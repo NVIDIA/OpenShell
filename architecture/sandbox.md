@@ -473,6 +473,44 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Configuration Admission
+
+Gateway-managed supervisors reconcile configuration before launching the main
+process or exposing workload services. Admission covers the effective policy,
+provider layers, credential bindings, and gateway-derived provenance. Explicit
+user and global policy precedence is unchanged; an image without a policy uses
+the restrictive baseline. An invalid image policy does not become a launchable
+default.
+
+The gateway tracks configuration admission independently of compute health.
+A blocked startup remains `Provisioning` with a `ConfigurationInvalid` readiness
+condition, even when the container backend reports readiness. Gateway management
+operations remain available. Replacing the policy or repairing providers allows
+the same supervisor to reconcile and launch; it does not recreate the sandbox.
+Static policy fields can be replaced before the first accepted activation.
+Admission validates policy composition; image and host setup failures, such as
+an unresolved OCI user or unavailable isolation facilities, retain their existing
+startup error behavior.
+
+Acceptance identifies the effective policy hash/version, configuration revision,
+provider-environment revision, and reporting supervisor instance. Startup captures
+the matching provider environment and constructs the runtime before reporting
+acceptance. Live reconciliation begins only after the main process has spawned,
+so it cannot replace the configuration captured for that launch. Restart resets
+admission and requires a fresh accepted configuration.
+
+Policy and provider refreshes are prepared before publication. Publication
+invalidates prior policy guards before exposing new provider material and swaps
+the policy under the same publication locks. Rejected candidates cannot install
+their credentials alongside the previous policy. Existing runtime fail-closed
+checks remain necessary for in-flight traffic and invalid live updates.
+
+In sidecar topology, the authenticated process supervisor supplies discovery
+from the workload image over the existing control socket. The network supervisor
+withholds bootstrap until admission succeeds, then sends the accepted policy and
+child environment together. Subsequent configuration messages carry both parts
+and an ordered generation; older messages cannot restore stale child credentials.
+
 ## Policy Revision Acknowledgement
 
 When the supervisor loads a sandbox-scoped policy from the gateway, it retains
@@ -508,11 +546,11 @@ outages cannot block policy polling, enforcement, settings, or provider
 refreshes and cannot permanently lose the initial acknowledgement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
-zero) are acknowledged. Global policies and local-file development policies do
-not use the sandbox revision API and produce no acknowledgement. When explicit
-local Rego and data files are configured, the supervisor continues polling the
-gateway for settings and provider refreshes but never replaces the local OPA
-engine with a gateway policy revision.
+zero) use the policy revision acknowledgement API. Global policies use the
+configuration admission contract without a sandbox policy revision acknowledgement.
+Local Rego/data overrides remain available for standalone development; combining
+them with a gateway-managed sandbox is rejected because the gateway cannot admit
+the runtime policy it would enforce.
 
 ## Failure Behavior
 

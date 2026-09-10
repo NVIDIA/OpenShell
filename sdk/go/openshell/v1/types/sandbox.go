@@ -109,14 +109,37 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName          string
-	AgentPod             string
-	AgentFd              string
-	SandboxFd            string
-	Phase                SandboxPhase
-	Conditions           []SandboxCondition
-	CurrentPolicyVersion uint32
-	ExitCode             *int32
+	SandboxName            string
+	AgentPod               string
+	AgentFd                string
+	SandboxFd              string
+	Phase                  SandboxPhase
+	Conditions             []SandboxCondition
+	CurrentPolicyVersion   uint32
+	ExitCode               *int32
+	ConfigurationAdmission *SandboxConfigurationAdmission
+}
+
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState string
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  ConfigurationAdmissionState = "unknown"
+	ConfigurationAdmissionPending  ConfigurationAdmissionState = "pending"
+	ConfigurationAdmissionAccepted ConfigurationAdmissionState = "accepted"
+	ConfigurationAdmissionRejected ConfigurationAdmissionState = "rejected"
+)
+
+// SandboxConfigurationAdmission identifies a validated or rejected configuration.
+// Supervisor instance fencing remains available through the raw protobuf API.
+type SandboxConfigurationAdmission struct {
+	State               ConfigurationAdmissionState
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	Error               string
 }
 
 // SandboxCondition describes an observed condition of a sandbox.

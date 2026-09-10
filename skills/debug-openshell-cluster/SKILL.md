@@ -141,6 +141,16 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+A `ConfigurationInvalid` readiness condition means startup admission rejected
+the image/effective policy or provider configuration. The supervisor remains
+alive while the workload stays unstarted. Inspect `openshell sandbox get` and
+repair the desired configuration with a complete policy replacement or provider
+change; do not treat a healthy container as proof that the workload is ready.
+See [policy validation and repair](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md).
+In sidecar topology, the process supervisor sends image-policy discovery over
+the authenticated control socket and waits for an accepted bootstrap. A process
+container waiting there can be expected during repair, rather than a crash loop.
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash

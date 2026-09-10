@@ -610,6 +610,13 @@ impl OpenShell for OpenShellService {
         policy::handle_report_policy_status(&self.state, request).await
     }
 
+    async fn report_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        policy::handle_report_sandbox_configuration(&self.state, request).await
+    }
+
     // --- Sandbox logs ---
 
     async fn get_sandbox_logs(

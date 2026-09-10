@@ -409,6 +409,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn report_sandbox_configuration(
+        &self,
+        _: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,

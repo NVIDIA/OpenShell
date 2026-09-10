@@ -638,6 +638,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn report_sandbox_configuration(
+        &self,
+        _: tonic::Request<proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _: tonic::Request<proto::ReportPolicyStatusRequest>,

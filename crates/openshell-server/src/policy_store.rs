@@ -20,6 +20,8 @@ pub struct AtomicPolicyRevisionWrite {
     pub provenance: HashMap<String, String>,
     pub expected_resource_version: u64,
     pub annotations: HashMap<String, String>,
+    /// Populate the create-time baseline, or replace it while startup admission
+    /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
 }
 
@@ -59,6 +61,14 @@ pub fn project_policy_revision_onto_sandbox(
     sandbox.set_resource_version(current_resource_version);
 
     let mut changed = false;
+    let startup_blocked = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .is_some_and(|admission| {
+            admission.state
+                != i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        });
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
         let spec = sandbox
             .spec
@@ -70,6 +80,10 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
+            Some(_) if startup_blocked => {
+                spec.policy = Some(backfill_policy.clone());
+                changed = true;
+            }
             Some(_) => {
                 return Err(PersistenceError::Conflict {
                     current_resource_version: Some(current_resource_version),

@@ -1484,6 +1484,17 @@ impl ComputeRuntime {
                         // Retain the previous instance id as a tombstone until
                         // the restarted supervisor registers its new id.
                         status.exit_code = None;
+                        if phase == SandboxPhase::Starting {
+                            status.configuration_admission =
+                                Some(openshell_core::proto::SandboxConfigurationAdmission {
+                                    // Fence delayed registrations from the previous runtime.
+                                    instance_id: uuid::Uuid::new_v4().to_string(),
+                                    state:
+                                        openshell_core::proto::ConfigurationAdmissionState::Pending
+                                            .into(),
+                                    ..Default::default()
+                                });
+                        }
                     }
                     upsert_ready_condition(
                         &mut sandbox.status,
@@ -3101,6 +3112,7 @@ impl ComputeRuntime {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
                     sandbox.set_phase(SandboxPhase::Provisioning as i32);
                 }
+                apply_configuration_readiness(sandbox);
             })
             .await;
 
@@ -4268,6 +4280,7 @@ fn public_status_from_driver(
         current_policy_version,
         main_process_instance_id: String::new(),
         exit_code: None,
+        configuration_admission: None,
     }
 }
 
@@ -4345,6 +4358,21 @@ fn apply_driver_snapshot(
         SandboxPhase::Stopping if phase != SandboxPhase::Error => SandboxPhase::Stopping,
         SandboxPhase::Stopped => SandboxPhase::Stopped,
         SandboxPhase::Completed => SandboxPhase::Completed,
+        SandboxPhase::Starting
+            if phase != SandboxPhase::Error
+                && sandbox
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configuration_admission.as_ref())
+                    .is_some_and(|admission| {
+                        admission.state
+                            != i32::from(
+                                openshell_core::proto::ConfigurationAdmissionState::Accepted,
+                            )
+                    }) =>
+        {
+            SandboxPhase::Starting
+        }
         SandboxPhase::Starting if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
             SandboxPhase::Starting
         }
@@ -4365,6 +4393,9 @@ fn apply_driver_snapshot(
             .main_process_instance_id
             .clone_from(&current_status.main_process_instance_id);
         status.exit_code = current_status.exit_code;
+        status
+            .configuration_admission
+            .clone_from(&current_status.configuration_admission);
     }
     if old_phase != phase {
         info!(
@@ -4401,6 +4432,71 @@ fn apply_driver_snapshot(
     sandbox.status = status;
     sandbox.set_phase(phase as i32);
     sandbox.set_current_policy_version(cpv);
+    apply_configuration_readiness(sandbox);
+}
+
+/// Configuration readiness is independent of compute/container readiness.
+pub fn apply_configuration_readiness(sandbox: &mut Sandbox) {
+    use openshell_core::proto::ConfigurationAdmissionState;
+    let Some(status) = sandbox.status.as_mut() else {
+        return;
+    };
+    let Some(admission) = status.configuration_admission.as_ref() else {
+        return;
+    };
+    let accepted = admission.state == i32::from(ConfigurationAdmissionState::Accepted);
+    let reason = if accepted {
+        "ConfigurationAccepted"
+    } else if admission.state == i32::from(ConfigurationAdmissionState::Rejected) {
+        "ConfigurationInvalid"
+    } else {
+        "ConfigurationPending"
+    };
+    let desired_error = admission.error.clone();
+    let message = if accepted {
+        String::new()
+    } else if admission.error.is_empty() {
+        "Waiting for effective configuration validation before workload activation".to_string()
+    } else {
+        admission.error.clone()
+    };
+    status.conditions.retain(|condition| {
+        condition.r#type != "ConfigurationReady" && condition.r#type != "DesiredConfigurationReady"
+    });
+    status.conditions.push(SandboxCondition {
+        r#type: "ConfigurationReady".to_string(),
+        status: if accepted { "True" } else { "False" }.to_string(),
+        reason: reason.to_string(),
+        message: message.clone(),
+        ..Default::default()
+    });
+    if accepted && !desired_error.is_empty() {
+        status.conditions.push(SandboxCondition {
+            r#type: "DesiredConfigurationReady".to_string(),
+            status: "False".to_string(),
+            reason: "ConfigurationInvalid".to_string(),
+            message: desired_error,
+            ..Default::default()
+        });
+    }
+    if !accepted
+        && matches!(
+            SandboxPhase::try_from(status.phase),
+            Ok(SandboxPhase::Ready | SandboxPhase::Provisioning)
+        )
+    {
+        status.phase = SandboxPhase::Provisioning as i32;
+        status
+            .conditions
+            .retain(|condition| condition.r#type != "Ready");
+        status.conditions.push(SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message,
+            ..Default::default()
+        });
+    }
 }
 
 fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
@@ -4964,6 +5060,82 @@ mod tests {
     use std::sync::{Arc, Mutex as TestMutex};
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
     use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    #[test]
+    fn configuration_admission_survives_driver_ready_observations() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
+        };
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox.status.as_mut().unwrap().configuration_admission =
+            Some(SandboxConfigurationAdmission {
+                instance_id: "instance".to_string(),
+                state: Admission::Rejected.into(),
+                error: "Invalid credentialed endpoint in rule image".to_string(),
+                ..Default::default()
+            });
+        let incoming = ready_driver_sandbox("sandbox", "sandbox");
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        assert_eq!(sandbox.phase(), SandboxPhase::Provisioning as i32);
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ConfigurationInvalid"
+                    && condition.status == "False")
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .state = Admission::Accepted.into();
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ConfigurationAccepted"
+                    && condition.status == "True")
+        );
+    }
+
+    #[test]
+    fn configuration_admission_preserves_starting_for_early_exit_reports() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
+        };
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Starting as i32);
+        let status = sandbox.status.as_mut().unwrap();
+        status.main_process_instance_id = "previous-instance".to_string();
+        status.configuration_admission = Some(SandboxConfigurationAdmission {
+            state: Admission::Pending.into(),
+            ..Default::default()
+        });
+        apply_configuration_readiness(&mut sandbox);
+        apply_driver_snapshot(
+            &mut sandbox,
+            &ready_driver_sandbox("sandbox", "sandbox"),
+            false,
+            true,
+        );
+        assert_eq!(sandbox.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(
+            sandbox.status.as_ref().unwrap().main_process_instance_id,
+            "previous-instance"
+        );
+    }
 
     fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
@@ -7092,6 +7264,39 @@ mod tests {
         );
 
         register_test_supervisor_session(&runtime, sandbox.object_id());
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+        let blocked = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocked.phase(),
+            SandboxPhase::Starting as i32,
+            "driver/session readiness cannot bypass restart configuration admission"
+        );
+        // Simulate the supervisor's successful exact-generation admission report.
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
+                sandbox
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .configuration_admission
+                    .as_mut()
+                    .unwrap()
+                    .state = openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+            })
+            .await
+            .unwrap();
         runtime
             .apply_sandbox_update(ready_driver_sandbox(
                 sandbox.object_id(),

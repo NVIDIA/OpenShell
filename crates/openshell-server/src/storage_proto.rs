@@ -119,11 +119,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "042034fe4d0000279ee4ed27e587ab8e530934b8d5c3aa36dc9769f81dfa6e51";
+        "25b9b3d6f2cebdcd3148b0049838dcce51ee745f52a4051428af6701e610afd0";
     const DURABLE_SCHEMA_SHA256: &str =
-        "920a5243dfb37ce709f0f562a47d17791a5ede90fd7f662ed01542abd60a0dfb";
+        "a6191e11d46430e5e32881f53b13f6c717717fbc6bff6e0a1d270fe8f9710d51";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
+        "68127e24cdb88b67433f68c4a1443c22a322f37ed1225b7547614a96f768cfac";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -447,14 +447,14 @@ mod tests {
             }
         }
         methods.sort();
-        assert_eq!(compiled_method_count, 100, "classify every compiled RPC");
-        assert_eq!(methods.len(), 74, "inventory every public gateway RPC");
+        assert_eq!(compiled_method_count, 101, "classify every compiled RPC");
+        assert_eq!(methods.len(), 75, "inventory every public gateway RPC");
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            74
+            75
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -487,13 +487,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (276, 12)
+            (279, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (81, 8)
+            (82, 9)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (71, 8));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
@@ -511,6 +511,21 @@ mod tests {
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {
         hex::decode(encoded).expect("checked-in legacy fixture must be valid hex")
+    }
+
+    #[test]
+    fn pre_admission_sandbox_decodes_without_fabricating_acceptance() {
+        use openshell_core::proto::{Sandbox, SandboxPhase};
+
+        // Encoded with openshell.proto at 0357daee, before status field 10.
+        let bytes =
+            legacy_bytes("0a180a096c65676163792d6964120b6c65676163792d6e616d651a0430023807");
+        let sandbox = Sandbox::decode(bytes.as_slice()).unwrap();
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.phase, SandboxPhase::Ready as i32);
+        assert_eq!(status.current_policy_version, 7);
+        assert!(status.configuration_admission.is_none());
+        assert_eq!(sandbox.encode_to_vec(), bytes);
     }
 
     #[test]

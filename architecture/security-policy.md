@@ -142,6 +142,14 @@ flag defaults to `false` and is security-flagged in policy approval flows.
 Incremental merges only ever add the flag to a matching endpoint; clearing it
 requires removing the endpoint or replacing the policy.
 
+Image discovery may persist a desired policy for repair, but does not authorize
+workload activation. The gateway applies the credential gate after full provider
+composition and provenance derivation. A rejected effective configuration keeps
+startup blocked with a bounded diagnostic; the supervisor waits for management
+repair instead of launching with connection-time denials or a fallback policy.
+Accepted runtime state includes the matching provider-environment revision, so
+policy and credential updates cannot activate independently.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies can continue streaming when body

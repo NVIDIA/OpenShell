@@ -17,12 +17,27 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
+
+/// Discovery belongs to the workload image, not the network sidecar image.
+#[derive(Debug, Clone)]
+pub enum ImagePolicyDiscovery {
+    Missing,
+    Policy(Box<openshell_core::proto::SandboxPolicy>),
+    Invalid,
+}
+
+struct AdmissionHandshake {
+    discovery: oneshot::Sender<ImagePolicyDiscovery>,
+    admitted: watch::Receiver<bool>,
+}
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct BootstrapData {
     pub policy_proto: openshell_core::proto::SandboxPolicy,
+    pub policy_hash: String,
+    pub config_revision: u64,
     pub provider_env_revision: u64,
     pub provider_env_generation: u64,
     pub provider_child_env: HashMap<String, String>,
@@ -49,6 +64,14 @@ pub struct ExpectedPeer {
 
 #[derive(Debug, Clone)]
 pub enum ControlUpdate {
+    Configuration {
+        policy_proto: Box<openshell_core::proto::SandboxPolicy>,
+        policy_hash: String,
+        config_revision: u64,
+        provider_env_revision: u64,
+        provider_env_generation: u64,
+        provider_child_env: HashMap<String, String>,
+    },
     ProviderEnv {
         revision: u64,
         generation: u64,
@@ -72,9 +95,47 @@ pub enum ControlUpdate {
 pub struct Publisher {
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
+    admitted: watch::Sender<bool>,
 }
 
 impl Publisher {
+    /// Release the initial handshake only after the complete configuration is accepted.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn publish_bootstrap(&self, bootstrap: BootstrapData) {
+        *self.state.write().expect("sidecar control state poisoned") = bootstrap;
+        self.admitted.send_replace(true);
+    }
+
+    /// Publish policy and child environment as one ordered configuration.
+    pub fn publish_configuration(
+        &self,
+        policy_proto: openshell_core::proto::SandboxPolicy,
+        policy_hash: String,
+        config_revision: u64,
+        provider_env_revision: u64,
+        provider_child_env: HashMap<String, String>,
+    ) {
+        let mut state = self.state.write().expect("sidecar control state poisoned");
+        state.policy_proto = policy_proto.clone();
+        state.policy_hash.clone_from(&policy_hash);
+        state.config_revision = config_revision;
+        state.provider_env_revision = provider_env_revision;
+        state.provider_env_generation = state
+            .provider_env_generation
+            .checked_add(1)
+            .expect("sidecar configuration generation overflow");
+        state.provider_child_env.clone_from(&provider_child_env);
+        let _ = self.updates.send(WireServerMessage::ConfigurationUpdated {
+            policy_proto: policy_proto.encode_to_vec(),
+            policy_hash,
+            config_revision,
+            provider_env_revision,
+            provider_env_generation: state.provider_env_generation,
+            provider_child_env,
+        });
+    }
+
+    #[cfg(test)]
     pub fn publish_provider_env(&self, revision: u64, provider_child_env: HashMap<String, String>) {
         let mut state = self.state.write().expect("sidecar control state poisoned");
         if revision == state.provider_env_revision {
@@ -93,24 +154,6 @@ impl Publisher {
             revision,
             generation: state.provider_env_generation,
             provider_child_env,
-        });
-    }
-
-    pub fn publish_policy(
-        &self,
-        policy_proto: openshell_core::proto::SandboxPolicy,
-        policy_hash: String,
-        config_revision: u64,
-    ) {
-        {
-            let mut state = self.state.write().expect("sidecar control state poisoned");
-            state.policy_proto = policy_proto.clone();
-        }
-
-        let _ = self.updates.send(WireServerMessage::PolicyUpdated {
-            policy_proto: policy_proto.encode_to_vec(),
-            policy_hash,
-            config_revision,
         });
     }
 
@@ -140,11 +183,19 @@ impl Publisher {
 pub struct ServerHandle {
     publisher: Publisher,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    discovered_policy: Option<oneshot::Receiver<ImagePolicyDiscovery>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     entrypoint_rx: mpsc::Receiver<EntrypointStarted>,
     connection_task: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn take_discovered_policy_receiver(
+        &mut self,
+    ) -> Option<oneshot::Receiver<ImagePolicyDiscovery>> {
+        self.discovered_policy.take()
+    }
     pub fn publisher(&self) -> Publisher {
         self.publisher.clone()
     }
@@ -168,16 +219,28 @@ impl ServerHandle {
 pub struct ProcessConnection {
     pub writer: Arc<Mutex<OwnedWriteHalf>>,
     pub updates: mpsc::UnboundedReceiver<ControlUpdate>,
-    pub closed: tokio::sync::oneshot::Receiver<()>,
+    pub closed: oneshot::Receiver<()>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
-    BootstrapRequest { supervisor_pid: u32 },
-    EntrypointStarted { pid: u32, instance_id: String },
-    MainProcessExited { instance_id: String, exit_code: i32 },
-    MainProcessFinalized { instance_id: String },
+    BootstrapRequest {
+        supervisor_pid: u32,
+        image_policy: Option<Vec<u8>>,
+        image_policy_invalid: bool,
+    },
+    EntrypointStarted {
+        pid: u32,
+        instance_id: String,
+    },
+    MainProcessExited {
+        instance_id: String,
+        exit_code: i32,
+    },
+    MainProcessFinalized {
+        instance_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,12 +248,22 @@ enum WireClientMessage {
 enum WireServerMessage {
     BootstrapResponse {
         policy_proto: Vec<u8>,
+        policy_hash: String,
+        config_revision: u64,
         provider_env_revision: u64,
         provider_env_generation: u64,
         provider_child_env: HashMap<String, String>,
         agent_proposals_enabled: bool,
         proxy_ca_cert_path: Option<String>,
         proxy_ca_bundle_path: Option<String>,
+    },
+    ConfigurationUpdated {
+        policy_proto: Vec<u8>,
+        policy_hash: String,
+        config_revision: u64,
+        provider_env_revision: u64,
+        provider_env_generation: u64,
+        provider_child_env: HashMap<String, String>,
     },
     ProviderEnvUpdated {
         revision: u64,
@@ -216,6 +289,8 @@ impl BootstrapData {
     fn to_wire(&self) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
             policy_proto: self.policy_proto.encode_to_vec(),
+            policy_hash: self.policy_hash.clone(),
+            config_revision: self.config_revision,
             provider_env_revision: self.provider_env_revision,
             provider_env_generation: self.provider_env_generation,
             provider_child_env: self.provider_child_env.clone(),
@@ -238,6 +313,8 @@ impl TryFrom<WireServerMessage> for BootstrapData {
     fn try_from(message: WireServerMessage) -> Result<Self> {
         let WireServerMessage::BootstrapResponse {
             policy_proto,
+            policy_hash,
+            config_revision,
             provider_env_revision,
             provider_env_generation,
             provider_child_env,
@@ -261,6 +338,8 @@ impl TryFrom<WireServerMessage> for BootstrapData {
 
         Ok(Self {
             policy_proto,
+            policy_hash,
+            config_revision,
             provider_env_revision,
             provider_env_generation,
             provider_child_env,
@@ -276,6 +355,31 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
 
     fn try_from(message: WireServerMessage) -> Result<Self> {
         match message {
+            WireServerMessage::ConfigurationUpdated {
+                policy_proto,
+                policy_hash,
+                config_revision,
+                provider_env_revision,
+                provider_env_generation,
+                provider_child_env,
+            } => {
+                let policy = openshell_core::proto::SandboxPolicy::decode(policy_proto.as_slice())
+                    .map_err(|_| {
+                        miette::miette!("failed to decode sidecar configuration policy")
+                    })?;
+                let policy = canonicalize_sidecar_policy(
+                    policy,
+                    "sidecar configuration policy failed validation",
+                )?;
+                Ok(Self::Configuration {
+                    policy_proto: Box::new(policy),
+                    policy_hash,
+                    config_revision,
+                    provider_env_revision,
+                    provider_env_generation,
+                    provider_child_env,
+                })
+            }
             WireServerMessage::ProviderEnvUpdated {
                 revision,
                 generation,
@@ -321,11 +425,41 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(test)]
 pub fn spawn_server(
     path: &Path,
     bootstrap: BootstrapData,
     expected_peer: ExpectedPeer,
+) -> Result<ServerHandle> {
+    spawn_server_inner(path, bootstrap, expected_peer, true)
+}
+
+/// Bind before image discovery; the authenticated process peer waits for admission.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn spawn_pending_server(path: &Path, expected_peer: ExpectedPeer) -> Result<ServerHandle> {
+    spawn_server_inner(
+        path,
+        BootstrapData {
+            policy_proto: openshell_policy::restrictive_default_policy(),
+            policy_hash: String::new(),
+            config_revision: 0,
+            provider_env_revision: 0,
+            provider_env_generation: 0,
+            provider_child_env: HashMap::new(),
+            agent_proposals_enabled: false,
+            proxy_ca_cert_path: None,
+            proxy_ca_bundle_path: None,
+        },
+        expected_peer,
+        false,
+    )
+}
+
+fn spawn_server_inner(
+    path: &Path,
+    bootstrap: BootstrapData,
+    expected_peer: ExpectedPeer,
+    initially_admitted: bool,
 ) -> Result<ServerHandle> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -370,9 +504,12 @@ pub fn spawn_server(
     let state = Arc::new(RwLock::new(bootstrap));
     let (updates, _) = broadcast::channel(32);
     let (entrypoint_tx, entrypoint_rx) = mpsc::channel(8);
+    let (discovery_tx, discovery_rx) = oneshot::channel();
+    let (admitted_tx, admitted_rx) = watch::channel(initially_admitted);
     let publisher = Publisher {
         state: state.clone(),
         updates: updates.clone(),
+        admitted: admitted_tx,
     };
 
     let connection_task = tokio::spawn(accept_authoritative_connection(
@@ -382,11 +519,16 @@ pub fn spawn_server(
         state,
         updates,
         entrypoint_tx,
+        AdmissionHandshake {
+            discovery: discovery_tx,
+            admitted: admitted_rx,
+        },
     ));
     info!(path = %path.display(), "Sidecar control socket listening");
 
     Ok(ServerHandle {
         publisher,
+        discovered_policy: Some(discovery_rx),
         entrypoint_rx,
         connection_task,
     })
@@ -400,6 +542,7 @@ async fn accept_authoritative_connection(
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
     entrypoint_tx: mpsc::Sender<EntrypointStarted>,
+    admission: AdmissionHandshake,
 ) {
     let stream = match listener.accept().await {
         Ok((stream, _addr)) => stream,
@@ -424,7 +567,16 @@ async fn accept_authoritative_connection(
         );
     }
 
-    if let Err(err) = handle_connection(stream, expected_peer, state, updates, entrypoint_tx).await
+    if let Err(err) = handle_connection(
+        stream,
+        expected_peer,
+        state,
+        updates,
+        entrypoint_tx,
+        admission.discovery,
+        admission.admitted,
+    )
+    .await
     {
         warn!(error = %err, "Authoritative sidecar control connection closed");
     }
@@ -437,6 +589,8 @@ async fn handle_connection(
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
     entrypoint_tx: mpsc::Sender<EntrypointStarted>,
+    discovery_tx: oneshot::Sender<ImagePolicyDiscovery>,
+    mut admitted_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let credentials = stream
         .peer_cred()
@@ -464,12 +618,27 @@ async fn handle_connection(
             miette::miette!("sidecar control client disconnected before bootstrap")
         })?;
     match decode_client_message(&first_line)? {
-        WireClientMessage::BootstrapRequest { supervisor_pid } => {
+        WireClientMessage::BootstrapRequest {
+            supervisor_pid,
+            image_policy,
+            image_policy_invalid,
+        } => {
             if supervisor_pid == 0 || supervisor_pid != peer_pid {
                 return Err(miette::miette!(
                     "sidecar bootstrap PID mismatch: peer PID {peer_pid}, claimed PID {supervisor_pid}"
                 ));
             }
+            let discovery = if image_policy_invalid {
+                ImagePolicyDiscovery::Invalid
+            } else {
+                image_policy.map_or(ImagePolicyDiscovery::Missing, |bytes| {
+                    openshell_core::proto::SandboxPolicy::decode(bytes.as_slice())
+                        .map_or(ImagePolicyDiscovery::Invalid, |policy| {
+                            ImagePolicyDiscovery::Policy(Box::new(policy))
+                        })
+                })
+            };
+            let _ = discovery_tx.send(discovery);
             entrypoint_tx
                 .send(EntrypointStarted {
                     pid: supervisor_pid,
@@ -489,6 +658,13 @@ async fn handle_connection(
             ));
         }
     }
+
+    // No bootstrap policy or workload credentials are exposed while admission
+    // is pending. The gateway remains available to repair the desired policy.
+    admitted_rx
+        .wait_for(|admitted| *admitted)
+        .await
+        .map_err(|_| miette::miette!("sidecar configuration admission ended before activation"))?;
 
     // Subscribe before taking the bootstrap snapshot so an update can neither
     // be missed between the snapshot and the live update stream nor omitted
@@ -568,9 +744,18 @@ async fn handle_connection(
     }
 }
 
+#[cfg(test)]
 pub async fn connect_process_client(
     path: &Path,
     timeout: Duration,
+) -> Result<(BootstrapData, ProcessConnection)> {
+    connect_process_client_with_policy(path, timeout, ImagePolicyDiscovery::Missing).await
+}
+
+pub async fn connect_process_client_with_policy(
+    path: &Path,
+    timeout: Duration,
+    discovery: ImagePolicyDiscovery,
 ) -> Result<(BootstrapData, ProcessConnection)> {
     let stream = connect_with_retry(path, timeout).await?;
     let (reader, mut writer) = stream.into_split();
@@ -578,6 +763,11 @@ pub async fn connect_process_client(
         &mut writer,
         &WireClientMessage::BootstrapRequest {
             supervisor_pid: std::process::id(),
+            image_policy: match &discovery {
+                ImagePolicyDiscovery::Policy(policy) => Some(policy.encode_to_vec()),
+                ImagePolicyDiscovery::Missing | ImagePolicyDiscovery::Invalid => None,
+            },
+            image_policy_invalid: matches!(discovery, ImagePolicyDiscovery::Invalid),
         },
     )
     .await?;
@@ -591,7 +781,7 @@ pub async fn connect_process_client(
     let bootstrap = BootstrapData::try_from(decode_server_message(&first_line)?)?;
 
     let (update_tx, updates) = mpsc::unbounded_channel();
-    let (closed_tx, closed) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed) = oneshot::channel();
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
             match decode_server_message(&line).and_then(ControlUpdate::try_from) {
@@ -753,6 +943,8 @@ mod tests {
     fn bootstrap_message(policy: &SandboxPolicy) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
             policy_proto: policy.encode_to_vec(),
+            policy_hash: "accepted-hash".to_string(),
+            config_revision: 1,
             provider_env_revision: 0,
             provider_env_generation: 0,
             provider_child_env: HashMap::new(),
@@ -775,6 +967,112 @@ mod tests {
             uid: nix::unistd::Uid::current().as_raw(),
             gid: nix::unistd::Gid::current().as_raw(),
         }
+    }
+
+    #[tokio::test]
+    async fn workload_image_discovery_precedes_bootstrap_and_repair_releases_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let mut server = spawn_pending_server(&socket, current_peer()).unwrap();
+        let discovery_rx = server.take_discovered_policy_receiver().unwrap();
+        let client = tokio::spawn(async move {
+            connect_process_client_with_policy(
+                &socket,
+                Duration::from_secs(1),
+                ImagePolicyDiscovery::Invalid,
+            )
+            .await
+        });
+        assert!(matches!(
+            discovery_rx.await.unwrap(),
+            ImagePolicyDiscovery::Invalid
+        ));
+        // Receipt of the authenticated discovery request is the synchronization
+        // point: no timing assumptions are needed to show admission is pending.
+        assert!(!client.is_finished());
+        assert!(!*server.publisher.admitted.borrow());
+
+        let policy = openshell_policy::restrictive_default_policy();
+        server.publisher().publish_bootstrap(BootstrapData {
+            policy_proto: policy.clone(),
+            policy_hash: "repaired".to_string(),
+            config_revision: 2,
+            provider_env_revision: 5,
+            provider_env_generation: 0,
+            provider_child_env: HashMap::new(),
+            agent_proposals_enabled: false,
+            proxy_ca_cert_path: None,
+            proxy_ca_bundle_path: None,
+        });
+        let (bootstrap, mut connection) = tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(bootstrap.policy_hash, "repaired");
+        assert_eq!(bootstrap.config_revision, 2);
+        assert_eq!(bootstrap.provider_env_revision, 5);
+
+        let environment = HashMap::from([("TOKEN".to_string(), "placeholder".to_string())]);
+        server.publisher().publish_configuration(
+            policy,
+            "updated".to_string(),
+            3,
+            6,
+            environment.clone(),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ControlUpdate::Configuration {
+            policy_hash,
+            config_revision,
+            provider_env_revision,
+            provider_env_generation,
+            provider_child_env,
+            ..
+        } = update
+        else {
+            panic!("configuration must arrive in one message");
+        };
+        assert_eq!(
+            (
+                policy_hash.as_str(),
+                config_revision,
+                provider_env_revision,
+                provider_env_generation
+            ),
+            ("updated", 3, 6, 1)
+        );
+        assert_eq!(provider_child_env, environment);
+        let state = server.publisher.state.read().unwrap();
+        assert_eq!(state.policy_hash, "updated");
+        assert_eq!(state.provider_env_revision, 6);
+    }
+
+    #[test]
+    fn configuration_update_rejects_invalid_policy_before_exposing_environment() {
+        let invalid = defaultable_mcp_policy(Some(McpOptions {
+            versions: vec!["secret-invalid-value".to_string()],
+            ..Default::default()
+        }));
+        let error = ControlUpdate::try_from(WireServerMessage::ConfigurationUpdated {
+            policy_proto: invalid.encode_to_vec(),
+            policy_hash: "invalid".to_string(),
+            config_revision: 1,
+            provider_env_revision: 1,
+            provider_env_generation: 1,
+            provider_child_env: HashMap::from([(
+                "TOKEN".to_string(),
+                "credential-value".to_string(),
+            )]),
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "sidecar configuration policy failed validation");
+        assert!(!error.contains("secret-invalid-value"));
+        assert!(!error.contains("credential-value"));
     }
 
     #[test]
@@ -830,6 +1128,8 @@ mod tests {
                 version: 7,
                 ..SandboxPolicy::default()
             },
+            policy_hash: "accepted-hash".to_string(),
+            config_revision: 1,
             provider_env_revision: 3,
             provider_env_generation: 0,
             provider_child_env: env.clone(),
@@ -866,6 +1166,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: u64::MAX,
                 provider_env_generation: 7,
                 provider_child_env: HashMap::from([("TOKEN".to_string(), "first".to_string())]),
@@ -950,6 +1252,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -991,6 +1295,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1072,6 +1378,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1107,6 +1415,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1137,6 +1447,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1168,6 +1480,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                policy_hash: "accepted-hash".to_string(),
+                config_revision: 1,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1185,6 +1499,8 @@ mod tests {
             &mut stream,
             &WireClientMessage::BootstrapRequest {
                 supervisor_pid: std::process::id().saturating_add(1),
+                image_policy: None,
+                image_policy_invalid: false,
             },
         )
         .await

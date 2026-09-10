@@ -110,14 +110,15 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"current_policy_version": true,
-		"exit_code":              true,
+		"sandbox_name":            true,
+		"agent_pod":               true,
+		"agent_fd":                true,
+		"sandbox_fd":              true,
+		"phase":                   true,
+		"conditions":              true,
+		"current_policy_version":  true,
+		"exit_code":               true,
+		"configuration_admission": true,
 	}
 	// The instance ID coordinates internal gateway/supervisor lifecycle
 	// fencing. It is exposed only through the raw protobuf API.

@@ -496,6 +496,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
