@@ -10,20 +10,6 @@ position: 6
 
 NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub resources directly.
 
-## 0.1.0 Migration Notes
-
-The compute-driver contract now carries portable user-namespace intent only in
-the typed `DriverSandboxTemplate.user_namespaces` field. The gateway no longer
-emits the former Kubernetes-specific `platform_config.host_users` value, and
-the Kubernetes driver no longer honors it.
-
-If you run the Kubernetes driver as an external process, upgrade it together
-with the gateway. A gateway or driver that relies on the legacy pre-`0.1.0`
-encoding does not preserve per-sandbox user-namespace overrides when paired
-with the typed-only contract. Out-of-tree driver maintainers must regenerate
-their protobuf bindings and consume the typed field. See the
-[compute driver compatibility matrix](/reference/sandbox-compute-drivers#compute-driver-compatibility).
-
 | Resource | Description |
 |---|---|
 | [Releases](https://github.com/NVIDIA/OpenShell/releases) | Versioned release notes and downloadable assets. |
