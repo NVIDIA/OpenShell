@@ -13,13 +13,14 @@
 /// Override at runtime with the `OPENSHELL_COMMUNITY_REGISTRY` env var.
 pub const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/openshell-community/sandboxes";
 
-/// Return the default sandbox image reference (`{registry}/base:latest`).
+/// Return the default sandbox image reference.
 ///
 /// Used by all compute drivers as the fallback image when none is specified in
-/// the sandbox spec.
+/// the sandbox spec. Defaults to a generic, version-qualified official Alpine
+/// image so a fresh install does not depend on the community image catalog.
 #[must_use]
 pub fn default_sandbox_image() -> String {
-    format!("{DEFAULT_COMMUNITY_REGISTRY}/base:latest")
+    "docker.io/library/alpine:3.22".to_string()
 }
 
 /// Resolve a user-supplied image string into a fully-qualified reference.
