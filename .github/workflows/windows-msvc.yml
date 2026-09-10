@@ -17,6 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # sccache cannot cache incremental Rust compilations, and rust-cache removes
+  # incremental artifacts before saving the target directory.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -70,11 +72,15 @@ jobs:
       - name: Isolate Rust toolchains
         # rust-cache hashes every installed toolchain, including unused runner defaults.
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: "1.95.0"
-          targets: ${{ matrix.rust_target }}
-          components: clippy
+      - name: Install Rust toolchain
+        # GitHub-hosted runners include rustup. With no toolchain argument,
+        # rustup installs the checked-in rust-toolchain.toml configuration:
+        # https://github.com/dtolnay/rust-toolchain/issues/133#issuecomment-2610825530
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustup component add clippy
+          rustup target add ${{ matrix.rust_target }}
       - name: Install cargo-nextest
         run: mise install --locked github:nextest-rs/nextest
       - name: Cache Rust target and registry
@@ -129,11 +135,12 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Isolate Rust toolchains
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: "1.95.0"
-          targets: ${{ matrix.rust_target }}
-          components: clippy
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustup component add clippy
+          rustup target add ${{ matrix.rust_target }}
       - name: Install cargo-nextest
         run: mise install --locked github:nextest-rs/nextest
       - name: Cache Rust target and registry
@@ -185,10 +192,11 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Isolate Rust toolchains
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: "1.95.0"
-          targets: ${{ matrix.rust_target }}
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustup target add ${{ matrix.rust_target }}
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
