@@ -179,6 +179,10 @@ sees a revision-scoped `GITHUB_TOKEN` placeholder, the host CONNECT proxy
 substitutes it for `api.github.com`, and the same placeholder is rejected for a
 different allowed endpoint.
 
+This example uses `process_container`. The `IsoSessionApp.dll` and
+`--features isolation_session` prerequisites above apply only to
+`isolation_session` runs and are not required for this scenario.
+
 ## Packaging the demo for the demo box
 
 Use [`examples/package-demo.ps1`](examples/package-demo.ps1) to assemble
