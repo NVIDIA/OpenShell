@@ -475,15 +475,18 @@ quickly.
 
 ## Supervisor Configuration Delivery
 
-The gateway and supervisor must implement the same internal supervisor protocol
-revision. Peers built before the handshake existed report revision zero and are
-accepted for one release with a warning and a counter, because sandboxes keep
-their supervisor binary until they are recreated. The gateway includes a configuration bootstrap when it accepts a
-`ConnectSupervisor` session and can send complete component replacements on the
-same stream after policy, settings, or provider state changes.
-While polling remains authoritative, optional bootstrap construction has a
-one-second budget. The gateway accepts the session without a bootstrap when
-that budget expires, so slow credential backends do not block relay reconnects.
+The current gateway and supervisor use internal supervisor protocol revision 2.
+The gateway accepts Stage 1 revision 1 supervisors through the polling
+compatibility path. Peers built before the handshake report revision zero and
+remain accepted for one release with a warning and counter because sandboxes
+keep their supervisor binary until they are recreated. The gateway includes a
+configuration bootstrap when it accepts a `ConnectSupervisor` session and can
+send complete component replacements on the same stream after policy, settings,
+or provider state changes.
+Revision 2 supervisors require a complete bootstrap. The gateway uses the same
+bounded 45-second construction window as other snapshot builds and rejects the
+connection when construction fails. Revision 1 compatibility sessions retain
+the optional one-second bootstrap budget and use polling when it expires.
 These payloads describe the latest effective state rather than
 the mutation that produced it. The gateway assigns ordering sequences within
 each session and component, while each snapshot retains its own content
@@ -503,21 +506,34 @@ without changing publishers. Provider payloads can contain
 credentials, so the gateway does not persist or render complete stream
 messages in logs.
 
-The supervisor currently parses and ignores stream-delivered configuration.
-Polling remains the only path that changes runtime state and repairs dropped or
-unavailable delivery. The gateway serializes construction per sandbox and
-component, and coalesces repeated mutations into the latest full snapshot. An
-enqueue result means only that the local stream queue accepted the message. A
-bounded scope fanout scheduler coalesces repeated workspace and global changes,
+The supervisor applies stream-delivered configuration through the same runtime
+primitives used by the compatibility poller. It reports the requested and
+active revisions plus a component-specific outcome on `ConnectSupervisor`.
+Sandbox-scoped policy results update only the matching policy-history row, so a
+late result cannot mark a newer revision loaded. Explicit local policy remains
+authoritative and produces a retained-local-override result.
+
+The gateway keeps one update in flight per session and component. It replaces
+the pending snapshot when newer desired state arrives, validates the update ID,
+component sequence, component, and requested revision on acknowledgement, then
+sends the newest pending snapshot. A 30-second owner reconciliation pass
+rebuilds current snapshots for active local sessions. Applied equality
+revisions suppress unchanged delivery, while failed or timed-out delivery is
+retried from current database state. Reconnect discards session delivery state
+and starts with a fresh bootstrap.
+
+Polling remains available during the mixed-version rollout. The gateway
+serializes construction per sandbox and component, and coalesces repeated
+mutations into the latest full snapshot. An enqueue result means only that the
+local stream queue accepted the message. A bounded scope fanout scheduler
+coalesces repeated workspace and global changes,
 and semaphores sized from the database pool bound delivery workers and snapshot
 builds. Fanout waits for worker capacity before admitting each recipient, so a
 fleet-wide change cannot create a fleet-sized task backlog or saturate the store
 and credential backends. Snapshot construction has a deadline that starts once
 a build holds a permit, and the gateway rejects encoded stream messages that
-approach the transport decoder limit. A later migration will apply these
-payloads directly and acknowledge their exact revisions before removing
-supervisor polling. At that point, the gateway will require a valid bootstrap
-before marking a session ready.
+approach the transport decoder limit. Durable apply operations and final polling
+removal remain separate follow-up work.
 
 ## Policy Revision Acknowledgement
 

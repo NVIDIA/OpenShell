@@ -28,7 +28,10 @@ pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 const CONFIG_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 // Stage 1 bootstrap is optional. Keep credential backend stalls well below
 // the 15-second relay session-wait budget while polling remains authoritative.
-const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+pub const OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+// Stage 2 supervisors apply the bootstrap directly, so allow the same bounded
+// build window as an ordinary complete snapshot before rejecting the session.
+pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = CONFIG_SNAPSHOT_BUILD_TIMEOUT;
 const MAX_ACTIVE_FANOUT_WORKERS: usize = 64;
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
@@ -65,6 +68,8 @@ impl fmt::Debug for SupervisorConfigMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryDisposition {
     Enqueued,
+    Coalesced,
+    SuppressedUnchanged,
     NoActiveSession,
     QueueFull,
     SessionClosed,
@@ -354,13 +359,11 @@ enum FanoutEnqueue {
 pub async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
+    timeout: Duration,
 ) -> Result<ConfigBootstrap, Status> {
-    tokio::time::timeout(
-        CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
-        build_consistent_config_bootstrap(state, sandbox),
-    )
-    .await
-    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
+    tokio::time::timeout(timeout, build_consistent_config_bootstrap(state, sandbox))
+        .await
+        .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
 }
 
 async fn build_consistent_config_bootstrap(
@@ -587,6 +590,8 @@ fn record_delivery_worker_full(sandbox_id: &str, component: &'static str) {
 fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
     let outcome = match disposition {
         DeliveryDisposition::Enqueued => "enqueued",
+        DeliveryDisposition::Coalesced => "coalesced",
+        DeliveryDisposition::SuppressedUnchanged => "unchanged",
         DeliveryDisposition::NoActiveSession => "no_active_session",
         DeliveryDisposition::QueueFull => "queue_full",
         DeliveryDisposition::SessionClosed => "session_closed",
@@ -598,6 +603,20 @@ fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
         "outcome" => outcome,
     )
     .increment(1);
+}
+
+/// Periodically rebuild current snapshots for every locally routable session.
+/// This repairs missed mutation notifications and queue pressure without a
+/// supervisor fetch.
+pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            publish_all_connected(&state, ConfigComponents::ALL);
+        }
+    });
 }
 
 fn record_build_failure(sandbox_id: &str, component: &'static str, error_code: Code) {
@@ -947,7 +966,7 @@ mod tests {
             let connect = connect_supervisor_stream(
                 &state,
                 "sandbox",
-                openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
+                openshell_core::proto::PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
             );
             let (response, hit) = tokio::join!(connect, resolve_hit);
             hit.expect("bootstrap must reach the stalled credential driver");

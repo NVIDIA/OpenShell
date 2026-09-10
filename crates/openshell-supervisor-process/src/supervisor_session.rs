@@ -13,17 +13,23 @@
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    ConfigApplyFailure, ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult,
+    ConfigComponent, ConfigComponentApplyResult, ConfigSnapshotRevision, ConfigUpdate,
+    ConfigUpdateResult, FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit,
+    RelayOpen, RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
+    SupervisorMessage, TcpRelayTarget, config_snapshot_revision, config_update, gateway_message,
+    relay_open, supervisor_message,
 };
-use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
+use openshell_core::proto::{
+    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
+    SUPERVISOR_PROTOCOL_REVISION,
+};
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder, OcsfEvent,
     SeverityId, StatusId, ocsf_emit,
@@ -39,6 +45,75 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// A stream-delivered desired-state payload awaiting application by the
+/// sandbox runtime. The response travels back over `ConnectSupervisor`.
+pub enum ConfigApplyRequest {
+    Bootstrap {
+        bootstrap: ConfigBootstrap,
+        response: tokio::sync::oneshot::Sender<ConfigBootstrapResult>,
+    },
+    Update {
+        update: ConfigUpdate,
+        response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
+    },
+}
+
+#[derive(Default)]
+struct ConfigSequenceWatermarks {
+    sandbox_config: u64,
+    provider_environment: u64,
+}
+
+fn failed_component_result(
+    component: ConfigComponent,
+    requested_revision: Option<ConfigSnapshotRevision>,
+    outcome: ConfigApplyOutcome,
+    code: &str,
+    message: &str,
+) -> ConfigComponentApplyResult {
+    ConfigComponentApplyResult {
+        component: component.into(),
+        requested_revision,
+        applied_revision: None,
+        outcome: outcome.into(),
+        failure: Some(ConfigApplyFailure {
+            code: code.to_string(),
+            message: message.chars().take(1024).collect(),
+            retryable: false,
+        }),
+    }
+}
+
+fn update_component_and_revision(
+    update: &ConfigUpdate,
+) -> (ConfigComponent, Option<ConfigSnapshotRevision>) {
+    match update.component.as_ref() {
+        Some(config_update::Component::SandboxConfig(snapshot)) => (
+            ConfigComponent::SandboxConfig,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::SandboxConfig(
+                    openshell_core::proto::SandboxConfigRevision {
+                        config_revision: snapshot.config_revision,
+                        policy_version: snapshot.version,
+                        policy_source: snapshot.policy_source,
+                        global_policy_version: snapshot.global_policy_version,
+                    },
+                )),
+            }),
+        ),
+        Some(config_update::Component::ProviderEnvironment(snapshot)) => (
+            ConfigComponent::ProviderEnvironment,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::ProviderEnvironment(
+                    snapshot.provider_env_revision,
+                )),
+            }),
+        ),
+        None => (ConfigComponent::Unspecified, None),
+    }
+}
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
 /// to treating the whole string as a domain if parsing fails.
@@ -271,6 +346,7 @@ fn map_session_stream_message<T>(
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
@@ -279,6 +355,7 @@ pub fn spawn(
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    config_apply_tx: Option<mpsc::Sender<ConfigApplyRequest>>,
 ) -> tokio::task::JoinHandle<()> {
     let config = SessionConfig {
         endpoint,
@@ -288,6 +365,7 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
+        config_apply_tx,
     };
     tokio::spawn(run_session_loop(config))
 }
@@ -300,6 +378,7 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    config_apply_tx: Option<mpsc::Sender<ConfigApplyRequest>>,
 }
 
 async fn run_session_loop(config: SessionConfig) {
@@ -392,13 +471,15 @@ async fn run_single_session(
     );
     ocsf_emit!(event);
 
-    if accepted.bootstrap.is_some() {
-        debug!(
-            sandbox_id = %config.sandbox_id,
-            session_id = %accepted.session_id,
-            "supervisor session: ignoring configuration bootstrap while polling remains active"
-        );
+    if let Some(bootstrap) = accepted.bootstrap {
+        let result = apply_bootstrap(config, bootstrap).await;
+        tx.send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
+        })
+        .await
+        .map_err(|_| "failed to queue configuration bootstrap result")?;
     }
+    let config_sequences = Arc::new(Mutex::new(ConfigSequenceWatermarks::default()));
 
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
@@ -424,6 +505,8 @@ async fn run_single_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
+                    config_apply_tx: config.config_apply_tx.as_ref(),
+                    config_sequences: &config_sequences,
                 };
                 handle_gateway_message(
                     &msg,
@@ -449,6 +532,12 @@ fn validate_gateway_protocol_revision(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match gateway_revision {
         SUPERVISOR_PROTOCOL_REVISION => Ok(()),
+        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
+            warn!(
+                "supervisor session: gateway uses Stage 1 stream semantics; polling remains active"
+            );
+            Ok(())
+        }
         LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
             warn!(
                 "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
@@ -460,6 +549,79 @@ fn validate_gateway_protocol_revision(
         )
         .into()),
     }
+}
+
+async fn apply_bootstrap(
+    config: &SessionConfig,
+    bootstrap: ConfigBootstrap,
+) -> ConfigBootstrapResult {
+    let Some(apply_tx) = config.config_apply_tx.as_ref() else {
+        return ConfigBootstrapResult {
+            results: bootstrap_components(&bootstrap)
+                .into_iter()
+                .map(|(component, revision)| {
+                    failed_component_result(
+                        component,
+                        revision,
+                        ConfigApplyOutcome::Unsupported,
+                        "apply_unavailable",
+                        "configuration apply service is unavailable",
+                    )
+                })
+                .collect(),
+        };
+    };
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    if apply_tx
+        .send(ConfigApplyRequest::Bootstrap {
+            bootstrap,
+            response,
+        })
+        .await
+        .is_err()
+    {
+        return ConfigBootstrapResult {
+            results: Vec::new(),
+        };
+    }
+    match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+        Ok(Ok(result)) => result,
+        _ => ConfigBootstrapResult {
+            results: Vec::new(),
+        },
+    }
+}
+
+fn bootstrap_components(
+    bootstrap: &ConfigBootstrap,
+) -> Vec<(ConfigComponent, Option<ConfigSnapshotRevision>)> {
+    let mut components = Vec::with_capacity(2);
+    if let Some(snapshot) = bootstrap.sandbox_config.as_ref() {
+        components.push((
+            ConfigComponent::SandboxConfig,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::SandboxConfig(
+                    openshell_core::proto::SandboxConfigRevision {
+                        config_revision: snapshot.config_revision,
+                        policy_version: snapshot.version,
+                        policy_source: snapshot.policy_source,
+                        global_policy_version: snapshot.global_policy_version,
+                    },
+                )),
+            }),
+        ));
+    }
+    if let Some(snapshot) = bootstrap.provider_environment.as_ref() {
+        components.push((
+            ConfigComponent::ProviderEnvironment,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::ProviderEnvironment(
+                    snapshot.provider_env_revision,
+                )),
+            }),
+        ));
+    }
+    components
 }
 
 /// Report the canonical process result and wait for durable handling.
@@ -510,6 +672,8 @@ struct GatewayMessageContext<'a> {
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
     terminating: &'a Arc<AtomicBool>,
+    config_apply_tx: Option<&'a mpsc::Sender<ConfigApplyRequest>>,
+    config_sequences: &'a Arc<Mutex<ConfigSequenceWatermarks>>,
 }
 
 fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
@@ -518,13 +682,97 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             // Gateway heartbeat — nothing to do.
         }
         Some(gateway_message::Payload::ConfigUpdate(update)) => {
-            // Stage 1 accepts pushed configuration but leaves polling as the
-            // only path that changes runtime state.
-            debug!(
-                sandbox_id = %context.sandbox_id,
-                component_sequence = update.component_sequence,
-                "supervisor session: ignoring configuration update while polling remains active"
-            );
+            let update = update.clone();
+            let tx = context.tx.clone();
+            let apply_tx = context.config_apply_tx.cloned();
+            let sandbox_id = context.sandbox_id.to_string();
+            let (component, _) = update_component_and_revision(&update);
+            let invalid_update = update.update_id.is_empty()
+                || update.component_sequence == 0
+                || update.component.is_none();
+            let stale_sequence = if invalid_update {
+                false
+            } else {
+                let mut watermarks = context.config_sequences.lock().unwrap();
+                let watermark = match component {
+                    ConfigComponent::ProviderEnvironment => &mut watermarks.provider_environment,
+                    ConfigComponent::SandboxConfig | ConfigComponent::Unspecified => {
+                        &mut watermarks.sandbox_config
+                    }
+                };
+                if update.component_sequence <= *watermark {
+                    true
+                } else {
+                    *watermark = update.component_sequence;
+                    false
+                }
+            };
+            tokio::spawn(async move {
+                let (component, revision) = update_component_and_revision(&update);
+                let fallback = |outcome, code: &str, message: &str| ConfigUpdateResult {
+                    update_id: update.update_id.clone(),
+                    component_sequence: update.component_sequence,
+                    result: Some(failed_component_result(
+                        component, revision, outcome, code, message,
+                    )),
+                };
+                let result = if invalid_update {
+                    fallback(
+                        ConfigApplyOutcome::Unsupported,
+                        "invalid_update",
+                        "configuration update identity, sequence, and component are required",
+                    )
+                } else if stale_sequence {
+                    fallback(
+                        ConfigApplyOutcome::IgnoredStale,
+                        "stale_sequence",
+                        "configuration update sequence is stale",
+                    )
+                } else if let Some(apply_tx) = apply_tx {
+                    let (response, receiver) = tokio::sync::oneshot::channel();
+                    if apply_tx
+                        .send(ConfigApplyRequest::Update {
+                            update: update.clone(),
+                            response,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        fallback(
+                            ConfigApplyOutcome::Unsupported,
+                            "apply_unavailable",
+                            "configuration apply service is unavailable",
+                        )
+                    } else {
+                        match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+                            Ok(Ok(result)) => result,
+                            _ => fallback(
+                                ConfigApplyOutcome::Unsupported,
+                                "apply_timeout",
+                                "configuration application timed out",
+                            ),
+                        }
+                    }
+                } else {
+                    fallback(
+                        ConfigApplyOutcome::Unsupported,
+                        "apply_unavailable",
+                        "configuration apply service is unavailable",
+                    )
+                };
+                if tx
+                    .send(SupervisorMessage {
+                        payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    debug!(
+                        sandbox_id,
+                        "configuration result dropped after session close"
+                    );
+                }
+            });
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
@@ -870,6 +1118,7 @@ mod target_tests {
     #[test]
     fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
         assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_gateway_protocol_revision(PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
         assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
     }
 

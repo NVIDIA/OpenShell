@@ -28,6 +28,7 @@ use crate::provider_profile_sources::ProviderProfileSources;
 use crate::storage_proto::StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
+use metrics::counter;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 #[cfg(test)]
 use openshell_core::proto::StaticCredentialBinding;
@@ -4318,61 +4319,21 @@ pub(super) async fn handle_report_policy_status(
         return Err(Status::invalid_argument("version is required"));
     }
 
-    let version = i64::from(req.version);
     let status_str = match PolicyStatus::try_from(req.status) {
         Ok(PolicyStatus::Loaded) => "loaded",
         Ok(PolicyStatus::Failed) => "failed",
         _ => return Err(Status::invalid_argument("status must be LOADED or FAILED")),
     };
 
-    let loaded_at_ms = if status_str == "loaded" {
-        Some(current_time_ms())
-    } else {
-        None
-    };
-
-    let load_error = if status_str == "failed" && !req.load_error.is_empty() {
-        Some(req.load_error.as_str())
-    } else {
-        None
-    };
-
-    let updated = state
-        .store
-        .update_policy_status(
-            &req.sandbox_id,
-            version,
-            status_str,
-            load_error,
-            loaded_at_ms,
-        )
-        .await
-        .map_err(|e| Status::internal(format!("update policy status failed: {e}")))?;
-
-    if !updated {
-        return Err(Status::not_found("policy revision not found"));
-    }
-
-    if status_str == "loaded" {
-        let _ = state
-            .store
-            .supersede_older_policies(&req.sandbox_id, version)
-            .await;
-
-        // Update current_policy_version using CAS
-        // TODO: Accept expected_version from UpdateConfigRequest for proper client-driven CAS
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let version_to_set = req.version;
-        state
-            .store
-            .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
-                sandbox.set_current_policy_version(version_to_set);
-            })
-            .await
-            .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
-
-        state.sandbox_watch_bus.notify(&req.sandbox_id);
-    }
+    record_policy_apply_result(
+        state,
+        &req.sandbox_id,
+        req.version,
+        status_str == "loaded",
+        (!req.load_error.is_empty()).then_some(req.load_error.as_str()),
+        "polling",
+    )
+    .await?;
 
     info!(
         sandbox_id = %req.sandbox_id,
@@ -4382,6 +4343,72 @@ pub(super) async fn handle_report_policy_status(
     );
 
     Ok(Response::new(ReportPolicyStatusResponse {}))
+}
+
+/// Persist the exact sandbox policy revision attempted by a supervisor.
+/// Unary rollout reports and stream acknowledgements share this path.
+pub async fn record_policy_apply_result(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    version: u32,
+    loaded: bool,
+    load_error: Option<&str>,
+    source: &'static str,
+) -> Result<(), Status> {
+    if sandbox_id.is_empty() || version == 0 {
+        return Err(Status::invalid_argument(
+            "sandbox_id and policy version are required",
+        ));
+    }
+    let status = if loaded { "loaded" } else { "failed" };
+    counter!(
+        "openshell_supervisor_policy_apply_results_total",
+        "source" => source,
+        "outcome" => status,
+    )
+    .increment(1);
+    let sanitized_error = (!loaded).then(|| {
+        load_error
+            .unwrap_or_default()
+            .chars()
+            .take(1024)
+            .collect::<String>()
+    });
+    let version_i64 = i64::from(version);
+    let updated = state
+        .store
+        .update_policy_status(
+            sandbox_id,
+            version_i64,
+            status,
+            sanitized_error.as_deref().filter(|error| !error.is_empty()),
+            loaded.then(current_time_ms),
+        )
+        .await
+        .map_err(|error| Status::internal(format!("update policy status failed: {error}")))?;
+    if !updated {
+        return Err(Status::not_found("policy revision not found"));
+    }
+    if loaded {
+        let _ = state
+            .store
+            .supersede_older_policies(sandbox_id, version_i64)
+            .await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+                if sandbox.current_policy_version() < version {
+                    sandbox.set_current_policy_version(version);
+                }
+            })
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "update current_policy_version")
+            })?;
+        state.sandbox_watch_bus.notify(sandbox_id);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

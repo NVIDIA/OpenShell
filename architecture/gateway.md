@@ -600,8 +600,10 @@ still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
-sandbox supervisor polls for config revisions and hot-reloads dynamic policy
-when the policy engine accepts the update.
+gateway pushes complete snapshots to active supervisor sessions and periodically
+rebuilds them to repair missed delivery. Supervisors hot-reload accepted policy
+and acknowledge the exact revision. The legacy poller remains as a mixed-version
+compatibility path during this stage.
 
 External supervisor middleware registration is operator-owned configuration
 under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
@@ -666,10 +668,12 @@ process-local supervisor registry. A future HA implementation can resolve the
 gateway that owns a session and forward the same typed message without changing
 mutation handlers.
 
-Polling remains authoritative during the first rollout stage. Snapshot build,
+Current supervisors apply stream snapshots directly. Previous-revision
+supervisors retain polling as a rollout fallback, and owner reconciliation
+repairs missed or failed delivery from current database state. Snapshot build,
 fanout, or enqueue failure cannot fail a mutation that already committed.
-Provider snapshots may contain credentials and must not be
-persisted or included in logs.
+Provider snapshots may contain credentials and must not be persisted or
+included in logs.
 
 See [sandbox configuration delivery](sandbox.md#supervisor-configuration-delivery)
 for bootstrap, revision, and supervisor application semantics.

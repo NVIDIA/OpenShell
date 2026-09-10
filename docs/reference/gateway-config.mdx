@@ -22,7 +22,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Supervisor connections and policy recovery
 
-During supervisor reconnects, the gateway waits at most one second for the optional configuration bootstrap. If a credential backend stalls, the gateway accepts the session without that bootstrap so SSH, exec, and service connections can resume. Supervisor polling continues to supply configuration.
+Current supervisors require a complete configuration bootstrap before the gateway accepts the session as initialized. The gateway gives bootstrap construction the same bounded 45-second window as other snapshot builds and rejects the connection when construction fails or times out. Immediately previous supervisors retain the Stage 1 compatibility behavior: the gateway waits at most one second for an optional bootstrap, accepts the session without it when necessary, and relies on supervisor polling for configuration.
 
 On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
 
@@ -112,10 +112,10 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-# Defaults to the gateway version. Custom builds must match the gateway's
-# internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed still connect, with
-# a gateway warning, until the next release.
+# Defaults to the gateway version. The gateway accepts its current internal
+# supervisor protocol revision, the immediately previous revision through
+# polling compatibility, and pre-handshake supervisors for one release. Other
+# revisions reject the session. Compatibility sessions emit gateway warnings.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"

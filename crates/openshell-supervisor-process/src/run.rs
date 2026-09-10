@@ -85,6 +85,9 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    config_apply_tx: Option<
+        tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
+    >,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -378,6 +381,7 @@ pub async fn run_process(
             None,
             Arc::clone(&supervisor_terminating),
             main_instance_id.clone(),
+            config_apply_tx,
         );
         info!("supervisor session task spawned");
         Some(task)
