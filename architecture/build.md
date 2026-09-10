@@ -163,6 +163,9 @@ libraries and Cargo environment settings. Linux and Darwin modules select the
 compiler and sysroot and generate the compiler wrapper for their platform.
 The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
 GCC environment, and sysroot assembly used by GNU Linux targets.
+The glibc build reuses a pinned historical Nixpkgs recipe with current build
+tools; its headers, shared libraries, and static archives are assembled into
+the sysroot from separate outputs.
 Each toolchain supplies its compiler driver, assembler, archiver, native
 libraries, and Cargo environment through derivation passthru. The shell omits
 an implicit host C compiler; Cargo builds select the appropriate tools with

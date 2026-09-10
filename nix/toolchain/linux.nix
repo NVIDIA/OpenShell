@@ -17,7 +17,7 @@ let
     else
       pkgs.callPackage ./glibc-2.28/sysroot.nix {
         buildInputs = packages;
-        inherit (gnu) glibc runtime;
+        inherit (gnu) glibc;
       };
   cc = if isMusl then stdenv.cc else gnu.gcc;
   searchFlags =
@@ -29,6 +29,13 @@ let
     ]
     ++ pkgs.lib.optionals isMusl (map (package: "-L${pkgs.lib.getLib package}/lib") packages);
   runtimeFlags = pkgs.lib.optionals (!isMusl) [
+    "-Wl,--dynamic-linker=${
+      {
+        x86_64-unknown-linux-gnu = "/lib64/ld-linux-x86-64.so.2";
+        aarch64-unknown-linux-gnu = "/lib/ld-linux-aarch64.so.1";
+      }
+      .${target}
+    }"
     "-static-libgcc"
     "-lssp"
   ];

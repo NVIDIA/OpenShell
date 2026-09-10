@@ -4,7 +4,6 @@
 {
   pkgs,
   glibc,
-  runtime,
   buildInputs ? [ ],
 }:
 
@@ -15,9 +14,9 @@ in
 pkgs.buildEnv {
   name = "${target}-sysroot";
   paths = [
-    glibc
-    runtime
-    pkgs.linuxHeaders
+    glibc.out
+    glibc.dev
+    glibc.static
   ]
   ++ pkgs.lib.concatMap (package: [
     (pkgs.lib.getDev package)
@@ -30,10 +29,13 @@ pkgs.buildEnv {
   extraPrefix = "/usr";
 
   postBuild = ''
+    # Rust explicitly links -lgcc_s, even with -static-libgcc.
+    echo 'GROUP ( libgcc.a libgcc_eh.a )' > "$out/usr/lib/libgcc_s.a"
+
     # Linker scripts must resolve libraries through the sysroot, not the store.
     rm "$out/usr/lib/libc.so" "$out/usr/lib/libm.so"
-    sed 's|${glibc}/lib/||g' ${glibc}/lib/libc.so > "$out/usr/lib/libc.so"
-    sed 's|${glibc}/lib/||g' ${glibc}/lib/libm.so > "$out/usr/lib/libm.so"
+    sed 's|${glibc.out}/lib/||g' ${glibc.out}/lib/libc.so > "$out/usr/lib/libc.so"
+    sed 's|${glibc.out}/lib/||g' ${glibc.out}/lib/libm.so > "$out/usr/lib/libm.so"
 
     ln -s usr/lib "$out/lib"
     ln -s usr/lib "$out/lib64"

@@ -4,79 +4,42 @@
 {
   lib,
   stdenv,
+  callPackage,
   fetchurl,
-  fetchpatch,
-  linuxHeaders,
-  bison,
-  gawk,
-  python3,
 }:
 
-stdenv.mkDerivation {
+let
+  nixpkgs = builtins.fetchTarball {
+    url = "https://github.com/NixOS/nixpkgs/archive/f6519103bf8c8217c4007baaeb8bcaa1fcf95f1f.tar.gz";
+    sha256 = "sha256-391FrgZ+VwYYg7poRQBmWwUMkK7dan66m6QhomEWkPE=";
+  };
+  glibc = callPackage "${nixpkgs}/pkgs/development/libraries/glibc" {
+    # Provide the stdenv attributes used by the historical recipe.
+    stdenv = stdenv // {
+      inherit lib;
+      inherit (stdenv.hostPlatform) is64bit isx86_64;
+    };
+  };
+in
+glibc.overrideAttrs (old: {
   pname = "glibc";
+  name = "glibc-2.28";
   version = "2.28";
-  enableParallelBuilding = true;
-  hardeningDisable = [
-    "fortify"
-    "pic"
-  ];
-
   src = fetchurl {
     url = "https://ftp.gnu.org/gnu/glibc/glibc-2.28.tar.gz";
     hash = "sha256-8xjW4/H07Qt00oMqxPSR0PuSjkUcntpZTL8cO+569Hw=";
   };
-
-  patches = lib.optionals stdenv.buildPlatform.isDarwin [
-    (fetchpatch {
-      url = "https://raw.githubusercontent.com/NixOS/nixpkgs/022caabb5f2265ad4006c1fa5b1ebe69fb0c3faf/pkgs/development/libraries/glibc/darwin-cross-build.patch";
-      hash = "sha256-RFs6jNY11ZVNnflm7B5NkFbCbVuRiR+RyJmdA993ArE=";
-    })
-  ];
-
-  postPatch = ''
+  hardeningDisable = old.hardeningDisable ++ [ "pic" ];
+  configureFlags = old.configureFlags ++ [ "--disable-werror" ];
+  postPatch = old.postPatch + ''
+    # Fixes a bug in Make that triggers infinte recursion on expansion.
     substituteInPlace sysdeps/gnu/Makefile \
       --replace-fail \
         '$(object-suffixes) $(object-suffixes:=.d)' \
         '$(object-suffixes)'
-  '';
-
-  nativeBuildInputs = [
-    bison
-    gawk
-    python3
-  ];
-
-  configureFlags = [
-    "--with-headers=${linuxHeaders}/include"
-    "--disable-werror"
-  ];
-
-  preConfigure = ''
-    mkdir build
-    cd build
-    configureScript=../configure
 
     # Keep the cross tools selected by Nix instead of GCC's bare tool names.
-    sed -i \
-      -e '/^AR=/d' \
-      -e '/^AS=/d' \
-      -e '/^LD=/d' \
-      -e '/^OBJCOPY=/d' \
-      -e '/^OBJDUMP=/d' \
-      "$configureScript"
+    sed -i -e '/^AR=/d' -e '/^AS=/d' -e '/^LD=/d' \
+      -e '/^OBJCOPY=/d' -e '/^OBJDUMP=/d' configure
   '';
-
-  postConfigure = ''
-    export NIX_DONT_SET_RPATH=1
-  '';
-
-  postFixup = ''
-    if grep -q "$out/lib64/" "$out/bin/ldd"; then
-      substituteInPlace "$out/bin/ldd" \
-        --replace-fail "$out/lib64/" "$out/lib/"
-    fi
-  '';
-
-  env.NIX_NO_SELF_RPATH = true;
-  passthru.threadModel = "posix";
-}
+})
