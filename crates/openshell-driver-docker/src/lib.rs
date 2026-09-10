@@ -266,7 +266,7 @@ impl DockerGpuRuntimeConfig {
             ));
         }
         Ok(())
-}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
