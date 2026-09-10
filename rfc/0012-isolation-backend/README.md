@@ -251,16 +251,28 @@ trait BoundaryTerminal: Send + Sync {
 ```rust
 #[async_trait]
 trait NetworkMediationSource: Send + Sync {
-    async fn accept(&self) -> Result<MediatedConnection, BackendError>;
+    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError>;
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError>;
 }
 
-struct MediatedConnection {
+struct PendingTcpOpen {
     stream: BoundaryDuplexStream,
     binary_identity: Result<BinaryIdentity, ResolveError>,
+    destination: SocketAddr,
+    socket: NetworkSocketMetadata,
+    policy_generation: u64,
+    decision: oneshot::Sender<TcpOpenDecision>,
+}
+
+struct PendingDnsQuery {
+    message: Vec<u8>, // exactly one DNS message; no TCP length prefix
+    transport: DnsTransport,
+    binary_identity: Result<BinaryIdentity, ResolveError>,
+    response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
 }
 ```
 
-`NetworkMediationSource` supplies outbound connections from one boundary to supervisor-owned network mediation. The backend routes all workload egress through that source and authoritatively associates each connection with the boundary without relying solely on workload-provided data. Capture, transport, placement, and coordination are backend-private.
+`NetworkMediationSource` supplies typed TCP opens and DNS queries from one boundary to supervisor-owned network mediation. The two accepts are independent so the supervisor can consume them concurrently without coupling their ordering or backpressure. The backend routes all workload egress through these sources and authoritatively associates each request with the boundary without relying solely on workload-provided data. Capture, transport, framing, placement, and coordination are backend-private. General UDP mediation is outside this contract.
 
 Every topology may use the same supervisor-owned mediation libraries or services; the source does not require a backend-specific policy engine.
 
