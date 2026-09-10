@@ -5014,7 +5014,7 @@ network_policies:
         let error = parse_sandbox_policy(yaml).expect_err("removed harness field must be rejected");
         let error_debug = format!("{error:?}");
         assert!(
-            error_debug.contains("unknown field `harness`"),
+            error_debug.contains("unknown field") && error_debug.contains("harness"),
             "unexpected error: {error_debug}"
         );
     }

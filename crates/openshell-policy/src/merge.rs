@@ -1531,10 +1531,11 @@ fn merge_endpoint(
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     existing.allow_uninspected_credentials |= incoming.allow_uninspected_credentials;
-    // Provenance is not an authorization bit. If either declaration came
-    // directly from a user or provider, keep the endpoint explicit. This
-    // mirrors binary provenance and prevents an advisor overlay from tainting
-    // an already explicit endpoint for exact-host SSRF evaluation.
+    // If either declaration came directly from a user or provider, keep the
+    // endpoint explicit. Clearing advisor provenance changes exact-host SSRF
+    // trust, so `ensure_authorization_inheritance_is_declared` only permits
+    // this transition when the incoming rule declares the existing binaries
+    // that will receive that trust.
     existing.advisor_proposed &= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
@@ -1810,7 +1811,13 @@ fn authorization_unit_unchanged(
     merged: &NetworkEndpoint,
     port: Option<u32>,
 ) -> bool {
-    endpoint_authorization_covers_port(existing, merged, port)
+    // Advisor provenance affects whether an exact hostname may resolve to a
+    // private address. Treat clearing it as an authorization change even
+    // though proposal coverage deliberately ignores provenance. Otherwise an
+    // explicit rule for one binary could make advisor-observed binaries on the
+    // same rule eligible for private-address access.
+    existing.advisor_proposed == merged.advisor_proposed
+        && endpoint_authorization_covers_port(existing, merged, port)
         && endpoint_authorization_covers_port(merged, existing, port)
 }
 
@@ -4764,6 +4771,84 @@ mod tests {
         let advisor = &result.policy.network_policies["allow_index_crates_io_443"];
         assert!(advisor.endpoints[0].advisor_proposed);
         assert_eq!(advisor.binaries, vec![binary("/usr/bin/curl")]);
+    }
+
+    #[test]
+    fn add_rule_keeps_explicit_binary_separate_from_advisor_endpoint() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "advisor_index".to_string(),
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "explicit_index".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "explicit-index".to_string(),
+                    endpoints: vec![endpoint("index.crates.io", 443)],
+                    binaries: vec![binary("/usr/bin/wget")],
+                },
+            }],
+        )
+        .expect("explicit authorization should remain separate");
+
+        let advisor = &result.policy.network_policies["advisor_index"];
+        assert!(advisor.endpoints[0].advisor_proposed);
+        assert_eq!(advisor.binaries, vec![binary("/usr/bin/curl")]);
+
+        let explicit = &result.policy.network_policies["explicit_index"];
+        assert!(!explicit.endpoints[0].advisor_proposed);
+        assert_eq!(explicit.binaries, vec![binary("/usr/bin/wget")]);
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::KeptRequestedRuleNameToAvoidWidening {
+                rule_name,
+                overlapping_rule_name,
+                ..
+            } if rule_name == "explicit_index" && overlapping_rule_name == "advisor_index"
+        )));
+    }
+
+    #[test]
+    fn add_rule_rejects_clearing_advisor_provenance_for_undeclared_binary() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let policy = policy_with_rule(
+            "advisor_index",
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "advisor_index".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "advisor-index".to_string(),
+                    endpoints: vec![endpoint("index.crates.io", 443)],
+                    binaries: vec![binary("/usr/bin/wget")],
+                },
+            }],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                undeclared_binaries,
+                ..
+            }) if undeclared_binaries == ["/usr/bin/curl"]
+        ));
     }
 
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {
