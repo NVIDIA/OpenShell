@@ -1506,13 +1506,10 @@ mod lifecycle_tests {
                 }],
             },
         );
-        backend
-            .policy_sink()
-            .lock()
-            .await
-            .insert("sb-egress".into(), policy.clone());
-
-        let sandbox = driver_sandbox_with_command("sb-egress", &share, cmd);
+        let sandbox = with_policy(
+            driver_sandbox_with_command("sb-egress", &share, cmd),
+            policy.clone(),
+        );
         backend
             .create_sandbox(&sandbox)
             .await
