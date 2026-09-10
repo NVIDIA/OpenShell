@@ -243,7 +243,6 @@ try {
     $env:OPENSHELL_GATEWAY = ""
     Invoke-Cli @("gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName) | Out-Null
     Invoke-Cli @("gateway", "select", $GatewayName) | Out-Null
-    Invoke-Cli @("settings", "set", "--global", "--yes", "--key", "providers_v2_enabled", "--value", "true") | Out-Null
     Invoke-Cli @("provider", "profile", "lint", "--file", $profileUsed) | Out-Null
     Invoke-Cli @("provider", "profile", "import", "--file", $profileUsed) | Out-Null
     Invoke-Cli @("provider", "create", "--name", $providerName, "--type", "mxc-github-e2e", "--credential", "GITHUB_TOKEN") | Out-Null
