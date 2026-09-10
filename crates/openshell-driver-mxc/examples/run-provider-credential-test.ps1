@@ -132,6 +132,7 @@ $sandboxName = "mxc-gh-$(Get-Date -Format 'MMddHHmmss')"
 $providerName = "mxc-github-e2e"
 $passed = $false
 $rawTokenLeak = $false
+$artifactScanFailed = $false
 $githubToken = $env:GITHUB_TOKEN
 
 try {
@@ -308,13 +309,18 @@ finally {
     # closed. Any match is redacted and turns the scenario into a failure.
     if (-not [string]::IsNullOrWhiteSpace($githubToken)) {
         Get-ChildItem $resultDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $artifact = $_
             try {
-                $contents = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
+                $contents = [System.IO.File]::ReadAllText($artifact.FullName, [System.Text.Encoding]::UTF8)
                 if ($contents.Contains($githubToken)) {
                     $rawTokenLeak = $true
-                    [System.IO.File]::WriteAllText($_.FullName, $contents.Replace($githubToken, "***REDACTED***"), $utf8NoBom)
+                    [System.IO.File]::WriteAllText($artifact.FullName, $contents.Replace($githubToken, "***REDACTED***"), $utf8NoBom)
                 }
-            } catch {}
+            } catch {
+                $artifactScanFailed = $true
+                $passed = $false
+                Bad "could not inspect result artifact $($artifact.FullName): $($_.Exception.GetType().Name)"
+            }
         }
     }
     if ($rawTokenLeak) {
@@ -341,11 +347,15 @@ PASS proves:
     [System.IO.File]::WriteAllText((Join-Path $resultDir "summary.txt"), $summary, $utf8NoBom)
     Write-Host "`n$summary" -ForegroundColor ($(if ($passed) { "Green" } else { "Red" }))
 
-    try {
-        $zip = Join-Path $here "results-provider-credential-$stamp.zip"
-        Compress-Archive -Path (Join-Path $resultDir "*") -DestinationPath $zip -Force
-        Write-Host "BUNDLE: $zip" -ForegroundColor Yellow
-    } catch { Info "could not create result bundle: $($_.Exception.Message)" }
+    if ($artifactScanFailed) {
+        Info "result bundle was not created because one or more artifacts could not be scanned"
+    } else {
+        try {
+            $zip = Join-Path $here "results-provider-credential-$stamp.zip"
+            Compress-Archive -Path (Join-Path $resultDir "*") -DestinationPath $zip -Force
+            Write-Host "BUNDLE: $zip" -ForegroundColor Yellow
+        } catch { Info "could not create result bundle: $($_.Exception.Message)" }
+    }
 }
 
 if ($passed) { exit 0 } else { exit 1 }
