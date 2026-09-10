@@ -25,12 +25,11 @@ use openshell_core::proto::{
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr,
     ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
-    ListSandboxesRequest, ListSandboxesResponse, Provider, ResourceRequirements,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources, SandboxResponse,
-    SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateProvenance, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
-    tcp_forward_init,
+    ListSandboxesRequest, ListSandboxesResponse, Provider, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxSpec, SandboxStreamEvent,
+    SandboxTemplateResponse, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SshRelayTarget, StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
@@ -41,7 +40,7 @@ use openshell_core::telemetry::{
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
-use prost_types::{Struct, Value, value::Kind};
+use prost_types::value::Kind;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -604,56 +603,16 @@ fn sandbox_spec_from_workload_template(
         .workload
         .as_ref()
         .ok_or_else(|| Status::new(missing_field_code, "sandbox template workload is required"))?;
-    let resources = workload.resources.as_ref();
     Ok(SandboxSpec {
         environment: workload.environment.clone(),
         template: Some(SandboxTemplate {
             image: workload.image.clone(),
-            resources: resources.and_then(template_resource_struct),
             driver_config: spec.driver_config.clone(),
             ..SandboxTemplate::default()
         }),
-        resource_requirements: resources.and_then(template_gpu_requirements),
+        resource_requirements: workload.resources.clone(),
         ..SandboxSpec::default()
     })
-}
-
-fn template_gpu_requirements(resources: &SandboxResources) -> Option<ResourceRequirements> {
-    Some(ResourceRequirements {
-        gpu: Some(resources.gpu?),
-    })
-}
-
-fn template_resource_struct(resources: &SandboxResources) -> Option<Struct> {
-    let mut limits = std::collections::BTreeMap::new();
-    if !resources.cpu.is_empty() {
-        limits.insert(
-            "cpu".to_string(),
-            Value {
-                kind: Some(Kind::StringValue(resources.cpu.clone())),
-            },
-        );
-    }
-    if !resources.memory.is_empty() {
-        limits.insert(
-            "memory".to_string(),
-            Value {
-                kind: Some(Kind::StringValue(resources.memory.clone())),
-            },
-        );
-    }
-    if limits.is_empty() {
-        None
-    } else {
-        let mut fields = std::collections::BTreeMap::new();
-        fields.insert(
-            "limits".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(Struct { fields: limits })),
-            },
-        );
-        Some(Struct { fields })
-    }
 }
 
 pub(super) async fn handle_get_sandbox(
@@ -3096,8 +3055,8 @@ mod tests {
     };
     use crate::provider_profile_sources::ProviderProfileSources;
     use openshell_core::GatewayProviderProfileSourceConfig;
-    use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{GpuResourceRequirements, ResourceRequirements};
 
     async fn test_server_state_with_user_only_github_profile() -> Arc<ServerState> {
         let mut state = test_server_state().await;
@@ -3172,6 +3131,8 @@ mod tests {
                 policy: Some(openshell_core::proto::SandboxPolicy::default()),
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(1) }),
+                    cpu: None,
+                    memory: None,
                 }),
                 ..SandboxSpec::default()
             }),
@@ -3553,22 +3514,19 @@ mod tests {
                 workload: Some(openshell_core::proto::SandboxWorkloadConfig {
                     image: "registry.example.com/agent:latest".to_string(),
                     environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
-                    resources: Some(SandboxResources {
-                        cpu: "2".to_string(),
-                        memory: "4Gi".to_string(),
+                    resources: Some(ResourceRequirements {
+                        cpu: Some(openshell_core::proto::CpuResourceRequirements {
+                            limit: "2".to_string(),
+                        }),
+                        memory: Some(openshell_core::proto::MemoryResourceRequirements {
+                            limit: "4Gi".to_string(),
+                        }),
                         gpu: Some(GpuResourceRequirements { count: Some(1) }),
                     }),
                 }),
                 driver_config: None,
                 desired_service_level: None,
             }),
-        }
-    }
-
-    fn proto_string_value(value: &Value) -> Option<&str> {
-        match value.kind.as_ref() {
-            Some(Kind::StringValue(value)) => Some(value.as_str()),
-            _ => None,
         }
     }
 
@@ -5335,27 +5293,22 @@ mod tests {
 
         let template = spec.template.expect("resolved inline template");
         assert_eq!(template.image, "registry.example.com/agent:latest");
-        let limits = template
-            .resources
-            .as_ref()
-            .and_then(|resources| resources.fields.get("limits"))
-            .and_then(|limits| limits.kind.as_ref())
-            .and_then(|kind| match kind {
-                Kind::StructValue(value) => Some(&value.fields),
-                _ => None,
-            })
-            .expect("resource limits");
-        assert_eq!(limits.get("cpu").and_then(proto_string_value), Some("2"));
+        assert!(template.resources.is_none());
+        let requirements = spec
+            .resource_requirements
+            .expect("portable resource requirements");
         assert_eq!(
-            limits.get("memory").and_then(proto_string_value),
+            requirements.cpu.as_ref().map(|cpu| cpu.limit.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            requirements
+                .memory
+                .as_ref()
+                .map(|memory| memory.limit.as_str()),
             Some("4Gi")
         );
-        assert_eq!(
-            spec.resource_requirements
-                .and_then(|requirements| requirements.gpu)
-                .and_then(|gpu| gpu.count),
-            Some(1)
-        );
+        assert_eq!(requirements.gpu.and_then(|gpu| gpu.count), Some(1));
     }
 
     #[tokio::test]

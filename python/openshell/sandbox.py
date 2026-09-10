@@ -1557,9 +1557,9 @@ def _sandbox_workload_template(
     if environment:
         template.spec.workload.environment.update(dict(environment))
     if cpu is not None:
-        template.spec.workload.resources.cpu = cpu
+        template.spec.workload.resources.cpu.limit = cpu
     if memory is not None:
-        template.spec.workload.resources.memory = memory
+        template.spec.workload.resources.memory.limit = memory
     if gpu or gpu_count is not None:
         template.spec.workload.resources.gpu.SetInParent()
     if gpu_count is not None:

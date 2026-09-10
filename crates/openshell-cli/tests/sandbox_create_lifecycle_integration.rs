@@ -23,9 +23,9 @@ use openshell_core::proto::{
     GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
     ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
-    SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
+    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, ResourceRequirements,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine,
+    SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest, sandbox_stream_event,
 };
@@ -1422,6 +1422,14 @@ fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
     GpuResourceRequirements { count }
 }
 
+fn resource_requirements(
+    gpu: Option<GpuResourceRequirements>,
+    cpu: Option<openshell_core::proto::CpuResourceRequirements>,
+    memory: Option<openshell_core::proto::MemoryResourceRequirements>,
+) -> ResourceRequirements {
+    ResourceRequirements { gpu, cpu, memory }
+}
+
 /// Shared defaults for integration tests. Note: `keep` is `true` here (most
 /// tests expect persistent sandboxes) while `SandboxCreateConfig::default()`
 /// sets `keep: false` (the safe production default). Tests that exercise
@@ -1537,7 +1545,7 @@ async fn sandbox_create_without_inferred_provider_skips_gateway_config() {
 }
 
 #[tokio::test]
-async fn sandbox_create_sends_cpu_and_memory_limits_only() {
+async fn sandbox_create_sends_typed_cpu_and_memory_requirements() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1550,8 +1558,15 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         "openshell",
         run::SandboxCreateConfig {
             name: Some("resources"),
-            cpu: Some("500m"),
-            memory: Some("2Gi"),
+            resource_requirements: Some(resource_requirements(
+                None,
+                Some(openshell_core::proto::CpuResourceRequirements {
+                    limit: "500m".to_string(),
+                }),
+                Some(openshell_core::proto::MemoryResourceRequirements {
+                    limit: "2Gi".to_string(),
+                }),
+            )),
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
@@ -1562,45 +1577,31 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let resources = requests[0]
+    let requirements = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.resources.as_ref())
-        .expect("resource limits should be sent");
-    let limits = resources
-        .fields
-        .get("limits")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("limits should be a struct");
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .expect("resource requirements should be sent");
 
     assert_eq!(
-        limits
-            .fields
-            .get("cpu")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
+        requirements.cpu.as_ref().map(|cpu| cpu.limit.as_str()),
         Some("500m")
     );
     assert_eq!(
-        limits
-            .fields
-            .get("memory")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
+        requirements
+            .memory
+            .as_ref()
+            .map(|memory| memory.limit.as_str()),
         Some("2Gi")
     );
-    assert!(!resources.fields.contains_key("requests"));
+    assert!(
+        requests[0]
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .is_none(),
+        "resource-only create should not synthesize a template"
+    );
 }
 
 #[tokio::test]
@@ -1826,8 +1827,17 @@ async fn sandbox_template_create_sends_workload_template_resource() {
         .resources
         .as_ref()
         .expect("resources should be sent");
-    assert_eq!(resources.cpu, "2");
-    assert_eq!(resources.memory, "4Gi");
+    assert_eq!(
+        resources.cpu.as_ref().map(|cpu| cpu.limit.as_str()),
+        Some("2")
+    );
+    assert_eq!(
+        resources
+            .memory
+            .as_ref()
+            .map(|memory| memory.limit.as_str()),
+        Some("4Gi")
+    );
     assert_eq!(resources.gpu.as_ref().and_then(|gpu| gpu.count), Some(1));
     assert!(spec.driver_config.is_some());
     let startup = spec
@@ -1943,7 +1953,11 @@ async fn sandbox_create_sends_gpu_default_request() {
         "openshell",
         run::SandboxCreateConfig {
             name: Some("gpu-default"),
-            gpu_requirements: Some(gpu_requirements(None)),
+            resource_requirements: Some(resource_requirements(
+                Some(gpu_requirements(None)),
+                None,
+                None,
+            )),
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
@@ -1978,7 +1992,11 @@ async fn sandbox_create_sends_gpu_count_request() {
         "openshell",
         run::SandboxCreateConfig {
             name: Some("gpu-two"),
-            gpu_requirements: Some(gpu_requirements(Some(2))),
+            resource_requirements: Some(resource_requirements(
+                Some(gpu_requirements(Some(2))),
+                None,
+                None,
+            )),
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },

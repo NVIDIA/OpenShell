@@ -245,12 +245,61 @@ describe('create', () => {
     expect(created.spec?.tty).toBe(true);
   });
 
+  it('sends portable CPU, memory, and explicit GPU requirements', async () => {
+    let created: {
+      spec?: {
+        resourceRequirements?: {
+          cpu?: { limit?: string };
+          memory?: { limit?: string };
+          gpu?: { count?: number };
+        };
+      };
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({
+      image: 'img',
+      resourceRequirements: {
+        cpu: { limit: '2' },
+        memory: { limit: '4Gi' },
+        gpu: { count: 2 },
+      },
+    });
+
+    expect(created.spec?.resourceRequirements).toMatchObject({
+      cpu: { limit: '2' },
+      memory: { limit: '4Gi' },
+      gpu: { count: 2 },
+    });
+  });
+
+  it('sends an empty GPU requirement for the driver default assignment', async () => {
+    let created: { spec?: { resourceRequirements?: { gpu?: { count?: number } } } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', resourceRequirements: { gpu: {} } });
+
+    expect(created.spec?.resourceRequirements?.gpu).toBeDefined();
+    expect(created.spec?.resourceRequirements?.gpu?.count).toBeUndefined();
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {
         logLevel?: string;
         template?: { image?: string };
         providers?: string[];
+        resourceRequirements?: { cpu?: { limit?: string } };
       };
     } = {};
     const sandbox = client({
@@ -262,7 +311,12 @@ describe('create', () => {
     await sandbox.create({
       image: 'curated-image',
       providers: ['claude'],
-      rawSpec: { logLevel: 'debug', template: { image: 'raw-image' } },
+      resourceRequirements: { cpu: { limit: '1' } },
+      rawSpec: {
+        logLevel: 'debug',
+        template: { image: 'raw-image' },
+        resourceRequirements: { cpu: { limit: '4' } },
+      },
     });
     // Ungated field only reachable via rawSpec.
     expect(created.spec?.logLevel).toBe('debug');
@@ -270,6 +324,8 @@ describe('create', () => {
     expect(created.spec?.template?.image).toBe('raw-image');
     // Curated fields rawSpec does not touch survive.
     expect(created.spec?.providers).toEqual(['claude']);
+    // rawSpec also wins over the curated resource requirements object.
+    expect(created.spec?.resourceRequirements?.cpu?.limit).toBe('4');
   });
 
   it('createFromTemplate sends the workload template name with governance fields only', async () => {
@@ -529,7 +585,11 @@ describe('sandbox templates', () => {
           workload?: {
             image?: string;
             environment?: Record<string, string>;
-            resources?: { cpu?: string; memory?: string; gpu?: { count?: number } };
+            resources?: {
+              cpu?: { limit?: string };
+              memory?: { limit?: string };
+              gpu?: { count?: number };
+            };
           };
           driverConfig?: Record<string, unknown>;
         };
@@ -560,7 +620,7 @@ describe('sandbox templates', () => {
           workload: {
             image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
             environment: { FEATURE_FLAG: 'on' },
-            resources: { cpu: '1', memory: '512Mi', gpu: { count: 1 } },
+            resources: { cpu: { limit: '1' }, memory: { limit: '512Mi' }, gpu: { count: 1 } },
           },
           driverConfig: { kubernetes: { runtime_class_name: 'kata-containers' } },
         },

@@ -66,7 +66,7 @@ openshell gateway select local
 
 ### CPU and Memory
 
-Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
+Set portable CPU and memory limits with `--cpu` and `--memory`:
 
 ```shell
 openshell sandbox create --cpu 2 --memory 4Gi -- claude
@@ -75,10 +75,20 @@ openshell sandbox create --cpu 2 --memory 4Gi -- claude
 CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
 Memory values use byte quantities such as `512Mi`, `4Gi`, or `8G`.
 
-Docker and Podman apply these values as runtime limits. Kubernetes applies each
-value as both the request and the limit so the scheduler reserves the same
-amount the sandbox can use. The VM driver currently accepts these flags but
-does not change VM allocation.
+OpenShell stores these values as typed portable resource requirements. Docker
+and Podman apply them as runtime limits. Kubernetes applies each value as both
+the request and limit so the scheduler reserves the same amount the sandbox can
+use. The VM and MXC drivers reject CPU or memory requirements because they do
+not currently support per-sandbox sizing. For VM gateways, configure `vcpus`
+and `mem_mib` on the driver instead.
+
+<Warning>
+CPU and memory values under `SandboxTemplate.resources.limits` or
+`SandboxTemplate.resources.requests` are no longer supported. API clients must
+use `SandboxSpec.resource_requirements.cpu.limit` and
+`SandboxSpec.resource_requirements.memory.limit`. The gateway rejects legacy
+requests with a migration error.
+</Warning>
 
 ### Driver-Specific Configuration
 
@@ -244,6 +254,12 @@ Create a sandbox from a template:
 ```shell
 openshell sandbox create --template gpu-kata --provider github -- claude
 ```
+
+When the gateway creates a sandbox from a template, it resolves the template's
+CPU, memory, and GPU settings into the sandbox's typed `resource_requirements`.
+The reusable template field `SandboxWorkloadConfig.resources` uses the same
+`ResourceRequirements` message as `SandboxSpec.resource_requirements`, so API
+and SDK callers use `cpu.limit`, `memory.limit`, and `gpu` in both places.
 
 The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
 

@@ -35,6 +35,10 @@ const client = await OpenShellClient.connect({
 
 const sandbox = await client.sandbox.create({
   image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+  resourceRequirements: {
+    cpu: { limit: '2' },
+    memory: { limit: '4Gi' },
+  },
 })
 await client.sandbox.waitReady(sandbox.name, 120)
 
@@ -68,6 +72,22 @@ The provider discovers and validates the issuer, keeps credentials and tokens
 in memory, and renews before expiry. The root client has no explicit close
 method because Connect does not retain a dedicated session. Close
 operation-scoped streams and forward handles instead.
+
+Set portable compute requirements with `resourceRequirements`. CPU and memory
+limits use Kubernetes-style quantities. Set `gpu: {}` to request the active
+driver's default GPU assignment, or set `gpu.count` to request a specific
+number:
+
+```ts
+await client.sandbox.create({
+  image,
+  resourceRequirements: {
+    cpu: { limit: '500m' },
+    memory: { limit: '2Gi' },
+    gpu: { count: 1 },
+  },
+})
+```
 
 Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy`
 cannot introduce static policy fields later, so set filesystem, landlock,
@@ -170,7 +190,7 @@ const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
       workload: {
         image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
         environment: { FEATURE_FLAG: 'on' },
-        resources: { cpu: '1', memory: '512Mi' },
+        resources: { cpu: { limit: '1' }, memory: { limit: '512Mi' } },
       },
       driverConfig: { kubernetes: { pod: { runtime_class_name: 'kata-containers' } } },
     },

@@ -44,16 +44,16 @@ use openshell_bootstrap::{
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
-    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
-    CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    ClearDraftChunksRequest, CpuResourceRequirements, CreateSandboxRequest,
+    CreateSandboxTemplateRequest, CreateSshSessionRequest, DeleteSandboxRequest,
+    DeleteSandboxTemplateRequest, DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
     GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
-    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
+    ListSandboxesRequest, ListServicesRequest, MemoryResourceRequirements, PolicySource,
+    PolicyStatus, RejectDraftChunkRequest, ResourceRequirements, RevokeSshSessionRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
@@ -266,41 +266,28 @@ fn is_provisional_container_exit(sandbox: &Sandbox) -> bool {
         })
 }
 
-fn build_sandbox_resource_limits(
+pub fn build_cpu_resource_requirements(
     cpu: Option<&str>,
-    memory: Option<&str>,
-) -> Result<Option<prost_types::Struct>> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    fn string_value(value: String) -> Value {
-        Value {
-            kind: Some(Kind::StringValue(value)),
-        }
-    }
-
-    let mut limits = std::collections::BTreeMap::new();
-    if let Some(cpu) = cpu {
-        limits.insert("cpu".to_string(), string_value(validate_cpu_quantity(cpu)?));
-    }
-    if let Some(memory) = memory {
-        limits.insert(
-            "memory".to_string(),
-            string_value(validate_memory_quantity(memory)?),
-        );
-    }
-
-    if limits.is_empty() {
+) -> Result<Option<CpuResourceRequirements>> {
+    let Some(cpu) = cpu else {
         return Ok(None);
-    }
+    };
 
-    let mut fields = std::collections::BTreeMap::new();
-    fields.insert(
-        "limits".to_string(),
-        Value {
-            kind: Some(Kind::StructValue(Struct { fields: limits })),
-        },
-    );
-    Ok(Some(Struct { fields }))
+    Ok(Some(CpuResourceRequirements {
+        limit: validate_cpu_quantity(cpu)?,
+    }))
+}
+
+pub fn build_memory_resource_requirements(
+    memory: Option<&str>,
+) -> Result<Option<MemoryResourceRequirements>> {
+    let Some(memory) = memory else {
+        return Ok(None);
+    };
+
+    Ok(Some(MemoryResourceRequirements {
+        limit: validate_memory_quantity(memory)?,
+    }))
 }
 
 fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
@@ -320,61 +307,14 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
 }
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(miette!("--cpu must not be empty"));
-    }
-
-    if let Some(millicores) = value.strip_suffix('m') {
-        if millicores.is_empty() || !millicores.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(miette!(
-                "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
-            ));
-        }
-        let millicores = millicores.parse::<u64>().into_diagnostic()?;
-        if millicores == 0 {
-            return Err(miette!("--cpu must be greater than zero"));
-        }
-        return Ok(value.to_string());
-    }
-
-    let cores = value.parse::<f64>().map_err(|_| {
-        miette!(
-            "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
-        )
-    })?;
-    if !cores.is_finite() || cores <= 0.0 {
-        return Err(miette!("--cpu must be greater than zero"));
-    }
-    Ok(value.to_string())
+    openshell_core::quantity::validate_cpu_quantity(value, "--cpu").map_err(|e| miette!("{e}"))?;
+    Ok(value.trim().to_string())
 }
 
 fn validate_memory_quantity(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(miette!("--memory must not be empty"));
-    }
-
-    let number_end = value
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(number_end);
-    if number.is_empty()
-        || !matches!(
-            suffix,
-            "" | "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" | "K" | "M" | "G" | "T" | "P" | "E"
-        )
-    {
-        return Err(miette!(
-            "invalid --memory value '{value}': expected positive bytes or a quantity such as 512Mi, 4Gi, or 8G"
-        ));
-    }
-
-    let amount = number.parse::<u128>().into_diagnostic()?;
-    if amount == 0 {
-        return Err(miette!("--memory must be greater than zero"));
-    }
-    Ok(value.to_string())
+    openshell_core::quantity::validate_memory_quantity(value, "--memory")
+        .map_err(|e| miette!("{e}"))?;
+    Ok(value.trim().to_string())
 }
 
 async fn finalize_sandbox_create_session(
@@ -415,9 +355,7 @@ pub struct SandboxCreateConfig<'a> {
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
-    pub gpu_requirements: Option<GpuResourceRequirements>,
-    pub cpu: Option<&'a str>,
-    pub memory: Option<&'a str>,
+    pub resource_requirements: Option<ResourceRequirements>,
     pub driver_config_json: Option<&'a str>,
     pub editor: Option<Editor>,
     pub providers: &'a [String],
@@ -441,9 +379,7 @@ impl Default for SandboxCreateConfig<'_> {
             from: None,
             uploads: &[],
             keep: false,
-            gpu_requirements: None,
-            cpu: None,
-            memory: None,
+            resource_requirements: None,
             driver_config_json: None,
             editor: None,
             providers: &[],
@@ -475,9 +411,7 @@ pub async fn sandbox_create(
         from,
         uploads,
         keep,
-        gpu_requirements,
-        cpu,
-        memory,
+        resource_requirements,
         driver_config_json,
         editor,
         providers,
@@ -527,9 +461,7 @@ pub async fn sandbox_create(
 
     if template.is_some()
         && (from.is_some()
-            || gpu_requirements.is_some()
-            || cpu.is_some()
-            || memory.is_some()
+            || resource_requirements.is_some()
             || driver_config_json.is_some()
             || !environment.is_empty())
     {
@@ -570,11 +502,6 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
-    let resource_limits = if template.is_none() {
-        build_sandbox_resource_limits(cpu, memory)?
-    } else {
-        None
-    };
     let mut driver_config = if template.is_none() {
         driver_config_json
             .map(parse_driver_config_json)
@@ -587,22 +514,16 @@ pub async fn sandbox_create(
         driver_config = Some(merge_rootfs_tar_driver_config(driver_config, token)?);
     }
 
-    let inline_template = if image.is_some()
-        || resource_limits.is_some()
-        || driver_config.is_some()
-        || rootfs_tar_token.is_some()
-    {
-        Some(SandboxTemplate {
-            image: image.unwrap_or_default(),
-            resources: resource_limits,
-            driver_config,
-            ..SandboxTemplate::default()
-        })
-    } else {
-        None
-    };
-
-    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+    let inline_template =
+        if image.is_some() || driver_config.is_some() || rootfs_tar_token.is_some() {
+            Some(SandboxTemplate {
+                image: image.unwrap_or_default(),
+                driver_config,
+                ..SandboxTemplate::default()
+            })
+        } else {
+            None
+        };
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
@@ -627,7 +548,7 @@ pub async fn sandbox_create(
     };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            resource_requirements,
+            resource_requirements: resource_requirements.clone(),
             environment: if template.is_none() {
                 environment
             } else {
@@ -2460,15 +2381,15 @@ pub async fn sandbox_template_create(
     tls: &TlsOptions,
 ) -> Result<()> {
     let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
-        Some(SandboxResources {
+        Some(ResourceRequirements {
             cpu: cpu
                 .map(validate_cpu_quantity)
                 .transpose()?
-                .unwrap_or_default(),
+                .map(|limit| CpuResourceRequirements { limit }),
             memory: memory
                 .map(validate_memory_quantity)
                 .transpose()?
-                .unwrap_or_default(),
+                .map(|limit| MemoryResourceRequirements { limit }),
             gpu: gpu_requirements,
         })
     } else {
@@ -2711,12 +2632,11 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
             }
             if let Some(resources) = &workload.resources {
                 let mut resources_json = serde_json::Map::new();
-                if !resources.cpu.is_empty() {
-                    resources_json.insert("cpu".to_string(), serde_json::json!(resources.cpu));
+                if let Some(cpu) = &resources.cpu {
+                    resources_json.insert("cpu".to_string(), serde_json::json!(cpu.limit));
                 }
-                if !resources.memory.is_empty() {
-                    resources_json
-                        .insert("memory".to_string(), serde_json::json!(resources.memory));
+                if let Some(memory) = &resources.memory {
+                    resources_json.insert("memory".to_string(), serde_json::json!(memory.limit));
                 }
                 if let Some(gpu) = &resources.gpu {
                     let value = gpu
@@ -2813,12 +2733,17 @@ fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
             println!(
                 "  {} {}",
                 "CPU:".dimmed(),
-                non_empty_or(&resources.cpu, "<default>")
+                resources
+                    .cpu
+                    .as_ref()
+                    .map_or("<default>", |cpu| non_empty_or(&cpu.limit, "<default>"))
             );
             println!(
                 "  {} {}",
                 "Memory:".dimmed(),
-                non_empty_or(&resources.memory, "<default>")
+                resources.memory.as_ref().map_or("<default>", |memory| {
+                    non_empty_or(&memory.limit, "<default>")
+                })
             );
             println!(
                 "  {} {}",
@@ -2902,11 +2827,13 @@ fn print_sandbox_template_table(templates: &[SandboxWorkloadTemplate], show_work
     for template in templates {
         let resources = template_resources(template);
         let cpu = resources
-            .map(|resources| resources.cpu.as_str())
+            .and_then(|resources| resources.cpu.as_ref())
+            .map(|cpu| cpu.limit.as_str())
             .filter(|cpu| !cpu.is_empty())
             .unwrap_or("-");
         let memory = resources
-            .map(|resources| resources.memory.as_str())
+            .and_then(|resources| resources.memory.as_ref())
+            .map(|memory| memory.limit.as_str())
             .filter(|memory| !memory.is_empty())
             .unwrap_or("-");
         let gpu = resources
@@ -2966,7 +2893,7 @@ fn template_image(template: &SandboxWorkloadTemplate) -> String {
         )
 }
 
-fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxResources> {
+fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&ResourceRequirements> {
     template
         .spec
         .as_ref()
@@ -2974,7 +2901,7 @@ fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxReso
         .and_then(|workload| workload.resources.as_ref())
 }
 
-fn template_resources_gpu_display(resources: &SandboxResources) -> Option<String> {
+fn template_resources_gpu_display(resources: &ResourceRequirements) -> Option<String> {
     if let Some(gpu) = &resources.gpu {
         return Some(
             gpu.count
@@ -5793,14 +5720,14 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        PolicyGetView, ProvisioningStep, build_cpu_resource_requirements,
+        build_memory_resource_requirements, format_endpoint, format_log_line, git_sync_files,
+        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
+        policy_revision_to_json, provisioning_timeout_message, ready_false_condition_message,
+        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
+        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
+        service_url_for_gateway, workspace_member_to_json,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
@@ -5820,10 +5747,9 @@ mod tests {
     use openshell_core::proto::{
         GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus,
         ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
-        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
-        datamodel::v1::ObjectMeta,
+        SandboxPolicyRevision, SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceEndpoint,
+        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6158,52 +6084,29 @@ mod tests {
     }
 
     #[test]
-    fn build_sandbox_resource_limits_sets_limits_only() {
-        let resources = build_sandbox_resource_limits(Some("500m"), Some("2Gi"))
-            .expect("resource limits should parse")
-            .expect("resource limits should be present");
+    fn build_cpu_resource_requirements_sets_typed_limit() {
+        let cpu = build_cpu_resource_requirements(Some("500m"))
+            .expect("CPU limit should parse")
+            .expect("CPU requirements should be present");
 
-        let limits = resources
-            .fields
-            .get("limits")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .expect("limits should be a struct");
-
-        assert_eq!(
-            limits
-                .fields
-                .get("cpu")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("500m")
-        );
-        assert_eq!(
-            limits
-                .fields
-                .get("memory")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("2Gi")
-        );
-        assert!(!resources.fields.contains_key("requests"));
+        assert_eq!(cpu.limit, "500m");
     }
 
     #[test]
-    fn build_sandbox_resource_limits_rejects_invalid_quantities() {
-        assert!(build_sandbox_resource_limits(Some("0"), None).is_err());
-        assert!(build_sandbox_resource_limits(Some("half"), None).is_err());
-        assert!(build_sandbox_resource_limits(None, Some("0Gi")).is_err());
-        assert!(build_sandbox_resource_limits(None, Some("1.5Gi")).is_err());
+    fn build_memory_resource_requirements_sets_typed_limit() {
+        let memory = build_memory_resource_requirements(Some("2Gi"))
+            .expect("memory limit should parse")
+            .expect("memory requirements should be present");
+
+        assert_eq!(memory.limit, "2Gi");
+    }
+
+    #[test]
+    fn build_cpu_and_memory_resource_requirements_reject_invalid_quantities() {
+        assert!(build_cpu_resource_requirements(Some("0")).is_err());
+        assert!(build_cpu_resource_requirements(Some("half")).is_err());
+        assert!(build_memory_resource_requirements(Some("0Gi")).is_err());
+        assert!(build_memory_resource_requirements(Some("1.5Gi")).is_err());
     }
 
     #[test]
@@ -6719,6 +6622,8 @@ mod tests {
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
         let resource_requirements = ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count: None }),
+            cpu: None,
+            memory: None,
         };
         let message = provisioning_timeout_message(
             120,
@@ -6740,7 +6645,11 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
-        let resource_requirements = ResourceRequirements { gpu: None };
+        let resource_requirements = ResourceRequirements {
+            gpu: None,
+            cpu: None,
+            memory: None,
+        };
         let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");
@@ -6979,7 +6888,7 @@ mod tests {
         let template = SandboxWorkloadTemplate {
             spec: Some(SandboxWorkloadTemplateSpec {
                 workload: Some(SandboxWorkloadConfig {
-                    resources: Some(SandboxResources {
+                    resources: Some(ResourceRequirements {
                         gpu: Some(GpuResourceRequirements { count: None }),
                         ..Default::default()
                     }),
@@ -7000,7 +6909,7 @@ mod tests {
         let template = SandboxWorkloadTemplate {
             spec: Some(SandboxWorkloadTemplateSpec {
                 workload: Some(SandboxWorkloadConfig {
-                    resources: Some(SandboxResources {
+                    resources: Some(ResourceRequirements {
                         gpu: Some(GpuResourceRequirements { count: Some(2) }),
                         ..Default::default()
                     }),
