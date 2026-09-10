@@ -48,6 +48,9 @@ struct ProviderState {
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     deny_provider_reads: Arc<AtomicBool>,
+    profile_list_requests: Arc<Mutex<Vec<(String, u32, u32)>>>,
+    profile_get_requests: Arc<Mutex<Vec<(String, String)>>>,
+    omit_profile_response: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     delete_provider_profile_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
@@ -485,13 +488,40 @@ impl OpenShell for TestOpenShell {
 
     async fn list_provider_profiles(
         &self,
-        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+        request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        let request = request.into_inner();
+        self.state.profile_list_requests.lock().await.push((
+            request.workspace.clone(),
+            request.limit,
+            request.offset,
+        ));
         let mut profiles = openshell_providers::builtin_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
         profiles.extend(self.state.profiles.lock().await.values().cloned());
+        profiles.extend(
+            self.state
+                .scoped_profiles
+                .lock()
+                .await
+                .iter()
+                .filter(|((workspace, _), _)| workspace == &request.workspace)
+                .map(|(_, profile)| profile.clone()),
+        );
+        // A stable order and real offsets let catalog tests exercise the wire
+        // pagination contract, including a final empty page after a full page.
+        profiles.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.scope.cmp(&right.scope))
+        });
+        let profiles = profiles
+            .into_iter()
+            .skip(request.offset as usize)
+            .take(request.limit as usize)
+            .collect();
         Ok(Response::new(
             openshell_core::proto::ListProviderProfilesResponse { profiles },
         ))
@@ -502,6 +532,16 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let request = request.into_inner();
+        self.state
+            .profile_get_requests
+            .lock()
+            .await
+            .push((request.workspace.clone(), request.id.clone()));
+        if self.state.omit_profile_response.load(Ordering::SeqCst) {
+            return Ok(Response::new(
+                openshell_core::proto::ProviderProfileResponse { profile: None },
+            ));
+        }
         let id = request.id;
         let scoped_profile = self
             .state
@@ -1397,12 +1437,218 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 }
 
 #[tokio::test]
-async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
+async fn profile_list_reads_all_pages_in_the_requested_workspace() {
     let ts = run_server().await;
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let builtin_count = openshell_providers::builtin_profiles().len();
 
-    run::provider_list_profiles(&ts.endpoint, "table", "default", &ts.tls)
+    for count in [100_usize.saturating_sub(builtin_count), 105] {
+        ts.state.profiles.lock().await.clear();
+        ts.state.profile_list_requests.lock().await.clear();
+        for i in 0..count {
+            install_test_profile(&ts, &format!("custom-{i:03}"), "CUSTOM_TOKEN").await;
+        }
+        let rendered = run::provider_list_profiles_text(&ts.endpoint, "json", "team", &ts.tls)
+            .await
+            .expect("profile catalog");
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_str(&rendered).expect("profile JSON");
+        assert_eq!(profiles.len(), builtin_count + count);
+        for i in 0..count {
+            assert!(
+                profiles
+                    .iter()
+                    .any(|profile| profile["id"] == format!("custom-{i:03}"))
+            );
+        }
+        let requests = ts.state.profile_list_requests.lock().await;
+        assert_eq!(requests.len(), (builtin_count + count) / 100 + 1);
+        for (page, (workspace, limit, offset)) in requests.iter().enumerate() {
+            assert_eq!(workspace, "team");
+            assert_eq!(*limit, 100);
+            assert_eq!(*offset as usize, page * 100);
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_describe_preserves_scope_and_structured_definition() {
+    let ts = run_server().await;
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let mut scoped = openshell_providers::builtin_profiles()
+        .iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile")
+        .to_proto();
+    scoped.display_name = "Team-only OpenAI".to_string();
+    scoped.scope = "workspace".to_string();
+    scoped.source = "custom".to_string();
+    ts.state
+        .scoped_profiles
+        .lock()
         .await
-        .expect("provider list-profiles");
+        .insert(("team".to_string(), "openai".to_string()), scoped);
+
+    let human =
+        run::provider_profile_describe_text(&ts.endpoint, "openai", "table", "team", &ts.tls)
+            .await
+            .expect("scoped description");
+    assert!(human.contains("Team-only OpenAI"));
+    assert!(human.contains("OPENAI_API_KEY"));
+    assert!(!human.contains('\u{1b}'));
+    let global = run::provider_profile_describe_text(&ts.endpoint, "openai", "table", "", &ts.tls)
+        .await
+        .expect("platform description");
+    assert!(!global.contains("Team-only OpenAI"));
+    for format in ["json", "yaml"] {
+        let description =
+            run::provider_profile_describe_text(&ts.endpoint, "openai", format, "team", &ts.tls)
+                .await
+                .expect("structured description");
+        let exported =
+            run::provider_profile_export_text(&ts.endpoint, "openai", format, "team", &ts.tls)
+                .await
+                .expect("profile export");
+        assert_eq!(description, exported);
+    }
+    let missing =
+        run::provider_profile_describe_text(&ts.endpoint, "missing", "table", "team", &ts.tls)
+            .await
+            .expect_err("unknown profile must fail");
+    assert!(missing.to_string().contains("not found"));
+    ts.state.omit_profile_response.store(true, Ordering::SeqCst);
+    let absent =
+        run::provider_profile_describe_text(&ts.endpoint, "openai", "json", "team", &ts.tls)
+            .await
+            .expect_err("empty successful response must fail");
+    assert!(absent.to_string().contains("openai"));
+}
+
+#[tokio::test]
+async fn profile_commands_dispatch_scope_and_output_to_gateway() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("test address"));
+    let state = ProviderState::default();
+    state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let service = TestOpenShell {
+        state: state.clone(),
+    };
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(OpenShellServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("test gateway");
+    });
+    let config = tempfile::tempdir().expect("isolated CLI config");
+    // The subprocess uses an explicit local endpoint and isolated config so
+    // profile dispatch cannot accidentally consult the developer's gateway.
+    for (verb, global, format) in [
+        ("list", false, "json"),
+        ("list", true, "yaml"),
+        ("describe", false, "json"),
+        ("describe", true, "table"),
+        ("export", false, "yaml"),
+        ("export", true, "json"),
+    ] {
+        let mut outputs = Vec::new();
+        for legacy in [false, true] {
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+            command
+                .env("XDG_CONFIG_HOME", config.path())
+                .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+                .env_remove("OPENSHELL_GATEWAY")
+                .env_remove("COMPLETE")
+                .args([
+                    "--gateway-endpoint",
+                    &endpoint,
+                    "--workspace",
+                    "team",
+                    "--color",
+                    "never",
+                ]);
+            if legacy && verb == "list" {
+                command.args(["provider", "list-profiles"]);
+            } else {
+                if legacy {
+                    command.arg("provider");
+                }
+                command.args(["profile", verb]);
+                if verb == "list" {
+                    command.args(["--type", "provider"]);
+                } else {
+                    command.arg("openai");
+                }
+            }
+            if global {
+                command.arg("--global");
+            }
+            let output = command
+                .args(["-o", format])
+                .output()
+                .await
+                .expect("profile subprocess");
+            assert!(
+                output.status.success(),
+                "profile {verb} (legacy={legacy}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+            match (verb, format) {
+                ("list", "json") => assert!(
+                    serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+                        .expect("JSON list")
+                        .iter()
+                        .any(|p| p["id"] == "openai")
+                ),
+                ("list", "yaml") => assert!(
+                    serde_yml::from_str::<Vec<serde_json::Value>>(&stdout)
+                        .expect("YAML list")
+                        .iter()
+                        .any(|p| p["id"] == "openai")
+                ),
+                (_, "json") => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&stdout).expect("JSON profile")["id"],
+                    "openai"
+                ),
+                (_, "yaml") => assert_eq!(
+                    serde_yml::from_str::<serde_json::Value>(&stdout).expect("YAML profile")["id"],
+                    "openai"
+                ),
+                _ => assert!(stdout.contains("openai (provider)")),
+            }
+            outputs.push(stdout);
+        }
+        // Both entry points must produce identical output, including structure
+        // and human-readable formatting, rather than only parsing successfully.
+        assert_eq!(outputs[0], outputs[1], "profile {verb} output differs");
+    }
+    assert_eq!(
+        *state.profile_list_requests.lock().await,
+        [
+            ("team".to_string(), 100, 0),
+            ("team".to_string(), 100, 0),
+            (String::new(), 100, 0),
+            (String::new(), 100, 0),
+        ]
+    );
+    assert_eq!(
+        *state.profile_get_requests.lock().await,
+        [
+            ("team".to_string(), "openai".to_string()),
+            ("team".to_string(), "openai".to_string()),
+            (String::new(), "openai".to_string()),
+            (String::new(), "openai".to_string()),
+            ("team".to_string(), "openai".to_string()),
+            ("team".to_string(), "openai".to_string()),
+            (String::new(), "openai".to_string()),
+            (String::new(), "openai".to_string()),
+        ]
+    );
+    // The listener belongs to this fixture and must not outlive the test.
+    server.abort();
 }
 
 #[tokio::test]
@@ -2015,7 +2261,7 @@ binaries: [/usr/bin/custom]
         .expect("profile export");
     run::provider_list_profiles(&ts.endpoint, "json", "default", &ts.tls)
         .await
-        .expect("provider list-profiles json");
+        .expect("profile list json");
     run::provider_create(
         &ts.endpoint,
         "custom-provider",

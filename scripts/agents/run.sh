@@ -333,12 +333,12 @@ import_provider_profile() {
     local profile_file="$2"
     local import_output current_profile resource_version update_dir update_file
 
-    openshell_cmd provider profile delete "$profile_id" >/dev/null 2>&1 || true
-    if import_output="$(openshell_cmd provider profile import --file "$profile_file" 2>&1)"; then
+    openshell_cmd profile delete "$profile_id" >/dev/null 2>&1 || true
+    if import_output="$(openshell_cmd profile import --file "$profile_file" 2>&1)"; then
         return 0
     fi
     if [[ "$import_output" == *"already exists"* ]]; then
-        if ! current_profile="$(openshell_cmd provider profile export \
+        if ! current_profile="$(openshell_cmd profile export \
             --output json "$profile_id")"; then
             echo "failed to export existing provider profile: $profile_id" >&2
             return 1
@@ -358,7 +358,7 @@ profile = YAML.load_file(profile_file) || {}
 profile["resource_version"] = Integer(resource_version, 10)
 File.write(update_file, YAML.dump(profile))
 RUBY
-        if openshell_cmd provider profile update "$profile_id" \
+        if openshell_cmd profile update "$profile_id" \
             --file "$update_file" >/dev/null; then
             rm -f "$update_file"
             rmdir "$update_dir"

@@ -34,8 +34,8 @@ Provider profiles include these user-facing features:
 - Built-in provider profiles loaded by the gateway by default.
 - Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
 - A user-managed profile shadows a built-in profile with the same ID in its applicable workspace or platform scope. The built-in remains the fallback outside that scope. Source-managed interceptor collisions still fail closed.
-- `openshell provider list-profiles` with table, YAML, and JSON output.
-- `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
+- `openshell profile list` and `openshell profile describe` with table, YAML, and JSON output.
+- `openshell profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
 - Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
 - Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
@@ -214,18 +214,38 @@ inference provider and call its native endpoint.
 
 A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, an informational provider category, and optional credential refresh metadata.
 
+Use `openshell profile` to discover, inspect, and manage reusable profile definitions. Use `openshell provider` to manage provider instances and their credential values. Provider profiles are the supported profile type.
+
+Existing command names remain supported. `openshell provider list-profiles` is equivalent to `openshell profile list --type provider`, and `openshell provider profile export/import/update/lint/delete` invokes the same handlers as the corresponding `openshell profile` commands. The nested commands retain their existing arguments, output options, and workspace/global flags. New examples use the top-level form.
+
 List available profiles:
 
 ```shell
-openshell provider list-profiles
+openshell profile list
+openshell profile list --type provider -o json
 ```
 
-By default the gateway lists built-in profiles plus custom profiles imported
-through the profile APIs. When a configured gateway interceptor vends an
-authoritative provider profile catalog, that catalog becomes the visible source
-of truth: list, export, provider creation, policy composition, and sandbox
-provider environment resolution use the interceptor-vended profiles instead of
-built-in or user-imported profiles.
+The default table shows `NAME`, `TYPE`, `CATEGORY`, `SOURCE`, and `SCOPE`. `NAME` is the profile ID used by the other profile commands and by `provider create --type`. The optional `--type provider` filter selects provider profiles. Use `-o json` or `-o yaml` for structured output.
+
+Inspect one profile before creating a provider:
+
+```shell
+openshell profile describe github
+openshell profile describe github -o yaml
+```
+
+The description shows metadata, credential names and authentication settings, endpoints with their protocols and policy rules, allowed binaries, source, and scope. It describes the reusable definition without reading credential values from provider instances. A missing profile ID returns an error.
+
+List and describe use the selected workspace's effective catalog. Pass the inherited `--workspace` flag to select another workspace, or `--global` to target platform scope. Platform operations require Platform Admin access.
+
+```shell
+openshell profile list --workspace team-ml
+openshell profile describe github --workspace team-ml
+openshell profile list --global
+openshell profile describe github --global
+```
+
+By default the gateway lists built-in profiles plus custom profiles imported through the profile APIs. When a configured gateway interceptor vends an authoritative provider profile catalog, that catalog becomes the visible source of truth. List, describe, export, provider creation, policy composition, and sandbox provider environment resolution use the interceptor-vended profiles instead of built-in or user-imported profiles.
 
 Built-in provider profiles currently include:
 
@@ -246,25 +266,25 @@ Built-in provider profiles currently include:
 Export a built-in profile as YAML:
 
 ```shell
-openshell provider profile export github -o yaml > github-profile.yaml
+openshell profile export github -o yaml > github-profile.yaml
 ```
 
 Lint a profile before importing it:
 
 ```shell
-openshell provider profile lint -f github-profile.yaml
+openshell profile lint -f github-profile.yaml
 ```
 
 Import one profile file:
 
 ```shell
-openshell provider profile import -f github-profile.yaml
+openshell profile import -f github-profile.yaml
 ```
 
 Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 
 ```shell
-openshell provider profile import --from ./provider-profiles
+openshell profile import --from ./provider-profiles
 ```
 
 Import is create-only. It fails if a custom profile with the same ID already exists.
@@ -272,17 +292,25 @@ Import is create-only. It fails if a custom profile with the same ID already exi
 Update an existing custom profile by exporting the current custom profile, editing the file, and submitting the edited file back:
 
 ```shell
-openshell provider profile export github-profile -o yaml > github-profile.yaml
-openshell provider profile update github-profile -f github-profile.yaml
+openshell profile export github-profile -o yaml > github-profile.yaml
+openshell profile update github-profile -f github-profile.yaml
 ```
 
 Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
+
+Delete custom profiles by ID:
+
+```shell
+openshell profile delete custom-api custom-alt
+```
+
+Export accepts `-o yaml` or `-o json` and defaults to YAML. Lint also accepts `--from <directory>` and asks the gateway to validate the supplied definitions without storing them. Export, import, update, lint, and delete use the selected workspace unless you pass `--global`.
 
 Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in and interceptor-managed profiles are read-only through the profile APIs. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
 
 ### Category Enum
 
-The `category` field controls how `openshell provider list-profiles` groups profiles. Use one of these canonical YAML values:
+The `category` field supplies the `CATEGORY` column in `openshell profile list`. Use one of these canonical YAML values:
 
 | Value | Use for |
 |---|---|
@@ -424,7 +452,7 @@ binaries:
 
 `id`, `display_name`, and `description` identify the profile. `id` is the value passed to `openshell provider create --type`.
 
-`category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
+`category` supplies the `CATEGORY` column in `openshell profile list`. Use one of the values in the category enum.
 
 `credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 

@@ -6,7 +6,7 @@ how an interceptor can vend provider profiles and make them the gateway's
 authoritative profile source.
 
 - provider profile YAML lives in `profiles/*.yaml`
-- `provider list-profiles` shows only the profiles vended by this interceptor
+- `profile list` shows only the profiles vended by this interceptor
 - providers can only be created with a `type` that matches one of those vended
   profile IDs
 - every vended provider profile gets governance annotations for its hash,
@@ -78,7 +78,7 @@ YAML files do not need an `id` field; if one is present, the filename still wins
 The interceptor advertises `provider_profiles = true` in its manifest and vends
 the current profile set through `SnapshotProviderProfiles`. The gateway config
 selects the interceptor as its only provider profile source, so
-`provider list-profiles` shows only `github` and `slack`; built-in and user
+`profile list` shows only `github` and `slack`; built-in and user
 sources are omitted. The example signs each profile's canonical protobuf payload
 and exposes the JWT under
 `annotations["openshell.nvidia.com/profile-signature"]`; the signed hash and key
