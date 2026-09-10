@@ -19,29 +19,35 @@ func newProfileClient(conn grpc.ClientConnInterface) *profileClient {
 	return &profileClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (p *profileClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+func (p *profileClient) List(workspace string, opts ...ListOptions) (*Pager[*ProviderProfile], error) {
 	pageSize, err := listPageSize(opts)
 	if err != nil {
 		return nil, err
 	}
-	req := &pb.ListProviderProfilesRequest{
-		Workspace: workspace,
-		PageSize:  pageSize,
+	var pageToken string
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
 	}
-	profiles := make([]*ProviderProfile, 0)
-	for {
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ProviderProfile], error) {
+		req := &pb.ListProviderProfilesRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
 		resp, err := p.client.ListProviderProfiles(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
 		for _, profile := range resp.GetProfiles() {
 			profiles = append(profiles, converter.ProviderProfileFromProto(profile))
 		}
-		if resp.GetNextPageToken() == "" {
-			return profiles, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[*ProviderProfile]{Items: profiles, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (p *profileClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {

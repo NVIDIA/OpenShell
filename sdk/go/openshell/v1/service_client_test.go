@@ -237,7 +237,7 @@ func TestServiceList(t *testing.T) {
 	_, err = client.Expose(context.Background(), "default", "web-app", "web", 3000, false)
 	require.NoError(t, err)
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	require.NoError(t, err)
 	assert.Len(t, endpoints, 2)
@@ -248,7 +248,7 @@ func TestServiceList_Empty(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	require.NoError(t, err)
 	assert.NotNil(t, endpoints)
@@ -263,7 +263,7 @@ func TestServiceList_WithOptions(t *testing.T) {
 	_, err := client.Expose(context.Background(), "default", "web-app", "api", 8080, true)
 	require.NoError(t, err)
 
-	endpoints, err := client.List(context.Background(), "default", "web-app", ListOptions{PageSize: 10})
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, endpoints, 1)
@@ -274,7 +274,10 @@ func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.ListAll(context.Background(), ListOptions{PageSize: 10})
+	endpoints, err := client.ListAll(context.Background(), "", "", ListOptions{
+		PageSize:      10,
+		AllWorkspaces: true,
+	})
 
 	require.NoError(t, err)
 	assert.Empty(t, endpoints)
@@ -289,7 +292,7 @@ func TestServiceList_Error(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	assert.Nil(t, endpoints)
 	require.Error(t, err)

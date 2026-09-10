@@ -419,7 +419,7 @@ func TestSandboxList(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
@@ -430,7 +430,7 @@ func TestSandboxList_Empty(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.NotNil(t, result)
@@ -446,7 +446,7 @@ func TestSandboxList_WithOptions(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default", ListOptions{PageSize: 10})
+	result, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, result, 1)
@@ -461,7 +461,7 @@ func TestSandboxList_FollowsContinuationTokens(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default", ListOptions{
+	result, err := client.ListAll(context.Background(), "default", ListOptions{
 		PageSize:      1,
 		LabelSelector: "team=core",
 	})

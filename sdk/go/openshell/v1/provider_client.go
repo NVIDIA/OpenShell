@@ -55,38 +55,41 @@ func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Prov
 	return converter.ProviderFromProto(resp.GetProvider()), nil
 }
 
-func (p *providerClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error) {
-	req := &pb.ListProvidersRequest{
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	return p.list(ctx, req, opts...)
-}
-
-func (p *providerClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Provider, error) {
-	return p.list(ctx, &pb.ListProvidersRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
-}
-
-func (p *providerClient) list(ctx context.Context, req *pb.ListProvidersRequest, opts ...ListOptions) ([]*Provider, error) {
+func (p *providerClient) List(workspace string, opts ...ListOptions) (*Pager[*Provider], error) {
 	pageSize, err := listPageSize(opts)
 	if err != nil {
 		return nil, err
 	}
-	req.PageSize = pageSize
-
-	providers := make([]*Provider, 0)
-	for {
+	var pageToken string
+	var allWorkspaces bool
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+		allWorkspaces = opts[0].AllWorkspaces
+	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Provider], error) {
+		req := &pb.ListProvidersRequest{WorkspaceScope: workspaceScope, PageSize: pageSize, PageToken: pageToken}
 		resp, err := p.client.ListProviders(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		providers := make([]*Provider, 0, len(resp.GetProviders()))
 		for _, proto := range resp.GetProviders() {
 			providers = append(providers, converter.ProviderFromProto(proto))
 		}
-		if resp.GetNextPageToken() == "" {
-			return providers, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[*Provider]{Items: providers, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (p *providerClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }
 
 func (p *providerClient) Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {

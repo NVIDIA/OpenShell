@@ -42,12 +42,12 @@ fmt.Println("Provider type:", provider.Type)
 
 ## List
 
-List all registered providers. The SDK follows gateway continuation tokens
-automatically; `PageSize` controls each request.
+`List` returns a lazy pager over registered providers. `ListAll` follows every
+continuation token; `PageSize` controls each request.
 
 ```go
 // List all providers
-providers, err := client.Providers().List(ctx, "default")
+providers, err := client.Providers().ListAll(ctx, "default")
 if err != nil {
     log.Fatal(err)
 }
@@ -56,7 +56,7 @@ for _, p := range providers {
 }
 
 // With a smaller page size
-providers, err = client.Providers().List(ctx, "default", v1.ListOptions{
+providers, err = client.Providers().ListAll(ctx, "default", v1.ListOptions{
     PageSize: 10,
 })
 

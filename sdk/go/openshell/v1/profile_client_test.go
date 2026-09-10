@@ -219,7 +219,7 @@ func TestProfileList(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.Len(t, profiles, 2)
@@ -230,7 +230,7 @@ func TestProfileList_Empty(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.NotNil(t, profiles)
@@ -243,7 +243,7 @@ func TestProfileList_WithOptions(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default", ListOptions{PageSize: 10})
+	profiles, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, profiles, 1)
@@ -258,7 +258,7 @@ func TestProfileList_Error(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	assert.Nil(t, profiles)
 	require.Error(t, err)

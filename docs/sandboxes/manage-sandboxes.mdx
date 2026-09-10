@@ -400,9 +400,13 @@ with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
+    matches = client.list_all(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
+
+Python SDK `list` methods return a lazy `Pager` whose iteration yields one
+`Page` per gateway request. Use `list_all` only when you want to exhaust the
+collection; pass `page_token` to resume from a token saved from an earlier page.
 
 Create reusable sandbox templates through the Python SDK when several runs
 should share the same workload shape:
@@ -431,7 +435,7 @@ from openshell import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
-    sandboxes = client.list(workspace="default")
+    sandboxes = client.list_all(workspace="default")
 ```
 
 ## Expose Long Running Services

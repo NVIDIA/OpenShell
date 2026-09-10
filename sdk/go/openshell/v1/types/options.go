@@ -12,8 +12,13 @@ type CreateOptions struct {
 
 // ListOptions configures resource listing with pagination and filtering.
 type ListOptions struct {
-	PageSize      int
+	// PageSize is the maximum number of resources requested per RPC.
+	PageSize int
+	// PageToken resumes after a page returned by the same list query.
+	PageToken     string
 	LabelSelector string
+	// AllWorkspaces selects a platform-admin view across workspace boundaries.
+	AllWorkspaces bool
 }
 
 // WatchOptions configures watch behavior.

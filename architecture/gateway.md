@@ -549,6 +549,10 @@ sandbox collections in one cancellable background refresh task, never overlaps
 periodic list refreshes, and discards results after a gateway or workspace
 change.
 
+Curated Rust, Python, Go, and TypeScript SDK list methods return lazy pagers.
+Advancing a pager issues one list RPC and exposes its continuation token;
+explicit `list_all` helpers are the only curated APIs that exhaust a collection.
+
 Persistence distinguishes one-page operations from exhaustive scans.
 `list_object_page` and `list_message_page` return one keyset page and its next
 cursor. `collect_records` and `collect_messages` exhaust those pages, fail on

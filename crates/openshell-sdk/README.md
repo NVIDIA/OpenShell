@@ -43,7 +43,7 @@ mTLS (client certificates) is not supported.
 ## Public surface
 
 `OpenShellClient::connect(ClientConfig)` returns a connected client exposing
-`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
+`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `list_all_sandboxes`, `delete_sandbox`,
 `create_sandbox_from_template`, `create_sandbox_template`,
 `get_sandbox_template`, `list_sandbox_templates`, `delete_sandbox_template`,
 `list_sandboxes_all_workspaces`, `list_sandbox_templates_all_workspaces`,
@@ -59,11 +59,22 @@ Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.
 
-Curated list methods follow continuation tokens until the collection is
-exhausted. `ListOptions::page_size` and
-`SandboxTemplateListOptions::page_size` control the size of each gateway
-request; callers that need explicit page boundaries can use the raw protobuf
-client.
+Curated `list_*` methods return a lazy `Pager<T>`. Each `next_page()` call
+issues at most one RPC and returns a `Page<T>` with its opaque continuation
+token. The explicit `list_all_*` conveniences exhaust that pager; `page_size`
+always controls one gateway request, and `page_token` resumes a saved traversal.
+
+```rust
+let mut pages = client.list_sandboxes(ListOptions {
+    page_size: 100,
+    ..Default::default()
+});
+while let Some(page) = pages.next_page().await? {
+    for sandbox in page.items {
+        println!("{}", sandbox.name);
+    }
+}
+```
 
 ```rust
 use openshell_sdk::{
@@ -115,6 +126,7 @@ let _sandbox = client
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
 | `error` | `SdkError` taxonomy. |
+| `pagination` | Lazy `Pager<T>` and response `Page<T>`. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |
 

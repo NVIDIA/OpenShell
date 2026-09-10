@@ -7,7 +7,6 @@ import (
 	"context"
 	"maps"
 	"slices"
-	"strings"
 	"sync"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -174,13 +173,16 @@ func (c *fakePolicyClient) GetStatus(_ context.Context, workspace, sandboxName s
 // List returns policy revisions. When the global option is set, it returns
 // global revisions; otherwise it returns all sandbox-scoped revisions for the
 // given workspace.
-func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.ListPolicyOption) ([]types.SandboxPolicyRevision, error) {
+func (c *fakePolicyClient) List(workspace, sandboxName string, opts ...v1.ListPolicyOption) (*v1.Pager[types.SandboxPolicyRevision], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	cfg := types.ApplyListPolicyOptions(opts)
 	if cfg.PageSize() < 0 {
 		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "page size must not be negative"}
+	}
+	if !cfg.Global() && sandboxName == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
 
 	c.mu.RLock()
@@ -190,17 +192,7 @@ func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.
 	if cfg.Global() {
 		revisions = slices.Clone(c.globalRevisions)
 	} else {
-		// Collect all revisions for sandboxes in this workspace.
-		prefix := workspace + "/"
-		for key, revs := range c.sandboxRevisions {
-			if strings.HasPrefix(key, prefix) {
-				revisions = append(revisions, revs...)
-			}
-		}
-	}
-
-	if len(revisions) == 0 {
-		return nil, nil
+		revisions = slices.Clone(c.sandboxRevisions[workspace+"/"+sandboxName])
 	}
 
 	// Sort by version for deterministic ordering (map iteration is random).
@@ -218,7 +210,15 @@ func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.
 	for i, r := range revisions {
 		result[i] = copySandboxPolicyRevision(r)
 	}
-	return result, nil
+	return newSlicePager(result, int(cfg.PageSize()), cfg.PageToken())
+}
+
+func (c *fakePolicyClient) ListAll(ctx context.Context, workspace, sandboxName string, opts ...v1.ListPolicyOption) ([]types.SandboxPolicyRevision, error) {
+	pager, err := c.List(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // EditDraftChunk returns Unimplemented.

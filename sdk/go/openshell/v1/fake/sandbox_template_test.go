@@ -71,7 +71,7 @@ func TestSandboxTemplate_CreateGetListDelete(t *testing.T) {
 	assert.Equal(t, "python:3.12", got.Spec.Workload.Image)
 	assert.Equal(t, "kata", got.Spec.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"])
 
-	listed, err := tc.List(ctx, "default")
+	listed, err := tc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	require.Len(t, listed, 1)
 	assert.Equal(t, "gpu-kata", listed[0].Name)
@@ -108,7 +108,7 @@ func TestSandboxTemplate_ListAllWorkspaces(t *testing.T) {
 	_, _ = tc.Create(ctx, "default", testSandboxWorkloadTemplate("default-template"))
 	_, _ = tc.Create(ctx, "team-a", testSandboxWorkloadTemplate("team-template"))
 
-	listed, err := tc.ListAll(ctx)
+	listed, err := tc.ListAll(ctx, "default", types.ListOptions{AllWorkspaces: true})
 	require.NoError(t, err)
 	assert.Len(t, listed, 2)
 }
@@ -132,7 +132,7 @@ func TestSandboxTemplate_ListFiltersByLabelSelector(t *testing.T) {
 		},
 	})
 
-	listed, err := tc.List(ctx, "default", types.ListOptions{LabelSelector: "team=runtime"})
+	listed, err := tc.ListAll(ctx, "default", types.ListOptions{LabelSelector: "team=runtime"})
 
 	require.NoError(t, err)
 	require.Len(t, listed, 1)
@@ -143,7 +143,7 @@ func TestSandboxTemplate_ListRejectsNegativePagination(t *testing.T) {
 	tc := newTestSandboxTemplateClient()
 	ctx := context.Background()
 
-	_, err := tc.List(ctx, "default", types.ListOptions{PageSize: -1})
+	_, err := tc.ListAll(ctx, "default", types.ListOptions{PageSize: -1})
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
 }
@@ -174,7 +174,7 @@ func TestSandboxTemplate_ListReturnsAllFilteredResults(t *testing.T) {
 		},
 	})
 
-	listed, err := tc.List(ctx, "default", types.ListOptions{
+	listed, err := tc.ListAll(ctx, "default", types.ListOptions{
 		LabelSelector: "team=runtime",
 		PageSize:      1,
 	})
@@ -293,7 +293,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateRejectsWorkloadOverrides(t *te
 		})
 	}
 
-	listed, err := client.Sandboxes().List(ctx, "default")
+	listed, err := client.Sandboxes().ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Empty(t, listed)
 }
@@ -453,7 +453,7 @@ func TestSandboxTemplate_CreateRejectsInvalidTemplate(t *testing.T) {
 		})
 	}
 
-	listed, err := tc.List(ctx, "default")
+	listed, err := tc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Empty(t, listed)
 }

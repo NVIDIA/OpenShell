@@ -89,16 +89,16 @@ fmt.Println(template.Spec.Workload.Image)
 
 ## List
 
-Lists every matching template in one workspace or across all workspaces. The
-SDK follows gateway continuation tokens automatically.
+`List` returns a lazy pager over matching templates in one workspace or across
+all workspaces. Use `ListAll` to follow every continuation token automatically.
 
 ```go
-templates, err := client.SandboxTemplates().List(ctx, "default", v1.ListOptions{
+templates, err := client.SandboxTemplates().ListAll(ctx, "default", v1.ListOptions{
     PageSize: 50,
 })
 
-allTemplates, err := client.SandboxTemplates().ListAll(ctx, v1.ListOptions{
-    PageSize: 50,
+allTemplates, err := client.SandboxTemplates().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
 })
 ```
 

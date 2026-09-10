@@ -223,7 +223,7 @@ func TestWorkspaceList_Success(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	workspaces, err := wc.List(context.Background())
+	workspaces, err := wc.ListAll(context.Background())
 
 	require.NoError(t, err)
 	require.Len(t, workspaces, 1)
@@ -238,7 +238,7 @@ func TestWorkspaceList_WithOptions(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.List(context.Background(), ListOptions{
+	_, err := wc.ListAll(context.Background(), ListOptions{
 		PageSize:      10,
 		LabelSelector: "team=platform",
 	})
@@ -254,7 +254,7 @@ func TestWorkspaceList_EmptyReturnsNonNilSlice(t *testing.T) {
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
-	workspaces, err := newWorkspaceClient(conn).List(context.Background())
+	workspaces, err := newWorkspaceClient(conn).ListAll(context.Background())
 
 	require.NoError(t, err)
 	assert.NotNil(t, workspaces)
@@ -444,7 +444,7 @@ func TestListMembers_Success(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	members, err := wc.ListMembers(context.Background(), "test-ws")
+	members, err := wc.ListAllMembers(context.Background(), "test-ws")
 
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -457,7 +457,7 @@ func TestListMembers_EmptyWorkspace(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.ListMembers(context.Background(), "")
+	_, err := wc.ListAllMembers(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -470,7 +470,7 @@ func TestListMembers_EmptyResultReturnsNonNilSlice(t *testing.T) {
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
-	members, err := newWorkspaceClient(conn).ListMembers(context.Background(), "test-ws")
+	members, err := newWorkspaceClient(conn).ListAllMembers(context.Background(), "test-ws")
 
 	require.NoError(t, err)
 	assert.NotNil(t, members)
@@ -485,7 +485,7 @@ func TestListMembers_WithOptions(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.ListMembers(context.Background(), "test-ws", ListOptions{PageSize: 5})
+	_, err := wc.ListAllMembers(context.Background(), "test-ws", ListOptions{PageSize: 5})
 
 	require.NoError(t, err)
 	assert.Equal(t, int32(5), mock.lastListMembersReq.GetPageSize())

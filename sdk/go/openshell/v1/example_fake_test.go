@@ -55,7 +55,7 @@ func ExampleNewClient_addProvider() {
 
 	ctx := context.Background()
 
-	providers, err := client.Providers().List(ctx, "default")
+	providers, err := client.Providers().ListAll(ctx, "default")
 	if err != nil {
 		log.Fatal(err)
 	}

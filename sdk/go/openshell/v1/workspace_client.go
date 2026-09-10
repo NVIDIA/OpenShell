@@ -48,30 +48,36 @@ func (w *workspaceClient) Get(ctx context.Context, name string) (*Workspace, err
 	return converter.WorkspaceFromProto(resp.GetWorkspace()), nil
 }
 
-func (w *workspaceClient) List(ctx context.Context, opts ...ListOptions) ([]*Workspace, error) {
+func (w *workspaceClient) List(opts ...ListOptions) (*Pager[*Workspace], error) {
 	pageSize, err := listPageSize(opts)
 	if err != nil {
 		return nil, err
 	}
-	req := &pb.ListWorkspacesRequest{PageSize: pageSize}
+	var pageToken, labelSelector string
 	if len(opts) > 0 {
-		req.LabelSelector = opts[0].LabelSelector
+		pageToken = opts[0].PageToken
+		labelSelector = opts[0].LabelSelector
 	}
-
-	workspaces := make([]*Workspace, 0)
-	for {
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Workspace], error) {
+		req := &pb.ListWorkspacesRequest{PageSize: pageSize, PageToken: pageToken, LabelSelector: labelSelector}
 		resp, err := w.client.ListWorkspaces(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		workspaces := make([]*Workspace, 0, len(resp.GetWorkspaces()))
 		for _, proto := range resp.GetWorkspaces() {
 			workspaces = append(workspaces, converter.WorkspaceFromProto(proto))
 		}
-		if resp.GetNextPageToken() == "" {
-			return workspaces, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[*Workspace]{Items: workspaces, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (w *workspaceClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Workspace, error) {
+	pager, err := w.List(opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }
 
 func (w *workspaceClient) Delete(ctx context.Context, name string) error {
@@ -130,7 +136,7 @@ func (w *workspaceClient) RemoveMember(ctx context.Context, workspace, principal
 	return nil
 }
 
-func (w *workspaceClient) ListMembers(ctx context.Context, workspace string, opts ...ListOptions) ([]*WorkspaceMember, error) {
+func (w *workspaceClient) ListMembers(workspace string, opts ...ListOptions) (*Pager[*WorkspaceMember], error) {
 	if workspace == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
@@ -139,22 +145,28 @@ func (w *workspaceClient) ListMembers(ctx context.Context, workspace string, opt
 	if err != nil {
 		return nil, err
 	}
-	req := &pb.ListWorkspaceMembersRequest{
-		Workspace: workspace,
-		PageSize:  pageSize,
+	var pageToken string
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
 	}
-	members := make([]*WorkspaceMember, 0)
-	for {
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*WorkspaceMember], error) {
+		req := &pb.ListWorkspaceMembersRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
 		resp, err := w.client.ListWorkspaceMembers(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		members := make([]*WorkspaceMember, 0, len(resp.GetMembers()))
 		for _, proto := range resp.GetMembers() {
 			members = append(members, converter.WorkspaceMemberFromProto(proto))
 		}
-		if resp.GetNextPageToken() == "" {
-			return members, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[*WorkspaceMember]{Items: members, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (w *workspaceClient) ListAllMembers(ctx context.Context, workspace string, opts ...ListOptions) ([]*WorkspaceMember, error) {
+	pager, err := w.ListMembers(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }

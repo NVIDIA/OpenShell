@@ -50,41 +50,45 @@ func (s *sandboxTemplateClient) Get(ctx context.Context, workspace, name string)
 	return converter.SandboxWorkloadTemplateFromProto(resp.GetTemplate()), nil
 }
 
-func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
-	req := &pb.ListSandboxTemplatesRequest{
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	return s.list(ctx, req, opts...)
-}
-
-func (s *sandboxTemplateClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
-	return s.list(ctx, &pb.ListSandboxTemplatesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
-}
-
-func (s *sandboxTemplateClient) list(ctx context.Context, req *pb.ListSandboxTemplatesRequest, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
+func (s *sandboxTemplateClient) List(workspace string, opts ...ListOptions) (*Pager[*SandboxWorkloadTemplate], error) {
 	pageSize, err := listPageSize(opts)
 	if err != nil {
 		return nil, err
 	}
-	req.PageSize = pageSize
+	var pageToken, labelSelector string
+	var allWorkspaces bool
 	if len(opts) > 0 {
-		req.LabelSelector = opts[0].LabelSelector
+		pageToken = opts[0].PageToken
+		labelSelector = opts[0].LabelSelector
+		allWorkspaces = opts[0].AllWorkspaces
 	}
-
-	templates := make([]*SandboxWorkloadTemplate, 0)
-	for {
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*SandboxWorkloadTemplate], error) {
+		req := &pb.ListSandboxTemplatesRequest{
+			WorkspaceScope: workspaceScope, PageSize: pageSize, PageToken: pageToken,
+			LabelSelector: labelSelector,
+		}
 		resp, err := s.client.ListSandboxTemplates(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		templates := make([]*SandboxWorkloadTemplate, 0, len(resp.GetTemplates()))
 		for _, protoTemplate := range resp.GetTemplates() {
 			templates = append(templates, converter.SandboxWorkloadTemplateFromProto(protoTemplate))
 		}
-		if resp.GetNextPageToken() == "" {
-			return templates, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[*SandboxWorkloadTemplate]{Items: templates, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (s *sandboxTemplateClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
+	pager, err := s.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }
 
 func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string) (bool, error) {

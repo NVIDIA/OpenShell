@@ -83,7 +83,7 @@ func TestProvider_List_Empty(t *testing.T) {
 	pc := newTestProviderClient()
 	ctx := context.Background()
 
-	list, err := pc.List(ctx, "default")
+	list, err := pc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Empty(t, list)
 }
@@ -95,7 +95,7 @@ func TestProvider_List(t *testing.T) {
 	_, _ = pc.Create(ctx, "default", &types.Provider{Name: "openai", Type: "openai"})
 	_, _ = pc.Create(ctx, "default", &types.Provider{Name: "anthropic", Type: "anthropic"})
 
-	list, err := pc.List(ctx, "default")
+	list, err := pc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Len(t, list, 2)
 }
@@ -265,7 +265,7 @@ func TestProvider_ConcurrentCreateGetListDeleteEnsure(_ *testing.T) {
 				p := &types.Provider{Name: name, Type: "test"}
 				_, _ = pc.Create(ctx, "default", p)
 				_, _ = pc.Get(ctx, "default", name)
-				_, _ = pc.List(ctx, "default")
+				_, _ = pc.ListAll(ctx, "default")
 				_, _ = pc.Update(ctx, "default", &types.Provider{Name: name, Type: "updated"})
 				_, _ = pc.Ensure(ctx, "default", &types.Provider{Name: name, Type: "ensured"})
 				_ = pc.Delete(ctx, "default", name)

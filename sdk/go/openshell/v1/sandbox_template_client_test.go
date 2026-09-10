@@ -220,7 +220,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Equal(t, "gpu-kata", got.Name)
 	assert.Equal(t, "img:v1", got.Spec.Workload.Image)
 
-	list, err := client.ListAll(context.Background(), ListOptions{
+	list, err := client.ListAll(context.Background(), "default", ListOptions{
 		PageSize:      10,
 		LabelSelector: "team=runtime",
 	})
@@ -238,7 +238,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Equal(t, "default", mock.getRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.getRequest.Name)
 	require.NotNil(t, mock.listRequest)
-	assert.NotNil(t, mock.listRequest.GetWorkspaceScope().GetAllWorkspaces())
+	assert.Equal(t, "default", mock.listRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, int32(10), mock.listRequest.PageSize)
 	assert.Empty(t, mock.listRequest.PageToken)
 	assert.Equal(t, "team=runtime", mock.listRequest.LabelSelector)
@@ -252,7 +252,7 @@ func TestSandboxTemplateList_RejectsNegativePagination(t *testing.T) {
 	client, cleanup := setupSandboxTemplateTest(t, mock)
 	defer cleanup()
 
-	_, err := client.List(context.Background(), "default", ListOptions{PageSize: -1})
+	_, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: -1})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 }
@@ -262,7 +262,7 @@ func TestSandboxTemplateList_EmptyReturnsNonNilSlice(t *testing.T) {
 	client, cleanup := setupSandboxTemplateTest(t, mock)
 	defer cleanup()
 
-	templates, err := client.List(context.Background(), "default")
+	templates, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.NotNil(t, templates)

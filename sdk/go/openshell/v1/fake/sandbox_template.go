@@ -105,15 +105,7 @@ func (c *fakeSandboxTemplateClient) Get(_ context.Context, workspace, name strin
 	return c.store.Get(workspace, name)
 }
 
-func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
-	return c.list(workspace, false, opts...)
-}
-
-func (c *fakeSandboxTemplateClient) ListAll(_ context.Context, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
-	return c.list("", true, opts...)
-}
-
-func (c *fakeSandboxTemplateClient) list(workspace string, allWorkspaces bool, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+func (c *fakeSandboxTemplateClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.SandboxWorkloadTemplate], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -125,7 +117,7 @@ func (c *fakeSandboxTemplateClient) list(workspace string, allWorkspaces bool, o
 		}
 	}
 	var templates []*types.SandboxWorkloadTemplate
-	if allWorkspaces {
+	if options.AllWorkspaces {
 		templates = c.store.ListAll()
 	} else {
 		templates = c.store.List(workspace)
@@ -135,7 +127,15 @@ func (c *fakeSandboxTemplateClient) list(workspace string, allWorkspaces bool, o
 	if err != nil {
 		return nil, err
 	}
-	return templates, nil
+	return newSlicePager(templates, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxTemplateClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string) (bool, error) {

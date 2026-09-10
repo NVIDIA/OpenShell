@@ -188,7 +188,7 @@ func TestProviderList(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
@@ -199,7 +199,7 @@ func TestProviderList_Empty(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.NotNil(t, result)

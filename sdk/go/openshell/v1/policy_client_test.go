@@ -773,7 +773,7 @@ func TestPolicyList(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 2)
@@ -781,6 +781,7 @@ func TestPolicyList(t *testing.T) {
 	// Verify request was forwarded (no pagination options).
 	mock.mu.Lock()
 	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, "sandbox", mock.lastListReq.GetName())
 	assert.Equal(t, int32(0), mock.lastListReq.GetPageSize())
 	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
@@ -805,7 +806,7 @@ func TestPolicyList_WithPageSize(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default",
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox",
 		types.WithPageSize(10),
 	)
 
@@ -826,10 +827,11 @@ func TestPolicyList_Empty(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
-	assert.Nil(t, revisions)
+	assert.NotNil(t, revisions)
+	assert.Empty(t, revisions)
 }
 
 func TestPolicyList_WithGlobal(t *testing.T) {
@@ -844,7 +846,7 @@ func TestPolicyList_WithGlobal(t *testing.T) {
 	defer cleanup()
 
 	// List with global flag and empty workspace.
-	revisions, err := client.List(context.Background(), "", types.WithListGlobal(true))
+	revisions, err := client.ListAll(context.Background(), "", "", types.WithListGlobal(true))
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -869,7 +871,7 @@ func TestPolicyList_WithGlobalIgnoresWorkspace(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "some-workspace", types.WithListGlobal(true))
+	revisions, err := client.ListAll(context.Background(), "some-workspace", "", types.WithListGlobal(true))
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -892,7 +894,7 @@ func TestPolicyList_WithGlobalAndPagination(t *testing.T) {
 	defer cleanup()
 
 	// Global flag composes with page-size options.
-	revisions, err := client.List(context.Background(), "",
+	revisions, err := client.ListAll(context.Background(), "", "",
 		types.WithListGlobal(true),
 		types.WithPageSize(10),
 	)
@@ -918,7 +920,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -937,7 +939,7 @@ func TestPolicyList_Error(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	assert.Nil(t, revisions)
 	require.Error(t, err)

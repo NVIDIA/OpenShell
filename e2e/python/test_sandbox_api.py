@@ -211,10 +211,10 @@ def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
 
         # A specific selector filters to exactly the primary sandbox.
         assert {
-            s.name for s in sandbox_client.list(workspace="default", label_selector=primary_selector)
+            s.name for s in sandbox_client.list_all(workspace="default", label_selector=primary_selector)
         } == {job_a}
         # The shared group label returns both.
-        assert {s.name for s in sandbox_client.list(workspace="default", label_selector=group_selector)} == {
+        assert {s.name for s in sandbox_client.list_all(workspace="default", label_selector=group_selector)} == {
             job_a,
             job_b,
         }
@@ -223,7 +223,7 @@ def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
         assert sandbox_client.delete(job_a, workspace="default")
         sandbox_client.wait_deleted(job_a, workspace="default")
         created.remove(job_a)
-        assert {s.name for s in sandbox_client.list(workspace="default", label_selector=group_selector)} == {
+        assert {s.name for s in sandbox_client.list_all(workspace="default", label_selector=group_selector)} == {
             job_b
         }
 
@@ -231,7 +231,7 @@ def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
         assert sandbox_client.delete(job_b, workspace="default")
         sandbox_client.wait_deleted(job_b, workspace="default")
         created.remove(job_b)
-        assert not sandbox_client.list(workspace="default", label_selector=group_selector)
+        assert not sandbox_client.list_all(workspace="default", label_selector=group_selector)
     finally:
         for name in created:
             with contextlib.suppress(Exception):

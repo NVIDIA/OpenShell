@@ -57,15 +57,19 @@ fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 
 ## List
 
-Lists every matching sandbox, following gateway continuation tokens
-automatically. `PageSize` controls the size of each request.
+`List` constructs a lazy pager; `NextPage` fetches one page at a time.
+`PageSize` controls each request, and `ListAll` explicitly exhausts the pager.
 
 ```go
 // List all sandboxes
-sandboxes, err := client.Sandboxes().List(ctx, "default")
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default")
+
+// Process one page at a time
+pages, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 10})
+page, err := pages.NextPage(ctx)
 
 // With a page size and label filtering
-sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default", v1.ListOptions{
     PageSize:      10,
     LabelSelector: "team=platform",
 })

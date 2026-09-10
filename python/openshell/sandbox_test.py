@@ -2408,7 +2408,7 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert stub.get_template_request.name == "gpu-kata"
     assert _request_workspace(stub.get_template_request) == "default"
 
-    listed = client.list(
+    listed = client.list_all(
         workspace="default", page_size=50, label_selector="team=runtime"
     )
     assert len(listed) == 1
@@ -2429,7 +2429,7 @@ def test_sandbox_template_list_for_all_workspaces_selects_all() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces(page_size=100, label_selector="team=runtime")
+    client.list_all_for_all_workspaces(page_size=100, label_selector="team=runtime")
 
     assert stub.list_template_request is not None
     assert _request_selects_all_workspaces(stub.list_template_request)
@@ -2533,7 +2533,7 @@ def test_list_forwards_label_selector() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="default", label_selector="aiq=deep-research")
+    client.list_all(workspace="default", label_selector="aiq=deep-research")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == "aiq=deep-research"
@@ -2544,7 +2544,7 @@ def test_list_without_selector_sends_empty_string() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="default")
+    client.list_all(workspace="default")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == ""
@@ -2559,11 +2559,17 @@ def test_list_follows_continuation_tokens() -> None:
     )
     client = _client_with_fake_stub(stub)
 
-    sandboxes = client.list(
-        workspace="default", page_size=1, label_selector="team=core"
-    )
+    pager = client.list(workspace="default", page_size=1, label_selector="team=core")
 
-    assert [sandbox.name for sandbox in sandboxes] == ["job-1", "job-2"]
+    assert stub.list_requests == []
+    first = next(pager)
+    assert [sandbox.name for sandbox in first.items] == ["job-1"]
+    assert first.next_page_token == "1"
+    second = next(pager)
+    assert [sandbox.name for sandbox in second.items] == ["job-2"]
+    assert second.next_page_token == ""
+    with pytest.raises(StopIteration):
+        next(pager)
     assert len(stub.list_requests) == 2
     assert stub.list_requests[0].page_token == ""
     assert stub.list_requests[1].page_token == "1"
@@ -2804,7 +2810,7 @@ def test_list_for_all_workspaces_sets_flag() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces()
+    client.list_all_for_all_workspaces()
 
     assert stub.list_request is not None
     assert _request_selects_all_workspaces(stub.list_request)
@@ -2815,7 +2821,7 @@ def test_list_with_workspace_passes_workspace() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="staging")
+    client.list_all(workspace="staging")
 
     assert stub.list_request is not None
     assert _request_workspace(stub.list_request) == "staging"

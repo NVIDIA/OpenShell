@@ -1031,9 +1031,10 @@ async fn sandbox_template_crud_uses_default_workspace() {
     );
 
     let listed = client
-        .list_sandbox_templates_all_workspaces(SandboxTemplateListOptions {
+        .list_all_sandbox_templates_all_workspaces(SandboxTemplateListOptions {
             page_size: 10,
             label_selector: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1095,8 +1096,9 @@ async fn list_sandboxes_propagates_filters() {
     let opts = ListOptions {
         page_size: 25,
         label_selector: Some("team=core".to_string()),
+        ..Default::default()
     };
-    let items = client.list_sandboxes(opts).await.unwrap();
+    let items = client.list_all_sandboxes(opts).await.unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].name, "alpha");
     assert_eq!(items[0].phase, SandboxPhase::Ready);
@@ -1117,17 +1119,22 @@ async fn list_sandboxes_follows_continuation_tokens() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let items = client
-        .list_sandboxes(ListOptions {
-            page_size: 1,
-            label_selector: Some("team=core".to_string()),
-        })
-        .await
-        .unwrap();
+    let mut pager = client.list_sandboxes(ListOptions {
+        page_size: 1,
+        label_selector: Some("team=core".to_string()),
+        ..Default::default()
+    });
+    assert!(state.list_requests.lock().await.is_empty());
 
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].name, "alpha");
-    assert_eq!(items[1].name, "beta");
+    let first = pager.next_page().await.unwrap().unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].name, "alpha");
+    assert_eq!(first.next_page_token, "page-2");
+    let second = pager.next_page().await.unwrap().unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].name, "beta");
+    assert!(second.next_page_token.is_empty());
+    assert!(pager.next_page().await.unwrap().is_none());
     let requests = state.list_requests.lock().await;
     assert_eq!(requests.len(), 2);
     assert!(requests[0].page_token.is_empty());
@@ -1471,7 +1478,7 @@ async fn workspace_scoped_list_passes_workspace() {
     let client = connect(&endpoint).await;
 
     let ws = client.workspace("dev");
-    let items = ws.list_sandboxes(ListOptions::default()).await.unwrap();
+    let items = ws.list_all_sandboxes(ListOptions::default()).await.unwrap();
     assert_eq!(items.len(), 2);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
@@ -1503,7 +1510,7 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
     );
 
     let listed = ws
-        .list_sandbox_templates(SandboxTemplateListOptions::default())
+        .list_all_sandbox_templates(SandboxTemplateListOptions::default())
         .await
         .unwrap();
     assert_eq!(listed.len(), 2);
@@ -1514,7 +1521,7 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
     );
 
     client
-        .list_sandbox_templates_all_workspaces(SandboxTemplateListOptions::default())
+        .list_all_sandbox_templates_all_workspaces(SandboxTemplateListOptions::default())
         .await
         .unwrap();
     let observed_all = state.last_template_list.lock().await.clone().unwrap();
@@ -1551,7 +1558,7 @@ async fn list_sandboxes_all_workspaces_sets_flag() {
     let client = connect(&endpoint).await;
 
     let items = client
-        .list_sandboxes_all_workspaces(ListOptions::default())
+        .list_all_sandboxes_all_workspaces(ListOptions::default())
         .await
         .unwrap();
     assert_eq!(items.len(), 2);
@@ -1600,7 +1607,7 @@ async fn list_workspaces_returns_all() {
     let client = connect(&endpoint).await;
 
     let workspaces = client
-        .list_workspaces(ListOptions::default())
+        .list_all_workspaces(ListOptions::default())
         .await
         .unwrap();
     assert_eq!(workspaces.len(), 2);

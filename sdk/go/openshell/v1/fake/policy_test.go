@@ -64,11 +64,12 @@ func TestFakePolicy_GetStatus_EmptyReturnsNotFound(t *testing.T) {
 	assert.True(t, types.IsNotFound(err))
 }
 
-func TestFakePolicy_List_EmptyReturnsNil(t *testing.T) {
+func TestFakePolicy_List_EmptyReturnsNonNil(t *testing.T) {
 	c := newFakePolicyClient(func() bool { return false })
-	revisions, err := c.List(context.Background(), "default")
+	revisions, err := c.ListAll(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
-	assert.Nil(t, revisions)
+	assert.NotNil(t, revisions)
+	assert.Empty(t, revisions)
 }
 
 func TestFakePolicy_EditDraftChunk_ReturnsUnimplemented(t *testing.T) {
@@ -96,7 +97,7 @@ func TestFakePolicy_List_Global(t *testing.T) {
 	c.AddRevision("default", "sb-1", types.SandboxPolicyRevision{Version: 1, PolicyHash: "sha256:sb-v1", Status: types.PolicyLoadStatusLoaded})
 
 	// List global revisions.
-	revisions, err := c.List(context.Background(), "", types.WithListGlobal(true))
+	revisions, err := c.ListAll(context.Background(), "", "", types.WithListGlobal(true))
 	require.NoError(t, err)
 	require.Len(t, revisions, 2)
 	assert.Equal(t, uint32(1), revisions[0].Version)
@@ -113,7 +114,7 @@ func TestFakePolicy_List_Sandbox(t *testing.T) {
 	c.AddRevision("default", "sb-1", types.SandboxPolicyRevision{Version: 2, PolicyHash: "sha256:sb-v2", Status: types.PolicyLoadStatusPending})
 
 	// List sandbox-scoped revisions (no global flag).
-	revisions, err := c.List(context.Background(), "default")
+	revisions, err := c.ListAll(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
 	require.Len(t, revisions, 2)
 	assert.Equal(t, "sha256:sb-v1", revisions[0].PolicyHash)
@@ -127,9 +128,10 @@ func TestFakePolicy_List_NoIsolationCrossContamination(t *testing.T) {
 	c.AddRevision("default", "sb-1", types.SandboxPolicyRevision{Version: 1, PolicyHash: "sha256:sb-v1"})
 
 	// Global list returns empty (no global revisions seeded).
-	revisions, err := c.List(context.Background(), "", types.WithListGlobal(true))
+	revisions, err := c.ListAll(context.Background(), "", "", types.WithListGlobal(true))
 	require.NoError(t, err)
-	assert.Nil(t, revisions)
+	assert.NotNil(t, revisions)
+	assert.Empty(t, revisions)
 }
 
 func TestFakePolicy_List_GlobalPageSizeStillReturnsAll(t *testing.T) {
@@ -139,7 +141,7 @@ func TestFakePolicy_List_GlobalPageSizeStillReturnsAll(t *testing.T) {
 	c.AddGlobalRevision(types.SandboxPolicyRevision{Version: 2})
 	c.AddGlobalRevision(types.SandboxPolicyRevision{Version: 3})
 
-	revisions, err := c.List(context.Background(), "", types.WithListGlobal(true), types.WithPageSize(2))
+	revisions, err := c.ListAll(context.Background(), "", "", types.WithListGlobal(true), types.WithPageSize(2))
 	require.NoError(t, err)
 	require.Len(t, revisions, 3)
 	assert.Equal(t, uint32(1), revisions[0].Version)
@@ -229,14 +231,14 @@ func TestFakePolicy_DeepCopyWithPolicy(t *testing.T) {
 	ctx := context.Background()
 
 	// Get global revision and mutate it.
-	revisions, err := fc.Policy().List(ctx, "", types.WithListGlobal(true))
+	revisions, err := fc.Policy().ListAll(ctx, "", "", types.WithListGlobal(true))
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
 	require.NotNil(t, revisions[0].Policy)
 	revisions[0].Policy.NetworkPolicies["rule-1"] = types.NetworkPolicyRule{Name: "mutated"}
 
 	// Verify internal state is not corrupted.
-	revisions2, err := fc.Policy().List(ctx, "", types.WithListGlobal(true))
+	revisions2, err := fc.Policy().ListAll(ctx, "", "", types.WithListGlobal(true))
 	require.NoError(t, err)
 	assert.Equal(t, "rule-1", revisions2[0].Policy.NetworkPolicies["rule-1"].Name)
 
@@ -249,7 +251,7 @@ func TestFakePolicy_DeepCopyWithPolicy(t *testing.T) {
 
 func TestFakePolicy_List_ClosedReturnsUnavailable(t *testing.T) {
 	c := newFakePolicyClient(func() bool { return true })
-	_, err := c.List(context.Background(), "", types.WithListGlobal(true))
+	_, err := c.ListAll(context.Background(), "", "", types.WithListGlobal(true))
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

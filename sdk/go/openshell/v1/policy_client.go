@@ -129,34 +129,41 @@ func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName str
 	return converter.PolicyStatusResultFromProto(resp), nil
 }
 
-func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
+func (p *policyClient) List(workspace, sandboxName string, opts ...ListPolicyOption) (*Pager[SandboxPolicyRevision], error) {
 	cfg := types.ApplyListPolicyOptions(opts)
 	if cfg.PageSize() < 0 {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "page size must not be negative"}
 	}
-	req := &pb.ListSandboxPoliciesRequest{
-		PageSize: cfg.PageSize(),
-		Global:   cfg.Global(),
+	if !cfg.Global() && sandboxName == "" {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	if !cfg.Global() {
-		req.WorkspaceScope = namedWorkspaceScope(workspace)
-	}
-	var result []SandboxPolicyRevision
-	for {
+	return newPager(cfg.PageToken(), func(ctx context.Context, pageToken string) (*Page[SandboxPolicyRevision], error) {
+		req := &pb.ListSandboxPoliciesRequest{
+			Name: sandboxName, PageSize: cfg.PageSize(), PageToken: pageToken, Global: cfg.Global(),
+		}
+		if !cfg.Global() {
+			req.WorkspaceScope = namedWorkspaceScope(workspace)
+		}
 		resp, err := p.client.ListSandboxPolicies(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
+		result := make([]SandboxPolicyRevision, 0, len(resp.GetRevisions()))
 		for _, revision := range resp.GetRevisions() {
 			if converted := converter.SandboxPolicyRevisionFromProto(revision); converted != nil {
 				result = append(result, *converted)
 			}
 		}
-		if resp.GetNextPageToken() == "" {
-			return result, nil
-		}
-		req.PageToken = resp.GetNextPageToken()
+		return &Page[SandboxPolicyRevision]{Items: result, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (p *policyClient) ListAll(ctx context.Context, workspace, sandboxName string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
+	pager, err := p.List(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
 	}
+	return pager.All(ctx)
 }
 
 func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error {
