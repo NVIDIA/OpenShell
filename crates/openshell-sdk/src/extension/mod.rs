@@ -9,5 +9,6 @@
 mod auth;
 
 pub use auth::{
-    AuthenticatedCaller, ExtensionCallerKind, GatewayJwtAuthenticator, VerificationError,
+    AuthenticatedCaller, DEFAULT_TRUST_DOMAIN, ExtensionCallerKind, GatewayJwtAuthenticator,
+    GatewayJwtAuthenticatorBuilder, VerificationError,
 };

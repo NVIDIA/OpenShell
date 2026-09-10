@@ -168,12 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cert = read(&config.tls_cert).await?;
     let key = read(&config.tls_key).await?;
     let public_key = read(&config.gateway_public_key).await?;
-    let authenticator = GatewayJwtAuthenticator::from_ed25519_pem(
-        &public_key,
-        config.gateway_key_id,
-        config.gateway_issuer,
-        config.audience.clone(),
-    )?;
+    let authenticator =
+        GatewayJwtAuthenticator::builder(config.gateway_issuer, config.audience.clone())
+            .ed25519_pem(config.gateway_key_id, &public_key)
+            .build()?;
     let service = ScriptedMiddleware {
         authenticator: Arc::new(authenticator),
         audience: config.audience,

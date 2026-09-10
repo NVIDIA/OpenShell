@@ -4492,6 +4492,7 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-sdk",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
