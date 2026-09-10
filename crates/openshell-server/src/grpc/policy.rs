@@ -3215,7 +3215,13 @@ pub(super) async fn handle_update_config(
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
+    let result = Box::pin(handle_update_config_inner(
+        state,
+        request,
+        &principal,
+        sandbox_caller,
+    ))
+    .await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -4599,7 +4605,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
-            && let Err(err) = auto_approve_chunk(
+            && let Err(err) = Box::pin(auto_approve_chunk(
                 state,
                 &effective_id,
                 AutoApproveChunkContext {
@@ -4608,7 +4614,7 @@ pub(super) async fn handle_submit_policy_analysis(
                     source: &req.analysis_mode,
                     resolved_from,
                 },
-            )
+            ))
             .await
         {
             persist_pending_application_error(state, &effective_id, &err).await;

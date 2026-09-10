@@ -156,8 +156,11 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// Handles Cloudflare Access and OIDC auth modes by loading the stored token
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
-fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let _ = apply_auth_with_status(tls, gateway_name);
+fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) -> Result<()> {
+    if let Some(error) = apply_auth_with_status(tls, gateway_name) {
+        return Err(miette::miette!(error));
+    }
+    Ok(())
 }
 
 /// Apply stored authentication and return a user-facing preparation failure,
@@ -206,12 +209,17 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
-                        // Use the expired token anyway — server will reject it
-                        // with a clear error prompting re-login.
-                        tls.oidc_token = Some(bundle.access_token);
-                        Some(format!(
-                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
-                        ))
+                        if openshell_bootstrap::oidc_token::is_token_actually_expired(&bundle) {
+                            Some(format!(
+                                "OIDC token refresh failed: {e}\ncached OIDC token has expired; run `openshell gateway login {gateway_name}`"
+                            ))
+                        } else {
+                            tls.oidc_token = Some(bundle.access_token);
+                            eprintln!(
+                                "Warning: OIDC token refresh failed; continuing with the cached token: {e}"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -264,7 +272,6 @@ const HELP_TEMPLATE: &str = "\
   gateway:     Manage gateways
   status:      Show gateway status and information
   whoami:      Show the authenticated user identity
-  inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
@@ -399,12 +406,6 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell gateway select my-gateway
   $ openshell gateway info
   $ openshell gateway remove my-gateway
-";
-
-const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
-  $ openshell inference set --provider openai --model gpt-4
-  $ openshell inference get
-  $ openshell inference update --model gpt-4-turbo
 ";
 
 const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
@@ -606,13 +607,6 @@ enum Commands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
-    },
-
-    /// Manage inference configuration.
-    #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
-    Inference {
-        #[command(subcommand)]
-        command: Option<InferenceCommands>,
     },
 
     // ===================================================================
@@ -1247,80 +1241,6 @@ enum GatewayCommands {
 }
 
 // -----------------------------------------------------------------------
-// Inference commands
-// -----------------------------------------------------------------------
-
-#[derive(Subcommand, Debug)]
-enum InferenceCommands {
-    /// Set workspace-level inference provider and model.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Set {
-        /// Provider name.
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: String,
-
-        /// Model identifier to force for generation calls.
-        #[arg(long)]
-        model: String,
-
-        /// Configure the system inference route instead of the user-facing
-        /// route. System inference is used by platform functions (e.g. the
-        /// agent harness) and is not accessible to user code.
-        #[arg(long)]
-        system: bool,
-
-        /// Skip endpoint verification before saving the route.
-        #[arg(long)]
-        no_verify: bool,
-
-        /// Request timeout in seconds for inference calls (0 = default 60s).
-        #[arg(long, default_value_t = 0)]
-        timeout: u64,
-    },
-
-    /// Update workspace-level inference configuration (partial update).
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Update {
-        /// Provider name (unchanged if omitted).
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: Option<String>,
-
-        /// Model identifier (unchanged if omitted).
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Target the system inference route.
-        #[arg(long)]
-        system: bool,
-
-        /// Skip endpoint verification before saving the route.
-        #[arg(long)]
-        no_verify: bool,
-
-        /// Request timeout in seconds for inference calls (0 = default 60s, unchanged if omitted).
-        #[arg(long)]
-        timeout: Option<u64>,
-    },
-
-    /// Get workspace-level inference provider and model.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Get {
-        /// Show the system inference route instead of the user-facing route.
-        /// When omitted, both routes are displayed.
-        #[arg(long)]
-        system: bool,
-    },
-
-    /// Delete a workspace-level inference route.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Delete {
-        /// Delete the system inference route instead of the user-facing route.
-        #[arg(long)]
-        system: bool,
-    },
-}
-
-// -----------------------------------------------------------------------
 // Doctor (diagnostic) commands
 // -----------------------------------------------------------------------
 
@@ -1355,16 +1275,17 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
         template: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
-        /// to a Dockerfile or directory containing one, or a full container
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
+        /// tar archive (`.tar`, `.tar.gz`, or `.tgz`), or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
-        /// When given a Dockerfile or directory, the image is built into the
-        /// local Docker daemon before creating the sandbox.
+        /// To use a local Dockerfile, build and tag it with the container
+        /// engine used by your local gateway, then pass the resulting image
+        /// reference here. A rootfs tar is staged for the VM compute driver.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
@@ -2381,12 +2302,6 @@ fn run_main() -> Result<()> {
 
 #[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
 async fn run_async() -> Result<()> {
-    // Install the rustls crypto provider before completion runs — completers may
-    // establish TLS connections to the gateway.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
-
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
@@ -2506,7 +2421,7 @@ async fn run_async() -> Result<()> {
             GatewayCommands::Info { output } => {
                 if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
                 } else {
                     run::gateway_info_not_configured()?;
@@ -2574,7 +2489,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Whoami { output }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
         }
 
@@ -2677,7 +2592,7 @@ async fn run_async() -> Result<()> {
             } => {
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 let local = local.unwrap_or_else(|| target_port.to_string());
                 run::service_forward_tcp(
@@ -2699,7 +2614,7 @@ async fn run_async() -> Result<()> {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 run::sandbox_forward(
                     &ctx.endpoint,
@@ -2730,7 +2645,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match command {
                 ServiceCommands::Expose {
                     sandbox,
@@ -2792,7 +2707,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
             run::sandbox_logs(
                 &ctx.endpoint,
@@ -2816,7 +2731,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
                 PolicyCommands::Set {
                     name,
@@ -2970,7 +2885,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match settings_cmd {
                 SettingsCommands::Get { name, global, json } => {
@@ -3049,7 +2964,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
                 DraftCommands::Get { name, status } => {
                     let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3111,69 +3026,6 @@ async fn run_async() -> Result<()> {
                 DraftCommands::History { name } => {
                     let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                     run::sandbox_draft_history(&ctx.endpoint, &name, &cli.workspace, &tls).await?;
-                }
-            }
-        }
-
-        // -----------------------------------------------------------
-        // Inference commands
-        // -----------------------------------------------------------
-        Some(Commands::Inference {
-            command: Some(command),
-        }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
-            let endpoint = &ctx.endpoint;
-            let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
-            match command {
-                InferenceCommands::Set {
-                    provider,
-                    model,
-                    system,
-                    no_verify,
-                    timeout,
-                } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_set(
-                        endpoint,
-                        &provider,
-                        &model,
-                        route_name,
-                        no_verify,
-                        timeout,
-                        &cli.workspace,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Update {
-                    provider,
-                    model,
-                    system,
-                    no_verify,
-                    timeout,
-                } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_update(
-                        endpoint,
-                        provider.as_deref(),
-                        model.as_deref(),
-                        route_name,
-                        no_verify,
-                        timeout,
-                        &cli.workspace,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Get { system } => {
-                    let route_name = if system { Some("sandbox-system") } else { None };
-                    run::gateway_inference_get(endpoint, route_name, &cli.workspace, &tls).await?;
-                }
-                InferenceCommands::Delete { system } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_delete(endpoint, route_name, &cli.workspace, &tls)
-                        .await?;
                 }
             }
         }
@@ -3275,7 +3127,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let exit_code = Box::pin(run::sandbox_create(
                         endpoint,
                         &ctx.name,
@@ -3318,7 +3170,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
                     run::sandbox_upload(
                         &ctx.endpoint,
@@ -3338,7 +3190,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
                     eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
                     run::sandbox_sync_down(
@@ -3356,7 +3208,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     match other {
                         SandboxCommands::Create { .. }
                         | SandboxCommands::Upload { .. }
@@ -3615,7 +3467,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 WorkspaceCommands::Create { name, labels } => {
@@ -3681,7 +3533,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 ProviderCommands::Create {
@@ -3896,7 +3748,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
@@ -3940,7 +3792,7 @@ async fn run_async() -> Result<()> {
                         None => tls,
                     };
                     if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g);
+                        apply_auth(&mut effective_tls, g)?;
                     }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
@@ -3959,7 +3811,7 @@ async fn run_async() -> Result<()> {
                         meta.gateway_endpoint
                     };
                     let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g);
+                    apply_auth(&mut tls, &g)?;
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
@@ -4028,13 +3880,6 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("gateway")
                 .expect("gateway subcommand exists")
-                .print_help()
-                .expect("Failed to print help");
-        }
-        Some(Commands::Inference { command: None }) => {
-            Cli::command()
-                .find_subcommand_mut("inference")
-                .expect("inference subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -4230,11 +4075,6 @@ mod tests {
                 "Dockerfile",
             ),
             (
-                vec!["openshell", "sandbox", "create", "--from", "Do"],
-                4,
-                "Dockerfile",
-            ),
-            (
                 vec![
                     "openshell",
                     "sandbox",
@@ -4388,6 +4228,11 @@ mod tests {
     }
 
     #[test]
+    fn managed_inference_is_not_a_command() {
+        assert!(Cli::try_parse_from(["openshell", "inference", "get"]).is_err());
+    }
+
+    #[test]
     fn hidden_aliases_still_parse() {
         let cli = Cli::try_parse_from(["openshell", "lg", "sandbox-1"])
             .expect("hidden aliases should still parse");
@@ -4395,54 +4240,6 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Logs { name: Some(ref name), .. }) if name == "sandbox-1"
-        ));
-    }
-
-    #[test]
-    fn inference_set_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "set",
-            "--provider",
-            "openai-dev",
-            "--model",
-            "gpt-4.1",
-            "--no-verify",
-        ])
-        .expect("inference set should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Set {
-                    no_verify: true,
-                    ..
-                })
-            })
-        ));
-    }
-
-    #[test]
-    fn inference_update_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "update",
-            "--provider",
-            "openai-dev",
-            "--no-verify",
-        ])
-        .expect("inference update should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Update {
-                    no_verify: true,
-                    ..
-                })
-            })
         ));
     }
 
@@ -4459,20 +4256,12 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_and_download_use_path_value_hints() {
+    fn sandbox_download_uses_path_value_hint() {
         let cmd = Cli::command();
         let sandbox = cmd
             .get_subcommands()
             .find(|c| c.get_name() == "sandbox")
             .expect("missing sandbox subcommand");
-        let create = sandbox
-            .get_subcommands()
-            .find(|c| c.get_name() == "create")
-            .expect("missing create subcommand");
-        let from = create
-            .get_arguments()
-            .find(|arg| arg.get_id() == "from")
-            .expect("missing from argument");
         let download = sandbox
             .get_subcommands()
             .find(|c| c.get_name() == "download")
@@ -4482,7 +4271,6 @@ mod tests {
             .find(|arg| arg.get_id() == "dest")
             .expect("missing dest argument");
 
-        assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
     }
 
@@ -4645,7 +4433,7 @@ mod tests {
             store_edge_token("edge-gateway", "token-123").unwrap();
 
             let mut tls = TlsOptions::default();
-            apply_auth(&mut tls, "edge-gateway");
+            apply_auth(&mut tls, "edge-gateway").unwrap();
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });

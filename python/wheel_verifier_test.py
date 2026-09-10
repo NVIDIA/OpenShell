@@ -32,7 +32,7 @@ def _wheel_files() -> set[str]:
         "openshell/py.typed",
         "openshell/_proto/__init__.py",
     }
-    for stem in ("datamodel", "inference", "openshell", "options", "sandbox"):
+    for stem in ("datamodel", "openshell", "options", "sandbox"):
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")

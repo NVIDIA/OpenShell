@@ -53,6 +53,13 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -605,11 +612,6 @@ impl OpenShell for TestOpenShell {
 // ---------------------------------------------------------------------------
 // TLS / PKI helpers (used by TLS integration tests)
 // ---------------------------------------------------------------------------
-
-/// Initialise the rustls crypto provider (idempotent).
-pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
 
 /// PKI bundle: CA cert, server cert+key, client cert+key (all PEM).
 #[allow(clippy::struct_field_names)]

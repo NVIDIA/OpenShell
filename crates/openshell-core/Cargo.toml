@@ -16,7 +16,7 @@ openshell-extension-core = { path = "../openshell-extension-core" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-ring"] }
+tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
 tonic-prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -31,7 +31,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"], optional = true }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots-no-provider"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
 

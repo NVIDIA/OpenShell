@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# False positives only; unimplemented hardening and accepted risks stay visible.
+# The script passes this YAML file explicitly and requires each exception to use
+# `**/<concrete-basename>`, which matches source and packaged-chart paths.
+# Trivy cannot scope Helm exceptions to one occurrence, so keep IDs and paths
+# narrow.
+
+misconfigurations:
+  # The namespace comes from `helm install -n`, not the rendered workload.
+  - id: KSV-0110
+    paths:
+      - "**/statefulset.yaml"
+      - "**/deployment.yaml"
+    statement: >-
+      An artifact of rendering the chart outside a cluster. The namespace is
+      supplied at install time.
+
+  # The ConfigMap stores an external Secret key name, not a credential.
+  - id: KSV-01010
+    paths:
+      - "**/gateway-config.yaml"
+    statement: >-
+      The ConfigMap holds the name of a key in an external Secret, not a
+      credential.
+
+  # Trivy cannot add this project's GHCR namespace to its trusted registries.
+  - id: KSV-0125
+    paths:
+      - "**/statefulset.yaml"
+      - "**/deployment.yaml"
+    statement: >-
+      Images come from ghcr.io/nvidia/openshell, this project's own registry.

@@ -18,6 +18,14 @@ use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
+#[cfg(test)]
+pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
+    POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.sql.as_ref())
+}
+
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]

@@ -205,8 +205,7 @@ trait — there is no separate binary, no surrogate, and no tonic adapter.
 
 #### Workload and software availability
 
-MXC does not consume the `openshell sandbox create --from Dockerfile` / OCI image
-model used by Linux container runtimes. For current support, the sandbox runs Windows
+MXC does not consume the OCI image model used by Linux container runtimes. For current support, the sandbox runs Windows
 software already present on the host or made available through explicit MXC
 filesystem grants, with the driver supplying the agent command, working
 directory, environment, credentials, and policy-derived MXC configuration.

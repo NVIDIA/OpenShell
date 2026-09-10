@@ -43,7 +43,7 @@ Recommends:     podman
 OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
 It offers a CLI for managing gateway registrations, sandboxes, and providers with
 policy-enforced egress routing, credential proxying, and privacy-aware
-LLM inference routing.
+profile-backed model-provider access.
 
 # --- Gateway sub-package ---
 %package gateway
@@ -71,7 +71,7 @@ Recommends:     %{name}
 
 %description -n python3-%{name}
 Python SDK for OpenShell providing programmatic access to sandbox
-management, agent execution, and inference routing via gRPC.
+management, agent execution, and provider access via gRPC.
 
 %prep
 %autosetup -n %{name}-%{version}

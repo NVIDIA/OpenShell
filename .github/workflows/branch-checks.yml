@@ -120,7 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}

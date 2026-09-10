@@ -23,7 +23,6 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
-openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
@@ -84,12 +83,12 @@ base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
-ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
+sqlx-core = { workspace = true }
 reqwest = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sts = { workspace = true }
@@ -123,8 +122,8 @@ test-support = []
 
 [dev-dependencies]
 base64 = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
-rcgen = { version = "0.13", features = ["crypto", "pem"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
+rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"

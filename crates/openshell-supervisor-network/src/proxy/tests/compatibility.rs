@@ -545,7 +545,6 @@ network_policies:
                                     Arc::new(AtomicU32::new(0)),
                                     None,
                                     None,
-                                    None,
                                     AgentProposals::default(),
                                     Arc::new(None),
                                     Arc::new(None),

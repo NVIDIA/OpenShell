@@ -33,22 +33,17 @@ jobs:
           - arch: x86_64
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.glibc-2-28
-            interpreter: /lib64/ld-linux-x86-64.so.2
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.glibc-2-28
-            interpreter: /lib/ld-linux-aarch64.so.1
           - arch: aarch64
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
-            dev_shell: .#devShells.aarch64-darwin.default
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
       run:
-        shell: nix develop ${{ matrix.dev_shell }} -c bash -euo pipefail {0}
+        shell: nix develop -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,7 +77,5 @@ jobs:
           package: openshell-driver-vm
           binary: openshell-driver-vm
           triple: ${{ matrix.triple }}
-          dev-shell: ${{ matrix.dev_shell }}
           cargo-version: ${{ inputs['cargo-version'] }}
           image-tag: ${{ inputs['image-tag'] }}
-          interpreter: ${{ matrix.interpreter }}

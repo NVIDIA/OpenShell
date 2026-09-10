@@ -11,9 +11,9 @@ use crate::{
     HostAction, OpenShellRunner, PlanRun, Poll, Scenario, ScenarioFuture, WorkloadExpectation,
 };
 
-const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(240);
+const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
+const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+const RECOVERY_TIMEOUT: Duration = Duration::from_mins(4);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]

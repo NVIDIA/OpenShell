@@ -1,25 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test inference routing through both inference.local and direct endpoint access.
+"""Test native NVIDIA inference with non-streaming and streaming requests.
 
-Exercises four scenarios to verify streaming works correctly:
-  1. inference.local — non-streaming
-  2. inference.local — streaming
-  3. Direct NVIDIA endpoint (L7 TLS intercept) — non-streaming
-  4. Direct NVIDIA endpoint (L7 TLS intercept) — streaming
-
-The direct endpoint tests verify that the L7 REST relay path (relay_chunked /
-relay_until_eof) streams responses incrementally, in contrast with the
-inference.local interception path which previously buffered the entire body.
+OpenShell attaches a profile-backed provider to supply endpoint-bound
+``NVIDIA_API_KEY`` credentials and matching network policy. The client selects
+the native endpoint, model, request shape, and timeout.
 
 Usage:
-  # inference.local only (no provider attached):
-  openshell sandbox create --policy sandbox-policy.yaml --upload inference.py \
-    -- python3 /sandbox/inference.py
-
-  # All 4 tests (attach the nvidia provider so NVIDIA_API_KEY is available):
-  openshell sandbox create --provider nvidia --policy sandbox-policy.yaml \
+  openshell sandbox create --provider nvidia-demo --policy sandbox-policy.yaml \
     --upload inference.py -- python3 /sandbox/inference.py
 """
 
@@ -113,26 +102,16 @@ DIRECT_MODEL = "meta/llama-3.1-8b-instruct"
 
 
 def main() -> None:
-    # --- inference.local tests (router injects auth + model) ---
-    local_client = OpenAI(api_key="dummy", base_url="https://inference.local/v1")
-
-    run_non_streaming(local_client, "inference.local", model="router")
-    run_streaming(local_client, "inference.local", model="router")
-
-    # --- Direct endpoint tests (L7 TLS intercept path) ---
-    # The API key is available when the sandbox is started with --provider nvidia.
     api_key = os.environ.get("NVIDIA_API_KEY")
-    if api_key:
-        direct_client = OpenAI(api_key=api_key, base_url=DIRECT_URL)
+    if not api_key:
+        raise SystemExit(
+            "NVIDIA_API_KEY is unavailable; attach the nvidia-demo provider "
+            "and launch a new process"
+        )
 
-        run_non_streaming(direct_client, f"direct ({DIRECT_URL})", model=DIRECT_MODEL)
-        run_streaming(direct_client, f"direct ({DIRECT_URL})", model=DIRECT_MODEL)
-    else:
-        print("=" * 60)
-        print("SKIPPED — direct endpoint tests (NVIDIA_API_KEY not set)")
-        print("=" * 60)
-        print("  Attach the nvidia provider to enable: --provider nvidia")
-        print()
+    client = OpenAI(api_key=api_key, base_url=DIRECT_URL, timeout=300)
+    run_non_streaming(client, DIRECT_URL, model=DIRECT_MODEL)
+    run_streaming(client, DIRECT_URL, model=DIRECT_MODEL)
 
 
 if __name__ == "__main__":

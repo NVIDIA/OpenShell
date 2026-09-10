@@ -1,166 +1,69 @@
-# Inference Routing Example
+# Provider-backed Inference Example
 
-This example demonstrates OpenShell's inference interception and routing.
-A sandbox process sends inference traffic to `inference.local`, and
-OpenShell intercepts and reroutes it to the configured backend.
-
-## How It Works
-
-1. The sandbox process sends HTTPS traffic to `inference.local`.
-2. The sandbox proxy intercepts that explicit inference endpoint locally.
-3. The proxy TLS-terminates, parses the HTTP request, and detects known
-   inference patterns (e.g., `POST /v1/chat/completions`).
-4. Matching requests are forwarded to the configured backend via the sandbox's
-   local router. Non-inference requests are denied.
+This example calls the NVIDIA API Catalog through its native OpenAI-compatible
+endpoint. OpenShell supplies endpoint-bound credentials and network policy from
+an explicitly imported provider profile; the Python client owns the endpoint,
+model, request shape, timeout, and streaming behavior.
 
 ## Files
 
 | File | Description |
 |---|---|
-| `inference.py` | Python script that tests streaming and non-streaming inference through `inference.local` |
-| `sandbox-policy.yaml` | Minimal sandbox policy (no network access except `inference.local`) |
-| `routes.yaml` | Example YAML route file for standalone (no-cluster) mode |
+| `nvidia-inference.yaml` | Example profile for the endpoint, credential, and allowed Python binaries |
+| `inference.py` | Native endpoint streaming and non-streaming client |
+| `sandbox-policy.yaml` | Minimal policy that lets Python install the OpenAI client from PyPI |
 
-## Quick Start (NVIDIA)
+## Run the Example
 
-Requires a running OpenShell gateway and `NVIDIA_API_KEY` set in your shell.
+Export the built-in profile as a starting point and compare it with the example
+before import. A custom profile must use a new ID; built-in IDs are reserved.
 
-```bash
-# 1. Create a provider using your NVIDIA credentials
-openshell provider create --name nvidia --type nvidia --credential NVIDIA_API_KEY
+```shell
+openshell provider profile export nvidia -o yaml > /tmp/nvidia-profile.yaml
+diff -u /tmp/nvidia-profile.yaml examples/local-inference/nvidia-inference.yaml
+openshell provider profile lint -f examples/local-inference/nvidia-inference.yaml
+openshell provider profile import -f examples/local-inference/nvidia-inference.yaml
+```
 
-# 2. Configure inference routing
-openshell inference set --provider nvidia --model meta/llama-3.1-8b-instruct
+Create the provider from the local `NVIDIA_API_KEY`, then attach it to the new
+sandbox:
 
-# 3. Run the test script in a sandbox
+```shell
+openshell provider create \
+  --name nvidia-demo \
+  --type nvidia-inference \
+  --from-existing
+
 openshell sandbox create \
+  --name inference-demo \
+  --provider nvidia-demo \
   --policy examples/local-inference/sandbox-policy.yaml \
   --upload examples/local-inference/inference.py \
   -- python3 /sandbox/inference.py
 ```
 
-Expected output (with the streaming buffering bug present):
+The profile contributes the NVIDIA endpoint to the effective network policy and
+injects an opaque `NVIDIA_API_KEY` placeholder. The proxy substitutes the real
+key only for requests that match the profile endpoint. Inspect the composed
+policy with:
 
-```text
-============================================================
-NON-STREAMING REQUEST
-============================================================
-  model   = meta/llama-3.1-8b-instruct
-  content = Glowing screens abide
-            Whirring circuits, silent mind
-            Tech's gentle grasp
-  total   = 0.96s
-
-============================================================
-STREAMING REQUEST
-============================================================
-  TTFB    = 0.54s
-  model   = meta/llama-3.1-8b-instruct
-  content = Glowing screens abide
-            Code and circuits whisper
-            Silent digital
-  total   = 0.54s
-
-  ** BUG: TTFB is 99% of total time — response was buffered, not streamed **
+```shell
+openshell policy get inference-demo --full
 ```
 
-When streaming works correctly, TTFB should be sub-second while total time
-stays the same (tokens arrive incrementally).
+To change the endpoint or allowed client binaries, export the custom profile,
+edit it, and submit its `resource_version` with `profile update`. The workload
+still needs a native client configuration that matches the profile.
 
-## Standalone (no cluster)
-
-Run the sandbox binary directly with a route file — no gateway needed:
-
-```bash
-# 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
-
-# 2. Run the sandbox with --inference-routes
-openshell-sandbox \
-  --inference-routes examples/local-inference/routes.yaml \
-  --policy-rules <your-policy.rego> \
-  --policy-data examples/local-inference/sandbox-policy.yaml \
-  -- python examples/local-inference/inference.py
+```shell
+openshell provider profile export nvidia-inference -o yaml > nvidia-inference.yaml
+# Edit nvidia-inference.yaml.
+openshell provider profile lint -f nvidia-inference.yaml
+openshell provider profile update nvidia-inference -f nvidia-inference.yaml
 ```
 
-The sandbox loads routes from the YAML file at startup and routes inference
-requests locally — no gRPC server or cluster required.
+Delete the sandbox when finished:
 
-### With a gateway
-
-#### 1. Start an OpenShell gateway
-
-```bash
-mise run gateway:docker
-openshell status
-```
-
-#### 2. Configure gateway inference
-
-First make sure a provider record exists for the backend you want to use:
-
-```bash
-openshell provider list
-```
-
-Then configure the gateway-managed `inference.local` route:
-
-```bash
-# Example: use an existing provider record
-openshell inference set \
-  --provider openai-prod \
-  --model nvidia/nemotron-3-nano-30b-a3b
-```
-
-Verify the active config:
-
-```bash
-openshell inference get
-```
-
-#### 3. Run the example inside a sandbox
-
-```bash
-openshell sandbox create \
-  --policy examples/local-inference/sandbox-policy.yaml \
-  --name inference-demo \
-  -- python examples/local-inference/inference.py
-```
-
-The script targets `https://inference.local/v1` directly. OpenShell
-intercepts that connection and routes it to whatever backend gateway inference
-is configured to use.
-
-Expected output:
-
-```text
-model=<backend model name>
-content=NAV_OK
-```
-
-#### 4. (Optional) Interactive session
-
-```bash
-openshell sandbox connect inference-demo
-# Inside the sandbox:
-python examples/local-inference/inference.py
-```
-
-#### 5. Cleanup
-
-```bash
+```shell
 openshell sandbox delete inference-demo
 ```
-
-## Customizing Routes
-
-Edit `routes.yaml` to change which backend endpoint/model standalone mode uses.
-In gateway mode, use `openshell inference set` instead.
-
-## Supported Protocols
-
-| Pattern | Protocol | Kind |
-|---|---|---|
-| `POST /v1/chat/completions` | `openai_chat_completions` | Chat completion |
-| `POST /v1/completions` | `openai_completions` | Text completion |
-| `POST /v1/responses` | `openai_responses` | Responses API |
-| `POST /v1/messages` | `anthropic_messages` | Anthropic messages |

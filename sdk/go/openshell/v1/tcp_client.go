@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
@@ -43,9 +44,7 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 	}
 
 	var cfg forwardConfig
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.client.ForwardTcp(streamCtx)
@@ -103,9 +102,7 @@ func (t *tcpClient) Listen(ctx context.Context, workspace, sandboxName string, r
 	}
 
 	cfg := listenConfig{bindAddress: "127.0.0.1"}
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	if cfg.useSSHTunnel && t.ssh == nil {
 		return nil, &StatusError{

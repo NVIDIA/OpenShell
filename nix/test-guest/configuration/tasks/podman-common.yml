@@ -11,3 +11,9 @@
   ansible.builtin.package:
     name: podman
     state: present
+
+- name: Create test-guest state directory
+  ansible.builtin.file:
+    path: /etc/openshell-test-guest
+    state: directory
+    mode: "0755"

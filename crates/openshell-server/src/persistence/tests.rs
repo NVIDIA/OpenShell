@@ -133,6 +133,56 @@ async fn sqlite_connect_runs_embedded_migrations() {
 }
 
 #[tokio::test]
+async fn sqlite_inference_route_removal_migration_deletes_only_managed_routes() {
+    use sqlx::{Connection, SqliteConnection};
+
+    let migration = super::sqlite::embedded_migration_sql(7)
+        .expect("SQLite migrator must embed removal migration 007");
+    let mut connection = SqliteConnection::connect("sqlite::memory:")
+        .await
+        .expect("connect to migration test database");
+    sqlx::raw_sql(
+        "CREATE TABLE objects (object_type TEXT NOT NULL, id TEXT NOT NULL);\
+         INSERT INTO objects VALUES ('inference_route', 'managed-route');\
+         INSERT INTO objects VALUES ('sandbox', 'preserved-sandbox');",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("seed pre-migration objects");
+
+    sqlx::raw_sql(migration)
+        .execute(&mut connection)
+        .await
+        .expect("run SQLite removal migration");
+
+    let remaining: Vec<(String, String)> =
+        sqlx::query_as("SELECT object_type, id FROM objects ORDER BY object_type, id")
+            .fetch_all(&mut connection)
+            .await
+            .expect("read migrated objects");
+    assert_eq!(
+        remaining,
+        vec![("sandbox".to_string(), "preserved-sandbox".to_string())],
+        "removal migration must purge managed routes without touching other objects"
+    );
+}
+
+#[test]
+fn embedded_migrators_include_inference_route_removal() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(7)),
+        ("postgres", super::postgres::embedded_migration_sql(7)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 007"));
+        assert!(
+            sql.contains("DELETE FROM objects WHERE object_type = 'inference_route'"),
+            "{backend} migration 007 must purge managed inference route objects"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
         let store = super::sqlite::SqliteStore::connect(url)
