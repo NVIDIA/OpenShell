@@ -48,16 +48,16 @@ use openshell_core::proto::{
     ListWorkspacesResponse, MemoryResourceCapabilities, ProviderProfileResponse, ProviderResponse,
     PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
     RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ResourceCapabilities,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxTemplateResponse,
+    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -590,6 +590,13 @@ impl OpenShell for OpenShellService {
         request: Request<ReportPolicyStatusRequest>,
     ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
         policy::handle_report_policy_status(&self.state, request).await
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        request: Request<ReportEndpointStatusRequest>,
+    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+        policy::handle_report_endpoint_status(&self.state, request).await
     }
 
     // --- Sandbox logs ---

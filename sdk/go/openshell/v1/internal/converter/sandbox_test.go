@@ -173,6 +173,74 @@ func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
 	assert.Equal(t, "kata", s.Spec.Template.DriverConfig["runtime"], "DriverConfig must be deep copied")
 }
 
+func TestSandboxFromProto_EndpointStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *pb.SandboxStatus
+	}{
+		{name: "nil status"},
+		{name: "nil endpoints", status: &pb.SandboxStatus{}},
+		{name: "empty endpoints", status: &pb.SandboxStatus{EndpointStatuses: []*pb.EndpointStatus{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := SandboxFromProto(&pb.Sandbox{Status: tc.status})
+			require.NotNil(t, s)
+			assert.Empty(t, s.Status.EndpointStatuses)
+		})
+	}
+
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{
+		Phase: pb.SandboxPhase_SANDBOX_PHASE_READY,
+		Conditions: []*pb.SandboxCondition{{
+			Type: "Ready", Status: "True", Reason: "AllGood", Message: "Sandbox is ready",
+		}},
+		EndpointStatuses: []*pb.EndpointStatus{
+			{EndpointId: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, LastReportedAt: "2026-09-11T10:00:00Z"},
+			{EndpointId: "endpoint-two", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other", LastResult: pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE},
+		},
+	}}
+
+	s := SandboxFromProto(input)
+	require.NotNil(t, s)
+	require.Equal(t, []v1.EndpointStatus{
+		{EndpointID: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: v1.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z"},
+		{EndpointID: "endpoint-two", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other", LastResult: v1.EndpointNoObservedExchange},
+	}, s.Status.EndpointStatuses)
+	assert.Equal(t, v1.SandboxReady, s.Status.Phase)
+	assert.Equal(t, []v1.SandboxCondition{{Type: "Ready", Status: "True", Reason: "AllGood", Message: "Sandbox is ready"}}, s.Status.Conditions)
+
+	// A response and its SDK representation must not share endpoint or port storage.
+	input.Status.EndpointStatuses[0].Host = "changed.example.test"
+	input.Status.EndpointStatuses[0].Ports[0] = 80
+	assert.Equal(t, "tools.example.test", s.Status.EndpointStatuses[0].Host)
+	assert.Equal(t, uint32(443), s.Status.EndpointStatuses[0].Ports[0])
+	s.Status.EndpointStatuses[1].Path = "/changed"
+	s.Status.EndpointStatuses[1].Ports[0] = 8080
+	assert.Equal(t, "/other", input.Status.EndpointStatuses[1].Path)
+	assert.Equal(t, uint32(443), input.Status.EndpointStatuses[1].Ports[0])
+}
+
+func TestEndpointResultFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		input pb.EndpointResult
+		want  v1.EndpointResult
+	}{
+		{pb.EndpointResult_ENDPOINT_RESULT_UNSPECIFIED, v1.EndpointUnspecified},
+		{pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE, v1.EndpointNoObservedExchange},
+		{pb.EndpointResult_ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED, v1.EndpointHTTPResponseReceived},
+		{pb.EndpointResult_ENDPOINT_RESULT_POLICY_DENIED, v1.EndpointPolicyDenied},
+		{pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE, v1.EndpointCredentialUnavailable},
+		{pb.EndpointResult_ENDPOINT_RESULT_TLS_FAILED, v1.EndpointTLSFailed},
+		{pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, v1.EndpointTransportFailed},
+		{pb.EndpointResult_ENDPOINT_RESULT_UPSTREAM_REJECTED, v1.EndpointUpstreamRejected},
+		{pb.EndpointResult(99), v1.EndpointUnspecified},
+	} {
+		t.Run(tc.input.String(), func(t *testing.T) {
+			assert.Equal(t, tc.want, endpointResultFromProto(tc.input))
+		})
+	}
+}
+
 func TestSandboxFromProto_NilFields(t *testing.T) {
 	proto := &pb.Sandbox{}
 

@@ -532,11 +532,48 @@ For automation, use `--output json` or `--output yaml` to get machine-readable s
 openshell sandbox get my-sandbox --output json
 ```
 
-Print only that policy YAML for scripting (same effective policy, no metadata):
+Print only the policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
 openshell sandbox get my-sandbox --policy-only
 ```
+
+### Diagnose Failed Calls to Tool Servers
+
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+
+JSON and YAML output include an `endpoint_statuses` list. The API and SDK expose it as `Sandbox.status.endpoint_statuses`. Each record contains `endpoint_id`, `host`, `ports`, `path`, `last_result`, and `last_reported_at`. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
+
+For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
+
+```shell
+openshell sandbox get my-sandbox --output json | jq -e \
+  --arg host tools.example.com --arg path /mcp --argjson ports '[443]' '
+  .endpoint_statuses[]
+  | select(.host == $host and .path == $path and .ports == $ports)
+  '
+```
+
+Read `last_result` to choose the next check:
+
+- `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
+- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
+- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version or request-body policy checks. Check the sandbox policy and denial logs.
+- `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
+- `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
+- `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
+- `UpstreamRejected`: the server returned an HTTP status of 400 or higher. Check the server's response and logs.
+- `Unspecified`: the result is unrecognized or absent. Do not infer success from it.
+
+For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After the server recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
+
+Results come from actual traffic and do not expire. A result can remain unchanged after the server stops until another observed exchange or configuration/session reset. Reports combine recent observations and can drop them when full, so this list is not a request history. The address remains available when a result resets to `NoObservedExchange`. To verify current tool availability, run the actual operation.
+
+`last_reported_at` is the RFC 3339 UTC time when the gateway accepted the result. It is empty until a result is reported. New accepted observations advance it, including repeated results; identical report retries do not. If a configuration reset supersedes a report whose acknowledgement was lost, the gateway can accept still-valid pending evidence again and advance this timestamp without another exchange.
+
+Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record that combines observations from all callers and ports; it does not establish that every caller or port works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one distinct endpoint. If several configured paths share that host and port, inspect the logs for the failure.
+
+### Inspect Logs and Activity
 
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 

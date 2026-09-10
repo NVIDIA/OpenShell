@@ -9,9 +9,11 @@
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
+use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
+use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
@@ -1947,6 +1949,7 @@ fn l7_matchers_to_json(
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+    let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
             serde_json::json!({
@@ -2128,6 +2131,17 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.provider_credentialed {
                         ep["provider_credentialed"] = true.into();
+                    }
+                    if is_mcp_protocol(&e.protocol) {
+                        // Derive endpoint identity from the policy endpoint while
+                        // it is still available. Request handling carries this
+                        // opaque value through exact path selection and never
+                        // recomputes identity from a concrete request host.
+                        ep["endpoint_id"] =
+                            openshell_core::endpoint_status::endpoint_id(e).into();
+                        // The selected endpoint must retain its policy identity
+                        // so it cannot bind to a replacement observation inventory.
+                        ep["policy_hash"] = policy_hash.clone().into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
@@ -5473,6 +5487,120 @@ network_policies:
                     .to_string()
                     .contains("mcp.versions is only valid for protocol mcp"),
                 "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn l7_endpoint_config_derives_endpoint_id_from_proto() {
+        let mut policy = defaultable_mcp_proto(None);
+        let endpoint = policy
+            .network_policies
+            .get_mut("mcp")
+            .and_then(|rule| rule.endpoints.first_mut())
+            .expect("MCP test endpoint");
+        endpoint.path = "/mcp".to_string();
+        let expected = openshell_core::endpoint_status::endpoint_id(endpoint);
+        policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .binaries = vec![NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+        }];
+        let canonical = openshell_policy::validate_and_canonicalize_sandbox_policy(policy.clone())
+            .expect("canonical MCP test policy");
+        let expected_hash = deterministic_policy_hash(&canonical);
+        let engine = OpaEngine::from_proto(&policy).expect("engine from proto");
+        let config = engine
+            .query_endpoint_config(&NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("query endpoint config")
+            .expect("MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse MCP config");
+        assert_eq!(
+            l7.endpoint_id, expected,
+            "OPA must carry the ID derived from the exact proto endpoint"
+        );
+        assert_eq!(l7.policy_hash, expected_hash);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_mcp_policy_keeps_endpoint_observation_identity() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, endpoint_id,
+            endpoint_status_channel,
+        };
+        use openshell_core::policy_identity::deterministic_policy_hash;
+
+        for protocol in ["Mcp", "MCP"] {
+            let mut policy = defaultable_mcp_proto(None);
+            let rule = policy
+                .network_policies
+                .get_mut("mcp")
+                .expect("MCP test rule");
+            rule.endpoints[0].protocol = protocol.to_string();
+            rule.binaries = vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }];
+            let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+                .expect("mixed-case MCP policy is valid");
+            let expected_id = endpoint_id(&policy.network_policies["mcp"].endpoints[0]);
+            let (sender, mut receiver) = endpoint_status_channel();
+            let mut tracker = receiver.tracker();
+            sender
+                .reset(
+                    EndpointConfigVersion {
+                        policy_hash: deterministic_policy_hash(&policy),
+                        provider_env_revision: 1,
+                    },
+                    vec![EndpointInventoryEntry {
+                        endpoint_id: expected_id.clone(),
+                        uses_provider_credentials: false,
+                    }],
+                )
+                .await
+                .expect("install mixed-case MCP inventory");
+            assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
+            let engine = OpaEngine::from_proto(&policy).expect("engine from mixed-case MCP proto");
+            let selected = engine
+                .query_endpoint_config(&NetworkInput {
+                    host: "mcp.example.com".into(),
+                    port: 443,
+                    binary_path: PathBuf::from("/usr/bin/curl"),
+                    binary_sha256: String::new(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                })
+                .expect("query mixed-case MCP endpoint")
+                .expect("mixed-case MCP endpoint config");
+            let selected =
+                crate::l7::parse_l7_config(&selected).expect("parse selected MCP config");
+            assert_eq!(selected.protocol, crate::l7::L7Protocol::Mcp);
+            assert_eq!(
+                selected.endpoint_id, expected_id,
+                "{protocol} must retain inventory identity"
+            );
+            let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
+                .expect("mixed-case MCP endpoint begins an observation");
+            observer.observe(EndpointResult::HttpResponseReceived);
+            while let Ok(command) = receiver.try_recv() {
+                tracker.apply(command);
+            }
+            let snapshot = tracker
+                .snapshot()
+                .expect("mixed-case MCP inventory remains installed");
+            assert_eq!(snapshot.endpoints.len(), 1);
+            assert_eq!(snapshot.endpoints[0].endpoint_id, expected_id);
+            assert_eq!(
+                snapshot.endpoints[0].result,
+                EndpointResult::HttpResponseReceived
             );
         }
     }

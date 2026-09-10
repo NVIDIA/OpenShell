@@ -694,6 +694,14 @@ pub(crate) async fn run_server(
                 error.message()
             ))
         })?;
+    grpc::policy::invalidate_endpoint_status_on_startup(&state)
+        .await
+        .map_err(|error| {
+            Error::execution(format!(
+                "tool server endpoint-status startup reconciliation failed: {}",
+                error.message()
+            ))
+        })?;
 
     let gateway_listeners = bind_gateway_listeners(
         config.bind_address,

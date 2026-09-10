@@ -361,6 +361,26 @@ auth file without the acknowledgement, and the acknowledgement without an
 auth file, so credentials are never sent in cleartext without an explicit
 operator decision.
 
+## Tool server connection status
+
+A sandbox can be `Ready` while a call to an external tool server fails. For configured endpoints that use MCP over HTTP, OpenShell records the last observed network result beside the endpoint's address. Users can identify the server and distinguish policy denial, unavailable credentials, TLS or network failure, and an upstream HTTP rejection without combining client and supervisor logs. These observations do not affect sandbox lifecycle readiness.
+
+```mermaid
+flowchart LR
+    Traffic[Calls to configured tool servers] --> Observer[Observe network result]
+    Observer --> Reporter[Background reporter]
+    Reporter --> Gateway[Validate and store results]
+    Gateway --> Status[Endpoint address, last result, report time]
+```
+
+The gateway exposes one record per configured endpoint in `Sandbox.status.endpoint_statuses`. Each record contains its address, an opaque identifier, a typed result, and the time the gateway accepted that result. The address remains available when evidence resets to `NoObservedExchange`. Ordinary sandbox conditions continue to describe lifecycle and platform state.
+
+Network observers send only the endpoint identifier and a fixed result classification, without credentials, payloads, or raw upstream errors. Requests capture observation authority before selecting policy or credentials, then bind the selected policy hash and provider revision to that capture. Observation handles also identify the installed endpoint inventory and supervisor authority, so a concurrent update cannot attribute an old request to a new configuration, and reinstalling the same configuration cannot revive an obsolete request. The sandbox reporter coalesces observations and retries an immutable snapshot through `ReportEndpointStatus`. Bounded delivery can drop observations, so endpoint status is not a complete request history.
+
+The gateway validates the reporting supervisor's session, configuration revisions, and report sequence before atomically storing results. Global policy writes share the report's synchronization boundary. An effective policy change resets all endpoint evidence; repeated acknowledgements and metadata-only policy revisions preserve it. A provider environment change resets evidence for endpoints that depend on those credentials. Supervisor disconnection or replacement and gateway restart also invalidate observation authority. Identical report retries leave timestamps unchanged. After an inventory reset, still-valid pending evidence can be accepted again if an acknowledgement was lost, advancing the report time without another exchange.
+
+These are passive observations with no expiry. `HttpResponseReceived` means the server returned a final HTTP status below 400, including a protocol upgrade; that response can still contain an MCP error. Informational responses alone do not establish success. MCP protocol-version and request-body policy rejections produce `PolicyDenied`. A failure before the HTTP path is known updates status only when the host and port identify one distinct endpoint. Ambiguous failures remain in structured events and logs. Results combine callers and effective ports for an endpoint. Consumers that need current tool availability must verify an actual operation. The sandbox management guide explains the public fields and results.
+
 ## Credentials
 
 Provider credentials are stored at the gateway and fetched by the supervisor at
