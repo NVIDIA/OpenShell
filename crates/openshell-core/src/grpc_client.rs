@@ -85,16 +85,48 @@ struct AcquiredToken {
 }
 
 fn install_token_slot(token: &str) -> Result<TokenSlot> {
-    let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+    let bearer = validate_gateway_bearer(token)?;
+    Ok(install_validated_token_slot(bearer))
+}
+
+fn validate_gateway_bearer(token: &str) -> Result<AsciiMetadataValue> {
+    AsciiMetadataValue::try_from(format!("Bearer {token}"))
         .into_diagnostic()
-        .wrap_err("sandbox JWT contained characters not valid for a header value")?;
+        .wrap_err("sandbox JWT contained characters not valid for a header value")
+}
+
+fn install_validated_token_slot(bearer: AsciiMetadataValue) -> TokenSlot {
     if let Some(existing) = TOKEN_SLOT.get() {
-        *existing.write().expect("token slot poisoned") = bearer;
-        return Ok(existing.clone());
+        *existing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bearer;
+        return existing.clone();
     }
     let slot: TokenSlot = Arc::new(RwLock::new(bearer));
     let _ = TOKEN_SLOT.set(slot.clone());
-    Ok(TOKEN_SLOT.get().cloned().unwrap_or(slot))
+    TOKEN_SLOT.get().cloned().unwrap_or(slot)
+}
+
+#[cfg(feature = "jwt")]
+struct ValidatedSandboxRefresh {
+    token: crate::jwt::SecretJwt,
+    expires_at: i64,
+    credential_epoch: crate::jwt::CredentialEpoch,
+}
+
+#[cfg(feature = "jwt")]
+fn validate_sandbox_refresh(
+    response: &crate::proto::RefreshSandboxTokenResponse,
+) -> std::result::Result<ValidatedSandboxRefresh, crate::jwt::SessionJwtError> {
+    let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())?;
+    let credential_epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
+    let expires_at = response.sandbox_expires_at_ms / 1000;
+    crate::jwt::SessionBearerTokenSlot::new(token.clone(), expires_at, credential_epoch)?;
+    Ok(ValidatedSandboxRefresh {
+        token,
+        expires_at,
+        credential_epoch,
+    })
 }
 
 /// Install the gateway-session credential supplied in trusted supervisor
@@ -380,28 +412,37 @@ async fn refresh_token_loop(
         {
             Ok(resp) => {
                 let response = resp.into_inner();
-                let new_token = response.token;
-                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                    Ok(value) => {
-                        if let Ok(mut guard) = slot.write() {
-                            *guard = value;
-                            info!("renewed gateway sandbox JWT in-place");
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
-                }
                 #[cfg(feature = "jwt")]
-                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
-                    let update =
-                        crate::jwt::SecretJwt::parse(response.sandbox_token).and_then(|token| {
-                            let epoch =
-                                crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
-                            sandbox_slot.update(token, response.sandbox_expires_at_ms / 1000, epoch)
-                        });
-                    if let Err(error) = update {
+                let sandbox_refresh = match validate_sandbox_refresh(&response) {
+                    Ok(refresh) => refresh,
+                    Err(error) => {
                         warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
+                        continue;
                     }
+                };
+                let gateway_bearer = match validate_gateway_bearer(&response.token) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(%error, "refreshed JWT contained invalid header bytes");
+                        continue;
+                    }
+                };
+
+                *slot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway_bearer;
+                #[cfg(feature = "jwt")]
+                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get()
+                    && let Err(error) = sandbox_slot.update(
+                        sandbox_refresh.token,
+                        sandbox_refresh.expires_at,
+                        sandbox_refresh.credential_epoch,
+                    )
+                    && error != crate::jwt::SessionJwtError::StaleCredentialEpoch
+                {
+                    warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
                 }
+                info!("renewed gateway and Sandbox Protocol credentials in-place");
             }
             Err(status) => {
                 if status.code() == tonic::Code::Unauthenticated
@@ -494,28 +535,11 @@ async fn refresh_extension_credentials_with_client(
         .wrap_err("failed to refresh extension service credentials")?
         .into_inner();
 
-    // The same refresh response renews the gateway credential. Install it
-    // before returning so all process-wide gateway clients stay current. This
-    // is a superset of what the dedicated renewal loop would do, so letting it
-    // land early is harmless.
-    install_token_slot(&response.token)?;
+    let gateway_bearer = validate_gateway_bearer(&response.token)?;
     #[cfg(feature = "jwt")]
-    if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
-        let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())
-            .into_diagnostic()
-            .wrap_err("gateway returned an invalid Sandbox Protocol token")?;
-        let epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)
-            .into_diagnostic()
-            .wrap_err("gateway returned an invalid Sandbox Protocol credential epoch")?;
-        match sandbox_slot.update(token, response.sandbox_expires_at_ms / 1000, epoch) {
-            Ok(()) | Err(crate::jwt::SessionJwtError::StaleCredentialEpoch) => {}
-            Err(error) => {
-                return Err(miette::miette!(
-                    "gateway returned an invalid Sandbox Protocol credential: {error}"
-                ));
-            }
-        }
-    }
+    let sandbox_refresh = validate_sandbox_refresh(&response)
+        .into_diagnostic()
+        .wrap_err("gateway returned an invalid Sandbox Protocol credential")?;
 
     // Validate the whole response before mutating any slot, so a malformed or
     // partial reply cannot leave the store half-rotated.
@@ -544,6 +568,32 @@ async fn refresh_extension_credentials_with_client(
     }
 
     let now_ms = now_ms();
+    for (token, expires_at_ms) in validated.values() {
+        BearerTokenSlot::new(token, *expires_at_ms)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid extension credential")?;
+    }
+
+    // Commit only after the gateway, Sandbox Protocol, and extension
+    // credentials have all been parsed and validated. The remaining updates
+    // repeat those validations but cannot fail for the validated inputs.
+    install_validated_token_slot(gateway_bearer);
+    #[cfg(feature = "jwt")]
+    if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+        match sandbox_slot.update(
+            sandbox_refresh.token,
+            sandbox_refresh.expires_at,
+            sandbox_refresh.credential_epoch,
+        ) {
+            Ok(()) | Err(crate::jwt::SessionJwtError::StaleCredentialEpoch) => {}
+            Err(error) => {
+                return Err(miette::miette!(
+                    "validated Sandbox Protocol credential could not be installed: {error}"
+                ));
+            }
+        }
+    }
+
     let mut selected = HashMap::with_capacity(validated.len());
     for (name, (token, expires_at_ms)) in validated {
         let slot = store
@@ -602,6 +652,22 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_rejects_invalid_lifetime_before_installation() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expires_at_ms: 999,
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_sandbox_refresh(&response).err(),
+            Some(crate::jwt::SessionJwtError::InvalidLifetime)
+        );
+    }
 
     #[test]
     fn parse_jwt_exp_reads_unsigned_payload() {
