@@ -102,6 +102,67 @@ func TestWithTimeout_ExplicitZeroNotOverridden(t *testing.T) {
 	assert.Zero(t, cfg.timeout)
 }
 
+func TestWithTimeout_NegativeMeansNoDeadline(t *testing.T) {
+	var cfg loginConfig
+	WithTimeout(-1 * time.Second)(&cfg)
+	cfg.applyDefaults()
+
+	// Every flow gates on timeout > 0, so a negative duration means
+	// "no deadline" exactly as zero does. It is not replaced by the default.
+	assert.True(t, cfg.timeoutSet)
+	assert.Negative(t, cfg.timeout)
+}
+
+// Interactive flows authenticate a user, so the request must carry the
+// "openid" scope regardless of what the caller asked for. This mirrors
+// build_scopes in crates/openshell-cli/src/oidc_auth.rs.
+func TestRequireOpenIDScope(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []LoginOption
+		want []string
+	}{
+		{
+			name: "unset scopes keep the defaults",
+			opts: nil,
+			want: []string{"openid", "profile", "email"},
+		},
+		{
+			name: "explicit empty still requests openid",
+			opts: []LoginOption{WithScopes()},
+			want: []string{"openid"},
+		},
+		{
+			name: "application scopes gain openid",
+			opts: []LoginOption{WithScopes("sandbox:read", "sandbox:write")},
+			want: []string{"openid", "sandbox:read", "sandbox:write"},
+		},
+		{
+			name: "existing openid is not duplicated",
+			opts: []LoginOption{WithScopes("openid", "profile")},
+			want: []string{"openid", "profile"},
+		},
+		{
+			name: "openid is normalized to the front",
+			opts: []LoginOption{WithScopes("profile", "openid", "email")},
+			want: []string{"openid", "profile", "email"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg loginConfig
+			for _, opt := range tt.opts {
+				opt(&cfg)
+			}
+			cfg.applyDefaults()
+			cfg.requireOpenIDScope()
+
+			assert.Equal(t, tt.want, cfg.scopes)
+		})
+	}
+}
+
 func TestWithKeyboardFlow(t *testing.T) {
 	var cfg loginConfig
 	WithKeyboardFlow()(&cfg)

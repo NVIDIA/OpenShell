@@ -120,6 +120,84 @@ func TestDeviceLogin_Success(t *testing.T) {
 
 // TestDeviceLogin_MissingIssuer verifies that DeviceLogin returns
 // ErrOIDCConfig when the issuer is not provided.
+// DeviceLogin authenticates a user, so the device authorization request must
+// carry "openid" on the wire even when the caller supplied its own scopes.
+func TestDeviceLogin_AlwaysRequestsOpenIDScope(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []LoginOption
+		want string
+	}{
+		{
+			name: "unset scopes send the defaults",
+			opts: nil,
+			want: "openid profile email",
+		},
+		{
+			name: "explicit empty still sends openid",
+			opts: []LoginOption{WithScopes()},
+			want: "openid",
+		},
+		{
+			name: "application scopes gain openid",
+			opts: []LoginOption{WithScopes("sandbox:read")},
+			want: "openid sandbox:read",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDiscoveryCache()
+
+			var requestedScope string
+			var scopeSeen atomic.Bool
+			mux := http.NewServeMux()
+			var srv *httptest.Server
+
+			mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"issuer":                        srv.URL,
+					"authorization_endpoint":        srv.URL + "/authorize",
+					"token_endpoint":                srv.URL + "/token",
+					"device_authorization_endpoint": srv.URL + "/device",
+				})
+			})
+			mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				requestedScope = r.Form.Get("scope")
+				scopeSeen.Store(true)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"device_code":      "test-device-code",
+					"user_code":        "ABCD-1234",
+					"verification_uri": "https://example.com/activate",
+					"expires_in":       300,
+					"interval":         1,
+				})
+			})
+			mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tokenResponseJSON("device-access-token", "", 3600)))
+			})
+
+			srv = httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			opts := append([]LoginOption{
+				WithIssuer(srv.URL),
+				WithClientID("device-client"),
+				WithDisplayFunc(func(_, _ string) {}),
+			}, tt.opts...)
+
+			_, err := DeviceLogin(ctx, opts...)
+			require.NoError(t, err)
+			require.True(t, scopeSeen.Load(), "device authorization endpoint was not called")
+			assert.Equal(t, tt.want, requestedScope)
+		})
+	}
+}
+
 func TestDeviceLogin_MissingIssuer(t *testing.T) {
 	resetDiscoveryCache()
 
