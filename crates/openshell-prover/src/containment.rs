@@ -1124,6 +1124,13 @@ fn counterexample_from_model(
 fn model_string_exact(model: &z3::Model, value: &Z3String) -> Option<String> {
     let evaluated = model.eval(value, true)?;
     let decoded = evaluated.as_string()?;
+    // Some Z3 versions expose non-ASCII UTF-8 bytes through `Z3_get_string`
+    // as `\u{..}` sequences. The binding does not distinguish that encoding
+    // from literal text, so do not risk publishing the serialization as a
+    // concrete witness.
+    if decoded.contains("\\u{") {
+        return None;
+    }
     let reconstructed = Z3String::from_str(&decoded).ok()?;
     (evaluated.eq(reconstructed).simplify().as_bool() == Some(true)).then_some(decoded)
 }
