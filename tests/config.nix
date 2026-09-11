@@ -1,14 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{ pkgs, toolchains }:
+{
+  pkgs,
+  toolchains,
+  qemuPkgs ? pkgs,
+  firmwarePkgs ? pkgs,
+}:
 
 let
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
   gnuTarget = toolchains.${if isAarch64 then "aarch64-gnu" else "x86_64-gnu"}.target;
   muslTarget = toolchains.${if isAarch64 then "aarch64-musl" else "x86_64-musl"}.target;
-  images = import ./images.nix { inherit pkgs; };
-  tmachine = pkgs.callPackage ./tmachine { };
+  images = import ./images.nix {
+    inherit pkgs qemuPkgs firmwarePkgs;
+  };
+  tmachine = pkgs.callPackage ./tmachine {
+    OVMF = firmwarePkgs.OVMF;
+  };
+  qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
   config = (pkgs.formats.yaml { }).generate "tmachine-config.yaml" {
     machines = [
       {
@@ -98,7 +108,7 @@ let
   runner = pkgs.writeShellApplication {
     name = "tmachine";
     runtimeInputs = [
-      pkgs.qemu
+      qemu
       pkgs.ansible
       pkgs.sshpass
     ];

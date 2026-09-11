@@ -45,6 +45,7 @@
           overlays = [ (import rust-overlay) ];
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
+        tmachineRuntimePkgs = if pkgs.stdenv.hostPlatform.isDarwin then testGuestPkgs else pkgs;
         commonDevShellPackages =
           with pkgs;
           [
@@ -121,7 +122,11 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
-        testMachines = import ./tests/config.nix { inherit pkgs toolchains; };
+        testMachines = import ./tests/config.nix {
+          inherit pkgs toolchains;
+          qemuPkgs = tmachineRuntimePkgs;
+          firmwarePkgs = tmachineRuntimePkgs;
+        };
         artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
       in
       {
