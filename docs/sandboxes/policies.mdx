@@ -326,10 +326,12 @@ The incremental update surface is split into endpoint-level operations and metho
 | `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
 | `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
-| `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
-| `--timeout <SECS>` | Sets the timeout for `--wait`. | Extend the wait window for slower sandboxes. |
+| `--wait` | Asks the gateway to wait on the durable update operation until the exact revision is applied or reaches another terminal state. | Confirm the change took effect before continuing. |
+| `--timeout <SECS>` | Sets the server-side timeout for `--wait`. A timeout does not roll back the committed update. | Extend the wait window for slower sandboxes. |
 
 `--wait` and `--dry-run` cannot be used together.
+If the wait times out, the error includes the durable operation ID so a client
+can query its later result without resubmitting the mutation.
 
 ### Add Endpoint Compared to Allow and Deny
 

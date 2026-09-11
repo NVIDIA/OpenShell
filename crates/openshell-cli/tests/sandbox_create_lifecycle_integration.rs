@@ -18,14 +18,13 @@ use openshell_core::proto::{
     DetachSandboxProviderResponse, ExchangeProviderSubjectTokenRequest,
     ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
     GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
-    GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
-    ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
-    SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxRequest,
+    GetSandboxTemplateRequest, GpuResourceRequirements, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
+    ListSandboxesRequest, ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine,
+    SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest, sandbox_stream_event,
 };
@@ -359,15 +358,6 @@ impl OpenShell for TestOpenShell {
             settings: self.state.global_settings.lock().await.clone(),
             settings_revision: 1,
         }))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
     }
 
     async fn create_ssh_session(
@@ -803,6 +793,17 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
     ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
+    }
+
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
     }
 
     async fn update_config(

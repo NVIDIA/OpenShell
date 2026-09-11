@@ -22,7 +22,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Supervisor connections and policy recovery
 
-Current supervisors open `ConnectSupervisor` before initializing gateway-owned runtime state and require a complete configuration bootstrap before the gateway accepts the session as initialized. They apply later policy, settings, middleware, and provider snapshots from that stream without configuration fetch polling. If first-start image policy discovery or image-specific baseline enrichment changes policy, the supervisor commits that repair and reconnects before installing the fresh stream bootstrap; it does not initialize from the mutation response. The gateway gives bootstrap construction the same bounded 45-second window as other snapshot builds and rejects the connection when construction fails or times out. Immediately previous supervisors retain the Stage 1 compatibility behavior: the gateway waits at most one second for an optional bootstrap, accepts the session without it when necessary, and relies on supervisor polling for configuration.
+Current supervisors open `ConnectSupervisor` before initializing gateway-owned runtime state and require a complete configuration bootstrap before the gateway accepts the session as initialized. They apply later policy, settings, middleware, and provider snapshots from that stream without configuration fetch polling. If first-start image policy discovery or image-specific baseline enrichment changes policy, the supervisor commits that repair and reconnects before installing the fresh stream bootstrap; it does not initialize from the mutation response. The gateway gives bootstrap construction the same bounded 45-second window as other snapshot builds and rejects the connection when construction fails or times out. Gateway and supervisor protocol revisions must match exactly; deployments upgrade those components together rather than falling back to polling for older peers.
 
 On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
 
@@ -155,6 +155,19 @@ enable_loopback_service_http = true
 
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false
+
+# Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
+# when the driver-specific table does not override them.
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+# Defaults to the gateway version. The gateway and supervisor use a
+# release-matched internal protocol revision; every other revision rejects the
+# session so configuration is never applied through a removed fallback path.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
+client_tls_secret_name  = "openshell-client-tls"
+service_account_name    = "openshell-sandbox"
+host_gateway_ip         = "10.0.0.1"
+enable_user_namespaces  = false
+sa_token_ttl_secs       = 3600
 
 # Guest TLS paths remain gateway settings. TLS-enabled Docker, Podman, and VM
 # gateways require a complete bundle unless package-managed local TLS supplies

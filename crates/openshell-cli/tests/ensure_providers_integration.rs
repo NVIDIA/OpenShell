@@ -19,8 +19,7 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    GetSandboxConfigResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
@@ -201,15 +200,6 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         Ok(Response::new(GetGatewayConfigResponse::default()))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
     }
 
     async fn create_ssh_session(
@@ -528,6 +518,17 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
     ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
+    }
+
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
     }
 
     async fn update_config(

@@ -4,7 +4,7 @@
 //! Shared state controlling agent-driven policy proposals.
 //!
 //! Initialised once during sandbox start from the `agent_policy_proposals_enabled`
-//! setting and updated by the policy poll loop or authoritative sidecar control
+//! setting and updated by the stream configuration loop or authoritative sidecar control
 //! when the setting changes. Read by the `policy.local` route handler and by
 //! the skills installer to gate the agent-controlled mutation surface.
 

@@ -447,6 +447,16 @@ service OpenShell {
     };
   }
 
+  // Get a durable sandbox configuration update operation by id.
+  rpc GetConfigUpdateOperation(GetConfigUpdateOperationRequest)
+      returns (GetConfigUpdateOperationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Get the load status of a specific policy version.
   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
       returns (GetSandboxPolicyStatusResponse) {
@@ -470,14 +480,6 @@ service OpenShell {
   // Report policy load result (called by sandbox after reload attempt).
   rpc ReportPolicyStatus(ReportPolicyStatusRequest)
       returns (ReportPolicyStatusResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
-  }
-
-  // Get provider environment for a sandbox (called by sandbox supervisor at startup).
-  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
-      returns (GetSandboxProviderEnvironmentResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -2273,6 +2275,55 @@ message UpdateConfigRequest {
   // Explicit workspace scope for sandbox-scoped updates. Omit only when
   // `global` is true; the all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 11;
+  // Controls whether the RPC returns after commit or after the runtime reaches
+  // a terminal apply result. Unspecified preserves commit-only compatibility.
+  ConfigUpdateConsistency consistency = 12;
+  // Optional retry key scoped to the sandbox. Reusing a key returns the
+  // original operation and never creates another desired-state revision.
+  string idempotency_key = 13;
+  // Server-side wait bound for WAIT_FOR_APPLY. Zero uses 60 seconds. The
+  // operation remains durable and may complete after this RPC times out.
+  uint32 wait_timeout_secs = 14;
+}
+
+enum ConfigUpdateConsistency {
+  CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED = 0;
+  CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY = 1;
+  CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_APPLY = 2;
+}
+
+enum ConfigUpdateOperationState {
+  CONFIG_UPDATE_OPERATION_STATE_UNSPECIFIED = 0;
+  CONFIG_UPDATE_OPERATION_STATE_PENDING = 1;
+  CONFIG_UPDATE_OPERATION_STATE_APPLIED = 2;
+  CONFIG_UPDATE_OPERATION_STATE_INACTIVE = 3;
+  CONFIG_UPDATE_OPERATION_STATE_FAILED = 4;
+  CONFIG_UPDATE_OPERATION_STATE_SUPERSEDED = 5;
+  CONFIG_UPDATE_OPERATION_STATE_CANCELLED = 6;
+}
+
+// Durable progress for one sandbox-scoped desired-state mutation. Snapshot
+// contents and credentials are never stored in this resource.
+message ConfigUpdateOperation {
+  string operation_id = 1;
+  string sandbox_id = 2;
+  ConfigComponent component = 3;
+  ConfigSnapshotRevision target_revision = 4;
+  ConfigUpdateOperationState state = 5;
+  ConfigApplyOutcome outcome = 6;
+  string sanitized_error = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+  int64 completed_at_ms = 10;
+}
+
+message GetConfigUpdateOperationRequest {
+  string operation_id = 1;
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+}
+
+message GetConfigUpdateOperationResponse {
+  ConfigUpdateOperation operation = 1;
 }
 
 message PolicyMergeOperation {
@@ -2330,6 +2381,9 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
+  // Durable apply operation for a changed sandbox-scoped mutation. Omitted
+  // for global changes and idempotent no-op updates.
+  ConfigUpdateOperation operation = 6;
 }
 
 // Get sandbox policy status request.
@@ -2576,6 +2630,9 @@ message SandboxConfigRevision {
   uint32 policy_version = 2;
   openshell.sandbox.v1.PolicySource policy_source = 3;
   uint32 global_policy_version = 4;
+  // Monotonic revision of the sandbox-scoped settings row. This disambiguates
+  // setting operations whose effective config fingerprint is equality-only.
+  uint64 settings_revision = 5;
 }
 
 enum ConfigApplyOutcome {

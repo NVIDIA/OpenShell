@@ -28,14 +28,14 @@ use openshell_core::proto::{
     DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
-    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
+    FinalizeMainProcessExitResponse, GatewayMessage, GetConfigUpdateOperationRequest,
+    GetConfigUpdateOperationResponse, GetCurrentUserRequest, GetCurrentUserResponse,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
     GpuResourceCapabilities, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
     ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
@@ -550,13 +550,6 @@ impl OpenShell for OpenShellService {
         policy::handle_get_gateway_config(&self.state, request).await
     }
 
-    async fn get_sandbox_provider_environment(
-        &self,
-        request: Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        policy::handle_get_sandbox_provider_environment(&self.state, request).await
-    }
-
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -569,6 +562,13 @@ impl OpenShell for OpenShellService {
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
         policy::handle_update_config(&self.state, request).await
+    }
+
+    async fn get_config_update_operation(
+        &self,
+        request: Request<GetConfigUpdateOperationRequest>,
+    ) -> Result<Response<GetConfigUpdateOperationResponse>, Status> {
+        policy::handle_get_config_update_operation(&self.state, request).await
     }
 
     async fn get_sandbox_policy_status(
