@@ -97,7 +97,6 @@ checksum = "sha256:0e91737aee2b5baf1d255b959630194a302335d848ff97bb07921eb6205b5
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_linux_amd64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001183"
 provenance = "github-attestations"
-provenance_verified = true
 
 [tools."github:anchore/syft"."platforms.macos-arm64"]
 checksum = "sha256:24e4d34078ae81da7c82539616f0ccac3e226cf4f74a38ce6fb3463619e50a55"
@@ -119,6 +118,11 @@ backend = "github:mozilla/sccache"
 checksum = "sha256:f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060468"
+
+[tools."github:mozilla/sccache"."platforms.linux-x64"]
+checksum = "sha256:aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060682"
 
 [tools."github:mozilla/sccache"."platforms.macos-arm64"]
 checksum = "sha256:ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430960"
@@ -157,7 +161,6 @@ checksum = "sha256:66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dc
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501882467"
 provenance = "github-attestations"
-provenance_verified = true
 
 [tools."github:nextest-rs/nextest"."platforms.macos-arm64"]
 checksum = "sha256:4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07"
@@ -452,15 +455,13 @@ version = "0.10.12"
 backend = "aqua:astral-sh/uv"
 
 [tools.uv."platforms.linux-arm64"]
-checksum = "sha256:0ed7d20f49f6b9b60d45fdfcac28f3ac01a671a6ef08672401ed2833423fea2a"
-url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491938"
+checksum = "sha256:55bd1c1c10ec8b95a8c184f5e18b566703c6ab105f0fc118aaa4d748aabf28e4"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-musl.tar.gz"
 provenance = "github-attestations"
 
 [tools.uv."platforms.linux-x64"]
-checksum = "sha256:ec72570c9d1f33021aa80b176d7baba390de2cfeb1abcbefca346d563bf17484"
-url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491996"
+checksum = "sha256:adccf40b5d1939a5e0093081ec2307ea24235adf7c2d96b122c561fa37711c46"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-musl.tar.gz"
 provenance = "github-attestations"
 
 [tools.uv."platforms.macos-arm64"]
