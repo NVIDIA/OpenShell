@@ -1,8 +1,6 @@
 name: Windows MSVC
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - main
@@ -36,6 +34,8 @@ jobs:
       - id: gate
         if: github.ref != 'refs/heads/main'
         uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:windows
 
   pr-check:
     name: PR lint and test (${{ matrix.arch }})
@@ -104,6 +104,8 @@ jobs:
 
   cache-seed:
     name: Seed cache (${{ matrix.arch }})
+    # Keep main/manual Windows validation advisory while the lane matures.
+    continue-on-error: true
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
@@ -164,6 +166,7 @@ jobs:
 
   build:
     name: Build binaries (${{ matrix.arch }})
+    continue-on-error: true
     needs: cache-seed
     strategy:
       fail-fast: false

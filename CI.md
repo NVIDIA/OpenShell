@@ -12,6 +12,12 @@ PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
+on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
+Windows checks are not required for merging and do not run in merge queues.
+Main and manual runs also build release binaries, with `continue-on-error: true`
+so Windows failures do not fail the workflow.
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
