@@ -403,7 +403,7 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
         authenticated_supervisor: true,
-        session_epoch: "epoch-1".to_string(),
+        session_id: SandboxSessionId::new(),
         driver_fence: DriverFenceEvidence::Vm {
             generation: "generation-1".to_string(),
             network_device_count: 0,

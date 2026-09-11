@@ -156,150 +156,33 @@ pub fn generate_sandbox_tls_material(
     })
 }
 
-/// Control-side endpoint for a driver-provisioned boundary.
-/// Supervisor-side mutual-TLS identity for one sandbox generation.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BoundaryClientTls {
-    /// DNS identity required from the sandbox certificate.
-    pub server_name: String,
-    /// Per-generation trust anchor for the sandbox certificate.
-    pub ca_certificate_pem: String,
-    /// Supervisor-only client certificate chain.
-    pub certificate_chain_pem: String,
-    /// Supervisor-only client private key.
-    pub private_key_pem: String,
-}
-
-impl fmt::Debug for BoundaryClientTls {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BoundaryClientTls")
-            .field("server_name", &self.server_name)
-            .field("ca_certificate_pem", &"<redacted>")
-            .field("certificate_chain_pem", &"<redacted>")
-            .field("private_key_pem", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Sandbox-side mutual-TLS files staged by a compute driver.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BoundaryServerTls {
-    /// Sandbox server certificate chain.
-    pub certificate_chain_path: PathBuf,
-    /// Sandbox server private key.
-    pub private_key_path: PathBuf,
-    /// Trust anchor used to require the generation-specific supervisor leaf.
-    pub client_ca_certificate_path: PathBuf,
-}
-
-/// Complete per-generation material returned only to a trusted driver.
-#[derive(Clone)]
-pub struct BoundaryMutualTlsMaterial {
-    pub server_name: String,
-    pub ca_certificate_pem: String,
-    pub sandbox_certificate_pem: String,
-    pub sandbox_private_key_pem: String,
-    pub supervisor_certificate_pem: String,
-    pub supervisor_private_key_pem: String,
-}
-
-/// Generate distinct server- and client-authentication leaves under a fresh CA.
-pub fn generate_boundary_mutual_tls_material() -> Result<BoundaryMutualTlsMaterial, BackendError> {
-    const SERVER_NAME: &str = "sandbox.openshell.internal";
-    let ca_key = KeyPair::generate()
-        .map_err(|error| BackendError::Descriptor(format!("generate boundary CA key: {error}")))?;
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "OpenShell sandbox channel CA");
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
-        BackendError::Descriptor(format!("generate boundary CA certificate: {error}"))
-    })?;
-
-    let sandbox_key = KeyPair::generate().map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox channel key: {error}"))
-    })?;
-    let mut sandbox_params = CertificateParams::new(vec![SERVER_NAME.to_string()])
-        .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
-    sandbox_params
-        .distinguished_name
-        .push(DnType::CommonName, "OpenShell sandbox");
-    sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
-        .map_err(|error| {
-            BackendError::Descriptor(format!("sign sandbox channel certificate: {error}"))
-        })?;
-
-    let supervisor_key = KeyPair::generate().map_err(|error| {
-        BackendError::Descriptor(format!("generate supervisor channel key: {error}"))
-    })?;
-    let mut supervisor_params = CertificateParams::default();
-    supervisor_params
-        .distinguished_name
-        .push(DnType::CommonName, "OpenShell supervisor");
-    supervisor_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let supervisor = supervisor_params
-        .signed_by(&supervisor_key, &ca, &ca_key)
-        .map_err(|error| {
-            BackendError::Descriptor(format!("sign supervisor channel certificate: {error}"))
-        })?;
-
-    Ok(BoundaryMutualTlsMaterial {
-        server_name: SERVER_NAME.to_string(),
-        ca_certificate_pem: ca.pem(),
-        sandbox_certificate_pem: sandbox.pem(),
-        sandbox_private_key_pem: sandbox_key.serialize_pem(),
-        supervisor_certificate_pem: supervisor.pem(),
-        supervisor_private_key_pem: supervisor_key.serialize_pem(),
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum BoundaryTransport {
-    /// Mutual TLS over a private Unix socket, including libkrun's host mapping.
-    Unix {
-        socket_path: PathBuf,
-        tls: BoundaryClientTls,
-    },
-    /// Mutual TLS over a runtime-scoped TCP endpoint.
-    TlsTcp {
-        address: std::net::SocketAddr,
-        tls: BoundaryClientTls,
-    },
-    /// Mutual TLS over Linux host `AF_VSOCK`.
-    Vsock {
-        guest_cid: u32,
-        control_port: u32,
-        tls: BoundaryClientTls,
-    },
-}
-
 /// Boundary-side listener provisioned by a compute driver.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BoundaryListener {
-    /// Mutual TLS over a private Unix socket shared with a companion.
+    /// TLS over a private Unix socket shared with the host supervisor.
     Unix {
         socket_path: PathBuf,
-        tls: BoundaryServerTls,
+        tls: SandboxTlsServerConfig,
     },
-    /// Mutual TLS over TCP. An unspecified IP is valid for the sandbox bind.
+    /// TLS over TCP. An unspecified IP is valid for the sandbox bind.
     TlsTcp {
         address: std::net::SocketAddr,
-        tls: BoundaryServerTls,
+        tls: SandboxTlsServerConfig,
     },
-    /// Mutual TLS over guest `AF_VSOCK`.
+    /// TLS over guest `AF_VSOCK`.
     Vsock {
         control_port: u32,
-        tls: BoundaryServerTls,
+        tls: SandboxTlsServerConfig,
     },
+}
+
+/// Public verification key staged in the sandbox's immutable auth bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayVerificationKey {
+    pub key_id: String,
+    pub public_key_pem: String,
 }
 
 /// Protected descriptor consumed by `openshell-supervisor`.
@@ -310,12 +193,14 @@ pub struct BoundaryTopology {
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
     pub generation: String,
-    /// Fresh session epoch shared with the sandbox bootstrap.
-    pub session_epoch: String,
+    /// Fresh gateway-issued identity for this exact launch.
+    pub session_id: SandboxSessionId,
     /// Immutable numeric identity already applied to the sandbox workload.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Driver-provisioned control endpoint.
-    pub transport: BoundaryTransport,
+    /// Driver-provisioned byte-stream endpoint.
+    pub transport: SandboxTransport,
+    /// Per-generation pinned TLS server identity.
+    pub tls: SandboxTlsClientConfig,
     /// Trusted dial target for well-known host-gateway aliases, when the
     /// network supervisor cannot use the boundary's resolver view.
     #[serde(default)]
@@ -326,8 +211,6 @@ pub struct BoundaryTopology {
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Concrete outer-fence evidence validated by the driver.
     pub driver_fence: DriverFenceEvidence,
-    /// Per-boundary authentication secret; never exposed to workload code.
-    pub bootstrap_token: String,
 }
 
 impl fmt::Debug for BoundaryTopology {
@@ -336,12 +219,12 @@ impl fmt::Debug for BoundaryTopology {
             .debug_struct("BoundaryTopology")
             .field("boundary_id", &self.boundary_id)
             .field("generation", &self.generation)
-            .field("session_epoch", &"<redacted>")
+            .field("session_id", &self.session_id)
             .field("transport", &self.transport)
+            .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
             .field("driver_fence", &self.driver_fence)
-            .field("bootstrap_token", &"<redacted>")
             .finish()
     }
 }
@@ -370,10 +253,12 @@ pub struct BoundaryConfig {
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
     pub generation: String,
-    /// Fresh session epoch for this sandbox/supervisor relationship.
-    pub session_epoch: String,
-    /// Per-boundary authentication secret.
-    pub bootstrap_token: String,
+    /// Fresh gateway-issued identity for this exact launch.
+    pub session_id: SandboxSessionId,
+    /// Gateway identity expected in Sandbox Protocol JWTs.
+    pub gateway_id: String,
+    /// Immutable current and staged-next gateway verification keys.
+    pub verification_keys: Vec<GatewayVerificationKey>,
     /// Driver-provisioned listener.
     pub listener: BoundaryListener,
     /// Immutable coordinates the boundary requires from the control-side
@@ -404,8 +289,16 @@ impl fmt::Debug for BoundaryConfig {
             .debug_struct("BoundaryConfig")
             .field("boundary_id", &self.boundary_id)
             .field("generation", &self.generation)
-            .field("session_epoch", &"<redacted>")
-            .field("bootstrap_token", &"<redacted>")
+            .field("session_id", &self.session_id)
+            .field("gateway_id", &self.gateway_id)
+            .field(
+                "verification_key_ids",
+                &self
+                    .verification_keys
+                    .iter()
+                    .map(|key| key.key_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("listener", &self.listener)
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
@@ -497,25 +390,17 @@ pub struct RequestEnvelope {
     pub request_id: String,
     /// SHA-256 of the canonically serialized request payload.
     pub payload_digest: String,
-    pub boundary_id: String,
-    pub bootstrap_token: String,
     pub request: Request,
 }
 
 impl RequestEnvelope {
     /// Build a request envelope with a fresh idempotency key and normalized
     /// payload digest.
-    pub fn new(
-        boundary_id: String,
-        bootstrap_token: String,
-        request: Request,
-    ) -> Result<Self, FrameError> {
+    pub fn new(request: Request) -> Result<Self, FrameError> {
         let payload_digest = request_payload_digest(&request)?;
         Ok(Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload_digest,
-            boundary_id,
-            bootstrap_token,
             request,
         })
     }
@@ -547,8 +432,6 @@ impl fmt::Debug for RequestEnvelope {
         formatter
             .debug_struct("RequestEnvelope")
             .field("request_id", &self.request_id)
-            .field("boundary_id", &self.boundary_id)
-            .field("bootstrap_token", &"<redacted>")
             .field("request", &self.request)
             .finish()
     }
@@ -1254,12 +1137,10 @@ mod tests {
     }
 
     #[test]
-    fn request_round_trips_and_redacts_token() {
+    fn request_round_trips_and_redacts_secrets() {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
-            boundary_id: "sandbox-1".to_string(),
-            bootstrap_token: "never-log-this".to_string(),
             request: Request::StartAgent {
                 sandbox_id: "sandbox-1".to_string(),
                 spec: AgentSpecWire {
@@ -1294,7 +1175,6 @@ mod tests {
         assert_eq!(decoded, request);
         let debug = format!("{request:?}");
         assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("never-log-this"));
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
         assert!(!debug.contains("test bundle"));
@@ -1320,12 +1200,8 @@ mod tests {
             request_payload_digest(&build(second)).expect("second digest")
         );
 
-        let mut envelope = RequestEnvelope::new(
-            "sandbox-1".to_string(),
-            "token".to_string(),
-            build(std::collections::HashMap::new()),
-        )
-        .expect("request envelope");
+        let mut envelope = RequestEnvelope::new(build(std::collections::HashMap::new()))
+            .expect("request envelope");
         envelope.request = Request::Terminate {
             process_id: "different".to_string(),
         };
