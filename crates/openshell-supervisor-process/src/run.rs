@@ -85,6 +85,12 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    main_instance_id: String,
+    prepared_supervisor_session: Option<crate::supervisor_session::PreparedSupervisorSession>,
+    prepared_bootstrap_result: Option<openshell_core::proto::ConfigBootstrapResult>,
+    config_apply_tx: Option<
+        tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
+    >,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -123,7 +129,13 @@ pub async fn run_process(
     // proposals flag is on at startup, rather than waiting for the policy
     // poll loop's first tick. In offline/file-mode there is no gateway, so
     // the flag stays at its default (false) and no skill is installed.
-    install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
+    install_initial_agent_skill(
+        sandbox_id,
+        openshell_endpoint,
+        &agent_proposals,
+        prepared_supervisor_session.is_none(),
+    )
+    .await;
 
     // Provider token grants may mount supervisor-only identity sockets such as
     // the SPIFFE Workload API. Prepare the child mount namespace that hides
@@ -271,7 +283,6 @@ pub async fn run_process(
 
     let main_pid = handle.pid();
     let main_session = crate::main_session::MainSession::new(handle.take_io(), main_pid);
-    let main_instance_id = uuid::Uuid::new_v4().to_string();
 
     // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
     // their env so cooperative tools (curl, npm, Node) route through the
@@ -367,17 +378,30 @@ pub async fn run_process(
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if let (Some(endpoint), Some(id), Some(socket)) =
-        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    let supervisor_session_task = if let (Some(prepared), Some(config_apply_tx)) =
+        (prepared_supervisor_session, config_apply_tx.clone())
     {
+        let task = crate::supervisor_session::spawn_prepared(
+            prepared,
+            prepared_bootstrap_result,
+            ssh_socket_path.clone().unwrap_or_default(),
+            ssh_netns_fd,
+            None,
+            Arc::clone(&supervisor_terminating),
+            config_apply_tx,
+        );
+        info!("prepared supervisor session task resumed");
+        Some(task)
+    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
         let task = crate::supervisor_session::spawn(
             endpoint.to_string(),
             id.to_string(),
-            socket.clone(),
+            ssh_socket_path.clone().unwrap_or_default(),
             ssh_netns_fd,
             None,
             Arc::clone(&supervisor_terminating),
             main_instance_id.clone(),
+            config_apply_tx,
         );
         info!("supervisor session task spawned");
         Some(task)
@@ -722,10 +746,12 @@ async fn install_initial_agent_skill(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     agent_proposals: &AgentProposals,
+    fetch_settings: bool,
 ) {
     use openshell_core::proto::setting_value;
 
-    if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
+    if fetch_settings
+        && let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
         && let Ok(client) =
             openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await
         && let Ok(result) = client.poll_settings(id).await

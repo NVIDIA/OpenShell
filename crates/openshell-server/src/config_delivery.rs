@@ -3,8 +3,7 @@
 
 //! Build and route complete supervisor configuration snapshots.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +12,8 @@ use metrics::counter;
 use openshell_core::proto::{
     ConfigBootstrap, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigSnapshot,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tonic::{Code, Status};
 use tracing::warn;
 
@@ -28,13 +28,21 @@ pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 const CONFIG_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 // Stage 1 bootstrap is optional. Keep credential backend stalls well below
 // the 15-second relay session-wait budget while polling remains authoritative.
-const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+pub const OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
+// Stage 2 supervisors apply the bootstrap directly, so allow the same bounded
+// build window as an ordinary complete snapshot before rejecting the session.
+pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = CONFIG_SNAPSHOT_BUILD_TIMEOUT;
 const MAX_ACTIVE_FANOUT_WORKERS: usize = 64;
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
 /// pool busy without stacking every waiter on the acquire timeout.
 const SNAPSHOT_BUILDS_PER_DB_CONNECTION: usize = 2;
 const MIN_CONCURRENT_SNAPSHOT_BUILDS: usize = 4;
+/// Admit scoped bursts independently of the database build bound. Workers
+/// waiting to build still count toward this limit.
+const MIN_CONCURRENT_DELIVERY_WORKERS: usize = 64;
+/// Includes running and queued component keys; payloads are built on dispatch.
+const MAX_PENDING_DELIVERIES: usize = 1024;
 
 /// One complete configuration component awaiting delivery to a supervisor.
 #[derive(Clone)]
@@ -65,6 +73,8 @@ impl fmt::Debug for SupervisorConfigMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryDisposition {
     Enqueued,
+    Coalesced,
+    SuppressedUnchanged,
     NoActiveSession,
     QueueFull,
     SessionClosed,
@@ -180,20 +190,30 @@ struct FanoutKey {
 
 /// Coalesces publications and bounds workers per sandbox and component.
 ///
-/// The map entry is also the worker lease. Its boolean is set when another
-/// mutation arrives during a build or route operation. The worker then rebuilds
-/// the current full snapshot once, regardless of how many mutations arrived.
-///
-/// Each pending map entry owns a delivery permit for its worker. Direct
-/// publications fail fast when all permits are held. Fanout workers wait for a
-/// permit before admitting the next recipient, which bounds both spawned tasks
-/// and pending keys while still walking the full recipient list.
+/// Queued keys do not own tasks or build permits. Repeated publications mark
+/// the existing key dirty. A mutation during delivery schedules another pass
+/// at the FIFO tail so a busy sandbox cannot monopolize a worker.
 #[derive(Debug)]
 pub struct ConfigDeliveryQueue {
-    pending: Mutex<HashMap<DeliveryKey, bool>>,
+    pending: Mutex<PendingDeliveries>,
     fanout_pending: Mutex<HashMap<FanoutKey, bool>>,
-    delivery_permits: Arc<Semaphore>,
+    max_delivery_workers: usize,
+    pending_slots: Arc<Semaphore>,
+    ready: Notify,
     build_permits: Semaphore,
+}
+
+#[derive(Debug, Default)]
+struct PendingDeliveries {
+    changed: HashMap<DeliveryKey, PendingDelivery>,
+    ready: VecDeque<DeliveryKey>,
+    dispatcher_running: bool,
+}
+
+#[derive(Debug)]
+struct PendingDelivery {
+    changed: bool,
+    _slot: OwnedSemaphorePermit,
 }
 
 impl Default for ConfigDeliveryQueue {
@@ -205,11 +225,29 @@ impl Default for ConfigDeliveryQueue {
 impl ConfigDeliveryQueue {
     #[must_use]
     pub fn new(max_concurrent_builds: usize) -> Self {
+        Self::with_limits(max_concurrent_builds, max_concurrent_builds)
+    }
+
+    fn with_limits(max_concurrent_builds: usize, max_delivery_workers: usize) -> Self {
+        Self::with_pending_capacity(
+            max_concurrent_builds,
+            max_delivery_workers,
+            MAX_PENDING_DELIVERIES,
+        )
+    }
+
+    fn with_pending_capacity(
+        max_concurrent_builds: usize,
+        max_delivery_workers: usize,
+        max_pending: usize,
+    ) -> Self {
         let max_concurrent_builds = max_concurrent_builds.max(1);
         Self {
             pending: Mutex::default(),
             fanout_pending: Mutex::default(),
-            delivery_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            max_delivery_workers: max_delivery_workers.max(1),
+            pending_slots: Arc::new(Semaphore::new(max_pending.max(1))),
+            ready: Notify::new(),
             build_permits: Semaphore::new(max_concurrent_builds),
         }
     }
@@ -218,11 +256,10 @@ impl ConfigDeliveryQueue {
     #[must_use]
     pub fn for_db_connections(max_connections: u32) -> Self {
         let max_connections = usize::try_from(max_connections).unwrap_or(usize::MAX);
-        Self::new(
-            max_connections
-                .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
-                .max(MIN_CONCURRENT_SNAPSHOT_BUILDS),
-        )
+        let builds = max_connections
+            .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
+            .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
+        Self::with_limits(builds, builds.max(MIN_CONCURRENT_DELIVERY_WORKERS))
     }
 
     #[cfg(test)]
@@ -247,61 +284,85 @@ impl ConfigDeliveryQueue {
 
     fn enqueue(&self, key: DeliveryKey) -> DeliveryEnqueue {
         let mut pending = self.pending.lock().unwrap();
-        match pending.entry(key) {
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() = true;
-                DeliveryEnqueue::Coalesced
-            }
-            Entry::Vacant(entry) => {
-                let Ok(permit) = Arc::clone(&self.delivery_permits).try_acquire_owned() else {
-                    return DeliveryEnqueue::Full;
-                };
-                entry.insert(true);
-                DeliveryEnqueue::StartWorker(permit)
-            }
+        if let Some(entry) = pending.changed.get_mut(&key) {
+            entry.changed = true;
+            return DeliveryEnqueue::Coalesced;
+        }
+        let Ok(slot) = Arc::clone(&self.pending_slots).try_acquire_owned() else {
+            return DeliveryEnqueue::Full;
+        };
+        self.admit(&mut pending, key, slot)
+    }
+
+    fn admit(
+        &self,
+        pending: &mut PendingDeliveries,
+        key: DeliveryKey,
+        slot: OwnedSemaphorePermit,
+    ) -> DeliveryEnqueue {
+        pending.changed.insert(
+            key.clone(),
+            PendingDelivery {
+                changed: true,
+                _slot: slot,
+            },
+        );
+        pending.ready.push_back(key);
+        self.ready.notify_one();
+        if pending.dispatcher_running {
+            DeliveryEnqueue::Queued
+        } else {
+            pending.dispatcher_running = true;
+            DeliveryEnqueue::StartDispatcher
         }
     }
 
     async fn enqueue_from_fanout(&self, key: DeliveryKey) -> DeliveryEnqueue {
         {
             let mut pending = self.pending.lock().unwrap();
-            if let Entry::Occupied(mut entry) = pending.entry(key.clone()) {
-                *entry.get_mut() = true;
+            if let Some(entry) = pending.changed.get_mut(&key) {
+                entry.changed = true;
                 return DeliveryEnqueue::Coalesced;
             }
         }
-
-        let permit = Arc::clone(&self.delivery_permits)
+        // The fair semaphore reserves released slots for waiting fanouts, so
+        // a stream of new direct publications cannot repeatedly bypass repair.
+        let slot = Arc::clone(&self.pending_slots)
             .acquire_owned()
             .await
-            .expect("delivery worker semaphore is never closed");
+            .expect("pending delivery semaphore is never closed");
         let mut pending = self.pending.lock().unwrap();
-        match pending.entry(key) {
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() = true;
-                DeliveryEnqueue::Coalesced
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(true);
-                DeliveryEnqueue::StartWorker(permit)
-            }
-        }
-    }
-
-    fn take(&self, key: &DeliveryKey) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(changed) = pending.get_mut(key) {
-            *changed = false;
-        }
-    }
-
-    fn finish_pass(&self, key: &DeliveryKey) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        if pending.get(key).is_some_and(|changed| !changed) {
-            pending.remove(key);
-            false
+        if let Some(entry) = pending.changed.get_mut(&key) {
+            entry.changed = true;
+            DeliveryEnqueue::Coalesced
         } else {
-            pending.contains_key(key)
+            self.admit(&mut pending, key, slot)
+        }
+    }
+
+    fn take_ready(&self) -> Option<DeliveryKey> {
+        let mut pending = self.pending.lock().unwrap();
+        let key = pending.ready.pop_front()?;
+        pending.changed.get_mut(&key).unwrap().changed = false;
+        Some(key)
+    }
+
+    fn finish_pass(&self, key: &DeliveryKey) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.changed.get(key).is_some_and(|entry| entry.changed) {
+            pending.ready.push_back(key.clone());
+        } else {
+            pending.changed.remove(key);
+        }
+    }
+
+    fn stop_if_idle(&self) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.ready.is_empty() {
+            pending.dispatcher_running = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -311,7 +372,10 @@ impl ConfigDeliveryQueue {
             *changed = true;
             return FanoutEnqueue::Coalesced;
         }
-        if pending.len() >= MAX_ACTIVE_FANOUT_WORKERS {
+        // Reserve the two all-connected component scopes for overflow repair,
+        // even when workspace fanout admission is full.
+        let reserved_repair = matches!(key.scope, FanoutScope::AllConnected);
+        if !reserved_repair && pending.len() >= MAX_ACTIVE_FANOUT_WORKERS {
             FanoutEnqueue::Full
         } else {
             pending.insert(key, true);
@@ -339,7 +403,8 @@ impl ConfigDeliveryQueue {
 
 #[derive(Debug)]
 enum DeliveryEnqueue {
-    StartWorker(OwnedSemaphorePermit),
+    StartDispatcher,
+    Queued,
     Coalesced,
     Full,
 }
@@ -354,13 +419,11 @@ enum FanoutEnqueue {
 pub async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
+    timeout: Duration,
 ) -> Result<ConfigBootstrap, Status> {
-    tokio::time::timeout(
-        CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
-        build_consistent_config_bootstrap(state, sandbox),
-    )
-    .await
-    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
+    tokio::time::timeout(timeout, build_consistent_config_bootstrap(state, sandbox))
+        .await
+        .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
 }
 
 async fn build_consistent_config_bootstrap(
@@ -415,26 +478,70 @@ fn enqueue_sandbox(state: &Arc<ServerState>, sandbox_id: &str, components: Confi
             component,
         };
         match state.config_delivery_queue.enqueue(key.clone()) {
-            DeliveryEnqueue::StartWorker(permit) => {
-                spawn_delivery_worker(state, key, permit);
+            DeliveryEnqueue::StartDispatcher => {
+                spawn_delivery_dispatcher(state);
             }
-            DeliveryEnqueue::Coalesced => {}
+            DeliveryEnqueue::Coalesced | DeliveryEnqueue::Queued => {}
             DeliveryEnqueue::Full => {
                 record_delivery_worker_full(sandbox_id, component.name());
+                // Retain the recovery obligation as one coalesced fleet pass,
+                // rather than a task or retry timer for every rejected key.
+                enqueue_fanout(
+                    state,
+                    FanoutScope::AllConnected,
+                    ConfigComponents {
+                        sandbox_config: component == ConfigComponentKind::SandboxConfig,
+                        provider_environment: component == ConfigComponentKind::ProviderEnvironment,
+                    },
+                );
             }
         }
     }
 }
 
-fn spawn_delivery_worker(state: &Arc<ServerState>, key: DeliveryKey, permit: OwnedSemaphorePermit) {
+fn spawn_delivery_dispatcher(state: &Arc<ServerState>) {
     let state = Arc::clone(state);
     tokio::spawn(async move {
-        let _permit = permit;
+        let queue = &state.config_delivery_queue;
+        let mut workers = JoinSet::new();
+        let mut in_flight = HashMap::new();
         loop {
-            state.config_delivery_queue.take(&key);
-            publish_sandbox_component_now(&state, &key).await;
-            if !state.config_delivery_queue.finish_pass(&key) {
+            while workers.len() < queue.max_delivery_workers {
+                let Some(key) = queue.take_ready() else {
+                    break;
+                };
+                let worker_state = Arc::clone(&state);
+                let worker_key = key.clone();
+                let handle = workers.spawn(async move {
+                    publish_sandbox_component_now(&worker_state, &worker_key).await;
+                });
+                in_flight.insert(handle.id(), key);
+            }
+            // Changing the running flag under the admission lock prevents a
+            // publication racing dispatcher exit from losing its wakeup.
+            if workers.is_empty() && queue.stop_if_idle() {
                 break;
+            }
+            tokio::select! {
+                completed = workers.join_next_with_id(), if !workers.is_empty() => {
+                    let id = match completed.expect("nonempty delivery workers") {
+                        Ok((id, ())) => id,
+                        Err(error) => {
+                            // Panic payloads may contain credential backend data.
+                            warn!(
+                                cancelled = error.is_cancelled(),
+                                panicked = error.is_panic(),
+                                "supervisor configuration delivery worker failed"
+                            );
+                            error.id()
+                        }
+                    };
+                    let key = in_flight.remove(&id).expect("delivery task has a key");
+                    // Failed builds/routes rely on reconciliation as before.
+                    // A concurrent mutation still gets its own subsequent pass.
+                    queue.finish_pass(&key);
+                }
+                () = queue.ready.notified() => {}
             }
         }
     });
@@ -454,8 +561,8 @@ async fn enqueue_sandbox_from_fanout(
         .enqueue_from_fanout(key.clone())
         .await
     {
-        DeliveryEnqueue::StartWorker(permit) => spawn_delivery_worker(state, key, permit),
-        DeliveryEnqueue::Coalesced => {}
+        DeliveryEnqueue::StartDispatcher => spawn_delivery_dispatcher(state),
+        DeliveryEnqueue::Coalesced | DeliveryEnqueue::Queued => {}
         DeliveryEnqueue::Full => unreachable!("fanout waits for delivery worker capacity"),
     }
 }
@@ -580,13 +687,15 @@ fn record_delivery_worker_full(sandbox_id: &str, component: &'static str) {
     .increment(1);
     warn!(
         sandbox_id,
-        component, "supervisor configuration delivery worker queue is full"
+        component, "supervisor configuration pending queue is full; scheduling reconciliation"
     );
 }
 
 fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
     let outcome = match disposition {
         DeliveryDisposition::Enqueued => "enqueued",
+        DeliveryDisposition::Coalesced => "coalesced",
+        DeliveryDisposition::SuppressedUnchanged => "unchanged",
         DeliveryDisposition::NoActiveSession => "no_active_session",
         DeliveryDisposition::QueueFull => "queue_full",
         DeliveryDisposition::SessionClosed => "session_closed",
@@ -598,6 +707,20 @@ fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
         "outcome" => outcome,
     )
     .increment(1);
+}
+
+/// Periodically rebuild current snapshots for every locally routable session.
+/// This repairs missed mutation notifications and queue pressure without a
+/// supervisor fetch.
+pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            publish_all_connected(&state, ConfigComponents::ALL);
+        }
+    });
 }
 
 fn record_build_failure(sandbox_id: &str, component: &'static str, error_code: Code) {
@@ -633,10 +756,10 @@ mod tests {
     fn queue_coalesces_repeated_component_changes_while_worker_is_active() {
         let queue = ConfigDeliveryQueue::default();
         let key = key("sb-1", ConfigComponentKind::SandboxConfig);
-        let DeliveryEnqueue::StartWorker(permit) = queue.enqueue(key.clone()) else {
-            panic!("first publication must start a worker");
+        let DeliveryEnqueue::StartDispatcher = queue.enqueue(key.clone()) else {
+            panic!("first publication must start the dispatcher");
         };
-        queue.take(&key);
+        assert_eq!(queue.take_ready(), Some(key.clone()));
         assert!(matches!(
             queue.enqueue(key.clone()),
             DeliveryEnqueue::Coalesced
@@ -645,14 +768,281 @@ mod tests {
             queue.enqueue(key.clone()),
             DeliveryEnqueue::Coalesced
         ));
-        assert!(queue.finish_pass(&key));
-        queue.take(&key);
-        assert!(!queue.finish_pass(&key));
-        drop(permit);
+        queue.finish_pass(&key);
+        assert_eq!(queue.take_ready(), Some(key.clone()));
+        queue.finish_pass(&key);
+        assert!(queue.take_ready().is_none());
+        assert!(queue.stop_if_idle());
+    }
+
+    #[test]
+    fn pending_work_is_bounded_coalesced_and_fair_to_other_keys() {
+        let queue = ConfigDeliveryQueue::with_pending_capacity(1, 1, 3);
+        let a = key("a", ConfigComponentKind::SandboxConfig);
+        let b = key("b", ConfigComponentKind::SandboxConfig);
+        let c = key("c", ConfigComponentKind::SandboxConfig);
+        assert!(matches!(
+            queue.enqueue(a.clone()),
+            DeliveryEnqueue::StartDispatcher
+        ));
+        assert_eq!(queue.take_ready(), Some(a.clone()));
+        assert!(matches!(queue.enqueue(b.clone()), DeliveryEnqueue::Queued));
+        assert!(matches!(queue.enqueue(c.clone()), DeliveryEnqueue::Queued));
+        for _ in 0..100 {
+            assert!(matches!(
+                queue.enqueue(a.clone()),
+                DeliveryEnqueue::Coalesced
+            ));
+            assert!(matches!(
+                queue.enqueue(b.clone()),
+                DeliveryEnqueue::Coalesced
+            ));
+        }
+        for i in 0..10_000 {
+            assert!(matches!(
+                queue.enqueue(key(
+                    &format!("overflow-{i}"),
+                    ConfigComponentKind::SandboxConfig
+                )),
+                DeliveryEnqueue::Full
+            ));
+        }
+        assert_eq!(queue.pending.lock().unwrap().changed.len(), 3);
+        queue.finish_pass(&a);
+        // The running key's new state goes behind both previously queued keys.
+        for expected in [b, c, a] {
+            assert_eq!(queue.take_ready(), Some(expected.clone()));
+            queue.finish_pass(&expected);
+        }
+        assert!(queue.take_ready().is_none());
+        assert_eq!(queue.pending_slots.available_permits(), 3);
+        assert!(queue.stop_if_idle());
+        assert!(matches!(
+            queue.enqueue(key("new", ConfigComponentKind::SandboxConfig)),
+            DeliveryEnqueue::StartDispatcher
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiting_fanout_reserves_capacity_ahead_of_new_direct_work() {
+        let queue = ConfigDeliveryQueue::with_pending_capacity(1, 1, 1);
+        let a = key("a", ConfigComponentKind::SandboxConfig);
+        let b = key("b", ConfigComponentKind::SandboxConfig);
+        queue.enqueue(a.clone());
+        assert_eq!(queue.take_ready(), Some(a.clone()));
+        let waiting = queue.enqueue_from_fanout(b.clone());
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("queue must be full"),
+            () = tokio::task::yield_now() => {}
+        }
+        queue.finish_pass(&a);
+        assert!(matches!(
+            queue.enqueue(key("new", ConfigComponentKind::SandboxConfig)),
+            DeliveryEnqueue::Full
+        ));
+        assert!(matches!(waiting.await, DeliveryEnqueue::Queued));
+        assert_eq!(queue.take_ready(), Some(b));
+    }
+
+    #[test]
+    fn idle_dispatcher_exit_does_not_lose_new_publications() {
+        let queue = ConfigDeliveryQueue::new(1);
+        let a = key("a", ConfigComponentKind::SandboxConfig);
+        queue.enqueue(a.clone());
+        queue.take_ready();
+        queue.finish_pass(&a);
+        // A publication before the exit check keeps this dispatcher alive.
+        assert!(matches!(queue.enqueue(a.clone()), DeliveryEnqueue::Queued));
+        assert!(!queue.stop_if_idle());
+        queue.take_ready();
+        queue.finish_pass(&a);
+        assert!(queue.stop_if_idle());
+        // A publication after the exit check starts a replacement dispatcher.
+        assert!(matches!(queue.enqueue(a), DeliveryEnqueue::StartDispatcher));
+    }
+
+    #[derive(Debug)]
+    struct GatedRouter {
+        visits: tokio::sync::mpsc::UnboundedSender<String>,
+        release: Semaphore,
+        panic_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorConfigRouter for GatedRouter {
+        async fn deliver(
+            &self,
+            sandbox_id: &str,
+            _message: SupervisorConfigMessage,
+        ) -> DeliveryDisposition {
+            self.visits.send(sandbox_id.to_string()).unwrap();
+            assert!(
+                !self.panic_next.swap(false, Ordering::SeqCst),
+                "injected worker failure"
+            );
+            self.release.acquire().await.unwrap().forget();
+            DeliveryDisposition::Enqueued
+        }
+
+        async fn routable_sandbox_ids(&self) -> Vec<String> {
+            vec!["a".into(), "b".into(), "c".into()]
+        }
+    }
+
+    async fn gated_delivery_state(
+        capacity: usize,
+    ) -> (
+        Arc<ServerState>,
+        Arc<GatedRouter>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let mut state = test_server_state().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = Arc::new(GatedRouter {
+            visits: tx,
+            release: Semaphore::new(0),
+            panic_next: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.config_delivery_queue = ConfigDeliveryQueue::with_pending_capacity(1, 1, capacity);
+        mutable.supervisor_config_router = router.clone();
+        for id in ["a", "b", "c"] {
+            state
+                .store
+                .put_message(&Sandbox {
+                    metadata: Some(ObjectMeta {
+                        id: id.into(),
+                        name: id.into(),
+                        workspace: "default".into(),
+                        ..Default::default()
+                    }),
+                    spec: Some(SandboxSpec::default()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        (state, router, rx)
+    }
+
+    async fn next_visit(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn wait_until_drained(state: &ServerState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !state
+                    .config_delivery_queue
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .dispatcher_running
+                    && state
+                        .config_delivery_queue
+                        .fanout_pending
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_changes_and_mutations_during_delivery_drain_without_reconciliation() {
+        let (state, router, mut rx) = gated_delivery_state(3).await;
+        publish_sandbox_components(&state, "a", ConfigComponents::SANDBOX_CONFIG);
+        assert_eq!(next_visit(&mut rx).await, "a");
+        for id in ["b", "b", "c", "a", "a"] {
+            publish_sandbox_components(&state, id, ConfigComponents::SANDBOX_CONFIG);
+        }
+        assert!(rx.try_recv().is_err(), "only one worker may run");
+        for expected in ["b", "c", "a"] {
+            router.release.add_permits(1);
+            assert_eq!(next_visit(&mut rx).await, expected);
+        }
+        router.release.add_permits(1);
+        wait_until_drained(&state).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .config_delivery_queue
+                .pending_slots
+                .available_permits(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_panic_does_not_strand_pending_work() {
+        let (state, router, mut rx) = gated_delivery_state(3).await;
+        router.panic_next.store(true, Ordering::SeqCst);
+        router.release.add_permits(1);
+        publish_sandbox_components(&state, "a", ConfigComponents::SANDBOX_CONFIG);
+        publish_sandbox_components(&state, "b", ConfigComponents::SANDBOX_CONFIG);
+        assert_eq!(next_visit(&mut rx).await, "a");
+        assert_eq!(next_visit(&mut rx).await, "b");
+        wait_until_drained(&state).await;
+        assert_eq!(
+            state
+                .config_delivery_queue
+                .pending_slots
+                .available_permits(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_repairs_rejected_keys_without_periodic_reconciliation() {
+        let (state, router, mut rx) = gated_delivery_state(1).await;
+        publish_sandbox_components(&state, "a", ConfigComponents::SANDBOX_CONFIG);
+        assert_eq!(next_visit(&mut rx).await, "a");
+        publish_sandbox_components(&state, "b", ConfigComponents::SANDBOX_CONFIG);
+        publish_sandbox_components(&state, "c", ConfigComponents::SANDBOX_CONFIG);
+        assert_eq!(
+            state
+                .config_delivery_queue
+                .pending
+                .lock()
+                .unwrap()
+                .changed
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .config_delivery_queue
+                .fanout_pending
+                .lock()
+                .unwrap()
+                .len()
+                <= 1
+        );
+        router.release.add_permits(16);
+        let mut observed = std::collections::HashSet::new();
+        while !observed.contains("b") || !observed.contains("c") {
+            observed.insert(next_visit(&mut rx).await);
+        }
+        wait_until_drained(&state).await;
+        // No owner reconciler was started in this fixture.
     }
 
     #[test]
     fn build_bound_is_sized_from_the_database_pool() {
+        let local = ConfigDeliveryQueue::for_db_connections(5);
+        assert_eq!(local.max_concurrent_builds(), 10);
+        assert_eq!(local.max_delivery_workers, 64);
         assert_eq!(
             ConfigDeliveryQueue::for_db_connections(10).max_concurrent_builds(),
             20
@@ -738,25 +1128,25 @@ mod tests {
         let queue = ConfigDeliveryQueue::new(3);
         assert!(matches!(
             queue.enqueue(key("sb-1", ConfigComponentKind::SandboxConfig)),
-            DeliveryEnqueue::StartWorker(_)
+            DeliveryEnqueue::StartDispatcher
         ));
         assert!(matches!(
             queue.enqueue(key("sb-1", ConfigComponentKind::ProviderEnvironment)),
-            DeliveryEnqueue::StartWorker(_)
+            DeliveryEnqueue::Queued
         ));
         assert!(matches!(
             queue.enqueue(key("sb-2", ConfigComponentKind::SandboxConfig)),
-            DeliveryEnqueue::StartWorker(_)
+            DeliveryEnqueue::Queued
         ));
     }
 
     #[tokio::test]
     async fn fleet_fanout_waits_without_creating_unbounded_delivery_workers() {
         const ROUTED_SANDBOXES: usize = 10_000;
-        let queue = Arc::new(ConfigDeliveryQueue::new(1));
+        let queue = Arc::new(ConfigDeliveryQueue::with_pending_capacity(1, 1, 2));
         let first = key("sandbox-0", ConfigComponentKind::SandboxConfig);
-        let DeliveryEnqueue::StartWorker(_blocked_worker) = queue.enqueue(first) else {
-            panic!("first publication must start a worker");
+        let DeliveryEnqueue::StartDispatcher = queue.enqueue(first) else {
+            panic!("first publication must start the dispatcher");
         };
 
         let sandbox_ids = (1..ROUTED_SANDBOXES)
@@ -775,7 +1165,7 @@ mod tests {
             () = tokio::task::yield_now() => {}
         }
 
-        assert_eq!(queue.pending.lock().unwrap().len(), 1);
+        assert_eq!(queue.pending.lock().unwrap().changed.len(), 2);
     }
 
     #[test]
@@ -811,6 +1201,21 @@ mod tests {
                 component: ConfigComponentKind::SandboxConfig,
             }),
             FanoutEnqueue::Full
+        );
+        for component in ConfigComponents::ALL.selected() {
+            let repair = FanoutKey {
+                scope: FanoutScope::AllConnected,
+                component,
+            };
+            assert_eq!(
+                queue.enqueue_fanout(repair.clone()),
+                FanoutEnqueue::StartWorker
+            );
+            assert_eq!(queue.enqueue_fanout(repair), FanoutEnqueue::Coalesced);
+        }
+        assert_eq!(
+            queue.fanout_pending.lock().unwrap().len(),
+            MAX_ACTIVE_FANOUT_WORKERS + 2
         );
     }
 
@@ -947,7 +1352,7 @@ mod tests {
             let connect = connect_supervisor_stream(
                 &state,
                 "sandbox",
-                openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
+                openshell_core::proto::PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
             );
             let (response, hit) = tokio::join!(connect, resolve_hit);
             hit.expect("bootstrap must reach the stalled credential driver");
