@@ -41,6 +41,24 @@ use url::Url;
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
 
+fn decode_launch_authentication(
+    encoded: &[u8],
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
+    let authentication =
+        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+            .map_err(|error| {
+                ComputeDriverError::Precondition(format!(
+                    "decode Podman sandbox launch authentication: {error}"
+                ))
+            })?;
+    authentication.validate().map_err(|error| {
+        ComputeDriverError::Precondition(format!(
+            "validate Podman sandbox launch authentication: {error}"
+        ))
+    })?;
+    Ok(authentication)
+}
+
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
         match value {
@@ -1009,11 +1027,24 @@ impl PodmanComputeDriver {
                                 .map(|(key, value)| (key.into(), value.into()))
                         })
                         .collect();
+                    let launch_authentication = sandbox
+                        .spec
+                        .as_ref()
+                        .filter(|spec| !spec.launch_authentication.is_empty())
+                        .ok_or_else(|| {
+                            ComputeDriverError::Precondition(
+                                "Podman sandbox launch authentication is required".to_string(),
+                            )
+                        })
+                        .and_then(|spec| {
+                            decode_launch_authentication(&spec.launch_authentication)
+                        })?;
                     let archives = crate::isolation::bootstrap_archives(
                         &sandbox.id,
                         &workload_id,
                         &identity,
                         child_env,
+                        &launch_authentication,
                     )?;
                     self.client
                         .copy_to_container(
@@ -1270,8 +1301,13 @@ impl PodmanComputeDriver {
             sandbox.id = %sandbox_id,
         )
     )]
-    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        encoded_authentication: &[u8],
+    ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let launch_authentication = decode_launch_authentication(encoded_authentication)?;
         let container = self
             .find_container(sandbox_id)
             .await?
@@ -1319,8 +1355,23 @@ impl PodmanComputeDriver {
                 .await?;
             let bundle =
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
+            let previous_config = crate::isolation::boundary_config_from_channel_archive(&bundle)?;
+            let archives = crate::isolation::bootstrap_archives(
+                sandbox_id,
+                &container_id,
+                &previous_config.workload_identity,
+                previous_config.child_env,
+                &launch_authentication,
+            )?;
             self.client
-                .copy_to_container(&container_id, crate::isolation::CHANNEL_ROOT, bundle)
+                .copy_to_container(
+                    &container_id,
+                    crate::isolation::CHANNEL_ROOT,
+                    archives.channel,
+                )
+                .await?;
+            self.client
+                .copy_to_container(&supervisor, "/", archives.supervisor)
                 .await?;
             self.client.verify_isolation_fence(&container_id).await?;
             self.client.start_container(&container_id).await?;
@@ -1787,12 +1838,38 @@ mod tests {
     use super::*;
     use crate::test_utils::{StubResponse, spawn_podman_stub};
     use hyper::StatusCode;
+    use openshell_core::jwt::{
+        CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
+        SupervisorAuthBundle,
+    };
     use openshell_core::proto::compute::v1::{
         DriverSandboxSpec, DriverSandboxTemplate, ResourceRequirements,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    fn launch_authentication() -> SandboxLaunchAuthentication {
+        SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id: openshell_core::SandboxSessionId::new(),
+                gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
+                gateway_expires_at: i64::MAX,
+                sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
+                sandbox_expires_at: i64::MAX,
+                credential_epoch: CredentialEpoch::new(1).unwrap(),
+            },
+            gateway_id: "gateway-test".to_string(),
+            verification_keys: vec![SessionVerificationKey {
+                key_id: "test-key".to_string(),
+                public_key_pem: b"public-key".to_vec(),
+            }],
+        }
+    }
+
+    fn encoded_launch_authentication() -> Vec<u8> {
+        serde_json::to_vec(&launch_authentication()).unwrap()
+    }
 
     // ── socket resolution ───────────────────────────────────────────────
     //
@@ -1910,8 +1987,9 @@ mod tests {
                 ),
             ].into_iter().chain(restart_responses()).collect(),
         );
+        let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1")
+            .start_sandbox("sandbox-1", &authentication)
             .await
             .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
@@ -1922,10 +2000,16 @@ mod tests {
                 .filter(|request| request.starts_with("PUT "))
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![format!(
-                "PUT {}",
-                api_path("/libpod/containers/ctr-1/archive?path=%2F.openshell%2Fchannel")
-            )]
+            vec![
+                format!(
+                    "PUT {}",
+                    api_path("/libpod/containers/ctr-1/archive?path=%2F.openshell%2Fchannel")
+                ),
+                format!(
+                    "PUT {}",
+                    api_path("/libpod/containers/openshell-supervisor-sandbox-1/archive?path=%2F")
+                ),
+            ]
         );
         assert!(
             !restart_requests
@@ -2209,8 +2293,9 @@ mod tests {
                 ),
             ].into_iter().chain(restart_responses()).collect(),
         );
+        let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1")
+            .start_sandbox("sandbox-1", &authentication)
             .with_subscriber(subscriber)
             .await
             .expect("start should succeed");
@@ -3172,10 +3257,16 @@ mod tests {
             "sha256:image".into(),
         )
         .unwrap();
-        let bundle =
-            crate::isolation::bootstrap_archives("sandbox-1", "ctr-1", &identity, HashMap::new())
-                .unwrap()
-                .channel;
+        let authentication = launch_authentication();
+        let bundle = crate::isolation::bootstrap_archives(
+            "sandbox-1",
+            "ctr-1",
+            &identity,
+            HashMap::new(),
+            &authentication,
+        )
+        .unwrap()
+        .channel;
         let mut header = tar::Header::new_gnu();
         header.set_size(bundle.len() as u64);
         header.set_mode(0o600);
@@ -3191,6 +3282,7 @@ mod tests {
             ),
             StubResponse::new(StatusCode::OK, archive.into_inner().unwrap()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
+            StubResponse::new(StatusCode::OK, ""), // refreshed supervisor auth and topology
             fence_response(),
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
@@ -3304,7 +3396,6 @@ mod tests {
             "sandbox/bootstrap.json",
             "sandbox/server.crt",
             "sandbox/server.key",
-            "sandbox/client-ca.crt",
         ]
     }
 

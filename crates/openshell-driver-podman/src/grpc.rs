@@ -200,7 +200,7 @@ impl ComputeDriver for ComputeDriverService {
                     return Err(Status::invalid_argument("sandbox_id is required"));
                 }
                 self.driver
-                    .start_sandbox(&request.sandbox_id)
+                    .start_sandbox(&request.sandbox_id, &request.launch_authentication)
                     .await
                     .map_err(Status::from)?;
                 Ok(Response::new(StartSandboxResponse {}))

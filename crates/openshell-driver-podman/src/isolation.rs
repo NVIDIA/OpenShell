@@ -4,13 +4,15 @@
 //! Podman-owned provisioning for the common authenticated isolation channel.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::boundary_protocol::{
-    BoundaryClientTls, BoundaryConfig, BoundaryListener, BoundaryServerTls, BoundaryTopology,
-    BoundaryTransport, generate_boundary_mutual_tls_material,
+    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
+    generate_sandbox_tls_material,
 };
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 
@@ -19,6 +21,7 @@ pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const TOPOLOGY_PATH: &str = "/.openshell/supervisor/topology.payload";
+pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_BUNDLE_PATH: &str = "/.openshell/supervisor/sandbox-bundle.tar";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 
@@ -134,8 +137,11 @@ pub fn bootstrap_archives(
     container_id: &str,
     identity: &ResolvedWorkloadIdentity,
     child_env: HashMap<String, String>,
+    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
-    let tls = generate_boundary_mutual_tls_material().map_err(invalid)?;
+    launch_authentication.validate().map_err(invalid)?;
+    let session_id = launch_authentication.supervisor.session_id;
+    let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
     let resource_claims = BTreeMap::from([
         ("podman.container_id".into(), container_id.into()),
         (
@@ -149,25 +155,29 @@ pub fn bootstrap_archives(
         unexpected_networks: Vec::new(),
     };
     let generation = uuid::Uuid::new_v4().to_string();
-    let session_epoch = uuid::Uuid::new_v4().to_string();
-    let bootstrap_token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    let verification_keys = launch_authentication
+        .verification_keys
+        .iter()
+        .map(|key| {
+            String::from_utf8(key.public_key_pem.clone())
+                .map(|public_key_pem| GatewayVerificationKey {
+                    key_id: key.key_id.clone(),
+                    public_key_pem,
+                })
+                .map_err(invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let config = BoundaryConfig {
         boundary_id: sandbox_id.into(),
         generation: generation.clone(),
-        session_epoch: session_epoch.clone(),
-        bootstrap_token: bootstrap_token.clone(),
+        session_id,
+        gateway_id: launch_authentication.gateway_id.clone(),
+        verification_keys,
         listener: BoundaryListener::Unix {
             socket_path: PathBuf::from(SOCKET_PATH),
-            tls: BoundaryServerTls {
+            tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from("/.openshell/channel/sandbox/server.crt"),
                 private_key_path: PathBuf::from("/.openshell/channel/sandbox/server.key"),
-                client_ca_certificate_path: PathBuf::from(
-                    "/.openshell/channel/sandbox/client-ca.crt",
-                ),
             },
         },
         resource_claims: resource_claims.clone(),
@@ -179,16 +189,13 @@ pub fn bootstrap_archives(
     let topology = BoundaryTopology {
         boundary_id: sandbox_id.into(),
         generation,
-        session_epoch,
-        bootstrap_token,
-        transport: BoundaryTransport::Unix {
+        session_id,
+        transport: SandboxTransport::Unix {
             socket_path: PathBuf::from(SOCKET_PATH),
-            tls: BoundaryClientTls {
-                server_name: tls.server_name,
-                ca_certificate_pem: tls.ca_certificate_pem.clone(),
-                certificate_chain_pem: tls.supervisor_certificate_pem,
-                private_key_pem: tls.supervisor_private_key_pem,
-            },
+        },
+        tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
         },
         host_gateway_ip: None,
         resource_claims,
@@ -205,9 +212,8 @@ pub fn bootstrap_archives(
         "sandbox/bootstrap.json",
         &serde_json::to_vec(&config).map_err(invalid)?,
     )?;
-    channel.file("sandbox/server.crt", tls.sandbox_certificate_pem.as_bytes())?;
-    channel.file("sandbox/server.key", tls.sandbox_private_key_pem.as_bytes())?;
-    channel.file("sandbox/client-ca.crt", tls.ca_certificate_pem.as_bytes())?;
+    channel.file("sandbox/server.crt", tls.certificate_chain_pem.as_bytes())?;
+    channel.file("sandbox/server.key", tls.private_key_pem.as_bytes())?;
     let channel = channel.finish()?;
     let mut workspace = Archive::new(identity);
     workspace.directory(".", 0o700, true)?;
@@ -218,12 +224,34 @@ pub fn bootstrap_archives(
         TOPOLOGY_PATH,
         &serde_json::to_vec(&topology).map_err(invalid)?,
     )?;
+    supervisor.file(
+        AUTH_BUNDLE_PATH,
+        &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
+    )?;
     supervisor.file(RESTART_BUNDLE_PATH, &channel)?;
     Ok(BootstrapArchives {
         channel,
         workspace: workspace.finish()?,
         supervisor: supervisor.finish()?,
     })
+}
+
+pub fn boundary_config_from_channel_archive(
+    archive: &[u8],
+) -> Result<BoundaryConfig, ComputeDriverError> {
+    for entry in tar::Archive::new(archive).entries().map_err(invalid)? {
+        let mut entry = entry.map_err(invalid)?;
+        if entry.path().map_err(invalid)?.as_ref() != std::path::Path::new("sandbox/bootstrap.json")
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(invalid)?;
+        return serde_json::from_slice(&bytes).map_err(invalid);
+    }
+    Err(ComputeDriverError::Precondition(
+        "Podman restart bundle has no sandbox bootstrap".to_string(),
+    ))
 }
 
 struct Archive<'a> {
@@ -285,7 +313,28 @@ impl<'a> Archive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
+    use openshell_core::jwt::{
+        CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
+        SupervisorAuthBundle,
+    };
+
+    fn authentication() -> SandboxLaunchAuthentication {
+        SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id: openshell_core::SandboxSessionId::new(),
+                gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
+                gateway_expires_at: i64::MAX,
+                sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
+                sandbox_expires_at: i64::MAX,
+                credential_epoch: CredentialEpoch::new(1).unwrap(),
+            },
+            gateway_id: "gateway-test".to_string(),
+            verification_keys: vec![SessionVerificationKey {
+                key_id: "test-key".to_string(),
+                public_key_pem: b"public-key".to_vec(),
+            }],
+        }
+    }
 
     #[test]
     fn identity_uses_pinned_image_accounts_and_rejects_root() {
@@ -331,8 +380,15 @@ mod tests {
             "sha256:image".into(),
         )
         .unwrap();
-        let archives =
-            bootstrap_archives("sandbox", "container", &identity, HashMap::new()).unwrap();
+        let authentication = authentication();
+        let archives = bootstrap_archives(
+            "sandbox",
+            "container",
+            &identity,
+            HashMap::new(),
+            &authentication,
+        )
+        .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
         let mut workspace = tar::Archive::new(archives.workspace.as_slice());
@@ -344,8 +400,8 @@ mod tests {
         assert_eq!(root.header().gid().unwrap(), u64::from(identity.gid));
         assert_eq!(root.header().mode().unwrap(), 0o700);
         assert!(entries.next().is_none());
-        assert_eq!(workload.len(), 4);
-        assert_eq!(supervisor.len(), 2);
+        assert_eq!(workload.len(), 3);
+        assert_eq!(supervisor.len(), 3);
         assert!(workload.keys().all(|path| path.starts_with("sandbox")));
         assert!(
             supervisor
@@ -365,7 +421,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.boundary_id, topology.boundary_id);
-        assert_eq!(config.bootstrap_token, topology.bootstrap_token);
+        assert_eq!(config.session_id, topology.session_id);
         assert_eq!(config.driver_fence, topology.driver_fence);
         assert_eq!(config.workload_identity, identity);
         topology

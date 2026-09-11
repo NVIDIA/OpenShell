@@ -1466,6 +1466,7 @@ pub fn build_isolation_specs(
             "--topology-payload-file={}",
             crate::isolation::TOPOLOGY_PATH
         ),
+        format!("--auth-bundle-file={}", crate::isolation::AUTH_BUNDLE_PATH),
         "--health-socket-path=/run/openshell/supervisor-health.sock".into(),
     ]);
     supervisor.env.insert(
