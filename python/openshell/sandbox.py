@@ -839,7 +839,7 @@ class SandboxClient:
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                sandbox_name=sandbox_name,
+                sandbox=sandbox_name,
                 workspace_scope=_workspace_scope(workspace),
             ),
             timeout=self._timeout,
@@ -959,7 +959,7 @@ class SandboxClient:
     def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                sandbox_name=sandbox_name,
+                sandbox=sandbox_name,
                 workspace_scope=_workspace_scope(workspace),
             ),
             timeout=self._timeout,
@@ -969,7 +969,7 @@ class SandboxClient:
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
-                sandbox_name=sandbox_name,
+                sandbox=sandbox_name,
                 workspace_scope=_workspace_scope(workspace),
             ),
             timeout=self._timeout,
@@ -979,7 +979,7 @@ class SandboxClient:
     def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
-                sandbox_name=sandbox_name,
+                sandbox=sandbox_name,
                 workspace_scope=_workspace_scope(workspace),
             ),
             timeout=self._timeout,
@@ -1074,7 +1074,7 @@ class SandboxClient:
             raise SandboxError("command must not be empty")
 
         request = openshell_pb2.ExecSandboxRequest(
-            sandbox_name=sandbox_name,
+            sandbox=sandbox_name,
             workspace_scope=_workspace_scope(workspace),
             command=list(command),
             workdir=workdir or "",

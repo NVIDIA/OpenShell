@@ -1009,7 +1009,7 @@ mod tests {
             codec: codec.clone(),
         };
         let request = UpdateConfigRequest {
-            sandbox_name: "demo".to_string(),
+            sandbox: "demo".to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             expected_resource_version: u64::MAX - 1,
             annotations: HashMap::from([
@@ -1187,7 +1187,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandboxName": "demo", "workspaceScope": {"workspace": "default"},
+                "sandbox": "demo", "workspaceScope": {"workspace": "default"},
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1228,7 +1228,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandboxName": "demo", "workspaceScope": {"workspace": "default"},
+                "sandbox": "demo", "workspaceScope": {"workspace": "default"},
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1269,14 +1269,14 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandboxName": "demo", "workspaceScope": {"workspace": "default"},
+                "sandbox": "demo", "workspaceScope": {"workspace": "default"},
                 "expectedResourceVersion": "7"
             }),
         )
         .unwrap();
         let prior = operation.clone();
         let result = allowed_result(vec![
-            patch("replace", "/sandboxName", json!("partially-mutated")),
+            patch("replace", "/sandbox", json!("partially-mutated")),
             patch("replace", "/expectedResourceVersion", json!("not-a-number")),
         ]);
 
@@ -1290,7 +1290,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, prior);
-        assert_eq!(outcome.json["sandboxName"], "demo");
+        assert_eq!(outcome.json["sandbox"], "demo");
     }
 
     #[tokio::test]
@@ -1302,19 +1302,19 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandboxName": "demo", "workspaceScope": {"workspace": "default"},
+                "sandbox": "demo", "workspaceScope": {"workspace": "default"},
                 "expectedResourceVersion": "7"
             }),
         )
         .unwrap();
         let plan = test_modify_plan(FailurePolicy::FailOpen);
         let invalid_first = allowed_result(vec![
-            patch("replace", "/sandboxName", json!("rejected-candidate")),
+            patch("replace", "/sandbox", json!("rejected-candidate")),
             patch("replace", "/expectedResourceVersion", json!("not-a-number")),
         ]);
         let second = allowed_result(vec![
-            patch("test", "/sandboxName", json!("demo")),
-            patch("replace", "/sandboxName", json!("accepted-candidate")),
+            patch("test", "/sandbox", json!("demo")),
+            patch("replace", "/sandbox", json!("accepted-candidate")),
         ]);
 
         let operation = apply_evaluation_result(
@@ -1334,9 +1334,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(operation.json["sandboxName"], "accepted-candidate");
+        assert_eq!(operation.json["sandbox"], "accepted-candidate");
         let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
-        assert_eq!(decoded.sandbox_name, "accepted-candidate");
+        assert_eq!(decoded.sandbox, "accepted-candidate");
         assert_eq!(decoded.expected_resource_version, 7);
     }
 
@@ -1384,12 +1384,12 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandboxName": "demo", "workspaceScope": {"workspace": "default"},
+                "sandbox": "demo", "workspaceScope": {"workspace": "default"},
                 "expectedResourceVersion": "7"
             }),
         )
         .unwrap();
-        let result = allowed_result(vec![patch("replace", "/sandboxName", json!("accepted"))]);
+        let result = allowed_result(vec![patch("replace", "/sandbox", json!("accepted"))]);
         let recorder = TestRecorder::default();
 
         let operation = metrics::with_local_recorder(&recorder, || {
@@ -1404,7 +1404,7 @@ mod tests {
         .unwrap();
 
         let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
-        assert_eq!(decoded.sandbox_name, "accepted");
+        assert_eq!(decoded.sandbox, "accepted");
         assert_eq!(TestRecorder::count(&recorder.evaluations), 1);
         assert_eq!(TestRecorder::count(&recorder.patches), 1);
         assert_eq!(TestRecorder::count(&recorder.fail_open), 0);

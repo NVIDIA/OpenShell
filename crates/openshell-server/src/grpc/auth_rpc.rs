@@ -164,7 +164,7 @@ pub async fn handle_refresh_sandbox_token(
         ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            sandbox_name: sandbox_record
+            sandbox: sandbox_record
                 .metadata
                 .as_ref()
                 .map_or_else(String::new, |metadata| metadata.name.clone()),

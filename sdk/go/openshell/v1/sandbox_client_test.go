@@ -84,7 +84,7 @@ func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequ
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -135,7 +135,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	_, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -147,7 +147,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -159,7 +159,7 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -174,7 +174,7 @@ func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.Att
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -189,7 +189,7 @@ func (s *mockSandboxServer) DetachSandboxProvider(_ context.Context, req *pb.Det
 	if s.detachErr != nil {
 		return nil, s.detachErr
 	}
-	name := req.GetSandboxName()
+	name := req.GetSandbox()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -201,7 +201,7 @@ func (s *mockSandboxServer) ListSandboxProviders(_ context.Context, req *pb.List
 	if s.listProvErr != nil {
 		return nil, s.listProvErr
 	}
-	provs := s.providers[req.GetSandboxName()]
+	provs := s.providers[req.GetSandbox()]
 	return &pb.ListSandboxProvidersResponse{Providers: provs}, nil
 }
 
@@ -1016,7 +1016,7 @@ func TestSandboxWatch_UsesName(t *testing.T) {
 	req := mock.watchRequest
 	mock.mu.Unlock()
 	require.NotNil(t, req)
-	assert.Equal(t, "my-sandbox", req.GetSandboxName())
+	assert.Equal(t, "my-sandbox", req.GetSandbox())
 }
 
 func TestSandboxWatch_ResolutionError(t *testing.T) {
@@ -1227,7 +1227,7 @@ func TestSandboxGetLogs(t *testing.T) {
 
 	// Verify name→id resolution: the proto request should contain the sandbox ID
 	mock.mu.Lock()
-	assert.Equal(t, "log-sb", mock.getLogsRequest.GetSandboxName())
+	assert.Equal(t, "log-sb", mock.getLogsRequest.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -1261,7 +1261,7 @@ func TestSandboxGetLogs_WithOptions(t *testing.T) {
 	mock.mu.Lock()
 	req := mock.getLogsRequest
 	mock.mu.Unlock()
-	assert.Equal(t, "opts-sb", req.GetSandboxName())
+	assert.Equal(t, "opts-sb", req.GetSandbox())
 	assert.Equal(t, uint32(50), req.GetLines())
 	assert.Equal(t, since.UnixMilli(), req.GetSinceMs())
 	assert.Equal(t, []string{"gateway", "sandbox"}, req.GetSources())

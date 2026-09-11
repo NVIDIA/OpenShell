@@ -21,7 +21,7 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 
 func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 		Service:        serviceName,
 		TargetPort:     targetPort,
@@ -35,7 +35,7 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 		Service:        serviceName,
 	})
@@ -62,7 +62,7 @@ func (s *serviceClient) List(workspace, sandboxName string, opts ...ListOptions)
 	}
 	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ServiceEndpoint], error) {
 		req := &pb.ListServicesRequest{
-			SandboxName: sandboxName, WorkspaceScope: workspaceScope, PageSize: pageSize,
+			Sandbox: sandboxName, WorkspaceScope: workspaceScope, PageSize: pageSize,
 			PageToken: pageToken,
 		}
 		resp, err := s.client.ListServices(ctx, req)
@@ -87,7 +87,7 @@ func (s *serviceClient) ListAll(ctx context.Context, workspace, sandboxName stri
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
 	_, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 		Service:        serviceName,
 	})

@@ -135,7 +135,7 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     min_role: MinWorkspaceRole,
 ) -> Result<Sandbox, Status> {
     if sandbox_name.is_empty() {
-        return Err(Status::invalid_argument("sandbox_name is required"));
+        return Err(Status::invalid_argument("sandbox is required"));
     }
     let sandbox = match principal {
         crate::auth::principal::Principal::Sandbox(sandbox_principal) => {
@@ -712,7 +712,7 @@ pub(super) async fn handle_get_sandbox(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1056,7 +1056,7 @@ pub(super) async fn handle_list_sandbox_providers(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1075,7 +1075,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &request.sandbox_name,
+        &request.sandbox,
         request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1225,7 +1225,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &request.sandbox_name,
+        &request.sandbox,
         request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1339,7 +1339,7 @@ async fn handle_delete_sandbox_inner(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1383,7 +1383,7 @@ async fn handle_stop_sandbox_inner(
     let resolved = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1423,7 +1423,7 @@ async fn handle_start_sandbox_inner(
     let resolved = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1488,7 +1488,7 @@ pub(super) async fn handle_watch_sandbox(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1760,7 +1760,7 @@ pub(super) async fn handle_exec_sandbox(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -1883,7 +1883,7 @@ pub(super) async fn handle_forward_tcp(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &init.sandbox_name,
+        &init.sandbox,
         init.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -2208,7 +2208,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -2293,7 +2293,7 @@ pub(super) async fn handle_create_ssh_session(
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
-        &req.sandbox_name,
+        &req.sandbox,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
@@ -3265,7 +3265,7 @@ mod tests {
     fn build_remote_exec_command_basic() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["ls".to_string(), "-la".to_string()],
             ..Default::default()
@@ -3277,7 +3277,7 @@ mod tests {
     fn build_remote_exec_command_with_env_and_workdir() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec![
                 "python".to_string(),
@@ -3298,7 +3298,7 @@ mod tests {
     fn build_remote_exec_command_rejects_null_bytes_in_args() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
@@ -3310,7 +3310,7 @@ mod tests {
     fn build_remote_exec_command_rejects_newlines_in_workdir() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
@@ -3324,7 +3324,7 @@ mod tests {
     fn build_remote_exec_command_accepts_multiline_script() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec![
                 "python3".to_string(),
@@ -3342,7 +3342,7 @@ mod tests {
     fn build_remote_exec_command_multiline_with_single_quotes() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec![
                 "python3".to_string(),
@@ -3363,7 +3363,7 @@ mod tests {
     fn tcp_forward_init_allows_loopback_targets() {
         for host in ["127.0.0.1", "::1", "localhost"] {
             let init = TcpForwardInit {
-                sandbox_name: "sbx".to_string(),
+                sandbox: "sbx".to_string(),
                 workspace_scope: None,
                 service_id: String::new(),
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -3379,7 +3379,7 @@ mod tests {
     #[test]
     fn tcp_forward_init_allows_ssh_target() {
         let init = TcpForwardInit {
-            sandbox_name: "sbx".to_string(),
+            sandbox: "sbx".to_string(),
             workspace_scope: None,
             target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
             ..Default::default()
@@ -3393,7 +3393,7 @@ mod tests {
     #[test]
     fn tcp_forward_init_rejects_non_loopback_targets() {
         let init = TcpForwardInit {
-            sandbox_name: "sbx".to_string(),
+            sandbox: "sbx".to_string(),
             workspace_scope: None,
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -3413,7 +3413,7 @@ mod tests {
     #[test]
     fn tcp_forward_init_rejects_invalid_port() {
         let init = TcpForwardInit {
-            sandbox_name: "sbx".to_string(),
+            sandbox: "sbx".to_string(),
             workspace_scope: None,
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
@@ -3433,7 +3433,7 @@ mod tests {
     #[test]
     fn tcp_forward_init_requires_target() {
         let init = TcpForwardInit {
-            sandbox_name: "sbx".to_string(),
+            sandbox: "sbx".to_string(),
             workspace_scope: None,
             ..Default::default()
         };
@@ -3597,7 +3597,7 @@ mod tests {
             handle_watch_sandbox(
                 &state,
                 authed_request(WatchSandboxRequest {
-                    sandbox_name: "watched".to_string(),
+                    sandbox: "watched".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 }),
@@ -3641,7 +3641,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
-                    sandbox_name: "reused-name".to_string(),
+                    sandbox: "reused-name".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -3700,7 +3700,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3741,7 +3741,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3779,7 +3779,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3830,7 +3830,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3855,7 +3855,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3902,7 +3902,7 @@ mod tests {
         let error = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-gcp".to_string(),
                 expected_resource_version: 0,
@@ -3942,7 +3942,7 @@ mod tests {
         let response = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -3970,7 +3970,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
@@ -4033,7 +4033,7 @@ mod tests {
         };
         let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("sandbox_name"));
+        assert!(err.message().contains("sandbox"));
     }
 
     #[test]
@@ -4041,7 +4041,7 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_name: "test-id".to_string(),
+                sandbox: "test-id".to_string(),
                 workspace_scope: None,
                 ..Default::default()
             })),
@@ -4056,7 +4056,7 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_name: "test-id".to_string(),
+                sandbox: "test-id".to_string(),
                 workspace_scope: None,
                 command: vec!["bash".to_string()],
                 environment: std::iter::once(("bad key!".to_string(), "val".to_string())).collect(),
@@ -4073,7 +4073,7 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_name: "test-id".to_string(),
+                sandbox: "test-id".to_string(),
                 workspace_scope: None,
                 command: vec!["bash".to_string()],
                 tty: true,
@@ -4083,7 +4083,7 @@ mod tests {
             })),
         };
         let req = validate_interactive_exec_start(Some(msg)).unwrap();
-        assert_eq!(req.sandbox_name, "test-id");
+        assert_eq!(req.sandbox, "test-id");
         assert_eq!(req.command, vec!["bash"]);
         assert!(req.tty);
         assert_eq!(req.cols, 120);
@@ -4095,7 +4095,7 @@ mod tests {
         let state = test_server_state().await;
 
         let req = ExecSandboxRequest {
-            sandbox_name: "nonexistent".to_string(),
+            sandbox: "nonexistent".to_string(),
             workspace_scope: None,
             command: vec!["bash".to_string()],
             tty: true,
@@ -4103,7 +4103,7 @@ mod tests {
         };
         let sandbox_result = state
             .store
-            .get_message_by_name::<Sandbox>("default", &req.sandbox_name)
+            .get_message_by_name::<Sandbox>("default", &req.sandbox)
             .await
             .unwrap();
         assert!(sandbox_result.is_none());
@@ -4599,7 +4599,7 @@ mod tests {
         let fetched = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                sandbox_name: "annotated".to_string(),
+                sandbox: "annotated".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -4663,7 +4663,7 @@ mod tests {
         let fetched_process = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                sandbox_name: "partial-id".to_string(),
+                sandbox: "partial-id".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -5676,7 +5676,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
@@ -5723,7 +5723,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
@@ -5778,7 +5778,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
@@ -5825,7 +5825,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: long_name,
                 expected_resource_version: 0,
@@ -5852,7 +5852,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: long_name,
                 expected_resource_version: 0,
@@ -5881,7 +5881,7 @@ mod tests {
             handle_create_ssh_session(
                 &state1,
                 authed_request(CreateSshSessionRequest {
-                    sandbox_name: "work".to_string(),
+                    sandbox: "work".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
             )
@@ -5893,7 +5893,7 @@ mod tests {
             handle_create_ssh_session(
                 &state2,
                 authed_request(CreateSshSessionRequest {
-                    sandbox_name: "work".to_string(),
+                    sandbox: "work".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
             )
@@ -5947,7 +5947,7 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -5976,7 +5976,7 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -6055,7 +6055,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
@@ -6107,7 +6107,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
@@ -6170,7 +6170,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
@@ -6222,7 +6222,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
@@ -6303,7 +6303,7 @@ mod tests {
                 handle_attach_sandbox_provider(
                     &state_clone,
                     authed_request(AttachSandboxProviderRequest {
-                        sandbox_name: "work".to_string(),
+                        sandbox: "work".to_string(),
                         workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
@@ -6389,7 +6389,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                sandbox_name: "shared-name".to_string(),
+                sandbox: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6404,7 +6404,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                sandbox_name: "shared-name".to_string(),
+                sandbox: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -6479,7 +6479,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                sandbox_name: "shared-name".to_string(),
+                sandbox: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -6601,7 +6601,7 @@ mod tests {
         let err = handle_get_sandbox(
             &state,
             non_member_request(GetSandboxRequest {
-                sandbox_name: ("any").to_string(),
+                sandbox: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
             }),
         )
@@ -6633,7 +6633,7 @@ mod tests {
         let err = handle_list_sandbox_providers(
             &state,
             non_member_request(ListSandboxProvidersRequest {
-                sandbox_name: ("any").to_string(),
+                sandbox: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
             }),
         )
@@ -6649,7 +6649,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             non_member_request(AttachSandboxProviderRequest {
-                sandbox_name: ("any").to_string(),
+                sandbox: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -6666,7 +6666,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             non_member_request(DetachSandboxProviderRequest {
-                sandbox_name: ("any").to_string(),
+                sandbox: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -6684,7 +6684,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
-                sandbox_name: ("any").to_string(),
+                sandbox: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
             }),
         )
@@ -6700,7 +6700,7 @@ mod tests {
             handle_stop_sandbox(
                 &state,
                 non_member_request(StopSandboxRequest {
-                    sandbox_name: ("any").to_string(),
+                    sandbox: ("any").to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 }),
             )
@@ -6708,7 +6708,7 @@ mod tests {
             handle_start_sandbox(
                 &state,
                 non_member_request(StartSandboxRequest {
-                    sandbox_name: ("any").to_string(),
+                    sandbox: ("any").to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 }),
             )
@@ -6756,7 +6756,7 @@ mod tests {
         let err = handle_watch_sandbox(
             &state,
             non_member_request(WatchSandboxRequest {
-                sandbox_name: "cross-ws".to_string(),
+                sandbox: "cross-ws".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("other-workspace")),
                 ..Default::default()
             }),
@@ -6773,7 +6773,7 @@ mod tests {
         let err = handle_create_ssh_session(
             &state,
             non_member_request(CreateSshSessionRequest {
-                sandbox_name: "cross-ws".to_string(),
+                sandbox: "cross-ws".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("other-workspace")),
             }),
         )
@@ -6798,7 +6798,7 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_name: "ws-test".to_string(),
+                sandbox: "ws-test".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )

@@ -720,7 +720,7 @@ async fn fetch_settings_snapshot_with_client(
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_name: sandbox_name.to_string(),
+            sandbox: sandbox_name.to_string(),
             workspace_scope: workspace.map(crate::proto::workspace_selector),
         })
         .await
@@ -755,7 +755,7 @@ async fn sync_policy_with_client(
 ) -> Result<()> {
     client
         .update_config(UpdateConfigRequest {
-            sandbox_name: sandbox.to_string(),
+            sandbox: sandbox.to_string(),
             workspace_scope: Some(crate::proto::workspace_selector(workspace)),
             policy: Some(policy.clone()),
             ..Default::default()
@@ -1056,7 +1056,7 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                sandbox_name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
                 workspace_scope: (!workspace.is_empty())
                     .then(|| crate::proto::workspace_selector(workspace)),
             })
@@ -1185,7 +1185,7 @@ impl CachedOpenShellClient {
             .clone()
             .get_draft_policy(GetDraftPolicyRequest {
                 status_filter: status_filter.to_string(),
-                sandbox_name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
                 workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await

@@ -29,7 +29,7 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// Reads the same token sources as the supervisor (env, file, K8s SA
 /// bootstrap) and issues a single gRPC call against the gateway. Useful
 /// for end-to-end verification: e.g. `docker exec` into a sandbox, then
-/// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-name <other>`
+/// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox <other>`
 /// to confirm the cross-sandbox authorization guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";

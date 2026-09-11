@@ -92,7 +92,7 @@ async fn ssh_session_config(
     // Resolve the sandbox and retain its ID for local lifecycle tracking.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            sandbox_name: name.to_string(),
+            sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
@@ -106,7 +106,7 @@ async fn ssh_session_config(
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
-                sandbox_name: name.to_string(),
+                sandbox: name.to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
@@ -1439,7 +1439,7 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
                 workspace_scope: None,
                 service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),

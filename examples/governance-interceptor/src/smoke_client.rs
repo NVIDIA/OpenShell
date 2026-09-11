@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_name: sandbox_name.clone(),
+            sandbox: sandbox_name.clone(),
             workspace_scope: None,
         })
         .await?
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy_result = client
         .update_config(UpdateConfigRequest {
-            sandbox_name: sandbox_name.clone(),
+            sandbox: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             policy: Some(widened_policy),
             ..Default::default()
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let after = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_name,
+            sandbox: sandbox_name,
             workspace_scope: None,
         })
         .await?

@@ -707,7 +707,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let handle = tokio::spawn(async move {
         // Phase 1: Fetch initial history via unary RPC.
         let req = openshell_core::proto::GetSandboxLogsRequest {
-            sandbox_name: sandbox_name.clone(),
+            sandbox: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(&workspace)),
             lines: 500,
             since_ms: 0,
@@ -749,7 +749,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
         // Phase 2: Stream live logs via WatchSandbox.
         let req = openshell_core::proto::WatchSandboxRequest {
-            sandbox_name,
+            sandbox: sandbox_name,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             follow_status: false,
             follow_logs: true,
@@ -815,7 +815,7 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest {
-        sandbox_name,
+        sandbox: sandbox_name,
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             app.selected_sandbox_workspace(),
         )),
@@ -851,7 +851,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
     };
 
     let req = openshell_core::proto::GetSandboxRequest {
-        sandbox_name: sandbox_name.clone(),
+        sandbox: sandbox_name.clone(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             app.selected_sandbox_workspace(),
         )),
@@ -883,7 +883,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
     // Step 2: Fetch the current live policy (includes updates since creation).
     if found {
         let policy_req = openshell_core::proto::GetSandboxConfigRequest {
-            sandbox_name,
+            sandbox: sandbox_name,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 app.selected_sandbox_workspace(),
             )),
@@ -943,7 +943,7 @@ async fn handle_shell_connect(
     let workspace = app.selected_sandbox_workspace();
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-            sandbox_name: sandbox_name.clone(),
+            sandbox: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
@@ -1076,7 +1076,7 @@ async fn handle_exec_command(
 ) -> Result<()> {
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-            sandbox_name: sandbox_name.to_string(),
+            sandbox: sandbox_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
@@ -1473,7 +1473,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
                 let req = openshell_core::proto::GetSandboxRequest {
-                    sandbox_name: sandbox_name.clone(),
+                    sandbox: sandbox_name.clone(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(&workspace)),
                 };
                 // Retry on transient errors.
@@ -1530,7 +1530,7 @@ async fn start_port_forwards(
     // Create SSH session.
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
-            sandbox_name: sandbox_name.to_string(),
+            sandbox: sandbox_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
@@ -1906,7 +1906,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::ApproveDraftChunkRequest {
-            sandbox_name: name.clone(),
+            sandbox: name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             chunk_id,
             review_token,
@@ -1951,7 +1951,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::RejectDraftChunkRequest {
-            sandbox_name: name.clone(),
+            sandbox: name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             chunk_id,
             reason: String::new(),
@@ -2001,7 +2001,7 @@ fn spawn_draft_approve_all(
             })
             .collect();
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
-            sandbox_name: name.clone(),
+            sandbox: name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             include_security_flagged: false,
             approvals,
@@ -2366,7 +2366,7 @@ async fn refresh_global_settings(app: &mut App) {
         page_size: 1,
         page_token: String::new(),
         global: true,
-        sandbox_name: String::new(),
+        sandbox: String::new(),
         workspace_scope: None,
     };
     match tokio::time::timeout(
@@ -2542,7 +2542,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let req = UpdateConfigRequest {
-            sandbox_name: name.clone(),
+            sandbox: name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
@@ -2580,7 +2580,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         use openshell_core::proto::UpdateConfigRequest;
 
         let req = UpdateConfigRequest {
-            sandbox_name: name.clone(),
+            sandbox: name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             setting_key: key,
             delete_setting: true,
@@ -2754,7 +2754,7 @@ async fn refresh_sandbox_policy(app: &mut App) {
     let workspace = app.selected_sandbox_workspace();
 
     let policy_req = openshell_core::proto::GetSandboxConfigRequest {
-        sandbox_name,
+        sandbox: sandbox_name,
         workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
     };
 
@@ -2794,7 +2794,7 @@ async fn refresh_draft_chunks(app: &mut App) {
     };
 
     let req = openshell_core::proto::GetDraftPolicyRequest {
-        sandbox_name,
+        sandbox: sandbox_name,
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             app.selected_sandbox_workspace(),
         )),
@@ -2874,7 +2874,7 @@ async fn fetch_sandbox_draft_counts(
             let mut client = client.clone();
             async move {
                 let req = openshell_core::proto::GetDraftPolicyRequest {
-                    sandbox_name: name,
+                    sandbox: name,
                     status_filter: "pending".to_string(),
                     workspace_scope: Some(named_workspace_scope(workspace)),
                 };

@@ -511,7 +511,7 @@ function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitSha
 }
 
 function sandboxTarget(name: string, options?: SandboxWorkspaceOptions | null) {
-  return { sandboxName: name, workspaceScope: workspaceScope(options) };
+  return { sandbox: name, workspaceScope: workspaceScope(options) };
 }
 
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {

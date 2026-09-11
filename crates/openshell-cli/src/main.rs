@@ -644,7 +644,7 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox-name <name> --token <token>`
+    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
     ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
@@ -657,7 +657,7 @@ enum Commands {
 
         /// Sandbox name. Required in token mode.
         #[arg(long)]
-        sandbox_name: Option<String>,
+        sandbox: Option<String>,
 
         /// SSH session token. Required in token mode.
         #[arg(long)]
@@ -3785,15 +3785,15 @@ async fn run_async() -> Result<()> {
         }
         Some(Commands::SshProxy {
             gateway,
-            sandbox_name,
+            sandbox,
             token,
             server,
             gateway_name,
             name,
         }) => {
-            match (gateway, sandbox_name, token, server, gateway_name, name) {
+            match (gateway, sandbox, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sandbox_name), Some(tok), _, gateway_name_opt, _) => {
+                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
                     let mut effective_tls = match gateway_name_opt {
                         Some(ref g) => tls.with_gateway_name(g),
                         None => tls,
@@ -3801,7 +3801,7 @@ async fn run_async() -> Result<()> {
                     if let Some(ref g) = gateway_name_opt {
                         apply_auth(&mut effective_tls, g)?;
                     }
-                    run::sandbox_ssh_proxy(&gw, &sandbox_name, &tok, &effective_tls).await?;
+                    run::sandbox_ssh_proxy(&gw, &sandbox, &tok, &effective_tls).await?;
                 }
                 // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(g), Some(n)) => {
@@ -3827,7 +3827,7 @@ async fn run_async() -> Result<()> {
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-name/--token or --gateway-name/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
                     ));
                 }
             }
@@ -4477,7 +4477,7 @@ mod tests {
             "ssh-proxy",
             "--gateway",
             "https://gw.example.com:8080/proxy/connect",
-            "--sandbox-name",
+            "--sandbox",
             "my-box",
             "--token",
             "tok-abc",
@@ -4489,7 +4489,7 @@ mod tests {
         match cli.command {
             Some(Commands::SshProxy {
                 gateway,
-                sandbox_name,
+                sandbox,
                 token,
                 gateway_name,
                 ..
@@ -4499,7 +4499,7 @@ mod tests {
                     Some("https://gw.example.com:8080/proxy/connect"),
                     "gateway URL must land in SshProxy.gateway, not the global flag"
                 );
-                assert_eq!(sandbox_name.as_deref(), Some("my-box"));
+                assert_eq!(sandbox.as_deref(), Some("my-box"));
                 assert_eq!(token.as_deref(), Some("tok-abc"));
                 assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
             }

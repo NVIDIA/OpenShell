@@ -55,7 +55,7 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 			Metadata: &dm.ObjectMeta{
 				Id: "ep-" + req.GetService(),
 			},
-			SandboxName: req.GetSandboxName(),
+			SandboxName: req.GetSandbox(),
 			ServiceName: req.GetService(),
 			TargetPort:  req.GetTargetPort(),
 			Domain:      req.GetDomain(),
@@ -65,7 +65,7 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 		resp.Url = "https://" + req.GetService() + ".example.com"
 	}
 
-	s.endpoints[serviceKey(req.GetSandboxName(), req.GetService())] = resp
+	s.endpoints[serviceKey(req.GetSandbox(), req.GetService())] = resp
 	return resp, nil
 }
 
@@ -76,7 +76,7 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 		return nil, s.getErr
 	}
 
-	sandboxName := req.GetSandboxName()
+	sandboxName := req.GetSandbox()
 	ep, ok := s.endpoints[serviceKey(sandboxName, req.GetService())]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), sandboxName)
@@ -94,7 +94,7 @@ func (s *mockServiceServer) ListServices(_ context.Context, req *pb.ListServices
 
 	var services []*pb.ServiceEndpointResponse
 	for key, ep := range s.endpoints {
-		sandboxName := req.GetSandboxName()
+		sandboxName := req.GetSandbox()
 		prefix := sandboxName + "/"
 		if sandboxName == "" || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
 			services = append(services, ep)
@@ -110,7 +110,7 @@ func (s *mockServiceServer) DeleteService(_ context.Context, req *pb.DeleteServi
 		return nil, s.deleteErr
 	}
 
-	sandboxName := req.GetSandboxName()
+	sandboxName := req.GetSandbox()
 	key := serviceKey(sandboxName, req.GetService())
 	_, ok := s.endpoints[key]
 	if !ok {
@@ -285,7 +285,7 @@ func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, endpoints)
 	require.NotNil(t, mock.lastList)
-	assert.Empty(t, mock.lastList.GetSandboxName())
+	assert.Empty(t, mock.lastList.GetSandbox())
 	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 

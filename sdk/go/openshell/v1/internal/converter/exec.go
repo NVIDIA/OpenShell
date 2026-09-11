@@ -39,8 +39,8 @@ func ExecChunkFromEvent(event *pb.ExecSandboxEvent) (*types.ExecChunk, int, erro
 // ExecRequestToProto builds a proto ExecSandboxRequest for Run/Stream modes.
 func ExecRequestToProto(sandboxName string, command []string, opts *types.ExecOptions) *pb.ExecSandboxRequest {
 	req := &pb.ExecSandboxRequest{
-		SandboxName: sandboxName,
-		Command:     CopyStringSlice(command),
+		Sandbox: sandboxName,
+		Command: CopyStringSlice(command),
 	}
 	if opts != nil {
 		req.Workdir = opts.WorkDir

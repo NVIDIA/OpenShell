@@ -188,7 +188,7 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		Annotations:             CopyStringMap(cu.Annotations),
 	}
 	if !cu.Global {
-		req.SandboxName = cu.Name
+		req.Sandbox = cu.Name
 	}
 
 	// Convert typed SDK SandboxPolicy to proto SandboxPolicy.

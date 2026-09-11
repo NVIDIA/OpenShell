@@ -89,7 +89,7 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		SandboxName:    name,
+		Sandbox:        name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -143,7 +143,7 @@ func (s *sandboxClient) ListAll(ctx context.Context, workspace string, opts ...L
 
 func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {
 	_, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
-		SandboxName:    name,
+		Sandbox:        name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -154,7 +154,7 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
-		SandboxName:    name,
+		Sandbox:        name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -165,7 +165,7 @@ func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sand
 
 func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
-		SandboxName:    name,
+		Sandbox:        name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxNa
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		SandboxName:             sandboxName,
+		Sandbox:                 sandboxName,
 		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -194,7 +194,7 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 	resp, err := s.client.DetachSandboxProvider(ctx, &pb.DetachSandboxProviderRequest{
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		SandboxName:             sandboxName,
+		Sandbox:                 sandboxName,
 		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -208,7 +208,7 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
 	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -300,7 +300,7 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	stream, err := s.client.WatchSandbox(streamCtx, &pb.WatchSandboxRequest{
-		SandboxName:    name,
+		Sandbox:        name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 		FollowStatus:   true,
 		StopOnTerminal: watchOpts.StopOnTerminal,
@@ -372,7 +372,7 @@ func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName stri
 	}
 	cfg := types.ApplyLogOptions(opts)
 	req := &pb.GetSandboxLogsRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 		Lines:          cfg.Lines(),
 		Sources:        cfg.Sources(),

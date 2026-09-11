@@ -320,7 +320,7 @@ message NetworkBinary {
 message GetSandboxConfigRequest {
   reserved 1;
   reserved "sandbox_id";
-  string sandbox_name = 2;
+  string sandbox = 2;
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 

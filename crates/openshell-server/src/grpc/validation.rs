@@ -43,8 +43,8 @@ pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 /// Command arguments only reject NUL (newlines are valid for inline scripts).
 /// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
-    if req.sandbox_name.is_empty() {
-        return Err(Status::invalid_argument("sandbox_name is required"));
+    if req.sandbox.is_empty() {
+        return Err(Status::invalid_argument("sandbox is required"));
     }
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn validate_exec_request_rejects_reserved_env_key() {
         let req = ExecSandboxRequest {
-            sandbox_name: "id".to_string(),
+            sandbox: "id".to_string(),
             workspace_scope: None,
             command: vec!["echo".to_string()],
             environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
@@ -1372,7 +1372,7 @@ mod tests {
     #[test]
     fn validate_exec_request_allows_pyfunc_helper_key() {
         let req = ExecSandboxRequest {
-            sandbox_name: "id".to_string(),
+            sandbox: "id".to_string(),
             workspace_scope: None,
             command: vec!["python".to_string()],
             environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn validate_exec_allows_newlines_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec![
                 "python3".to_string(),
@@ -2266,7 +2266,7 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_null_bytes_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
@@ -2278,7 +2278,7 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_workdir() {
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
@@ -2291,7 +2291,7 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_env_values() {
         let req = ExecSandboxRequest {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             workspace_scope: None,
             command: vec!["ls".to_string()],
             environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))

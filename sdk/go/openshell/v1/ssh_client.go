@@ -32,7 +32,7 @@ func newSSHClient(conn grpc.ClientConnInterface, sandboxes SandboxInterface) *ss
 
 func (s *sshClient) CreateSession(ctx context.Context, workspace, sandboxName string) (*SSHSession, error) {
 	resp, err := s.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxName:    sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -93,7 +93,7 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
-				SandboxName:        sandboxName,
+				Sandbox:            sandboxName,
 				WorkspaceScope:     namedWorkspaceScope(workspace),
 				ServiceId:          cfg.serviceID,
 				AuthorizationToken: session.Token,

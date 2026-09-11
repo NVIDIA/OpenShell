@@ -10,7 +10,7 @@
 //! confirming the cross-sandbox authorization guard and renewal semantics.
 //!
 //! Subcommands:
-//! - `get-sandbox-config --sandbox-name <name>` — call `GetSandboxConfig`
+//! - `get-sandbox-config --sandbox <name>` — call `GetSandboxConfig`
 //! - `refresh` — call `RefreshSandboxToken`
 //! - `show-token` — print a token fingerprint and expiry, never the bearer
 //! - `show-principal` — pretty-print the decoded JWT claims
@@ -53,7 +53,7 @@ const USAGE: &str = "\
 usage: openshell-sandbox debug-rpc <command> [options]
 
 commands:
-  get-sandbox-config --sandbox-name <NAME>  call GetSandboxConfig
+  get-sandbox-config --sandbox <NAME>  call GetSandboxConfig
   refresh                                 renew the gateway JWT
   show-token                              print JWT fingerprint and expiry
   show-principal                          print decoded JWT claims
@@ -71,12 +71,12 @@ async fn open_client() -> Result<OpenShellClient<AuthedChannel>> {
 }
 
 async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
-    let sandbox_name = parse_flag(args, "--sandbox-name")
-        .ok_or_else(|| miette::miette!("get-sandbox-config: --sandbox-name <NAME> is required"))?;
+    let sandbox_name = parse_flag(args, "--sandbox")
+        .ok_or_else(|| miette::miette!("get-sandbox-config: --sandbox <NAME> is required"))?;
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_name: sandbox_name.to_string(),
+            sandbox: sandbox_name.to_string(),
             workspace_scope: None,
         })
         .await;
@@ -253,22 +253,22 @@ mod tests {
 
     #[test]
     fn parse_flag_handles_space_separated() {
-        let args: Vec<String> = ["--sandbox-name", "abc-123"]
+        let args: Vec<String> = ["--sandbox", "abc-123"]
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(parse_flag(&args, "--sandbox-name"), Some("abc-123"));
+        assert_eq!(parse_flag(&args, "--sandbox"), Some("abc-123"));
     }
 
     #[test]
     fn parse_flag_handles_equals_separated() {
-        let args: Vec<String> = ["--sandbox-name=abc-123".to_string()].to_vec();
-        assert_eq!(parse_flag(&args, "--sandbox-name"), Some("abc-123"));
+        let args: Vec<String> = ["--sandbox=abc-123".to_string()].to_vec();
+        assert_eq!(parse_flag(&args, "--sandbox"), Some("abc-123"));
     }
 
     #[test]
     fn parse_flag_returns_none_when_missing() {
         let args: Vec<String> = ["--other".to_string(), "x".to_string()].to_vec();
-        assert!(parse_flag(&args, "--sandbox-name").is_none());
+        assert!(parse_flag(&args, "--sandbox").is_none());
     }
 }

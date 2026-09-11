@@ -175,7 +175,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
-        let name = request.sandbox_name;
+        let name = request.sandbox;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -210,7 +210,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<ListSandboxProvidersRequest>,
     ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
         let request = request.into_inner();
-        let sandbox_name = request.sandbox_name.clone();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()
@@ -239,7 +239,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let sandbox_name = request.sandbox_name.clone();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()
@@ -287,7 +287,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let sandbox_name = request.sandbox_name.clone();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()

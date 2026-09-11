@@ -54,7 +54,7 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
-				SandboxName:    sandboxName,
+				Sandbox:        sandboxName,
 				WorkspaceScope: namedWorkspaceScope(workspace),
 				ServiceId:      cfg.serviceID,
 				Target: &pb.TcpForwardInit_Tcp{

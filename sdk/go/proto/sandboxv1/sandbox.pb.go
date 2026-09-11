@@ -1498,7 +1498,7 @@ func (x *NetworkBinary) GetHarness() bool {
 // Request to get sandbox settings by sandbox name.
 type GetSandboxConfigRequest struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
-	SandboxName    string                         `protobuf:"bytes,2,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	Sandbox        string                         `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -1534,9 +1534,9 @@ func (*GetSandboxConfigRequest) Descriptor() ([]byte, []int) {
 	return file_sandbox_proto_rawDescGZIP(), []int{16}
 }
 
-func (x *GetSandboxConfigRequest) GetSandboxName() string {
+func (x *GetSandboxConfigRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -2207,9 +2207,9 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"A\n" +
 	"\rNetworkBinary\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1c\n" +
-	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"\xa2\x01\n" +
-	"\x17GetSandboxConfigRequest\x12!\n" +
-	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12R\n" +
+	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"\x99\x01\n" +
+	"\x17GetSandboxConfigRequest\x12\x18\n" +
+	"\asandbox\x18\x02 \x01(\tR\asandbox\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02R\n" +
 	"sandbox_id\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +

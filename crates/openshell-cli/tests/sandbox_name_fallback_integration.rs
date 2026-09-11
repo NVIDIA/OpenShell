@@ -118,7 +118,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
-        let name = request.sandbox_name.clone();
+        let name = request.sandbox.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -179,7 +179,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxConfigRequest>,
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
         let req = request.into_inner();
-        assert!(!req.sandbox_name.is_empty());
+        assert!(!req.sandbox.is_empty());
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
                 version: 9,
@@ -448,7 +448,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxPolicyStatusRequest>,
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
-        assert_eq!(req.sandbox_name, "my-sandbox");
+        assert_eq!(req.sandbox, "my-sandbox");
         assert_eq!(req.version, 3);
         assert!(!req.global);
 
