@@ -67,6 +67,46 @@ depends = [
 ]
 hide = true
 
+["sdk:ts:proto:drift"]
+description = "Check TypeScript SDK proto drift and output a JSON report"
+dir = "sdk/typescript"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# TS SDK generated files (src/gen/) are gitignored, so there's no committed
+# baseline to diff against. Instead, detect drift by regenerating + type
+# checking: if the handwritten SDK code no longer compiles against the current
+# proto definitions, that's drift.
+
+if ! command -v jq &>/dev/null; then
+  echo '{"sdk":"typescript","synced":false,"error":"jq not found"}'
+  exit 1
+fi
+
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+if ! mise run sdk:ts:proto > "$LOG_FILE" 2>&1; then
+  jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"proto generation failed"}'
+  exit 1
+fi
+
+if ! mise run sdk:ts:typecheck >> "$LOG_FILE" 2>&1; then
+  jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"typecheck failed after proto regeneration"}'
+  exit 1
+fi
+
+jq -n -c '{sdk:"typescript", synced:true, files:[], summary:"all files synced"}'
+"""
+hide = true
+
+["sdk:ts:proto:build-check"]
+description = "Run full TypeScript SDK proto generate, typecheck, and test pipeline"
+dir = "sdk/typescript"
+run = 'bash ../../tasks/scripts/sdk_build_check.sh typescript gen=sdk:ts:proto typecheck=sdk:ts:typecheck test=sdk:ts:test'
+hide = true
+
 # Publish to the registry in package.json publishConfig. Set OPENSHELL_NPM_VERSION
 # to stamp the version from the release tag (release.py get-version --npm); the
 # package.json placeholder 0.0.0 is restored afterward, mirroring the Cargo
