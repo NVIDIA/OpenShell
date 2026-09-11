@@ -16,17 +16,18 @@ type Page[T any] struct {
 
 type pageFetcher[T any] func(context.Context, string) (*Page[T], error)
 
-// Pager lazily fetches one RPC page per call to NextPage.
+// Pager lazily fetches pages from the continuation-token contract.
 //
 // A Pager is single-pass and must not be used concurrently.
 type Pager[T any] struct {
-	fetch         pageFetcher[T]
-	nextPageToken *string
+	fetch          pageFetcher[T]
+	nextPageToken  *string
+	consumedTokens map[string]struct{}
 }
 
 // NewPager constructs a pager from an RPC page fetcher.
 func NewPager[T any](pageToken string, fetch func(context.Context, string) (*Page[T], error)) *Pager[T] {
-	return &Pager[T]{fetch: fetch, nextPageToken: &pageToken}
+	return &Pager[T]{fetch: fetch, nextPageToken: &pageToken, consumedTokens: make(map[string]struct{})}
 }
 
 func newPager[T any](pageToken string, fetch pageFetcher[T]) *Pager[T] {
@@ -47,6 +48,12 @@ func (p *Pager[T]) NextPage(ctx context.Context) (*Page[T], error) {
 	}
 	if page.Items == nil {
 		page.Items = make([]T, 0)
+	}
+	if *p.nextPageToken != "" {
+		p.consumedTokens[*p.nextPageToken] = struct{}{}
+	}
+	if _, seen := p.consumedTokens[page.NextPageToken]; page.NextPageToken != "" && seen {
+		return nil, errors.New("pager received a repeated continuation token")
 	}
 	if page.NextPageToken == "" {
 		p.nextPageToken = nil
