@@ -328,6 +328,9 @@ fn descriptor(backend_name: &str) -> TopologyDescriptor {
 fn sandbox_ctx() -> SandboxContext {
     SandboxContext {
         sandbox_id: "sb-1".to_string(),
+        session_id: "550e8400-e29b-41d4-a716-446655440000"
+            .parse()
+            .expect("valid session ID"),
         policy: SandboxPolicy {
             version: 1,
             filesystem: openshell_core::policy::FilesystemPolicy::default(),
@@ -394,6 +397,7 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
         authenticated_supervisor: true,
         session_epoch: "epoch-1".to_string(),
         direct_egress_blocked: true,
+        runtime_exit_terminates_workload: true,
         resource_claims: BTreeMap::new(),
     }
 }
@@ -804,6 +808,10 @@ fn confirmation_evidence_rejects_identity_or_posture_drift() {
     let mut drifted = confirmation_evidence();
     drifted.capabilities.effective = 1;
     assert!(drifted.validate(&expected).is_err());
+
+    let mut unmanaged = confirmation_evidence();
+    unmanaged.runtime_exit_terminates_workload = false;
+    assert!(unmanaged.validate(&expected).is_err());
 
     let different = ResolvedWorkloadIdentity::new(
         1002,

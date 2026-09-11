@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
+pub use openshell_core::SandboxSessionId;
 pub use openshell_core::policy::SandboxPolicy;
 
 // ============================================================================
@@ -243,6 +244,11 @@ impl ResolvedWorkloadIdentity {
 pub struct SandboxContext {
     /// Which sandbox this is.
     pub sandbox_id: String,
+    /// Which create or start-from-stopped launch this attachment belongs to.
+    ///
+    /// Retries of one durable launch reuse this identity. A later launch gets
+    /// a new identity even when the compute platform reuses its outer resource.
+    pub session_id: SandboxSessionId,
     /// The admitted launch-time policy.
     pub policy: SandboxPolicy,
     /// The admitted agent workload.
@@ -334,8 +340,10 @@ pub trait IsolationBackend: Send + Sync {
     /// Validate the opaque payload, establish any boundary-local resources,
     /// and atomically bind them to the trusted sandbox context: returns `Bound`
     /// or fails closed. Never binds a resource already bound to an active
-    /// boundary. Durable resource lifecycle remains owned by the compute driver
-    /// or external orchestrator that supplied the descriptor.
+    /// boundary. The authenticated runtime session must match
+    /// `sandbox.session_id`; a session from an earlier launch is rejected.
+    /// Durable resource lifecycle remains owned by the compute driver or
+    /// external orchestrator that supplied the descriptor.
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
@@ -440,6 +448,9 @@ pub struct SandboxConfirmEvidence {
     pub authenticated_supervisor: bool,
     pub session_epoch: String,
     pub direct_egress_blocked: bool,
+    /// The driver-owned containment primitive terminates the workload when its
+    /// Sandbox Runtime exits.
+    pub runtime_exit_terminates_workload: bool,
     pub resource_claims: BTreeMap<String, String>,
 }
 
@@ -469,6 +480,7 @@ impl SandboxConfirmEvidence {
             && self.tcp_deny_round_trip
             && self.authenticated_supervisor
             && self.direct_egress_blocked
+            && self.runtime_exit_terminates_workload
             && !self.generation.is_empty()
             && !self.session_epoch.is_empty();
         if complete {
