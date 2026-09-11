@@ -61,6 +61,10 @@ impl Device {
     pub fn windows(hostname: &str) -> Self {
         Self {
             hostname: hostname.to_string(),
+            name: None,
+            uid: None,
+            type_id: DeviceTypeId::Other,
+            type_label: "Sandbox".to_string(),
             os: Some(OsInfo {
                 name: "Windows".to_string(),
             }),
@@ -103,6 +107,10 @@ mod tests {
         let json = serde_json::to_value(&device).unwrap();
         assert_eq!(json["hostname"], "gateway-host");
         assert_eq!(json["os"]["name"], "Windows");
+        assert_eq!(json["type_id"], DeviceTypeId::Other.as_u8());
+        assert_eq!(json["type"], "Sandbox");
+        let decoded: Device = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, device);
     }
 
     #[test]
@@ -115,7 +123,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         assert_eq!(json["os"]["name"], "Linux");
     }
-  
+
     #[test]
     fn sandbox_device_type_is_independent_of_its_os() {
         let json = serde_json::to_value(Device::linux("sandbox-abc123")).unwrap();

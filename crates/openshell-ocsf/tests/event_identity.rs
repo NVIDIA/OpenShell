@@ -5,10 +5,10 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use openshell_ocsf::{ActivityId, NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId};
+use openshell_ocsf::{ActivityId, EventContext, NetworkActivityBuilder, OcsfEvent, SeverityId};
 
-fn sandbox_ctx(container_image: &str) -> SandboxContext {
-    SandboxContext {
+fn sandbox_ctx(container_image: &str) -> EventContext {
+    EventContext {
         sandbox_id: "sb-1".to_string(),
         sandbox_name: "agent-01".to_string(),
         container_image: container_image.to_string(),
@@ -19,7 +19,7 @@ fn sandbox_ctx(container_image: &str) -> SandboxContext {
     }
 }
 
-fn event(ctx: &SandboxContext) -> OcsfEvent {
+fn event(ctx: &EventContext) -> OcsfEvent {
     NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Open)
         .severity(SeverityId::Medium)

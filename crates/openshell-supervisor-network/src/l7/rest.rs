@@ -14,8 +14,8 @@ use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 use openshell_core::secrets::{
-    CREDENTIAL_MARKER_SCAN_TAIL_BYTES, SecretResolver, contains_reserved_credential_marker,
-    contains_reserved_credential_marker_bytes, rewrite_http_header_block,
+    SecretResolver, contains_reserved_credential_marker, contains_reserved_credential_marker_bytes,
+    rewrite_http_header_block,
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
@@ -723,6 +723,7 @@ where
         upstream,
         RelayRequestOptions {
             resolver,
+            body_classifier: None,
             credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
@@ -748,6 +749,7 @@ pub(crate) enum WebSocketExtensionMode {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) body_classifier: Option<&'a openshell_core::secrets::body::BodyCredentialClassifier>,
     pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
@@ -1097,12 +1099,12 @@ where
             upstream,
             &rewrite_result.rewritten,
             &req.raw_header[header_end..],
-            options.generation_guard,
+            options,
         )
         .await
         {
-            if error.to_string().contains("credential placeholder") {
-                emit_uninspected_body_credential_denial(req, &options);
+            if let Some(reason) = error.downcast_ref::<BodyCredentialError>() {
+                emit_uninspected_body_credential_denial(req, &options, *reason);
             }
             return Err(error);
         }
@@ -1158,34 +1160,43 @@ where
     Ok(outcome)
 }
 
-#[derive(Default)]
-struct ReservedMarkerStreamGuard {
-    pending: Vec<u8>,
+use openshell_core::secrets::body::{
+    BodyCredentialError, BodyPlaceholderGuard as ReservedMarkerStreamGuard,
+};
+
+fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()> {
+    ensure_credential_generation_current(options)?;
+    if let Some(guard) = options.generation_guard {
+        guard.ensure_current()?;
+    }
+    Ok(())
 }
 
-impl ReservedMarkerStreamGuard {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
-        self.pending.extend_from_slice(bytes);
-        if contains_reserved_credential_marker_bytes(&self.pending) {
-            return Err(miette!(
-                "request body credential placeholder denied because rewrite is disabled"
-            ));
-        }
-        let safe_len = self
-            .pending
-            .len()
-            .saturating_sub(CREDENTIAL_MARKER_SCAN_TAIL_BYTES);
-        Ok(self.pending.drain(..safe_len).collect())
-    }
+async fn write_body_bytes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    options: RelayRequestOptions<'_>,
+) -> Result<()> {
+    ensure_body_generation_current(options)?;
+    writer.write_all(bytes).await.into_diagnostic()
+}
 
-    fn finish(mut self) -> Result<Vec<u8>> {
-        if contains_reserved_credential_marker_bytes(&self.pending) {
-            return Err(miette!(
-                "request body credential placeholder denied because rewrite is disabled"
-            ));
-        }
-        Ok(std::mem::take(&mut self.pending))
+async fn write_guarded_chunk<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+    options: RelayRequestOptions<'_>,
+) -> Result<()> {
+    if payload.is_empty() {
+        return Ok(());
     }
+    write_body_bytes(
+        writer,
+        format!("{:X}\r\n", payload.len()).as_bytes(),
+        options,
+    )
+    .await?;
+    write_body_bytes(writer, payload, options).await?;
+    write_body_bytes(writer, b"\r\n", options).await
 }
 
 async fn relay_request_body_with_marker_guard<C, U>(
@@ -1194,30 +1205,28 @@ async fn relay_request_body_with_marker_guard<C, U>(
     upstream: &mut U,
     headers: &[u8],
     already_read: &[u8],
-    generation_guard: Option<&PolicyGenerationGuard>,
+    options: RelayRequestOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
+    ensure_body_generation_current(options)?;
     upstream.write_all(headers).await.into_diagnostic()?;
     match req.body_length {
         BodyLength::None => {
-            let mut scanner = ReservedMarkerStreamGuard::default();
+            let mut scanner = ReservedMarkerStreamGuard::new(options.body_classifier);
             let safe = scanner.push(already_read)?;
-            upstream.write_all(&safe).await.into_diagnostic()?;
-            upstream
-                .write_all(&scanner.finish()?)
-                .await
-                .into_diagnostic()?;
+            write_body_bytes(upstream, &safe, options).await?;
+            write_body_bytes(upstream, &scanner.finish()?, options).await?;
         }
         BodyLength::ContentLength(len) => {
             let initial_len = usize::try_from(len)
                 .unwrap_or(usize::MAX)
                 .min(already_read.len());
-            let mut scanner = ReservedMarkerStreamGuard::default();
+            let mut scanner = ReservedMarkerStreamGuard::new(options.body_classifier);
             let safe = scanner.push(&already_read[..initial_len])?;
-            upstream.write_all(&safe).await.into_diagnostic()?;
+            write_body_bytes(upstream, &safe, options).await?;
             let mut remaining = len.saturating_sub(initial_len as u64);
             let mut buf = vec![0u8; RELAY_BUF_SIZE];
             while remaining > 0 {
@@ -1230,36 +1239,17 @@ where
                         "Connection closed with {remaining} body bytes remaining"
                     ));
                 }
-                if let Some(guard) = generation_guard {
-                    guard.ensure_current()?;
-                }
+                ensure_body_generation_current(options)?;
                 let safe = scanner.push(&buf[..n])?;
-                upstream.write_all(&safe).await.into_diagnostic()?;
+                write_body_bytes(upstream, &safe, options).await?;
                 remaining -= n as u64;
             }
-            upstream
-                .write_all(&scanner.finish()?)
-                .await
-                .into_diagnostic()?;
+            write_body_bytes(upstream, &scanner.finish()?, options).await?;
         }
         BodyLength::Chunked => {
-            relay_chunked_with_marker_guard(client, upstream, already_read, generation_guard)
-                .await?;
+            relay_chunked_with_marker_guard(client, upstream, already_read, options).await?;
         }
     }
-    Ok(())
-}
-
-async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-    writer
-        .write_all(format!("{:X}\r\n", payload.len()).as_bytes())
-        .await
-        .into_diagnostic()?;
-    writer.write_all(payload).await.into_diagnostic()?;
-    writer.write_all(b"\r\n").await.into_diagnostic()?;
     Ok(())
 }
 
@@ -1267,18 +1257,19 @@ async fn relay_chunked_with_marker_guard<C, U>(
     client: &mut C,
     upstream: &mut U,
     already_read: &[u8],
-    generation_guard: Option<&PolicyGenerationGuard>,
+    options: RelayRequestOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
+    let generation_guard = options.generation_guard;
     let mut read_state = ChunkedReadState {
         buffered_pos: 0,
         wire_bytes: 0,
         max_wire_bytes: None,
     };
-    let mut scanner = ReservedMarkerStreamGuard::default();
+    let mut scanner = ReservedMarkerStreamGuard::new(options.body_classifier);
 
     loop {
         let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
@@ -1295,20 +1286,18 @@ where
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
 
         if chunk_size == 0 {
-            write_chunk(upstream, &scanner.finish()?).await?;
-            upstream.write_all(b"0\r\n").await.into_diagnostic()?;
+            write_guarded_chunk(upstream, &scanner.finish()?, options).await?;
+            write_body_bytes(upstream, b"0\r\n", options).await?;
             loop {
                 let trailer =
                     read_chunked_line(client, already_read, &mut read_state, generation_guard)
                         .await
                         .map_err(CollectChunkedError::into_report)?;
                 if contains_reserved_credential_marker_bytes(&trailer) {
-                    return Err(miette!(
-                        "request body credential placeholder denied because rewrite is disabled"
-                    ));
+                    return Err(BodyCredentialError::Trailer.into());
                 }
-                upstream.write_all(&trailer).await.into_diagnostic()?;
-                upstream.write_all(b"\r\n").await.into_diagnostic()?;
+                write_body_bytes(upstream, &trailer, options).await?;
+                write_body_bytes(upstream, b"\r\n", options).await?;
                 if trailer.is_empty() {
                     return Ok(());
                 }
@@ -1329,7 +1318,7 @@ where
             )
             .await
             .map_err(CollectChunkedError::into_report)?;
-            write_chunk(upstream, &scanner.push(&block)?).await?;
+            write_guarded_chunk(upstream, &scanner.push(&block)?, options).await?;
             remaining -= block_len;
         }
 
@@ -1350,7 +1339,11 @@ where
     }
 }
 
-fn emit_uninspected_body_credential_denial(req: &L7Request, options: &RelayRequestOptions<'_>) {
+fn emit_uninspected_body_credential_denial(
+    req: &L7Request,
+    options: &RelayRequestOptions<'_>,
+    reason: BodyCredentialError,
+) {
     let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(openshell_ocsf::ActivityId::Traffic)
         .action(openshell_ocsf::ActionId::Denied)
@@ -1367,7 +1360,20 @@ fn emit_uninspected_body_credential_denial(req: &L7Request, options: &RelayReque
         ))
         .build();
     openshell_ocsf::ocsf_emit!(event);
-    crate::l7::emit_uninspected_credential_finding(options.host, "", "http-request-body");
+    let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(openshell_ocsf::SeverityId::High)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.credentials.traffic_uninspectable",
+            "Credential-bearing traffic cannot be inspected",
+        ))
+        .evidence_pairs(&[
+            ("host", options.host),
+            ("surface", "http-request-body"),
+            ("reason", reason.reason()),
+        ])
+        .message("Request body credential placeholder denied")
+        .build();
+    openshell_ocsf::ocsf_emit!(finding);
 }
 
 struct PreparedRequestBody {
@@ -7212,6 +7218,141 @@ mod tests {
         assert!(!lower.contains("upgrade: h2c"));
     }
 
+    #[tokio::test]
+    async fn guarded_conversation_body_preserves_literals_own_and_foreign_tokens() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([("GITHUB_TOKEN".into(), "private-test-secret".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "GITHUB_TOKEN".into(),
+                StaticCredentialBinding {
+                    credential_identity: "github".into(),
+                    workload_credential_handle: String::new(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.github.com".into(),
+                        port: 443,
+                        path: "/**".into(),
+                    }],
+                },
+            )]),
+            vec![],
+        )
+        .unwrap();
+        // Same REST defaults as each built-in conversation profile, with real scoped bindings.
+        for host in [
+            "api.openai.com",
+            "api.anthropic.com",
+            "api.githubcopilot.com",
+            "api.github.com",
+        ] {
+            let (_, classifier, revision) =
+                state.resolver_and_body_classifier_for_endpoint(host, 443, "/v1/responses");
+            let issued = state.snapshot().child_env["GITHUB_TOKEN"].clone();
+            for token in [
+                "openshell:resolve:env:KEY".to_owned(),
+                issued.clone(),
+                issued.replace(':', "%3A"),
+                format!(
+                    "sk-OPENSHELL-RESOLVE-ENV-{}",
+                    issued.strip_prefix("openshell:resolve:env:").unwrap()
+                ),
+            ] {
+                let body = format!(
+                    r#"{{"input":[{{"type":"function_call_output","output":"Token: {token}"}}]}}"#
+                );
+                for chunked in [false, true] {
+                    let wire = if chunked {
+                        let mut wire = Vec::new();
+                        for byte in body.bytes() {
+                            wire.extend_from_slice(&[b'1', b'\r', b'\n', byte, b'\r', b'\n']);
+                        }
+                        wire.extend_from_slice(b"0\r\n\r\n");
+                        wire
+                    } else {
+                        body.as_bytes().to_vec()
+                    };
+                    let req = L7Request {
+                        action: "POST".into(),
+                        target: "/v1/responses".into(),
+                        query_params: HashMap::new(),
+                        raw_header: Vec::new(),
+                        body_length: if chunked {
+                            BodyLength::Chunked
+                        } else {
+                            BodyLength::ContentLength(wire.len() as u64)
+                        },
+                    };
+                    let mut input = wire.as_slice();
+                    let mut output = Vec::new();
+                    relay_request_body_with_marker_guard(
+                        &req,
+                        &mut input,
+                        &mut output,
+                        b"",
+                        b"",
+                        RelayRequestOptions {
+                            body_classifier: classifier.as_deref(),
+                            credential_generation: Some(CredentialGenerationGuard::new(
+                                &state, revision,
+                            )),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    if chunked {
+                        let mut cursor = output.as_slice();
+                        let mut decoded = Vec::new();
+                        loop {
+                            let end = cursor.windows(2).position(|w| w == b"\r\n").unwrap();
+                            let len = usize::from_str_radix(
+                                std::str::from_utf8(&cursor[..end]).unwrap(),
+                                16,
+                            )
+                            .unwrap();
+                            cursor = &cursor[end + 2..];
+                            if len == 0 {
+                                break;
+                            }
+                            decoded.extend_from_slice(&cursor[..len]);
+                            cursor = &cursor[len + 2..];
+                        }
+                        assert_eq!(decoded, body.as_bytes());
+                    } else {
+                        assert_eq!(output, body.as_bytes());
+                    }
+                    assert!(!String::from_utf8_lossy(&output).contains("private-test-secret"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_body_rejects_stale_credentials_before_writing() {
+        let state = openshell_core::provider_credentials::ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let options = RelayRequestOptions {
+            credential_generation: Some(CredentialGenerationGuard::new(&state, 1)),
+            ..Default::default()
+        };
+        state.revoke_static_provider_environment(2);
+        let mut output = Vec::new();
+        assert!(
+            write_body_bytes(&mut output, b"must not forward", options)
+                .await
+                .is_err()
+        );
+        assert!(output.is_empty());
+    }
+
     #[test]
     fn streamed_body_guard_detects_marker_split_across_reads() {
         let mut guard = ReservedMarkerStreamGuard::default();
@@ -7304,7 +7445,7 @@ mod tests {
             &mut tokio::io::empty(),
             &mut upstream_writer,
             wire,
-            None,
+            RelayRequestOptions::default(),
         )
         .await
         .expect_err("encoded placeholder must fail closed");

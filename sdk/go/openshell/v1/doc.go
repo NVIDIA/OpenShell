@@ -5,8 +5,9 @@
 //
 // The SDK follows the Kubernetes client-go sub-client pattern: a single Client
 // provides typed accessors for each resource domain (Sandboxes, Providers, Exec,
-// Files, Health, Services, SSH, TCP, Config, Policy, and Workspaces). All operations accept a context.Context and return idiomatic
-// Go types. Proto-generated types never appear in the public API.
+// Files, Health, Services, SSH, TCP, Config, Policy, and Workspaces). Network
+// operations accept a context.Context and return idiomatic Go types.
+// Proto-generated types never appear in the public API.
 //
 // # Quick Start
 //
@@ -32,6 +33,28 @@
 //	sandbox, err = client.Sandboxes().WaitReady(ctx, "default", sandbox.Name)
 //	if err != nil {
 //	    log.Fatal(err)
+//	}
+//
+// # Pagination
+//
+// List methods construct a lazy Pager without issuing an RPC. Each NextPage
+// call fetches one page; ListAll is the explicit exhaustive convenience.
+//
+//	pages, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 100})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for {
+//	    page, err := pages.NextPage(ctx)
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    if page == nil {
+//	        break
+//	    }
+//	    for _, sandbox := range page.Items {
+//	        fmt.Println(sandbox.Name)
+//	    }
 //	}
 //
 // # Command Execution
@@ -86,7 +109,7 @@
 //	}
 //	fmt.Printf("Service URL: %s\n", endpoint.URL)
 //
-//	endpoints, err := client.Services().List(ctx, "default", "my-sandbox")
+//	endpoints, err := client.Services().ListAll(ctx, "default", "my-sandbox")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -98,7 +121,7 @@
 //
 // List available provider profiles and import new ones:
 //
-//	profiles, err := client.Providers().Profiles().List(ctx, "default")
+//	profiles, err := client.Providers().Profiles().ListAll(ctx, "default")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -314,7 +337,7 @@
 //
 // Read a policy back from revision history:
 //
-//	revisions, err := client.Policy().List(ctx, "default")
+//	revisions, err := client.Policy().ListAll(ctx, "default", "my-sandbox")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -328,7 +351,7 @@
 //
 // List gateway-global policy revisions (no sandbox name or workspace needed):
 //
-//	revisions, err := client.Policy().List(ctx, "", v1.WithListGlobal(true))
+//	revisions, err := client.Policy().ListAll(ctx, "", "", v1.WithListGlobal(true))
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -359,7 +382,7 @@
 //	}
 //	fmt.Printf("Workspace %s created (phase: %s)\n", ws.Name, ws.Phase)
 //
-//	workspaces, err := client.Workspaces().List(ctx)
+//	workspaces, err := client.Workspaces().ListAll(ctx)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -378,7 +401,7 @@
 //	}
 //	fmt.Printf("Added %s as %s\n", member.PrincipalSubject, member.Role)
 //
-//	members, err := client.Workspaces().ListMembers(ctx, "team-alpha")
+//	members, err := client.Workspaces().ListAllMembers(ctx, "team-alpha")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}

@@ -25,7 +25,7 @@
 //! # async fn run() -> Result<(), openshell_sdk::SdkError> {
 //! let client = OpenShellClient::connect(ClientConfig::new("http://127.0.0.1:8080")).await?;
 //! let health = client.health().await?;
-//! let sandboxes = client.list_sandboxes(ListOptions::default()).await?;
+//! let sandboxes = client.list_all_sandboxes(ListOptions::default()).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -36,6 +36,7 @@ pub mod config;
 pub mod edge_tunnel;
 pub mod error;
 pub mod oidc;
+pub mod pagination;
 pub mod raw;
 pub mod refresh;
 pub mod transport;
@@ -45,6 +46,7 @@ pub use auth::EdgeAuthInterceptor;
 pub use client::{OpenShellClient, WorkspaceScopedClient};
 pub use config::{AuthConfig, ClientConfig};
 pub use error::SdkError;
+pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxResources,

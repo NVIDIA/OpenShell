@@ -81,12 +81,13 @@ def provider(
     _delete_provider(stub, name)
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
                 profile_workspace=profile_workspace,
-            )
+            ),
         )
     )
     try:
@@ -98,7 +99,12 @@ def provider(
 def _delete_provider(stub: object, name: str) -> None:
     """Delete a provider, ignoring not-found errors."""
     try:
-        stub.DeleteProvider(openshell_pb2.DeleteProviderRequest(name=name))
+        stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
     except grpc.RpcError as exc:
         if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
             pass
@@ -337,13 +343,14 @@ def test_profileless_provider_creation_is_rejected(
     with pytest.raises(grpc.RpcError) as exc_info:
         sandbox_client._stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(
                         name="e2e-test-profileless-provider"
                     ),
                     type="generic",
                     credentials={"CUSTOM_SERVICE_TOKEN": "token-generic-123"},
-                )
+                ),
             )
         )
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
@@ -496,6 +503,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
             try:
                 stub.AttachSandboxProvider(
                     openshell_pb2.AttachSandboxProviderRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
                         sandbox_name=sb.sandbox.name,
                         provider_name=provider_name,
                     )
@@ -507,6 +517,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
 
                 stub.DetachSandboxProvider(
                     openshell_pb2.DetachSandboxProviderRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
                         sandbox_name=sb.sandbox.name,
                         provider_name=provider_name,
                     )
@@ -516,6 +529,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 try:
                     stub.DetachSandboxProvider(
                         openshell_pb2.DetachSandboxProviderRequest(
+                            workspace_scope=datamodel_pb2.WorkspaceSelector(
+                                workspace="default"
+                            ),
                             sandbox_name=sb.sandbox.name,
                             provider_name=provider_name,
                         )
@@ -750,7 +766,12 @@ def test_credentials_not_in_persisted_spec_environment(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
-                openshell_pb2.GetSandboxRequest(name=sb.sandbox.name)
+                openshell_pb2.GetSandboxRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
+                    name=sb.sandbox.name,
+                )
             )
             persisted_env = dict(fetched.sandbox.spec.environment)
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
@@ -774,6 +795,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="codex",
@@ -783,21 +805,27 @@ def test_update_provider_preserves_unset_credentials_and_config(
                         "CODEX_AUTH_ACCOUNT_ID": "account-id",
                     },
                     config={"BASE_URL": "https://example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     credentials={"CODEX_AUTH_ACCESS_TOKEN": "rotated-a"},
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -823,25 +851,32 @@ def test_update_provider_empty_maps_preserves_all(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "secret"},
                     config={"URL": "https://api.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -865,26 +900,33 @@ def test_update_provider_merges_config_preserves_credentials(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "original-key"},
                     config={"ENDPOINT": "https://old.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     config={"ENDPOINT": "https://new.example.com"},
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -908,21 +950,25 @@ def test_update_provider_rejects_type_change(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "val"},
-                )
+                ),
             )
         )
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
-                    )
+                    ),
                 )
             )
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
@@ -1045,7 +1091,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="")
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1056,7 +1102,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
 
         workspace_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="default")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="default")
         )
         workspace_ids = [p.id for p in workspace_list.profiles]
         assert workspace_id in workspace_ids, (
@@ -1112,14 +1158,14 @@ def test_cross_workspace_profile_ids_do_not_collide(
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_a)
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_a)
         )
         assert any(p.id == profile_id for p in list_a.profiles), (
             "profile should appear in ws-a"
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_b)
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_b)
         )
         assert any(p.id == profile_id for p in list_b.profiles), (
             "profile should appear in ws-b"

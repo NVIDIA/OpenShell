@@ -1104,6 +1104,11 @@ impl DockerComputeDriver {
                     }
                 }
             }
+            // Container gone and no in-memory record survived (gateway
+            // restarted after an out-of-band `docker rm`). DeleteSandbox is
+            // the only thing that ever reclaims the token file, so reclaim it
+            // here too.
+            cleanup_sandbox_token_file_for_delete(sandbox_id, None, &self.config);
             return Ok(false);
         };
         let Some(target) = summary_container_target(&container) else {

@@ -52,7 +52,7 @@ def test_workspace_list_includes_created(workspace_client: WorkspaceClient) -> N
     try:
         workspace_client.create(name)
 
-        names = {ws.name for ws in workspace_client.list()}
+        names = {ws.name for ws in workspace_client.list_all()}
         assert name in names
         assert "default" in names
     finally:

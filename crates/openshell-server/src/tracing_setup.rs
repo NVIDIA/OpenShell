@@ -209,7 +209,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use openshell_ocsf::{
-        AppLifecycleBuilder, OcsfJsonlLayer, SandboxContext, emit_ocsf_event_routed,
+        AppLifecycleBuilder, EventContext, OcsfJsonlLayer, emit_ocsf_event_routed,
     };
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
@@ -240,7 +240,7 @@ mod tests {
                     .with_filter(EnvFilter::new("warn")),
             )
             .with(OcsfJsonlLayer::new(SharedWriter(output.clone())));
-        let ctx = SandboxContext {
+        let ctx = EventContext {
             sandbox_id: "sandbox-filter-test".into(),
             sandbox_name: "filter-test".into(),
             container_image: String::new(),

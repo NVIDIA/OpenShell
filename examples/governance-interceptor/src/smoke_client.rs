@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .update_config(UpdateConfigRequest {
             name: sandbox_name.clone(),
             policy: Some(widened_policy),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..Default::default()
         })
         .await;

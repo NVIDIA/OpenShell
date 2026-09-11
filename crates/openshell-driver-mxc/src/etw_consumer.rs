@@ -72,8 +72,8 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    DispositionId, FindingInfo, LaunchTypeId, OcsfEvent, Process, ProcessActivityBuilder,
-    SandboxContext, SecurityLevelId, SeverityId, StateId, StatusId,
+    DispositionId, EventContext, FindingInfo, LaunchTypeId, OcsfEvent, Process,
+    ProcessActivityBuilder, SecurityLevelId, SeverityId, StateId, StatusId,
 };
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +1691,7 @@ fn emit_resolved(
 // ---------------------------------------------------------------------------
 
 /// `SandboxCreateWithPolicyEnforcement` (START) → Application Lifecycle [6002].
-fn map_lifecycle_create(ctx: &SandboxContext, sandbox_name: &str) -> OcsfEvent {
+fn map_lifecycle_create(ctx: &EventContext, sandbox_name: &str) -> OcsfEvent {
     AppLifecycleBuilder::new(ctx)
         .activity(ActivityId::Reset) // lifecycle label = "Start"
         .severity(SeverityId::Informational)
@@ -1711,7 +1711,7 @@ fn map_lifecycle_create(ctx: &SandboxContext, sandbox_name: &str) -> OcsfEvent {
 /// `SandboxConsoleReferencePlumbed` (console-handle plumbing). Whichever
 /// config-ish fields the event carries ride along as `unmapped`, and
 /// `security_level` reflects any hardening signal present.
-fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
+fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     let flag = |k: &str| ev.get(k).map(|v| v == "1").unwrap_or(false);
     let nonzero = |k: &str| ev.get(k).map(|v| v != "0").unwrap_or(false);
     let hardened = flag("useLeastPrivilege") || flag("useAppContainer") || nonzero("agenticFlags");
@@ -1782,7 +1782,7 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
 /// the message because legitimate arguments may contain credentials, signed URLs,
 /// or PII. The executable basename provides a useful, bounded audit identity
 /// without copying the raw ETW command line into durable or streamed logs.
-fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str) -> OcsfEvent {
+fn map_process_launch(ctx: &EventContext, ev: &DecodedEtwEvent, cmd_line: &str) -> OcsfEvent {
     // The created process's own pid isn't in this event (it appears later in
     // `ProcessLaunched`); the emitting pid is the sandbox host (wxc-exec).
     let executable = exe_name(cmd_line);
@@ -1815,7 +1815,7 @@ fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str
 /// of the process that actually started. We give the process a distinct name
 /// (`sandboxed-process`) so the shorthand row is visibly the confirmed-start twin,
 /// not a duplicate of the launch-request row.
-fn map_process_started(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
+fn map_process_started(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     let pid = ev
         .get("processId")
         .map(|v| v.trim_matches('"'))
@@ -1843,7 +1843,7 @@ fn map_process_started(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent 
 }
 
 /// `ActivityError` / `FallbackError` → Detection Finding [2004] (informational).
-fn map_finding(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
+fn map_finding(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     let kind = ev.event_name.as_deref().unwrap_or("SandboxError");
     let uid = ev
         .cv_base()
@@ -1914,8 +1914,8 @@ fn gateway_hostname() -> &'static str {
 
 /// Build a per-event OCSF context (not the process-wide `ctx()` singleton, since
 /// one gateway process hosts many sandboxes — wrinkle #1).
-fn etw_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
-    SandboxContext {
+fn etw_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "mxc/appcontainer".to_string(),

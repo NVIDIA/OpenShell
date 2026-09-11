@@ -124,17 +124,19 @@ fn validate_command(label: &str, command: &Path, timeout_secs: u64) -> Result<()
 mod tests {
     use super::*;
 
-    fn absolute_test_command(name: &str) -> String {
-        if cfg!(target_os = "windows") {
-            format!("C:/OpenShell/{name}")
-        } else {
-            format!("/usr/local/libexec/{name}")
-        }
-    }
+    #[cfg(not(windows))]
+    const RESTART_GATEWAY_COMMAND: &str = "/usr/local/libexec/restart-gateway";
+    #[cfg(windows)]
+    const RESTART_GATEWAY_COMMAND: &str = r"C:\usr\local\libexec\restart-gateway";
+
+    #[cfg(not(windows))]
+    const DIAGNOSTICS_COMMAND: &str = "/usr/local/libexec/diagnostics";
+    #[cfg(windows)]
+    const DIAGNOSTICS_COMMAND: &str = r"C:\usr\local\libexec\diagnostics";
 
     #[test]
     fn parses_a_smoke_and_continuity_plan() {
-        let input = format!(
+        let plan = ConformancePlan::parse(&format!(
             r#"
                 version = 1
 
@@ -147,12 +149,11 @@ mod tests {
 
                 [[runs.actions]]
                 name = "gateway-upgrade"
-                command = '{}'
+                command = '{RESTART_GATEWAY_COMMAND}'
                 timeout_secs = 120
             "#,
-            absolute_test_command("restart-gateway")
-        );
-        let plan = ConformancePlan::parse(&input).expect("valid plan");
+        ))
+        .expect("valid plan");
 
         assert_eq!(plan.runs.len(), 2);
         assert_eq!(plan.runs[1].actions[0].name, "gateway-upgrade");
@@ -160,20 +161,19 @@ mod tests {
 
     #[test]
     fn parses_plan_diagnostics() {
-        let input = format!(
+        let plan = ConformancePlan::parse(&format!(
             r#"
                 version = 1
 
                 [diagnostics]
-                command = '{}'
+                command = '{DIAGNOSTICS_COMMAND}'
                 timeout_secs = 60
 
                 [[runs]]
                 scenario = "smoke"
             "#,
-            absolute_test_command("diagnostics")
-        );
-        let plan = ConformancePlan::parse(&input).expect("valid plan with diagnostics");
+        ))
+        .expect("valid plan with diagnostics");
 
         assert_eq!(
             plan.diagnostics

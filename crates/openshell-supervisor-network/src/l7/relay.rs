@@ -64,6 +64,7 @@ pub struct L7EvalContext {
     /// resolver. Used to reject a request if credentials change again before
     /// its first upstream write.
     pub(crate) provider_credential_revision: Option<u64>,
+    pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
     /// Dynamic credentials (token grants) keyed by endpoint-bound provider metadata.
@@ -99,13 +100,15 @@ fn scoped_context_for_request(
         // credential use. Clearing the resolver makes any placeholder or
         // signing attempt fail closed before an upstream write.
         scoped.secret_resolver = None;
+        scoped.body_classifier = None;
         scoped.provider_credential_revision = None;
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
-    let (resolver, revision) =
-        credentials.resolver_for_endpoint_with_revision(&ctx.host, ctx.port, &request.target);
+    let (resolver, classifier, revision) =
+        credentials.resolver_and_body_classifier_for_endpoint(&ctx.host, ctx.port, &request.target);
     scoped.secret_resolver = resolver;
+    scoped.body_classifier = classifier;
     scoped.provider_credential_revision = Some(revision);
     Some(scoped)
 }
@@ -369,6 +372,26 @@ where
     Ok(())
 }
 
+pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    error: secrets::body::BodyCredentialError,
+) -> Result<()> {
+    let body = serde_json::json!({"error": {
+        "code": "credential_placeholder_in_request_body",
+        "reason": error.reason(),
+        "message": "A credential placeholder in the request body cannot be forwarded. Remove the reference from conversation history or restore provider access; body credential rewriting is disabled."
+    }}).to_string();
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()
+}
+
 async fn relay_http_request_with_credential_rejection<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -387,7 +410,12 @@ where
     {
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
-            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                let _ = upstream.shutdown().await;
+                reject_body_credential(client, *error).await?;
+                Ok(None)
+            } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
+            {
                 reject_credential_resolution(client, ctx, error).await?;
                 Ok(None)
             } else {
@@ -929,6 +957,7 @@ where
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
+                    body_classifier: ctx.body_classifier.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
                     websocket_extensions: websocket_extension_mode(
@@ -1149,10 +1178,10 @@ pub(crate) async fn websocket_middleware_preflight(
 
 /// Build the WebSocket preflight input from the sandbox and evaluation
 /// contexts. Kept separate from `websocket_middleware_preflight` (and taking an
-/// explicit `SandboxContext`) so the identifier copy is unit-testable with a
+/// explicit `EventContext`) so the identifier copy is unit-testable with a
 /// real sandbox name, mirroring `middleware_request_input` on the HTTP path.
 fn websocket_preflight_input(
-    sandbox: &openshell_ocsf::SandboxContext,
+    sandbox: &openshell_ocsf::EventContext,
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     scheme: &str,
@@ -1668,6 +1697,7 @@ where
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
+                    body_classifier: ctx.body_classifier.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
                     websocket_extensions: websocket_extension_mode(
@@ -2046,6 +2076,7 @@ where
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
+                    body_classifier: ctx.body_classifier.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
                     ..Default::default()
@@ -2281,6 +2312,7 @@ where
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
+                    body_classifier: ctx.body_classifier.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
                     ..Default::default()
@@ -2984,6 +3016,44 @@ mod tests {
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn body_denial_returns_actionable_local_json() {
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(), target: "/v1/responses".into(), query_params: TestHashMap::new(),
+            raw_header: b"POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 25\r\n\r\nopenshell:resolve:env:KEY".to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(25),
+        };
+        let (mut client, mut caller) = tokio::io::duplex(4096);
+        let (mut upstream, mut server) = tokio::io::duplex(4096);
+        let outcome = relay_http_request_with_credential_rejection(
+            &req,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                deny_uninspected_credentials: true,
+                ..Default::default()
+            },
+            &L7EvalContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_none());
+        drop(client);
+        let mut response = String::new();
+        caller.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            "credential_placeholder_in_request_body"
+        );
+        assert_eq!(body["error"]["reason"], "classification_unavailable");
+        let mut sent = String::new();
+        server.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("openshell:resolve:"));
+    }
+
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
     fn endpoint_binding(identity: &str) -> StaticCredentialBinding {
@@ -3022,7 +3092,7 @@ mod tests {
 
     #[test]
     fn websocket_preflight_input_carries_real_sandbox_name() {
-        let sandbox = openshell_ocsf::SandboxContext {
+        let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),

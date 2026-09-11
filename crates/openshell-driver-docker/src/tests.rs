@@ -209,6 +209,29 @@ fn request_with_traceparent<T>(message: T) -> Request<T> {
     request
 }
 
+async fn fake_docker_with_no_containers() -> (String, JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let mut scratch = [0_u8; 4096_usize];
+            let _ = stream.read(&mut scratch).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                           Content-Type: application/json\r\n\
+                           Content-Length: 2\r\n\r\n[]",
+                )
+                .await;
+            let _ = stream.flush().await;
+        }
+    });
+    (format!("http://{address}"), server)
+}
+
 async fn standalone_traced_client() -> (
     TestDriverClient,
     tokio::sync::oneshot::Sender<()>,
@@ -3717,4 +3740,78 @@ fn managed_container_identity_requires_the_configured_namespace() {
         "sbx-alpha",
         "demo"
     ));
+}
+
+#[tokio::test]
+async fn delete_sandbox_reclaims_token_file_when_container_and_pending_are_gone() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let (endpoint, server) = fake_docker_with_no_containers().await;
+
+    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
+        let config = runtime_config();
+        let mut driver = test_driver_with_config(config.clone());
+        driver.docker = Arc::new(
+            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
+        );
+
+        // Arrange the leak: token on disk, container gone, `pending` empty.
+        let token = openshell_core::driver_utils::sandbox_token_path(
+            "docker-sandbox-tokens",
+            Some(&config.sandbox_namespace),
+            "sandbox-1",
+        )
+        .unwrap();
+
+        fs::create_dir_all(token.parent().unwrap()).unwrap();
+        fs::write(&token, "jwt\n").unwrap();
+
+        let deleted = driver.delete_sandbox_inner("sandbox-1", "").await.unwrap();
+        assert!(!deleted, "nothing was removed, must not claim a deletion");
+        assert!(!token.exists(), "token file must be reclaimed");
+    })
+    .await;
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn delete_sandbox_by_name_only_leaves_the_namespace_directory_alone() {
+    // `DeleteSandbox` accepts a name without an id. With no id there is no
+    // token path to derive, so the cleanup must be a no-op: deriving a path
+    // from an empty id yields `<namespace>/sandbox.jwt`, whose parent is the
+    // shared namespace directory.
+    let state_dir = tempfile::tempdir().unwrap();
+    let (endpoint, server) = fake_docker_with_no_containers().await;
+
+    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
+        let config = runtime_config();
+        let mut driver = test_driver_with_config(config.clone());
+        driver.docker = Arc::new(
+            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
+        );
+
+        let namespace_dir = openshell_core::driver_utils::sandbox_token_path(
+            "docker-sandbox-tokens",
+            Some(&config.sandbox_namespace),
+            "sandbox-1",
+        )
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_path_buf();
+        fs::create_dir_all(&namespace_dir).unwrap();
+
+        let deleted = driver.delete_sandbox_inner("", "sandbox-1").await.unwrap();
+
+        assert!(!deleted, "nothing was removed, must not claim a deletion");
+        assert!(
+            namespace_dir.is_dir(),
+            "namespace directory must survive a name-only delete: {}",
+            namespace_dir.display()
+        );
+    })
+    .await;
+
+    server.abort();
 }

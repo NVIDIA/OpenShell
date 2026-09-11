@@ -643,7 +643,7 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
         labels,
         annotations,
-        workspace: workspace.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         await_main_process_attachment,
         workload_template_name: template.unwrap_or_default().to_string(),
     };
@@ -689,7 +689,7 @@ pub async fn sandbox_create(
                 name: sandbox_name.clone(),
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
                 ..Default::default()
             })
             .await
@@ -1307,7 +1307,7 @@ async fn stage_rootfs_tar(
     // archive over its configured limit, before allocating anything.
     let slot = client
         .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             file_name,
             size_bytes: source_meta.len(),
         })
@@ -1495,7 +1495,7 @@ pub async fn sandbox_get(
     let response = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -1657,7 +1657,7 @@ pub async fn sandbox_exec_grpc(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -1891,7 +1891,7 @@ async fn fetch_ready_sandbox_for_forward(
     let response = match client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -2232,8 +2232,8 @@ async fn sandbox_exec_interactive_grpc(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     ids_only: bool,
     names_only: bool,
     label_selector: Option<&str>,
@@ -2246,24 +2246,32 @@ pub async fn sandbox_list(
 
     let response = client
         .list_sandboxes(ListSandboxesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.unwrap_or("").to_string(),
-            workspace: if all_workspaces {
-                String::new()
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
         })
         .await
         .into_diagnostic()?;
 
-    let sandboxes = response.into_inner().sandboxes;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let sandboxes = response.sandboxes;
 
-    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "sandboxes",
+        &sandboxes,
+        &next_page_token,
+        sandbox_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if sandboxes.is_empty() {
         if !ids_only && !names_only {
@@ -2490,7 +2498,7 @@ pub async fn sandbox_template_create(
                     labels,
                     resource_version: 0,
                     annotations,
-                    workspace: String::new(),
+                    workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,
                 }),
                 spec: Some(SandboxWorkloadTemplateSpec {
@@ -2503,7 +2511,7 @@ pub async fn sandbox_template_create(
                     desired_service_level,
                 }),
             }),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -2568,7 +2576,7 @@ pub async fn sandbox_template_get(
     let response = client
         .get_sandbox_template(GetSandboxTemplateRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -2588,8 +2596,8 @@ pub async fn sandbox_template_get(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_template_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     label_selector: Option<&str>,
     names_only: bool,
     output: &str,
@@ -2600,23 +2608,31 @@ pub async fn sandbox_template_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_sandbox_templates(ListSandboxTemplatesRequest {
-            limit,
-            offset,
-            workspace: if all_workspaces {
-                String::new()
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
             label_selector: label_selector.unwrap_or_default().to_string(),
         })
         .await
         .into_diagnostic()?;
-    let templates = response.into_inner().templates;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let templates = response.templates;
 
-    if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "templates",
+        &templates,
+        &next_page_token,
+        sandbox_template_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if templates.is_empty() {
         if !names_only {
@@ -2651,7 +2667,7 @@ pub async fn sandbox_template_delete(
         let response = client
             .delete_sandbox_template(DeleteSandboxTemplateRequest {
                 name: name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -3030,18 +3046,25 @@ pub async fn sandbox_delete(
     let mut client = grpc_client(server, tls).await?;
 
     let names_to_delete: Vec<String> = if all {
-        // Fetch all sandboxes (use a large page size).
-        let response = client
-            .list_sandboxes(ListSandboxesRequest {
-                limit: 1000,
-                offset: 0,
-                label_selector: String::new(),
-                workspace: workspace.to_string(),
-                all_workspaces: false,
-            })
-            .await
-            .into_diagnostic()?;
-        let sandboxes = response.into_inner().sandboxes;
+        let mut page_token = String::new();
+        let mut sandboxes = Vec::new();
+        loop {
+            let response = client
+                .list_sandboxes(ListSandboxesRequest {
+                    page_size: 1000,
+                    page_token,
+                    label_selector: String::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                })
+                .await
+                .into_diagnostic()?
+                .into_inner();
+            sandboxes.extend(response.sandboxes);
+            if response.next_page_token.is_empty() {
+                break;
+            }
+            page_token = response.next_page_token;
+        }
         if sandboxes.is_empty() {
             println!("No sandboxes to delete.");
             return Ok(());
@@ -3069,7 +3092,7 @@ pub async fn sandbox_delete(
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
                 name: name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
@@ -3121,7 +3144,7 @@ pub async fn sandbox_stop(
     let sandbox = client
         .stop_sandbox(StopSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -3144,7 +3167,7 @@ pub async fn sandbox_start(
     let sandbox = client
         .start_sandbox(StartSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -3245,7 +3268,7 @@ pub async fn service_expose(
             service: service.to_string(),
             target_port: u32::from(target_port),
             domain: true,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .map_err(service_expose_status_error)?
@@ -3282,8 +3305,8 @@ fn service_expose_status_error(status: Status) -> miette::Report {
 pub async fn service_list(
     server: &str,
     sandbox: Option<&str>,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     workspace: &str,
     all_workspaces: bool,
     output: &str,
@@ -3293,27 +3316,34 @@ pub async fn service_list(
     let response = client
         .list_services(ListServicesRequest {
             sandbox: sandbox.unwrap_or_default().to_string(),
-            limit,
-            offset,
-            workspace: if all_workspaces {
-                String::new()
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
         })
         .await
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
 
+    let next_page_token = response.next_page_token.clone();
     let services = response
         .services
         .iter()
         .filter_map(|response| service_endpoint_to_json(response, server))
         .collect::<Vec<_>>();
-    if crate::output::print_output_collection(output, &services, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "services",
+        &services,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
@@ -3340,7 +3370,7 @@ pub async fn service_get(
         .get_service(GetServiceRequest {
             sandbox: sandbox.to_string(),
             service: service.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .map_err(|status| service_status_error("get service", "sandbox:read", status))?
@@ -3362,7 +3392,7 @@ pub async fn service_delete(
         .delete_service(DeleteServiceRequest {
             sandbox: sandbox.to_string(),
             service: service.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
@@ -3650,8 +3680,8 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
 
 pub async fn workspace_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     label_selector: &str,
     output: &str,
     tls: &TlsOptions,
@@ -3661,17 +3691,26 @@ pub async fn workspace_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspaces(ListWorkspacesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let workspaces = response.into_inner().workspaces;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let workspaces = response.workspaces;
 
-    if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "workspaces",
+        &workspaces,
+        &next_page_token,
+        workspace_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if workspaces.is_empty() {
         println!("No workspaces found.");
@@ -3821,8 +3860,8 @@ pub async fn workspace_member_remove(
 pub async fn workspace_member_list(
     server: &str,
     workspace: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3832,16 +3871,25 @@ pub async fn workspace_member_list(
     let response = client
         .list_workspace_members(ListWorkspaceMembersRequest {
             workspace: workspace.to_string(),
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let members = response.into_inner().members;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let members = response.members;
 
-    if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "members",
+        &members,
+        &next_page_token,
+        workspace_member_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if members.is_empty() {
         println!("No members found in workspace {workspace}.");
@@ -4139,7 +4187,7 @@ pub async fn sandbox_policy_set_global(
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if wait {
@@ -4159,7 +4207,6 @@ pub async fn sandbox_policy_set_global(
             name: String::new(),
             policy: Some(policy),
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -4190,7 +4237,7 @@ pub async fn sandbox_settings_get(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -4348,7 +4395,7 @@ pub async fn gateway_setting_set(
     key: &str,
     value: &str,
     yes: bool,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let setting_value = parse_cli_setting_value(key, value)?;
@@ -4361,7 +4408,6 @@ pub async fn gateway_setting_set(
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -4394,7 +4440,7 @@ pub async fn sandbox_setting_set(
             name: name.to_string(),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4416,7 +4462,7 @@ pub async fn gateway_setting_delete(
     server: &str,
     key: &str,
     yes: bool,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     confirm_global_setting_delete(key, yes)?;
@@ -4428,7 +4474,6 @@ pub async fn gateway_setting_delete(
             setting_key: key.to_string(),
             delete_setting: true,
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -4461,7 +4506,7 @@ pub async fn sandbox_setting_delete(
             name: name.to_string(),
             setting_key: key.to_string(),
             delete_setting: true,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4507,7 +4552,7 @@ pub async fn sandbox_policy_set(
             name: name.to_string(),
             version: 0,
             global: false,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .ok()
@@ -4518,7 +4563,7 @@ pub async fn sandbox_policy_set(
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
             policy: Some(policy),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4566,7 +4611,7 @@ pub async fn sandbox_policy_set(
                 name: name.to_string(),
                 version: resp.version,
                 global: false,
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -4643,7 +4688,7 @@ pub async fn sandbox_policy_update(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -4692,7 +4737,7 @@ pub async fn sandbox_policy_update(
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
             merge_operations: plan.merge_operations,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -4740,7 +4785,7 @@ pub async fn sandbox_policy_update(
                 name: name.to_string(),
                 version: response.version,
                 global: false,
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -4848,7 +4893,7 @@ where
             name: name.to_string(),
             version,
             global: false,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -4930,7 +4975,7 @@ where
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -5032,7 +5077,7 @@ pub async fn sandbox_policy_get_global(
     version: u32,
     view: PolicyGetView,
     output: &str,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -5042,7 +5087,7 @@ pub async fn sandbox_policy_get_global(
             name: String::new(),
             version,
             global: true,
-            workspace: workspace.to_string(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
@@ -5170,7 +5215,8 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
 pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
-    limit: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -5180,19 +5226,28 @@ pub async fn sandbox_policy_list(
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
             name: name.to_string(),
-            limit,
-            offset: 0,
+            page_size,
+            page_token: page_token.to_string(),
             global: false,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    let next_page_token = resp.next_page_token;
+    let revisions = resp.revisions;
     let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if revisions.is_empty() {
         eprintln!("No policy history found for sandbox '{name}'");
@@ -5205,9 +5260,10 @@ pub async fn sandbox_policy_list(
 
 pub async fn sandbox_policy_list_global(
     server: &str,
-    limit: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -5215,19 +5271,28 @@ pub async fn sandbox_policy_list_global(
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
             name: String::new(),
-            limit,
-            offset: 0,
+            page_size,
+            page_token: page_token.to_string(),
             global: true,
-            workspace: workspace.to_string(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    let next_page_token = resp.next_page_token;
+    let revisions = resp.revisions;
     let structured = policy_revision_list_json("global", None, &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if revisions.is_empty() {
         eprintln!("No global policy history found");
@@ -5310,7 +5375,7 @@ pub async fn sandbox_logs(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -5375,7 +5440,7 @@ pub async fn sandbox_logs(
                 since_ms,
                 sources: source_filter,
                 min_level: level.to_uppercase(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
@@ -5451,7 +5516,7 @@ pub async fn sandbox_draft_get(
         .get_draft_policy(GetDraftPolicyRequest {
             name: name.to_string(),
             status_filter: status_filter.unwrap_or("").to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5559,7 +5624,7 @@ pub async fn sandbox_draft_approve(
         .get_draft_policy(GetDraftPolicyRequest {
             name: name.to_string(),
             status_filter: String::new(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -5574,7 +5639,7 @@ pub async fn sandbox_draft_approve(
         .approve_draft_chunk(ApproveDraftChunkRequest {
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             review_token,
         })
         .await
@@ -5607,7 +5672,7 @@ pub async fn sandbox_draft_reject(
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
             reason: reason.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5630,7 +5695,7 @@ pub async fn sandbox_draft_approve_all(
         .get_draft_policy(GetDraftPolicyRequest {
             name: name.to_string(),
             status_filter: "pending".to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -5647,7 +5712,7 @@ pub async fn sandbox_draft_approve_all(
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
             name: name.to_string(),
             include_security_flagged,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             approvals,
         })
         .await
@@ -5677,7 +5742,7 @@ pub async fn sandbox_draft_clear(
     let response = client
         .clear_draft_chunks(ClearDraftChunksRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -5704,7 +5769,7 @@ pub async fn sandbox_draft_history(
     let response = client
         .get_draft_history(GetDraftHistoryRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;

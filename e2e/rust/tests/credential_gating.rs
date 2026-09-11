@@ -311,6 +311,7 @@ process:
 struct BodyObservation {
     saw_placeholder: bool,
     saw_secret: bool,
+    authenticated: bool,
 }
 
 struct HttpProbeServer {
@@ -528,11 +529,20 @@ async fn handle_http_probe(
         }
     }
 
+    let header_end = received
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(received.len(), |end| end + 4);
+    let headers = String::from_utf8_lossy(&received[..header_end]);
+    let body = &received[header_end..];
     let observation = BodyObservation {
-        saw_placeholder: received
+        authenticated: headers
+            .lines()
+            .any(|line| line == format!("Authorization: Bearer {TEST_SECRET}")),
+        saw_placeholder: body
             .windows(PLACEHOLDER_PREFIX.len())
             .any(|window| window == PLACEHOLDER_PREFIX.as_bytes()),
-        saw_secret: received
+        saw_secret: body
             .windows(TEST_SECRET.len())
             .any(|window| window == TEST_SECRET.as_bytes()),
     };
@@ -540,14 +550,23 @@ async fn handle_http_probe(
     if expected_total.is_some_and(|expected| received.len() >= expected) {
         let result = if observation.saw_secret && !observation.saw_placeholder {
             "BODY_REWRITTEN"
+        } else if observation.saw_placeholder && !observation.saw_secret {
+            "BODY_TEXT"
         } else {
             "BODY_BAD"
         };
+        // Echo admitted literal bodies so clients can assert exact preservation.
+        let response_body = if result == "BODY_TEXT" {
+            [b"BODY_TEXT\n".as_slice(), body].concat()
+        } else {
+            result.as_bytes().to_vec()
+        };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}",
-            result.len()
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
         );
         stream.write_all(response.as_bytes()).await?;
+        stream.write_all(&response_body).await?;
     }
     Ok(())
 }
@@ -594,7 +613,7 @@ with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as
         if not chunk:
             break
         response += chunk
-    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_DENIED")
+    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_TEXT" if b"BODY_TEXT" in response else "BODY_DENIED")
 "#
     )
 }
@@ -857,13 +876,55 @@ async fn run_body_sandbox(
     Ok(output)
 }
 
-async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
-    let policy = write_base_policy()?;
-    let policy_path = policy
-        .path()
-        .to_str()
-        .ok_or_else(|| "body policy path is not UTF-8".to_string())?;
-    let script = body_client_script(port);
+async fn assert_conversation_placeholders_pass(
+    server: &HttpProbeServer,
+    own_provider: bool,
+) -> Result<(), String> {
+    let policy = if own_provider {
+        write_base_policy()?
+    } else {
+        write_policy(
+            server.port,
+            EndpointMode::RestBody { rewrite: false },
+            CredentialSource::ProviderProfile,
+        )?
+    };
+    let policy_path = policy.path().to_str().ok_or("invalid policy path")?;
+    let script = format!(
+        r#"
+import http.client
+import json
+import os
+import urllib.parse
+
+proxy_url = next(os.environ[name] for name in
+    ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+    if os.environ.get(name))
+proxy = urllib.parse.urlparse(proxy_url)
+target = "{host}:{port}"
+issued = os.environ[{env:?}]
+for token in ("openshell:resolve:env:KEY", issued):
+    body = json.dumps({{"messages": [{{"role": "tool", "content": "{env}=" + token}}, {{"role": "user", "content": "hi"}}]}}).encode()
+    for tunnel in (False, True):
+        for replay in range(2):
+            connection = http.client.HTTPConnection(proxy.hostname, proxy.port or 80, timeout=10)
+            if tunnel:
+                connection.set_tunnel({host:?}, {port})
+            headers = {{"Content-Type": "application/json", "Connection": "close"}}
+            if {own}:
+                headers["Authorization"] = "Bearer " + issued
+            connection.request("POST", "/token" if tunnel else "http://" + target + "/token", body, headers)
+            response = connection.getresponse()
+            assert response.status == 200, response.status
+            assert response.read() == b"BODY_TEXT\n" + body, "body changed"
+            connection.close()
+            print("BODY_TEXT")
+"#,
+        host = TEST_HOST,
+        port = server.port,
+        env = TOKEN_ENV,
+        own = if own_provider { "True" } else { "False" },
+    );
     let mut sandbox = SandboxGuard::create(&[
         "--policy",
         policy_path,
@@ -877,16 +938,21 @@ async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
     .await?;
     let output = sandbox.create_output.clone();
     sandbox.cleanup().await;
-    Ok(output)
-}
-
-async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), String> {
-    let denied = run_profile_body_sandbox(server.port).await?;
-    assert!(denied.contains("BODY_DENIED"));
-    let observations = server.wait_for_observations(1).await;
-    assert_eq!(observations.len(), 1, "observations: {observations:?}");
-    assert!(!observations[0].saw_placeholder);
-    assert!(!observations[0].saw_secret);
+    assert_eq!(
+        output.matches("BODY_TEXT").count(),
+        8,
+        "conversation did not survive replay: {output}"
+    );
+    assert!(!output.contains(TEST_SECRET));
+    let observations = server.wait_for_observations(8).await;
+    assert_eq!(observations.len(), 8);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.saw_placeholder
+                && !observation.saw_secret
+                && observation.authenticated == own_provider)
+    );
     Ok(())
 }
 
@@ -932,7 +998,9 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_rest_body_backstop(&server).await?;
+        assert_conversation_placeholders_pass(&server, true).await?;
+        let foreign_server = HttpProbeServer::start().await?;
+        assert_conversation_placeholders_pass(&foreign_server, false).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
     .await;
@@ -945,13 +1013,13 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install endpointless provider");
     let endpointless_result = async {
         assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
-        let denied = run_body_sandbox(
+        let literal = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: false },
             CredentialSource::PolicyBinding,
         )
         .await?;
-        assert!(denied.contains("BODY_DENIED"));
+        assert!(literal.contains("BODY_TEXT"));
         let rewritten = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: true },
@@ -961,12 +1029,12 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         assert!(rewritten.contains("BODY_REWRITTEN"));
         assert!(!rewritten.contains(TEST_SECRET));
         assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
-        let observations = server.wait_for_observations(3).await;
-        assert_eq!(observations.len(), 3, "observations: {observations:?}");
-        assert!(!observations[1].saw_placeholder);
-        assert!(!observations[1].saw_secret);
-        assert!(!observations[2].saw_placeholder);
-        assert!(observations[2].saw_secret);
+        let observations = server.wait_for_observations(10).await;
+        assert_eq!(observations.len(), 10, "observations: {observations:?}");
+        assert!(observations[8].saw_placeholder);
+        assert!(!observations[8].saw_secret);
+        assert!(!observations[9].saw_placeholder);
+        assert!(observations[9].saw_secret);
         assert_endpointless_provider_env_live_update(server.port).await?;
         Ok::<(), String>(())
     }
