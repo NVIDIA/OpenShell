@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.4
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# In-cluster (OpenShift/Buildah) variant of Dockerfile.gateway.
+#
+# Upstream CI builds the GNU-linked openshell-gateway binary inside the
+# project's Nix devShell with the gnu cross target (z3 and aws-lc statically
+# embedded, standard ELF interpreter), and stages it under
+# deploy/docker/.build/prebuilt-binaries. This multi-stage Dockerfile
+# reproduces that exact artifact in a builder stage so clusters without the Nix
+# CI pipeline can build the gateway image directly from source. The final stage
+# is identical to Dockerfile.gateway.
+
+# In a multi-stage build, an ARG that feeds a `FROM` must be declared before the
+# very first FROM (global pre-FROM scope). Declaring it between the two stages
+# makes Buildah attach it to the builder stage and fail the second FROM with
+# "no FROM statement found".
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+
+# ---- Builder: glibc base + Nix, reproduce upstream's cross build -------------
+#
+# The build must run on a glibc/FHS base (like the CI runners), NOT on the
+# minimal nixos/nix image: cross-compiling emits host build-scripts linked for
+# x86_64-unknown-linux-gnu whose ELF interpreter is /lib64/ld-linux-x86-64.so.2,
+# which the nixos/nix (Alpine, store-only) image does not provide.
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl xz-utils ca-certificates git && rm -rf /var/lib/apt/lists/*
+
+# Single-user Nix (no daemon) as root. NIX_CONFIG disables per-build users
+# during the install itself (the installer reads config before our nix.conf
+# exists); the written nix.conf carries that to later `nix develop` runs, plus
+# flakes and the flake's cachix substituter for prebuilt toolchain/z3/aws-lc.
+RUN export NIX_CONFIG="build-users-group =" && \
+    mkdir -m 0755 /nix && \
+    curl -L https://nixos.org/nix/install -o /tmp/nix-install.sh && \
+    sh /tmp/nix-install.sh --no-daemon && \
+    mkdir -p /etc/nix && \
+    printf 'experimental-features = nix-command flakes\naccept-flake-config = true\nbuild-users-group =\nsandbox = false\n' > /etc/nix/nix.conf
+
+# Put single-user Nix on PATH directly (Buildah RUN is not a login shell, so the
+# profile script is unreliable) and point it at Debian's CA bundle for HTTPS
+# substituter fetches.
+ENV HOME=/root \
+    PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+WORKDIR /build
+COPY . .
+
+# Build the gateway exactly like CI: same devShell, same cargo command and
+# target triple. The gnu cross toolchain emits a standard ELF interpreter, so
+# the binary runs on distroless without post-processing. Everything runs in a
+# single layer: build, stage the binary at /, then delete the Nix store and
+# Cargo target so the committed builder layer stays small.
+RUN nix develop -c bash -euo pipefail -c '\
+      GIT_DIR=/nonexistent cargo auditable build --release \
+        --target x86_64-unknown-linux-gnu \
+        --package openshell-gateway --bin openshell-gateway' && \
+    cp target/x86_64-unknown-linux-gnu/release/openshell-gateway /openshell-gateway && \
+    cd / && rm -rf /nix /build /root/.cache /tmp/*
+
+# ---- Runtime: identical to deploy/docker/Dockerfile.gateway ------------------
+#
+# Distroless Debian provides the glibc runtime required by the binary.
+FROM ${GATEWAY_BASE_IMAGE} AS gateway
+
+ARG TARGETARCH
+
+WORKDIR /app
+
+COPY --from=builder /openshell-gateway /usr/local/bin/openshell-gateway
+
+USER 1000:1000
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

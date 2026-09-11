@@ -224,6 +224,18 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Default numeric UID assigned to a sandbox when the image declares no OCI
+/// `USER` (e.g. a plain Alpine base).
+///
+/// Local container drivers (Docker, Podman) supply this in place of an empty
+/// OCI declaration so the supervisor runs the sandbox as a synthesized non-root
+/// account instead of rejecting the image, matching the numeric-identity
+/// behavior of the Kubernetes and VM drivers.
+pub const DEFAULT_SANDBOX_UID: u32 = 1000;
+
+/// Default numeric GID paired with [`DEFAULT_SANDBOX_UID`].
+pub const DEFAULT_SANDBOX_GID: u32 = 1000;
+
 /// Raw OCI `Config.User` declaration from the immutable image selected by a
 /// local container driver.
 ///

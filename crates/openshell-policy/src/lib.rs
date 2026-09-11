@@ -1282,7 +1282,6 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/lib".into(),
                 "/proc".into(),
                 "/dev/urandom".into(),
-                "/app".into(),
                 "/etc".into(),
                 "/var/log".into(),
             ],

@@ -1275,13 +1275,9 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
         template: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
-        /// tar archive (`.tar`, `.tar.gz`, or `.tgz`), or a full container
-        /// image reference (e.g., `myregistry.com/img:tag`).
-        ///
-        /// Community names are resolved to
-        /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
-        /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
+        /// Sandbox source: a full container image reference (e.g.,
+        /// `docker.io/library/alpine:3.22`, `myregistry.com/img:tag`) or a
+        /// rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`).
         ///
         /// To use a local Dockerfile, build and tag it with the container
         /// engine used by your local gateway, then pass the resulting image
