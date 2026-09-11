@@ -26,6 +26,10 @@ on:
         required: false
         type: string
         default: ""
+      test-name:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -61,4 +65,5 @@ jobs:
       - name: Run tests
         env:
           E2E_TASK: ${{ inputs.e2e-task }}
+          OPENSHELL_E2E_VM_TEST: ${{ inputs.test-name }}
         run: mise run --no-deps --skip-deps "$E2E_TASK"

@@ -79,5 +79,6 @@ bundled-z3 = ["openshell-server/bundled-z3"]
 workspace = true
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }

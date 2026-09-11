@@ -63,6 +63,11 @@ if [ -n "${E2E_TEST}" ]; then
   SELECTED_TESTS=("${E2E_TEST}")
 fi
 
+if [ "${E2E_TEST}" = "additional_ca" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA=1
+  E2E_FEATURES="${E2E_FEATURES},e2e-additional-ca"
+fi
+
 if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] && [ ! -f "${DEFAULT_WORKLOAD_MANIFEST}" ]; then
   echo "note: running Podman GPU e2e without a workload manifest; workload validation will log an explicit skip. Build one with 'CONTAINER_ENGINE=podman mise run e2e:workloads:build' or set OPENSHELL_E2E_WORKLOAD_MANIFEST."
 fi

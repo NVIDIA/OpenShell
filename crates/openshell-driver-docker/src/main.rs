@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         docker_config.allow_driver_config = policy.allow_driver_config;
         docker_config.resource_admission = policy.resource_admission;
     }
-    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
 
