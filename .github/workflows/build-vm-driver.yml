@@ -35,7 +35,6 @@ jobs:
       binary: openshell-supervisor
       triple: aarch64-apple-darwin
       runner: macos-15-xlarge
-      dev-shell: .#devShells.aarch64-darwin.default
       cargo-version: ${{ inputs.cargo-version }}
       image-tag: ${{ inputs.image-tag }}
       checkout-ref: ${{ inputs.checkout-ref }}
