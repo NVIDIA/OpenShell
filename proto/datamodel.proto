@@ -27,6 +27,21 @@ message WorkspaceSelector {
 // Marker for the all-workspaces selector variant.
 message AllWorkspaces {}
 
+// Identifies one existing sandbox in the public API.
+//
+// Exactly one identifier is required. `id` is the immutable, globally unique
+// gateway-generated ObjectMeta.id and MUST NOT include workspace_scope. `name`
+// is the human-readable ObjectMeta.name and requires a named workspace_scope;
+// all_workspaces is never valid for a sandbox reference.
+message SandboxReference {
+  oneof identifier {
+    string id = 1;
+    string name = 2;
+  }
+
+  WorkspaceSelector workspace_scope = 3;
+}
+
 // Kubernetes-style metadata shared by all top-level OpenShell domain objects.
 //
 // This structure provides consistent metadata (identity, labels, annotations,

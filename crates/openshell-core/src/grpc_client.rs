@@ -28,7 +28,6 @@ use crate::proto::{
     NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
     ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, UpdateConfigRequest, open_shell_client::OpenShellClient,
-    workspace_selector,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -717,7 +716,7 @@ async fn fetch_settings_snapshot_with_client(
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_ref: Some(crate::proto::sandbox_reference_by_id(sandbox_id)),
         })
         .await
         .into_diagnostic()?;
@@ -751,9 +750,8 @@ async fn sync_policy_with_client(
 ) -> Result<()> {
     client
         .update_config(UpdateConfigRequest {
-            name: sandbox.to_string(),
+            sandbox_ref: Some(crate::proto::sandbox_reference_by_name(workspace, sandbox)),
             policy: Some(policy.clone()),
-            workspace_scope: Some(workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -1053,7 +1051,7 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                sandbox_ref: Some(crate::proto::sandbox_reference_by_id(sandbox_id)),
             })
             .await
             .into_diagnostic()?;
@@ -1179,9 +1177,11 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_draft_policy(GetDraftPolicyRequest {
-                name: sandbox_name.to_string(),
                 status_filter: status_filter.to_string(),
-                workspace_scope: Some(workspace_selector(self.workspace())),
+                sandbox_ref: Some(crate::proto::sandbox_reference_by_name(
+                    self.workspace(),
+                    sandbox_name,
+                )),
             })
             .await
             .into_diagnostic()?;

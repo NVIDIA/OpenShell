@@ -51,13 +51,14 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		return nil, s.createErr
 	}
 
-	token := "tok-" + req.GetSandboxId()
+	sandboxID := sandboxRefID(req.GetSandboxRef())
+	token := "tok-" + sandboxID
 	if s.nextToken != "" {
 		token = s.nextToken
 	}
 
 	resp := &pb.CreateSshSessionResponse{
-		SandboxId:          req.GetSandboxId(),
+		SandboxId:          sandboxID,
 		Token:              token,
 		GatewayHost:        "gw.example.com",
 		GatewayPort:        2222,
@@ -65,7 +66,7 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		HostKeyFingerprint: "SHA256:abc123",
 		ExpiresAtMs:        1700000000000,
 	}
-	s.sessions[req.GetSandboxId()] = resp
+	s.sessions[sandboxID] = resp
 	s.tokens[token] = true
 	return resp, nil
 }
@@ -330,7 +331,7 @@ func TestSSHTunnel_Success(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, init)
-	assert.Equal(t, "sb-123", init.GetSandboxId())
+	assert.Equal(t, "sb-123", init.GetSandboxRef().GetId())
 	assert.NotEmpty(t, init.GetAuthorizationToken())
 	assert.NotNil(t, init.GetSsh(), "target should be SshRelayTarget")
 }

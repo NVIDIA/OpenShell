@@ -91,8 +91,10 @@ async fn ssh_session_config(
     // Resolve sandbox name to id.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace,
+                name.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -105,7 +107,9 @@ async fn ssh_session_config(
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                    sandbox.object_id(),
+                )),
             })
             .await
         {
@@ -1436,7 +1440,7 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_id: sandbox_id.to_string(),
+                sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(sandbox_id)),
                 service_id: format!("ssh-proxy:{sandbox_id}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),

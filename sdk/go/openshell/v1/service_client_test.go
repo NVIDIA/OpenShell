@@ -55,7 +55,7 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 			Metadata: &dm.ObjectMeta{
 				Id: "ep-" + req.GetService(),
 			},
-			SandboxName: req.GetSandbox(),
+			SandboxName: sandboxRefName(req.GetSandboxRef()),
 			ServiceName: req.GetService(),
 			TargetPort:  req.GetTargetPort(),
 			Domain:      req.GetDomain(),
@@ -65,7 +65,7 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 		resp.Url = "https://" + req.GetService() + ".example.com"
 	}
 
-	s.endpoints[serviceKey(req.GetSandbox(), req.GetService())] = resp
+	s.endpoints[serviceKey(sandboxRefName(req.GetSandboxRef()), req.GetService())] = resp
 	return resp, nil
 }
 
@@ -76,9 +76,10 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 		return nil, s.getErr
 	}
 
-	ep, ok := s.endpoints[serviceKey(req.GetSandbox(), req.GetService())]
+	sandboxName := sandboxRefName(req.GetSandboxRef())
+	ep, ok := s.endpoints[serviceKey(sandboxName, req.GetService())]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), req.GetSandbox())
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), sandboxName)
 	}
 	return ep, nil
 }
@@ -93,8 +94,9 @@ func (s *mockServiceServer) ListServices(_ context.Context, req *pb.ListServices
 
 	var services []*pb.ServiceEndpointResponse
 	for key, ep := range s.endpoints {
-		prefix := req.GetSandbox() + "/"
-		if req.GetSandbox() == "" || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
+		sandboxName := sandboxRefName(req.GetSandboxRef())
+		prefix := sandboxName + "/"
+		if sandboxName == "" || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
 			services = append(services, ep)
 		}
 	}
@@ -108,10 +110,11 @@ func (s *mockServiceServer) DeleteService(_ context.Context, req *pb.DeleteServi
 		return nil, s.deleteErr
 	}
 
-	key := serviceKey(req.GetSandbox(), req.GetService())
+	sandboxName := sandboxRefName(req.GetSandboxRef())
+	key := serviceKey(sandboxName, req.GetService())
 	_, ok := s.endpoints[key]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), req.GetSandbox())
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), sandboxName)
 	}
 	delete(s.endpoints, key)
 	return &pb.DeleteServiceResponse{Deleted: true}, nil
@@ -278,7 +281,7 @@ func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, endpoints)
 	require.NotNil(t, mock.lastList)
-	assert.Empty(t, mock.lastList.GetSandbox())
+	assert.Nil(t, mock.lastList.GetSandboxRef())
 	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 

@@ -109,7 +109,7 @@ func TestFileUpload(t *testing.T) {
 	err := client.Upload(context.Background(), "default", "test-sandbox", localPath, "/remote/upload.txt")
 
 	require.NoError(t, err)
-	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxRef().GetId())
 	assert.Equal(t, 1, mock.createCallCount)
 }
 
@@ -164,7 +164,7 @@ func TestFileDownload(t *testing.T) {
 	err := client.Download(context.Background(), "default", "test-sandbox", "/remote/file.txt", localPath)
 
 	require.NoError(t, err)
-	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxRef().GetId())
 	assert.Equal(t, 1, mock.createCallCount)
 }
 
@@ -261,7 +261,7 @@ func TestFileUpload_ResolvesNameToID(t *testing.T) {
 	_ = client.Upload(context.Background(), "default", "my-sandbox", localPath, "/remote/file.txt")
 
 	// Verify the proto request contains the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxRef().GetId())
 }
 
 func TestFileUpload_ResolutionError(t *testing.T) {
@@ -307,7 +307,7 @@ func TestFileDownload_ResolvesNameToID(t *testing.T) {
 	localPath := filepath.Join(t.TempDir(), "downloaded.txt")
 	_ = client.Download(context.Background(), "default", "my-sandbox", "/remote/file.txt", localPath)
 
-	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxRef().GetId())
 }
 
 func TestFileDownload_ResolutionError(t *testing.T) {

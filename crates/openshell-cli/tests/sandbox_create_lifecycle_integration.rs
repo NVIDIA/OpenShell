@@ -56,6 +56,20 @@ fn selected_workspace(
     }
 }
 
+fn sandbox_reference_name(sandbox_ref: Option<&openshell_core::proto::SandboxReference>) -> String {
+    match sandbox_ref.and_then(|reference| reference.identifier.as_ref()) {
+        Some(openshell_core::proto::sandbox_reference::Identifier::Name(name)) => name.clone(),
+        _ => panic!("expected sandbox name reference"),
+    }
+}
+
+fn sandbox_reference_id(sandbox_ref: Option<&openshell_core::proto::SandboxReference>) -> String {
+    match sandbox_ref.and_then(|reference| reference.identifier.as_ref()) {
+        Some(openshell_core::proto::sandbox_reference::Identifier::Id(id)) => id.clone(),
+        _ => panic!("expected sandbox ID reference"),
+    }
+}
+
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
@@ -182,7 +196,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = sandbox_reference_name(request.sandbox_ref.as_ref());
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
@@ -332,7 +347,7 @@ impl OpenShell for TestOpenShell {
             .deleted_names
             .lock()
             .await
-            .push(vec![request.name.clone()]);
+            .push(vec![sandbox_reference_name(request.sandbox_ref.as_ref())]);
         let delete_failure = self.state.fail_delete_sandbox_message.lock().await.take();
         if let Some(message) = delete_failure {
             return Err(Status::internal(message));
@@ -386,7 +401,8 @@ impl OpenShell for TestOpenShell {
         {
             return Err(Status::failed_precondition("sandbox is not ready"));
         }
-        let sandbox_id = request.into_inner().sandbox_id;
+        let request = request.into_inner();
+        let sandbox_id = sandbox_reference_id(request.sandbox_ref.as_ref());
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
             token: "test-token".to_string(),
@@ -574,7 +590,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        let sandbox_id = request.into_inner().id;
+        let request = request.into_inner();
+        let sandbox_id = sandbox_reference_id(request.sandbox_ref.as_ref());
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
         let vm_error_with_observed_exit = self

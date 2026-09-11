@@ -76,7 +76,7 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(sandbox_id)),
         })
         .await;
     match resp {

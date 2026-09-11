@@ -21,11 +21,10 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 
 func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
-		TargetPort:     targetPort,
-		Domain:         domain,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
+		Service:    serviceName,
+		TargetPort: targetPort,
+		Domain:     domain,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,9 +34,8 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
+		Service:    serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -46,9 +44,10 @@ func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, service
 }
 
 func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error) {
-	req := &pb.ListServicesRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+	req := &pb.ListServicesRequest{WorkspaceScope: namedWorkspaceScope(workspace)}
+	if sandboxName != "" {
+		req.SandboxRef = sandboxReferenceByName(workspace, sandboxName)
+		req.WorkspaceScope = nil
 	}
 	return s.list(ctx, req, opts...)
 }
@@ -83,9 +82,8 @@ func (s *serviceClient) list(ctx context.Context, req *pb.ListServicesRequest, o
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
 	_, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
+		Service:    serviceName,
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

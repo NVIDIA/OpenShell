@@ -23,9 +23,8 @@ func newPolicyClient(conn grpc.ClientConnInterface) *policyClient {
 func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName string, opts ...GetDraftOption) (*DraftPolicy, error) {
 	cfg := types.ApplyGetDraftOptions(opts)
 	resp, err := p.client.GetDraftPolicy(ctx, &pb.GetDraftPolicyRequest{
-		Name:           sandboxName,
-		StatusFilter:   cfg.StatusFilter(),
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef:   sandboxReferenceByName(workspace, sandboxName),
+		StatusFilter: cfg.StatusFilter(),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,10 +34,9 @@ func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName stri
 
 func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reviewToken string) (*ApproveResult, error) {
 	resp, err := p.client.ApproveDraftChunk(ctx, &pb.ApproveDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-		ReviewToken:    reviewToken,
+		SandboxRef:  sandboxReferenceByName(workspace, sandboxName),
+		ChunkId:     chunkID,
+		ReviewToken: reviewToken,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -48,10 +46,9 @@ func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandbox
 
 func (p *policyClient) RejectDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reason string) error {
 	_, err := p.client.RejectDraftChunk(ctx, &pb.RejectDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
-		Reason:         reason,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
+		ChunkId:    chunkID,
+		Reason:     reason,
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -69,10 +66,9 @@ func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, san
 		})
 	}
 	resp, err := p.client.ApproveAllDraftChunks(ctx, &pb.ApproveAllDraftChunksRequest{
-		Name:                   sandboxName,
 		IncludeSecurityFlagged: cfg.IncludeSecurityFlagged(),
-		WorkspaceScope:         namedWorkspaceScope(workspace),
 		Approvals:              approvals,
+		SandboxRef:             sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -82,8 +78,7 @@ func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, san
 
 func (p *policyClient) ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error) {
 	resp, err := p.client.ClearDraftChunks(ctx, &pb.ClearDraftChunksRequest{
-		Name:           sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -93,8 +88,7 @@ func (p *policyClient) ClearDraftChunks(ctx context.Context, workspace, sandboxN
 
 func (p *policyClient) GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error) {
 	resp, err := p.client.GetDraftHistory(ctx, &pb.GetDraftHistoryRequest{
-		Name:           sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -115,12 +109,11 @@ func (p *policyClient) GetDraftHistory(ctx context.Context, workspace, sandboxNa
 func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error) {
 	cfg := types.ApplyGetStatusOptions(opts)
 	req := &pb.GetSandboxPolicyStatusRequest{
-		Name:    sandboxName,
 		Version: cfg.Version(),
 		Global:  cfg.Global(),
 	}
 	if !cfg.Global() {
-		req.WorkspaceScope = namedWorkspaceScope(workspace)
+		req.SandboxRef = sandboxReferenceByName(workspace, sandboxName)
 	}
 	resp, err := p.client.GetSandboxPolicyStatus(ctx, req)
 	if err != nil {
@@ -129,7 +122,7 @@ func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName str
 	return converter.PolicyStatusResultFromProto(resp), nil
 }
 
-func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
+func (p *policyClient) List(ctx context.Context, workspace, sandboxName string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
 	cfg := types.ApplyListPolicyOptions(opts)
 	req := &pb.ListSandboxPoliciesRequest{
 		Limit:  cfg.Limit(),
@@ -137,7 +130,7 @@ func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListP
 		Global: cfg.Global(),
 	}
 	if !cfg.Global() {
-		req.WorkspaceScope = namedWorkspaceScope(workspace)
+		req.SandboxRef = sandboxReferenceByName(workspace, sandboxName)
 	}
 	resp, err := p.client.ListSandboxPolicies(ctx, req)
 	if err != nil {
@@ -158,10 +151,9 @@ func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListP
 
 func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error {
 	_, err := p.client.EditDraftChunk(ctx, &pb.EditDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
-		ProposedRule:   converter.NetworkPolicyRuleToProto(proposedRule),
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef:   sandboxReferenceByName(workspace, sandboxName),
+		ChunkId:      chunkID,
+		ProposedRule: converter.NetworkPolicyRuleToProto(proposedRule),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -171,9 +163,8 @@ func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxNam
 
 func (p *policyClient) UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error) {
 	resp, err := p.client.UndoDraftChunk(ctx, &pb.UndoDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
+		ChunkId:    chunkID,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

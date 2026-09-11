@@ -32,6 +32,20 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
+fn sandbox_reference_name(sandbox_ref: Option<&openshell_core::proto::SandboxReference>) -> String {
+    match sandbox_ref.and_then(|reference| reference.identifier.as_ref()) {
+        Some(openshell_core::proto::sandbox_reference::Identifier::Name(name)) => name.clone(),
+        _ => panic!("expected sandbox name reference"),
+    }
+}
+
+fn sandbox_reference_id(sandbox_ref: Option<&openshell_core::proto::SandboxReference>) -> String {
+    match sandbox_ref.and_then(|reference| reference.identifier.as_ref()) {
+        Some(openshell_core::proto::sandbox_reference::Identifier::Id(id)) => id.clone(),
+        _ => panic!("expected sandbox ID reference"),
+    }
+}
+
 // ── mock OpenShell server ─────────────────────────────────────────────
 
 /// Records which sandbox name was requested via `get_sandbox`.
@@ -117,7 +131,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = sandbox_reference_name(request.sandbox_ref.as_ref());
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -179,7 +194,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
         let req = request.into_inner();
         assert_eq!(
-            req.sandbox_id, "test-id",
+            sandbox_reference_id(req.sandbox_ref.as_ref()),
+            "test-id",
             "GetSandboxConfig should pass the id from GetSandbox"
         );
         Ok(Response::new(GetSandboxConfigResponse {
@@ -450,7 +466,10 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxPolicyStatusRequest>,
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
-        assert_eq!(req.name, "my-sandbox");
+        assert_eq!(
+            sandbox_reference_name(req.sandbox_ref.as_ref()),
+            "my-sandbox"
+        );
         assert_eq!(req.version, 3);
         assert!(!req.global);
 

@@ -6566,12 +6566,12 @@ mod tests {
         let attached = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
-                sandbox_name: "sandbox-custom".to_string(),
+                sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                    "default".to_string(),
+                    "sandbox-custom".to_string(),
+                )),
                 provider_name: "custom-provider".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    "default".to_string(),
-                )),
             }),
         )
         .await

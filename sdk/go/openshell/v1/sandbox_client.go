@@ -89,8 +89,7 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, name),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -136,8 +135,7 @@ func (s *sandboxClient) list(ctx context.Context, req *pb.ListSandboxesRequest, 
 
 func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {
 	_, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, name),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -147,8 +145,7 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, name),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -158,8 +155,7 @@ func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sand
 
 func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, name),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -169,10 +165,9 @@ func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*San
 
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
-		SandboxName:             sandboxName,
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		WorkspaceScope:          namedWorkspaceScope(workspace),
+		SandboxRef:              sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -185,10 +180,9 @@ func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error) {
 	resp, err := s.client.DetachSandboxProvider(ctx, &pb.DetachSandboxProviderRequest{
-		SandboxName:             sandboxName,
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		WorkspaceScope:          namedWorkspaceScope(workspace),
+		SandboxRef:              sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -201,8 +195,7 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
 	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		SandboxName:    sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByName(workspace, sandboxName),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -295,7 +288,7 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	stream, err := s.client.WatchSandbox(streamCtx, &pb.WatchSandboxRequest{
-		Id:             sb.ID,
+		SandboxRef:     sandboxReferenceByID(sb.ID),
 		FollowStatus:   true,
 		StopOnTerminal: watchOpts.StopOnTerminal,
 	})
@@ -368,11 +361,10 @@ func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName stri
 
 	cfg := types.ApplyLogOptions(opts)
 	req := &pb.GetSandboxLogsRequest{
-		SandboxId:      sb.ID,
-		Lines:          cfg.Lines(),
-		Sources:        cfg.Sources(),
-		MinLevel:       cfg.MinLevel(),
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		SandboxRef: sandboxReferenceByID(sb.ID),
+		Lines:      cfg.Lines(),
+		Sources:    cfg.Sources(),
+		MinLevel:   cfg.MinLevel(),
 	}
 	if !cfg.Since().IsZero() {
 		req.SinceMs = converter.MillisFromTime(cfg.Since())

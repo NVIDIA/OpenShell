@@ -58,8 +58,9 @@ pub async fn sandbox_provider_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_sandbox_providers(ListSandboxProvidersRequest {
-            sandbox_name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace, name,
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -90,8 +91,9 @@ pub async fn sandbox_provider_attach(
     // Fetch current sandbox to get resource_version for CAS
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace, name,
+            )),
         })
         .await
         .into_diagnostic()?
@@ -103,10 +105,11 @@ pub async fn sandbox_provider_attach(
 
     let response = match client
         .attach_sandbox_provider(AttachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace, name,
+            )),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -146,8 +149,9 @@ pub async fn sandbox_provider_detach(
     // Fetch current sandbox to get resource_version for CAS
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace, name,
+            )),
         })
         .await
         .into_diagnostic()?
@@ -159,10 +163,11 @@ pub async fn sandbox_provider_detach(
 
     let response = match client
         .detach_sandbox_provider(DetachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                workspace, name,
+            )),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {

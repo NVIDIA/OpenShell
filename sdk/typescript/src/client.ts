@@ -506,6 +506,17 @@ function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitSha
   return options?.allWorkspaces ? { selection: { case: 'allWorkspaces', value: {} } } : workspaceScope(options);
 }
 
+function sandboxReferenceByName(name: string, options?: SandboxWorkspaceOptions | null) {
+  return {
+    identifier: { case: 'name' as const, value: name },
+    workspaceScope: workspaceScope(options),
+  };
+}
+
+function sandboxReferenceById(id: string) {
+  return { identifier: { case: 'id' as const, value: id } };
+}
+
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
   if (!options) return undefined;
   const { workspace: _workspace, ...callOptions } = options;
@@ -800,7 +811,7 @@ export class SandboxClient {
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.getSandbox(
-        { name, workspaceScope: workspaceScope(options) },
+        { sandboxRef: sandboxReferenceByName(name, options) },
         requestCallOptions(options),
       );
       return sandboxRef(resp.sandbox);
@@ -825,7 +836,7 @@ export class SandboxClient {
 
   async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {
     try {
-      const resp = await this.grpc.deleteSandbox({ name, workspaceScope: workspaceScope(options) });
+      const resp = await this.grpc.deleteSandbox({ sandboxRef: sandboxReferenceByName(name, options) });
       return resp.deleted;
     } catch (e) {
       throw fromConnect(e);
@@ -901,7 +912,7 @@ export class SandboxClient {
       });
       const stream = this.grpc.execSandbox(
         {
-          sandboxId: sandbox.id,
+          sandboxRef: sandboxReferenceById(sandbox.id),
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
@@ -984,7 +995,7 @@ export class SandboxClient {
       payload: {
         case: 'start',
         value: {
-          sandboxId,
+          sandboxRef: sandboxReferenceById(sandboxId),
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
@@ -1204,7 +1215,7 @@ export class SandboxClient {
     const input = new Pushable<MessageInitShape<typeof TcpForwardFrameSchema>>();
     input.onDrain = () => socket.resume();
     try {
-      const session = await this.grpc.createSshSession({ sandboxId }, { signal });
+      const session = await this.grpc.createSshSession({ sandboxRef: sandboxReferenceById(sandboxId) }, { signal });
       // Defense-in-depth: the token feeds forwardTcp authorization, so hold it
       // to the same trust-boundary contract as createSshSession. A violation
       // tears down this one socket via the catch below.
@@ -1214,7 +1225,7 @@ export class SandboxClient {
         payload: {
           case: 'init',
           value: {
-            sandboxId,
+            sandboxRef: sandboxReferenceById(sandboxId),
             serviceId: `service-forward:${name}:${targetHost}:${targetPort}`,
             target: {
               case: 'tcp',
@@ -1277,7 +1288,7 @@ export class SandboxClient {
   async createSshSession(name: string, options?: SandboxWorkspaceOptions | null): Promise<SshSession> {
     try {
       const sandbox = await this.get(name, options);
-      const resp = await this.grpc.createSshSession({ sandboxId: sandbox.id });
+      const resp = await this.grpc.createSshSession({ sandboxRef: sandboxReferenceById(sandbox.id) });
       // Reject any response outside the proto trust-boundary contract before
       // handing these values to the caller (they feed OpenSSH ProxyCommand).
       validateSshResponse(resp, sandbox.id);
@@ -1311,10 +1322,9 @@ export class SandboxClient {
   ): Promise<ProviderChange> {
     try {
       const resp = await this.grpc.attachSandboxProvider({
-        sandboxName: name,
+        sandboxRef: sandboxReferenceByName(name, options),
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
     } catch (e) {
@@ -1329,10 +1339,9 @@ export class SandboxClient {
   ): Promise<ProviderChange> {
     try {
       const resp = await this.grpc.detachSandboxProvider({
-        sandboxName: name,
+        sandboxRef: sandboxReferenceByName(name, options),
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
     } catch (e) {
@@ -1343,8 +1352,7 @@ export class SandboxClient {
   async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
     try {
       const resp = await this.grpc.listSandboxProviders({
-        sandboxName: name,
-        workspaceScope: workspaceScope(options),
+        sandboxRef: sandboxReferenceByName(name, options),
       });
       return resp.providers.map((p) => providerRef(p));
     } catch (e) {
@@ -1355,7 +1363,10 @@ export class SandboxClient {
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
     try {
       const sandbox = await this.get(name, options);
-      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id }, requestCallOptions(options));
+      const resp = await this.grpc.getSandboxConfig(
+        { sandboxRef: sandboxReferenceById(sandbox.id) },
+        requestCallOptions(options),
+      );
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -1373,11 +1384,10 @@ export class SandboxClient {
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
-        name,
+        sandboxRef: sandboxReferenceByName(name, options),
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspaceScope: workspaceScope(options),
       });
       const result = updateConfigResult(resp);
       if (options?.wait)
@@ -1398,11 +1408,10 @@ export class SandboxClient {
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
-        name,
+        sandboxRef: sandboxReferenceByName(name, options),
         settingKey: key,
         settingValue: value,
         global: false,
-        workspaceScope: workspaceScope(options),
       });
       return updateConfigResult(resp);
     } catch (e) {

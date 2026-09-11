@@ -59,7 +59,7 @@ func (f *fileClient) Upload(ctx context.Context, workspace, sandboxName string, 
 	}
 
 	session, err := f.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxId: sb.ID,
+		SandboxRef: sandboxReferenceByID(sb.ID),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -93,7 +93,7 @@ func (f *fileClient) Download(ctx context.Context, workspace, sandboxName string
 	}
 
 	session, err := f.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxId: sb.ID,
+		SandboxRef: sandboxReferenceByID(sb.ID),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

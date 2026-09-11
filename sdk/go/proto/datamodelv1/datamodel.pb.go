@@ -204,6 +204,102 @@ func (*AllWorkspaces) Descriptor() ([]byte, []int) {
 	return file_datamodel_proto_rawDescGZIP(), []int{1}
 }
 
+// Identifies one existing sandbox in the public API.
+//
+// Exactly one identifier is required. `id` is the immutable, globally unique
+// gateway-generated ObjectMeta.id and MUST NOT include workspace_scope. `name`
+// is the human-readable ObjectMeta.name and requires a named workspace_scope;
+// all_workspaces is never valid for a sandbox reference.
+type SandboxReference struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Identifier:
+	//
+	//	*SandboxReference_Id
+	//	*SandboxReference_Name
+	Identifier     isSandboxReference_Identifier `protobuf_oneof:"identifier"`
+	WorkspaceScope *WorkspaceSelector            `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SandboxReference) Reset() {
+	*x = SandboxReference{}
+	mi := &file_datamodel_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxReference) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxReference) ProtoMessage() {}
+
+func (x *SandboxReference) ProtoReflect() protoreflect.Message {
+	mi := &file_datamodel_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxReference.ProtoReflect.Descriptor instead.
+func (*SandboxReference) Descriptor() ([]byte, []int) {
+	return file_datamodel_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *SandboxReference) GetIdentifier() isSandboxReference_Identifier {
+	if x != nil {
+		return x.Identifier
+	}
+	return nil
+}
+
+func (x *SandboxReference) GetId() string {
+	if x != nil {
+		if x, ok := x.Identifier.(*SandboxReference_Id); ok {
+			return x.Id
+		}
+	}
+	return ""
+}
+
+func (x *SandboxReference) GetName() string {
+	if x != nil {
+		if x, ok := x.Identifier.(*SandboxReference_Name); ok {
+			return x.Name
+		}
+	}
+	return ""
+}
+
+func (x *SandboxReference) GetWorkspaceScope() *WorkspaceSelector {
+	if x != nil {
+		return x.WorkspaceScope
+	}
+	return nil
+}
+
+type isSandboxReference_Identifier interface {
+	isSandboxReference_Identifier()
+}
+
+type SandboxReference_Id struct {
+	Id string `protobuf:"bytes,1,opt,name=id,proto3,oneof"`
+}
+
+type SandboxReference_Name struct {
+	Name string `protobuf:"bytes,2,opt,name=name,proto3,oneof"`
+}
+
+func (*SandboxReference_Id) isSandboxReference_Identifier() {}
+
+func (*SandboxReference_Name) isSandboxReference_Identifier() {}
+
 // Kubernetes-style metadata shared by all top-level OpenShell domain objects.
 //
 // This structure provides consistent metadata (identity, labels, annotations,
@@ -239,7 +335,7 @@ type ObjectMeta struct {
 
 func (x *ObjectMeta) Reset() {
 	*x = ObjectMeta{}
-	mi := &file_datamodel_proto_msgTypes[2]
+	mi := &file_datamodel_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -251,7 +347,7 @@ func (x *ObjectMeta) String() string {
 func (*ObjectMeta) ProtoMessage() {}
 
 func (x *ObjectMeta) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[2]
+	mi := &file_datamodel_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -264,7 +360,7 @@ func (x *ObjectMeta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ObjectMeta.ProtoReflect.Descriptor instead.
 func (*ObjectMeta) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{2}
+	return file_datamodel_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ObjectMeta) GetId() string {
@@ -333,7 +429,7 @@ type WorkspaceStatus struct {
 
 func (x *WorkspaceStatus) Reset() {
 	*x = WorkspaceStatus{}
-	mi := &file_datamodel_proto_msgTypes[3]
+	mi := &file_datamodel_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -345,7 +441,7 @@ func (x *WorkspaceStatus) String() string {
 func (*WorkspaceStatus) ProtoMessage() {}
 
 func (x *WorkspaceStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[3]
+	mi := &file_datamodel_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -358,7 +454,7 @@ func (x *WorkspaceStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkspaceStatus.ProtoReflect.Descriptor instead.
 func (*WorkspaceStatus) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{3}
+	return file_datamodel_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *WorkspaceStatus) GetPhase() WorkspacePhase {
@@ -384,7 +480,7 @@ type Workspace struct {
 
 func (x *Workspace) Reset() {
 	*x = Workspace{}
-	mi := &file_datamodel_proto_msgTypes[4]
+	mi := &file_datamodel_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -396,7 +492,7 @@ func (x *Workspace) String() string {
 func (*Workspace) ProtoMessage() {}
 
 func (x *Workspace) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[4]
+	mi := &file_datamodel_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -409,7 +505,7 @@ func (x *Workspace) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Workspace.ProtoReflect.Descriptor instead.
 func (*Workspace) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{4}
+	return file_datamodel_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Workspace) GetMetadata() *ObjectMeta {
@@ -442,7 +538,7 @@ type CredentialHandle struct {
 
 func (x *CredentialHandle) Reset() {
 	*x = CredentialHandle{}
-	mi := &file_datamodel_proto_msgTypes[5]
+	mi := &file_datamodel_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -454,7 +550,7 @@ func (x *CredentialHandle) String() string {
 func (*CredentialHandle) ProtoMessage() {}
 
 func (x *CredentialHandle) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[5]
+	mi := &file_datamodel_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -467,7 +563,7 @@ func (x *CredentialHandle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialHandle.ProtoReflect.Descriptor instead.
 func (*CredentialHandle) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{5}
+	return file_datamodel_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *CredentialHandle) GetDriver() string {
@@ -518,7 +614,7 @@ type Provider struct {
 
 func (x *Provider) Reset() {
 	*x = Provider{}
-	mi := &file_datamodel_proto_msgTypes[6]
+	mi := &file_datamodel_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -530,7 +626,7 @@ func (x *Provider) String() string {
 func (*Provider) ProtoMessage() {}
 
 func (x *Provider) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[6]
+	mi := &file_datamodel_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -543,7 +639,7 @@ func (x *Provider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Provider.ProtoReflect.Descriptor instead.
 func (*Provider) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{6}
+	return file_datamodel_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Provider) GetMetadata() *ObjectMeta {
@@ -604,7 +700,13 @@ const file_datamodel_proto_rawDesc = "" +
 	"\tworkspace\x18\x01 \x01(\tH\x00R\tworkspace\x12N\n" +
 	"\x0eall_workspaces\x18\x02 \x01(\v2%.openshell.datamodel.v1.AllWorkspacesH\x00R\rallWorkspacesB\v\n" +
 	"\tselection\"\x0f\n" +
-	"\rAllWorkspaces\"\xeb\x03\n" +
+	"\rAllWorkspaces\"\x9c\x01\n" +
+	"\x10SandboxReference\x12\x10\n" +
+	"\x02id\x18\x01 \x01(\tH\x00R\x02id\x12\x14\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x12R\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeB\f\n" +
+	"\n" +
+	"identifier\"\xeb\x03\n" +
 	"\n" +
 	"ObjectMeta\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
@@ -671,43 +773,45 @@ func file_datamodel_proto_rawDescGZIP() []byte {
 }
 
 var file_datamodel_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_datamodel_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_datamodel_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_datamodel_proto_goTypes = []any{
 	(WorkspacePhase)(0),       // 0: openshell.datamodel.v1.WorkspacePhase
 	(*WorkspaceSelector)(nil), // 1: openshell.datamodel.v1.WorkspaceSelector
 	(*AllWorkspaces)(nil),     // 2: openshell.datamodel.v1.AllWorkspaces
-	(*ObjectMeta)(nil),        // 3: openshell.datamodel.v1.ObjectMeta
-	(*WorkspaceStatus)(nil),   // 4: openshell.datamodel.v1.WorkspaceStatus
-	(*Workspace)(nil),         // 5: openshell.datamodel.v1.Workspace
-	(*CredentialHandle)(nil),  // 6: openshell.datamodel.v1.CredentialHandle
-	(*Provider)(nil),          // 7: openshell.datamodel.v1.Provider
-	nil,                       // 8: openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	nil,                       // 9: openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	nil,                       // 10: openshell.datamodel.v1.CredentialHandle.MetadataEntry
-	nil,                       // 11: openshell.datamodel.v1.Provider.CredentialsEntry
-	nil,                       // 12: openshell.datamodel.v1.Provider.ConfigEntry
-	nil,                       // 13: openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
-	nil,                       // 14: openshell.datamodel.v1.Provider.CredentialHandlesEntry
+	(*SandboxReference)(nil),  // 3: openshell.datamodel.v1.SandboxReference
+	(*ObjectMeta)(nil),        // 4: openshell.datamodel.v1.ObjectMeta
+	(*WorkspaceStatus)(nil),   // 5: openshell.datamodel.v1.WorkspaceStatus
+	(*Workspace)(nil),         // 6: openshell.datamodel.v1.Workspace
+	(*CredentialHandle)(nil),  // 7: openshell.datamodel.v1.CredentialHandle
+	(*Provider)(nil),          // 8: openshell.datamodel.v1.Provider
+	nil,                       // 9: openshell.datamodel.v1.ObjectMeta.LabelsEntry
+	nil,                       // 10: openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
+	nil,                       // 11: openshell.datamodel.v1.CredentialHandle.MetadataEntry
+	nil,                       // 12: openshell.datamodel.v1.Provider.CredentialsEntry
+	nil,                       // 13: openshell.datamodel.v1.Provider.ConfigEntry
+	nil,                       // 14: openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
+	nil,                       // 15: openshell.datamodel.v1.Provider.CredentialHandlesEntry
 }
 var file_datamodel_proto_depIdxs = []int32{
 	2,  // 0: openshell.datamodel.v1.WorkspaceSelector.all_workspaces:type_name -> openshell.datamodel.v1.AllWorkspaces
-	8,  // 1: openshell.datamodel.v1.ObjectMeta.labels:type_name -> openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	9,  // 2: openshell.datamodel.v1.ObjectMeta.annotations:type_name -> openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	0,  // 3: openshell.datamodel.v1.WorkspaceStatus.phase:type_name -> openshell.datamodel.v1.WorkspacePhase
-	3,  // 4: openshell.datamodel.v1.Workspace.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	4,  // 5: openshell.datamodel.v1.Workspace.status:type_name -> openshell.datamodel.v1.WorkspaceStatus
-	10, // 6: openshell.datamodel.v1.CredentialHandle.metadata:type_name -> openshell.datamodel.v1.CredentialHandle.MetadataEntry
-	3,  // 7: openshell.datamodel.v1.Provider.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	11, // 8: openshell.datamodel.v1.Provider.credentials:type_name -> openshell.datamodel.v1.Provider.CredentialsEntry
-	12, // 9: openshell.datamodel.v1.Provider.config:type_name -> openshell.datamodel.v1.Provider.ConfigEntry
-	13, // 10: openshell.datamodel.v1.Provider.credential_expires_at_ms:type_name -> openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
-	14, // 11: openshell.datamodel.v1.Provider.credential_handles:type_name -> openshell.datamodel.v1.Provider.CredentialHandlesEntry
-	6,  // 12: openshell.datamodel.v1.Provider.CredentialHandlesEntry.value:type_name -> openshell.datamodel.v1.CredentialHandle
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	1,  // 1: openshell.datamodel.v1.SandboxReference.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	9,  // 2: openshell.datamodel.v1.ObjectMeta.labels:type_name -> openshell.datamodel.v1.ObjectMeta.LabelsEntry
+	10, // 3: openshell.datamodel.v1.ObjectMeta.annotations:type_name -> openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
+	0,  // 4: openshell.datamodel.v1.WorkspaceStatus.phase:type_name -> openshell.datamodel.v1.WorkspacePhase
+	4,  // 5: openshell.datamodel.v1.Workspace.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	5,  // 6: openshell.datamodel.v1.Workspace.status:type_name -> openshell.datamodel.v1.WorkspaceStatus
+	11, // 7: openshell.datamodel.v1.CredentialHandle.metadata:type_name -> openshell.datamodel.v1.CredentialHandle.MetadataEntry
+	4,  // 8: openshell.datamodel.v1.Provider.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	12, // 9: openshell.datamodel.v1.Provider.credentials:type_name -> openshell.datamodel.v1.Provider.CredentialsEntry
+	13, // 10: openshell.datamodel.v1.Provider.config:type_name -> openshell.datamodel.v1.Provider.ConfigEntry
+	14, // 11: openshell.datamodel.v1.Provider.credential_expires_at_ms:type_name -> openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
+	15, // 12: openshell.datamodel.v1.Provider.credential_handles:type_name -> openshell.datamodel.v1.Provider.CredentialHandlesEntry
+	7,  // 13: openshell.datamodel.v1.Provider.CredentialHandlesEntry.value:type_name -> openshell.datamodel.v1.CredentialHandle
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_datamodel_proto_init() }
@@ -719,13 +823,17 @@ func file_datamodel_proto_init() {
 		(*WorkspaceSelector_Workspace)(nil),
 		(*WorkspaceSelector_AllWorkspaces)(nil),
 	}
+	file_datamodel_proto_msgTypes[2].OneofWrappers = []any{
+		(*SandboxReference_Id)(nil),
+		(*SandboxReference_Name)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datamodel_proto_rawDesc), len(file_datamodel_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

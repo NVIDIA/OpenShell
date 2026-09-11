@@ -39,6 +39,13 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
+fn sandbox_reference_name(sandbox_ref: Option<&openshell_core::proto::SandboxReference>) -> String {
+    match sandbox_ref.and_then(|reference| reference.identifier.as_ref()) {
+        Some(openshell_core::proto::sandbox_reference::Identifier::Name(name)) => name.clone(),
+        _ => panic!("expected sandbox name reference"),
+    }
+}
+
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
@@ -174,7 +181,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = sandbox_reference_name(request.sandbox_ref.as_ref());
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -208,7 +216,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<ListSandboxProvidersRequest>,
     ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
-        let sandbox_name = request.into_inner().sandbox_name;
+        let request = request.into_inner();
+        let sandbox_name = sandbox_reference_name(request.sandbox_ref.as_ref());
         self.state
             .sandbox_provider_requests
             .lock()
@@ -237,12 +246,13 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
+        let sandbox_name = sandbox_reference_name(request.sandbox_ref.as_ref());
         self.state
             .sandbox_provider_requests
             .lock()
             .await
             .push(SandboxProviderRequestLog::Attach {
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
             });
         if !self
@@ -255,9 +265,7 @@ impl OpenShell for TestOpenShell {
             return Err(Status::failed_precondition("provider not found"));
         }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
-        let providers = sandbox_providers
-            .entry(request.sandbox_name.clone())
-            .or_default();
+        let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let attached = if providers.contains(&request.provider_name) {
             false
         } else {
@@ -266,7 +274,7 @@ impl OpenShell for TestOpenShell {
         };
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                name: request.sandbox_name,
+                name: sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
@@ -286,24 +294,23 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
+        let sandbox_name = sandbox_reference_name(request.sandbox_ref.as_ref());
         self.state
             .sandbox_provider_requests
             .lock()
             .await
             .push(SandboxProviderRequestLog::Detach {
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
             });
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
-        let providers = sandbox_providers
-            .entry(request.sandbox_name.clone())
-            .or_default();
+        let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
         providers.retain(|name| name != &request.provider_name);
         let detached = providers.len() != before_len;
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                name: request.sandbox_name,
+                name: sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {

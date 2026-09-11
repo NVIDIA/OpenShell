@@ -47,6 +47,18 @@ def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
     return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
 
 
+def _sandbox_reference_by_name(
+    workspace: str, name: str
+) -> datamodel_pb2.SandboxReference:
+    return datamodel_pb2.SandboxReference(
+        name=name, workspace_scope=_workspace_scope(workspace)
+    )
+
+
+def _sandbox_reference_by_id(sandbox_id: str) -> datamodel_pb2.SandboxReference:
+    return datamodel_pb2.SandboxReference(id=sandbox_id)
+
+
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
     pass
 
@@ -806,7 +818,7 @@ class SandboxClient:
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox_ref=_sandbox_reference_by_name(workspace, sandbox_name)
             ),
             timeout=self._timeout,
         )
@@ -885,7 +897,7 @@ class SandboxClient:
     def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox_ref=_sandbox_reference_by_name(workspace, sandbox_name)
             ),
             timeout=self._timeout,
         )
@@ -894,7 +906,7 @@ class SandboxClient:
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox_ref=_sandbox_reference_by_name(workspace, sandbox_name)
             ),
             timeout=self._timeout,
         )
@@ -903,7 +915,7 @@ class SandboxClient:
     def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox_ref=_sandbox_reference_by_name(workspace, sandbox_name)
             ),
             timeout=self._timeout,
         )
@@ -996,7 +1008,7 @@ class SandboxClient:
             raise SandboxError("command must not be empty")
 
         request = openshell_pb2.ExecSandboxRequest(
-            sandbox_id=sandbox_id,
+            sandbox_ref=_sandbox_reference_by_id(sandbox_id),
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),

@@ -291,7 +291,7 @@ mod tests {
 
     use openshell_core::proto::{
         CreateProviderRequest, CreateSandboxRequest, GpuResourceRequirements, Provider,
-        SandboxSpec, UpdateConfigRequest, workspace_selector,
+        SandboxSpec, UpdateConfigRequest, sandbox_reference_by_name, workspace_selector,
     };
     use prost::Message as _;
     use prost_types::{
@@ -454,12 +454,11 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = UpdateConfigRequest {
-            name: "demo".to_string(),
+            sandbox_ref: Some(sandbox_reference_by_name("default", "demo")),
             annotations: HashMap::from([(
                 "openshell.nvidia.com/policy-signature".to_string(),
                 "signed".to_string(),
             )]),
-            workspace_scope: Some(workspace_selector("default")),
             ..Default::default()
         };
         let bytes = request.encode_to_vec();

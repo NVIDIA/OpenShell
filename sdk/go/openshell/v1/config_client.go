@@ -31,7 +31,7 @@ func (c *configClient) GetSandbox(ctx context.Context, workspace, sandboxName st
 	}
 
 	resp, err := c.client.GetSandboxConfig(ctx, &sbv1.GetSandboxConfigRequest{
-		SandboxId: sb.ID,
+		SandboxRef: sandboxReferenceByID(sb.ID),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -59,7 +59,7 @@ func (c *configClient) Update(ctx context.Context, workspace string, update *Con
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: convErr.Error()}
 	}
 	if !req.GetGlobal() {
-		req.WorkspaceScope = namedWorkspaceScope(workspace)
+		req.SandboxRef.WorkspaceScope = namedWorkspaceScope(workspace)
 	}
 	resp, err := c.client.UpdateConfig(ctx, req)
 	if err != nil {

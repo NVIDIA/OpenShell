@@ -236,7 +236,7 @@ func TestExecRun_WithOptions(t *testing.T) {
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	assert.Equal(t, "sb-test-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "sb-test-sandbox", mock.lastExecRequest.GetSandboxRef().GetId())
 	assert.Equal(t, []string{"ls"}, mock.lastExecRequest.GetCommand())
 	assert.Equal(t, "/tmp", mock.lastExecRequest.GetWorkdir())
 	assert.Equal(t, map[string]string{"FOO": "bar"}, mock.lastExecRequest.GetEnvironment())
@@ -380,7 +380,7 @@ func TestExecInteractive(t *testing.T) {
 
 	startReq := startInput.GetStart()
 	require.NotNil(t, startReq)
-	assert.Equal(t, "sb-test-sandbox", startReq.GetSandboxId())
+	assert.Equal(t, "sb-test-sandbox", startReq.GetSandboxRef().GetId())
 	assert.Equal(t, []string{"/bin/bash"}, startReq.GetCommand())
 	assert.True(t, startReq.GetTty())
 	assert.Equal(t, uint32(80), startReq.GetCols())
@@ -546,7 +546,7 @@ func TestExecRun_ResolvesNameToID(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	// Verify the proto request contains the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxRef().GetId())
 }
 
 func TestExecRun_ResolutionError(t *testing.T) {
@@ -576,7 +576,7 @@ func TestExecStream_ResolvesNameToID(t *testing.T) {
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxRef().GetId())
 }
 
 func TestExecStream_ResolutionError(t *testing.T) {
@@ -609,7 +609,7 @@ func TestExecInteractive_ResolvesNameToID(t *testing.T) {
 	require.NotEmpty(t, mock.receivedInputs)
 	startReq := mock.receivedInputs[0].GetStart()
 	require.NotNil(t, startReq)
-	assert.Equal(t, "sb-my-sandbox", startReq.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", startReq.GetSandboxRef().GetId())
 }
 
 func TestExecInteractive_ResolutionError(t *testing.T) {

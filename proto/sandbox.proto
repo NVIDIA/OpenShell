@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package openshell.sandbox.v1;
 
+import "datamodel.proto";
 import "google/protobuf/struct.proto";
 
 // Sandbox-supervisor configuration and policy messages.
@@ -317,8 +318,11 @@ message NetworkBinary {
 
 // Request to get sandbox settings by sandbox ID.
 message GetSandboxConfigRequest {
-  // The sandbox ID.
-  string sandbox_id = 1;
+  reserved 1;
+  reserved "sandbox_id";
+  // Canonical public sandbox reference. Sandbox-authenticated callers use the
+  // ID variant; user clients may use either supported variant.
+  openshell.datamodel.v1.SandboxReference sandbox_ref = 2;
 }
 
 // Request to get gateway-global settings.

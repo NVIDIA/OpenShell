@@ -43,6 +43,9 @@ pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 /// Command arguments only reject NUL (newlines are valid for inline scripts).
 /// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    if req.sandbox_ref.is_none() {
+        return Err(Status::invalid_argument("sandbox_ref is required"));
+    }
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
             "command array exceeds {MAX_EXEC_COMMAND_ARGS} argument limit"
@@ -1351,7 +1354,9 @@ mod tests {
     #[test]
     fn validate_exec_request_rejects_reserved_env_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "id".to_string(),
+            )),
             command: vec!["echo".to_string()],
             environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
                 .collect(),
@@ -1368,7 +1373,9 @@ mod tests {
     #[test]
     fn validate_exec_request_allows_pyfunc_helper_key() {
         let req = ExecSandboxRequest {
-            sandbox_id: "id".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "id".to_string(),
+            )),
             command: vec!["python".to_string()],
             environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
                 .collect(),
@@ -2246,7 +2253,9 @@ mod tests {
     #[test]
     fn validate_exec_allows_newlines_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "test".to_string(),
+            )),
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -2260,7 +2269,9 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_null_bytes_in_command_args() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "test".to_string(),
+            )),
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
         };
@@ -2271,7 +2282,9 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_workdir() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "test".to_string(),
+            )),
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
@@ -2283,7 +2296,9 @@ mod tests {
     #[test]
     fn validate_exec_still_rejects_newlines_in_env_values() {
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                "test".to_string(),
+            )),
             command: vec!["ls".to_string()],
             environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
                 .collect(),

@@ -166,7 +166,9 @@ The public API represents this choice with a `WorkspaceSelector` oneof. Set
 `all_workspaces` marker on list requests that support it. Omitting the selector
 or sending an unset selector is invalid for workspace-scoped operations. The
 all-workspaces variant is accepted only by sandbox, sandbox template, provider,
-and service list requests, and it requires Platform Admin access.
+and service list requests, and it requires Platform Admin access. For services,
+choose either a sandbox name or `--all-workspaces`; the options are mutually
+exclusive.
 
 Clients migrating from the previous request fields should make the scope
 explicit:
@@ -177,6 +179,21 @@ explicit:
 | Empty or omitted `workspace` for the default | `workspace_scope.workspace: "default"` |
 | `all_workspaces: true` | `workspace_scope.all_workspaces: {}` |
 | `global: true` | Omit `workspace_scope` |
+
+Sandbox-scoped RPCs use a `SandboxReference` instead of separate sandbox and
+workspace fields. Use the name variant for human-readable lookup and include a
+named workspace selector. Use the ID variant when the canonical sandbox ID is
+already known; ID references must omit `workspace_scope`.
+
+| Previous request fields | Sandbox reference |
+| --- | --- |
+| `name: "agent"`, `workspace_scope.workspace: "team-ml"` | `sandbox_ref.name: "agent"`, `sandbox_ref.workspace_scope.workspace: "team-ml"` |
+| `sandbox_name: "agent"`, `workspace_scope.workspace: "team-ml"` | `sandbox_ref.name: "agent"`, `sandbox_ref.workspace_scope.workspace: "team-ml"` |
+| `sandbox_id: "<canonical-id>"` | `sandbox_ref.id: "<canonical-id>"` |
+
+Do not set both `sandbox_ref` and a request-level `workspace_scope`. List RPCs
+that are not filtered to one sandbox continue to use the request-level
+`workspace_scope` selector.
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
 SDK uses `ListAll`, and the TypeScript SDK uses a discriminated option type, so

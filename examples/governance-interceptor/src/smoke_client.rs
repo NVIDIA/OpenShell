@@ -57,7 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.clone(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                sandbox_id.clone(),
+            )),
         })
         .await?
         .into_inner();
@@ -83,9 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy_result = client
         .update_config(UpdateConfigRequest {
-            name: sandbox_name.clone(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_name(
+                "default",
+                sandbox_name.clone(),
+            )),
             policy: Some(widened_policy),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..Default::default()
         })
         .await;
@@ -120,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|status| format!("telemetry-only policy analysis was denied: {status}"))?;
 
     let after = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(sandbox_id)),
+        })
         .await?
         .into_inner();
     if after.version != before.version || after.policy_hash != before.policy_hash {

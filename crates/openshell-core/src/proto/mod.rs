@@ -89,3 +89,22 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
         )),
     }
 }
+
+/// Build a canonical reference from a stable sandbox ID.
+pub fn sandbox_reference_by_id(id: impl Into<String>) -> SandboxReference {
+    SandboxReference {
+        identifier: Some(sandbox_reference::Identifier::Id(id.into())),
+        workspace_scope: None,
+    }
+}
+
+/// Build a canonical reference from a workspace-scoped sandbox name.
+pub fn sandbox_reference_by_name(
+    workspace: impl Into<String>,
+    name: impl Into<String>,
+) -> SandboxReference {
+    SandboxReference {
+        identifier: Some(sandbox_reference::Identifier::Name(name.into())),
+        workspace_scope: Some(workspace_selector(workspace)),
+    }
+}

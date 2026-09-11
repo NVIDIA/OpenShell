@@ -164,7 +164,9 @@ pub async fn handle_refresh_sandbox_token(
         ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox_ref: Some(openshell_core::proto::sandbox_reference_by_id(
+                &sandbox.sandbox_id,
+            )),
         });
         config_request
             .extensions_mut()

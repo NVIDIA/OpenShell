@@ -7,7 +7,6 @@ import (
 	"context"
 	"maps"
 	"slices"
-	"strings"
 	"sync"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -172,9 +171,8 @@ func (c *fakePolicyClient) GetStatus(_ context.Context, workspace, sandboxName s
 }
 
 // List returns policy revisions. When the global option is set, it returns
-// global revisions; otherwise it returns all sandbox-scoped revisions for the
-// given workspace.
-func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.ListPolicyOption) ([]types.SandboxPolicyRevision, error) {
+// global revisions; otherwise it returns revisions for the specified sandbox.
+func (c *fakePolicyClient) List(_ context.Context, workspace, sandboxName string, opts ...v1.ListPolicyOption) ([]types.SandboxPolicyRevision, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -187,13 +185,7 @@ func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.
 	if cfg.Global() {
 		revisions = slices.Clone(c.globalRevisions)
 	} else {
-		// Collect all revisions for sandboxes in this workspace.
-		prefix := workspace + "/"
-		for key, revs := range c.sandboxRevisions {
-			if strings.HasPrefix(key, prefix) {
-				revisions = append(revisions, revs...)
-			}
-		}
+		revisions = slices.Clone(c.sandboxRevisions[workspace+"/"+sandboxName])
 	}
 
 	if len(revisions) == 0 {

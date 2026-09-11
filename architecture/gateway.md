@@ -56,13 +56,16 @@ cross-origin or sibling-subdomain request.
 
 Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
 select one non-empty workspace explicitly; `default` is an ordinary explicit
-name, not an omitted-value fallback. Sandbox, sandbox template, provider, and
-service list RPCs also accept an all-workspaces marker after Platform Admin
-authorization. Single-workspace handlers reject that marker. Platform-global
-policy operations require the selector to be absent, while workspace policy
-operations require it. The gateway authorizes the selected scope before
-performing resource lookup so malformed, unsupported, and unauthorized scopes
-have consistent behavior across resource types.
+name, not an omitted-value fallback. Sandbox-scoped RPCs instead carry a
+`SandboxReference`: name references include a named workspace selector, while
+canonical ID references omit it. The gateway resolves either form to the same
+persisted sandbox record and authorizes that record's workspace. Missing and
+unauthorized references use the same response within each principal class so
+the resolver does not expose an object-existence oracle. Sandbox, sandbox
+template, provider, and service list RPCs also accept an all-workspaces marker
+after Platform Admin authorization. Single-workspace handlers reject that
+marker. Platform-global policy operations require the sandbox reference to be
+absent, while sandbox policy operations require it.
 
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway

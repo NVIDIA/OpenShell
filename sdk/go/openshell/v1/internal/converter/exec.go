@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 )
 
@@ -39,8 +40,10 @@ func ExecChunkFromEvent(event *pb.ExecSandboxEvent) (*types.ExecChunk, int, erro
 // ExecRequestToProto builds a proto ExecSandboxRequest for Run/Stream modes.
 func ExecRequestToProto(sandboxID string, command []string, opts *types.ExecOptions) *pb.ExecSandboxRequest {
 	req := &pb.ExecSandboxRequest{
-		SandboxId: sandboxID,
-		Command:   CopyStringSlice(command),
+		SandboxRef: &dm.SandboxReference{
+			Identifier: &dm.SandboxReference_Id{Id: sandboxID},
+		},
+		Command: CopyStringSlice(command),
 	}
 	if opts != nil {
 		req.Workdir = opts.WorkDir

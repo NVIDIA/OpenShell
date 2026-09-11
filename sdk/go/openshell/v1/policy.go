@@ -111,7 +111,7 @@ type PolicyInterface interface {
 	ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error)
 	GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error)
 	GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error)
-	List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error)
+	List(ctx context.Context, workspace, sandboxName string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error)
 	EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error
 	UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error)
 }

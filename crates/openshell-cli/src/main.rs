@@ -2137,7 +2137,7 @@ enum ServiceCommands {
         offset: u32,
 
         /// List services across all workspaces (overrides --workspace).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sandbox")]
         all_workspaces: bool,
 
         /// Output format.
@@ -6057,6 +6057,19 @@ mod tests {
             }
             other => panic!("expected service list command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_list_rejects_sandbox_with_all_workspaces() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "list",
+            "my-sandbox",
+            "--all-workspaces",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

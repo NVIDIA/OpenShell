@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 )
@@ -180,13 +181,17 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		return nil, nil
 	}
 	req := &pb.UpdateConfigRequest{
-		Name:                    cu.Name,
 		SettingKey:              cu.SettingKey,
 		SettingValue:            SettingValueToProto(cu.SettingValue),
 		DeleteSetting:           cu.DeleteSetting,
 		Global:                  cu.Global,
 		ExpectedResourceVersion: cu.ExpectedResourceVersion,
 		Annotations:             CopyStringMap(cu.Annotations),
+	}
+	if !cu.Global {
+		req.SandboxRef = &dm.SandboxReference{
+			Identifier: &dm.SandboxReference_Name{Name: cu.Name},
+		}
 	}
 
 	// Convert typed SDK SandboxPolicy to proto SandboxPolicy.

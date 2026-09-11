@@ -130,7 +130,7 @@ func TestTCPForward_InitFrame(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, init)
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", init.GetSandboxRef().GetId())
 	assert.Empty(t, init.GetServiceId(), "service_id should be empty per FR-007a")
 	assert.Empty(t, init.GetAuthorizationToken())
 
@@ -336,7 +336,7 @@ func TestTCPForward_WithServiceID(t *testing.T) {
 
 	require.NotNil(t, init)
 	assert.Equal(t, "audit-svc", init.GetServiceId())
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId())
+	assert.Equal(t, "sb-my-sandbox", init.GetSandboxRef().GetId())
 }
 
 func TestTCPForward_WithoutOptions_BackwardCompat(t *testing.T) {
@@ -416,7 +416,7 @@ func TestTCPForward_ResolvesNameToID(t *testing.T) {
 
 	require.NotNil(t, init)
 	// stubSandboxResolver returns ID "sb-<name>" — verify the proto has the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId(), "Forward should send resolved sandbox ID, not the name")
+	assert.Equal(t, "sb-my-sandbox", init.GetSandboxRef().GetId(), "Forward should send resolved sandbox ID, not the name")
 }
 
 func TestTCPForward_ResolutionError(t *testing.T) {
