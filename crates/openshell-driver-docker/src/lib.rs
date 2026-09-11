@@ -61,7 +61,8 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{Error, Result as CoreResult};
 use openshell_isolation_interface::boundary_protocol::{
-    BoundaryClientTls, BoundaryServerTls, BoundaryTopology, generate_boundary_mutual_tls_material,
+    BoundaryConfig, BoundaryTopology, GatewayVerificationKey, SandboxTlsClientConfig,
+    SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use opentelemetry::trace::TraceContextExt as _;
@@ -106,7 +107,6 @@ const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.
 const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
-const BOUNDARY_CLIENT_CA_MOUNT_PATH: &str = "/.openshell/channel/sandbox/client-ca.crt";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/channel/supervisor";
 const DRIVER_ADMITTED_BACKEND: &str = "docker";
 const LABEL_ISOLATION_TOPOLOGY: &str = "openshell.ai/isolation-topology";
@@ -122,7 +122,7 @@ const WORKSPACE_ROOT_FILE: &str = "workspace-root";
 const BOUNDARY_CONFIG_FILE: &str = "boundary-bootstrap.json";
 const BOUNDARY_CERTIFICATE_FILE: &str = "boundary-server.crt";
 const BOUNDARY_PRIVATE_KEY_FILE: &str = "boundary-server.key";
-const BOUNDARY_CLIENT_CA_FILE: &str = "boundary-client-ca.crt";
+const SUPERVISOR_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
@@ -1001,17 +1001,16 @@ impl DockerComputeDriver {
     }
 
     fn validate_sandbox_auth(sandbox: &DriverSandbox) -> Result<(), Status> {
-        let token_present = sandbox
+        let authentication = sandbox
             .spec
             .as_ref()
-            .is_some_and(|spec| !spec.sandbox_token.trim().is_empty());
-        if token_present {
-            return Ok(());
-        }
-
-        Err(Status::failed_precondition(
-            "docker sandboxes require gateway JWT auth; configure [openshell.gateway.gateway_jwt]",
-        ))
+            .filter(|spec| !spec.launch_authentication.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "docker sandboxes require launch-scoped gateway authentication",
+                )
+            })?;
+        decode_docker_launch_authentication(&authentication.launch_authentication).map(|_| ())
     }
 
     fn validate_gpu_request(
@@ -2124,14 +2123,19 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        launch_authentication: &[u8],
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
         self.lifecycle_event_fences
             .clear_stop(sandbox_id, sandbox_name);
         self.lifecycle_event_fences.begin_start(sandbox_id);
-        let result =
-            Box::pin(self.start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name)).await;
+        let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
+            sandbox_id,
+            sandbox_name,
+            launch_authentication,
+        ))
+        .await;
         self.lifecycle_event_fences.finish_start(sandbox_id);
         span_status.finish(result)
     }
@@ -2140,6 +2144,7 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        launch_authentication: &[u8],
     ) -> Result<bool, Status> {
         let Some(container) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
@@ -2184,6 +2189,12 @@ impl DockerComputeDriver {
             .as_ref()
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
+        refresh_docker_boundary_authentication(
+            resolved_sandbox_id,
+            &self.config,
+            launch_authentication,
+        )
+        .await?;
         let Some(topology) =
             read_docker_boundary_topology(resolved_sandbox_id, &self.config).await?
         else {
@@ -2219,13 +2230,6 @@ impl DockerComputeDriver {
                         "read Docker sandbox channel private key for restart: {error}"
                     ))
                 })?;
-        let boundary_client_ca = tokio::fs::read(boundary_directory.join(BOUNDARY_CLIENT_CA_FILE))
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "read Docker sandbox channel client CA for restart: {error}"
-                ))
-            })?;
         let workspace_root = tokio::fs::read_to_string(
             docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
                 .join(WORKSPACE_ROOT_FILE),
@@ -2245,7 +2249,6 @@ impl DockerComputeDriver {
             DockerSandboxTls {
                 certificate: &boundary_certificate,
                 private_key: &boundary_private_key,
-                client_ca: &boundary_client_ca,
             },
             &workspace_root,
         )
@@ -3083,6 +3086,7 @@ impl ComputeDriver for DockerComputeDriver {
             self,
             &request.sandbox_id,
             &request.sandbox_name,
+            &request.launch_authentication,
         ))
         .await?
         {
@@ -3940,7 +3944,6 @@ fn append_docker_archive_file(
 struct DockerSandboxTls<'a> {
     certificate: &'a [u8],
     private_key: &'a [u8],
-    client_ca: &'a [u8],
 }
 
 fn docker_sandbox_bundle_archive(
@@ -3989,10 +3992,6 @@ fn docker_sandbox_bundle_archive(
         (
             ".openshell/channel/sandbox/server.key",
             boundary_tls.private_key,
-        ),
-        (
-            ".openshell/channel/sandbox/client-ca.crt",
-            boundary_tls.client_ca,
         ),
     ] {
         append_docker_archive_file(
@@ -4051,6 +4050,43 @@ async fn stage_docker_sandbox_bundle(
         .map_err(|error| Status::internal(format!("stage Docker sandbox bundle: {error}")))
 }
 
+fn decode_docker_launch_authentication(
+    encoded: &[u8],
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    let authentication =
+        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "decode Docker sandbox launch authentication: {error}"
+                ))
+            })?;
+    authentication.validate().map_err(|error| {
+        Status::failed_precondition(format!(
+            "validate Docker sandbox launch authentication: {error}"
+        ))
+    })?;
+    Ok(authentication)
+}
+
+fn gateway_verification_keys(
+    keys: &[openshell_core::jwt::SessionVerificationKey],
+) -> Result<Vec<GatewayVerificationKey>, Status> {
+    keys.iter()
+        .map(|key| {
+            String::from_utf8(key.public_key_pem.clone())
+                .map(|public_key_pem| GatewayVerificationKey {
+                    key_id: key.key_id.clone(),
+                    public_key_pem,
+                })
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "Docker sandbox verification key is not UTF-8 PEM: {error}"
+                    ))
+                })
+        })
+        .collect()
+}
+
 async fn prepare_docker_boundary_files(
     docker: &Docker,
     sandbox: &DriverSandbox,
@@ -4062,32 +4098,39 @@ async fn prepare_docker_boundary_files(
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
-    let bootstrap_token = random_boundary_token();
+    let launch_authentication = sandbox
+        .spec
+        .as_ref()
+        .filter(|spec| !spec.launch_authentication.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition("Docker sandbox launch authentication is required")
+        })
+        .and_then(|spec| decode_docker_launch_authentication(&spec.launch_authentication))?;
     let host_gateway_ip = Some(match config.gateway_route {
         DockerGatewayRoute::Bridge { bind_address, .. } => bind_address.ip(),
         DockerGatewayRoute::HostGateway => IpAddr::V4(Ipv4Addr::LOCALHOST),
     });
-    let tls = generate_boundary_mutual_tls_material()
+    let session_id = launch_authentication.supervisor.session_id;
+    let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
+    let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
     let provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
-        bootstrap_token,
         generation: random_boundary_token(),
-        session_epoch: random_boundary_token(),
+        session_id,
+        gateway_id: launch_authentication.gateway_id,
+        verification_keys,
         container_id: container_id.to_string(),
         image_identity: image.id.clone(),
         listener_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         control_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
-        sandbox_tls: BoundaryServerTls {
+        sandbox_tls: SandboxTlsServerConfig {
             certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_MOUNT_PATH),
             private_key_path: PathBuf::from(BOUNDARY_PRIVATE_KEY_MOUNT_PATH),
-            client_ca_certificate_path: PathBuf::from(BOUNDARY_CLIENT_CA_MOUNT_PATH),
         },
-        supervisor_tls: BoundaryClientTls {
+        supervisor_tls: SandboxTlsClientConfig {
             server_name: tls.server_name.clone(),
-            ca_certificate_pem: tls.ca_certificate_pem.clone(),
-            certificate_chain_pem: tls.supervisor_certificate_pem.clone(),
-            private_key_pem: tls.supervisor_private_key_pem.clone(),
+            trust_anchor_pem: tls.trust_anchor_pem.clone(),
         },
         host_gateway_ip,
         workload_identity: workload_identity.clone(),
@@ -4101,17 +4144,12 @@ async fn prepare_docker_boundary_files(
     write_docker_boundary_file(&directory.join(BOUNDARY_CONFIG_FILE), &boundary_config).await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_CERTIFICATE_FILE),
-        tls.sandbox_certificate_pem.as_bytes(),
+        tls.certificate_chain_pem.as_bytes(),
     )
     .await?;
     write_docker_boundary_file(
         &directory.join(BOUNDARY_PRIVATE_KEY_FILE),
-        tls.sandbox_private_key_pem.as_bytes(),
-    )
-    .await?;
-    write_docker_boundary_file(
-        &directory.join(BOUNDARY_CLIENT_CA_FILE),
-        tls.ca_certificate_pem.as_bytes(),
+        tls.private_key_pem.as_bytes(),
     )
     .await?;
     stage_docker_sandbox_bundle(
@@ -4121,9 +4159,8 @@ async fn prepare_docker_boundary_files(
         workload_identity,
         &boundary_config,
         DockerSandboxTls {
-            certificate: tls.sandbox_certificate_pem.as_bytes(),
-            private_key: tls.sandbox_private_key_pem.as_bytes(),
-            client_ca: tls.ca_certificate_pem.as_bytes(),
+            certificate: tls.certificate_chain_pem.as_bytes(),
+            private_key: tls.private_key_pem.as_bytes(),
         },
         &workspace_root,
     )
@@ -4133,6 +4170,13 @@ async fn prepare_docker_boundary_files(
         .descriptor(DRIVER_ADMITTED_BACKEND)
         .map_err(|error| Status::internal(error.to_string()))?;
     write_docker_boundary_file(&directory.join(TOPOLOGY_PAYLOAD_FILE), &descriptor.payload).await?;
+    let supervisor_auth = serde_json::to_vec(&launch_authentication.supervisor)
+        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
+    write_docker_boundary_file(
+        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
+        &supervisor_auth,
+    )
+    .await?;
     let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
         sandbox.spec.as_ref(),
     )
@@ -4158,14 +4202,14 @@ async fn docker_supervisor_bundle_archive(
     let topology = tokio::fs::read(directory.join(TOPOLOGY_PAYLOAD_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker topology payload: {error}")))?;
-    let token = tokio::fs::read(sandbox_token_host_path(sandbox, config)?)
+    let auth_bundle = tokio::fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE))
         .await
         .map_err(|error| {
-            Status::failed_precondition(format!("read Docker sandbox JWT: {error}"))
+            Status::failed_precondition(format!("read Docker supervisor auth bundle: {error}"))
         })?;
-    if token.iter().all(u8::is_ascii_whitespace) {
+    if auth_bundle.is_empty() {
         return Err(Status::failed_precondition(
-            "Docker supervisor requires a sandbox JWT",
+            "Docker supervisor requires launch authentication",
         ));
     }
     let mut archive = tar::Builder::new(Vec::new());
@@ -4186,11 +4230,11 @@ async fn docker_supervisor_bundle_archive(
     )?;
     append_docker_archive_file(
         &mut archive,
-        ".openshell/channel/supervisor/sandbox.jwt",
+        ".openshell/channel/supervisor/auth.json",
         0o600,
         SUPERVISOR_UID,
         SUPERVISOR_GID,
-        &token,
+        &auth_bundle,
     )?;
     if let Some(tls) = &config.guest_tls {
         append_docker_archive_directory(
@@ -4224,6 +4268,75 @@ async fn docker_supervisor_bundle_archive(
     archive
         .into_inner()
         .map_err(|error| Status::internal(format!("finish Docker supervisor archive: {error}")))
+}
+
+async fn refresh_docker_boundary_authentication(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+    encoded_authentication: &[u8],
+) -> Result<(), Status> {
+    let authentication = decode_docker_launch_authentication(encoded_authentication)?;
+    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
+    let mut boundary_config = serde_json::from_slice::<BoundaryConfig>(
+        &tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "read Docker sandbox bootstrap for authentication rotation: {error}"
+                ))
+            })?,
+    )
+    .map_err(|error| {
+        Status::failed_precondition(format!(
+            "decode Docker sandbox bootstrap for authentication rotation: {error}"
+        ))
+    })?;
+    let Some(mut topology) = read_docker_boundary_topology(sandbox_id, config).await? else {
+        return Err(Status::failed_precondition(
+            "Docker sandbox topology is missing during authentication rotation",
+        ));
+    };
+    let session_id = authentication.supervisor.session_id;
+    let tls = generate_sandbox_tls_material(session_id)
+        .map_err(|error| Status::internal(format!("rotate Docker boundary TLS: {error}")))?;
+    boundary_config.session_id = session_id;
+    boundary_config.gateway_id = authentication.gateway_id;
+    boundary_config.verification_keys =
+        gateway_verification_keys(&authentication.verification_keys)?;
+    topology.session_id = session_id;
+    topology.tls = SandboxTlsClientConfig {
+        server_name: tls.server_name,
+        trust_anchor_pem: tls.trust_anchor_pem,
+    };
+    let encoded_boundary_config = boundary_config
+        .encode()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let descriptor = topology
+        .descriptor(DRIVER_ADMITTED_BACKEND)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
+        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
+    write_docker_boundary_file(
+        &directory.join(BOUNDARY_CONFIG_FILE),
+        &encoded_boundary_config,
+    )
+    .await?;
+    write_docker_boundary_file(
+        &directory.join(BOUNDARY_CERTIFICATE_FILE),
+        tls.certificate_chain_pem.as_bytes(),
+    )
+    .await?;
+    write_docker_boundary_file(
+        &directory.join(BOUNDARY_PRIVATE_KEY_FILE),
+        tls.private_key_pem.as_bytes(),
+    )
+    .await?;
+    write_docker_boundary_file(&directory.join(TOPOLOGY_PAYLOAD_FILE), &descriptor.payload).await?;
+    write_docker_boundary_file(
+        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
+        &supervisor_auth,
+    )
+    .await
 }
 
 async fn read_docker_boundary_topology(
@@ -4375,7 +4488,7 @@ async fn spawn_docker_control_process(
         )
         .await;
     let topology_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/topology.payload");
-    let token_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/sandbox.jwt");
+    let auth_bundle_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/auth.json");
     let mut environment = vec![
         format!(
             "{}={DRIVER_ADMITTED_BACKEND}",
@@ -4392,10 +4505,6 @@ async fn spawn_docker_control_process(
         ),
         format!("{}={}", openshell_core::sandbox_env::SANDBOX_ID, sandbox.id),
         format!("{}={}", openshell_core::sandbox_env::SANDBOX, sandbox.name),
-        format!(
-            "{}={token_path}",
-            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
-        ),
         format!(
             "{}=/run/openshell/ssh.sock",
             openshell_core::sandbox_env::SSH_SOCKET_PATH
@@ -4465,6 +4574,8 @@ async fn spawn_docker_control_process(
             format!("--topology-backend-name={}", descriptor.backend_name),
             "--topology-payload-file".to_string(),
             topology_path.clone(),
+            "--auth-bundle-file".to_string(),
+            auth_bundle_path,
             "--workdir".to_string(),
             workspace_root,
             format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
