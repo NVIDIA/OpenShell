@@ -53,12 +53,13 @@ $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindo
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-supervisor-process --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
-$BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
-$BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
-$BundledZ3GatewayFeatures = "--features openshell-gateway/bundled-z3"
-$Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
-$Z3ServerFeatures = $BundledZ3ServerFeatures
-$Z3GatewayFeatures = $BundledZ3GatewayFeatures
+$PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
+$PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
+$PrebuiltZ3GatewayFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
+$PrebuiltZ3Version = "4.16.0"
+$Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
+$Z3ServerFeatures = $PrebuiltZ3ServerFeatures
+$Z3GatewayFeatures = $PrebuiltZ3GatewayFeatures
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -354,11 +355,13 @@ function Resolve-Z3HeaderPath([string] $HeaderPath) {
 
 function Configure-Z3 {
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
-        Write-Host "==> Z3: bundled"
+        Write-Host "==> Z3: prebuilt release"
+        $env:Z3_SYS_Z3_VERSION = $PrebuiltZ3Version
+        Write-Host "    Z3_SYS_Z3_VERSION=$env:Z3_SYS_Z3_VERSION"
         return [pscustomobject]@{
-            WorkspaceFeatures = $BundledZ3WorkspaceFeatures
-            ServerFeatures = $BundledZ3ServerFeatures
-            GatewayFeatures = $BundledZ3GatewayFeatures
+            WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
+            ServerFeatures = $PrebuiltZ3ServerFeatures
+            GatewayFeatures = $PrebuiltZ3GatewayFeatures
         }
     }
 

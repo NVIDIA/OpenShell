@@ -309,16 +309,15 @@ Project requirements:
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
-- CMake 3.16+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
 The `openshell-prover` crate links directly against Z3. The `openshell-server`
 crate depends on the prover, and the `openshell-gateway` binary crate depends
-on `openshell-server` in turn; both forward a `bundled-z3` feature down to
-`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on
-Z3. On macOS and Linux, install the system Z3 development package; `z3-sys`
-discovers it through `pkg-config`.
+on `openshell-server` in turn. The `openshell-cli` crate does not depend on Z3.
+The Nix development shell supplies Z3. For builds outside that shell on macOS
+and Linux, install the system Z3 development package; `z3-sys` discovers it
+through `pkg-config`.
 
 ```bash
 # macOS
@@ -331,18 +330,15 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
-compiles Z3 from source during the Rust build and requires CMake 3.16+:
-
-```bash
-cargo build -p openshell-prover --features bundled-z3
-```
-
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
-- Bundled Z3 (the default for `windows:*` tasks): `z3-sys` builds Z3 from
-  source and links it into the OpenShell binaries. This keeps the release
-  executables independent of `libz3.dll` when they are copied to another host.
+- Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
+  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  build. Cargo reuses the extracted archive from its target directory. Windows
+  CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
+  preserves the archive in the architecture-specific Cargo target cache. For
+  cold local builds, you may set `READ_ONLY_GITHUB_TOKEN` to avoid anonymous
+  GitHub API rate limits.
 - System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
   target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to
   `z3.h`. The `windows:*` tasks use this path automatically when
@@ -353,24 +349,24 @@ For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 just this crate does not require `LIBCLANG_PATH`:
 
 ```powershell
-cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
 ```
 
 ### Windows full build
 
 To build the full set of Windows binaries, including `openshell-gateway.exe`
 and `openshell.exe`, use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It builds Z3 from source (bundled) by default. A full
-build also compiles crates that use `bindgen` (e.g. the MXC driver on Windows),
-so it requires `libclang.dll`; if LLVM is not on the default search path, set
-`LIBCLANG_PATH` to the directory containing `libclang.dll`:
+single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by
+default. A full build also compiles crates that use `bindgen` (e.g. the MXC
+driver on Windows), so it requires `libclang.dll`; if LLVM is not on the default
+search path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 mise run --skip-tools windows:build:x64
 ```
 
-To use a local x64 Z3 release instead of the bundled build, set
+To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
