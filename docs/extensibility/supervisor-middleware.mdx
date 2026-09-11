@@ -22,13 +22,7 @@ For each inspected HTTP request, the supervisor:
 5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
 6. Applies allowed transformations, injects provider credentials, and forwards the request.
 
-Response middleware advertising `HTTP_RESPONSE/PRE_RETURN` inspects the final
-upstream response before OpenShell returns it to the workload. Its preflight
-includes upstream `Content-Length`, `Content-Encoding`, and `Content-Range`
-fields as read-only metadata, except when `Connection` nominates the field as
-hop-by-hop. Middleware cannot write or remove these fields. OpenShell computes
-downstream framing separately and emits the final `Content-Length` or
-`Transfer-Encoding` exactly once after middleware processing.
+Response middleware advertising `HTTP_RESPONSE/PRE_RETURN` inspects the final upstream response before OpenShell returns it to the workload. Its preflight includes upstream `Content-Length`, `Content-Encoding`, and `Content-Range` fields as read-only metadata, except when `Connection` nominates the field as hop-by-hop. Middleware cannot write or remove these fields. OpenShell computes downstream framing separately and emits the final `Content-Length` or `Transfer-Encoding` exactly once after middleware processing.
 
 For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds every host-matched attachment, then selects only implementations that advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It opens one ordered, phase-specific `EvaluateWebSocketSession` stream per selected stage. OpenShell sends `WebSocketSessionEvent` values, while the service returns `WebSocketSessionEventResult` values only for preflight and message events; session start and end are notifications. Future upstream-to-client inspection uses the same RPC with `PRE_RETURN`; an implementation that advertises both phases receives two independent streams for the WebSocket session. An attachment without the selected binding can still inspect the HTTP upgrade request when it advertises the HTTP binding, but it is not a failed WebSocket stage. OpenShell allows post-upgrade traffic and emits an informational `binding_not_selected` coverage event for that attachment.
 
@@ -232,11 +226,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 
 ## Runnable example
 
-The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard)
-matches configured literal terms in UTF-8 request bodies, complete response
-bodies, and client WebSocket text messages. It supports redaction and denial.
-Responses require whole-body inspection; unavailable inspection or invalid
-UTF-8 invokes the configured `on_error` policy. It is not a general PII detector.
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) matches configured literal terms in UTF-8 request bodies, complete response bodies, and client WebSocket text messages. It supports redaction and denial. Responses require whole-body inspection; unavailable inspection or invalid UTF-8 invokes the configured `on_error` policy. It is not a general PII detector.
 
 The example includes a policy, local fixture, and smoke launcher.
 
