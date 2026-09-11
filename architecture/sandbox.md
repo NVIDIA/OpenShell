@@ -604,6 +604,11 @@ HTTP Activity records contain a request or response; early rejections with only
 connection context use Network Activity. Producer regression tests validate
 required fields and `at_least_one` constraints against the vendored OCSF 1.8
 schemas.
+Network Activity records identify at least one observed endpoint; connection
+failures retain their known peer or listening endpoint.
+Configuration diagnostics use Config State Change.
+Unix socket relay and relay-control notifications, plus proxy and mediation
+failures without an observed network endpoint, use Base Event.
 
 ## Policy Proposals
 
