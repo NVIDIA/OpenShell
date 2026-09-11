@@ -12,6 +12,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Maximum number of normalized PEM bytes accepted for destination trust.
+///
+/// This bound is shared by the gateway normalization boundary and all compute
+/// driver consumers. Kubernetes counts the `ca.crt` key and value toward its
+/// 1 MiB `ConfigMap` data limit, so reserve the six key bytes here to keep every
+/// supported driver on the same deployable boundary.
+pub const MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES: usize = 1024 * 1024 - "ca.crt".len();
+
 /// Normalized, gateway-owned trust material for sandbox destination TLS.
 ///
 /// The PEM bytes contain only canonical X.509 certificate blocks.  The type is
