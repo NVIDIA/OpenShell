@@ -105,8 +105,32 @@ gateway callback mTLS trust.
 
 Changing only the source ConfigMap does not roll or reload the gateway. Restart
 the gateway, then recreate or restart affected sandboxes to use the new roots.
-If you render the TOML setting outside this Helm value, provide equivalent
-`get`, `create`, and `patch` ConfigMap permissions in sandbox namespaces.
+Removing `additionalCaConfigMapName` removes the global TOML setting; newly
+created or recreated sandbox pods then have no additional-CA volume or mount.
+Existing running sandbox supervisors retain their startup trust until they are
+restarted or recreated.
+
+The driver manages the deterministic name
+`openshell-network-additional-ca-<effective-gateway-id>` (the effective ID is
+`server.sandboxJwt.gatewayId`, or the chart fullname when unset). Its `get` and
+`patch` permissions must be restricted to that exact name; `create` must remain
+a separate unrestricted ConfigMap permission because Kubernetes cannot apply
+`resourceNames` to create authorization. If you render the TOML setting outside
+this Helm value, grant that same split RBAC policy in every sandbox namespace.
+
+Disabling the setting intentionally does not delete driver-managed ConfigMaps:
+the driver has no list/delete permissions, and a shared or operator namespace
+may contain resources still used by another gateway instance. After all
+affected sandboxes are restarted, identify an unused object by its exact name
+and the labels `openshell.ai/managed-by=openshell` and matching
+`openshell.ai/gateway-id`, then delete it explicitly in the target namespace:
+
+```shell
+kubectl -n <sandbox-namespace> get configmap \
+  openshell-network-additional-ca-<effective-gateway-id> --show-labels
+kubectl -n <sandbox-namespace> delete configmap \
+  openshell-network-additional-ca-<effective-gateway-id>
+```
 
 A configured CA can authenticate every policy-permitted TLS endpoint with a
 matching certificate chain and hostname. Scope private CAs accordingly.

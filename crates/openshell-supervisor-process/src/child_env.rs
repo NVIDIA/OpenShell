@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::path::Path;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
@@ -21,6 +22,34 @@ pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     ]
 }
 
+/// Determines whether `OpenShell`'s generated TLS environment must override a
+/// caller-provided value or merely supplies a missing default.
+///
+/// Proxy interception requires the `OpenShell` CA to be authoritative: replacing
+/// any of these values is necessary for the workload to trust the generated
+/// MITM leaf. Direct additional-destination-CA mode has no interception CA,
+/// so caller-supplied values retain precedence and `OpenShell` fills only gaps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsEnvironmentMode {
+    ForceOpenShell,
+    FillMissing,
+}
+
+/// TLS trust variables `OpenShell` supplies to workload and SSH child processes.
+pub const TLS_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "NODE_EXTRA_CA_CERTS",
+    "DENO_CERT",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
+
+/// Whether `key` is one of the workload TLS trust variables.
+pub fn is_tls_environment_variable(key: &str) -> bool {
+    TLS_ENVIRONMENT_VARIABLES.contains(&key)
+}
+
 pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
@@ -37,6 +66,27 @@ pub fn tls_env_vars(
         // git reads GIT_SSL_CAINFO (or http.sslCAInfo) to locate the CA bundle.
         ("GIT_SSL_CAINFO", combined_bundle_path),
     ]
+}
+
+/// Apply child TLS environment variables according to the selected trust mode.
+///
+/// `user_environment` is the original sandbox environment captured by the
+/// driver. It is used instead of inspecting the parent process environment so
+/// SSH's `env_clear()` path and the direct entrypoint path have identical,
+/// deterministic precedence rules.
+pub fn tls_env_vars_for_mode<S: std::hash::BuildHasher>(
+    ca_cert_path: &Path,
+    combined_bundle_path: &Path,
+    mode: TlsEnvironmentMode,
+    user_environment: &HashMap<String, String, S>,
+) -> Vec<(&'static str, String)> {
+    tls_env_vars(ca_cert_path, combined_bundle_path)
+        .into_iter()
+        .filter(|(key, _)| {
+            matches!(mode, TlsEnvironmentMode::ForceOpenShell)
+                || !user_environment.contains_key(*key)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -66,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_tls_env_sets_node_and_bundle_paths() {
+    fn forced_tls_env_sets_node_and_bundle_paths() {
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -74,7 +124,19 @@ mod tests {
 
         let ca_cert_path = Path::new("/etc/openshell-tls/openshell-ca.pem");
         let combined_bundle_path = Path::new("/etc/openshell-tls/ca-bundle.pem");
-        for (key, value) in tls_env_vars(ca_cert_path, combined_bundle_path) {
+        let user_environment = tls_env_vars(ca_cert_path, combined_bundle_path)
+            .into_iter()
+            .map(|(key, _)| (key.to_string(), format!("/caller/{key}")))
+            .collect::<HashMap<_, _>>();
+        for (key, value) in &user_environment {
+            cmd.env(key, value);
+        }
+        for (key, value) in tls_env_vars_for_mode(
+            ca_cert_path,
+            combined_bundle_path,
+            TlsEnvironmentMode::ForceOpenShell,
+            &user_environment,
+        ) {
             cmd.env(key, value);
         }
 
@@ -97,5 +159,38 @@ mod tests {
             ca_cert_path,
             Path::new(openshell_core::container_paths::TLS_CA_MOUNT_PATH)
         );
+    }
+
+    #[test]
+    fn fill_missing_tls_env_preserves_all_user_values_and_adds_only_gaps() {
+        let ca_cert_path = Path::new("/etc/openshell-tls/openshell-ca.pem");
+        let combined_bundle_path = Path::new("/etc/openshell-tls/ca-bundle.pem");
+        let mut user_environment = HashMap::new();
+        for (key, _) in tls_env_vars(ca_cert_path, combined_bundle_path) {
+            user_environment.insert(key.to_string(), format!("/caller/{key}"));
+        }
+        // Exercise the gap separately: five values must retain their exact
+        // caller values while the missing one is supplied by OpenShell.
+        user_environment.remove("DENO_CERT");
+
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear();
+        for (key, value) in &user_environment {
+            cmd.env(key, value);
+        }
+        for (key, value) in tls_env_vars_for_mode(
+            ca_cert_path,
+            combined_bundle_path,
+            TlsEnvironmentMode::FillMissing,
+            &user_environment,
+        ) {
+            cmd.env(key, value);
+        }
+        let output = cmd.output().expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        for (key, value) in &user_environment {
+            assert!(stdout.contains(&format!("{key}={value}")), "{stdout}");
+        }
+        assert!(stdout.contains("DENO_CERT=/etc/openshell-tls/openshell-ca.pem"));
     }
 }

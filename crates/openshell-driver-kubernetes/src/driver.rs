@@ -70,6 +70,11 @@ pub type WatchStream =
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
 const NETWORK_ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-network-additional-ca";
 const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
+/// Kubernetes limits a `ConfigMap`'s key-plus-value data to 1 MiB. The shared
+/// boundary reserves space for `ca.crt`, so every supported driver enforces one
+/// deployable contract.
+const NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES: usize =
+    openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
@@ -423,6 +428,13 @@ fn network_additional_ca_config_map(
     gateway_id: &str,
     bundle: &NetworkSupervisorTrustBundle,
 ) -> Result<ConfigMap, KubernetesDriverError> {
+    if bundle.normalized_pem().len() > NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "normalized network additional CA material is too large for a Kubernetes ConfigMap ({} bytes; maximum {} bytes)",
+            bundle.normalized_pem().len(),
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES
+        )));
+    }
     let pem = String::from_utf8(bundle.normalized_pem().to_vec()).map_err(|_| {
         KubernetesDriverError::Precondition(
             "normalized network additional CA material is not UTF-8 PEM".to_string(),
@@ -954,10 +966,12 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    /// Apply the gateway-normalized destination trust bundle in the target namespace.
+    /// Ensure the gateway-normalized destination trust bundle exists in the target namespace.
     ///
-    /// Server-side apply gives each gateway one stable object per namespace and
-    /// replaces its `ca.crt` value when a restarted gateway has new material.
+    /// The deterministic name is first read and its ownership labels are checked.
+    /// This prevents SSA from adopting an object created by another principal.
+    /// A missing object is created directly; if that races with another gateway
+    /// instance, the winner is read and validated before a forced SSA update.
     async fn ensure_network_additional_ca_config_map(
         &self,
         namespace: &str,
@@ -967,32 +981,162 @@ impl KubernetesComputeDriver {
         };
         let name = network_additional_ca_config_map_name(&self.config.gateway_id)
             .map_err(KubernetesDriverError::Precondition)?;
-        let config_map =
+        let desired =
             network_additional_ca_config_map(namespace, &name, &self.config.gateway_id, bundle)?;
         let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
+        match self
+            .get_network_additional_ca_config_map(&api, &name, namespace)
+            .await?
+        {
+            Some(existing) => {
+                self.validate_network_additional_ca_config_map_ownership(
+                    &existing, &name, namespace,
+                )?;
+                self.apply_network_additional_ca_config_map(
+                    &api, &desired, &name, namespace, bundle,
+                )
+                .await?;
+            }
+            None => match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.create(&PostParams::default(), &desired),
+            )
+            .await
+            {
+                Ok(Ok(created)) => {
+                    // Admission may mutate a created object. Verify the returned
+                    // labels before allowing the object to be mounted by a pod.
+                    self.validate_network_additional_ca_config_map_ownership(
+                        &created, &name, namespace,
+                    )?;
+                    Self::validate_network_additional_ca_config_map_data(
+                        &created, &name, namespace, bundle,
+                    )?;
+                    info!(namespace, config_map = %name, certificate_count = bundle.certificate_count(), digest = bundle.digest(), "created network additional CA ConfigMap");
+                    return Ok(());
+                }
+                Ok(Err(KubeError::Api(error))) if error.code == 409 => {
+                    // A second gateway can create between GET and CREATE. Never
+                    // apply until the raced object has passed ownership validation.
+                    let existing = self.get_network_additional_ca_config_map(&api, &name, namespace).await?
+                        .ok_or_else(|| KubernetesDriverError::Message(format!(
+                            "network additional CA ConfigMap {name} disappeared after a create conflict in namespace {namespace}"
+                        )))?;
+                    self.validate_network_additional_ca_config_map_ownership(
+                        &existing, &name, namespace,
+                    )?;
+                    self.apply_network_additional_ca_config_map(
+                        &api, &desired, &name, namespace, bundle,
+                    )
+                    .await?;
+                }
+                Ok(Err(_)) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "failed to create network additional CA ConfigMap {name} in namespace {namespace}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timeout creating network additional CA ConfigMap {name} in namespace {namespace}"
+                    )));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    async fn get_network_additional_ca_config_map(
+        &self,
+        api: &Api<ConfigMap>,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<ConfigMap>, KubernetesDriverError> {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name)).await {
+            Ok(Ok(config_map)) => Ok(config_map),
+            Ok(Err(_)) => Err(KubernetesDriverError::Message(format!(
+                "failed to get network additional CA ConfigMap {name} in namespace {namespace}"
+            ))),
+            Err(_) => Err(KubernetesDriverError::Message(format!(
+                "timeout getting network additional CA ConfigMap {name} in namespace {namespace}"
+            ))),
+        }
+    }
+
+    fn validate_network_additional_ca_config_map_ownership(
+        &self,
+        config_map: &ConfigMap,
+        name: &str,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let labels = config_map.metadata.labels.as_ref();
+        if labels
+            .and_then(|labels| labels.get(LABEL_MANAGED_BY))
+            .map(String::as_str)
+            != Some(LABEL_MANAGED_BY_VALUE)
+            || labels
+                .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+                .map(String::as_str)
+                != Some(self.config.gateway_id.as_str())
+        {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} exists but is not owned by this gateway"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_network_additional_ca_config_map_data(
+        config_map: &ConfigMap,
+        name: &str,
+        namespace: &str,
+        bundle: &NetworkSupervisorTrustBundle,
+    ) -> Result<(), KubernetesDriverError> {
+        let actual = config_map
+            .data
+            .as_ref()
+            .and_then(|data| data.get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY))
+            .map(String::as_bytes);
+        if actual != Some(bundle.normalized_pem()) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} did not retain the gateway-normalized trust bundle"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn apply_network_additional_ca_config_map(
+        &self,
+        api: &Api<ConfigMap>,
+        desired: &ConfigMap,
+        name: &str,
+        namespace: &str,
+        bundle: &NetworkSupervisorTrustBundle,
+    ) -> Result<(), KubernetesDriverError> {
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.patch(
-                &name,
-                &PatchParams::apply("openshell"),
-                &Patch::Apply(&config_map),
+                name,
+                &PatchParams::apply("openshell").force(),
+                &Patch::Apply(desired),
             ),
         )
         .await
         {
-            Ok(Ok(_)) => {
-                info!(
-                    namespace,
-                    config_map = %name,
-                    certificate_count = bundle.certificate_count(),
-                    digest = bundle.digest(),
-                    "applied network additional CA ConfigMap"
-                );
+            Ok(Ok(applied)) => {
+                self.validate_network_additional_ca_config_map_ownership(
+                    &applied, name, namespace,
+                )?;
+                Self::validate_network_additional_ca_config_map_data(
+                    &applied, name, namespace, bundle,
+                )?;
+                info!(namespace, config_map = %name, certificate_count = bundle.certificate_count(), digest = bundle.digest(), "applied network additional CA ConfigMap");
                 Ok(())
             }
-            Ok(Err(error)) => Err(KubernetesDriverError::Message(format!(
-                "failed to apply network additional CA ConfigMap {name} in namespace {namespace}: {error}"
+            // Do not include arbitrary API response text: admission webhooks may
+            // echo request fields, including the certificate bundle.
+            Ok(Err(_)) => Err(KubernetesDriverError::Message(format!(
+                "failed to apply network additional CA ConfigMap {name} in namespace {namespace}"
             ))),
             Err(_) => Err(KubernetesDriverError::Message(format!(
                 "timeout applying network additional CA ConfigMap {name} in namespace {namespace}"
@@ -5092,9 +5236,9 @@ mod tests {
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
     use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
@@ -9118,55 +9262,272 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn network_ca_config_map_is_applied_before_pod_delivery_and_api_errors_surface() {
-        use std::sync::{Arc, Mutex};
+    fn network_ca_api_response(
+        status: u16,
+        body: serde_json::Value,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .unwrap()
+    }
 
+    fn owned_network_ca_config_map() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "openshell-network-additional-ca-gateway-a",
+                "labels": {
+                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+                    LABEL_GATEWAY_ID: "gateway-a"
+                }
+            },
+            "data": {
+                NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY:
+                    "-----BEGIN CERTIFICATE-----\ntest-normalized-ca\n-----END CERTIFICATE-----\n"
+            }
+        })
+    }
+
+    type NetworkCaRequests = Arc<Mutex<Vec<(http::Method, String)>>>;
+
+    fn network_ca_test_driver(
+        responses: Vec<http::Response<http_body_util::Full<bytes::Bytes>>>,
+    ) -> (KubernetesComputeDriver, NetworkCaRequests) {
+        use std::collections::VecDeque;
+
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&requests);
+        let service_responses = Arc::clone(&responses);
+        let service_requests = Arc::clone(&requests);
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
-            let captured = Arc::clone(&captured);
+            let responses = Arc::clone(&service_responses);
+            let requests = Arc::clone(&service_requests);
             async move {
-                captured
+                requests
                     .lock()
                     .unwrap()
                     .push((request.method().clone(), request.uri().to_string()));
-                let response = http::Response::builder()
-                    .status(403)
-                    .header("content-type", "application/json")
-                    .body(http_body_util::Full::new(bytes::Bytes::from_static(
-                        br#"{"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}"#,
-                    )))
-                    .unwrap();
-                Ok::<_, std::convert::Infallible>(response)
+                Ok::<_, std::convert::Infallible>(
+                    responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected Kubernetes API request"),
+                )
             }
         });
-        let client = Client::new(service, "default");
         let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
             gateway_id: "gateway-a".to_string(),
             ..KubernetesComputeConfig::default()
         });
-        driver.client = client;
+        driver.client = Client::new(service, "default");
         driver.network_trust_bundle = Some(test_network_trust_bundle());
+        (driver, requests)
+    }
 
-        let error = driver
+    #[tokio::test]
+    async fn network_ca_config_map_creates_deterministic_absent_object() {
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(
+                404,
+                serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+            ),
+            network_ca_api_response(201, owned_network_ca_config_map()),
+        ]);
+        driver
             .ensure_network_additional_ca_config_map("workspace-a")
             .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("ConfigMap"));
-        assert!(message.contains("workspace-a"));
-        assert!(!message.contains("test-normalized-ca"));
-
+            .unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].0, http::Method::PATCH);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| &request.0)
+                .collect::<Vec<_>>(),
+            vec![&http::Method::GET, &http::Method::POST]
+        );
         assert!(
             requests[0]
                 .1
-                .contains("/namespaces/workspace-a/configmaps/")
+                .contains("openshell-network-additional-ca-gateway-a")
         );
-        assert!(requests[0].1.contains("fieldManager=openshell"));
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_updates_owned_object_with_forced_ssa() {
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(200, owned_network_ca_config_map()),
+            network_ca_api_response(200, owned_network_ca_config_map()),
+        ]);
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[1].0, http::Method::PATCH);
+        assert!(requests[1].1.contains("fieldManager=openshell"));
+        assert!(requests[1].1.contains("force=true"));
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_create_conflict_revalidates_before_forced_ssa() {
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(
+                404,
+                serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+            ),
+            network_ca_api_response(
+                409,
+                serde_json::json!({"status":"Failure", "reason":"AlreadyExists", "code":409}),
+            ),
+            network_ca_api_response(200, owned_network_ca_config_map()),
+            network_ca_api_response(200, owned_network_ca_config_map()),
+        ]);
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| &request.0)
+                .collect::<Vec<_>>(),
+            vec![
+                &http::Method::GET,
+                &http::Method::POST,
+                &http::Method::GET,
+                &http::Method::PATCH
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_rejects_foreign_object_before_mutation() {
+        let mut missing_managed_by = owned_network_ca_config_map();
+        missing_managed_by["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(LABEL_MANAGED_BY);
+        let mut wrong_gateway = owned_network_ca_config_map();
+        wrong_gateway["metadata"]["labels"][LABEL_GATEWAY_ID] = serde_json::json!("other-gateway");
+
+        for foreign in [missing_managed_by, wrong_gateway] {
+            let (driver, requests) =
+                network_ca_test_driver(vec![network_ca_api_response(200, foreign)]);
+            let error = driver
+                .ensure_network_additional_ca_config_map("workspace-a")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not owned by this gateway"));
+            assert!(!error.to_string().contains("test-normalized-ca"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_rejects_admission_mutated_data() {
+        let mut mutated = owned_network_ca_config_map();
+        mutated["data"][NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY] =
+            serde_json::json!("admission-replaced-data");
+
+        for responses in [
+            vec![
+                network_ca_api_response(
+                    404,
+                    serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+                ),
+                network_ca_api_response(201, mutated.clone()),
+            ],
+            vec![
+                network_ca_api_response(200, owned_network_ca_config_map()),
+                network_ca_api_response(200, mutated.clone()),
+            ],
+        ] {
+            let (driver, _) = network_ca_test_driver(responses);
+            let error = driver
+                .ensure_network_additional_ca_config_map("workspace-a")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("did not retain"));
+            assert!(!error.to_string().contains("test-normalized-ca"));
+            assert!(!error.to_string().contains("admission-replaced-data"));
+        }
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_api_failures_do_not_expose_certificate_bytes() {
+        for responses in [
+            vec![network_ca_api_response(
+                403,
+                serde_json::json!({"status":"Failure", "reason":"Forbidden", "code":403}),
+            )],
+            vec![
+                network_ca_api_response(
+                    404,
+                    serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+                ),
+                network_ca_api_response(
+                    403,
+                    serde_json::json!({"status":"Failure", "reason":"Forbidden", "code":403}),
+                ),
+            ],
+            vec![
+                network_ca_api_response(200, owned_network_ca_config_map()),
+                network_ca_api_response(
+                    500,
+                    serde_json::json!({"status":"Failure", "reason":"InternalError", "code":500}),
+                ),
+            ],
+        ] {
+            let (driver, _) = network_ca_test_driver(responses);
+            let error = driver
+                .ensure_network_additional_ca_config_map("workspace-a")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ConfigMap"));
+            assert!(!error.to_string().contains("test-normalized-ca"));
+        }
+    }
+
+    #[test]
+    fn network_ca_config_map_accepts_exact_shared_limit_with_key_overhead() {
+        let bundle = NetworkSupervisorTrustBundle::new(
+            vec![b'x'; NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES],
+            1,
+            "sha256:test-network-ca",
+            PathBuf::from("/gateway-owned/network-additional-ca.crt"),
+        );
+        let config_map =
+            network_additional_ca_config_map("workspace-a", "name", "gateway-a", &bundle).unwrap();
+        let value = config_map
+            .data
+            .as_ref()
+            .unwrap()
+            .get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY)
+            .unwrap();
+        assert_eq!(
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY.len() + value.len(),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn network_ca_config_map_rejects_material_too_large_for_kubernetes() {
+        let bundle = NetworkSupervisorTrustBundle::new(
+            vec![b'x'; NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES + 1],
+            1,
+            "sha256:test-network-ca",
+            PathBuf::from("/gateway-owned/network-additional-ca.crt"),
+        );
+        let error = network_additional_ca_config_map("workspace-a", "name", "gateway-a", &bundle)
+            .unwrap_err();
+        assert!(error.to_string().contains("too large"));
     }
 
     #[tokio::test]

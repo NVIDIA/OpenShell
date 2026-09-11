@@ -147,6 +147,23 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
+Effective gateway identity written to gateway.toml. Keep consumers such as
+RBAC aligned with the Kubernetes driver's deterministic managed resource names.
+*/}}
+{{- define "openshell.effectiveGatewayId" -}}
+{{- .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) -}}
+{{- end }}
+
+{{/*
+Deterministic ConfigMap name used by the Kubernetes driver for normalized
+network additional CAs. This must remain an exact prefix + effective gateway ID
+(the driver does not truncate names).
+*/}}
+{{- define "openshell.networkAdditionalCaConfigMapName" -}}
+{{- printf "openshell-network-additional-ca-%s" (include "openshell.effectiveGatewayId" .) -}}
+{{- end }}
+
+{{/*
 Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}
