@@ -35,7 +35,7 @@ disable_tls         = true
 
 [openshell.drivers.docker]
 # Default image pulled for `openshell sandbox create` without --from.
-default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image     = "docker.io/library/alpine:3.22"
 # Supervisor image from which the openshell-sandbox binary is extracted on
 # first start.  The binary is cached to XDG_DATA_HOME and reused on restart.
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
