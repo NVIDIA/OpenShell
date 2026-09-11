@@ -14,7 +14,10 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace_selector,
 };
-use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
+use crate::pagination::Pagination;
+use crate::persistence::{
+    ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
+};
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -66,7 +69,7 @@ use super::validation::{
     validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
+use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
@@ -696,8 +699,6 @@ pub(super) async fn handle_list_sandboxes(
 ) -> Result<Response<ListSandboxesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -706,21 +707,11 @@ pub(super) async fn handle_list_sandboxes(
         MinWorkspaceRole::User,
     )
     .await?;
-    let sandboxes: Vec<Sandbox> = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_all_messages(limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_all_messages_with_selector(&request.label_selector, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        }
+    if !request.label_selector.is_empty() {
+        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+    }
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        None
     } else {
         let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
             unreachable!("all-workspaces scope handled above")
@@ -728,30 +719,35 @@ pub(super) async fn handle_list_sandboxes(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_messages(&workspace, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("list sandboxes with selector failed: {e}"))
-                })?
-        }
+        Some(workspace)
     };
-
-    Ok(Response::new(ListSandboxesResponse { sandboxes }))
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListSandboxes",
+        &[scope_fingerprint, &request.label_selector],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, selector) => ObjectListQuery::AllWorkspacesSelector(selector),
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+    };
+    let page = state
+        .store
+        .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListSandboxesResponse {
+        sandboxes: page.messages,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_create_sandbox_template(
@@ -882,7 +878,6 @@ pub(super) async fn handle_list_sandbox_templates(
 ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -891,25 +886,11 @@ pub(super) async fn handle_list_sandbox_templates(
         MinWorkspaceRole::User,
     )
     .await?;
-    let templates = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_all_messages::<SandboxWorkloadTemplate>(limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_all_messages_with_selector::<SandboxWorkloadTemplate>(
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        }
+    if !request.label_selector.is_empty() {
+        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+    }
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        None
     } else {
         let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
             unreachable!("all-workspaces scope handled above")
@@ -917,29 +898,35 @@ pub(super) async fn handle_list_sandbox_templates(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_messages::<SandboxWorkloadTemplate>(&workspace, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_messages_with_selector::<SandboxWorkloadTemplate>(
-                    &workspace,
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("list sandbox templates with selector failed: {e}"))
-                })?
-        }
+        Some(workspace)
     };
-    Ok(Response::new(ListSandboxTemplatesResponse { templates }))
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListSandboxTemplates",
+        &[scope_fingerprint, &request.label_selector],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, selector) => ObjectListQuery::AllWorkspacesSelector(selector),
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+    };
+    let page = state
+        .store
+        .list_message_page::<SandboxWorkloadTemplate>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListSandboxTemplatesResponse {
+        templates: page.messages,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_sandbox_template(
@@ -4826,8 +4813,8 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -4912,8 +4899,8 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -4951,8 +4938,8 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -5000,8 +4987,8 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -6399,8 +6386,8 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -6417,8 +6404,8 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
@@ -6442,8 +6429,8 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -6487,8 +6474,8 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
@@ -6497,6 +6484,38 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(listed.sandboxes.len(), 2);
+        let first_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                page_size: 1,
+                page_token: String::new(),
+                label_selector: String::new(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.sandboxes.len(), 1);
+        assert!(!first_page.next_page_token.is_empty());
+        let second_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                page_size: 100,
+                page_token: first_page.next_page_token,
+                label_selector: String::new(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(second_page.sandboxes.len(), 1);
+        assert!(second_page.next_page_token.is_empty());
+        assert_ne!(
+            first_page.sandboxes[0].object_id(),
+            second_page.sandboxes[0].object_id()
+        );
     }
 
     /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when

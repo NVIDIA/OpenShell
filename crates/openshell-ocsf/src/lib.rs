@@ -12,7 +12,7 @@
 //!   State Change, and Base Event
 //! - **Typed enums and objects**: All OCSF enum and object types used by the
 //!   event classes
-//! - **Builders**: Ergonomic per-class builders with `SandboxContext` for shared
+//! - **Builders**: Ergonomic per-class builders with `EventContext` for shared
 //!   metadata
 //! - **Dual formatters**: `format_shorthand()` for human-readable single-line
 //!   output, and `to_json()`/`to_json_line()` for OCSF-compliant JSONL
@@ -58,11 +58,12 @@ pub use objects::{
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
-    SandboxContext, SshActivityBuilder,
+    DetectionFindingBuilder, EventContext, HttpActivityBuilder, NetworkActivityBuilder,
+    ProcessActivityBuilder, SshActivityBuilder,
 };
 
 // --- Tracing layers ---
 pub use tracing_layers::{
-    OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clone_current_event, emit_ocsf_event,
+    OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clear_current_event, clone_current_event,
+    emit_ocsf_event, emit_ocsf_event_routed, set_current_event,
 };

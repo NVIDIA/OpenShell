@@ -186,13 +186,24 @@ const sandbox = await client.sandbox.createFromTemplate({
 })
 
 await client.sandboxTemplates.get('python', { workspace: 'default' })
-await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
+await client.sandboxTemplates.listAll({ workspace: 'default', pageSize: 100 })
 await client.sandboxTemplates.delete('python', { workspace: 'default' })
 ```
 
 Use `allWorkspaces: true` on `list()` for a platform-admin view. The
 discriminated option type makes `workspace` and `allWorkspaces` mutually
 exclusive. Omitting both options explicitly selects the `default` workspace.
+List methods follow continuation tokens through a lazy `Pager`; each advance
+fetches one RPC page. Use `listAll()` only
+when you want to exhaust the collection. `pageSize` controls one request and
+`pageToken` resumes a saved traversal.
+
+```ts
+const pages = client.sandbox.list({ workspace: 'default', pageSize: 100 })
+for await (const page of pages) {
+  for (const sandbox of page.items) console.log(sandbox.name)
+}
+```
 
 ## Surface and roadmap
 

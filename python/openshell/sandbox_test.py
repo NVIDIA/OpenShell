@@ -23,6 +23,8 @@ from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
     ClientCredentialsAuth,
+    Page,
+    Pager,
     Sandbox,
     SandboxClient,
     SandboxError,
@@ -1963,7 +1965,11 @@ def _make_workload_template_proto(
 
 
 class _FakeSandboxStub:
-    def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
+    def __init__(
+        self,
+        listed: list[openshell_pb2.Sandbox] | None = None,
+        listed_pages: list[list[openshell_pb2.Sandbox]] | None = None,
+    ) -> None:
         self.create_request: openshell_pb2.CreateSandboxRequest | None = None
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
@@ -1981,6 +1987,8 @@ class _FakeSandboxStub:
             openshell_pb2.DeleteSandboxTemplateRequest | None
         ) = None
         self._listed = listed or []
+        self._listed_pages = listed_pages
+        self.list_requests: list[openshell_pb2.ListSandboxesRequest] = []
         self._templates: list[openshell_pb2.SandboxWorkloadTemplate] = []
 
     def GetSandbox(
@@ -2061,7 +2069,17 @@ class _FakeSandboxStub:
         timeout: float | None = None,
     ) -> Any:
         self.list_request = request
+        self.list_requests.append(deepcopy(request))
         _ = timeout
+        if self._listed_pages is not None:
+            page = int(request.page_token or "0")
+            next_page_token = (
+                str(page + 1) if page + 1 < len(self._listed_pages) else ""
+            )
+            return SimpleNamespace(
+                sandboxes=list(self._listed_pages[page]),
+                next_page_token=next_page_token,
+            )
         return SimpleNamespace(sandboxes=list(self._listed))
 
     def CreateSandboxTemplate(
@@ -2392,14 +2410,14 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert stub.get_template_request.name == "gpu-kata"
     assert _request_workspace(stub.get_template_request) == "default"
 
-    listed = client.list(
-        workspace="default", limit=50, offset=10, label_selector="team=runtime"
+    listed = client.list_all(
+        workspace="default", page_size=50, label_selector="team=runtime"
     )
     assert len(listed) == 1
     assert stub.list_template_request is not None
     assert _request_workspace(stub.list_template_request) == "default"
-    assert stub.list_template_request.limit == 50
-    assert stub.list_template_request.offset == 10
+    assert stub.list_template_request.page_size == 50
+    assert stub.list_template_request.page_token == ""
     assert stub.list_template_request.label_selector == "team=runtime"
     assert not _request_selects_all_workspaces(stub.list_template_request)
 
@@ -2413,13 +2431,13 @@ def test_sandbox_template_list_for_all_workspaces_selects_all() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces(limit=100, offset=5, label_selector="team=runtime")
+    client.list_all_for_all_workspaces(page_size=100, label_selector="team=runtime")
 
     assert stub.list_template_request is not None
     assert _request_selects_all_workspaces(stub.list_template_request)
     assert _request_workspace(stub.list_template_request) is None
-    assert stub.list_template_request.limit == 100
-    assert stub.list_template_request.offset == 5
+    assert stub.list_template_request.page_size == 100
+    assert stub.list_template_request.page_token == ""
     assert stub.list_template_request.label_selector == "team=runtime"
 
 
@@ -2517,7 +2535,7 @@ def test_list_forwards_label_selector() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="default", label_selector="aiq=deep-research")
+    client.list_all(workspace="default", label_selector="aiq=deep-research")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == "aiq=deep-research"
@@ -2528,10 +2546,68 @@ def test_list_without_selector_sends_empty_string() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="default")
+    client.list_all(workspace="default")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == ""
+
+
+def test_list_follows_continuation_tokens() -> None:
+    stub = _FakeSandboxStub(
+        listed_pages=[
+            [_make_sandbox_proto("sandbox-1", "job-1")],
+            [_make_sandbox_proto("sandbox-2", "job-2")],
+        ]
+    )
+    client = _client_with_fake_stub(stub)
+
+    pager = client.list(workspace="default", page_size=1, label_selector="team=core")
+
+    assert stub.list_requests == []
+    first = next(pager)
+    assert [sandbox.name for sandbox in first.items] == ["job-1"]
+    assert first.next_page_token == "1"
+    second = next(pager)
+    assert [sandbox.name for sandbox in second.items] == ["job-2"]
+    assert second.next_page_token == ""
+    with pytest.raises(StopIteration):
+        next(pager)
+    assert len(stub.list_requests) == 2
+    assert stub.list_requests[0].page_token == ""
+    assert stub.list_requests[1].page_token == "1"
+    assert stub.list_requests[1].label_selector == "team=core"
+
+
+def test_list_passes_initial_page_token() -> None:
+    stub = _FakeSandboxStub(
+        listed_pages=[
+            [_make_sandbox_proto("sandbox-1", "skipped")],
+            [_make_sandbox_proto("sandbox-2", "resumed")],
+        ]
+    )
+    client = _client_with_fake_stub(stub)
+
+    page = next(client.list(workspace="default", page_token="1"))
+
+    assert [sandbox.name for sandbox in page.items] == ["resumed"]
+    assert stub.list_requests[0].page_token == "1"
+
+
+def test_pager_retries_same_token_after_fetch_error() -> None:
+    tokens: list[str] = []
+
+    def fetch(token: str) -> Page[int]:
+        tokens.append(token)
+        if len(tokens) == 1:
+            raise RuntimeError("temporary failure")
+        return Page(items=[1], next_page_token="")
+
+    pager = Pager(fetch, page_token="resume")
+    with pytest.raises(RuntimeError, match="temporary failure"):
+        next(pager)
+
+    assert next(pager).items == [1]
+    assert tokens == ["resume", "resume"]
 
 
 def test_list_ids_forwards_label_selector() -> None:
@@ -2768,7 +2844,7 @@ def test_list_for_all_workspaces_sets_flag() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces()
+    client.list_all_for_all_workspaces()
 
     assert stub.list_request is not None
     assert _request_selects_all_workspaces(stub.list_request)
@@ -2779,7 +2855,7 @@ def test_list_with_workspace_passes_workspace() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(workspace="staging")
+    client.list_all(workspace="staging")
 
     assert stub.list_request is not None
     assert _request_workspace(stub.list_request) == "staging"

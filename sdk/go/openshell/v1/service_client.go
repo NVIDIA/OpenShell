@@ -45,40 +45,44 @@ func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, service
 	return converter.ServiceEndpointFromProto(resp), nil
 }
 
-func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error) {
-	req := &pb.ListServicesRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	return s.list(ctx, req, opts...)
-}
-
-func (s *serviceClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*ServiceEndpoint, error) {
-	return s.list(ctx, &pb.ListServicesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
-}
-
-func (s *serviceClient) list(ctx context.Context, req *pb.ListServicesRequest, opts ...ListOptions) ([]*ServiceEndpoint, error) {
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := s.client.ListServices(ctx, req)
+func (s *serviceClient) List(workspace, sandboxName string, opts ...ListOptions) (*Pager[*ServiceEndpoint], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken string
+	var allWorkspaces bool
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+		allWorkspaces = opts[0].AllWorkspaces
+	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ServiceEndpoint], error) {
+		req := &pb.ListServicesRequest{
+			Sandbox: sandboxName, WorkspaceScope: workspaceScope, PageSize: pageSize,
+			PageToken: pageToken,
+		}
+		resp, err := s.client.ListServices(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		endpoints := make([]*ServiceEndpoint, 0, len(resp.GetServices()))
+		for _, svc := range resp.GetServices() {
+			endpoints = append(endpoints, converter.ServiceEndpointFromProto(svc))
+		}
+		return &Page[*ServiceEndpoint]{Items: endpoints, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	endpoints := make([]*ServiceEndpoint, 0, len(resp.GetServices()))
-	for _, svc := range resp.GetServices() {
-		endpoints = append(endpoints, converter.ServiceEndpointFromProto(svc))
+func (s *serviceClient) ListAll(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error) {
+	pager, err := s.List(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return endpoints, nil
+	return pager.All(ctx)
 }
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {

@@ -20,10 +20,11 @@ fmt.Printf("Service available at: %s\n", endpoint.URL)
 
 ## List
 
-List all exposed services for a sandbox.
+`List` returns a lazy pager over exposed services. Use `ListAll` to collect
+every page.
 
 ```go
-services, err := client.Services().List(ctx, "default", "my-sandbox")
+services, err := client.Services().ListAll(ctx, "default", "my-sandbox")
 if err != nil {
     log.Fatal(err)
 }
@@ -32,7 +33,9 @@ for _, svc := range services {
 }
 
 // Platform Admin only: list services across all workspaces
-allServices, err := client.Services().ListAll(ctx)
+allServices, err := client.Services().ListAll(ctx, "", "", v1.ListOptions{
+    AllWorkspaces: true,
+})
 ```
 
 ## Delete

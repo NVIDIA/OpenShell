@@ -1224,21 +1224,20 @@ async fn propagate_policy_to_running_sandboxes(
         .await
         .map_err(|err| format!("connect to gateway {gateway_endpoint} failed: {err}"))?;
     let mut client = OpenShellClient::new(channel);
-    let mut offset = 0_u32;
-    let limit = 100_u32;
+    let mut page_token = String::new();
     let correlation_id = format!("{}:{}", RELOAD_CORRELATION_PREFIX, now_secs());
     loop {
         let response = client
             .list_sandboxes(ListSandboxesRequest {
-                limit,
-                offset,
+                page_size: 100,
+                page_token,
                 label_selector: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
             .into_inner();
-        let count = response.sandboxes.len();
+        let next_page_token = response.next_page_token;
         for sandbox in response.sandboxes {
             if !sandbox_accepts_policy_reload(&sandbox) {
                 continue;
@@ -1279,10 +1278,10 @@ async fn propagate_policy_to_running_sandboxes(
                 }
             }
         }
-        if count < usize::try_from(limit).unwrap_or(usize::MAX) {
+        if next_page_token.is_empty() {
             break;
         }
-        offset = offset.saturating_add(limit);
+        page_token = next_page_token;
     }
     Ok(())
 }

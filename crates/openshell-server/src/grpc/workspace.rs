@@ -23,14 +23,13 @@ use tonic::{Request, Response, Status};
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{AuthGrant, MinWorkspaceRole, authorize_workspace};
+use crate::pagination::Pagination;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE, WriteCondition,
-    current_time_ms,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectListQuery, ObjectType, POLICY_OBJECT_TYPE,
+    WriteCondition, current_time_ms,
 };
 use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use std::collections::HashMap;
-
-use super::{MAX_PAGE_SIZE, clamp_limit};
 
 pub const WORKSPACE_OBJECT_TYPE: &str = "workspace";
 pub const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -248,40 +247,42 @@ pub(super) async fn handle_list_workspaces(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     super::validation::validate_label_selector(&req.label_selector)?;
-    let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
     let subject = membership_filter_subject(state, &principal)?;
-
     let member_type = WorkspaceMember::object_type();
-    let workspaces = match subject {
-        Some(subject) if req.label_selector.is_empty() => state
-            .store
-            .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        Some(subject) => state
-            .store
-            .list_messages_with_membership_and_selector::<Workspace>(
-                member_type,
-                subject,
-                &req.label_selector,
-                limit,
-                req.offset,
-            )
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        None if req.label_selector.is_empty() => state
-            .store
-            .list_messages("", limit, req.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        None => state
-            .store
-            .list_messages_with_selector("", &req.label_selector, limit, req.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListWorkspaces",
+        &[&req.label_selector, subject.unwrap_or("")],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = match (subject, req.label_selector.as_str()) {
+        (Some(subject), "") => ObjectListQuery::Membership {
+            member_type,
+            member_name: subject,
+        },
+        (Some(subject), selector) => ObjectListQuery::MembershipSelector {
+            member_type,
+            member_name: subject,
+            label_selector: selector,
+        },
+        (None, "") => ObjectListQuery::Workspace(""),
+        (None, selector) => ObjectListQuery::WorkspaceSelector {
+            workspace: "",
+            label_selector: selector,
+        },
     };
+    let page = state
+        .store
+        .list_message_page::<Workspace>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
 
-    Ok(Response::new(ListWorkspacesResponse { workspaces }))
+    Ok(Response::new(ListWorkspacesResponse {
+        workspaces: page.messages,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_workspace(
@@ -603,15 +604,28 @@ pub(super) async fn handle_list_workspace_members(
         .await?
         .name;
 
-    let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
-
-    let members: Vec<WorkspaceMember> = state
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListWorkspaceMembers",
+        &[&req.workspace],
+    )?;
+    let after = pagination.object_cursor()?;
+    let page = state
         .store
-        .list_messages(&workspace, limit, req.offset)
+        .list_message_page::<WorkspaceMember>(
+            ObjectListQuery::Workspace(&workspace),
+            after.as_ref(),
+            pagination.page_size(),
+        )
         .await
         .map_err(|e| Status::internal(format!("list workspace members failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
 
-    Ok(Response::new(ListWorkspaceMembersResponse { members }))
+    Ok(Response::new(ListWorkspaceMembersResponse {
+        members: page.messages,
+        next_page_token,
+    }))
 }
 
 #[cfg(test)]
@@ -1044,8 +1058,8 @@ mod tests {
             &state,
             authed_request(ListWorkspaceMembersRequest {
                 workspace: "default".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
             }),
         )
         .await
@@ -1086,8 +1100,8 @@ mod tests {
             &state,
             authed_request(ListWorkspaceMembersRequest {
                 workspace: "default".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
             }),
         )
         .await
@@ -1166,8 +1180,8 @@ mod tests {
             &state,
             authed_request(ListWorkspaceMembersRequest {
                 workspace: "cleanup-test".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
             }),
         )
         .await

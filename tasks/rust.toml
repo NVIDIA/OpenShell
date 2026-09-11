@@ -5,18 +5,25 @@
 
 ["rust:check"]
 description = "Check all Rust crates for errors"
+depends = ["rust:lockfiles:check"]
 run = "cargo check --workspace"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check native"
 hide = true
 
+["rust:lockfiles:check"]
+description = "Verify all tracked Cargo lockfiles are current"
+run = "tasks/scripts/check-cargo-lockfiles.sh"
+hide = true
+
 ["rust:lint"]
 description = "Lint Rust code with Clippy (deny warnings)"
+depends = ["rust:lockfiles:check"]
 run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
-  "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets",
-  "cargo check --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets",
-  "cargo check --manifest-path e2e/supervisor-middleware-fixture/Cargo.toml --all-targets",
+  "cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path e2e/supervisor-middleware-fixture/Cargo.toml --all-targets -- -D warnings",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true

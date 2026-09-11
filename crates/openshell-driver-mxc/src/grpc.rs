@@ -203,6 +203,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_authentication_is_not_supported() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        let error = service
+            .authenticate_sandbox(Request::new(AuthenticateSandboxRequest::default()))
+            .await
+            .expect_err("MXC must not advertise sandbox credential authentication");
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().contains("does not authenticate"));
+    }
+
+    #[tokio::test]
     async fn workspace_lifecycle_is_an_idempotent_no_op() {
         let service =
             ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));

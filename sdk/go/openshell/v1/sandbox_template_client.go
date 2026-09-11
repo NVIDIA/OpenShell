@@ -50,40 +50,45 @@ func (s *sandboxTemplateClient) Get(ctx context.Context, workspace, name string)
 	return converter.SandboxWorkloadTemplateFromProto(resp.GetTemplate()), nil
 }
 
-func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
-	req := &pb.ListSandboxTemplatesRequest{
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	return s.list(ctx, req, opts...)
-}
-
-func (s *sandboxTemplateClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
-	return s.list(ctx, &pb.ListSandboxTemplatesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
-}
-
-func (s *sandboxTemplateClient) list(ctx context.Context, req *pb.ListSandboxTemplatesRequest, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-		req.LabelSelector = opts[0].LabelSelector
-	}
-
-	resp, err := s.client.ListSandboxTemplates(ctx, req)
+func (s *sandboxTemplateClient) List(workspace string, opts ...ListOptions) (*Pager[*SandboxWorkloadTemplate], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken, labelSelector string
+	var allWorkspaces bool
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+		labelSelector = opts[0].LabelSelector
+		allWorkspaces = opts[0].AllWorkspaces
+	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*SandboxWorkloadTemplate], error) {
+		req := &pb.ListSandboxTemplatesRequest{
+			WorkspaceScope: workspaceScope, PageSize: pageSize, PageToken: pageToken,
+			LabelSelector: labelSelector,
+		}
+		resp, err := s.client.ListSandboxTemplates(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		templates := make([]*SandboxWorkloadTemplate, 0, len(resp.GetTemplates()))
+		for _, protoTemplate := range resp.GetTemplates() {
+			templates = append(templates, converter.SandboxWorkloadTemplateFromProto(protoTemplate))
+		}
+		return &Page[*SandboxWorkloadTemplate]{Items: templates, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	templates := make([]*SandboxWorkloadTemplate, 0, len(resp.GetTemplates()))
-	for _, protoTemplate := range resp.GetTemplates() {
-		templates = append(templates, converter.SandboxWorkloadTemplateFromProto(protoTemplate))
+func (s *sandboxTemplateClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
+	pager, err := s.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return templates, nil
+	return pager.All(ctx)
 }
 
 func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string) (bool, error) {

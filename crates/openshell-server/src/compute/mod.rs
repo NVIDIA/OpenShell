@@ -10,8 +10,8 @@ pub mod rootfs_tar;
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectName, ObjectRecord, ObjectType,
-    POLICY_OBJECT_TYPE, Store, WriteCondition,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectListQuery, ObjectName, ObjectRecord,
+    ObjectType, POLICY_OBJECT_TYPE, Store, WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -2491,25 +2491,11 @@ impl ComputeRuntime {
     }
 
     async fn list_persisted_sandbox_ids(&self, operation: &str) -> Result<Vec<String>, String> {
-        let mut sandbox_ids = Vec::new();
-        let mut offset = 0u32;
-        loop {
-            let records = self
-                .store
-                .list_by_type(Sandbox::object_type(), LIFECYCLE_SWEEP_PAGE_SIZE, offset)
-                .await
-                .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))?;
-            let page_len = u32::try_from(records.len())
-                .map_err(|_| format!("sandbox page size overflow during {operation}"))?;
-            sandbox_ids.extend(records.into_iter().map(|record| record.id));
-            if page_len < LIFECYCLE_SWEEP_PAGE_SIZE {
-                break;
-            }
-            offset = offset
-                .checked_add(page_len)
-                .ok_or_else(|| format!("sandbox pagination offset overflow during {operation}"))?;
-        }
-        Ok(sandbox_ids)
+        self.store
+            .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
+            .await
+            .map(|records| records.into_iter().map(|record| record.id).collect())
+            .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
@@ -2791,7 +2777,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list_by_type(Sandbox::object_type(), 500, 0)
+            .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
             .await
             .map_err(|e| e.to_string())
             .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
@@ -3501,10 +3487,6 @@ impl ComputeRuntime {
             .await
     }
 
-    // TODO: introduce a per-sandbox cap on service endpoints and paginate
-    // this cleanup loop, or query by sandbox label instead of scanning the
-    // full workspace. Without a cap the flat 1,000-record page could miss
-    // endpoints in large workspaces.
     async fn cleanup_sandbox_service_endpoints(
         &self,
         sandbox_id: &str,
@@ -3512,7 +3494,10 @@ impl ComputeRuntime {
     ) -> Result<(), String> {
         let records = self
             .store
-            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
+            .collect_records(
+                ServiceEndpoint::object_type(),
+                ObjectListQuery::Workspace(workspace),
+            )
             .await
             .map_err(|e| format!("list service endpoints: {e}"))?;
 

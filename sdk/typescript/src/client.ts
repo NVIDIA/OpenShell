@@ -150,8 +150,10 @@ export interface SandboxWorkloadTemplateProvenance {
 }
 
 interface PaginationOptions {
-  limit?: number;
-  offset?: number;
+  /** Maximum resources requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
   labelSelector?: string;
 }
 
@@ -175,8 +177,10 @@ export interface SandboxTemplateWorkspaceOptions {
 }
 
 export type SandboxTemplateListOptions = WorkspaceListScope & {
-  limit?: number;
-  offset?: number;
+  /** Maximum templates requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
   /** Optional label selector in key=value comma-separated form. */
   labelSelector?: string;
 };
@@ -636,6 +640,47 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
+/** One response page from a list operation. */
+export interface Page<T> {
+  readonly items: T[];
+  readonly nextPageToken: string;
+}
+
+/** Lazy, single-pass iterator that fetches one RPC page per advance. */
+export class Pager<T> implements AsyncIterable<Page<T>> {
+  private nextToken: string | undefined;
+
+  constructor(
+    private readonly fetch: (pageToken: string) => Promise<Page<T>>,
+    pageToken = '',
+  ) {
+    this.nextToken = pageToken;
+  }
+
+  /** Fetch the next page, or return undefined after the final page. */
+  async nextPage(): Promise<Page<T> | undefined> {
+    if (this.nextToken === undefined) return undefined;
+    const page = await this.fetch(this.nextToken);
+    this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
+    return page;
+  }
+
+  /** Consume the pager and collect every remaining item. */
+  async all(): Promise<T[]> {
+    const items: T[] = [];
+    for await (const page of this) items.push(...page.items);
+    return items;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<Page<T>> {
+    for (;;) {
+      const page = await this.nextPage();
+      if (page === undefined) return;
+      yield page;
+    }
+  }
+}
+
 // ---- sandbox template client ----------------------------------------------
 
 // Reusable sandbox workload template lifecycle. Templates intentionally return
@@ -685,18 +730,25 @@ export class SandboxTemplateClient {
     }
   }
 
-  async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
-    try {
-      const resp = await this.grpc.listSandboxTemplates({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        labelSelector: options?.labelSelector ?? '',
-        workspaceScope: listWorkspaceScope(options),
-      });
-      return resp.templates;
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  list(options?: SandboxTemplateListOptions | null): Pager<SandboxWorkloadTemplate> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxTemplates({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        return { items: resp.templates, nextPageToken: resp.nextPageToken };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every sandbox template in this scope. */
+  async listAll(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
+    return this.list(options).all();
   }
 
   async delete(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<boolean> {
@@ -809,18 +861,28 @@ export class SandboxClient {
     }
   }
 
-  async list(options?: ListOptions | null): Promise<SandboxRef[]> {
-    try {
-      const resp = await this.grpc.listSandboxes({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        labelSelector: options?.labelSelector ?? '',
-        workspaceScope: listWorkspaceScope(options),
-      });
-      return resp.sandboxes.map((s) => sandboxRef(s));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  list(options?: ListOptions | null): Pager<SandboxRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxes({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        return {
+          items: resp.sandboxes.map((sandbox) => sandboxRef(sandbox)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every sandbox in this scope. */
+  async listAll(options?: ListOptions | null): Promise<SandboxRef[]> {
+    return this.list(options).all();
   }
 
   async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {

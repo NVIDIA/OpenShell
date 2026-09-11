@@ -480,7 +480,10 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -493,7 +496,10 @@ impl OpenShell for TestOpenShell {
             .collect::<Vec<_>>();
         profiles.extend(self.state.profiles.lock().await.values().cloned());
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse { profiles },
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
         ))
     }
 
@@ -1357,7 +1363,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "table",
         "default",
@@ -1428,7 +1434,7 @@ async fn provider_list_json_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -1471,7 +1477,7 @@ async fn provider_list_yaml_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "yaml",
         "default",
@@ -1499,7 +1505,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -2554,7 +2560,6 @@ binaries: [/usr/bin/yaml-client]
 }
 
 #[tokio::test]
-#[allow(deprecated)]
 async fn provider_profile_import_preserves_advanced_network_policy_fields() {
     let ts = run_server().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2583,7 +2588,6 @@ endpoints:
     path: /v1
 binaries:
   - path: /usr/bin/advanced
-    harness: true
 ",
     )
     .unwrap();
@@ -2612,7 +2616,7 @@ binaries:
     assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
     assert!(endpoint.allow_encoded_slash);
     assert_eq!(endpoint.path, "/v1");
-    assert!(profile.binaries[0].harness);
+    assert_eq!(profile.binaries[0].path, "/usr/bin/advanced");
 }
 
 #[tokio::test]

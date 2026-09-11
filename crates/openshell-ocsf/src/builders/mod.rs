@@ -3,7 +3,7 @@
 
 //! Ergonomic builders for constructing OCSF events.
 //!
-//! Each event class has a builder that takes a `SandboxContext` reference
+//! Each event class has a builder that takes a `EventContext` reference
 //! and provides chainable methods for setting event fields.
 
 /// Generate the shared `severity`, `status`, and `message` setter methods that
@@ -180,7 +180,7 @@ use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 /// Passed to every event builder to populate shared OCSF fields
 /// (metadata, container, device, proxy endpoint).
 #[derive(Debug, Clone)]
-pub struct SandboxContext {
+pub struct EventContext {
     /// Sandbox unique identifier.
     pub sandbox_id: String,
     /// Sandbox display name.
@@ -197,7 +197,7 @@ pub struct SandboxContext {
     pub proxy_port: u16,
 }
 
-impl SandboxContext {
+impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
@@ -225,10 +225,11 @@ impl SandboxContext {
         })
     }
 
-    /// Build the OCSF `Device` object.
+    /// Build the OCSF `Device` object, stamped with the host OS this build runs
+    /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::linux(&self.hostname)
+        Device::for_current_os(&self.hostname)
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -259,8 +260,8 @@ impl SandboxContext {
 }
 
 #[cfg(test)]
-pub(crate) fn test_sandbox_context() -> SandboxContext {
-    SandboxContext {
+pub(crate) fn test_sandbox_context() -> EventContext {
+    EventContext {
         sandbox_id: "sandbox-abc123".to_string(),
         sandbox_name: "my-sandbox".to_string(),
         container_image: "ghcr.io/openshell/sandbox:latest".to_string(),

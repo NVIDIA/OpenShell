@@ -220,9 +220,8 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Equal(t, "gpu-kata", got.Name)
 	assert.Equal(t, "img:v1", got.Spec.Workload.Image)
 
-	list, err := client.ListAll(context.Background(), ListOptions{
-		Limit:         10,
-		Offset:        2,
+	list, err := client.ListAll(context.Background(), "default", ListOptions{
+		PageSize:      10,
 		LabelSelector: "team=runtime",
 	})
 	require.NoError(t, err)
@@ -239,9 +238,9 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Equal(t, "default", mock.getRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.getRequest.Name)
 	require.NotNil(t, mock.listRequest)
-	assert.NotNil(t, mock.listRequest.GetWorkspaceScope().GetAllWorkspaces())
-	assert.Equal(t, uint32(10), mock.listRequest.Limit)
-	assert.Equal(t, uint32(2), mock.listRequest.Offset)
+	assert.Equal(t, "default", mock.listRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, int32(10), mock.listRequest.PageSize)
+	assert.Empty(t, mock.listRequest.PageToken)
 	assert.Equal(t, "team=runtime", mock.listRequest.LabelSelector)
 	require.NotNil(t, mock.deleteRequest)
 	assert.Equal(t, "default", mock.deleteRequest.GetWorkspaceScope().GetWorkspace())
@@ -253,11 +252,19 @@ func TestSandboxTemplateList_RejectsNegativePagination(t *testing.T) {
 	client, cleanup := setupSandboxTemplateTest(t, mock)
 	defer cleanup()
 
-	_, err := client.List(context.Background(), "default", ListOptions{Limit: -1})
+	_, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: -1})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
+}
 
-	_, err = client.List(context.Background(), "default", ListOptions{Offset: -1})
-	require.Error(t, err)
-	assert.True(t, IsInvalidArgument(err))
+func TestSandboxTemplateList_EmptyReturnsNonNilSlice(t *testing.T) {
+	mock := newMockSandboxTemplateServer()
+	client, cleanup := setupSandboxTemplateTest(t, mock)
+	defer cleanup()
+
+	templates, err := client.ListAll(context.Background(), "default")
+
+	require.NoError(t, err)
+	assert.NotNil(t, templates)
+	assert.Empty(t, templates)
 }

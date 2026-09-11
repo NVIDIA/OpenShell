@@ -98,40 +98,47 @@ func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandb
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
-func (s *sandboxClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error) {
-	req := &pb.ListSandboxesRequest{
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	return s.list(ctx, req, opts...)
-}
-
-func (s *sandboxClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Sandbox, error) {
-	return s.list(ctx, &pb.ListSandboxesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
-}
-
-func (s *sandboxClient) list(ctx context.Context, req *pb.ListSandboxesRequest, opts ...ListOptions) ([]*Sandbox, error) {
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-		req.LabelSelector = opts[0].LabelSelector
-	}
-
-	resp, err := s.client.ListSandboxes(ctx, req)
+func (s *sandboxClient) List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken, labelSelector string
+	var allWorkspaces bool
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+		labelSelector = opts[0].LabelSelector
+		allWorkspaces = opts[0].AllWorkspaces
+	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Sandbox], error) {
+		req := &pb.ListSandboxesRequest{
+			WorkspaceScope: workspaceScope,
+			PageSize:       pageSize,
+			PageToken:      pageToken,
+			LabelSelector:  labelSelector,
+		}
+		resp, err := s.client.ListSandboxes(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		sandboxes := make([]*Sandbox, 0, len(resp.GetSandboxes()))
+		for _, proto := range resp.GetSandboxes() {
+			sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
+		}
+		return &Page[*Sandbox]{Items: sandboxes, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	sandboxes := make([]*Sandbox, 0, len(resp.GetSandboxes()))
-	for _, proto := range resp.GetSandboxes() {
-		sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
+func (s *sandboxClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error) {
+	pager, err := s.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return sandboxes, nil
+	return pager.All(ctx)
 }
 
 func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {

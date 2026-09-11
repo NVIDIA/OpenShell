@@ -161,10 +161,10 @@ pub type SandboxStartup = proto::SandboxStartup;
 /// Options for listing reusable sandbox templates.
 #[derive(Clone, Debug, Default)]
 pub struct SandboxTemplateListOptions {
-    /// Maximum templates to return. `0` defers to the server default.
-    pub limit: u32,
-    /// Offset into the result list.
-    pub offset: u32,
+    /// Maximum templates requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
     /// Optional label selector in `key=value,key2=value2` form.
     pub label_selector: String,
 }
@@ -247,10 +247,10 @@ impl WorkspaceRef {
 /// Options for listing sandboxes.
 #[derive(Clone, Debug, Default)]
 pub struct ListOptions {
-    /// Maximum sandboxes to return. `0` defers to the server default.
-    pub limit: u32,
-    /// Offset into the result list.
-    pub offset: u32,
+    /// Maximum resources requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
     /// Optional Kubernetes-style label selector (e.g. `env=prod,team=core`).
     pub label_selector: Option<String>,
 }

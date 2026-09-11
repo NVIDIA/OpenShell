@@ -34,6 +34,74 @@
 use miette::{IntoDiagnostic, Result};
 use std::io::Write;
 
+/// Report a continuation token for table output.
+pub fn print_next_page_token(next_page_token: &str) {
+    if !next_page_token.is_empty() {
+        eprintln!("Next page token: {next_page_token}");
+    }
+}
+
+fn paginated_collection_value<T, F>(
+    collection_name: &str,
+    items: &[T],
+    next_page_token: &str,
+    to_json: F,
+) -> serde_json::Value
+where
+    F: Fn(&T) -> serde_json::Value,
+{
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        collection_name.to_string(),
+        serde_json::Value::Array(items.iter().map(to_json).collect()),
+    );
+    envelope.insert(
+        "next_page_token".to_string(),
+        serde_json::Value::String(next_page_token.to_string()),
+    );
+    serde_json::Value::Object(envelope)
+}
+
+/// Print a single page as a structured response envelope.
+///
+/// JSON and YAML output include both the named collection and
+/// `next_page_token`, so callers can continue without scraping stderr. Table
+/// output is not handled; callers should render the table and may report the
+/// token with [`print_next_page_token`].
+pub fn print_paginated_output_collection<T, F>(
+    format: impl AsRef<str>,
+    collection_name: &str,
+    items: &[T],
+    next_page_token: &str,
+    to_json: F,
+) -> Result<bool>
+where
+    F: Fn(&T) -> serde_json::Value,
+{
+    match format.as_ref() {
+        "json" => {
+            let envelope =
+                paginated_collection_value(collection_name, items, next_page_token, to_json);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&envelope).into_diagnostic()?
+            );
+            Ok(true)
+        }
+        "yaml" => {
+            let envelope =
+                paginated_collection_value(collection_name, items, next_page_token, to_json);
+            print!("{}", serde_yml::to_string(&envelope).into_diagnostic()?);
+            Ok(true)
+        }
+        "table" => Ok(false),
+        _ => Err(miette::miette!(
+            "unsupported output format: {}",
+            format.as_ref()
+        )),
+    }
+}
+
 /// Print collection output in specified format (json/yaml/table).
 ///
 /// # Returns
@@ -198,6 +266,50 @@ where
                 writer,
                 "{}",
                 serde_yml::to_string(&values).into_diagnostic()?
+            )
+            .into_diagnostic()?;
+            Ok(true)
+        }
+        "table" => Ok(false),
+        _ => Err(miette::miette!(
+            "unsupported output format: {}",
+            format.as_ref()
+        )),
+    }
+}
+
+/// Writer variant of [`print_paginated_output_collection`].
+pub fn print_paginated_output_collection_to_writer<W, T, F>(
+    format: impl AsRef<str>,
+    writer: &mut W,
+    collection_name: &str,
+    items: &[T],
+    next_page_token: &str,
+    to_json: F,
+) -> Result<bool>
+where
+    W: Write,
+    F: Fn(&T) -> serde_json::Value,
+{
+    match format.as_ref() {
+        "json" => {
+            let envelope =
+                paginated_collection_value(collection_name, items, next_page_token, to_json);
+            writeln!(
+                writer,
+                "{}",
+                serde_json::to_string_pretty(&envelope).into_diagnostic()?
+            )
+            .into_diagnostic()?;
+            Ok(true)
+        }
+        "yaml" => {
+            let envelope =
+                paginated_collection_value(collection_name, items, next_page_token, to_json);
+            write!(
+                writer,
+                "{}",
+                serde_yml::to_string(&envelope).into_diagnostic()?
             )
             .into_diagnostic()?;
             Ok(true)
@@ -470,6 +582,73 @@ mod tests {
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("id: 1"));
         assert!(output.contains("name: test"));
+    }
+
+    #[test]
+    fn test_print_paginated_output_collection_to_writer_json() {
+        let items = vec![TestItem {
+            id: 1,
+            name: "test".to_string(),
+        }];
+        let mut buffer = Vec::new();
+
+        let handled = print_paginated_output_collection_to_writer(
+            "json",
+            &mut buffer,
+            "items",
+            &items,
+            "next-token",
+            test_item_to_json,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let output: serde_json::Value = serde_json::from_slice(&buffer).unwrap();
+        assert_eq!(output["items"][0]["id"], 1);
+        assert_eq!(output["next_page_token"], "next-token");
+    }
+
+    #[test]
+    fn test_print_paginated_output_collection_to_writer_yaml() {
+        let items = vec![TestItem {
+            id: 1,
+            name: "test".to_string(),
+        }];
+        let mut buffer = Vec::new();
+
+        let handled = print_paginated_output_collection_to_writer(
+            "yaml",
+            &mut buffer,
+            "items",
+            &items,
+            "",
+            test_item_to_json,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let output: serde_json::Value = serde_yml::from_slice(&buffer).unwrap();
+        assert_eq!(output["items"][0]["name"], "test");
+        assert_eq!(output["next_page_token"], "");
+    }
+
+    #[test]
+    fn test_print_paginated_output_collection_table_is_not_handled() {
+        let items = Vec::<TestItem>::new();
+        let mut buffer = Vec::new();
+
+        let handled = print_paginated_output_collection_to_writer(
+            "table",
+            &mut buffer,
+            "items",
+            &items,
+            "next-token",
+            test_item_to_json,
+        )
+        .unwrap();
+
+        assert!(!handled);
+        assert!(buffer.is_empty());
     }
 
     #[test]

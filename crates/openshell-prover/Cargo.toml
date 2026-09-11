@@ -12,6 +12,7 @@ repository.workspace = true
 
 [features]
 bundled-z3 = ["z3/bundled"]
+prebuilt-z3 = ["z3/gh-release"]
 
 [dependencies]
 z3 = { workspace = true }

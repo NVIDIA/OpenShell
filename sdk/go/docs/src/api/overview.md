@@ -56,9 +56,10 @@ Each interface has a reference page with method signatures and usage examples:
 
 ## Common Patterns
 
-All SDK methods follow these conventions:
+SDK methods follow these conventions:
 
-- Every method takes `context.Context` as its first argument
+- Network operations take `context.Context`; list constructors return a pager,
+  and each `NextPage` call accepts the request context
 - Methods that can fail return `(result, error)`
-- List methods accept variadic option arguments
+- List methods accept variadic options and `ListAll` is the explicit exhaustive path
 - Errors from the gateway carry a `StatusError` with a typed code (see [Error Handling](../error-handling.md))

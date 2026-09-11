@@ -144,13 +144,25 @@ requires removing the endpoint or replacing the policy.
 
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
-placeholders require rewrite. REST bodies can continue streaming when body
-rewrite is disabled, but the relay withholds enough trailing bytes to detect a
-placeholder split across reads before forwarding its marker. Explicitly opted-in
+placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
+complete placeholder candidates until a request-scoped metadata snapshot can
+classify them. Authoritatively unknown keys and valid credentials with a current
+binding pass unchanged, including references bound to the destination itself.
+Revoked or invalid identities and unavailable classification state
+fail closed. Classification never substitutes secret values and shares the request's
+credential revision; stale credential or policy generations terminate forwarding.
+Header rewriting scans only headers. Body bytes received in the initial proxy
+read follow the same body classifier or explicit rewriter as later reads.
+Candidates are limited to 4096 wire bytes, including percent encoding. Malformed
+or oversized candidates fail closed; HTTP trailers retain prefix-based rejection. Explicitly opted-in
 endpoints retain raw passthrough behavior.
 
+Body denials return `credential_placeholder_in_request_body` in a local HTTP 403
+response and discard any partially written upstream request. Safe preceding bytes
+may already have reached upstream.
+
 Denials emit both the relevant network activity and a detection finding. Events
-identify only the destination, policy, and traffic surface; they never include
+identify only the destination, policy, traffic surface, and controlled denial reason; they never include
 credential names, placeholders, body content, or secret values.
 
 Credential provenance is gateway-derived and deliberately absent from the policy
@@ -281,21 +293,23 @@ After any successful policy write, pending chunks already covered by the new
 live effective policy are rejected as redundant. This keeps the review inbox
 aligned with what the sandbox currently enforces.
 
-Endpoint and binary advisor markers are provenance, not authorization or
-connection metadata. Provider- or user-authored declarations carry explicit
-provenance; `policy.local` declarations carry advisor provenance. A difference
-in endpoint provenance alone is compatible during effective-policy ambiguity
-validation. When identical endpoint or binary identities merge, an explicit
-declaration dominates an advisor declaration. Proposal coverage likewise
-ignores provenance so an approved overlay converges when an existing explicit
-declaration already supplies the same identity.
+Endpoint advisor markers are provenance, not authorization or connection
+metadata. Provider- or user-authored endpoints carry explicit provenance;
+`policy.local` endpoints carry advisor provenance. A difference in endpoint
+provenance alone is compatible during effective-policy ambiguity validation.
+When identical endpoints merge, an explicit declaration dominates an advisor
+declaration. Proposal coverage likewise ignores provenance so an approved
+overlay converges when an existing explicit declaration already supplies the
+same identity.
 
 This compatibility does not weaken SSRF classification. Exact-host trust
-requires one matching rule to contain both an exact explicit endpoint and an
-explicit binary identity. An advisor-only endpoint or binary cannot assemble
-that trust from unrelated rules. A provider rule may independently establish
-trust for its own explicit endpoint and binary pair, but an advisor overlay
-does not broaden that pair to a different binary.
+requires one matching rule to contain both an exact explicit endpoint and a
+matching binary identity. An advisor endpoint cannot assemble that trust from
+an unrelated explicit endpoint. When the advisor observes a new binary for an
+existing explicit endpoint contract, canonicalization keeps the observation in
+a separate rule whose endpoint retains advisor provenance. A provider or user
+rule may independently establish trust for its own explicit endpoint and binary
+pair, but an advisor overlay does not broaden that pair to a different binary.
 
 ### Security-notes gate
 
@@ -377,3 +391,19 @@ record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
+The gateway-local OCSF JSONL file sink is restricted to the Windows/MXC path
+and requires an explicit `OPENSHELL_OCSF_JSON=1` opt-in. Other gateway
+deployments do not initialize this gateway file sink; a cross-platform gateway
+sink requires its own storage and configuration integration.
+MXC ETW process events record executable identity but omit command-line
+arguments from structured fields and messages. Raw ETW debug summaries replace
+the `commandLine` value with `[REDACTED]`, including pending-buffer eviction
+diagnostics.
+MXC ETW attribution never treats command text as ownership evidence. It uses the
+driver-owned `wxc-exec` PID plus its kernel process start key as the initial
+anchor. ETW attaches that generation key to each record, and the driver queries
+the same key from its child process handle. PID attribution requires both values
+to match, so reuse cannot transfer ownership between process generations.
+Retired PID evidence is discarded; established identity, activity, and
+correlation-vector links remain eligible during the five-second late-event
+window. Records without matching generation evidence fail closed.

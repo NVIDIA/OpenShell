@@ -258,7 +258,7 @@ class TestClientCredentials:
                 metadata=admin_md,
             )
         try:
-            ci_client.list(workspace="default")
+            ci_client.list_all(workspace="default")
         finally:
             ci_client.close()
             with contextlib.suppress(grpc.RpcError):

@@ -773,7 +773,7 @@ func TestPolicyList(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 2)
@@ -781,8 +781,9 @@ func TestPolicyList(t *testing.T) {
 	// Verify request was forwarded (no pagination options).
 	mock.mu.Lock()
 	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
-	assert.Equal(t, uint32(0), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(0), mock.lastListReq.GetOffset())
+	assert.Equal(t, "sandbox", mock.lastListReq.GetName())
+	assert.Equal(t, int32(0), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
 
 	assert.Equal(t, uint32(1), revisions[0].Version)
@@ -794,7 +795,7 @@ func TestPolicyList(t *testing.T) {
 	assert.Equal(t, PolicyLoadStatusLoaded, revisions[1].Status)
 }
 
-func TestPolicyList_WithPagination(t *testing.T) {
+func TestPolicyList_WithPageSize(t *testing.T) {
 	mock := newMockPolicyServer()
 	mock.listResp = &pb.ListSandboxPoliciesResponse{
 		Revisions: []*pb.SandboxPolicyRevision{
@@ -805,18 +806,17 @@ func TestPolicyList_WithPagination(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default",
-		types.WithLimit(10),
-		types.WithOffset(20),
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox",
+		types.WithPageSize(10),
 	)
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
 
-	// Verify pagination options were forwarded.
+	// Verify page size was forwarded and the initial token is empty.
 	mock.mu.Lock()
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(20), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
 }
 
@@ -827,10 +827,11 @@ func TestPolicyList_Empty(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
-	assert.Nil(t, revisions)
+	assert.NotNil(t, revisions)
+	assert.Empty(t, revisions)
 }
 
 func TestPolicyList_WithGlobal(t *testing.T) {
@@ -845,7 +846,7 @@ func TestPolicyList_WithGlobal(t *testing.T) {
 	defer cleanup()
 
 	// List with global flag and empty workspace.
-	revisions, err := client.List(context.Background(), "", types.WithListGlobal(true))
+	revisions, err := client.ListAll(context.Background(), "", "", types.WithListGlobal(true))
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -870,7 +871,7 @@ func TestPolicyList_WithGlobalIgnoresWorkspace(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "some-workspace", types.WithListGlobal(true))
+	revisions, err := client.ListAll(context.Background(), "some-workspace", "", types.WithListGlobal(true))
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -892,11 +893,10 @@ func TestPolicyList_WithGlobalAndPagination(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	// Global flag composes with pagination options.
-	revisions, err := client.List(context.Background(), "",
+	// Global flag composes with page-size options.
+	revisions, err := client.ListAll(context.Background(), "", "",
 		types.WithListGlobal(true),
-		types.WithLimit(10),
-		types.WithOffset(20),
+		types.WithPageSize(10),
 	)
 
 	require.NoError(t, err)
@@ -904,8 +904,8 @@ func TestPolicyList_WithGlobalAndPagination(t *testing.T) {
 
 	mock.mu.Lock()
 	assert.True(t, mock.lastListReq.GetGlobal())
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(20), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
 }
 
@@ -920,7 +920,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -939,7 +939,7 @@ func TestPolicyList_Error(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.List(context.Background(), "default")
+	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
 
 	assert.Nil(t, revisions)
 	require.Error(t, err)

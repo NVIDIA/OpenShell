@@ -89,16 +89,16 @@ fmt.Println(template.Spec.Workload.Image)
 
 ## List
 
-Lists templates in one workspace or across all workspaces.
+`List` returns a lazy pager over matching templates in one workspace or across
+all workspaces. Use `ListAll` to follow every continuation token automatically.
 
 ```go
-templates, err := client.SandboxTemplates().List(ctx, "default", v1.ListOptions{
-    Limit:  50,
-    Offset: 0,
+templates, err := client.SandboxTemplates().ListAll(ctx, "default", v1.ListOptions{
+    PageSize: 50,
 })
 
-allTemplates, err := client.SandboxTemplates().ListAll(ctx, v1.ListOptions{
-    Limit: 50,
+allTemplates, err := client.SandboxTemplates().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
 })
 ```
 

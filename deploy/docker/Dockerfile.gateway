@@ -8,7 +8,7 @@
 #
 # Distroless Debian provides the glibc runtime required by the binary.
 
-ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
 ARG TARGETARCH

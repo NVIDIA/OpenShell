@@ -111,20 +111,28 @@ func (c *fakeProviderClient) Get(_ context.Context, workspace, name string) (*ty
 	return c.store.Get(workspace, name)
 }
 
-// List returns all providers. ListOptions are accepted for interface
-// compatibility but filtering is not implemented.
-func (c *fakeProviderClient) List(_ context.Context, workspace string, _ ...v1.ListOptions) ([]*types.Provider, error) {
+// List returns a lazy pager over providers. Filtering is not implemented.
+func (c *fakeProviderClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.Provider], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return c.store.List(workspace), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	items := c.store.List(workspace)
+	if len(opts) > 0 && opts[0].AllWorkspaces {
+		items = c.store.ListAll()
+	}
+	return newSlicePager(items, options.PageSize, options.PageToken)
 }
 
-func (c *fakeProviderClient) ListAll(_ context.Context, _ ...v1.ListOptions) ([]*types.Provider, error) {
-	if c.closedFunc() {
-		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+func (c *fakeProviderClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Provider, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return c.store.ListAll(), nil
+	return pager.All(ctx)
 }
 
 // Update replaces an existing provider's data. ResourceVersion is

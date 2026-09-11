@@ -271,7 +271,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".into(),
-                    ..Default::default()
                 }],
             },
         );
