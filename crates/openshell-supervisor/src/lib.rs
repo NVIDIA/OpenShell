@@ -311,6 +311,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     topology_descriptor: openshell_isolation_interface::contract::TopologyDescriptor,
+    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
 ) -> Result<i32> {
@@ -506,12 +507,20 @@ pub async fn run_sandbox(
     let topology: openshell_isolation_interface::boundary_protocol::BoundaryTopology =
         serde_json::from_slice(&topology_descriptor.payload)
             .map_err(|error| miette::miette!("decode boundary topology: {error}"))?;
+    if auth_bundle.session_id != topology.session_id {
+        return Err(miette::miette!(
+            "supervisor authentication bundle does not match topology session"
+        ));
+    }
+    let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    let session_id = topology.session_id;
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
     let backend: Arc<dyn openshell_isolation_interface::contract::IsolationBackend> = Arc::new(
         openshell_isolation_interface::remote::RemoteIsolationBackend::new(
             admitted_backend_name.clone(),
             ca_file_paths.clone(),
             provider_credentials.clone(),
+            sandbox_bearer,
         ),
     );
     let mut registry = openshell_isolation_interface::contract::BackendRegistry::new();
@@ -523,6 +532,7 @@ pub async fn run_sandbox(
         .map_err(|error| miette::miette!(error.to_string()))?;
     let context = openshell_isolation_interface::contract::SandboxContext {
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
+        session_id,
         policy: policy.clone(),
         agent: openshell_isolation_interface::AgentSpec {
             program,
@@ -573,7 +583,6 @@ pub async fn run_sandbox(
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
-    let remote_dns_source = remote_boundary.0.dns_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
 
     let mut networking = Some(
@@ -602,7 +611,6 @@ pub async fn run_sandbox(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
-            remote_dns_source,
         )
         .await?,
     );

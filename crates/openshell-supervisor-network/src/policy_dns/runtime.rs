@@ -10,7 +10,9 @@ use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_isolation_interface::contract::{DnsMediationSource, DnsTransport, MediatedDnsQuery};
+use openshell_isolation_interface::contract::{
+    DnsTransport, NetworkMediationSource, PendingDnsQuery,
+};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -26,10 +28,10 @@ const MEDIATION_ACCEPT_WINDOW: usize = 32;
 const MEDIATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MEDIATION_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn accept_mediated_dns(source: Arc<dyn DnsMediationSource>) -> MediatedDnsQuery {
+async fn accept_mediated_dns(source: Arc<dyn NetworkMediationSource>) -> PendingDnsQuery {
     let mut delay = MEDIATION_RETRY_DELAY;
     loop {
-        match source.accept().await {
+        match source.accept_dns().await {
             Ok(query) => return query,
             Err(error) => {
                 tracing::warn!(%error, "mediated DNS accept failed; retrying");
@@ -86,7 +88,7 @@ impl PolicyDnsRuntime {
     /// TCP listener is bound in the supervisor namespace.
     pub(crate) fn start_mediated(
         policy: Arc<OpaEngine>,
-        source: Arc<dyn DnsMediationSource>,
+        source: Arc<dyn NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
@@ -122,10 +124,10 @@ impl PolicyDnsRuntime {
                     let timing = query.timing.clone();
                     let response = match query.transport {
                         DnsTransport::Udp => {
-                            wire::handle_udp_query_with_ipv6(&service, &query.request, false).await
+                            wire::handle_udp_query_with_ipv6(&service, &query.message, false).await
                         }
                         DnsTransport::Tcp => {
-                            wire::handle_tcp_query_with_ipv6(&service, &query.request, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &query.message, false).await
                         }
                     }
                     .map_err(|error| {
@@ -333,14 +335,25 @@ mod tests {
         struct RecoveringSource(AtomicUsize);
 
         #[async_trait::async_trait]
-        impl DnsMediationSource for RecoveringSource {
-            async fn accept(&self) -> std::result::Result<MediatedDnsQuery, BackendError> {
+        impl NetworkMediationSource for RecoveringSource {
+            async fn accept_tcp(
+                &self,
+            ) -> std::result::Result<
+                openshell_isolation_interface::contract::PendingTcpOpen,
+                BackendError,
+            > {
+                Err(BackendError::Unavailable(
+                    "TCP not used by this test".into(),
+                ))
+            }
+
+            async fn accept_dns(&self) -> std::result::Result<PendingDnsQuery, BackendError> {
                 if self.0.fetch_add(1, Ordering::AcqRel) < 2 {
                     return Err(BackendError::Unavailable("injected disconnect".into()));
                 }
                 let (response, _) = tokio::sync::oneshot::channel();
-                Ok(MediatedDnsQuery {
-                    request: b"recovered query".to_vec(),
+                Ok(PendingDnsQuery {
+                    message: b"recovered query".to_vec(),
                     transport: DnsTransport::Udp,
                     binary_identity: Err(ResolveError::Failed("unknown sender".into())),
                     timing: MediationTiming::default(),
@@ -352,12 +365,12 @@ mod tests {
         let source = Arc::new(RecoveringSource(AtomicUsize::new(0)));
         let start = tokio::time::Instant::now();
         let query = accept_mediated_dns(source.clone()).await;
-        assert_eq!(query.request, b"recovered query");
+        assert_eq!(query.message, b"recovered query");
         assert_eq!(source.0.load(Ordering::Acquire), 3);
         assert!(start.elapsed() >= MEDIATION_RETRY_DELAY * 3);
         // The same source remains usable when the accept window replenishes.
         assert_eq!(
-            accept_mediated_dns(source).await.request,
+            accept_mediated_dns(source).await.message,
             b"recovered query"
         );
     }

@@ -220,6 +220,10 @@ message DriverSandboxSpec {
   // an immutable workload. Empty selectors mean the pinned image/rootfs
   // defaults. Resolution is mandatory for supported isolation backends.
   WorkloadIdentityRequest workload_identity = 15;
+  // Opaque, gateway-created launch credentials. The driver must split this
+  // material between the host supervisor and workload-side sandbox runtime;
+  // it must never expose the supervisor bearer tokens to the workload.
+  bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
 }
 
 // Identity inputs admitted by the gateway before workload provisioning.
@@ -417,6 +421,9 @@ message StartSandboxRequest {
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
   string sandbox_name = 2;
+  // Fresh launch credentials for start-from-stopped. Empty only for drivers
+  // that do not implement the OpenShell Sandbox Protocol.
+  bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
 }
 
 message StartSandboxResponse {}
