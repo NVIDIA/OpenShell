@@ -3,9 +3,9 @@
 
 syntax = "proto3";
 
-package openshell.isolation.v1;
+package openshell.sandbox.protocol.v1;
 
-// IsolationBoundary multiplexes the protected sandbox-to-supervisor protocol
+// IsolationBoundary multiplexes the OpenShell Sandbox Protocol
 // over one authenticated gRPC connection. Each Exchange call is an independent
 // HTTP/2 stream; Mediate is the persistent DNS exchange channel.
 service IsolationBoundary {

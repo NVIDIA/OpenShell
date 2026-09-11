@@ -4363,25 +4363,11 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "hyper-util",
  "libc",
  "openshell-core",
- "rcgen",
  "rustix 1.1.4",
- "rustls",
- "rustls-pemfile",
  "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2",
- "thiserror 2.0.18",
  "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tower 0.5.3",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -4497,6 +4483,37 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "openshell-sandbox-backend"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "libc",
+ "openshell-core",
+ "openshell-isolation-interface",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower 0.5.3",
+ "tracing",
  "uuid",
 ]
 
