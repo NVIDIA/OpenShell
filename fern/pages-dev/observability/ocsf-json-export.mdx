@@ -33,9 +33,34 @@ To disable:
 openshell settings set --global --key ocsf_json_enabled --value false
 ```
 
+### Windows MXC gateways
+
+MXC audit events originate in the Windows gateway rather than an in-sandbox
+supervisor. Enable the MXC ETW consumer in `gateway.toml`, then explicitly opt
+the gateway into durable JSONL output:
+
+```toml
+[openshell.drivers.mxc]
+etw_audit = true
+```
+
+```powershell
+$env:OPENSHELL_OCSF_JSON = "1"
+# Optional; defaults to %PROGRAMDATA%\OpenShell\logs.
+$env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
+openshell-gateway --drivers mxc --config gateway.toml
+```
+
+The sink is available only when Windows selects the MXC driver. It rotates
+daily and retains the three most recent files. Diagnostic `--log-level` values
+do not suppress records in this explicitly enabled audit sink.
+
 ## Output Location
 
-When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. The file rotates daily and retains the 3 most recent files, matching the main log file rotation.
+For sandbox supervisors, OCSF JSON records are written to
+`/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. Windows MXC gateway
+records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. Both
+sinks rotate daily and retain the three most recent files.
 
 ## JSON Record Structure
 
