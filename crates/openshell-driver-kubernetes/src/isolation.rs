@@ -105,7 +105,6 @@ impl KubernetesProxyPodNetworkFenceSpec {
                 // permitted by conforming NetworkPolicy implementations.
                 egress: Some(Vec::new()),
             }),
-            status: None,
         };
 
         KubernetesProxyPodNetworkFence {
