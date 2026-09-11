@@ -8,12 +8,12 @@
 //! VM claims; `openshell-isolation-interface` and `openshell-sandbox` provide
 //! the common control and boundary behavior.
 
-use openshell_isolation_interface::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
-    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
-};
 use openshell_isolation_interface::contract::{
     BackendError, DriverFenceEvidence, ResolvedWorkloadIdentity,
+};
+use openshell_sandbox_backend::boundary_protocol::{
+    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -97,7 +97,7 @@ impl VmBoundarySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_isolation_interface::boundary_protocol::{
+    use openshell_sandbox_backend::boundary_protocol::{
         SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
         generate_sandbox_tls_material,
     };
