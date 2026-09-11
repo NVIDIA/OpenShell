@@ -50,9 +50,6 @@ func DeviceLogin(ctx context.Context, opts ...LoginOption) (*oauth2.Token, error
 		opt(cfg)
 	}
 	cfg.applyDefaults()
-	// DeviceLogin authenticates a user, so the request must be an OIDC one even
-	// when the caller supplied its own scopes.
-	cfg.requireOpenIDScope()
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline && cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.timeout)
@@ -77,7 +74,18 @@ func DeviceLogin(ctx context.Context, opts ...LoginOption) (*oauth2.Token, error
 		}
 		cfg.issuer = gwCfg.OIDCIssuer
 		cfg.clientID = gwCfg.OIDCClientID
+		// Gateway-configured scopes fill only genuinely-unset scopes, so an
+		// explicit WithScopes always wins.
+		if !cfg.scopesSet && gwCfg.OIDCScopes != "" {
+			cfg.scopes = strings.Fields(gwCfg.OIDCScopes)
+			cfg.scopesSet = true
+		}
 	}
+
+	// DeviceLogin authenticates a user, so the request must be an OIDC one
+	// whether the scopes came from the caller, the gateway metadata, or the
+	// defaults.
+	cfg.requireOpenIDScope()
 
 	// Validate required configuration.
 	if cfg.issuer == "" || cfg.clientID == "" {

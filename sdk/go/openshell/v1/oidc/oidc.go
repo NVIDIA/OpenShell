@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 
 	"golang.org/x/oauth2"
 
@@ -37,9 +38,6 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 		opt(cfg)
 	}
 	cfg.applyDefaults()
-	// Login authenticates a user, so the request must be an OIDC one even when
-	// the caller supplied its own scopes.
-	cfg.requireOpenIDScope()
 
 	// Apply configured timeout if the caller's context has no deadline.
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline && cfg.timeout > 0 {
@@ -53,6 +51,9 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 	if err != nil {
 		return nil, err
 	}
+	// Login authenticates a user, so the request must be an OIDC one whether the
+	// scopes came from the caller, the gateway metadata, or the defaults.
+	cfg.requireOpenIDScope()
 
 	// FR-019: Check for existing valid token on disk before starting
 	// an interactive flow.
@@ -118,8 +119,8 @@ func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth
 	return tok, nil
 }
 
-// resolveOIDCConfig resolves the OIDC issuer and client ID either from
-// the gateway metadata or from explicit options. Returns the token
+// resolveOIDCConfig resolves the OIDC issuer, client ID, and scopes either
+// from the gateway metadata or from explicit options. Returns the token
 // directory path (empty if in-memory or no directory available).
 func resolveOIDCConfig(cfg *loginConfig, gatewayName string) (string, error) {
 	tokenDir := cfg.tokenDir
@@ -139,6 +140,12 @@ func resolveOIDCConfig(cfg *loginConfig, gatewayName string) (string, error) {
 		}
 		cfg.issuer = gwCfg.OIDCIssuer
 		cfg.clientID = gwCfg.OIDCClientID
+		// Gateway-configured scopes fill only genuinely-unset scopes, so an
+		// explicit WithScopes always wins.
+		if !cfg.scopesSet && gwCfg.OIDCScopes != "" {
+			cfg.scopes = strings.Fields(gwCfg.OIDCScopes)
+			cfg.scopesSet = true
+		}
 		if tokenDir == "" {
 			tokenDir = gwCfg.Dir
 		}
