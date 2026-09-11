@@ -224,8 +224,8 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
     }
     let mut config =
         rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
 }
@@ -1909,9 +1909,9 @@ mod tests {
             .expect("server private key");
         let mut server_config =
             rustls::ServerConfig::builder_with_protocol_versions(protocol_versions)
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .expect("build test TLS server config");
+                .with_no_client_auth()
+                .with_single_cert(certificates, private_key)
+                .expect("build test TLS server config");
         server_config.alpn_protocols = vec![b"h2".to_vec()];
         TestCertificate {
             client_tls: SandboxTlsClientConfig {
