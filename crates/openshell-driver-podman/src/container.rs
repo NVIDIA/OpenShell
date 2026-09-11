@@ -1097,7 +1097,7 @@ fn build_base_spec(
         Vec::new()
     } else {
         vec![ImageVolume {
-            source: config.supervisor_image.clone(),
+            source: config.sandbox_runtime_image.clone(),
             destination: SUPERVISOR_MOUNT_DIR.into(),
             rw: false,
         }]
@@ -1115,10 +1115,10 @@ fn build_base_spec(
         labels,
         env,
         volumes,
-        // Side-load the supervisor binary from a standalone OCI image.
+        // Side-load the sandbox runtime binary from its standalone OCI image.
         // Podman resolves image_volumes at the libpod layer, mounting the
         // image's filesystem at the destination path without starting a
-        // container from it. The supervisor image exposes the binary at
+        // container from it. The sandbox runtime image exposes the binary at
         // /openshell-sandbox, so it appears at /opt/openshell/bin/openshell-sandbox.
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
@@ -2593,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_includes_supervisor_image_volume() {
+    fn container_spec_includes_sandbox_runtime_image_volume() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
@@ -2610,8 +2610,8 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some(openshell_core::config::default_supervisor_image().as_str()),
-            "image volume source should be the supervisor image"
+            Some(openshell_core::config::default_sandbox_runtime_image().as_str()),
+            "image volume source should be the sandbox runtime image"
         );
         assert_eq!(
             vol["destination"].as_str(),
@@ -2696,9 +2696,9 @@ mod tests {
         let image_volumes = spec["image_volumes"]
             .as_array()
             .expect("image_volumes should be an array");
-        let expected_supervisor = openshell_core::config::default_supervisor_image();
+        let expected_sandbox_runtime = openshell_core::config::default_sandbox_runtime_image();
         assert!(image_volumes.iter().any(|volume| {
-            volume["source"].as_str() == Some(expected_supervisor.as_str())
+            volume["source"].as_str() == Some(expected_sandbox_runtime.as_str())
                 && volume["destination"].as_str() == Some("/opt/openshell/bin")
         }));
         assert!(image_volumes.iter().any(|volume| {
@@ -3505,7 +3505,7 @@ mod tests {
             !image_volumes
                 .iter()
                 .any(|v| v["destination"].as_str() == Some(SUPERVISOR_MOUNT_DIR)),
-            "supervisor image volume should not be present when bind path is provided"
+            "sandbox runtime image volume should not be present when bind path is provided"
         );
 
         let mounts = spec["mounts"]
@@ -3539,7 +3539,7 @@ mod tests {
             image_volumes
                 .iter()
                 .any(|v| v["destination"].as_str() == Some(SUPERVISOR_MOUNT_DIR)),
-            "supervisor image volume should be present by default"
+            "sandbox runtime image volume should be present by default"
         );
 
         let mounts = spec["mounts"]

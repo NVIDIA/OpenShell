@@ -77,11 +77,12 @@ supplementary groups. Root and unresolved identities fail before provisioning.
 Images must not prepopulate the reserved `/.openshell` hierarchy; this prevents
 image-controlled symlinks from aliasing private control state into user mounts.
 
-The trusted runtime image supplies `/openshell-sandbox` and
-`/openshell-supervisor`. Podman's read-only image volume delivers the sandbox
-binary; user-namespace modes that cannot use image volumes retain the existing
-trusted binary extraction path. Image and request environment belong to agent
-children, never the supervisor process.
+`sandbox_runtime_image` supplies the statically linked musl
+`/openshell-sandbox` binary. Podman's read-only image volume delivers it to the
+workload; user-namespace modes that cannot use image volumes retain the trusted
+binary extraction path. `supervisor_image` supplies the dynamically linked
+glibc `/openshell-supervisor` binary outside the workload. Image and request
+environment belong to agent children, never the supervisor process.
 
 ## Lifecycle and readiness
 
