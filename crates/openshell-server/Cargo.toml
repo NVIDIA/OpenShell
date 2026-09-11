@@ -126,7 +126,6 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
-openshell-sdk = { path = "../openshell-sdk", features = ["extension"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
