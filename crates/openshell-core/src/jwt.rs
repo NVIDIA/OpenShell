@@ -181,6 +181,119 @@ mod session {
         }
     }
 
+    impl Serialize for SecretJwt {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretJwt {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer)?;
+            Self::parse(value).map_err(serde::de::Error::custom)
+        }
+    }
+
+    /// Trusted launch input delivered only to `openshell-supervisor`.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SupervisorAuthBundle {
+        pub session_id: SandboxSessionId,
+        pub gateway_token: SecretJwt,
+        pub gateway_expires_at: i64,
+        pub sandbox_token: SecretJwt,
+        pub sandbox_expires_at: i64,
+        pub credential_epoch: CredentialEpoch,
+    }
+
+    /// Gateway-created authentication input trusted by a compute driver.
+    ///
+    /// Drivers split this structure: the supervisor receives `supervisor`,
+    /// while the sandbox receives only the gateway identity and public keys.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SandboxLaunchAuthentication {
+        pub supervisor: SupervisorAuthBundle,
+        pub gateway_id: String,
+        pub verification_keys: Vec<SessionVerificationKey>,
+    }
+
+    impl SandboxLaunchAuthentication {
+        pub fn validate(&self) -> Result<(), SessionJwtError> {
+            self.supervisor.validate()?;
+            validate_gateway_id(&self.gateway_id)?;
+            if self.verification_keys.is_empty() {
+                return Err(SessionJwtError::NoVerificationKeys);
+            }
+            let mut key_ids = std::collections::BTreeSet::new();
+            for key in &self.verification_keys {
+                validate_key_id(key.key_id.clone())?;
+                if key.public_key_pem.is_empty() {
+                    return Err(SessionJwtError::InvalidVerificationKey);
+                }
+                if !key_ids.insert(key.key_id.as_str()) {
+                    return Err(SessionJwtError::DuplicateKeyId);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl fmt::Debug for SandboxLaunchAuthentication {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SandboxLaunchAuthentication")
+                .field("supervisor", &self.supervisor)
+                .field("gateway_id", &self.gateway_id)
+                .field(
+                    "verification_key_ids",
+                    &self
+                        .verification_keys
+                        .iter()
+                        .map(|key| key.key_id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .finish()
+        }
+    }
+
+    impl SupervisorAuthBundle {
+        pub fn validate(&self) -> Result<(), SessionJwtError> {
+            if self.gateway_expires_at <= 0 || self.sandbox_expires_at <= 0 {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            Ok(())
+        }
+
+        pub fn sandbox_bearer_slot(&self) -> Result<SessionBearerTokenSlot, SessionJwtError> {
+            SessionBearerTokenSlot::new(
+                self.sandbox_token.clone(),
+                self.sandbox_expires_at,
+                self.credential_epoch,
+            )
+        }
+    }
+
+    impl fmt::Debug for SupervisorAuthBundle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SupervisorAuthBundle")
+                .field("session_id", &self.session_id)
+                .field("gateway_token", &"[REDACTED]")
+                .field("gateway_expires_at", &self.gateway_expires_at)
+                .field("sandbox_token", &"[REDACTED]")
+                .field("sandbox_expires_at", &self.sandbox_expires_at)
+                .field("credential_epoch", &self.credential_epoch)
+                .finish()
+        }
+    }
+
     #[derive(Clone, Debug)]
     pub struct MintedSessionToken {
         pub token: SecretJwt,
@@ -206,6 +319,7 @@ mod session {
     struct StoredBearer {
         token: SecretJwt,
         expires_at: i64,
+        credential_epoch: CredentialEpoch,
     }
 
     impl SessionBearerTokenSlot {
@@ -216,21 +330,40 @@ mod session {
             }
         }
 
-        pub fn new(token: SecretJwt, expires_at: i64) -> Result<Self, SessionJwtError> {
+        pub fn new(
+            token: SecretJwt,
+            expires_at: i64,
+            credential_epoch: CredentialEpoch,
+        ) -> Result<Self, SessionJwtError> {
             let slot = Self::empty();
-            slot.update(token, expires_at)?;
+            slot.update(token, expires_at, credential_epoch)?;
             Ok(slot)
         }
 
-        pub fn update(&self, token: SecretJwt, expires_at: i64) -> Result<(), SessionJwtError> {
+        pub fn update(
+            &self,
+            token: SecretJwt,
+            expires_at: i64,
+            credential_epoch: CredentialEpoch,
+        ) -> Result<(), SessionJwtError> {
             if expires_at <= 0 {
                 return Err(SessionJwtError::InvalidLifetime);
             }
-            *self
+            let mut stored = self
                 .inner
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(StoredBearer { token, expires_at });
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if stored
+                .as_ref()
+                .is_some_and(|current| credential_epoch <= current.credential_epoch)
+            {
+                return Err(SessionJwtError::StaleCredentialEpoch);
+            }
+            *stored = Some(StoredBearer {
+                token,
+                expires_at,
+                credential_epoch,
+            });
             Ok(())
         }
 
@@ -248,6 +381,15 @@ mod session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .map(|stored| stored.expires_at)
+        }
+
+        #[must_use]
+        pub fn credential_epoch(&self) -> Option<CredentialEpoch> {
+            self.inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|stored| stored.credential_epoch)
         }
 
         pub fn authorization_metadata(
@@ -278,6 +420,7 @@ mod session {
             formatter
                 .debug_struct("SessionBearerTokenSlot")
                 .field("expires_at", &self.expires_at())
+                .field("credential_epoch", &self.credential_epoch())
                 .finish_non_exhaustive()
         }
     }
@@ -401,6 +544,8 @@ mod session {
     }
 
     /// One accepted public key from the immutable sandbox verification bundle.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct SessionVerificationKey {
         pub key_id: String,
         pub public_key_pem: Vec<u8>,
@@ -541,6 +686,8 @@ mod session {
         InvalidGatewayId,
         #[error("credential epoch must be positive")]
         InvalidCredentialEpoch,
+        #[error("credential epoch does not advance the active credential")]
+        StaleCredentialEpoch,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -763,6 +910,41 @@ mod tests {
             let debug = format!("{:?}", pair.sandbox.token);
             assert_eq!(debug, "SecretJwt([REDACTED])");
             assert!(!debug.contains(pair.sandbox.token.expose_secret()));
+        }
+
+        #[test]
+        fn supervisor_auth_bundle_round_trips_without_exposing_secrets_in_debug() {
+            let (issuer, _gateway, _sandbox, identity) = fixture();
+            let pair = issuer
+                .mint_pair(&identity, CredentialEpoch::new(7).expect("epoch"))
+                .expect("token pair");
+            let bundle = SupervisorAuthBundle {
+                session_id: identity.session_id,
+                gateway_token: pair.gateway.token,
+                gateway_expires_at: pair.gateway.expires_at,
+                sandbox_token: pair.sandbox.token,
+                sandbox_expires_at: pair.sandbox.expires_at,
+                credential_epoch: pair.credential_epoch,
+            };
+
+            let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
+            let decoded: SupervisorAuthBundle =
+                serde_json::from_slice(&encoded).expect("deserialize auth bundle");
+            assert_eq!(decoded.session_id, bundle.session_id);
+            assert_eq!(decoded.credential_epoch, bundle.credential_epoch);
+            assert_eq!(
+                decoded.gateway_token.expose_secret(),
+                bundle.gateway_token.expose_secret()
+            );
+            assert_eq!(
+                decoded.sandbox_token.expose_secret(),
+                bundle.sandbox_token.expose_secret()
+            );
+
+            let debug = format!("{bundle:?}");
+            assert!(!debug.contains(bundle.gateway_token.expose_secret()));
+            assert!(!debug.contains(bundle.sandbox_token.expose_secret()));
+            assert_eq!(debug.matches("[REDACTED]").count(), 2);
         }
 
         #[derive(Serialize)]
