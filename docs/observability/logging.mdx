@@ -54,6 +54,7 @@ OpenShell maps sandbox events to these OCSF classes:
 
 | Shorthand prefix | OCSF class | Class UID | What it covers |
 |---|---|---|---|
+| `EVENT` | Base Event | 0 | Unix socket relay and relay-control notifications without network endpoints |
 | `NET:` | Network Activity | 4001 | TCP proxy CONNECT tunnels, bypass detection, DNS failures |
 | `HTTP:` | HTTP Activity | 4002 | HTTP FORWARD requests, L7 enforcement decisions |
 | `SSH:` | SSH Activity | 4007 | SSH handshakes, authentication, channel operations |
@@ -69,6 +70,10 @@ The shorthand format follows this pattern:
 ```text
 CLASS:ACTIVITY [SEVERITY] ACTION DETAILS [CONTEXT]
 ```
+
+Base Events use `EVENT [SEVERITY] MESSAGE [CONTEXT]`. Unix socket relay and
+relay-control notifications moved from `NET:*` to `EVENT` because they do not
+have a network endpoint.
 
 ### Components
 
