@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Security Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        required: true
+        type: string
+      stable_ref:
+        description: Optional previous stable tag override for Codex
+        default: ""
+        type: string
+      allow_full_bootstrap:
+        description: Allow a full Codex scan when no previous stable tag exists
+        default: false
+        type: boolean
+      allow-high-critical:
+        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
+        default: false
+        type: boolean
+      images:
+        description: Newline-separated image references for Trivy
+        default: ""
+        type: string
+      charts:
+        description: Newline-separated packaged Helm chart OCI references for Trivy
+        default: ""
+        type: string
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        required: true
+        type: string
+      stable_ref:
+        description: Optional previous stable tag override for Codex
+        default: ""
+        type: string
+      allow_full_bootstrap:
+        description: Allow a full Codex scan when no previous stable tag exists
+        default: false
+        type: boolean
+      allow-high-critical:
+        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
+        default: false
+        type: boolean
+      images:
+        description: Newline-separated image references for Trivy
+        default: ""
+        type: string
+      charts:
+        description: Newline-separated packaged Helm chart OCI references for Trivy
+        default: ""
+        type: string
+    secrets:
+      CODEX_SECURITY_API_KEY:
+        required: true
+      CACHIX_AUTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+# Only the finding threshold is overridable; execution failures remain fatal.
+jobs:
+  codex:
+    name: Codex Security
+    uses: ./.github/workflows/codex-security.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    with:
+      candidate_ref: ${{ inputs.candidate_ref }}
+      stable_ref: ${{ inputs.stable_ref }}
+      allow_full_bootstrap: ${{ inputs.allow_full_bootstrap }}
+      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      upload_sarif: true
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
+  codeql:
+    name: CodeQL
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      candidate_ref: ${{ inputs.candidate_ref }}
+      fail-on-findings: ${{ !inputs.allow-high-critical }}
+
+  trivy:
+    name: Trivy
+    uses: ./.github/workflows/trivy-scan.yml
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    with:
+      candidate_ref: ${{ inputs.candidate_ref }}
+      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      severity: HIGH,CRITICAL
+      ignore-unfixed: false
+      images: ${{ inputs.images }}
+      charts: ${{ inputs.charts }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  cargo-deny:
+    name: Cargo Deny
+    uses: ./.github/workflows/cargo-deny.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      candidate_ref: ${{ inputs.candidate_ref }}
+      advisories-only: true
+
+  workflow-security:
+    name: Actionlint and Zizmor
+    uses: ./.github/workflows/workflow-security.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      candidate_ref: ${{ inputs.candidate_ref }}
+      fail-on-findings: ${{ !inputs.allow-high-critical }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

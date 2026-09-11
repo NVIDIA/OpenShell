@@ -256,11 +256,14 @@ e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 cat >"${GATEWAY_CONFIG}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 bind_address = "127.0.0.1:${HOST_PORT}"
-compute_drivers = ["vm"]
+compute_driver = "vm"
+guest_tls_ca = "${PKI_DIR}/ca.crt"
+guest_tls_cert = "${PKI_DIR}/client/tls.crt"
+guest_tls_key = "${PKI_DIR}/client/tls.key"
 
 [openshell.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"
@@ -277,7 +280,6 @@ kid_path = "${JWT_DIR}/kid"
 gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
-ttl_secs = 0
 
 [openshell.drivers.vm]
 EOF
@@ -288,9 +290,6 @@ else
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
-guest_tls_ca = "${PKI_DIR}/ca.crt"
-guest_tls_cert = "${PKI_DIR}/client/tls.crt"
-guest_tls_key = "${PKI_DIR}/client/tls.key"
 EOF
 fi
 
@@ -298,7 +297,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   "${DRIVER_BIN}" \
     --bind-socket "${DRIVER_SOCKET}" \
     --allow-same-uid-peer \
-    --openshell-endpoint "https://host.openshell.internal:${HOST_PORT}" \
+    --grpc-endpoint "https://host.openshell.internal:${HOST_PORT}" \
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \

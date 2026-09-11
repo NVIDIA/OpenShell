@@ -55,6 +55,38 @@ impl Device {
             }),
         }
     }
+
+    /// Create a Windows device with the given hostname.
+    #[must_use]
+    pub fn windows(hostname: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            name: None,
+            uid: None,
+            type_id: DeviceTypeId::Other,
+            type_label: "Sandbox".to_string(),
+            os: Some(OsInfo {
+                name: "Windows".to_string(),
+            }),
+        }
+    }
+
+    /// Create a device stamped with the OS this build is running on.
+    ///
+    /// The gateway (Windows) and the Linux supervisor emit through the same
+    /// builders; the `device.os.name` should reflect the host each runs on —
+    /// an OS-appropriate difference, not a divergence.
+    #[must_use]
+    pub fn for_current_os(hostname: &str) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::windows(hostname)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::linux(hostname)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +98,29 @@ mod tests {
         let device = Device::linux("sandbox-abc123");
         let json = serde_json::to_value(&device).unwrap();
         assert_eq!(json["hostname"], "sandbox-abc123");
+        assert_eq!(json["os"]["name"], "Linux");
+    }
+
+    #[test]
+    fn test_device_windows() {
+        let device = Device::windows("gateway-host");
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["hostname"], "gateway-host");
+        assert_eq!(json["os"]["name"], "Windows");
+        assert_eq!(json["type_id"], DeviceTypeId::Other.as_u8());
+        assert_eq!(json["type"], "Sandbox");
+        let decoded: Device = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, device);
+    }
+
+    #[test]
+    fn test_device_for_current_os() {
+        let device = Device::for_current_os("host");
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["hostname"], "host");
+        #[cfg(target_os = "windows")]
+        assert_eq!(json["os"]["name"], "Windows");
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(json["os"]["name"], "Linux");
     }
 

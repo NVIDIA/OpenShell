@@ -12,7 +12,9 @@ FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+# Refresh base packages too: adding firewall tools does not upgrade OpenSSL.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache nftables iptables iptables-legacy
 
 # Keep the binary root-owned for Podman image-volume mounts and executable by
 # the Kubernetes network sidecar's non-root proxy UID.

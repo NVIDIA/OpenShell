@@ -389,3 +389,19 @@ record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
+The gateway-local OCSF JSONL file sink is restricted to the Windows/MXC path
+and requires an explicit `OPENSHELL_OCSF_JSON=1` opt-in. Other gateway
+deployments do not initialize this gateway file sink; a cross-platform gateway
+sink requires its own storage and configuration integration.
+MXC ETW process events record executable identity but omit command-line
+arguments from structured fields and messages. Raw ETW debug summaries replace
+the `commandLine` value with `[REDACTED]`, including pending-buffer eviction
+diagnostics.
+MXC ETW attribution never treats command text as ownership evidence. It uses the
+driver-owned `wxc-exec` PID plus its kernel process start key as the initial
+anchor. ETW attaches that generation key to each record, and the driver queries
+the same key from its child process handle. PID attribution requires both values
+to match, so reuse cannot transfer ownership between process generations.
+Retired PID evidence is discarded; established identity, activity, and
+correlation-vector links remain eligible during the five-second late-event
+window. Records without matching generation evidence fail closed.

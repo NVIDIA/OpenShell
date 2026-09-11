@@ -217,7 +217,7 @@ GATEWAY_ENDPOINT="http://127.0.0.1:$GATEWAY_PORT"
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -227,7 +227,6 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
 
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
@@ -378,10 +377,10 @@ wait_for_upstream() {
 start_gateway() {
   local -a driver_args=()
   if [[ -n "$COMPUTE_DRIVER" ]]; then
-    driver_args=(--drivers "$COMPUTE_DRIVER")
+    driver_args=(--compute-driver "$COMPUTE_DRIVER")
   fi
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$GATEWAY_BIN" \
+  env -u OPENSHELL_DRIVERS -u OPENSHELL_COMPUTE_DRIVER "$GATEWAY_BIN" \
     "${driver_args[@]}" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \

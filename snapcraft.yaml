@@ -87,9 +87,9 @@ apps:
     # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
     # The wrapper sets OPENSHELL_DISABLE_TLS=true and OPENSHELL_DB_URL to
-    # use $SNAP_COMMON/gateway.db. If $SNAP_COMMON/gateway.toml exists it is
-    # passed to the gateway as --config, allowing operators to override
-    # settings without rebuilding the snap.
+    # use $SNAP_COMMON/gateway.db. Before startup it validates the selected
+    # operator-provided config without creating or rewriting it. A nonempty
+    # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"

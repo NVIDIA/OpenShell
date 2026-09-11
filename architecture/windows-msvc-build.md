@@ -31,6 +31,14 @@ Windows. These registrations preserve config-file selection and reject
 unsupported drivers with a clear error without depending on their runtime
 crates.
 
+Each stub follows its corresponding `compute-driver-*` Cargo feature.
+`compute-driver-mxc` independently links and registers MXC, so a gateway built
+with only that feature has only the MXC registration. The default
+`in-tree-compute-drivers` alias enables all five features and preserves the
+existing MXC plus unsupported-driver registrations. The focused Windows
+contract tasks cover default, protocol-only, MXC-only, Docker-stub-only, and
+MXC plus Docker-stub compositions.
+
 The Windows lane does not build, release, package, or smoke-test standalone
 driver binaries for Docker, Kubernetes, Podman, or VM. Those binaries are Linux
 or macOS deliverables only.
@@ -55,7 +63,8 @@ creating misleading Windows driver artifacts.
 ## Mise Lane
 
 The GitHub Actions workflow runs Clippy for the Windows-supported workspace and
-e2e crates plus Rust tests for pull-request mirror branches and merge queues. On
+e2e crates plus Rust tests for pull-request mirror branches labeled `test:windows`.
+Merge queues do not run this workflow. On
 pushes to `main`, a cache-seed job runs the same lint and test commands before a
 dependent job builds the release binaries. Manual dispatches exercise the same
 seed-then-build path. The binaries remain CI validation artifacts and are not
@@ -146,7 +155,7 @@ break ARM64 crypto dependency builds.
 ## CI Shape
 
 The x64 GitHub Actions jobs run on `windows-2025`; native ARM64 jobs run on
-`windows-11-arm`. Pull-request mirrors and merge queues execute the matching
+`windows-11-arm`. Pull-request mirrors labeled `test:windows` execute the matching
 architecture-specific tasks:
 
 ```powershell
@@ -155,7 +164,10 @@ mise run --skip-tools windows:test:<x64|arm64>
 ```
 
 Pushes to `main` and manual dispatches first seed the shared caches with those
-same lint and test commands. After the seed succeeds, a separate job executes:
+same lint and test commands. Both seed and build jobs use job-level
+`continue-on-error: true`, so Windows job failures do not fail the main/manual
+workflow. Opt-in PR jobs still report failures normally. After the seed job
+finishes, a separate job executes:
 
 ```powershell
 mise run --skip-tools windows:build:<x64|arm64>

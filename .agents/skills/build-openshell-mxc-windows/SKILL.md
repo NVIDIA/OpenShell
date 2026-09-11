@@ -30,7 +30,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test plus main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
@@ -193,11 +193,14 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors and merge queues run Clippy for the
+dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
 Windows-supported workspace and e2e crates plus Rust tests. Pushes to `main` and
 manual dispatches run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build job. The seed and PR jobs use the
-same cache namespaces. The binaries are not uploaded or published.
+same cache namespaces. Merge queues do not run this workflow. Main/manual seed
+and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
+failures normally. Applying the label alone does not start a run: re-run all
+jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -252,6 +255,13 @@ in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 Windows must continue to reject unsupported compute drivers clearly.
 
+The gateway's `compute-driver-mxc` feature independently links and registers
+MXC on Windows. Each other `compute-driver-*` feature installs its own Windows
+rejection stub without linking that driver crate. The default
+`in-tree-compute-drivers` alias enables all five features. An MXC-only build
+uses `--no-default-features --features compute-driver-mxc` (add `telemetry`
+and `bundled-z3` as needed).
+
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
 | Docker | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
@@ -263,11 +273,16 @@ The focused contract tasks for either native architecture run:
 
 ```text
 windows_builtin_compute_drivers_report_unsupported
+default_registry_contains_exactly_the_enabled_compute_drivers
 ```
 
-These tests are also included in the full x64 workspace test run. The focused
-task is available for local diagnosis; GitHub Actions does not re-run it after
-the full suite.
+The same tasks also run gateway library tests for protocol-only, MXC-only,
+Docker-stub-only, and MXC plus Docker-stub builds. Their logs use
+`test-<target>-selective-<variant>.log`.
+
+The default-feature tests are also included in the full workspace test run.
+The focused task is available for local diagnosis and selective-build
+validation; GitHub Actions does not re-run it after the full suite.
 
 ## Test Accounting Guidance
 
