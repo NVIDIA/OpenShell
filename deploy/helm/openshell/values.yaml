@@ -26,8 +26,17 @@ image:
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
 
-# Trusted runtime image. Its `openshell-sandbox` binary stages into the workload
-# runtime volume, while its `openshell-supervisor` binary runs in a separate Pod.
+# Trusted workload-side runtime image.
+sandboxRuntime:
+  image:
+    # -- Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set.
+    repository: ghcr.io/nvidia/openshell/sandbox
+    # -- Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty.
+    pullPolicy: ""
+    # -- Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed.
+    tag: ""
+
+# Trusted control-side runtime image.
 supervisor:
   image:
     # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
