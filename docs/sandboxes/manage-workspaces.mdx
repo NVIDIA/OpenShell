@@ -168,7 +168,9 @@ The public API represents this choice with a `WorkspaceSelector` oneof. Set
 `all_workspaces` marker on list requests that support it. Omitting the selector
 or sending an unset selector is invalid for workspace-scoped operations. The
 all-workspaces variant is accepted only by sandbox, sandbox template, provider,
-and service list requests, and it requires Platform Admin access.
+and service list requests, and it requires Platform Admin access. For services,
+choose either a sandbox name or `--all-workspaces`; the options are mutually
+exclusive.
 
 Clients migrating from the previous request fields should make the scope
 explicit:
@@ -179,6 +181,24 @@ explicit:
 | Empty or omitted `workspace` for the default | `workspace_scope.workspace: "default"` |
 | `all_workspaces: true` | `workspace_scope.all_workspaces: {}` |
 | `global: true` | Omit `workspace_scope` |
+
+Every sandbox-scoped RPC identifies the sandbox by its human-readable name and
+keeps workspace selection in a separate field:
+
+```json
+{
+  "sandbox": "agent",
+  "workspaceScope": {
+    "workspace": "team-ml"
+  }
+}
+```
+
+Public requests do not accept canonical sandbox IDs as references. Fields that
+previously accepted `sandbox_id` are removed and their protobuf field numbers
+are reserved. Resolve stored IDs to sandbox names before calling the public
+API. List RPCs that are not filtered to one sandbox continue to use only the
+request-level `workspace_scope` selector.
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
 SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the

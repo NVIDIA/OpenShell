@@ -182,7 +182,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.sandbox;
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
@@ -333,7 +334,7 @@ impl OpenShell for TestOpenShell {
             .deleted_names
             .lock()
             .await
-            .push(vec![request.name.clone()]);
+            .push(vec![request.sandbox.clone()]);
         let delete_failure = self.state.fail_delete_sandbox_message.lock().await.take();
         if let Some(message) = delete_failure {
             return Err(Status::internal(message));
@@ -387,7 +388,8 @@ impl OpenShell for TestOpenShell {
         {
             return Err(Status::failed_precondition("sandbox is not ready"));
         }
-        let sandbox_id = request.into_inner().sandbox_id;
+        let request = request.into_inner();
+        let sandbox_id = format!("id-{}", request.sandbox);
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
             token: "test-token".to_string(),
@@ -579,7 +581,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        let sandbox_id = request.into_inner().id;
+        let request = request.into_inner();
+        let sandbox_id = format!("id-{}", request.sandbox);
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
         let vm_error_with_observed_exit = self
@@ -1213,7 +1216,7 @@ for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     case "$arg" in
       ProxyCommand=*)
-        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox \([^ ]*\).*/\1/p')"
         ;;
     esac
     previous=""
@@ -1257,8 +1260,8 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -L $forward sandbox" > '@COMMAND_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
+printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_id --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -L $forward sandbox" > '@COMMAND_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string())
         .replace("@COMMAND_PATH@", &command_path.display().to_string())
@@ -1302,7 +1305,7 @@ for arg in "$@"; do
   if [ "$previous" = "-o" ]; then
     case "$arg" in
       ProxyCommand=*)
-        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox \([^ ]*\).*/\1/p')"
         ;;
     esac
     previous=""
@@ -1331,7 +1334,7 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string())

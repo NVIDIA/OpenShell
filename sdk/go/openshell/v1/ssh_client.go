@@ -30,9 +30,10 @@ func newSSHClient(conn grpc.ClientConnInterface, sandboxes SandboxInterface) *ss
 	}
 }
 
-func (s *sshClient) CreateSession(ctx context.Context, _, sandboxID string) (*SSHSession, error) {
+func (s *sshClient) CreateSession(ctx context.Context, workspace, sandboxName string) (*SSHSession, error) {
 	resp, err := s.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxId: sandboxID,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -63,16 +64,14 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
+	if _, err := s.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+		return nil, err
+	}
 
 	var cfg tunnelConfig
 	options.Apply(&cfg, opts)
 
-	sandbox, err := s.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
-		return nil, err
-	}
-
-	session, err := s.CreateSession(ctx, workspace, sandbox.ID)
+	session, err := s.CreateSession(ctx, workspace, sandboxName)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +93,8 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
-				SandboxId:          sandbox.ID,
+				Sandbox:            sandboxName,
+				WorkspaceScope:     namedWorkspaceScope(workspace),
 				ServiceId:          cfg.serviceID,
 				AuthorizationToken: session.Token,
 				Target: &pb.TcpForwardInit_Ssh{

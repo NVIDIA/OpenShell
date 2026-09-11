@@ -236,7 +236,7 @@ func TestExecRun_WithOptions(t *testing.T) {
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	assert.Equal(t, "sb-test-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "test-sandbox", mock.lastExecRequest.GetSandbox())
 	assert.Equal(t, []string{"ls"}, mock.lastExecRequest.GetCommand())
 	assert.Equal(t, "/tmp", mock.lastExecRequest.GetWorkdir())
 	assert.Equal(t, map[string]string{"FOO": "bar"}, mock.lastExecRequest.GetEnvironment())
@@ -380,7 +380,7 @@ func TestExecInteractive(t *testing.T) {
 
 	startReq := startInput.GetStart()
 	require.NotNil(t, startReq)
-	assert.Equal(t, "sb-test-sandbox", startReq.GetSandboxId())
+	assert.Equal(t, "test-sandbox", startReq.GetSandbox())
 	assert.Equal(t, []string{"/bin/bash"}, startReq.GetCommand())
 	assert.True(t, startReq.GetTty())
 	assert.Equal(t, uint32(80), startReq.GetCols())
@@ -532,7 +532,7 @@ func TestExecInteractive_ConcurrentReadAndExitCode(t *testing.T) {
 
 // --- Name-to-ID resolution tests ---
 
-func TestExecRun_ResolvesNameToID(t *testing.T) {
+func TestExecRun_UsesName(t *testing.T) {
 	mock := newMockExecServer()
 	mock.execEvents = []*pb.ExecSandboxEvent{
 		{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 0}}},
@@ -546,7 +546,7 @@ func TestExecRun_ResolvesNameToID(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	// Verify the proto request contains the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastExecRequest.GetSandbox())
 }
 
 func TestExecRun_ResolutionError(t *testing.T) {
@@ -560,7 +560,7 @@ func TestExecRun_ResolutionError(t *testing.T) {
 	assert.True(t, IsNotFound(err))
 }
 
-func TestExecStream_ResolvesNameToID(t *testing.T) {
+func TestExecStream_UsesName(t *testing.T) {
 	mock := newMockExecServer()
 	mock.execEvents = []*pb.ExecSandboxEvent{
 		{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 0}}},
@@ -576,7 +576,7 @@ func TestExecStream_ResolvesNameToID(t *testing.T) {
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastExecRequest.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastExecRequest.GetSandbox())
 }
 
 func TestExecStream_ResolutionError(t *testing.T) {
@@ -590,7 +590,7 @@ func TestExecStream_ResolutionError(t *testing.T) {
 	assert.True(t, IsNotFound(err))
 }
 
-func TestExecInteractive_ResolvesNameToID(t *testing.T) {
+func TestExecInteractive_UsesName(t *testing.T) {
 	mock := newMockExecServer()
 	mock.interactiveEvents = []*pb.ExecSandboxEvent{
 		{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 0}}},
@@ -609,7 +609,7 @@ func TestExecInteractive_ResolvesNameToID(t *testing.T) {
 	require.NotEmpty(t, mock.receivedInputs)
 	startReq := mock.receivedInputs[0].GetStart()
 	require.NotNil(t, startReq)
-	assert.Equal(t, "sb-my-sandbox", startReq.GetSandboxId())
+	assert.Equal(t, "my-sandbox", startReq.GetSandbox())
 }
 
 func TestExecInteractive_ResolutionError(t *testing.T) {

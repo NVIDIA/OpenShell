@@ -10,6 +10,7 @@
 package sandboxv1
 
 import (
+	datamodelv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -1494,13 +1495,13 @@ func (x *NetworkBinary) GetHarness() bool {
 	return false
 }
 
-// Request to get sandbox settings by sandbox ID.
+// Request to get sandbox settings by sandbox name.
 type GetSandboxConfigRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The sandbox ID.
-	SandboxId     string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState         `protogen:"open.v1"`
+	Sandbox        string                         `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigRequest) Reset() {
@@ -1533,11 +1534,18 @@ func (*GetSandboxConfigRequest) Descriptor() ([]byte, []int) {
 	return file_sandbox_proto_rawDescGZIP(), []int{16}
 }
 
-func (x *GetSandboxConfigRequest) GetSandboxId() string {
+func (x *GetSandboxConfigRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxId
+		return x.Sandbox
 	}
 	return ""
+}
+
+func (x *GetSandboxConfigRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+	if x != nil {
+		return x.WorkspaceScope
+	}
+	return nil
 }
 
 // Request to get gateway-global settings.
@@ -2069,7 +2077,7 @@ var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
 	"\n" +
-	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\"\xa8\x05\n" +
+	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x0fdatamodel.proto\x1a\x1cgoogle/protobuf/struct.proto\"\xa8\x05\n" +
 	"\rSandboxPolicy\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12F\n" +
 	"\n" +
@@ -2199,10 +2207,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"A\n" +
 	"\rNetworkBinary\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1c\n" +
-	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"8\n" +
-	"\x17GetSandboxConfigRequest\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x19\n" +
+	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"\x99\x01\n" +
+	"\x17GetSandboxConfigRequest\x12\x18\n" +
+	"\asandbox\x18\x02 \x01(\tR\asandbox\x12R\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02R\n" +
+	"sandbox_id\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
 	"\x18GetGatewayConfigResponse\x12X\n" +
 	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +
@@ -2271,41 +2280,42 @@ func file_sandbox_proto_rawDescGZIP() []byte {
 var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
 var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_sandbox_proto_goTypes = []any{
-	(SettingScope)(0),                   // 0: openshell.sandbox.v1.SettingScope
-	(PolicySource)(0),                   // 1: openshell.sandbox.v1.PolicySource
-	(*SandboxPolicy)(nil),               // 2: openshell.sandbox.v1.SandboxPolicy
-	(*FilesystemPolicy)(nil),            // 3: openshell.sandbox.v1.FilesystemPolicy
-	(*LandlockPolicy)(nil),              // 4: openshell.sandbox.v1.LandlockPolicy
-	(*ProcessPolicy)(nil),               // 5: openshell.sandbox.v1.ProcessPolicy
-	(*NetworkPolicyRule)(nil),           // 6: openshell.sandbox.v1.NetworkPolicyRule
-	(*NetworkMiddlewareConfig)(nil),     // 7: openshell.sandbox.v1.NetworkMiddlewareConfig
-	(*MiddlewareEndpointSelector)(nil),  // 8: openshell.sandbox.v1.MiddlewareEndpointSelector
-	(*NetworkCredentialBinding)(nil),    // 9: openshell.sandbox.v1.NetworkCredentialBinding
-	(*NetworkEndpoint)(nil),             // 10: openshell.sandbox.v1.NetworkEndpoint
-	(*McpOptions)(nil),                  // 11: openshell.sandbox.v1.McpOptions
-	(*GraphqlOperation)(nil),            // 12: openshell.sandbox.v1.GraphqlOperation
-	(*L7DenyRule)(nil),                  // 13: openshell.sandbox.v1.L7DenyRule
-	(*L7Rule)(nil),                      // 14: openshell.sandbox.v1.L7Rule
-	(*L7Allow)(nil),                     // 15: openshell.sandbox.v1.L7Allow
-	(*L7QueryMatcher)(nil),              // 16: openshell.sandbox.v1.L7QueryMatcher
-	(*NetworkBinary)(nil),               // 17: openshell.sandbox.v1.NetworkBinary
-	(*GetSandboxConfigRequest)(nil),     // 18: openshell.sandbox.v1.GetSandboxConfigRequest
-	(*GetGatewayConfigRequest)(nil),     // 19: openshell.sandbox.v1.GetGatewayConfigRequest
-	(*GetGatewayConfigResponse)(nil),    // 20: openshell.sandbox.v1.GetGatewayConfigResponse
-	(*SettingValue)(nil),                // 21: openshell.sandbox.v1.SettingValue
-	(*EffectiveSetting)(nil),            // 22: openshell.sandbox.v1.EffectiveSetting
-	(*GetSandboxConfigResponse)(nil),    // 23: openshell.sandbox.v1.GetSandboxConfigResponse
-	(*SupervisorMiddlewareService)(nil), // 24: openshell.sandbox.v1.SupervisorMiddlewareService
-	nil,                                 // 25: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	nil,                                 // 26: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
-	nil,                                 // 27: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	nil,                                 // 28: openshell.sandbox.v1.L7DenyRule.QueryEntry
-	nil,                                 // 29: openshell.sandbox.v1.L7DenyRule.ParamsEntry
-	nil,                                 // 30: openshell.sandbox.v1.L7Allow.QueryEntry
-	nil,                                 // 31: openshell.sandbox.v1.L7Allow.ParamsEntry
-	nil,                                 // 32: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	nil,                                 // 33: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
-	(*structpb.Struct)(nil),             // 34: google.protobuf.Struct
+	(SettingScope)(0),                     // 0: openshell.sandbox.v1.SettingScope
+	(PolicySource)(0),                     // 1: openshell.sandbox.v1.PolicySource
+	(*SandboxPolicy)(nil),                 // 2: openshell.sandbox.v1.SandboxPolicy
+	(*FilesystemPolicy)(nil),              // 3: openshell.sandbox.v1.FilesystemPolicy
+	(*LandlockPolicy)(nil),                // 4: openshell.sandbox.v1.LandlockPolicy
+	(*ProcessPolicy)(nil),                 // 5: openshell.sandbox.v1.ProcessPolicy
+	(*NetworkPolicyRule)(nil),             // 6: openshell.sandbox.v1.NetworkPolicyRule
+	(*NetworkMiddlewareConfig)(nil),       // 7: openshell.sandbox.v1.NetworkMiddlewareConfig
+	(*MiddlewareEndpointSelector)(nil),    // 8: openshell.sandbox.v1.MiddlewareEndpointSelector
+	(*NetworkCredentialBinding)(nil),      // 9: openshell.sandbox.v1.NetworkCredentialBinding
+	(*NetworkEndpoint)(nil),               // 10: openshell.sandbox.v1.NetworkEndpoint
+	(*McpOptions)(nil),                    // 11: openshell.sandbox.v1.McpOptions
+	(*GraphqlOperation)(nil),              // 12: openshell.sandbox.v1.GraphqlOperation
+	(*L7DenyRule)(nil),                    // 13: openshell.sandbox.v1.L7DenyRule
+	(*L7Rule)(nil),                        // 14: openshell.sandbox.v1.L7Rule
+	(*L7Allow)(nil),                       // 15: openshell.sandbox.v1.L7Allow
+	(*L7QueryMatcher)(nil),                // 16: openshell.sandbox.v1.L7QueryMatcher
+	(*NetworkBinary)(nil),                 // 17: openshell.sandbox.v1.NetworkBinary
+	(*GetSandboxConfigRequest)(nil),       // 18: openshell.sandbox.v1.GetSandboxConfigRequest
+	(*GetGatewayConfigRequest)(nil),       // 19: openshell.sandbox.v1.GetGatewayConfigRequest
+	(*GetGatewayConfigResponse)(nil),      // 20: openshell.sandbox.v1.GetGatewayConfigResponse
+	(*SettingValue)(nil),                  // 21: openshell.sandbox.v1.SettingValue
+	(*EffectiveSetting)(nil),              // 22: openshell.sandbox.v1.EffectiveSetting
+	(*GetSandboxConfigResponse)(nil),      // 23: openshell.sandbox.v1.GetSandboxConfigResponse
+	(*SupervisorMiddlewareService)(nil),   // 24: openshell.sandbox.v1.SupervisorMiddlewareService
+	nil,                                   // 25: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	nil,                                   // 26: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
+	nil,                                   // 27: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	nil,                                   // 28: openshell.sandbox.v1.L7DenyRule.QueryEntry
+	nil,                                   // 29: openshell.sandbox.v1.L7DenyRule.ParamsEntry
+	nil,                                   // 30: openshell.sandbox.v1.L7Allow.QueryEntry
+	nil,                                   // 31: openshell.sandbox.v1.L7Allow.ParamsEntry
+	nil,                                   // 32: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	nil,                                   // 33: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	(*structpb.Struct)(nil),               // 34: google.protobuf.Struct
+	(*datamodelv1.WorkspaceSelector)(nil), // 35: openshell.datamodel.v1.WorkspaceSelector
 }
 var file_sandbox_proto_depIdxs = []int32{
 	3,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
@@ -2327,27 +2337,28 @@ var file_sandbox_proto_depIdxs = []int32{
 	15, // 16: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
 	30, // 17: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
 	31, // 18: openshell.sandbox.v1.L7Allow.params:type_name -> openshell.sandbox.v1.L7Allow.ParamsEntry
-	32, // 19: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	21, // 20: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
-	0,  // 21: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
-	2,  // 22: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	33, // 23: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
-	1,  // 24: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	24, // 25: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	6,  // 26: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	7,  // 27: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
-	12, // 28: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	16, // 29: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 30: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 31: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 32: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	21, // 33: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	22, // 34: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	35, // [35:35] is the sub-list for method output_type
-	35, // [35:35] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	35, // 19: openshell.sandbox.v1.GetSandboxConfigRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	32, // 20: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	21, // 21: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
+	0,  // 22: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
+	2,  // 23: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	33, // 24: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	1,  // 25: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
+	24, // 26: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
+	6,  // 27: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	7,  // 28: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
+	12, // 29: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
+	16, // 30: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 31: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 32: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 33: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	21, // 34: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
+	22, // 35: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	36, // [36:36] is the sub-list for method output_type
+	36, // [36:36] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }
