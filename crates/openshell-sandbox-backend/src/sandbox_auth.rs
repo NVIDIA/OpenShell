@@ -152,6 +152,9 @@ impl SandboxConnectionRegistry {
             return Err(SandboxAuthError::TerminalSession);
         }
         if let Some(active) = state.active {
+            if active.id == principal.connection_id && active.epoch == epoch {
+                return Ok(None);
+            }
             if epoch <= active.epoch {
                 return Err(SandboxAuthError::StaleCredentialEpoch);
             }
@@ -344,10 +347,7 @@ mod tests {
             .expect("first principal");
         let registry = SandboxConnectionRegistry::default();
         assert_eq!(registry.attach(&first), Ok(None));
-        assert_eq!(
-            registry.attach(&first),
-            Err(SandboxAuthError::StaleCredentialEpoch)
-        );
+        assert_eq!(registry.attach(&first), Ok(None));
 
         registry.disconnect(first_id);
         assert_eq!(registry.attach(&first), Ok(None));

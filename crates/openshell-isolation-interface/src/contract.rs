@@ -545,7 +545,7 @@ pub struct SandboxConfirmEvidence {
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
     pub authenticated_supervisor: bool,
-    pub session_epoch: String,
+    pub session_id: SandboxSessionId,
     pub driver_fence: DriverFenceEvidence,
     /// The driver-owned containment primitive terminates the workload when its
     /// Sandbox Runtime exits.
@@ -581,8 +581,7 @@ impl SandboxConfirmEvidence {
             && self.tcp_deny_round_trip
             && self.authenticated_supervisor
             && self.runtime_exit_terminates_workload
-            && !self.generation.is_empty()
-            && !self.session_epoch.is_empty();
+            && !self.generation.is_empty();
         if complete {
             Ok(())
         } else {
