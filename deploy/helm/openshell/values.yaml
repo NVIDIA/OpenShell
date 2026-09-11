@@ -225,7 +225,7 @@ server:
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
   # -- Default sandbox image used when requests do not specify one.
-  sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+  sandboxImage: "docker.io/library/alpine:3.22"
   # -- Pull policy for sandbox pods. Leave unset to use the Kubernetes image
   # default (Always for :latest, IfNotPresent otherwise). Prefer always,
   # if_not_present, or never; the chart also accepts legacy Kubernetes spellings

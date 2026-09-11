@@ -29,7 +29,7 @@ spec:
       tag: latest
       pullPolicy: __IMAGE_PULL_POLICY__
     server:
-      sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      sandboxImage: docker.io/library/alpine:3.22
       sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
       supervisorImage: ghcr.io/nvidia/openshell/supervisor:latest
       dbUrl: __DB_URL__
