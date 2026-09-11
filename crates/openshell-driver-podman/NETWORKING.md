@@ -7,7 +7,7 @@ environment variable.
 
 ```text
 workload container                       supervisor container
-agent -> sandbox -- private UDS / gRPC -> policy proxy -> Podman network -> destination
+agent -> sandbox -- private UDS / gRPC -> policy proxy -> host network -> destination
                                             |
                                             +-- authenticated gateway callback
 ```
@@ -26,9 +26,10 @@ supervisor. General UDP is unsupported.
 
 ## Supervisor callback network
 
-The configured `network_name`, host-gateway aliases, upstream corporate proxy,
-and published SSH port apply only to the supervisor companion. The gateway's
-SSH tunnel still uses the supervisor relay, not the published port.
+The supervisor companion uses Podman's host network. Host-gateway aliases and
+the upstream corporate proxy apply only to the supervisor. The gateway's SSH
+tunnel uses the supervisor relay over its private Unix socket, so the driver
+does not publish a supervisor port.
 
 Rootful Podman uses the configured bridge and its gateway address. Rootless
 local callbacks require the existing pasta path; slirp4netns or unknown helpers
@@ -50,7 +51,7 @@ Inspect both containers with the same sandbox-ID label, distinguishing
 - Sandbox cannot authenticate to supervisor: check the private channel volume,
   matching user namespace mappings, and shared SELinux label.
 - Supervisor cannot call back: inspect its configured gateway endpoint,
-  credentials, Podman network, and gateway callback listener.
+  credentials, host network, and gateway callback listener.
 - DNS or egress denied: inspect supervisor policy decisions. Do not add a
   workload network, resolver bypass, or direct gateway route.
 - Pair is not Ready: check the supervisor health socket and gateway session.

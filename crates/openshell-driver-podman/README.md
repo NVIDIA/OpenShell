@@ -18,7 +18,7 @@ identity, DNS, TCP, and loopback-forwarding semantics.
 | UID/GID | Pinned non-root workload identity | Same mapped identity |
 | Capabilities | Drop all; add none | Drop all; add none |
 | Seccomp | Runtime default plus sandbox-installed filters | Runtime default |
-| Network | `none`; loopback only | Configured Podman network |
+| Network | `none`; loopback only | Podman host network |
 | Gateway JWT and upstream credentials | Never mounted | Podman secrets |
 | User volumes and CDI devices | Workload only | Never mounted |
 | Channel | Private named volume, writable | Same volume, read-only |
@@ -112,7 +112,7 @@ root cannot be replaced. User-owned volumes are never created or deleted.
 
 See [gateway configuration](../../docs/reference/gateway-config.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for callback networking.
-The configured network and upstream proxy belong to the supervisor.
+The supervisor uses Podman's host network and owns the upstream proxy settings.
 `health_check_interval_secs=0` uses a one-second check rather than disabling
 the readiness check required by this topology.
 
