@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::{StreamExt as _, stream};
 use metrics::{counter, gauge, histogram};
 use openshell_core::ObjectId;
 use openshell_core::proto::{
@@ -18,7 +19,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::persistence::{ObjectType, current_time_ms};
+use crate::persistence::{KnownVersionUpdate, ObjectType, current_time_ms};
 use crate::storage_proto::StoredConfigUpdateOperation;
 
 pub const CONFIG_UPDATE_OPERATION_OBJECT_TYPE: &str = "config_update_operation";
@@ -212,16 +213,18 @@ where
             .metadata
             .as_ref()
             .map_or(0, |metadata| metadata.resource_version);
-        let mut changed = false;
+        let mut candidate = current.clone();
+        let changed = mutate(&mut candidate);
+        if !changed {
+            return Ok(Some((current, false)));
+        }
         let updated = state
             .store
-            .update_message_cas::<StoredConfigUpdateOperation, _>(operation_id, version, |record| {
-                changed = mutate(record);
-            })
+            .update_config_operation_cas(&candidate, version)
             .await;
         match updated {
-            Ok(updated) => return Ok(Some((updated, changed))),
-            Err(crate::persistence::PersistenceError::Conflict { .. }) => {}
+            Ok(KnownVersionUpdate::Changed(updated)) => return Ok(Some((updated, true))),
+            Ok(KnownVersionUpdate::Conflict) => {}
             Err(error) => {
                 return Err(Status::internal(format!(
                     "persist update operation transition failed: {error}"
@@ -242,7 +245,7 @@ async fn finish(
     error: &str,
 ) -> Result<(), Status> {
     let now = current_time_ms();
-    let _ = mutate_record(state, operation_id, |record| {
+    let transition = mutate_record(state, operation_id, |record| {
         let Some(operation) = record.operation.as_mut() else {
             return false;
         };
@@ -258,11 +261,16 @@ async fn finish(
         true
     })
     .await?;
-    counter!(
-        "openshell_config_update_operations_terminal_total",
-        "state" => terminal_state.as_str_name()
-    )
-    .increment(1);
+    if let Some((record, true)) = transition {
+        counter!(
+            "openshell_config_update_operations_terminal_total",
+            "state" => terminal_state.as_str_name()
+        )
+        .increment(1);
+        if let Some(operation) = record.operation.as_ref() {
+            state.sandbox_watch_bus.notify(&operation.sandbox_id);
+        }
+    }
     Ok(())
 }
 
@@ -305,104 +313,221 @@ pub async fn reconcile_one(state: &Arc<ServerState>, operation_id: &str) -> Resu
     let Some(record) = get_record(state, operation_id).await? else {
         return Ok(());
     };
-    let operation = public_operation(&record)?;
-    let operation_state = ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
-    if terminal(operation_state) {
+    reconcile_records_for_sandbox(state, vec![record]).await
+}
+
+async fn reconcile_records_for_sandbox(
+    state: &Arc<ServerState>,
+    records: Vec<StoredConfigUpdateOperation>,
+) -> Result<(), Status> {
+    let Some(first_operation) = records.first().and_then(|record| record.operation.as_ref()) else {
         return Ok(());
-    }
+    };
+    let sandbox_id = first_operation.sandbox_id.clone();
 
     let Some(sandbox) = state
         .store
-        .get_message::<Sandbox>(&operation.sandbox_id)
+        .get_message::<Sandbox>(&sandbox_id)
         .await
         .map_err(|error| Status::internal(format!("fetch operation sandbox failed: {error}")))?
     else {
-        return finish(
-            state,
-            operation_id,
-            ConfigUpdateOperationState::Cancelled,
-            ConfigApplyOutcome::Unspecified,
-            "sandbox no longer exists",
-        )
-        .await;
+        for record in records {
+            if let Some(operation) = record.operation.as_ref() {
+                finish(
+                    state,
+                    &operation.operation_id,
+                    ConfigUpdateOperationState::Cancelled,
+                    ConfigApplyOutcome::Unspecified,
+                    "sandbox no longer exists",
+                )
+                .await?;
+            }
+        }
+        return Ok(());
     };
 
     match initial_state(sandbox_phase(&sandbox)) {
         ConfigUpdateOperationState::Inactive => {
-            return finish(
-                state,
-                operation_id,
-                ConfigUpdateOperationState::Inactive,
-                ConfigApplyOutcome::Unspecified,
-                "",
-            )
-            .await;
+            for record in records {
+                if let Some(operation) = record.operation.as_ref() {
+                    finish(
+                        state,
+                        &operation.operation_id,
+                        ConfigUpdateOperationState::Inactive,
+                        ConfigApplyOutcome::Unspecified,
+                        "",
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
         }
         ConfigUpdateOperationState::Cancelled => {
-            return finish(
-                state,
-                operation_id,
-                ConfigUpdateOperationState::Cancelled,
-                ConfigApplyOutcome::Unspecified,
-                "sandbox is deleting",
-            )
-            .await;
+            for record in records {
+                if let Some(operation) = record.operation.as_ref() {
+                    finish(
+                        state,
+                        &operation.operation_id,
+                        ConfigUpdateOperationState::Cancelled,
+                        ConfigApplyOutcome::Unspecified,
+                        "sandbox is deleting",
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
         }
         _ => {}
     }
 
+    let now = current_time_ms();
+    let mut claimed_records = Vec::new();
+    for record in records {
+        let operation = public_operation(&record)?;
+        let operation_state =
+            ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
+        if terminal(operation_state) {
+            continue;
+        }
+        let claimed = mutate_record(state, &operation.operation_id, |stored| {
+            let Some(operation) = stored.operation.as_mut() else {
+                return false;
+            };
+            if ConfigUpdateOperationState::try_from(operation.state).is_ok_and(terminal)
+                || stored.next_attempt_at_ms > now
+            {
+                return false;
+            }
+            operation.updated_at_ms = now;
+            stored.attempt_count = stored.attempt_count.saturating_add(1);
+            let exponent = stored.attempt_count.min(8);
+            let delay_ms = 250_i64.saturating_mul(1_i64 << exponent).min(30_000);
+            stored.next_attempt_at_ms = now.saturating_add(delay_ms);
+            true
+        })
+        .await?;
+        if let Some((claimed, true)) = claimed {
+            claimed_records.push(claimed);
+        }
+    }
+    if claimed_records.is_empty() {
+        return Ok(());
+    }
+
+    // Claim commits above keep slow snapshot construction and delivery out of
+    // the write transaction. Another gateway may inspect the same batch, but
+    // its CAS sees the advanced retry deadline and does no work.
     let snapshot = crate::grpc::policy::build_sandbox_config_snapshot(state, &sandbox).await?;
-    match target_relation(&record, &snapshot) {
-        std::cmp::Ordering::Greater => {
-            finish(
-                state,
-                operation_id,
-                ConfigUpdateOperationState::Superseded,
-                ConfigApplyOutcome::IgnoredStale,
-                "a newer desired revision replaced this update before application",
-            )
-            .await?;
-        }
-        std::cmp::Ordering::Less => {
-            debug!(
-                operation_id,
-                "desired revision has not reached update operation target"
-            );
-        }
-        std::cmp::Ordering::Equal => {
-            let target_revision = snapshot_revision(&snapshot);
-            let now = current_time_ms();
-            let claimed = mutate_record(state, operation_id, |stored| {
-                let Some(operation) = stored.operation.as_mut() else {
-                    return false;
-                };
-                if ConfigUpdateOperationState::try_from(operation.state).is_ok_and(terminal) {
-                    return false;
-                }
-                if stored.next_attempt_at_ms > now {
-                    return false;
-                }
-                operation.target_revision = Some(target_revision);
-                operation.updated_at_ms = now;
-                stored.attempt_count = stored.attempt_count.saturating_add(1);
-                let exponent = stored.attempt_count.min(8);
-                let delay_ms = 250_i64.saturating_mul(1_i64 << exponent).min(30_000);
-                stored.next_attempt_at_ms = now.saturating_add(delay_ms);
-                true
-            })
-            .await?;
-            if claimed.is_some_and(|(_, changed)| changed) {
-                let components = if record.response_policy_version == 0 {
-                    crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
-                } else {
-                    crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
-                };
-                crate::config_delivery::publish_sandbox_components(
+    let mut publish_provider_environment = false;
+    let mut claimed_any = false;
+    for record in claimed_records {
+        let operation = public_operation(&record)?;
+        match target_relation(&record, &snapshot) {
+            std::cmp::Ordering::Greater => {
+                finish(
                     state,
-                    &operation.sandbox_id,
-                    components,
+                    &operation.operation_id,
+                    ConfigUpdateOperationState::Superseded,
+                    ConfigApplyOutcome::IgnoredStale,
+                    "a newer desired revision replaced this update before application",
+                )
+                .await?;
+            }
+            std::cmp::Ordering::Less => {
+                debug!(
+                    operation_id = operation.operation_id,
+                    "desired revision has not reached update operation target"
                 );
             }
+            std::cmp::Ordering::Equal => {
+                let target_revision = snapshot_revision(&snapshot);
+                let _ = mutate_record(state, &operation.operation_id, |stored| {
+                    let Some(operation) = stored.operation.as_mut() else {
+                        return false;
+                    };
+                    if ConfigUpdateOperationState::try_from(operation.state).is_ok_and(terminal) {
+                        return false;
+                    }
+                    if operation.target_revision.as_ref() == Some(&target_revision) {
+                        return false;
+                    }
+                    operation.target_revision = Some(target_revision);
+                    operation.updated_at_ms = now;
+                    true
+                })
+                .await?;
+                claimed_any = true;
+                publish_provider_environment |= record.response_policy_version != 0;
+            }
+        }
+    }
+    if claimed_any {
+        let components = if publish_provider_environment {
+            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+        } else {
+            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+        };
+        crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
+    }
+    Ok(())
+}
+
+pub async fn complete_from_apply_results(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    results: &[ConfigComponentApplyResult],
+) -> Result<(), Status> {
+    let relevant: Vec<_> = results
+        .iter()
+        .filter(|result| result.component != ConfigComponent::ProviderEnvironment as i32)
+        .collect();
+    if relevant.is_empty() {
+        return Ok(());
+    }
+    let operations = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list update operations failed: {error}")))?;
+    for record in operations {
+        let Some(operation) = record.operation.as_ref() else {
+            continue;
+        };
+        for result in &relevant {
+            let requested = result
+                .requested_revision
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("configuration result revision missing"))?;
+            if operation.component != result.component
+                || operation.target_revision.as_ref() != Some(requested)
+            {
+                continue;
+            }
+            let outcome = ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default();
+            let terminal_state = match outcome {
+                ConfigApplyOutcome::Applied
+                | ConfigApplyOutcome::IgnoredDuplicate
+                | ConfigApplyOutcome::Degraded => ConfigUpdateOperationState::Applied,
+                ConfigApplyOutcome::IgnoredStale => ConfigUpdateOperationState::Superseded,
+                ConfigApplyOutcome::RetainedLocalOverride
+                | ConfigApplyOutcome::FailedRetainedLastKnownGood
+                | ConfigApplyOutcome::FailedClosed
+                | ConfigApplyOutcome::Unsupported
+                | ConfigApplyOutcome::Unspecified => ConfigUpdateOperationState::Failed,
+            };
+            let failure = result
+                .failure
+                .as_ref()
+                .map_or("", |failure| failure.message.as_str());
+            finish(
+                state,
+                &operation.operation_id,
+                terminal_state,
+                outcome,
+                failure,
+            )
+            .await?;
+            break;
         }
     }
     Ok(())
@@ -413,60 +538,7 @@ pub async fn complete_from_apply_result(
     sandbox_id: &str,
     result: &ConfigComponentApplyResult,
 ) -> Result<(), Status> {
-    let requested = result
-        .requested_revision
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("configuration result revision missing"))?;
-    let outcome = ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default();
-    let terminal_state = match outcome {
-        ConfigApplyOutcome::Applied
-        | ConfigApplyOutcome::IgnoredDuplicate
-        | ConfigApplyOutcome::Degraded => ConfigUpdateOperationState::Applied,
-        ConfigApplyOutcome::IgnoredStale => ConfigUpdateOperationState::Superseded,
-        ConfigApplyOutcome::RetainedLocalOverride
-        | ConfigApplyOutcome::FailedRetainedLastKnownGood
-        | ConfigApplyOutcome::FailedClosed
-        | ConfigApplyOutcome::Unsupported
-        | ConfigApplyOutcome::Unspecified => ConfigUpdateOperationState::Failed,
-    };
-    let failure = result
-        .failure
-        .as_ref()
-        .map_or("", |failure| failure.message.as_str());
-    let mut offset = 0;
-    loop {
-        let operations = state
-            .store
-            .list_all_messages::<StoredConfigUpdateOperation>(OPERATION_SCAN_PAGE_SIZE, offset)
-            .await
-            .map_err(|error| Status::internal(format!("list update operations failed: {error}")))?;
-        let page_len = operations.len();
-        for record in operations {
-            let Some(operation) = record.operation.as_ref() else {
-                continue;
-            };
-            if operation.sandbox_id == sandbox_id
-                && operation.component == result.component
-                && operation.target_revision.as_ref() == Some(requested)
-                && ConfigUpdateOperationState::try_from(operation.state)
-                    .is_ok_and(|state| state == ConfigUpdateOperationState::Pending)
-            {
-                finish(
-                    state,
-                    &operation.operation_id,
-                    terminal_state,
-                    outcome,
-                    failure,
-                )
-                .await?;
-            }
-        }
-        if page_len < OPERATION_SCAN_PAGE_SIZE as usize {
-            break;
-        }
-        offset = offset.saturating_add(OPERATION_SCAN_PAGE_SIZE);
-    }
-    Ok(())
+    complete_from_apply_results(state, sandbox_id, std::slice::from_ref(result)).await
 }
 
 pub async fn wait_for_terminal(
@@ -514,55 +586,79 @@ pub async fn wait_for_terminal(
     }
 }
 
+async fn reconcile_sandbox(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
+    let operations = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list sandbox operations failed: {error}")))?;
+    reconcile_records_for_sandbox(state, operations).await
+}
+
+async fn reconcile_due_batch(state: &Arc<ServerState>) {
+    let now = current_time_ms();
+    match state
+        .store
+        .list_due_config_update_operations(now, OPERATION_SCAN_PAGE_SIZE)
+        .await
+    {
+        Ok(operations) => {
+            let mut sandbox_groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for record in operations {
+                let Some(sandbox_id) = record
+                    .operation
+                    .as_ref()
+                    .map(|operation| operation.sandbox_id.clone())
+                else {
+                    continue;
+                };
+                sandbox_groups.entry(sandbox_id).or_default().push(record);
+            }
+            let concurrency = state.store.max_connections().saturating_sub(1).max(1) as usize;
+            stream::iter(sandbox_groups)
+                .for_each_concurrent(concurrency, |(sandbox_id, records)| {
+                    let state = state.clone();
+                    async move {
+                        if let Err(error) = reconcile_records_for_sandbox(&state, records).await {
+                            warn!(sandbox_id, error = %error, "update operation reconciliation failed");
+                        }
+                    }
+                })
+                .await;
+        }
+        Err(error) => warn!(error = %error, "failed to list due update operations"),
+    }
+    match state.store.count_pending_config_update_operations().await {
+        Ok(pending) => {
+            gauge!("openshell_config_update_operations_pending")
+                .set(u32::try_from(pending).unwrap_or(u32::MAX));
+        }
+        Err(error) => warn!(error = %error, "failed to count pending update operations"),
+    }
+}
+
 pub fn spawn_reconciler(state: Arc<ServerState>, interval: Duration) {
+    let mut changed_sandboxes = state.sandbox_watch_bus.subscribe_all();
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         timer.tick().await;
         loop {
-            timer.tick().await;
-            let now = current_time_ms();
-            let mut offset = 0;
-            let mut pending = 0_u32;
-            loop {
-                match state
-                    .store
-                    .list_all_messages::<StoredConfigUpdateOperation>(
-                        OPERATION_SCAN_PAGE_SIZE,
-                        offset,
-                    )
-                    .await
-                {
-                    Ok(operations) => {
-                        let page_len = operations.len();
-                        for record in operations {
-                            let Some(operation) = record.operation.as_ref() else {
-                                continue;
-                            };
-                            let operation_state =
-                                ConfigUpdateOperationState::try_from(operation.state)
-                                    .unwrap_or_default();
-                            if operation_state == ConfigUpdateOperationState::Pending {
-                                pending = pending.saturating_add(1);
-                                if record.next_attempt_at_ms <= now
-                                    && let Err(error) =
-                                        reconcile_one(&state, &operation.operation_id).await
-                                {
-                                    warn!(operation_id = %operation.operation_id, error = %error, "update operation reconciliation failed");
-                                }
+            tokio::select! {
+                _ = timer.tick() => reconcile_due_batch(&state).await,
+                changed = changed_sandboxes.recv() => {
+                    match changed {
+                        Ok(sandbox_id) => {
+                            if let Err(error) = reconcile_sandbox(&state, &sandbox_id).await {
+                                warn!(sandbox_id, error = %error, "sandbox update operation reconciliation failed");
                             }
                         }
-                        if page_len < OPERATION_SCAN_PAGE_SIZE as usize {
-                            break;
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            reconcile_due_batch(&state).await;
                         }
-                        offset = offset.saturating_add(OPERATION_SCAN_PAGE_SIZE);
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "failed to scan pending update operations");
-                        break;
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
                 }
             }
-            gauge!("openshell_config_update_operations_pending").set(pending);
         }
     });
 }

@@ -406,8 +406,12 @@ record; sandbox metadata receives the same annotations only as a convenience
 projection and can retain keys from earlier revisions. Policy revision creation,
 optional first-policy backfill, metadata projection, and superseding older
 revisions commit in one database transaction. SQLite serializes this operation
-with an immediate transaction, while Postgres locks the sandbox row. A failed
-resource-version check or revision insert rolls back the entire operation.
+with an immediate transaction. Postgres first locks a dedicated configuration
+fence keyed by sandbox ID, then locks the sandbox row. Settings mutations take
+the same fence before reading the current policy target. This makes concurrent
+policy and settings commits select targets in one database-owned serial order
+across gateway replicas. A failed resource-version check, desired-state write,
+projection, or operation insert rolls back the entire transaction.
 
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
@@ -686,7 +690,15 @@ terminal. Pending-operation reconciliation provides crash recovery and can run
 on a gateway other than the request handler; local notifications are wake-up
 hints only. Operations persist revisions, outcome, timestamps, response
 metadata, and bounded sanitized errors, never complete configuration payloads
-or credentials.
+or credentials. The SQL status column changes atomically with the encoded
+operation. Result correlation queries only pending operations scoped to the
+reporting sandbox. Recovery claims bounded due batches, commits each retry
+deadline before snapshot construction, groups work by sandbox, and publishes
+each component at most once per sandbox pass.
+
+Operation records and their idempotency keys currently have no automatic
+expiration. The gateway retains both until an explicit deletion contract is
+defined, so an idempotency key cannot be reused merely because time passed.
 
 See [sandbox configuration delivery](sandbox.md#supervisor-configuration-delivery)
 for bootstrap, revision, and supervisor application semantics.

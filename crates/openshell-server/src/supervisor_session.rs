@@ -1460,23 +1460,35 @@ async fn handle_supervisor_message(
             {
                 return;
             }
+            let mut persisted_results = Vec::with_capacity(result.results.len());
             for component in &result.results {
-                let persisted = record_component_apply_result(state, sandbox_id, component).await;
-                let completed = if persisted.is_ok() {
-                    crate::config_update_operation::complete_from_apply_result(
-                        state, sandbox_id, component,
-                    )
-                    .await
-                } else {
-                    Ok(())
-                };
-                if let Err(error) = persisted.and(completed) {
+                match record_component_apply_result(state, sandbox_id, component).await {
+                    Ok(()) => persisted_results.push(component.clone()),
+                    Err(error) => {
+                        warn!(
+                            sandbox_id,
+                            session_id,
+                            component = component.component,
+                            error = %error,
+                            "failed to persist supervisor bootstrap result"
+                        );
+                    }
+                }
+            }
+            if let Err(error) = crate::config_update_operation::complete_from_apply_results(
+                state,
+                sandbox_id,
+                &persisted_results,
+            )
+            .await
+            {
+                for component in &persisted_results {
                     warn!(
                         sandbox_id,
                         session_id,
                         component = component.component,
                         error = %error,
-                        "failed to persist supervisor bootstrap result"
+                        "failed to complete operation from supervisor bootstrap result"
                     );
                 }
             }

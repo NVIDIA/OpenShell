@@ -3770,23 +3770,10 @@ async fn handle_update_config_inner(
         .await;
     }
 
-    // Serialize sandbox-config mutations while their exact two-dimensional
-    // target (policy version plus settings revision) is selected. The durable
-    // operation is inserted by the same database transaction as the dimension
-    // that changes, so an acknowledgement can never complete the wrong state.
+    // Avoid redundant validation and snapshot construction within one gateway.
+    // The database transaction owns cross-replica serialization and completes
+    // the unchanged target dimension after locking the sandbox fence.
     let config_guard = state.settings_mutex.lock().await;
-    let target_settings_revision =
-        load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
-            .await?
-            .revision;
-    let target_policy_version = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
-        .map_or(0, |record| {
-            u32::try_from(record.version).unwrap_or(u32::MAX)
-        });
 
     let mut projected_annotations = response_annotations.clone();
     projected_annotations.extend(req.annotations.clone());
@@ -3829,7 +3816,7 @@ async fn handle_update_config_inner(
                     &workspace,
                     &req.idempotency_key,
                     OperationTarget {
-                        policy_version: target_policy_version,
+                        policy_version: 0,
                         settings_revision: sandbox_settings.revision,
                     },
                     CommittedResponse {
@@ -3910,7 +3897,7 @@ async fn handle_update_config_inner(
                 &workspace,
                 &req.idempotency_key,
                 OperationTarget {
-                    policy_version: target_policy_version,
+                    policy_version: 0,
                     settings_revision: sandbox_settings.revision,
                 },
                 CommittedResponse {
@@ -3990,7 +3977,6 @@ async fn handle_update_config_inner(
             annotations: &req.annotations,
             sandbox: &sandbox,
             idempotency_key: &req.idempotency_key,
-            target_settings_revision,
         };
         let baseline_policy = spec.policy.clone();
         let (version, hash, updated_sandbox, operation_id) = apply_merge_operations_with_retry(
@@ -4201,7 +4187,7 @@ async fn handle_update_config_inner(
                 &req.idempotency_key,
                 OperationTarget {
                     policy_version: u32::try_from(next_version).unwrap_or(u32::MAX),
-                    settings_revision: target_settings_revision,
+                    settings_revision: 0,
                 },
                 CommittedResponse {
                     policy_version: u32::try_from(next_version).unwrap_or(u32::MAX),
@@ -6885,7 +6871,6 @@ struct AtomicPolicyWriteContext<'a> {
     annotations: &'a HashMap<String, String>,
     sandbox: &'a Sandbox,
     idempotency_key: &'a str,
-    target_settings_revision: u64,
 }
 
 struct PolicyCredentialBindingValidationContext<'a> {
@@ -7119,7 +7104,7 @@ async fn apply_merge_operations_with_retry(
                 context.idempotency_key,
                 OperationTarget {
                     policy_version: u32::try_from(next_version).unwrap_or(u32::MAX),
-                    settings_revision: context.target_settings_revision,
+                    settings_revision: 0,
                 },
                 CommittedResponse {
                     policy_version: u32::try_from(next_version).unwrap_or(u32::MAX),
@@ -7652,6 +7637,7 @@ mod tests {
     };
     use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::persistence::test_store;
+    use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent, ConfigComponentApplyResult};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11398,7 +11384,6 @@ mod tests {
             Vec::new(),
         );
         state.store.put_message(&sandbox).await.unwrap();
-
         let error = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(openshell_core::proto::AttachSandboxProviderRequest {
@@ -21709,6 +21694,145 @@ mod tests {
                 .get("change-ticket")
                 .map(String::as_str),
             Some("1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_operation_transition_wakes_local_waiter() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-operation-wake",
+            "operation-wake",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "operation-wake-policy",
+                sandbox.object_id(),
+                "default",
+                1,
+                &ProtoSandboxPolicy::default().encode_to_vec(),
+                "operation-wake-policy-hash",
+            )
+            .await
+            .unwrap();
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox.object_name().to_string(),
+                setting_key: "ocsf_json_enabled".to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                idempotency_key: "wake-local-waiter".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let operation = response.operation.unwrap();
+        let requested_revision = operation.target_revision.unwrap();
+        let operation_id = operation.operation_id.clone();
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            config_update_operation::wait_for_terminal(&waiter_state, &operation_id, 5).await
+        });
+        tokio::task::yield_now().await;
+        config_update_operation::complete_from_apply_result(
+            &state,
+            sandbox.object_id(),
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(requested_revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("terminal transition should notify the local waiter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            openshell_core::proto::ConfigUpdateOperationState::try_from(terminal.state).unwrap(),
+            openshell_core::proto::ConfigUpdateOperationState::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_waiter_recovers_when_notification_is_missed() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-operation-poll",
+            "operation-poll",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "operation-poll-policy",
+                sandbox.object_id(),
+                "default",
+                1,
+                &ProtoSandboxPolicy::default().encode_to_vec(),
+                "operation-poll-policy-hash",
+            )
+            .await
+            .unwrap();
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox.object_name().to_string(),
+                setting_key: "ocsf_json_enabled".to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                consistency: ConfigUpdateConsistency::CommitOnly.into(),
+                idempotency_key: "poll-missed-notification".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let operation_id = response.operation.unwrap().operation_id;
+        let waiter_state = state.clone();
+        let waiter_operation_id = operation_id.clone();
+        let waiter = tokio::spawn(async move {
+            config_update_operation::wait_for_terminal(&waiter_state, &waiter_operation_id, 5).await
+        });
+        tokio::task::yield_now().await;
+        let mut record = config_update_operation::get_record(&state, &operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        record.operation.as_mut().unwrap().state =
+            openshell_core::proto::ConfigUpdateOperationState::Applied.into();
+        let resource_version = record.metadata.as_ref().unwrap().resource_version;
+        state
+            .store
+            .update_config_operation_cas(&record, resource_version)
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("point polling should recover a missed notification")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            openshell_core::proto::ConfigUpdateOperationState::try_from(terminal.state).unwrap(),
+            openshell_core::proto::ConfigUpdateOperationState::Applied
         );
     }
 

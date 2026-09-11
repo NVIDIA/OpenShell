@@ -549,9 +549,13 @@ after that commit; `WAIT_FOR_APPLY` durably waits for `applied`, `inactive`,
 `failed`, `superseded`, or `cancelled`. A client timeout does not roll back the
 mutation or cancel the operation, and the operation ID is returned in error
 metadata for later lookup. Stopped or completed sandboxes finish as `inactive`;
-session absence alone never does. A background reconciler pages through pending
-operations, rebuilds current snapshots, and republishes with bounded backoff,
-closing the crash window between commit and first delivery.
+session absence alone never does. A background reconciler reads pending
+operations in bounded due batches. It claims retry ownership before building a
+snapshot, groups claimed work by sandbox, and republishes each requested
+component at most once for that sandbox. Local sandbox-state notifications run
+the same scoped reconciliation path immediately. The periodic database query
+remains the recovery path when another gateway owns the waiter or a notification
+is missed.
 
 ## Policy Revision Acknowledgement
 

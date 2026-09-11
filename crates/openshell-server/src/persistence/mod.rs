@@ -36,6 +36,13 @@ pub struct AtomicSandboxProjection<'a> {
     pub expected_resource_version: u64,
 }
 
+/// Result of a compare-and-swap update that already has the current payload.
+#[derive(Debug)]
+pub enum KnownVersionUpdate<T> {
+    Changed(T),
+    Conflict,
+}
+
 /// Maximum number of object ids sent in one set-based delete statement.
 ///
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
@@ -398,6 +405,53 @@ impl Store {
             operation,
             sandbox_projection
         ))
+    }
+
+    /// Update an operation payload and its query columns with one CAS write.
+    pub async fn update_config_operation_cas(
+        &self,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<KnownVersionUpdate<crate::storage_proto::StoredConfigUpdateOperation>>
+    {
+        let resource_version = store_dispatch!(
+            self.update_config_operation_cas(operation, expected_resource_version)
+        )?;
+        let Some(resource_version) = resource_version else {
+            return Ok(KnownVersionUpdate::Conflict);
+        };
+        let mut updated = operation.clone();
+        updated.set_resource_version(resource_version);
+        Ok(KnownVersionUpdate::Changed(updated))
+    }
+
+    /// Return pending operations for one sandbox. Terminal history is excluded
+    /// by SQL before protobuf payloads are decoded.
+    pub async fn list_pending_config_operations_for_scope(
+        &self,
+        scope: &str,
+    ) -> PersistenceResult<Vec<crate::storage_proto::StoredConfigUpdateOperation>> {
+        store_dispatch!(self.list_pending_config_operations_for_scope(scope))?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// Return a bounded, stable batch of pending operations whose retry time
+    /// has arrived.
+    pub async fn list_due_config_update_operations(
+        &self,
+        now_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<crate::storage_proto::StoredConfigUpdateOperation>> {
+        store_dispatch!(self.list_due_config_update_operations(now_ms, limit))?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    pub async fn count_pending_config_update_operations(&self) -> PersistenceResult<u64> {
+        store_dispatch!(self.count_pending_config_update_operations())
     }
 
     /// Delete an object by id with compare-and-swap support.
