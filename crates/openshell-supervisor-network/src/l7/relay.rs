@@ -255,7 +255,7 @@ where
 }
 
 fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -295,7 +295,7 @@ fn build_credential_resolution_event(
     ctx: &L7EvalContext,
     endpoint_mismatch: bool,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -3088,6 +3088,31 @@ mod tests {
             .resolver_for_endpoint("denied.example.test", 443, "/outside")
             .expect("endpoint-scoped resolver");
         (state, resolver)
+    }
+
+    #[test]
+    fn early_rejections_use_network_class_with_known_destination() {
+        use openshell_ocsf::validation::{
+            load_class_schema, validate_enum_value, validate_required_fields,
+        };
+        let ctx = L7EvalContext {
+            host: "example.com".into(),
+            port: 443,
+            ..Default::default()
+        };
+        let schema = load_class_schema("network_activity");
+        for event in [
+            build_request_authority_mismatch_event(&ctx),
+            build_credential_resolution_event(&ctx, true),
+            build_credential_resolution_event(&ctx, false),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 4001);
+            assert_eq!(json["dst_endpoint"]["domain"], "example.com");
+            assert_eq!(json["action_id"], 2);
+            validate_required_fields(&json, &schema);
+            validate_enum_value(&json, "activity_id", &schema);
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 #[cfg(target_os = "linux")]
@@ -67,7 +67,7 @@ const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
 fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1328,6 +1328,34 @@ fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!("FORWARD parse error for {path}"))
+        .build()
+}
+
+/// Build the rejection event for an absolute-form request whose scheme is not
+/// supported by the forward proxy. The request URL is omitted because paths may
+/// contain credentials; the method and generated response provide the HTTP
+/// context required by OCSF 1.8.
+fn build_forward_unsupported_scheme_ocsf_event(
+    method: &str,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse { code: 400 })
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Rejected)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "FORWARD rejected: unsupported scheme {scheme} for {host}:{port}"
+        ))
         .build()
 }
 
@@ -4144,17 +4172,7 @@ async fn handle_forward_proxy(
     }
 
     if scheme != "http" {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Refuse)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Rejected)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .message(format!(
-                "FORWARD rejected: unsupported scheme {scheme} for {host_lc}:{port}"
-            ))
-            .build();
+        let event = build_forward_unsupported_scheme_ocsf_event(method, &scheme, &host_lc, port);
         ocsf_emit!(event);
         if scheme == "https" {
             respond(
@@ -9255,6 +9273,20 @@ network_policies:
         assert_eq!(malformed, "/[INVALID_REQUEST_TARGET]");
         assert!(!malformed.contains("API_TOKEN"));
         assert!(!malformed.contains("real-secret"));
+    }
+
+    #[test]
+    fn unsupported_forward_scheme_event_omits_request_url() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let event =
+            build_forward_unsupported_scheme_ocsf_event("GET", "https", "api.example.com", 443);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert!(json["http_request"].get("url").is_none());
+        assert_eq!(json["http_response"]["code"], 400);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
     }
 
     #[test]
