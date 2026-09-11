@@ -99,6 +99,8 @@ impl FakeComputeDriver {
                     driver_reports_runtime_readiness: false,
                     resource_capabilities: None,
                     supports_ui_policy: false,
+                    rootfs_tar_staging_dir: String::new(),
+                    rootfs_tar_max_bytes: 0,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,

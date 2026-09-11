@@ -9,8 +9,8 @@ position: 3
 ---
 
 An OpenShell workspace is an access and resource isolation boundary. Sandboxes,
-sandbox workload templates, providers, services, policies, settings, and
-inference routes belong to a workspace and are not visible to members of other
+sandbox workload templates, providers, provider profiles, services, policies,
+and settings belong to a workspace and are not visible to members of other
 workspaces.
 
 The CLI targets the `default` workspace unless you set `--workspace` or
@@ -126,7 +126,9 @@ openshell workspace member remove \
 
 Add `--output json` or `--output yaml` to list membership records for
 automation. Each record contains `subject` and a normalized `role` of `admin`,
-`user`, or `unknown`. An empty result is an empty collection.
+`user`, or `unknown`. Structured output is an envelope with `members` and
+`next_page_token` fields; pass the returned token to `--page-token` to
+continue. An empty result has an empty `members` collection.
 
 To change a member's role, remove the existing membership and add it again
 with the new role. A Platform Admin must perform any change to `admin`.
@@ -149,8 +151,9 @@ export OPENSHELL_WORKSPACE=team-ml
 openshell sandbox list
 ```
 
-An empty workspace value resolves to `default`. It never means all
-workspaces.
+When `--workspace` is omitted, the CLI intentionally selects the `default`
+workspace. An empty workspace name is invalid and never means either `default`
+or all workspaces.
 
 Platform Admins can opt into cross-workspace list operations:
 
@@ -159,6 +162,30 @@ openshell sandbox list --all-workspaces
 openshell provider list --all-workspaces
 openshell service list --all-workspaces
 ```
+
+The public API represents this choice with a `WorkspaceSelector` oneof. Set
+`workspace` to a non-empty name, including the literal `default`, or set the
+`all_workspaces` marker on list requests that support it. Omitting the selector
+or sending an unset selector is invalid for workspace-scoped operations. The
+all-workspaces variant is accepted only by sandbox, sandbox template, provider,
+and service list requests, and it requires Platform Admin access.
+
+Clients migrating from the previous request fields should make the scope
+explicit:
+
+| Previous request | Typed selector |
+| --- | --- |
+| `workspace: "team-ml"` | `workspace_scope.workspace: "team-ml"` |
+| Empty or omitted `workspace` for the default | `workspace_scope.workspace: "default"` |
+| `all_workspaces: true` | `workspace_scope.all_workspaces: {}` |
+| `global: true` | Omit `workspace_scope` |
+
+The Rust and Python SDKs expose separate all-workspaces list methods. The Go
+SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the
+TypeScript SDK uses a discriminated option type, so a caller cannot select a
+named workspace and all workspaces in one typed call.
+The TUI starts in the `default` workspace and sends that named selector
+explicitly. Its all-workspaces view sends the marker instead.
 
 Provider profiles and policy also have explicit `--global` operations. Those
 operations target platform scope and require Platform Admin access. A
@@ -193,8 +220,8 @@ openshell workspace delete team-ml
 A custom workspace must not contain sandboxes, sandbox workload templates,
 providers, provider profiles, services, SSH sessions, settings, policies, draft
 policy chunks, or credential refresh state. Remove those resources before
-retrying deletion. OpenShell removes membership records and inference routes as
-part of successful workspace deletion.
+retrying deletion. OpenShell removes membership records as part of successful
+workspace deletion.
 
 ## Next Steps
 

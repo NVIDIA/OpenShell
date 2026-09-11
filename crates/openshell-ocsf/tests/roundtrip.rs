@@ -12,14 +12,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthTypeId,
     BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder, ConnectionInfo,
-    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpActivityBuilder, HttpMethod,
-    HttpRequest, HttpResponse, LaunchTypeId, NetworkActivityBuilder, OcsfEvent, Process,
-    ProcessActivityBuilder, RiskLevelId, SandboxContext, SecurityLevelId, SeverityId,
-    SshActivityBuilder, StateId, StatusId, Url,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo,
+    HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
+    NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder, RiskLevelId,
+    SecurityLevelId, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
 };
 
-fn ctx() -> SandboxContext {
-    SandboxContext {
+fn ctx() -> EventContext {
+    EventContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
         container_image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
@@ -197,12 +197,11 @@ fn api_activity_round_trips() {
         .status(StatusId::Success)
         .http_request(HttpRequest {
             http_method: HttpMethod::Post,
-            url: Some(Url::new("https", "inference.local", "/v1/chat", 443)),
+            url: Some(Url::new("https", "api.example.com", "/v1/chat", 443)),
         })
-        .dst_endpoint(Endpoint::from_domain("inference.local", 443))
+        .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
         .ai_model(AiModel::new("llama-3.1-8b", "nvidia"))
-        .message("inference request routed")
-        .unmapped("route", "system")
+        .message("inference request completed")
         .build();
 
     assert_round_trips("api_activity", &event);

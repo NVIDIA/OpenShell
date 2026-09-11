@@ -82,6 +82,7 @@ pub(super) fn http_context(
         secret_resolver,
         provider_credentials,
         provider_credential_revision: None,
+        body_classifier: None,
         activity_tx,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -353,6 +354,7 @@ mod tests {
             secret_resolver: None,
             provider_credentials: None,
             provider_credential_revision: None,
+            body_classifier: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
@@ -409,6 +411,7 @@ mod tests {
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

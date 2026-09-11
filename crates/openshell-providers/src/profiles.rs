@@ -3272,6 +3272,75 @@ mod tests {
     }
 
     #[test]
+    fn builtin_agent_conversation_defaults_preserve_own_and_foreign_body_text() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        use openshell_core::secrets::body::BodyPlaceholderGuard;
+        let binding = |profile: &ProviderTypeProfile| StaticCredentialBinding {
+            credential_identity: profile.id.clone(),
+            workload_credential_handle: String::new(),
+            endpoints: profile
+                .to_proto()
+                .endpoints
+                .iter()
+                .map(|endpoint| StaticCredentialEndpointBinding {
+                    host: endpoint.host.clone(),
+                    port: endpoint.port,
+                    path: endpoint.path.clone(),
+                })
+                .collect(),
+        };
+        for id in ["codex", "claude-code", "copilot"] {
+            let profile = builtin_profile(id);
+            let model_key = profile.credential_env_vars()[0].to_owned();
+            let state = ProviderCredentialState::from_bound_environment(
+                42,
+                HashMap::from([
+                    ("GITHUB_TOKEN".into(), "github-test-secret".into()),
+                    (model_key.clone(), "model-test-secret".into()),
+                ]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([
+                    ("GITHUB_TOKEN".into(), binding(builtin_profile("github"))),
+                    (model_key.clone(), binding(profile)),
+                ]),
+                vec![],
+            )
+            .unwrap();
+            for endpoint in profile
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.protocol == "rest")
+            {
+                assert!(!endpoint.request_body_credential_rewrite);
+                assert!(!endpoint.allow_uninspected_credentials);
+                let (_, classifier, _) = state.resolver_and_body_classifier_for_endpoint(
+                    &endpoint.host,
+                    u16::try_from(endpoint.port).unwrap(),
+                    "/v1/responses",
+                );
+                let classifier = classifier.unwrap();
+                for token in [
+                    "openshell:resolve:env:KEY".to_owned(),
+                    state.snapshot().child_env["GITHUB_TOKEN"].clone(),
+                    state.snapshot().child_env[&model_key].clone(),
+                ] {
+                    let body = format!(r#"{{"tool_output":"Token: {token}"}}"#);
+                    let mut guard = BodyPlaceholderGuard::new(Some(&classifier));
+                    let mut forwarded = guard.push(body.as_bytes()).unwrap();
+                    forwarded.extend(guard.finish().unwrap());
+                    assert_eq!(forwarded, body.as_bytes());
+                }
+                assert_eq!(
+                    classifier.check(&state.snapshot().child_env[&model_key]),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn builtin_profiles_are_sorted_by_id() {
         let ids = builtin_profiles()
             .iter()

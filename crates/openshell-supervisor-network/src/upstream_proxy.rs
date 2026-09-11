@@ -1129,13 +1129,6 @@ mod tests {
         config_from(pairs).unwrap().unwrap()
     }
 
-    /// Install the process-wide rustls crypto provider once. Building a
-    /// `ClientConfig` (for an `https://` proxy) requires it; the install is
-    /// idempotent, so tests that build TLS configs call this first.
-    fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
     #[test]
     fn no_env_yields_none() {
         assert!(config_from(&[]).unwrap().is_none());
@@ -1270,7 +1263,6 @@ mod tests {
 
     #[test]
     fn https_proxy_scheme_enables_tls_and_requires_explicit_port() {
-        install_crypto_provider();
         // An explicit port is required (no scheme-default fallback), matching
         // the http:// grammar.
         let err = config_from(&[(HTTPS_PROXY, "https://proxy.corp.com")]).unwrap_err();
@@ -1314,7 +1306,6 @@ mod tests {
 
     #[test]
     fn unreadable_ca_bundle_is_fatal_for_https_proxy() {
-        install_crypto_provider();
         let err = config_from(&[
             (HTTPS_PROXY, "https://proxy.corp.com:3130"),
             (PROXY_CA_BUNDLE, "/nonexistent/proxy-ca.pem"),
@@ -1338,7 +1329,6 @@ mod tests {
 
     #[test]
     fn ca_bundle_with_no_certificates_is_fatal() {
-        install_crypto_provider();
         let bundle = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(bundle.path(), "not a certificate\n").unwrap();
         let path = bundle.path().to_string_lossy().into_owned();
@@ -1352,7 +1342,6 @@ mod tests {
 
     #[test]
     fn ca_bundle_with_invalid_der_certificates_is_fatal() {
-        install_crypto_provider();
         let bundle = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             bundle.path(),
@@ -1439,7 +1428,6 @@ mod tests {
 
     #[test]
     fn auth_file_without_insecure_acknowledgement_is_allowed_for_https_proxy() {
-        install_crypto_provider();
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "user:secret\n").unwrap();
         let path = file.path().to_str().unwrap().to_string();
@@ -2013,8 +2001,6 @@ mod tests {
 
         const SERVER_HOSTNAME: &str = "upstream.example.test";
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.
         let ca = tls::SandboxCa::generate().unwrap();
@@ -2246,7 +2232,6 @@ mod tests {
     /// the server task (yielding the received CONNECT request), and the
     /// server certificate PEM to use as the corporate CA bundle.
     async fn fake_tls_proxy() -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
-        install_crypto_provider();
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
             .unwrap()

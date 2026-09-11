@@ -120,7 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
@@ -181,6 +181,16 @@ jobs:
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
           cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox
+
+      - name: Verify selective gateway compute-driver builds
+        run: |
+          cargo test -p openshell-gateway --all-targets --no-default-features
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
       - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
         run: tasks/scripts/verify-defaults-without-telemetry.sh

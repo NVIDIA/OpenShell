@@ -77,6 +77,10 @@ pub struct MxcComputeConfig {
 
     /// Enable `--debug` flag on `wxc-exec` invocations.
     pub debug: bool,
+    /// Enable the in-process ETW → OCSF audit consumer (Plane A). Consumes the OS
+    /// Sandboxing provider MXC drives and emits OCSF into the gateway trail.
+    /// Requires the gateway account to be in "Performance Log Users" (or admin).
+    pub etw_audit: bool,
 }
 
 impl Default for MxcComputeConfig {
@@ -89,6 +93,7 @@ impl Default for MxcComputeConfig {
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
 
             debug: false,
+            etw_audit: false,
         }
     }
 }
@@ -186,6 +191,17 @@ pub struct MxcComputeBackend {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     policy_mapper: Arc<dyn PolicyMapper>,
+    /// In-process ETW → OCSF audit consumer (Plane A). `Some` only when
+    /// `config.etw_audit` is set and the session started; kept alive here so it
+    /// stops when the backend is dropped (held purely for its `Drop`, hence
+    /// never read directly).
+    #[allow(dead_code)]
+    etw_session: Option<crate::etw_consumer::EtwSession>,
+    /// Shared MXC-ETW → `sandbox_id` attribution index. Seeded by the driver
+    /// (`pid → sandbox_id`) as it launches sandboxes and read by the ETW
+    /// consumer thread to map/emit OCSF. `Arc` even when audit is off so the
+    /// launch path is branch-free.
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
 }
 
 impl std::fmt::Debug for MxcComputeBackend {
@@ -273,6 +289,26 @@ impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
         let (watch_tx, _) = broadcast::channel(256);
+
+        // Start the Plane-A ETW → OCSF consumer if enabled. The consumer thread
+        // attributes each event to a `sandbox_id` via `attribution` (seeded by
+        // the launch path) and emits OCSF for the mapped classes.
+        // Failure is non-fatal — the driver still runs, just without ETW audit.
+        let attribution = Arc::new(std::sync::Mutex::new(
+            crate::etw_consumer::AttributionIndex::new(),
+        ));
+        let etw_session = if config.etw_audit {
+            match crate::etw_consumer::start_session(attribution.clone()) {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    warn!(error = %e, "MXC ETW audit consumer failed to start; continuing without it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             invoker,
             config,
@@ -281,6 +317,8 @@ impl MxcComputeBackend {
             // Production policy translation is always handled by the embedded
             // mapper before any MXC lifecycle side effects begin.
             policy_mapper: Arc::new(EmbeddedPolicyMapper),
+            etw_session,
+            attribution,
         }
     }
 
@@ -302,6 +340,8 @@ impl MxcComputeBackend {
             driver_reports_runtime_readiness: true,
             resource_capabilities: None,
             supports_ui_policy: self.config.backend == MxcBackend::ProcessContainer,
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         }
     }
 
@@ -431,6 +471,7 @@ impl MxcComputeBackend {
         let config = self.config.clone();
         let registry = self.registry.clone();
         let watch_tx = self.watch_tx.clone();
+        let attribution = self.attribution.clone();
         let sandbox = sandbox.clone();
         tokio::spawn(async move {
             run_lifecycle(
@@ -438,6 +479,7 @@ impl MxcComputeBackend {
                 config,
                 registry,
                 watch_tx,
+                attribution,
                 sandbox,
                 sandbox_config,
                 mapped,
@@ -569,6 +611,9 @@ impl MxcComputeBackend {
 
         let mut registry = self.registry.lock().await;
         if registry.remove(sandbox_id).is_some() {
+            if let Ok(mut idx) = self.attribution.lock() {
+                idx.forget(sandbox_id);
+            }
             let _ = self.watch_tx.send(deleted_event(sandbox_id.to_string()));
             return Ok(true);
         }
@@ -630,6 +675,7 @@ async fn run_lifecycle(
     config: MxcComputeConfig,
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
     sandbox: DriverSandbox,
     sandbox_config: MxcSandboxConfig,
     mapped: MappedConfig,
@@ -758,19 +804,52 @@ async fn run_lifecycle(
         // process exit. Holding the registry lock while spawning prevents a
         // completed child from being overwritten with AgentRunning.
         let mut registry_guard = registry.lock().await;
-        if let Some(entry) = registry_guard.get_mut(&sandbox_id) {
-            entry.sandbox = ready_sandbox.clone();
-            entry.phase_state = PhaseState::Running;
-            entry.monitor_cancel = Some(cancel_tx);
-            entry.monitor_task = Some(tokio::spawn(monitor_exec(
-                registry.clone(),
-                watch_tx.clone(),
-                sandbox.clone(),
-                sandbox_id.clone(),
-                cancel_rx,
-                child,
-            )));
+        let Some(entry) = registry_guard.get_mut(&sandbox_id) else {
+            // The sandbox was deleted between agent launch and readiness. Bail
+            // without seeding ETW attribution (a stale key would misroute later
+            // events to a dead sandbox), without reporting Ready, and without
+            // spawning the exec monitor. `delete` already tore down the process.
+            return;
+        };
+
+        // Seed ETW attribution while holding the registry lock so a concurrent
+        // `delete` cannot remove the sandbox after we register (which would leave
+        // a stale key). The `wxc-exec` pid we just spawned is the collision-proof
+        // anchor that ties the `Sandboxing` provider's events back to this
+        // `sandbox_id` while the child is alive. Command text is never an
+        // attribution key. No-op unless the ETW consumer is running.
+        if config.etw_audit
+            && let Some(pid) = child.id()
+        {
+            match crate::etw_consumer::child_process_start_key(&child) {
+                Ok(process_start_key) => {
+                    if let Ok(mut idx) = attribution.lock() {
+                        idx.register_launch(&sandbox_id, &sandbox_name, pid, process_start_key);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        sandbox = %sandbox_name,
+                        pid,
+                        error,
+                        "failed to obtain wxc-exec process generation key; PID-based ETW attribution disabled for this launch"
+                    );
+                }
+            }
         }
+
+        entry.sandbox = ready_sandbox.clone();
+        entry.phase_state = PhaseState::Running;
+        entry.monitor_cancel = Some(cancel_tx);
+        entry.monitor_task = Some(tokio::spawn(monitor_exec(
+            registry.clone(),
+            watch_tx.clone(),
+            attribution.clone(),
+            sandbox.clone(),
+            sandbox_id.clone(),
+            cancel_rx,
+            child,
+        )));
     }
     let _ = watch_tx.send(sandbox_event(ready_sandbox));
 }
@@ -778,13 +857,15 @@ async fn run_lifecycle(
 async fn monitor_exec(
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
     sandbox: DriverSandbox,
     sandbox_id: String,
     mut cancel_rx: watch::Receiver<bool>,
     mut child: tokio::process::Child,
 ) {
+    let wxc_pid = child.id();
     let status = tokio::select! {
-        status = child.wait() => status,
+        status = child.wait() => Some(status),
         changed = cancel_rx.changed() => {
             let should_kill = changed.is_ok() && *cancel_rx.borrow_and_update();
             if should_kill {
@@ -795,8 +876,21 @@ async fn monitor_exec(
                 // harmless and guarantees the OS process handle is reaped.
                 let _ = child.wait().await;
             }
-            return;
+            None
         }
+    };
+
+    // A Windows PID is authoritative only while the exact driver-owned child is
+    // alive. Retire it on every monitor exit path, including cancellation, before
+    // Windows can recycle it while the sandbox remains in the registry.
+    if let Some(pid) = wxc_pid
+        && let Ok(mut idx) = attribution.lock()
+    {
+        idx.retire_launch(&sandbox_id, pid);
+    }
+
+    let Some(status) = status else {
+        return;
     };
 
     match status {
@@ -1096,6 +1190,14 @@ mod lifecycle_tests {
         assert!(
             completed.is_some(),
             "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
+        );
+        assert!(
+            !backend
+                .attribution
+                .lock()
+                .unwrap()
+                .has_live_pid_for_sandbox("sb-pos"),
+            "the process monitor must retire the wxc-exec PID before publishing completion"
         );
     }
 

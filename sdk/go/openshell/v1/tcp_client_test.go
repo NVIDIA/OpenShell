@@ -996,7 +996,10 @@ func (r *flippableResolver) Get(_ context.Context, _, name string) (*Sandbox, er
 func (r *flippableResolver) Create(context.Context, string, string, *SandboxSpec, map[string]string, ...CreateOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
-func (r *flippableResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
+func (r *flippableResolver) List(string, ...ListOptions) (*Pager[*Sandbox], error) {
+	panic("not implemented")
+}
+func (r *flippableResolver) ListAll(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
 	panic("not implemented")
 }
 func (r *flippableResolver) Delete(context.Context, string, string) error {

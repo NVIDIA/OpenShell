@@ -147,9 +147,16 @@ landlock:
 }
 
 #[cfg(feature = "e2e-docker")]
-fn write_local_override_image() -> Result<tempfile::TempDir, String> {
+fn write_local_override_image() -> Result<
+    (
+        tempfile::TempDir,
+        openshell_e2e::harness::container::ImageGuard,
+    ),
+    String,
+> {
     let dir = tempfile::tempdir().map_err(|e| format!("create image context: {e}"))?;
-    std::fs::write(dir.path().join("Dockerfile"), LOCAL_OVERRIDE_DOCKERFILE)
+    let dockerfile = dir.path().join("Dockerfile");
+    std::fs::write(&dockerfile, LOCAL_OVERRIDE_DOCKERFILE)
         .map_err(|e| format!("write local override Dockerfile: {e}"))?;
     std::fs::write(dir.path().join("local-policy.rego"), LOCAL_OVERRIDE_REGO)
         .map_err(|e| format!("write local override Rego policy: {e}"))?;
@@ -181,7 +188,12 @@ network_policies: {}
 ",
     )
     .map_err(|e| format!("write local override policy data: {e}"))?;
-    Ok(dir)
+    let image = openshell_e2e::harness::container::ImageGuard::build(
+        "local-override",
+        &dockerfile,
+        dir.path(),
+    )?;
+    Ok((dir, image))
 }
 
 // ---------------------------------------------------------------------------
@@ -588,11 +600,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 #[cfg(feature = "e2e-docker")]
 #[tokio::test]
 async fn local_policy_override_survives_gateway_policy_polls() {
-    let image_context = write_local_override_image().expect("write local override image");
-    let dockerfile = image_context.path().join("Dockerfile");
-    let dockerfile = dockerfile
-        .to_str()
-        .expect("Dockerfile path should be utf-8");
+    let (_image_context, image) = write_local_override_image().expect("write local override image");
 
     let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
     let gateway_policy_a_path = gateway_policy_a_file
@@ -613,7 +621,7 @@ async fn local_policy_override_survives_gateway_policy_polls() {
             "--name",
             "e2e-lcl-pol-ovrd",
             "--from",
-            dockerfile,
+            image.tag(),
             "--policy",
             &gateway_policy_a_path,
             "--no-tty",

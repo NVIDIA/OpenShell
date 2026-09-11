@@ -12,6 +12,7 @@
 
 use std::{fs, io::Write};
 
+use openshell_e2e::harness::container::ImageGuard;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
@@ -66,7 +67,7 @@ const MARKER: &str = "custom-image-e2e-marker";
 /// already grants that authority; existing content retains its ownership.
 #[tokio::test]
 #[serial(custom_image)]
-async fn sandbox_from_custom_dockerfile() {
+async fn sandbox_from_custom_image() {
     // Step 1: Write a temporary Dockerfile.
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
@@ -76,10 +77,13 @@ async fn sandbox_from_custom_dockerfile() {
             .expect("write Dockerfile");
     }
 
-    // Step 2: Create a sandbox from the Dockerfile.
-    let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
+    // Step 2: Build the image out-of-band and create a sandbox from it.
+    // `--from` no longer builds local Dockerfiles itself (pre-0.1.0
+    // breaking change); tests build explicitly and pass the resulting tag.
+    let image = ImageGuard::build("custom-dockerfile", &dockerfile_path, tmpdir.path())
+        .expect("build custom image with selected container engine");
     let mut guard = SandboxGuard::create_keep_with_args(
-        &["--from", dockerfile_str, "--no-tty"],
+        &["--from", image.tag(), "--no-tty"],
         &[
             "sh",
             "-c",
@@ -92,7 +96,7 @@ async fn sandbox_from_custom_dockerfile() {
         "Ready",
     )
     .await
-    .expect("sandbox create from Dockerfile");
+    .expect("sandbox create from custom image");
 
     // Step 3: Verify the marker file content appears in the output.
     let clean_output = strip_ansi(&guard.create_output);
@@ -194,10 +198,11 @@ async fn sandbox_from_passwd_less_numeric_oci_user() {
             .expect("write Dockerfile");
     }
 
-    let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
+    let image = ImageGuard::build("passwd-less-numeric", &dockerfile_path, tmpdir.path())
+        .expect("build numeric OCI image with selected container engine");
     let mut guard = SandboxGuard::create(&[
         "--from",
-        dockerfile_str,
+        image.tag(),
         "--",
         "sh",
         "-c",
@@ -222,10 +227,11 @@ async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
     fs::write(&dockerfile_path, UNWRITABLE_WORKDIR_DOCKERFILE_CONTENT).expect("write Dockerfile");
-    let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
+    let image = ImageGuard::build("unwritable-workdir", &dockerfile_path, tmpdir.path())
+        .expect("build unwritable-workdir image with selected container engine");
 
     let result = SandboxGuard::create_keep_with_args(
-        &["--from", dockerfile_str, "--no-tty"],
+        &["--from", image.tag(), "--no-tty"],
         &["sh", "-c", "echo should-not-run"],
         "should-not-run",
     )
@@ -239,9 +245,7 @@ async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
     };
     let message = error.to_string();
     assert!(
-        message.contains("WorkingDir")
-            || message.contains("workspace")
-            || message.contains("readiness"),
-        "expected workspace authority failure, got: {message}"
+        message.contains("WorkspaceValidationFailed") && message.contains("WorkingDir"),
+        "expected rejected image to fail provisioning, got: {message}"
     );
 }

@@ -66,7 +66,7 @@ client.AddProvider(&types.Provider{
 })
 
 // List returns the seeded provider
-providers, _ := client.Providers().List(ctx, "default")
+providers, _ := client.Providers().ListAll(ctx, "default")
 // len(providers) == 1
 ```
 

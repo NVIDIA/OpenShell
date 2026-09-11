@@ -144,20 +144,70 @@ openshell sandbox create \
 
 ### Custom Containers
 
-Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a rootfs tar archive, or a container image:
 
 ```shell
 openshell sandbox create --from base
 openshell sandbox create --from ollama
-openshell sandbox create --from ./my-sandbox-dir
+openshell sandbox create --from ./rootfs.tar
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
-through the local Docker daemon. Use a registry image reference for remote
-gateways.
+`--from` does not build local Dockerfiles or directories. Build and tag the
+image with the container engine used by your local gateway, then pass the
+resulting image reference:
+
+```shell
+# Docker gateway
+docker build -t my-image:latest .
+openshell sandbox create --from my-image:latest
+
+# Podman gateway
+podman build -t localhost/my-image:latest .
+openshell sandbox create --from localhost/my-image:latest
+```
+
+For a remote gateway, push the image to a registry that the gateway can pull
+from and use that registry image reference.
+
+<Warning>
+**Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
+and directory sources no longer build images. Build and tag the image before
+you create the sandbox.
+</Warning>
+
+#### Rootfs Tar Archives
+
+A rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) is a flat filesystem produced
+by `docker export`, `podman export`, or `buildah mount` plus `tar`. It lets you
+create a sandbox without a registry or a running image daemon:
+
+```shell
+docker create --name export-me my-image:latest
+docker export -o rootfs.tar export-me
+docker rm export-me
+
+openshell sandbox create --from ./rootfs.tar
+```
+
+Rootfs tar sources require a local gateway running the VM compute driver. The
+CLI asks the gateway for a staging slot, writes the archive to the location the
+gateway allocates, and passes back a single-use token; the gateway resolves that
+token to a path for the driver. Because the CLI writes the archive directly to
+the gateway host's filesystem, the two must share a filesystem and run as the
+same user. Gateways using the Docker, Podman, or Kubernetes drivers reject
+rootfs tar sources.
+
+Gzip-compressed archives (`.tar.gz`, `.tgz`) are decompressed while the gateway
+stages them, so the sandbox sees the same filesystem either way. Compression is
+detected from the archive contents, not the file name.
+
+The gateway caps archive size (10 GiB by default, configurable with the VM
+driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
+minutes. The cap applies to the expanded archive too: a compressed source that
+decompresses past the limit is rejected.
 
 ## Reuse Workload Templates
 
@@ -211,6 +261,10 @@ Use `--all-workspaces` with `sandbox template list` when you need an admin view 
 ```shell
 openshell sandbox template list --all-workspaces
 ```
+
+For JSON or YAML, template list output contains `templates` and
+`next_page_token` fields. Pass the returned token to `--page-token` to
+continue.
 
 ## Base Sandbox Container
 
@@ -346,9 +400,13 @@ with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
+    matches = client.list_all(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
+
+Python SDK `list` methods return a lazy `Pager` whose iteration yields one
+`Page` per gateway request. Use `list_all` only when you want to exhaust the
+collection; pass `page_token` to resume from a token saved from an earlier page.
 
 Create reusable sandbox templates through the Python SDK when several runs
 should share the same workload shape:
@@ -377,7 +435,7 @@ from openshell import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
-    sandboxes = client.list(workspace="default")
+    sandboxes = client.list_all(workspace="default")
 ```
 
 ## Expose Long Running Services
@@ -415,9 +473,10 @@ openshell service list --output json
 openshell service list my-sandbox --output yaml
 ```
 
-Each record contains `workspace`, `sandbox`, `service`, `target_port`, and
-`url`. The unnamed service uses an empty `service` string. An empty result is
-an empty collection.
+Structured list output contains `services` and `next_page_token` fields. Each
+record contains `workspace`, `sandbox`, `service`, `target_port`, and `url`.
+The unnamed service uses an empty `service` string. Pass the returned token to
+`--page-token` to continue. An empty result has an empty `services` collection.
 
 Show or delete one endpoint:
 
@@ -458,6 +517,9 @@ openshell sandbox list -o json
 openshell sandbox list -o yaml
 ```
 
+Structured list output contains `sandboxes` and `next_page_token` fields.
+Pass the returned token to `--page-token` to continue.
+
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
@@ -495,7 +557,7 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 openshell term
 ```
 
-Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/sandboxes/policies) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 

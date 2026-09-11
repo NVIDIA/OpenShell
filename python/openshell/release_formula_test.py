@@ -136,7 +136,8 @@ def test_snap_docker_connect_hook_restarts_gateway() -> None:
     hook = repo_root / "snap/hooks/connect-plug-docker"
 
     assert hook.is_file()
-    assert hook.stat().st_mode & stat.S_IXUSR
+    if sys.platform != "win32":
+        assert hook.stat().st_mode & stat.S_IXUSR
     assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
         encoding="utf-8"
     )

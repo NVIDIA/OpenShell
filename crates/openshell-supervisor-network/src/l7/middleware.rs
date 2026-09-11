@@ -611,7 +611,7 @@ pub async fn send_middleware_admission_exhausted_response<
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn middleware_request_input(
-    sandbox: &openshell_ocsf::SandboxContext,
+    sandbox: &openshell_ocsf::EventContext,
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn middleware_input_carries_real_sandbox_name() {
-        let sandbox = openshell_ocsf::SandboxContext {
+        let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),

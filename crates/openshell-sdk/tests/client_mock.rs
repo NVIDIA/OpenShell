@@ -23,6 +23,22 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Response, Status};
 
+fn selected_workspace(scope: &Option<proto::datamodel::v1::WorkspaceSelector>) -> Option<&str> {
+    match scope.as_ref()?.selection.as_ref()? {
+        proto::datamodel::v1::workspace_selector::Selection::Workspace(workspace) => {
+            Some(workspace)
+        }
+        proto::datamodel::v1::workspace_selector::Selection::AllWorkspaces(_) => None,
+    }
+}
+
+fn selects_all_workspaces(scope: &Option<proto::datamodel::v1::WorkspaceSelector>) -> bool {
+    matches!(
+        scope.as_ref().and_then(|scope| scope.selection.as_ref()),
+        Some(proto::datamodel::v1::workspace_selector::Selection::AllWorkspaces(_))
+    )
+}
+
 /// Captured fixture state — what the mock observed and the canned replies it
 /// returned. One per test so assertions are scoped.
 #[derive(Default)]
@@ -39,12 +55,14 @@ struct MockState {
     last_stop: Mutex<Option<proto::StopSandboxRequest>>,
     last_start: Mutex<Option<proto::StartSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
+    list_requests: Mutex<Vec<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
     last_workspace_request: Mutex<Option<String>>,
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
     get_returns_not_found: bool,
     not_found_after: Option<u32>,
+    paginate_list: bool,
     /// When set, `health` rejects any request whose `authorization` header
     /// does not match this exact value (e.g. `"Bearer fresh-token"`).
     require_bearer: Option<String>,
@@ -139,6 +157,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<proto::ReportMainProcessExitRequest>,
@@ -236,11 +261,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::GetSandboxTemplateRequest>,
     ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
         let request = request.into_inner();
-        let workspace = if request.workspace.is_empty() {
-            "default"
-        } else {
-            &request.workspace
-        };
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or("default");
         let template = workload_template_proto(&request.name, workspace);
         *self.state.last_template_get.lock().await = Some(request);
         Ok(Response::new(proto::SandboxTemplateResponse {
@@ -259,6 +280,7 @@ impl OpenShell for TestOpenShell {
                 workload_template_proto("python", "default"),
                 workload_template_proto("cuda", "gpu"),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -280,7 +302,7 @@ impl OpenShell for TestOpenShell {
         let sandbox = sandbox_with_phase_ws(
             &request.name,
             proto::SandboxPhase::Stopped,
-            &request.workspace,
+            selected_workspace(&request.workspace_scope).unwrap_or("default"),
         );
         *self.state.last_stop.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
@@ -296,7 +318,7 @@ impl OpenShell for TestOpenShell {
         let sandbox = sandbox_with_phase_ws(
             &request.name,
             proto::SandboxPhase::Starting,
-            &request.workspace,
+            selected_workspace(&request.workspace_scope).unwrap_or("default"),
         );
         *self.state.last_start.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
@@ -311,7 +333,8 @@ impl OpenShell for TestOpenShell {
         let req = request.into_inner();
         let name = req.name;
         *self.state.last_get_name.lock().await = Some(name.clone());
-        *self.state.last_get_workspace.lock().await = Some(req.workspace.clone());
+        *self.state.last_get_workspace.lock().await =
+            selected_workspace(&req.workspace_scope).map(str::to_string);
         let count = self.state.get_calls.fetch_add(1, Ordering::SeqCst);
 
         if self.state.get_returns_not_found {
@@ -340,12 +363,36 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::ListSandboxesRequest>,
     ) -> Result<Response<proto::ListSandboxesResponse>, Status> {
-        *self.state.last_list_request.lock().await = Some(request.into_inner());
+        let request = request.into_inner();
+        *self.state.last_list_request.lock().await = Some(request.clone());
+        self.state.list_requests.lock().await.push(request.clone());
+        if self.state.paginate_list {
+            let (sandboxes, next_page_token) = if request.page_token.is_empty() {
+                (
+                    vec![sandbox_with_phase("alpha", proto::SandboxPhase::Ready)],
+                    "page-2".to_string(),
+                )
+            } else {
+                assert_eq!(request.page_token, "page-2");
+                (
+                    vec![sandbox_with_phase(
+                        "beta",
+                        proto::SandboxPhase::Provisioning,
+                    )],
+                    String::new(),
+                )
+            };
+            return Ok(Response::new(proto::ListSandboxesResponse {
+                sandboxes,
+                next_page_token,
+            }));
+        }
         Ok(Response::new(proto::ListSandboxesResponse {
             sandboxes: vec![
                 sandbox_with_phase("alpha", proto::SandboxPhase::Ready),
                 sandbox_with_phase("beta", proto::SandboxPhase::Provisioning),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -380,7 +427,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
         *self.state.last_delete_name.lock().await = Some(req.name);
-        *self.state.last_delete_workspace.lock().await = Some(req.workspace);
+        *self.state.last_delete_workspace.lock().await =
+            selected_workspace(&req.workspace_scope).map(str::to_string);
         Ok(Response::new(proto::DeleteSandboxResponse {
             deleted: true,
         }))
@@ -805,6 +853,7 @@ impl OpenShell for TestOpenShell {
                 workspace_proto("default", proto::datamodel::v1::WorkspacePhase::Active),
                 workspace_proto("staging", proto::datamodel::v1::WorkspacePhase::Active),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -958,7 +1007,10 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert_eq!(created.metadata.as_ref().unwrap().name, "python");
 
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
-    assert!(observed_create.workspace.is_empty());
+    assert_eq!(
+        selected_workspace(&observed_create.workspace_scope),
+        Some("default")
+    );
     assert_eq!(
         observed_create
             .template
@@ -973,29 +1025,33 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert_eq!(fetched.metadata.as_ref().unwrap().name, "python");
     let observed_get = state.last_template_get.lock().await.clone().unwrap();
     assert_eq!(observed_get.name, "python");
-    assert!(observed_get.workspace.is_empty());
+    assert_eq!(
+        selected_workspace(&observed_get.workspace_scope),
+        Some("default")
+    );
 
     let listed = client
-        .list_sandbox_templates(SandboxTemplateListOptions {
-            limit: 10,
-            offset: 2,
+        .list_all_sandbox_templates_all_workspaces(SandboxTemplateListOptions {
+            page_size: 10,
             label_selector: String::new(),
-            all_workspaces: true,
+            ..Default::default()
         })
         .await
         .unwrap();
     assert_eq!(listed.len(), 2);
     let observed_list = state.last_template_list.lock().await.clone().unwrap();
-    assert_eq!(observed_list.limit, 10);
-    assert_eq!(observed_list.offset, 2);
-    assert!(observed_list.workspace.is_empty());
-    assert!(observed_list.all_workspaces);
+    assert_eq!(observed_list.page_size, 10);
+    assert!(observed_list.page_token.is_empty());
+    assert!(selects_all_workspaces(&observed_list.workspace_scope));
 
     let deleted = client.delete_sandbox_template("python").await.unwrap();
     assert!(deleted);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
-    assert!(observed_delete.workspace.is_empty());
+    assert_eq!(
+        selected_workspace(&observed_delete.workspace_scope),
+        Some("default")
+    );
 }
 
 #[tokio::test]
@@ -1038,20 +1094,75 @@ async fn list_sandboxes_propagates_filters() {
     let client = connect(&endpoint).await;
 
     let opts = ListOptions {
-        limit: 25,
-        offset: 5,
+        page_size: 25,
         label_selector: Some("team=core".to_string()),
+        ..Default::default()
     };
-    let items = client.list_sandboxes(opts).await.unwrap();
+    let items = client.list_all_sandboxes(opts).await.unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].name, "alpha");
     assert_eq!(items[0].phase, SandboxPhase::Ready);
     assert_eq!(items[1].phase, SandboxPhase::Provisioning);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
-    assert_eq!(observed.limit, 25);
-    assert_eq!(observed.offset, 5);
+    assert_eq!(observed.page_size, 25);
+    assert!(observed.page_token.is_empty());
     assert_eq!(observed.label_selector, "team=core");
+}
+
+#[tokio::test]
+async fn list_sandboxes_follows_continuation_tokens() {
+    let state = Arc::new(MockState {
+        paginate_list: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let mut pager = client.list_sandboxes(ListOptions {
+        page_size: 1,
+        label_selector: Some("team=core".to_string()),
+        ..Default::default()
+    });
+    assert!(state.list_requests.lock().await.is_empty());
+
+    let first = pager.next_page().await.unwrap().unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].name, "alpha");
+    assert_eq!(first.next_page_token, "page-2");
+    let second = pager.next_page().await.unwrap().unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].name, "beta");
+    assert!(second.next_page_token.is_empty());
+    assert!(pager.next_page().await.unwrap().is_none());
+    let requests = state.list_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].page_token.is_empty());
+    assert_eq!(requests[1].page_token, "page-2");
+    assert_eq!(requests[1].label_selector, "team=core");
+}
+
+#[tokio::test]
+async fn list_sandboxes_passes_initial_page_token() {
+    let state = Arc::new(MockState {
+        paginate_list: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let mut pager = client.list_sandboxes(ListOptions {
+        page_size: 1,
+        page_token: "page-2".to_string(),
+        ..Default::default()
+    });
+    let page = pager.next_page().await.unwrap().unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "beta");
+    let requests = state.list_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].page_token, "page-2");
 }
 
 #[tokio::test]
@@ -1077,7 +1188,7 @@ async fn stop_and_start_map_requests_and_phases() {
     assert_eq!(stopped.phase, SandboxPhase::Stopped);
     let stop = state.last_stop.lock().await.clone().unwrap();
     assert_eq!(stop.name, "sleepy");
-    assert!(stop.workspace.is_empty());
+    assert_eq!(selected_workspace(&stop.workspace_scope), Some("default"));
 
     let started = client
         .workspace("team-a")
@@ -1087,7 +1198,7 @@ async fn stop_and_start_map_requests_and_phases() {
     assert_eq!(started.phase, SandboxPhase::Starting);
     let start = state.last_start.lock().await.clone().unwrap();
     assert_eq!(start.name, "sleepy");
-    assert_eq!(start.workspace, "team-a");
+    assert_eq!(selected_workspace(&start.workspace_scope), Some("team-a"));
 }
 
 #[tokio::test]
@@ -1330,7 +1441,10 @@ async fn workspace_scoped_create_passes_workspace() {
     assert_eq!(result.name, "my-box");
 
     let observed = state.last_create.lock().await.clone().unwrap();
-    assert_eq!(observed.workspace, "staging");
+    assert_eq!(
+        selected_workspace(&observed.workspace_scope),
+        Some("staging")
+    );
 }
 
 #[tokio::test]
@@ -1355,7 +1469,10 @@ async fn workspace_scoped_create_from_template_passes_workspace() {
     assert_eq!(sandbox.name, "from-template");
 
     let observed = state.last_create.lock().await.clone().unwrap();
-    assert_eq!(observed.workspace, "staging");
+    assert_eq!(
+        selected_workspace(&observed.workspace_scope),
+        Some("staging")
+    );
     assert_eq!(observed.workload_template_name, "python");
     assert_eq!(observed.spec.unwrap().policy.unwrap().version, 2);
 }
@@ -1384,12 +1501,11 @@ async fn workspace_scoped_list_passes_workspace() {
     let client = connect(&endpoint).await;
 
     let ws = client.workspace("dev");
-    let items = ws.list_sandboxes(ListOptions::default()).await.unwrap();
+    let items = ws.list_all_sandboxes(ListOptions::default()).await.unwrap();
     assert_eq!(items.len(), 2);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
-    assert_eq!(observed.workspace, "dev");
-    assert!(!observed.all_workspaces);
+    assert_eq!(selected_workspace(&observed.workspace_scope), Some("dev"));
 }
 
 #[tokio::test]
@@ -1403,37 +1519,45 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
         .await
         .unwrap();
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
-    assert_eq!(observed_create.workspace, "staging");
+    assert_eq!(
+        selected_workspace(&observed_create.workspace_scope),
+        Some("staging")
+    );
 
     ws.get_sandbox_template("python").await.unwrap();
     let observed_get = state.last_template_get.lock().await.clone().unwrap();
     assert_eq!(observed_get.name, "python");
-    assert_eq!(observed_get.workspace, "staging");
+    assert_eq!(
+        selected_workspace(&observed_get.workspace_scope),
+        Some("staging")
+    );
 
     let listed = ws
-        .list_sandbox_templates(SandboxTemplateListOptions::default())
+        .list_all_sandbox_templates(SandboxTemplateListOptions::default())
         .await
         .unwrap();
     assert_eq!(listed.len(), 2);
     let observed_list = state.last_template_list.lock().await.clone().unwrap();
-    assert_eq!(observed_list.workspace, "staging");
-    assert!(!observed_list.all_workspaces);
+    assert_eq!(
+        selected_workspace(&observed_list.workspace_scope),
+        Some("staging")
+    );
 
-    ws.list_sandbox_templates(SandboxTemplateListOptions {
-        all_workspaces: true,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    client
+        .list_all_sandbox_templates_all_workspaces(SandboxTemplateListOptions::default())
+        .await
+        .unwrap();
     let observed_all = state.last_template_list.lock().await.clone().unwrap();
-    assert!(observed_all.workspace.is_empty());
-    assert!(observed_all.all_workspaces);
+    assert!(selects_all_workspaces(&observed_all.workspace_scope));
 
     let deleted = ws.delete_sandbox_template("python").await.unwrap();
     assert!(deleted);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
-    assert_eq!(observed_delete.workspace, "staging");
+    assert_eq!(
+        selected_workspace(&observed_delete.workspace_scope),
+        Some("staging")
+    );
 }
 
 #[tokio::test]
@@ -1457,14 +1581,13 @@ async fn list_sandboxes_all_workspaces_sets_flag() {
     let client = connect(&endpoint).await;
 
     let items = client
-        .list_sandboxes_all_workspaces(ListOptions::default())
+        .list_all_sandboxes_all_workspaces(ListOptions::default())
         .await
         .unwrap();
     assert_eq!(items.len(), 2);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
-    assert!(observed.all_workspaces);
-    assert!(observed.workspace.is_empty());
+    assert!(selects_all_workspaces(&observed.workspace_scope));
 }
 
 // ---- Workspace CRUD tests ----
@@ -1507,7 +1630,7 @@ async fn list_workspaces_returns_all() {
     let client = connect(&endpoint).await;
 
     let workspaces = client
-        .list_workspaces(ListOptions::default())
+        .list_all_workspaces(ListOptions::default())
         .await
         .unwrap();
     assert_eq!(workspaces.len(), 2);

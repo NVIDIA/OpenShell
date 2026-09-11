@@ -589,6 +589,40 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
+### MXC
+
+The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
+map Windows Sandboxing provider events into the gateway's OCSF stream.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["mxc"]
+
+[openshell.drivers.mxc]
+wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+backend                 = "process_container"
+default_configuration_id = "composable"
+pc_least_privilege      = false
+pc_capabilities         = []
+debug                   = false
+etw_audit               = true
+```
+
+`etw_audit` defaults to `false`. When enabled, the gateway account must be an
+administrator or belong to the Windows Performance Log Users group. Workload
+commands and working directories remain sandbox-scoped and must be supplied in
+the `mxc` driver configuration when creating a sandbox.
+
+The driver records executable identity in process audit events and omits raw
+command arguments because they can contain credentials or personal data. See
+[OCSF JSON Export](/observability/ocsf-json-export) for durable Windows audit
+output.
+
 ### Docker
 
 Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.
@@ -840,7 +874,22 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Where the gateway stages rootfs tar archives for `--from ./rootfs.tar`.
+# Defaults to <state_dir>/rootfs-tar-staging. The gateway creates one
+# request-scoped subdirectory per staging slot and removes it after use.
+# rootfs_tar_staging_dir = "/var/lib/openshell/vm/rootfs-tar-staging"
+# Largest rootfs tar archive the driver accepts, in bytes. Defaults to 10 GiB.
+# Gzip archives are decompressed while staging, and the limit also bounds the
+# expanded tar.
+# rootfs_tar_max_bytes = 10737418240
 ```
+
+Rootfs tar staging requires the gateway and the VM driver to share a filesystem
+and run as the same user. That holds for the managed VM driver, which the
+gateway starts as a subprocess. If you point `compute_driver_endpoints` at an
+externally managed `vm` socket owned by another user, the driver cannot read the
+gateway's staging directory and rootfs tar sources fail with a
+`FAILED_PRECONDITION` error; use a registry image reference instead.
 
 ### Extension Driver
 

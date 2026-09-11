@@ -171,6 +171,7 @@ build_component_for_arch() {
   local current_host_os
   local current_host_arch
   local binary_path
+  local cargo_output_dir
   local build_rustflags
 
   resolve_component "$component"
@@ -254,10 +255,11 @@ build_component_for_arch() {
     if [[ -n "$build_rustflags" ]]; then
       export RUSTFLAGS="$build_rustflags"
     fi
-    CARGO_INCREMENTAL=0 mise x -- "${cargo_env[@]}" "${cargo_subcommand[@]}" "${args[@]}"
+    CARGO_INCREMENTAL=0 mise x -- ${cargo_env[@]+"${cargo_env[@]}"} "${cargo_subcommand[@]}" "${args[@]}"
   )
 
-  binary_path="${ROOT}/target/${target}/release/${binary}"
+  cargo_output_dir="$(cd "$ROOT" && mise x -- cargo metadata --format-version=1 --no-deps | jq -er '.target_directory')"
+  binary_path="${cargo_output_dir}/${target}/release/${binary}"
   if [[ "$component" == "gateway" ]]; then
     "$SCRIPT_DIR/verify-glibc-symbols.sh" 2.28 "$binary_path"
   elif [[ "$component" == "supervisor" ]]; then

@@ -6,9 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    InferenceRoute, ObjectForTest, Provider, Sandbox, SandboxStatus, SandboxWorkloadTemplate,
-    ServiceEndpoint, SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile,
-    Workspace, WorkspaceMember,
+    ObjectForTest, Provider, Sandbox, SandboxStatus, SandboxWorkloadTemplate, ServiceEndpoint,
+    SshSession, Workspace, WorkspaceMember,
 };
 use std::collections::HashMap;
 
@@ -233,90 +232,6 @@ impl ObjectWorkspace for Provider {
     }
 }
 
-// Implementations for StoredProviderProfile
-impl ObjectId for StoredProviderProfile {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for StoredProviderProfile {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredProviderProfile {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredProviderProfile {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredProviderProfile {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-impl ObjectWorkspace for StoredProviderProfile {
-    fn object_workspace(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
-    }
-    fn requires_workspace() -> bool {
-        false
-    }
-}
-
-// Implementations for StoredProviderCredentialRefreshState
-impl ObjectId for StoredProviderCredentialRefreshState {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for StoredProviderCredentialRefreshState {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredProviderCredentialRefreshState {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredProviderCredentialRefreshState {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredProviderCredentialRefreshState {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-impl ObjectWorkspace for StoredProviderCredentialRefreshState {
-    fn object_workspace(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
-    }
-    fn requires_workspace() -> bool {
-        true
-    }
-}
-
 // Implementations for SshSession
 impl ObjectId for SshSession {
     fn object_id(&self) -> &str {
@@ -393,48 +308,6 @@ impl GetResourceVersion for ServiceEndpoint {
 }
 
 impl ObjectWorkspace for ServiceEndpoint {
-    fn object_workspace(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
-    }
-    fn requires_workspace() -> bool {
-        true
-    }
-}
-
-// Implementations for InferenceRoute
-impl ObjectId for InferenceRoute {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for InferenceRoute {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for InferenceRoute {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for InferenceRoute {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for InferenceRoute {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-impl ObjectWorkspace for InferenceRoute {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }

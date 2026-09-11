@@ -40,6 +40,33 @@ an exited canonical process remains a terminal sandbox result. Exit code zero
 produces `Completed`; a nonzero or signal-normalized exit produces `Error`
 with the exact exit code. Driver and supervisor failures remain `Error`.
 
+## Build with Selected Compute Drivers
+
+Source builds of `openshell-gateway` can include any subset of the Docker,
+Podman, Kubernetes, VM, and MXC drivers. Enable the corresponding
+`compute-driver-docker`, `compute-driver-podman`, `compute-driver-kubernetes`,
+`compute-driver-vm`, or `compute-driver-mxc` Cargo features. For example, build
+a Docker-only gateway with telemetry support:
+
+```shell
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+```
+
+On Windows, select only MXC with:
+
+```shell
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
+```
+
+The default `in-tree-compute-drivers` feature retains the full platform driver
+set, including MXC on Windows. MXC links only on Windows. The other four
+features link drivers on non-Windows platforms; on Windows they install
+registrations that report the driver as unsupported. A build with no default
+features and no driver features connects to external drivers only.
+Auto-detection probes only compiled registrations.
+To select a driver omitted from a custom build, configure its external
+`socket_path` as described below.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
@@ -157,7 +184,7 @@ the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
 allowlist. If the primary listener is not reachable through that address, the
 gateway creates an additional callback-only listener. Use the primary endpoint
-for CLI, administrator, health, reflection, inference-route management, and
+for CLI, administrator, health, reflection, provider management, and
 HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.
@@ -166,7 +193,7 @@ to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
 
-The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
+The gateway talks to the Docker daemon to create sandbox containers.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
 through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener
@@ -254,6 +281,26 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+
+### macOS Podman Socket Path
+
+On macOS, Homebrew-installed Podman does not create the default socket path
+that the driver probes (`~/.local/share/containers/podman/machine/podman.sock`).
+The actual API socket lives under `/var/folders/` in a path that macOS can
+rotate after a reboot.
+
+If the gateway fails with `Podman socket not found; is podman machine running?`
+while `podman machine list` shows a running machine, set the
+`OPENSHELL_PODMAN_SOCKET` environment variable to the dynamic socket path:
+
+```shell
+export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+```
+
+Add this to your shell profile or gateway launch environment so it resolves
+correctly after each reboot. Alternatively, set `socket_path` in
+`[openshell.drivers.podman]` to the current path, but note that the path may
+change when macOS rotates `/var/folders/`.
 
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
 

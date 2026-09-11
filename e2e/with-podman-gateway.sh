@@ -80,7 +80,11 @@ with_podman_config() {
 }
 
 podman_cmd() {
-  with_podman_config podman "$@"
+  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    with_podman_config podman --url "unix://${OPENSHELL_PODMAN_SOCKET}" "$@"
+  else
+    with_podman_config podman "$@"
+  fi
 }
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
@@ -234,6 +238,7 @@ default_podman_socket_path() {
 
 ensure_podman_api_socket() {
   if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -241,8 +246,9 @@ ensure_podman_api_socket() {
   default_socket="$(default_podman_socket_path || true)"
   if [ -n "${default_socket}" ] \
      && [ -S "${default_socket}" ] \
-     && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
+     && with_podman_config podman --url "unix://${default_socket}" info >/dev/null 2>&1; then
     export OPENSHELL_PODMAN_SOCKET="${default_socket}"
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -266,12 +272,13 @@ ensure_podman_api_socket() {
     >"${PODMAN_SERVICE_LOG}" 2>&1 &
   PODMAN_SERVICE_PID=$!
   export OPENSHELL_PODMAN_SOCKET="${PODMAN_SOCKET}"
+  export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
 
   local elapsed=0
   local timeout=30
   while [ "${elapsed}" -lt "${timeout}" ]; do
     if [ -S "${PODMAN_SOCKET}" ] \
-       && podman_cmd --url "unix://${PODMAN_SOCKET}" info >/dev/null 2>&1; then
+       && podman_cmd info >/dev/null 2>&1; then
       return 0
     fi
 
@@ -375,12 +382,12 @@ if ! command -v podman >/dev/null 2>&1; then
   echo "ERROR: podman CLI is required to run Podman-backed e2e tests" >&2
   exit 2
 fi
+ensure_podman_api_socket
 if ! podman_cmd info >/dev/null 2>&1; then
   echo "ERROR: podman service is not reachable (podman info failed)" >&2
   echo "       Start it with 'podman machine start' on macOS, or the user service on Linux." >&2
   exit 2
 fi
-ensure_podman_api_socket
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 export OPENSHELL_BIN="${CLI_BIN}"

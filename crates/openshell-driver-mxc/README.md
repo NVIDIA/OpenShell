@@ -43,6 +43,7 @@ default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
 debug = false
+etw_audit = false
 ```
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
@@ -58,6 +59,33 @@ The `command` array is required and preserves Windows argument boundaries. `cwd`
 Network policy support depends on the selected containment path. Policy
 replacement and merge updates use the gateway's standard sandbox configuration
 revision contract.
+
+When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
+session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
+per-start discriminator. Starting another gateway never stops an existing
+gateway's capture. Graceful shutdown stops the session by its owned handle. A
+force-killed gateway can leave a stale session; the audit example removes only
+matching sessions whose encoded owner process is no longer running.
+
+The gateway-local OCSF JSONL sink is available only for the Windows/MXC path
+and is opt-in. Set `OPENSHELL_OCSF_JSON=1` to enable it and optionally set
+`OPENSHELL_OCSF_LOG_DIR` to override its `%PROGRAMDATA%\OpenShell\logs` default.
+Other gateway deployments do not initialize this local file sink.
+
+The ETW callback uses a non-blocking queue capped at 4,096 records and 16 MiB
+of copied event data. Records that exceed either limit are dropped instead of
+blocking the ETW pump or growing gateway memory. The gateway emits an immediate
+warning identifying the audit coverage gap and rate-limits follow-up warnings
+to once every 30 seconds while overload continues.
+
+Audit attribution bootstraps only when the driver-owned `wxc-exec` PID and its
+kernel process start key both match the values attached to the ETW record;
+command text is never an ownership key. This generation key prevents a recycled
+PID from inheriting the previous process's attribution regardless of delivery
+delay. The process monitor retires the live PID at exit. Established identity,
+activity, and correlation-vector links remain available for five seconds so
+already in-flight ETW records can arrive, but retired PID evidence cannot resolve
+them. Records without matching generation evidence remain unattributed.
 
 ## Prerequisites (live runs)
 

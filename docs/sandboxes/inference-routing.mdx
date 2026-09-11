@@ -1,348 +1,311 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Inference Routing"
-sidebar-title: "Inference Routing"
-description: "Understand and configure OpenShell inference routing through inference.local and external endpoints."
-keywords: "Generative AI, Cybersecurity, Inference Routing, Configuration, Privacy, LLM, Provider"
+title: "Provider-backed Inference"
+sidebar-title: "Provider-backed Inference"
+description: "Grant a sandbox access to model providers through provider profiles, attachments, and native endpoints."
+keywords: "Generative AI, Cybersecurity, Inference, Provider Profiles, Credentials, LLM"
 position: 8
 ---
 
-OpenShell handles inference traffic through two paths: external endpoints and `inference.local`.
+OpenShell grants model-provider access through provider profiles and sandbox
+attachments. The workload calls the provider's native API. OpenShell evaluates
+the request against the profile-derived network policy and substitutes the real
+credential only at an endpoint authorized by that profile.
 
-| Path | How it works |
+This keeps the complete access contract in one place:
+
+| Concern | Owner |
 |---|---|
-| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to [Policies](/sandboxes/policies). |
-| `inference.local` | A sandbox-local HTTPS endpoint that routes model requests through the gateway. The privacy router strips sandbox-supplied credentials, forwards only approved inference headers, injects the configured backend credentials, and forwards to the managed model endpoint. |
+| Credential and refresh lifecycle | Provider instance |
+| Authorized hosts, ports, paths, and binaries | Provider profile |
+| Which workload receives access | Sandbox provider attachment |
+| Base URL, model, request shape, and timeout | Native client or workload configuration |
 
-## How `inference.local` Works
+## Define and Attach a Hosted Provider
 
-When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials come from OpenShell rather than from code inside the sandbox, and only approved inference headers are forwarded upstream.
+Start from an existing profile, review its access, and import it under a new
+ID. For example, export the NVIDIA profile:
 
-If code calls an external inference host directly, OpenShell evaluates that traffic only through `network_policies`.
+```shell
+openshell provider profile export nvidia -o yaml > nvidia-native.yaml
+```
 
-| Property | Detail |
-|---|---|
-| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
-| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. Vertex Claude rawPredict routes strip `anthropic-beta` and do not forward `anthropic-version` as a header because the router injects `anthropic_version` into the Vertex request body. NVIDIA routes allow `x-model-id`. AWS Bedrock routes have no passthrough headers today. All other caller headers are stripped. |
-| Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
-| Provider support | NVIDIA, Anthropic, Google Vertex AI, AWS Bedrock (via a translating bridge — direct AWS with SigV4 signing is a separate follow-up), and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
-| Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
-| Hot refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
+In `nvidia-native.yaml`, change `id` to `nvidia-native`, give the profile a
+distinct `display_name`, and set `binaries` to the paths that may call the API.
+Keep the credential and endpoint definitions you intend to grant. For a Python
+workload, the edited fields can look like:
 
-## Supported API Patterns
+```yaml
+id: nvidia-native
+display_name: NVIDIA Native API
+binaries:
+  - /usr/bin/python3
+  - /usr/bin/python3.13
+  - /usr/local/bin/python
+  - /sandbox/.venv/**
+```
 
-Supported request patterns depend on the provider configured for `inference.local`.
+Lint and import the complete edited profile, then create a provider from its
+new ID:
 
-<Tabs>
-<Tab title="OpenAI-compatible">
+```shell
+openshell provider profile lint -f nvidia-native.yaml
+openshell provider profile import -f nvidia-native.yaml
 
-| Pattern | Method | Path |
-|---|---|---|
-| Chat Completions | `POST` | `/v1/chat/completions` |
-| Completions | `POST` | `/v1/completions` |
-| Responses | `POST` | `/v1/responses` |
-| Embeddings | `POST` | `/v1/embeddings` |
-| Model Discovery | `GET` | `/v1/models` |
-| Model Discovery | `GET` | `/v1/models/*` |
+openshell provider create \
+  --name nvidia-prod \
+  --type nvidia-native \
+  --from-existing
 
-</Tab>
+openshell sandbox create \
+  --name inference-demo \
+  --provider nvidia-prod \
+  -- python app.py
+```
 
-<Tab title="Anthropic-compatible">
+The imported provider profile supplies `NVIDIA_API_KEY` as an opaque placeholder and
+allows the profile's native endpoint. Configure the client with the real model
+identifier:
 
-| Pattern | Method | Path |
-|---|---|---|
-| Messages | `POST` | `/v1/messages` |
+```python
+import os
+from openai import OpenAI
 
-</Tab>
+client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.environ["NVIDIA_API_KEY"],
+    timeout=300,
+)
 
-<Tab title="AWS Bedrock">
+response = client.responses.create(
+    model="nvidia/nemotron-3-nano-30b-a3b",
+    input="Hello!",
+)
+print(response.output_text)
+```
 
-| Pattern | Method | Path |
-|---|---|---|
-| InvokeModel | `POST` | `/model/{modelId}/invoke` |
+Use the same export, edit, and import flow for OpenAI, Anthropic, or another
+hosted service. Set a new profile ID, retain only the endpoints and credentials
+the workload needs, and name the actual client binaries. Provider attachment
+does not select or rewrite a model.
 
-The `{modelId}` segment is constrained to a single non-empty path segment to avoid path-traversal liabilities. `/model//invoke` and `/model/a/b/invoke` both no-match.
+This release still loads built-in profiles for compatibility, so existing
+providers continue to resolve their profiles. Treat those built-ins as starting
+templates for new provider definitions rather than the primary setup workflow.
 
-<Note>
-Today the `aws-bedrock` provider type is bridge-fronted only. The router does not inject any auth header on outbound requests; the configured `BEDROCK_BASE_URL` is expected to point at a translating bridge or Bedrock-compatible proxy whose own pod holds operator-side credentials. SigV4 signing for direct AWS Bedrock is deferred to a follow-up release.
+## Attach a Provider to a Running Sandbox
 
-`InvokeModelWithResponseStream` is intentionally not advertised yet. The streaming path emits AWS event-stream framing, which our protocol-aware error path does not yet model; surfacing it without that work risks shipping responses the sandbox cannot interpret on failure. It will land alongside the streaming-error work in a follow-up.
-</Note>
+```shell
+openshell sandbox provider attach inference-demo nvidia-prod
+openshell sandbox provider list inference-demo
+```
 
-</Tab>
-</Tabs>
+Running sandboxes poll for provider and effective-policy changes. Launch a new
+process after attachment so it receives the new credential placeholder:
 
-Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
+```shell
+openshell sandbox exec inference-demo -- python app.py
+```
 
-Google Vertex AI does not expose every OpenAI-compatible path through `inference.local`. Vertex routes for Gemini and other non-Anthropic models currently support Chat Completions. Vertex routes for Claude models use the Anthropic Messages pattern. Base URL overrides are only supported for non-Anthropic Vertex routes.
+An already-running process does not gain new environment variables. Credential
+rotation and detach still take effect immediately at placeholder resolution.
 
-## Configure Inference Routing
+Detach the provider to revoke its policy and credential access:
 
-The managed local inference endpoint uses three values:
+```shell
+openshell sandbox provider detach inference-demo nvidia-prod
+```
 
-| Value | Description |
-|---|---|
-| Provider record | The credential backend OpenShell uses to authenticate with the upstream model host. |
-| Model ID | The model to use for generation requests. |
-| Timeout | Per-request timeout in seconds for upstream inference calls. Defaults to 60 seconds. |
+## Use a Custom or Self-hosted Endpoint
 
-For tested providers and base URLs, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers).
+Do not reuse the built-in `openai` or `anthropic` profile for an alternate
+host. Those profiles bind credentials to the public vendor endpoints. Import a
+profile that names the intended endpoint and the binaries that may call it.
 
-## Create a Provider
+For a credentialless Ollama server on the gateway host, save this profile as
+`ollama-openai.yaml`:
 
-Create a provider that holds the backend credentials you want OpenShell to use.
+```yaml
+id: ollama-openai
+display_name: Ollama
+description: Host-local Ollama OpenAI-compatible API
+category: inference
+inference_capable: true
+credentials: []
+endpoints:
+  - host: host.openshell.internal
+    port: 11434
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/bin/python3
+  - /usr/local/bin/python
+  - /sandbox/.uv/python/**
+  - /sandbox/.venv/**
+```
 
-<Tabs>
-<Tab title="NVIDIA API Catalog">
+Import the profile, create an instance, and attach it:
+
+```shell
+openshell provider profile lint -f ollama-openai.yaml
+openshell provider profile import -f ollama-openai.yaml
+openshell provider create --name ollama --type ollama-openai
+
+openshell sandbox create \
+  --name ollama-client \
+  --provider ollama \
+  --env OPENAI_BASE_URL=http://host.openshell.internal:11434/v1 \
+  -- python app.py
+```
+
+Use any non-empty placeholder value if the client library requires an API key
+for a server that does not authenticate requests:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["OPENAI_BASE_URL"],
+    api_key="unused",
+)
+response = client.chat.completions.create(
+    model="qwen3.5:0.8b",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+For an authenticated alternate endpoint, declare a credential in the custom
+profile, bind it to that endpoint, and create the provider from the original
+credential source. OpenShell never exports stored credential values.
+
+## Verify Access
+
+Inspect the effective policy, including provider-derived entries:
+
+```shell
+openshell policy get inference-demo --full
+```
+
+Then run a native request from a new sandbox process. A successful request
+confirms endpoint policy, binary attribution, credential substitution, DNS,
+and upstream service behavior.
+
+If the request is denied:
+
+- Confirm the provider is attached with `openshell sandbox provider list`.
+- Confirm the caller binary and native endpoint appear in
+  `openshell policy get <sandbox> --full`.
+- If the provider was attached after the process started, launch a new process.
+- If the sandbox uses a gateway global policy override, add the native endpoint
+  there because a global override suppresses provider-derived policy layers.
+- Inspect logs for `credential_endpoint_mismatch`. That error means policy
+  admitted the request but the provider profile did not authorize its
+  credential at the requested endpoint.
+
+## Migrate from Managed Inference Routes
+
+OpenShell removed the workspace-global managed inference route and the
+`openshell inference` commands. Upgrades remove stored route records. Provider
+records, provider refresh configuration, and existing sandbox attachments are
+preserved. Built-in profiles remain available during the transition, but new
+setups should import an explicit profile under a new ID.
+
+The old route cannot be converted automatically. It applied one provider and
+model to every sandbox in a workspace, while provider attachments intentionally
+grant access to selected sandboxes. OpenShell cannot infer which sandboxes
+should receive that authority.
+
+### Now
+
+Earlier releases configured one shared route:
 
 ```shell
 openshell provider create --name nvidia-prod --type nvidia --from-existing
-```
-
-This reads `NVIDIA_API_KEY` from your environment.
-
-</Tab>
-
-<Tab title="OpenAI-compatible Provider">
-
-Any cloud provider that exposes an OpenAI-compatible API works with the `openai` provider type. You need three values from the provider: the base URL, an API key, and a model name.
-
-```shell
-openshell provider create \
-    --name my-cloud-provider \
-    --type openai \
-    --credential OPENAI_API_KEY=<your_api_key> \
-    --config OPENAI_BASE_URL=https://api.example.com/v1
-```
-
-Replace the base URL and API key with the values from your provider. For supported providers out of the box, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers). For other providers, refer to your provider's documentation for the correct base URL, available models, and API key setup.
-
-This override is used by gateway inference routing. It disables the built-in
-public OpenAI endpoint policy and credential binding for direct sandbox
-traffic, so the alternate-upstream key cannot be substituted at
-`api.openai.com`. Import an endpoint-bearing custom profile if a sandbox must
-contact the alternate upstream directly.
-
-</Tab>
-
-<Tab title="Google Vertex AI">
-
-```shell
-openshell provider create \
-    --name vertex-local \
-    --type google-vertex-ai \
-    --from-gcloud-adc \
-    --config VERTEX_AI_PROJECT_ID=my-gcp-project \
-    --config VERTEX_AI_REGION=us-central1
-```
-
-Use [Google Vertex AI](/providers/google-vertex-ai) for the full auth flows, including the production service-account refresh path, ADC-backed providers that mint `GOOGLE_VERTEX_AI_TOKEN`, and `--from-existing` support.
-
-</Tab>
-
-<Tab title="Local Endpoint">
-
-```shell
-openshell provider create \
-    --name my-local-model \
-    --type openai \
-    --credential OPENAI_API_KEY=empty-if-not-required \
-    --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
-```
-
-Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
-
-The override is route-only and does not add the local endpoint to sandbox
-network policy.
-
-<Tip>
-For a self-contained setup, the Ollama sandbox bundles Ollama inside the sandbox itself, so no host-level provider is needed. Refer to [Inference Ollama](/get-started/tutorials/inference-ollama) for details.
-
-</Tip>
-
-Ollama also supports cloud-hosted models using the `:cloud` tag suffix, for example `qwen3.5:cloud`.
-
-</Tab>
-
-<Tab title="Anthropic">
-
-```shell
-openshell provider create --name anthropic-prod --type anthropic --from-existing
-```
-
-This reads `ANTHROPIC_API_KEY` from your environment.
-
-</Tab>
-
-<Tab title="AWS Bedrock">
-
-```shell
-openshell provider create \
-    --name bedrock-bridge \
-    --type aws-bedrock \
-    --credential AWS_ACCESS_KEY_ID=unused-bridge-fronted-shape \
-    --config BEDROCK_BASE_URL=http://your-bedrock-bridge.your-ns.svc.cluster.local:8080
-```
-
-Then set the inference route, passing `--no-verify` because the validation probe does not yet support Bedrock protocols:
-
-```shell
 openshell inference set \
-    --provider bedrock-bridge \
-    --model anthropic.claude-3-5-sonnet-20241022-v2:0 \
-    --no-verify
+  --provider nvidia-prod \
+  --model nvidia/nemotron-3-nano-30b-a3b \
+  --timeout 300
 ```
 
-**Why a placeholder credential?** `provider create` requires a non-empty `credentials` map even when the upstream auth scheme is `AuthHeader::None` — `aws-bedrock` falls into that bucket today because the router never injects a credential header on outbound requests; the bridge holds operator-side auth in its own pod. Any non-empty string value satisfies the structural requirement; `unused-bridge-fronted-shape` makes the intent obvious in `openshell provider get` output. The same pattern applies to any standalone-router profile that registers `AuthHeader::None`. When the SigV4 follow-up lands and the router begins signing requests itself, this becomes a real key.
+Clients called `https://inference.local`, supplied a placeholder key and model,
+and relied on OpenShell to rewrite the request.
 
-**About the bridge-fronted shape.** The router does not inject any auth header on outbound requests. Point `BEDROCK_BASE_URL` at a translating bridge or Bedrock-compatible proxy that handles authentication in its own pod. The bridge is expected to accept Bedrock InvokeModel requests on the patterns listed above and forward to the operator's real upstream.
+### After
 
-**About `--no-verify`.** The default validation probe does not yet recognize the `aws_bedrock_invoke` protocol, so without `--no-verify` the `inference set` call would fail before it could mint a route. The first sandbox round-trip is the real verification today.
-
-**For direct AWS Bedrock**, refer to a future release that adds the SigV4 router-side signer. Until then, a `BEDROCK_BASE_URL` is required at provider-create time — the core profile sets `default_base_url: ""`, so route resolution rejects providers without it rather than silently forwarding prompts to AWS with no usable auth.
-
-</Tab>
-</Tabs>
-
-## Set Inference Routing
-
-Point `inference.local` at that provider and choose the model to use:
+Export the old provider type's profile, edit its ID and access contract, import
+it, and create a replacement provider from the original credential source:
 
 ```shell
-openshell inference set \
-    --provider nvidia-prod \
-    --model nvidia/nemotron-3-nano-30b-a3b
+openshell provider profile export nvidia -o yaml > nvidia-native.yaml
+# Edit id, display_name, endpoints, and binaries in nvidia-native.yaml.
+openshell provider profile lint -f nvidia-native.yaml
+openshell provider profile import -f nvidia-native.yaml
+openshell provider create \
+  --name nvidia-native-prod \
+  --type nvidia-native \
+  --from-existing
+openshell sandbox provider attach inference-demo nvidia-native-prod
 ```
 
-To override the default 60-second per-request timeout, add `--timeout`:
+OpenShell does not export stored credential values or change a provider's
+profile type in place. If the original credential source is unavailable, the
+compatibility built-in lets you attach the preserved provider while you arrange
+credential rotation into the replacement provider.
 
-```shell
-openshell inference set \
-    --provider nvidia-prod \
-    --model nvidia/nemotron-3-nano-30b-a3b \
-    --timeout 300
-```
+Update each workload to:
 
-The value is in seconds. When `--timeout` is omitted or set to `0`, the default of 60 seconds applies. Increase `--timeout` when you expect extended thinking phases so the full response completes before the request deadline.
+1. Call the provider's native endpoint.
+2. Read the credential variable declared by its profile.
+3. Send the real provider model identifier.
+4. Configure request timeouts in the client.
+5. Use the provider's native request format.
 
-## Inspect and Update the Config
+Launch a new process after attachment and verify a native request before
+upgrading production workloads. Code that still calls `inference.local` fails
+DNS resolution because OpenShell no longer resolves or trusts that virtual
+host.
 
-Confirm that the provider and model are set correctly:
+### Migration Checklist
 
-```shell
-openshell inference get
-Gateway inference:
+Before upgrading, record the old provider, model, and timeout with the previous
+release's `openshell inference get`. Identify actual consumers, export and edit
+the source profile, import it under a new ID, and create the replacement
+provider from the original credential source. Attach it only to those
+sandboxes, migrate their clients, and test the native path while the old route
+is still available. Delete the old route on the previous release to expose
+missed consumers. After upgrading the gateway, delete and recreate every
+pre-upgrade sandbox so no old supervisor, DNS entry, trust material, or cached
+route survives. Reapply only the provider attachments each replacement
+sandbox needs.
 
-  Provider: nvidia-prod
-  Model: nvidia/nemotron-3-nano-30b-a3b
-  Timeout: 300s
-  Version: 1
-```
+Special cases require additional work:
 
-Use `update` when you want to change only one field:
+- A provider with an alternate `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` needs
+  an endpoint-bearing custom profile for that host.
+- Host-local services need `host.openshell.internal` or a reachable LAN/service
+  hostname, not `127.0.0.1` or `localhost`.
+- Google Vertex AI clients must use the native Vertex endpoint and
+  authentication behavior. See [Google Vertex AI](/providers/google-vertex-ai).
+- A bridge-fronted AWS Bedrock deployment needs a custom profile that declares
+  the bridge endpoint and allowed client binaries.
 
-```shell
-openshell inference update --model nvidia/nemotron-3-nano-30b-a3b
-openshell inference update --provider openai-prod
-openshell inference update --timeout 120
-```
+## Security Differences
 
-## Use the Local Endpoint from a Sandbox
-
-After inference is configured, code inside any sandbox can call `https://inference.local` directly. The client-supplied `model` and `api_key` values are not sent upstream — the privacy router injects the real credentials from the configured provider and rewrites the model before forwarding. Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value; pass any placeholder such as `unused`.
-
-<Tabs>
-<Tab title="Claude Code">
-
-```shell
-ANTHROPIC_BASE_URL="https://inference.local" ANTHROPIC_API_KEY=unused claude --bare
-```
-
-`--bare` skips the OAuth login flow and uses `ANTHROPIC_API_KEY` directly. The key is stripped by the proxy and never reaches the upstream provider.
-
-<Note>
-Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`, so omit the `/v1` suffix from the base URL.
-</Note>
-
-</Tab>
-<Tab title="OpenCode">
-
-```shell
-ANTHROPIC_BASE_URL="https://inference.local/v1" ANTHROPIC_API_KEY=unused opencode
-```
-
-<Note>
-OpenCode appends `/messages` directly to `ANTHROPIC_BASE_URL`. Include the `/v1` suffix so the full path becomes `/v1/messages`, which matches the inference pattern.
-</Note>
-
-</Tab>
-<Tab title="Python (OpenAI SDK)">
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="https://inference.local/v1", api_key="unused")
-
-response = client.chat.completions.create(
-    model="anything",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-```
-
-</Tab>
-<Tab title="Python (Anthropic SDK)">
-
-```python
-import anthropic
-
-client = anthropic.Anthropic(
-    base_url="https://inference.local",
-    api_key="unused",
-)
-
-message = client.messages.create(
-    model="anything",
-    max_tokens=1024,
-    messages=[{"role": "user", "content": "Hello"}],
-)
-```
-
-</Tab>
-</Tabs>
-
-Use `inference.local` when inference should stay private and credentials should not be exposed inside the sandbox. External providers reached directly belong in `network_policies` instead.
-
-When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.
-
-If the gateway runs on a remote host or behind a cloud deployment, `host.openshell.internal` points to that remote machine, not to your laptop. A locally running Ollama or vLLM process is not reachable from a remote gateway unless you add your own tunnel or shared network path.
-
-## Verify from a Sandbox
-
-`openshell inference set` and `openshell inference update` verify the resolved upstream endpoint by default before saving the configuration. If the endpoint is not live yet, retry with `--no-verify` to persist the route without the probe.
-
-To confirm end-to-end connectivity from a sandbox, run:
-
-```shell
-curl https://inference.local/v1/responses \
-    -H "Content-Type: application/json" \
-    -d '{
-      "instructions": "You are a helpful assistant.",
-      "input": "Hello!"
-    }'
-```
-
-A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
-
-- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
-- HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
-- Hot reload: Provider, model, and timeout changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
+Provider attachment preserves credential non-disclosure: workloads receive
+opaque placeholders, and the proxy substitutes a real credential only after
+network policy and endpoint binding both pass. Native requests are no longer
+filtered or rewritten by a model-specific router. The provider profile's L7
+rules therefore define the allowed API surface, and the workload controls
+headers, model selection, request shape, streaming, and timeout behavior.
 
 ## Next Steps
 
-Explore related topics:
-
-- To follow a complete Ollama-based local setup, refer to [Inference Ollama](/get-started/tutorials/inference-ollama).
-- To follow a complete LM Studio-based local setup, refer to [Local Inference LM Studio](/get-started/tutorials/local-inference-lmstudio).
-- To control external endpoints, refer to [Policies](/sandboxes/policies).
-- To manage provider records, refer to [Providers](/sandboxes/manage-providers).
+- [Profiles](/providers/profiles)
+- [Providers](/sandboxes/manage-providers)
+- [Customize Sandbox Policies](/sandboxes/policies)
+- [Google Vertex AI](/providers/google-vertex-ai)

@@ -92,6 +92,19 @@ pub enum LandlockCompatibility {
     HardRequirement,
 }
 
+/// Accepted `landlock.compatibility` values in their proto string form.
+///
+/// Single source of truth shared by YAML parsing, proto→runtime conversion,
+/// and gateway policy validation so the accepted set cannot drift.
+pub const LANDLOCK_COMPATIBILITY_VALUES: [&str; 2] = ["best_effort", "hard_requirement"];
+
+/// Returns `true` if `value` is an accepted `landlock.compatibility` string.
+///
+/// The empty string is accepted and defaults to `best_effort`.
+pub fn is_valid_landlock_compatibility(value: &str) -> bool {
+    value.is_empty() || LANDLOCK_COMPATIBILITY_VALUES.contains(&value)
+}
+
 // ============================================================================
 // Proto to Rust type conversions
 // ============================================================================
@@ -105,7 +118,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
         // schema-level UI allowance cannot grant a UI surface there. The MXC
         // driver consumes the typed proto directly on Windows.
         // In cluster mode we always run with proxy networking so all egress
-        // can be evaluated by OPA and `inference.local` is always addressable.
+        // can be evaluated by OPA.
         let network = NetworkPolicy {
             mode: NetworkMode::Proxy,
             proxy: Some(ProxyPolicy { http_addr: None }),
@@ -118,7 +131,11 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
                 .map(FilesystemPolicy::from)
                 .unwrap_or_default(),
             network,
-            landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
+            landlock: proto
+                .landlock
+                .map(LandlockPolicy::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
         })
     }
@@ -142,14 +159,20 @@ impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
     }
 }
 
-impl From<ProtoLandlockPolicy> for LandlockPolicy {
-    fn from(proto: ProtoLandlockPolicy) -> Self {
-        let compatibility = if proto.compatibility == "hard_requirement" {
-            LandlockCompatibility::HardRequirement
-        } else {
-            LandlockCompatibility::BestEffort
+impl TryFrom<ProtoLandlockPolicy> for LandlockPolicy {
+    type Error = miette::Error;
+
+    fn try_from(proto: ProtoLandlockPolicy) -> Result<Self, Self::Error> {
+        let compatibility = match proto.compatibility.as_str() {
+            "best_effort" | "" => LandlockCompatibility::BestEffort,
+            "hard_requirement" => LandlockCompatibility::HardRequirement,
+            otherwise => miette::bail!(
+                "invalid landlock.compatibility {:?}; accepted: {}",
+                otherwise,
+                LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+            ),
         };
-        Self { compatibility }
+        Ok(Self { compatibility })
     }
 }
 
@@ -195,5 +218,46 @@ mod tests {
         assert!(converted.filesystem.read_write.is_empty());
         assert!(converted.process.run_as_user.is_none());
         assert!(converted.process.run_as_group.is_none());
+    }
+
+    #[test]
+    fn try_from_maps_known_compatibility_values() {
+        for (input, expected) in [
+            ("", LandlockCompatibility::BestEffort),
+            ("best_effort", LandlockCompatibility::BestEffort),
+            ("hard_requirement", LandlockCompatibility::HardRequirement),
+        ] {
+            let proto = ProtoLandlockPolicy {
+                compatibility: input.into(),
+            };
+            let policy = LandlockPolicy::try_from(proto).expect("should convert");
+            assert_eq!(
+                std::mem::discriminant(&policy.compatibility),
+                std::mem::discriminant(&expected),
+                "input {input:?} mapped to unexpected variant",
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_invalid_compatibility() {
+        let proto = ProtoLandlockPolicy {
+            compatibility: "hard-requirement".into(),
+        };
+        let err = LandlockPolicy::try_from(proto).expect_err("should reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn is_valid_landlock_compatibility_accepts_empty_and_known() {
+        assert!(is_valid_landlock_compatibility(""));
+        assert!(is_valid_landlock_compatibility("best_effort"));
+        assert!(is_valid_landlock_compatibility("hard_requirement"));
+        assert!(!is_valid_landlock_compatibility("nope"));
+        assert!(!is_valid_landlock_compatibility("BestEffort"));
     }
 }
