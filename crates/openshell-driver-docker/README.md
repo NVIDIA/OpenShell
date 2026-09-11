@@ -136,6 +136,11 @@ gateway. Docker Desktop and compatible VM-backed daemons use Docker's
 `host-gateway` route. A configured HTTPS server certificate must include the
 endpoint host in its subject alternative names.
 
+The driver pins a concrete managed-bridge address in the sandbox descriptor.
+For Docker's special `host-gateway` route, it leaves the address unpinned so
+the supervisor resolves the driver-injected alias in its own container. This
+avoids treating the Docker VM's loopback as the desktop host.
+
 The supervisor owns these security-critical variables:
 
 - `OPENSHELL_ENDPOINT`
