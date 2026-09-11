@@ -12,23 +12,24 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::boundary_protocol::{
-    BoundaryClientTls, BoundaryConfig, BoundaryListener, BoundaryServerTls, BoundaryTopology,
-    BoundaryTransport,
+    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
 pub struct DockerBoundarySpec {
     pub boundary_id: String,
-    pub bootstrap_token: String,
     pub generation: String,
-    pub session_epoch: String,
+    pub session_id: openshell_core::SandboxSessionId,
+    pub gateway_id: String,
+    pub verification_keys: Vec<GatewayVerificationKey>,
     pub container_id: String,
     pub image_identity: String,
     pub listener_socket: PathBuf,
     pub control_socket: PathBuf,
-    pub sandbox_tls: BoundaryServerTls,
-    pub supervisor_tls: BoundaryClientTls,
+    pub sandbox_tls: SandboxTlsServerConfig,
+    pub supervisor_tls: SandboxTlsClientConfig,
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
@@ -58,13 +59,13 @@ impl DockerBoundarySpec {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
                 generation: self.generation.clone(),
-                session_epoch: self.session_epoch.clone(),
-                bootstrap_token: self.bootstrap_token.clone(),
+                session_id: self.session_id,
+                gateway_id: self.gateway_id,
+                verification_keys: self.verification_keys,
                 listener: BoundaryListener::Unix {
                     socket_path: self.listener_socket,
                     tls: self.sandbox_tls,
                 },
-                multiplexed: true,
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: self.workload_identity.clone(),
@@ -74,17 +75,15 @@ impl DockerBoundarySpec {
             topology: BoundaryTopology {
                 boundary_id: self.boundary_id,
                 generation: self.generation,
-                session_epoch: self.session_epoch,
+                session_id: self.session_id,
                 workload_identity: self.workload_identity,
-                transport: BoundaryTransport::Unix {
+                transport: SandboxTransport::Unix {
                     socket_path: self.control_socket,
-                    tls: self.supervisor_tls,
                 },
-                multiplexed: true,
+                tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
                 driver_fence,
-                bootstrap_token: self.bootstrap_token,
             },
         }
     }
@@ -96,27 +95,31 @@ mod tests {
 
     #[test]
     fn provisioning_binds_container_and_image_claims() {
-        let tls = openshell_isolation_interface::boundary_protocol::generate_boundary_mutual_tls_material()
-            .unwrap();
+        let session_id = openshell_core::SandboxSessionId::new();
+        let tls = openshell_isolation_interface::boundary_protocol::generate_sandbox_tls_material(
+            session_id,
+        )
+        .unwrap();
         let provisioned = DockerBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
-            bootstrap_token: "a".repeat(64),
             generation: "generation-1".to_string(),
-            session_epoch: "epoch-1".to_string(),
+            session_id,
+            gateway_id: "gateway-1".to_string(),
+            verification_keys: vec![GatewayVerificationKey {
+                key_id: "key-1".to_string(),
+                public_key_pem: "public-key".to_string(),
+            }],
             container_id: "sha256:container".to_string(),
             image_identity: "sha256:image".to_string(),
             listener_socket: PathBuf::from("/run/openshell/boundary/control.sock"),
             control_socket: PathBuf::from("/host/control.sock"),
-            sandbox_tls: BoundaryServerTls {
+            sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from("/run/openshell/boundary/server.crt"),
                 private_key_path: PathBuf::from("/run/openshell/boundary/server.key"),
-                client_ca_certificate_path: PathBuf::from("/run/openshell/boundary/client-ca.crt"),
             },
-            supervisor_tls: BoundaryClientTls {
+            supervisor_tls: SandboxTlsClientConfig {
                 server_name: tls.server_name,
-                ca_certificate_pem: tls.ca_certificate_pem,
-                certificate_chain_pem: tls.supervisor_certificate_pem,
-                private_key_pem: tls.supervisor_private_key_pem,
+                trust_anchor_pem: tls.trust_anchor_pem,
             },
             host_gateway_ip: Some(IpAddr::from([127, 0, 0, 1])),
             workload_identity: ResolvedWorkloadIdentity::new(
