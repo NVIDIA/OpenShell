@@ -143,6 +143,7 @@ pub struct KubernetesProxyPodBoundarySpec {
     pub egress_policy_uid: String,
     pub egress_policy_resource_version: String,
     pub boundary_listener: SocketAddr,
+    pub control_authority: String,
     pub control_address: SocketAddr,
     pub sandbox_tls: SandboxTlsServerConfig,
     pub supervisor_tls: SandboxTlsClientConfig,
@@ -219,7 +220,7 @@ impl KubernetesProxyPodBoundarySpec {
                 session_id: self.session_id,
                 workload_identity: self.workload_identity,
                 transport: SandboxTransport::Tcp {
-                    authority: self.control_address.to_string(),
+                    authority: self.control_authority,
                     addresses: vec![self.control_address],
                 },
                 tls: self.supervisor_tls,
@@ -253,6 +254,7 @@ mod tests {
             egress_policy_uid: "network-policy-uid".to_string(),
             egress_policy_resource_version: "1945".to_string(),
             boundary_listener: "0.0.0.0:5500".parse().expect("valid listener"),
+            control_authority: "os-boundary-sandbox.default.svc:5500".to_string(),
             control_address: "10.42.0.7:5500".parse().expect("valid target"),
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from("/run/boundary/tls.crt"),
@@ -321,7 +323,7 @@ mod tests {
         assert_eq!(
             provisioned.topology.transport,
             SandboxTransport::Tcp {
-                authority: "10.42.0.7:5500".to_string(),
+                authority: "os-boundary-sandbox.default.svc:5500".to_string(),
                 addresses: vec!["10.42.0.7:5500".parse().expect("valid target")],
             }
         );

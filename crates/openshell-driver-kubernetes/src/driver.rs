@@ -88,6 +88,17 @@ const ANNOTATION_PROXY_POD_GENERATION: &str = "openshell.ai/proxy-pod-generation
 const ANNOTATION_PROXY_POD_READINESS: &str = "openshell.ai/proxy-pod-readiness";
 const ANNOTATION_PROXY_POD_WORKLOAD_UID: &str = "openshell.ai/proxy-pod-workload-uid";
 
+fn boundary_service_authority(
+    namespace: &str,
+    names: &ProxyPodNames,
+    boundary_port: u16,
+) -> String {
+    format!(
+        "{}.{}.svc:{boundary_port}",
+        names.boundary_service, namespace
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
     #[error("sandbox already exists")]
@@ -2348,6 +2359,11 @@ impl KubernetesComputeDriver {
                 },
                 self.config.proxy_pod.boundary_port,
             ),
+            control_authority: boundary_service_authority(
+                namespace,
+                names,
+                self.config.proxy_pod.boundary_port,
+            ),
             control_address: std::net::SocketAddr::new(
                 service_ip,
                 self.config.proxy_pod.boundary_port,
@@ -2568,6 +2584,11 @@ impl KubernetesComputeDriver {
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
                 },
+                self.config.proxy_pod.boundary_port,
+            ),
+            control_authority: boundary_service_authority(
+                namespace,
+                names,
                 self.config.proxy_pod.boundary_port,
             ),
             control_address: std::net::SocketAddr::new(
@@ -6667,6 +6688,16 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn boundary_authority_uses_stable_service_dns_name() {
+        let names = ProxyPodNames::new("sandbox-1");
+
+        assert_eq!(
+            boundary_service_authority("workspace-a", &names, 5500),
+            "os-boundary-sandbox-1.workspace-a.svc:5500"
+        );
+    }
 
     #[tokio::test]
     async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
