@@ -38,7 +38,7 @@ pub fn load_object_schema(object: &str) -> Value {
     serde_json::from_str(&data).unwrap_or_else(|e| panic!("Invalid JSON in {path}: {e}"))
 }
 
-/// Validate that all required fields from the schema are present in the event JSON.
+/// Validate required fields and the schema's `at_least_one` constraint.
 ///
 /// The OCSF schema stores attributes as an object where each key is a field name
 /// and the value contains a `requirement` field.
@@ -56,12 +56,26 @@ pub fn validate_required_fields(event: &Value, schema: &Value) {
         _ => return,
     };
 
+    if let Some(fields) = schema
+        .get("constraints")
+        .and_then(|constraints| constraints.get("at_least_one"))
+        .and_then(Value::as_array)
+    {
+        assert!(
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|field| { event.get(field).is_some_and(|value| !value.is_null()) }),
+            "Missing at_least_one field from {fields:?}"
+        );
+    }
+
     for (name, def) in &attrs {
         let is_required = def.get("requirement").and_then(|r| r.as_str()) == Some("required");
         let is_profile_field = def.get("profile").is_some() || def.get("profiles").is_some();
         if is_required && !is_profile_field {
             assert!(
-                event.get(name).is_some(),
+                event.get(name).is_some_and(|value| !value.is_null()),
                 "Missing required field '{name}' in OCSF event. Event keys: {:?}",
                 event.as_object().map(|o| o.keys().collect::<Vec<_>>())
             );
@@ -91,6 +105,32 @@ pub fn validate_enum_value(event: &Value, field: &str, schema: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_and_http_require_at_least_one_non_null_field() {
+        for (class, fields) in [
+            ("network_activity", ["src_endpoint", "dst_endpoint"]),
+            ("http_activity", ["http_request", "http_response"]),
+        ] {
+            let schema = load_class_schema(class);
+            let mut event = serde_json::json!({
+                "class_uid": schema["uid"], "severity_id": 1, "metadata": {},
+                "time": 12345, "type_uid": 0, "activity_id": 0, "category_uid": 4
+            });
+            assert!(
+                std::panic::catch_unwind(|| validate_required_fields(&event, &schema)).is_err()
+            );
+            for field in fields {
+                event[field] = Value::Null;
+                assert!(
+                    std::panic::catch_unwind(|| validate_required_fields(&event, &schema)).is_err()
+                );
+                event[field] = serde_json::json!({});
+                validate_required_fields(&event, &schema);
+                event.as_object_mut().unwrap().remove(field);
+            }
+        }
+    }
 
     #[test]
     fn test_load_class_schemas() {

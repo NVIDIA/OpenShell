@@ -45,6 +45,7 @@ socket2 = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 tempfile = "3"
 
 [lints]

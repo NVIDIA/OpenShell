@@ -55,6 +55,7 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tempfile = "3"
 tonic = { workspace = true }
