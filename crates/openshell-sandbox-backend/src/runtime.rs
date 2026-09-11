@@ -1994,7 +1994,7 @@ mod tests {
     fn sandbox() -> SandboxContext {
         SandboxContext {
             sandbox_id: "sandbox-1".to_string(),
-            session_id: openshell_core::SandboxSessionId::new(),
+            session_id: test_session_id(),
             policy: SandboxPolicy {
                 version: 1,
                 filesystem: FilesystemPolicy::default(),
