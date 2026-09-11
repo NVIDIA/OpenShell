@@ -13,6 +13,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::driver::DEFAULT_SANDBOX_UID;
+
 const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
 const SUPERVISOR_RUNTIME: &[u8] =
@@ -25,8 +27,6 @@ pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
-const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
-    openshell_core::container_paths::VM_SANDBOX_OWNER_NORMALIZED_MARKER;
 const SANDBOX_SUPERVISOR_RUNTIME_PATH: &str = "/opt/openshell/bin/openshell-runtime";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
@@ -52,7 +52,7 @@ pub fn sandbox_guest_runtime_identity() -> String {
 
 /// Materialize the supervisor embedded in the VM driver for host-side use.
 pub fn extract_host_supervisor(path: &Path) -> Result<(), String> {
-    if SANDBOX.is_empty() {
+    if SUPERVISOR.is_empty() {
         return Err(
             "host supervisor is not embedded; run `mise run vm:supervisor` and rebuild openshell-driver-vm"
                 .to_string(),

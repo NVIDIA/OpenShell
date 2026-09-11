@@ -14,6 +14,7 @@ use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
     recover_rootfs_image, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
     set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
@@ -276,67 +277,6 @@ pub struct VmDriverConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
 
-    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
-    /// passed to the host supervisor.
-    ///
-    /// The supervisor chains policy-approved TLS tunnels through this proxy
-    /// with HTTP CONNECT instead of dialing destinations directly. This is an
-    /// operator-owned egress boundary: it travels on the supervisor's argv,
-    /// which sandbox spec/template environment and image `ENV` cannot
-    /// influence. `host.openshell.internal` resolves to host loopback for the
-    /// host supervisor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub https_proxy: Option<String>,
-
-    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
-    ///
-    /// Matching destinations are dialed directly instead of through the
-    /// corporate proxy. This bypasses only the corporate proxy, never
-    /// `OpenShell` policy evaluation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_proxy: Option<String>,
-
-    /// Path (on the gateway host) to a file containing the corporate proxy
-    /// credential in `user:pass` form.
-    ///
-    /// The driver validates it at sandbox-create time and stages it into the
-    /// per-sandbox overlay at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], root-only.
-    /// Credentials are never embedded in the proxy URL and never reach the
-    /// guest environment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_auth_file: Option<String>,
-
-    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
-    ///
-    /// `Proxy-Authorization: Basic` over the plain-TCP connection to an
-    /// `http://` proxy is recoverable by anyone on the network path, so
-    /// [`Self::proxy_auth_file`] requires this acknowledgement. An `https://`
-    /// proxy carries the credential inside the verified TLS session and does
-    /// not need it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_auth_allow_insecure: Option<bool>,
-
-    /// Send the destination hostname in CONNECT requests instead of a
-    /// validated IP.
-    ///
-    /// The default binds the tunnel to an address that passed the sandbox's
-    /// SSRF and `allowed_ips` validation. Set this only when the proxy's ACLs
-    /// filter on hostnames and reject IP CONNECT targets: the proxy then
-    /// resolves the name itself and its own ACLs become the effective egress
-    /// control for proxied TLS.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_connect_by_hostname: Option<bool>,
-
-    /// Path (on the gateway host) to a PEM CA bundle trusted for the
-    /// corporate proxy.
-    ///
-    /// The driver stages it into the per-sandbox overlay at
-    /// [`GUEST_PROXY_CA_PATH`] and passes that path via
-    /// `--upstream-proxy-ca-bundle`. It is trusted both for the handshake
-    /// with an `https://` proxy and for server certificates re-signed by a
-    /// TLS-intercepting proxy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_ca_bundle: Option<String>,
     /// Directory where rootfs tar files must be staged before they can be
     /// referenced in a `CreateSandbox` request. Defaults to `<state_dir>/rootfs-tar-staging`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,29 +451,6 @@ impl VmDriverConfig {
             ));
         }
         Ok(())
-    }
-
-    /// Validate the operator's corporate upstream-proxy settings, fail-closed.
-    ///
-    /// Delegates to the validator shared with the Podman and Kubernetes
-    /// drivers and with the host supervisor, so a value accepted here is
-    /// never rejected by the host supervisor — and no misconfiguration can silently
-    /// degrade to a direct dial.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the offending key.
-    pub fn validate_proxy_config(&self) -> Result<(), String> {
-        openshell_core::driver_utils::validate_upstream_proxy_settings(
-            &openshell_core::driver_utils::UpstreamProxySettings {
-                url: self.https_proxy.as_deref(),
-                no_proxy: self.no_proxy.as_deref(),
-                auth_file: self.proxy_auth_file.as_deref(),
-                auth_allow_insecure: self.proxy_auth_allow_insecure,
-                connect_by_hostname: self.proxy_connect_by_hostname,
-                ca_bundle: self.proxy_ca_bundle.as_deref(),
-            },
-        )
     }
 
     fn rootfs_tar_staging_dir(&self) -> PathBuf {
@@ -896,7 +813,7 @@ impl VmDriver {
     ) -> Result<Child, Status> {
         let supervisor_binary = self.host_supervisor_binary().await?;
         let (openshell_endpoint, gateway_tls_server_name) =
-            host_control_openshell_endpoint(&self.config.openshell_endpoint)
+            host_control_openshell_endpoint(&self.config.grpc_endpoint)
                 .map_err(Status::failed_precondition)?;
         let auth_bundle_path = state_dir.join(HOST_AUTH_BUNDLE_FILE);
         let encoded_auth_bundle = serde_json::to_vec(auth_bundle)
@@ -1350,8 +1267,13 @@ impl VmDriver {
                 "Preparing writable VM overlay disk".to_string(),
             ),
         );
-        if let Err(err) = self
-            .prepare_runtime_overlay(&overlay_disk, overlay_preparation)
+        let sandbox_owner_state = self
+            .prepare_runtime_overlay(
+                &state_dir,
+                &overlay_disk,
+                &owner_source_disk,
+                overlay_preparation,
+            )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -2637,6 +2559,7 @@ impl VmDriver {
         &self,
         state_dir: &Path,
         overlay_disk: &Path,
+        owner_source_disk: &Path,
         preparation: OverlayPreparation,
     ) -> Result<SandboxOwnerIdentity, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
@@ -2700,7 +2623,10 @@ impl VmDriver {
                 .await
                 .map_err(|error| format!("overlay recovery panicked: {error}"))??;
         }
-        span_status.finish(Ok(()))
+        if write_owner_state && !owner_state_written_before_prepare {
+            write_sandbox_owner_state(state_dir, owner_state).await?;
+        }
+        span_status.finish(Ok(owner_state))
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -6287,9 +6213,9 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Result<Vec<String>, Strin
         args.push("--upstream-no-proxy".to_string());
         args.push(list.clone());
     }
-    if let Some(path) = &config.proxy_auth_file {
+    if let Some(path) = &config.upstream_proxy.proxy_auth_file {
         args.push("--upstream-proxy-auth-file".to_string());
-        args.push(path.clone());
+        args.push(path.display().to_string());
     }
     // Config validation guarantees the acknowledgement is `true` whenever an
     // auth file is configured against an http:// proxy; the supervisor
@@ -6304,7 +6230,7 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Result<Vec<String>, Strin
     }
     if let Some(path) = &config.proxy_ca_bundle {
         args.push("--upstream-proxy-ca-bundle".to_string());
-        args.push(path.clone());
+        args.push(path.display().to_string());
     }
     Ok(args)
 }
@@ -7327,7 +7253,12 @@ mod tests {
         let parent = tracing::info_span!("vm.provision");
 
         let result = driver
-            .prepare_runtime_overlay(Path::new("/unused"), OverlayPreparation::Fresh)
+            .prepare_runtime_overlay(
+                Path::new("/unused"),
+                Path::new("/unused"),
+                Path::new("/unused"),
+                OverlayPreparation::Fresh,
+            )
             .instrument(parent)
             .await;
         assert!(result.is_err(), "overflow should stop before disk I/O");
@@ -9331,6 +9262,8 @@ mod tests {
 
     #[test]
     fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
+        let image = "sha256:local-image";
+        let image_account = prepared_image_cache_identity(image, &VmDriverConfig::default());
         assert_eq!(
             image_account,
             format!(
@@ -10191,7 +10124,11 @@ mod tests {
     }
 
     /// A driver config carrying only corporate proxy settings.
-    fn proxy_config(https_proxy: Option<&str>, auth_file: Option<&str>) -> VmDriverConfig {
+    fn proxy_config(
+        https_proxy: Option<&str>,
+        auth_file: Option<&str>,
+        ca_bundle: Option<&str>,
+    ) -> VmDriverConfig {
         VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             upstream_proxy: UpstreamProxyConfig {
@@ -10200,6 +10137,7 @@ mod tests {
                 proxy_auth_allow_insecure: auth_file.map(|_| true),
                 ..UpstreamProxyConfig::default()
             },
+            proxy_ca_bundle: ca_bundle.map(PathBuf::from),
             ..Default::default()
         }
     }
@@ -10213,6 +10151,7 @@ mod tests {
             proxy_config(
                 Some("http://user:secret@proxy.corp.test:3128"),
                 Some("/etc/openshell/secrets/proxy-auth"),
+                None,
             )
         );
         assert!(
@@ -10244,6 +10183,7 @@ mod tests {
         let config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
+            Some("/etc/openshell/tls/corp-ca.pem"),
         );
         let args = upstream_proxy_cli_args(&config).unwrap();
 
@@ -10264,7 +10204,7 @@ mod tests {
     #[test]
     fn upstream_proxy_args_pass_only_explicit_opt_ins() {
         let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None, None);
-        config.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
+        config.upstream_proxy.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
         let args = upstream_proxy_cli_args(&config).unwrap();
         assert_eq!(
             args,
@@ -10326,7 +10266,7 @@ mod tests {
             .expect_err("a bypass list without a proxy would hide a fail-open state");
         assert!(err.contains("no_proxy"), "{err}");
 
-        let config = proxy_config(Some("http://proxy.corp.test:3128"), None);
+        let config = proxy_config(Some("http://proxy.corp.test:3128"), None, None);
         config
             .validate_runtime_security_config()
             .expect("a lone proxy URL is a complete configuration");
@@ -10346,6 +10286,7 @@ mod tests {
         let mut config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
+            None,
         );
         config.upstream_proxy.proxy_auth_allow_insecure = None;
         let err = config
@@ -10374,6 +10315,7 @@ mod tests {
         let config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
+            None,
         );
         let sandbox = Sandbox {
             id: "sb-proxy".to_string(),
