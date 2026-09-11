@@ -29,7 +29,7 @@ K3D_CLUSTER_NAME_MAX=32
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
 # Preload the default community sandbox image so the first sandbox create does
 # not pay the full registry pull cost inside the cluster.
-DEFAULT_SANDBOX_PRELOAD_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+DEFAULT_SANDBOX_PRELOAD_IMAGE="docker.io/library/alpine:3.22"
 PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
 # Upstream agent-sandbox release pinned for both CRDs/controller and extensions.
