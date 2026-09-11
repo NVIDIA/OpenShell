@@ -10,7 +10,7 @@
 
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxSpec, SandboxTemplate,
+    SandboxSpec, SandboxTemplate, UiClipboardAccess,
 };
 use openshell_core::rpc_error::invalid_argument;
 use prost::Message;
@@ -1042,7 +1042,14 @@ pub(super) fn validate_static_fields_unchanged(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
     }
-    if baseline.ui != new.ui {
+    let mut baseline_ui = baseline.ui;
+    let mut new_ui = new.ui;
+    for ui in [&mut baseline_ui, &mut new_ui].into_iter().flatten() {
+        if ui.clipboard == UiClipboardAccess::Unspecified as i32 {
+            ui.clipboard = UiClipboardAccess::None as i32;
+        }
+    }
+    if baseline_ui != new_ui {
         return Err(Status::invalid_argument(
             "UI policy cannot be changed on a live sandbox (applied at startup)",
         ));

@@ -321,10 +321,31 @@ fn map_ui(ui: Option<&UiPolicy>, containment: &str, items: &mut Vec<LossItem>) -
                     "none"
                 }
             };
+            let graphical_ui_disabled = !ui.allow_graphical_ui;
+            if graphical_ui_disabled && clipboard != "none" {
+                add_loss(
+                    items,
+                    "ui.clipboard",
+                    "error",
+                    "MXC ignores clipboard grants when ui.disable is true.",
+                    "directional clipboard access without graphical UI",
+                    "MXC receives clipboard=none and sandbox creation is rejected; set allow_graphical_ui=true to request clipboard access.",
+                );
+            }
+            if graphical_ui_disabled && ui.allow_input_injection {
+                add_loss(
+                    items,
+                    "ui.allow_input_injection",
+                    "error",
+                    "MXC ignores input-injection grants when ui.disable is true.",
+                    "input injection without graphical UI",
+                    "MXC receives injection=false and sandbox creation is rejected; set allow_graphical_ui=true to request input injection.",
+                );
+            }
             Some(json!({
-                "disable": !ui.allow_graphical_ui,
-                "clipboard": clipboard,
-                "injection": ui.allow_input_injection,
+                "disable": graphical_ui_disabled,
+                "clipboard": if graphical_ui_disabled { "none" } else { clipboard },
+                "injection": !graphical_ui_disabled && ui.allow_input_injection,
             }))
         }
         "isolation_session" => {
