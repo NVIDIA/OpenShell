@@ -536,13 +536,23 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
 
     $tests = @(
-        "windows_builtin_compute_drivers_report_unsupported"
+        "windows_builtin_compute_drivers_report_unsupported",
+        "default_registry_contains_exactly_the_enabled_compute_drivers"
     )
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
             -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
+    }
+
+    foreach ($features in @("", "compute-driver-mxc", "compute-driver-docker", "compute-driver-mxc,compute-driver-docker")) {
+        $featureArgs = if ($features) { "--features $features" } else { "" }
+        $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
+        Invoke-VsCargo `
+            -RustTarget $RustTarget `
+            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
+            -LogName "test-$RustTarget-selective-$variant.log"
     }
 }
 

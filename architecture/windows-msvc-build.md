@@ -31,6 +31,14 @@ Windows. These registrations preserve config-file selection and reject
 unsupported drivers with a clear error without depending on their runtime
 crates.
 
+Each stub follows its corresponding `compute-driver-*` Cargo feature.
+`compute-driver-mxc` independently links and registers MXC, so a gateway built
+with only that feature has only the MXC registration. The default
+`in-tree-compute-drivers` alias enables all five features and preserves the
+existing MXC plus unsupported-driver registrations. The focused Windows
+contract tasks cover default, protocol-only, MXC-only, Docker-stub-only, and
+MXC plus Docker-stub compositions.
+
 The Windows lane does not build, release, package, or smoke-test standalone
 driver binaries for Docker, Kubernetes, Podman, or VM. Those binaries are Linux
 or macOS deliverables only.
