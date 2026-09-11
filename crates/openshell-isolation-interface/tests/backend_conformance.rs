@@ -257,6 +257,7 @@ impl<K: MockKind> ReadyBoundary for MockReady<K> {
     }
 }
 
+#[async_trait]
 impl<K: MockKind> RunningBoundary for MockRunning<K> {
     fn agent(&self) -> Arc<dyn BoundaryProcess> {
         self.process.clone()
@@ -266,6 +267,9 @@ impl<K: MockKind> RunningBoundary for MockRunning<K> {
     }
     fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
         self.loopback_connector.clone()
+    }
+    async fn terminate(&self) -> Result<(), BackendError> {
+        self.process.terminate().await
     }
 }
 
