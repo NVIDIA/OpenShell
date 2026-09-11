@@ -24,6 +24,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
 #[cfg(target_os = "linux")]
@@ -1656,7 +1657,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     let bundle_final = state.join("bootstrap");
     fs::create_dir(&bundle_tmp).into_diagnostic()?;
     fs::set_permissions(&bundle_tmp, fs::Permissions::from_mode(0o700)).into_diagnostic()?;
-    for name in ["boundary.json", "tls.crt", "tls.key", "client-ca.crt"] {
+    for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
         copy_projected_secret_file(source, name, &bundle_tmp.join(name), 0o600)?;
     }
     fs::rename(&bundle_tmp, &bundle_final).into_diagnostic()?;
@@ -1918,13 +1919,8 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         let revision = source.join("..2026_09_04_00_00_00");
         std::fs::create_dir(&revision).unwrap();
-        for (name, contents) in [
-            ("boundary.json", b"{}".as_slice()),
-            ("tls.crt", b"certificate".as_slice()),
-            ("tls.key", b"private-key".as_slice()),
-            ("client-ca.crt", b"client-ca".as_slice()),
-        ] {
-            std::fs::write(revision.join(name), contents).unwrap();
+        for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
+            std::fs::write(revision.join(name), format!("contents-{name}")).unwrap();
             std::os::unix::fs::symlink(format!("..data/{name}"), source.join(name)).unwrap();
         }
         std::os::unix::fs::symlink(revision.file_name().unwrap(), source.join("..data")).unwrap();
@@ -1940,7 +1936,7 @@ mod tests {
                 & 0o777,
             0o500
         );
-        for name in ["boundary.json", "tls.crt", "tls.key", "client-ca.crt"] {
+        for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
             let staged = state.join("bootstrap").join(name);
             assert_eq!(
                 std::fs::read(&staged).unwrap(),
