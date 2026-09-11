@@ -13,6 +13,7 @@ OpenShell builds these main artifacts:
 | Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
 | E2E conformance CLI | `crates/openshell-conformance-cli` |
+| Standalone policy prover | `crates/openshell-prover-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
@@ -84,6 +85,14 @@ The workspace uses `z3` versions whose `z3-sys` dependency keeps downloader
 HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
+
+The standalone `openshell-prover` executable is distributed independently of
+the main CLI. Release workflows build Linux musl x86_64 and aarch64 binaries
+and a macOS Apple Silicon binary, then publish one archive per target plus a
+dedicated SHA-256 manifest. Before publication, target-native jobs extract each
+archive, reject host Z3 or Nix store linkage, and run a real local containment
+check. The tool therefore requires neither an OpenShell installation nor a
+separately installed Z3 runtime.
 
 ## Linux Runtime Environments
 
@@ -191,7 +200,9 @@ attestation below, which describes a published image.
 
 The shared binary build action uses the default Nix shell and compiles release
 artifacts with `cargo auditable build --target <triple>`. Verification and upload
-read binaries from `target/<triple>/release/`.
+read binaries from `target/<triple>/release/`. The standalone prover uses this
+same action, while its package workflow adds target-native extracted-archive
+linkage and containment smoke checks before producing its checksum manifest.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the

@@ -4412,9 +4412,24 @@ dependencies = [
  "include_dir",
  "miette",
  "noyalib",
+ "openshell-core",
  "owo-colors",
+ "regorus",
  "serde",
+ "serde_json",
  "z3",
+]
+
+[[package]]
+name = "openshell-prover-cli"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "nix 0.29.0",
+ "openshell-prover",
+ "serde",
+ "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

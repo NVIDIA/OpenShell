@@ -1,0 +1,304 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::fmt::Write as _;
+use std::fs;
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, Output};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
+
+use serde_json::Value;
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_openshell-prover"))
+        .args(args)
+        .output()
+        .expect("run openshell-prover")
+}
+
+fn check_json(candidate: &str, maximum: &str) -> Output {
+    run(&[
+        "check",
+        fixture(candidate).to_str().expect("UTF-8 fixture path"),
+        "--maximum",
+        fixture(maximum).to_str().expect("UTF-8 fixture path"),
+        "--output",
+        "json",
+    ])
+}
+
+#[test]
+fn help_and_version_succeed() {
+    for args in [
+        &["--help"][..],
+        &["--version"][..],
+        &["check", "--help"][..],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn bare_invocation_shows_help() {
+    let output = run(&[]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+}
+
+#[test]
+fn contained_policy_returns_stable_json_and_zero() {
+    let output = check_json("candidate-contained.yaml", "maximum.yaml");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["check"], "maximum_boundary");
+    assert_eq!(value["result"], "within_max");
+    assert_eq!(value["exit_code"], 0);
+    assert!(value["scope"]["domains"].is_array());
+    assert!(value["counterexample"].is_null());
+}
+
+#[test]
+fn exceeding_policy_returns_counterexample_and_one() {
+    let output = check_json("candidate-exceeds.yaml", "maximum.yaml");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "exceeds_max");
+    assert_eq!(value["exit_code"], 1);
+    assert_eq!(value["counterexample"]["domain"], "filesystem");
+}
+
+#[test]
+fn unsupported_policy_returns_reason_and_three() {
+    let output = check_json("unsupported.yaml", "maximum.yaml");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "unsupported");
+    assert_eq!(value["exit_code"], 3);
+    assert!(value["reason_code"].is_string());
+    assert!(value["reason"].is_string());
+}
+
+#[test]
+fn resource_exhaustion_is_inconclusive_and_returns_three() {
+    let path = std::env::temp_dir().join(format!(
+        "openshell-prover-resource-limit-{}.yaml",
+        std::process::id()
+    ));
+    let mut source = String::from("version: 1\nnetwork_policies:\n");
+    for index in 0..=1_024 {
+        writeln!(source, "  rule-{index}: {{}}").unwrap();
+    }
+    fs::write(&path, source).expect("write resource-limit policy");
+
+    let output = run(&[
+        "check",
+        path.to_str().expect("UTF-8 temporary path"),
+        "--maximum",
+        fixture("maximum.yaml").to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    fs::remove_file(path).expect("remove resource-limit policy");
+
+    assert_eq!(output.status.code(), Some(3));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "inconclusive");
+    assert_eq!(value["reason_code"], "resource_limit");
+}
+
+#[test]
+fn invalid_json_mode_input_uses_error_envelope_and_two() {
+    let output = check_json("invalid.yaml", "maximum.yaml");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["exit_code"], 2);
+    assert_eq!(value["reason_code"], "invalid_input");
+}
+
+#[test]
+fn missing_json_mode_input_uses_error_envelope_and_two() {
+    let output = run(&[
+        "check",
+        fixture("does-not-exist.yaml").to_str().unwrap(),
+        "--maximum",
+        fixture("maximum.yaml").to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["reason_code"], "invalid_input");
+    assert!(value["reason"].as_str().unwrap().contains("cannot open"));
+}
+
+#[test]
+fn usage_errors_return_two() {
+    let output = run(&["check"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required"));
+}
+
+#[test]
+fn timeout_must_be_positive() {
+    let output = run(&[
+        "check",
+        fixture("candidate-contained.yaml").to_str().unwrap(),
+        "--maximum",
+        fixture("maximum.yaml").to_str().unwrap(),
+        "--timeout",
+        "0ms",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("positive"));
+}
+
+#[test]
+fn text_diagnostics_escape_terminal_controls() {
+    let output = run(&[
+        "check",
+        "missing\u{1b}[31m.yaml",
+        "--maximum",
+        fixture("maximum.yaml").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!output.stderr.contains(&0x1b));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\\u{1b}"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_input_is_rejected_without_blocking() {
+    use std::time::Instant;
+
+    let path = std::env::temp_dir().join(format!("openshell-prover-fifo-{}", std::process::id()));
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).expect("create FIFO fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell-prover"))
+        .args([
+            "check",
+            path.to_str().expect("UTF-8 temporary path"),
+            "--maximum",
+            fixture("maximum.yaml").to_str().unwrap(),
+            "--output",
+            "json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start prover with FIFO input");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().expect("poll prover").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("terminate blocked prover");
+            let _ = child.wait();
+            fs::remove_file(&path).expect("remove FIFO fixture");
+            panic!("prover blocked while opening a FIFO input");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().expect("collect prover output");
+    fs::remove_file(path).expect("remove FIFO fixture");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["reason_code"], "invalid_input");
+    assert!(
+        value["reason"]
+            .as_str()
+            .expect("string reason")
+            .contains("not a regular file")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_the_check_with_exit_130() {
+    let path = std::env::temp_dir().join(format!(
+        "openshell-prover-cancellation-{}.yaml",
+        std::process::id()
+    ));
+    let mut source = String::from("version: 1\nnetwork_policies:\n");
+    for index in 0..500 {
+        writeln!(
+            source,
+            "  rule-{index}:\n    endpoints: [{{ host: host-{index}.example.com, port: 443 }}]\n    binaries: [{{ path: /usr/bin/curl }}]"
+        )
+        .unwrap();
+    }
+    fs::write(&path, source).expect("write cancellation policy");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_openshell-prover"))
+        .args([
+            "check",
+            path.to_str().expect("UTF-8 temporary path"),
+            "--maximum",
+            path.to_str().expect("UTF-8 temporary path"),
+            "--output",
+            "json",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start cancellable prover");
+    thread::sleep(Duration::from_millis(25));
+    let signal = Command::new("kill")
+        .args(["-s", "INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(signal.success());
+    let output = child.wait_with_output().expect("wait for cancelled prover");
+    fs::remove_file(path).expect("remove cancellation policy");
+    assert_eq!(output.status.code(), Some(130));
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("structured cancellation JSON");
+    assert_eq!(value["result"], "inconclusive");
+    assert_eq!(value["reason_code"], "cancelled");
+    assert_eq!(value["exit_code"], 130);
+}

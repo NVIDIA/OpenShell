@@ -335,7 +335,35 @@ may store such a draft, but existing merge validation rejects it when an
 approval attempts to add it to policy; runtime SSRF protections remain the
 final enforcement boundary.
 
-## What the prover decides
+## Standalone maximum-boundary checks
+
+The standalone `openshell-prover check` command compares a fully composed local
+candidate policy with an operator-supplied local maximum. It establishes
+`Allowed(candidate) ⊆ Allowed(maximum)` for the model scope reported in its
+result. It does not fetch gateway state, compose provider rules, apply policy,
+or decide whether an in-boundary change is eligible for automatic approval.
+
+The initial maximum-boundary model covers filesystem paths, L4 network
+authority, and enforced REST method and path authority, including explicit REST
+denies. Network containment covers runtime configurations both with and without
+binary identity enforcement. Strict checks match grants and denies against the
+executable and an ancestor identity, and the evidence identifies the identities
+for an exceeding witness. Recognized authority outside the reviewed model
+produces an unsupported result rather than being silently ignored.
+Environment-dependent authority also remains unsupported when the result
+depends on context that is unavailable to the local command. This includes an
+unresolved workdir, binary containment that depends on image-specific symlink
+resolution, and overlapping L4 and REST endpoints whose inspection selection
+depends on the complete runtime endpoint set. Candidate and maximum paths use
+the same sandbox namespace and mount interpretation; the checker does not
+resolve them against the CLI host or verify kernel enforcement in a running
+sandbox.
+
+This containment operation is separate from the proposal-risk queries below.
+See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+for installation, command behavior, evidence, and exit codes.
+
+## What the proposal prover decides
 
 The prover answers four formal questions about each proposed policy
 change. Each "yes" answer becomes its own categorical finding — there is
