@@ -4060,6 +4060,7 @@ dependencies = [
  "tonic-types",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

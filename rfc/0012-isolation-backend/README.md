@@ -93,7 +93,7 @@ Six invariants hold for every boundary:
 3. An operation is authorized only when the complete effective policy permits it; network operations are decided through network mediation. There is no silent weakening.
 4. Agent startup, `exec`, and forwarding occur only through the active backend, and every workload process remains in the compute driver's provisioned execution environment.
 5. Shared infrastructure preserves strict per-boundary lifecycle, policy, identity, enforcement, and cleanup isolation.
-6. If the logical supervisor is lost, the boundary remains under its last confirmed enforcement state while supervisor-dependent operations fail closed. Loss of required enforcement ends `Running` and terminates all workload processes within a documented bound; detection and termination may be performed by a trusted node or control-plane actor. Network-mediation unavailability denies outbound connections and never enables direct egress.
+6. If the logical supervisor is lost, the boundary remains under its last confirmed enforcement state while supervisor-dependent operations fail closed. Loss of required enforcement ends `Running` and terminates all workload processes within a documented bound; detection and termination may be performed by a trusted node or control-plane actor. Network-mediation unavailability denies outbound connections and never enables direct egress. Exit of the Sandbox Runtime that owns the boundary terminates its workload through the compute driver's containment primitive; it never leaves an unmanaged agent process tree.
 
 Each backend states its termination bound in its implementation documentation. Loss of the logical supervisor means loss of the components holding the backend lifecycle, not loss of the gateway connection; gateway disconnection follows RFC 0001's reconnection semantics.
 
@@ -110,6 +110,8 @@ If a topology depends on cluster-scoped coverage or registration, admission veri
 Every topology provides a trusted cleanup path that does not depend on logical-supervisor availability.
 
 A compute driver may provision a resource and `TopologyDescriptor` before the control plane assigns it to a sandbox. No untrusted workload runs while the resource is unassigned. After claim or assignment produces a trusted `SandboxContext`, the supervisor calls `attach`; the backend either binds that context to the prepared resource and returns `Bound`, or rejects it as incompatible. Pool creation, claim, reset, release, and recycling remain outside this contract.
+
+Every create or start-from-stopped operation receives a fresh `SandboxSessionId`. Retries of the same durable launch transition reuse that identity, while a later launch receives a new one even when the compute platform reuses its outer resource. The backend binds `attach` to that exact session and rejects descriptors or runtime sessions left over from an earlier launch.
 
 ### The topology descriptor
 
@@ -160,6 +162,7 @@ trait IsolationBackend: Send + Sync {
 
 struct SandboxContext {
     sandbox_id: SandboxId,
+    session_id: SandboxSessionId,
     policy: SandboxPolicy,
     agent: AgentSpec,
 }
@@ -190,7 +193,7 @@ trait RunningBoundary: Send + Sync {
 
 `AgentSpec` carries the complete admitted agent launch specification, including command, arguments, working directory, timeout, and interactive mode.
 
-`SandboxContext` carries the admitted create-time policy. [RFC 0002](../0002-agent-driven-policy-management/README.md) defines how network-policy revisions are proposed and approved. Approved revisions reach the supervisor through the existing [`GetSandboxConfig`](../../proto/sandbox.proto) gateway-supervisor contract, described in the [gateway](../../architecture/gateway.md) and [sandbox](../../architecture/sandbox.md#policy-revision-acknowledgement) architecture. The supervisor makes approved network-policy revisions effective through network mediation. If an approved network-policy revision cannot be loaded, it never becomes effective; the configured rejection posture retains the last valid generation or denies network access until a valid generation is loaded.
+`SandboxContext` carries the admitted create-time policy and the identity of this launch. [RFC 0002](../0002-agent-driven-policy-management/README.md) defines how network-policy revisions are proposed and approved. Approved revisions reach the supervisor through the existing [`GetSandboxConfig`](../../proto/sandbox.proto) gateway-supervisor contract, described in the [gateway](../../architecture/gateway.md) and [sandbox](../../architecture/sandbox.md#policy-revision-acknowledgement) architecture. The supervisor makes approved network-policy revisions effective through network mediation. If an approved network-policy revision cannot be loaded, it never becomes effective; the configured rejection posture retains the last valid generation or denies network access until a valid generation is loaded.
 
 The states have normative meanings:
 
