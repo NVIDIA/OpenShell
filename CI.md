@@ -135,9 +135,16 @@ Use a fresh `TRIVY_REPORT_DIR` for each scan session. `prepare-sarif` creates
 
 ### Pull-request change gate
 
-`Trivy Changes` scans the base and candidate when a pull request or merge group
-changes deployment configuration or scanner inputs. It fails only for new
-`HIGH` or `CRITICAL` misconfigurations and retains both report sets.
+`Trivy Changes` scans the base and candidate when a pull request changes
+deployment configuration or scanner inputs; merge groups and manual runs always
+scan. It fails only for new `HIGH` or `CRITICAL` misconfigurations and retains
+both report sets.
+
+For pull requests, change detection compares the exact tested merge commit with
+its first parent. Both detection and scanning use that same pair. This excludes
+unrelated changes on `main` even when the event carries an older base SHA or a
+job is rerun. Merge groups use the event's base SHA; manual runs use the supplied
+base and head. A missing revision or invalid PR merge checkout fails the gate.
 
 The candidate ignore file is validated, but the baseline policy applies to both
 scans so a change cannot exempt its own finding. Existing profiles are compared

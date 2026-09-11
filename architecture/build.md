@@ -494,6 +494,10 @@ references. Publication batches respect GitHub's limit of 20 SARIF runs.
 The PR/merge-group gate scans base and candidate with the same scanner and rejects
 new `HIGH` or `CRITICAL` configuration findings. Its stable
 `OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
+For PRs, the baseline is the first parent of the exact merge commit being tested,
+not the event's potentially older base SHA or the current branch tip. Change
+detection and both scans use that same immutable pair, including on reruns.
+Merge groups and manual runs retain their explicit baseline and always scan.
 Image CVEs need the standalone scan. The reporting and gate invariants are:
 
 - A structurally invalid Trivy report is an error, not an empty finding set.
