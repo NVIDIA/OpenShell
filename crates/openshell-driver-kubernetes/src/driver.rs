@@ -1722,8 +1722,8 @@ impl KubernetesComputeDriver {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
             image_pull_secrets: &self.config.image_pull_secrets,
-            supervisor_image: &self.config.supervisor_image,
-            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            sandbox_runtime_image: &self.config.sandbox_runtime_image,
+            sandbox_runtime_image_pull_policy: &self.config.sandbox_runtime_image_pull_policy,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             enable_user_namespaces: self.config.enable_user_namespaces,
@@ -5235,7 +5235,7 @@ fn apply_supervisor_proxy_pod_boundary(
         .expect("pod init containers must be an array");
     let mut bootstrap = serde_json::json!({
         "name": "openshell-sandbox-bootstrap",
-        "image": params.supervisor_image,
+        "image": params.sandbox_runtime_image,
         "command": ["/openshell-sandbox", "bootstrap"],
         "securityContext": {
             "runAsUser": params.sandbox_uid,
@@ -5251,8 +5251,8 @@ fn apply_supervisor_proxy_pod_boundary(
             {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
         ]
     });
-    if !params.supervisor_image_pull_policy.is_empty() {
-        bootstrap["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    if !params.sandbox_runtime_image_pull_policy.is_empty() {
+        bootstrap["imagePullPolicy"] = serde_json::json!(params.sandbox_runtime_image_pull_policy);
     }
     init_containers.push(bootstrap);
 
@@ -5519,8 +5519,8 @@ struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
     image_pull_secrets: &'a [String],
-    supervisor_image: &'a str,
-    supervisor_image_pull_policy: &'a str,
+    sandbox_runtime_image: &'a str,
+    sandbox_runtime_image_pull_policy: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     enable_user_namespaces: bool,
@@ -5543,8 +5543,8 @@ impl Default for SandboxPodParams<'_> {
             default_image: "",
             image_pull_policy: "",
             image_pull_secrets: &[],
-            supervisor_image: "",
-            supervisor_image_pull_policy: "",
+            sandbox_runtime_image: "",
+            sandbox_runtime_image_pull_policy: "",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             enable_user_namespaces: false,
@@ -8102,7 +8102,7 @@ mod tests {
     #[test]
     fn proxy_pod_topology_renders_credential_free_boundary_workload() {
         let params = SandboxPodParams {
-            supervisor_image: "supervisor-image:latest",
+            sandbox_runtime_image: "sandbox-runtime-image:latest",
             sandbox_id: "sandbox-123",
             sandbox_uid: 1500,
             sandbox_gid: 1500,
@@ -8147,6 +8147,13 @@ mod tests {
             pod_template["spec"]["schedulingGates"],
             serde_json::json!([{"name": SANDBOX_BOOTSTRAP_SCHEDULING_GATE}])
         );
+        let sandbox_bootstrap = pod_template["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == "openshell-sandbox-bootstrap")
+            .unwrap();
+        assert_eq!(sandbox_bootstrap["image"], "sandbox-runtime-image:latest");
         let workspace_init = pod_template["spec"]["initContainers"]
             .as_array()
             .unwrap()

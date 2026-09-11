@@ -45,9 +45,10 @@ not a tenant isolation boundary.
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to
-this driver. Kubernetes owns scheduling and pod lifecycle. The driver always
-uses the proxy-pod topology. The workload Pod runs `openshell-sandbox`, while a
-separate Deployment runs `openshell-supervisor`.
+this driver. Kubernetes owns scheduling and pod lifecycle. The workload Pod
+stages the statically linked musl `openshell-sandbox` binary from
+`sandbox_runtime_image`, while a separate Deployment runs the dynamically
+linked glibc `openshell-supervisor` from `supervisor_image`.
 
 The sandbox owns the agent process, applies Landlock and child seccomp filters,
 identifies the binary behind each network syscall, and relays mediated streams

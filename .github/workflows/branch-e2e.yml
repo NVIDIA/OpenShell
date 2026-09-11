@@ -453,7 +453,7 @@ jobs:
       e2e-task: e2e:kubernetes:external-driver
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-kubernetes
-      cluster-images: supervisor
+      cluster-images: sandbox supervisor
       extra-helm-values: deploy/helm/openshell/ci/values-proxy-pod.yaml
       conformance-artifact-prefix: openshell-conformance
 
