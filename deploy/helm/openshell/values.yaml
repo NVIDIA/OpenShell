@@ -375,8 +375,8 @@ server:
     # proxies cannot present client certificates to the backend.
     enableMtls: true
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
-    # Only used when enableMtls is true. Set to "" to use the default client CA
-    # (from pkiInitJob or cert-manager).
+    # Only used when enableMtls is true. Set to "" to disable client certificate
+    # verification for HTTPS-only mode.
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
