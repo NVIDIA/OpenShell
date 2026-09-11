@@ -31,8 +31,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
-    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
-    write_ca_files,
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config_with_additional,
+    read_additional_ca_bundle, read_system_ca_bundle, write_ca_files_with_additional,
 };
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
@@ -195,8 +195,15 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    network_additional_ca_bundle: Option<&std::path::Path>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
+    // Validate the driver-staged material before starting any networking task.
+    // The gateway already normalized it, but this second boundary check catches
+    // a missing, replaced, or truncated mount and must never downgrade to the
+    // default roots.
+    let additional_ca_bundle = initialize_additional_ca_bundle(network_additional_ca_bundle)?;
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -312,44 +319,81 @@ pub async fn run_networking(
     // the proxy, so it's owned here.
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
-    // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
-    // The CA cert is written to disk so sandbox processes can trust it.
-    let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match SandboxCa::generate() {
-            Ok(ca) => {
-                let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                    .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
-                let tls_dir = std::path::Path::new(&tls_dir);
-                let mut system_ca_bundle = read_system_ca_bundle();
-                // A TLS-intercepting corporate proxy (issue #1792) re-signs
-                // tunneled server certificates with the corporate CA, so the
-                // operator-provided bundle must be trusted for upstream
-                // re-encryption (build_upstream_client_config below) and by
-                // sandbox processes (the combined bundle written by
-                // write_ca_files) — not only for the TLS handshake with an
-                // https:// proxy listener. Fail closed on an unreadable or
-                // certificate-free bundle, matching the rest of the
-                // operator-owned proxy configuration.
-                if let Some(path) = upstream_proxy_args.proxy_ca_bundle.as_deref() {
-                    let pem = crate::upstream_proxy::read_proxy_ca_bundle(
-                        path,
-                        crate::upstream_proxy::ARG_PROXY_CA_BUNDLE,
-                    )
-                    .map_err(|err| miette::miette!("{err}"))?;
-                    if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
-                        system_ca_bundle.push('\n');
-                    }
-                    system_ca_bundle.push_str(&pem);
-                }
-                match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
-                    Ok(paths) => {
-                        // /etc/openshell-tls is subsumed by the /etc baseline
-                        // path injected by enrich_*_baseline_paths(), so no
-                        // explicit Landlock entry is needed here.
+    // Generate the ephemeral interception CA in proxy mode, and create child
+    // trust files in direct mode when additional destination roots were
+    // explicitly supplied.
+    let proxy_mode = matches!(policy.network.mode, NetworkMode::Proxy);
+    let (tls_state, ca_file_paths) = if proxy_mode || additional_ca_bundle.is_some() {
+        let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
+            .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
+        let tls_dir = std::path::Path::new(&tls_dir);
+        let mut system_ca_bundle = read_system_ca_bundle();
 
-                        let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
+        // Keep corporate-proxy trust independent from destination trust. The
+        // former retains its pairing rules and existing composition behavior;
+        // the latter is passed separately to every root-store build.
+        if proxy_mode && let Some(path) = upstream_proxy_args.proxy_ca_bundle.as_deref() {
+            let pem = crate::upstream_proxy::read_proxy_ca_bundle(
+                path,
+                crate::upstream_proxy::ARG_PROXY_CA_BUNDLE,
+            )
+            .map_err(|err| miette::miette!("{err}"))?;
+            if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
+                system_ca_bundle.push('\n');
+            }
+            system_ca_bundle.push_str(&pem);
+        }
+
+        let ca = if proxy_mode {
+            match SandboxCa::generate() {
+                Ok(ca) => Some(ca),
+                Err(error) if additional_ca_bundle.is_some() => return Err(error),
+                Err(error) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "disabled")
+                            .message(format!(
+                                "Failed to generate ephemeral CA, TLS termination disabled: {error}"
+                            ))
+                            .build()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if proxy_mode && ca.is_none() {
+            (None, None)
+        } else {
+            match write_ca_files_with_additional(
+                ca.as_ref(),
+                tls_dir,
+                &system_ca_bundle,
+                additional_ca_bundle.as_deref(),
+            ) {
+                Ok(paths) => {
+                    // /etc/openshell-tls is subsumed by the /etc baseline path
+                    // injected by enrich_*_baseline_paths().
+                    if additional_ca_bundle.is_some() {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .message("Additional destination CA trust initialized")
+                                .build()
+                        );
+                    }
+                    let state = if let Some(ca) = ca {
+                        let upstream_config = build_upstream_client_config_with_additional(
+                            &system_ca_bundle,
+                            additional_ca_bundle.as_deref(),
+                        )?;
                         let cert_cache = CertCache::new(ca);
-                        let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)
@@ -358,43 +402,26 @@ pub async fn run_networking(
                                 .message("TLS termination enabled: ephemeral CA generated")
                                 .build()
                         );
-                        (Some(state), Some(paths))
-                    }
-                    Err(e) => {
-                        // High severity: with TLS termination disabled the proxy
-                        // cannot rewrite credentials, so it fails closed on
-                        // TLS-bearing connections (see proxy.rs) rather than
-                        // leaking placeholders through a raw tunnel.
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::High)
-                                .status(StatusId::Failure)
-                                .state(StateId::Disabled, "disabled")
-                                .message(format!(
-                                    "Failed to write CA files, TLS termination disabled: {e}"
-                                ))
-                                .build()
-                        );
-                        (None, None)
-                    }
+                        Some(Arc::new(ProxyTlsState::new(cert_cache, upstream_config)))
+                    } else {
+                        None
+                    };
+                    (state, Some(paths))
                 }
-            }
-            Err(e) => {
-                // High severity: with TLS termination disabled the proxy cannot
-                // rewrite credentials, so it fails closed on TLS-bearing
-                // connections (see proxy.rs) rather than leaking placeholders
-                // through a raw tunnel.
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::High)
-                        .status(StatusId::Failure)
-                        .state(StateId::Disabled, "disabled")
-                        .message(format!(
-                            "Failed to generate ephemeral CA, TLS termination disabled: {e}"
-                        ))
-                        .build()
-                );
-                (None, None)
+                Err(error) if additional_ca_bundle.is_some() => return Err(error),
+                Err(error) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "disabled")
+                            .message(format!(
+                                "Failed to write CA files, TLS termination disabled: {error}"
+                            ))
+                            .build()
+                    );
+                    (None, None)
+                }
             }
         }
     } else {
@@ -487,6 +514,50 @@ pub async fn run_networking(
         #[cfg(target_os = "linux")]
         _transparent_tcp: transparent_tcp,
     })
+}
+
+fn initialize_additional_ca_bundle(path: Option<&std::path::Path>) -> Result<Option<String>> {
+    path.map(read_additional_ca_bundle).transpose()
+}
+
+#[cfg(test)]
+mod additional_ca_tests {
+    use super::*;
+    use rcgen::generate_simple_self_signed;
+
+    #[test]
+    fn omitted_additional_bundle_preserves_legacy_startup() {
+        assert!(initialize_additional_ca_bundle(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicitly_requested_invalid_bundles_fail_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = [
+            ("empty.pem", Vec::new()),
+            ("malformed.pem", b"not PEM material".to_vec()),
+            (
+                "private-key.pem",
+                generate_simple_self_signed(vec!["destination.example".to_string()])
+                    .unwrap()
+                    .key_pair
+                    .serialize_pem()
+                    .into_bytes(),
+            ),
+        ];
+        for (name, contents) in cases {
+            let path = directory.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            let error = initialize_additional_ca_bundle(Some(&path)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("destination CA bundle"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+        }
+
+        let missing = directory.path().join("missing.pem");
+        let error = initialize_additional_ca_bundle(Some(&missing)).unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

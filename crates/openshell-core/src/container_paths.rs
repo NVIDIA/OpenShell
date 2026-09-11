@@ -43,6 +43,10 @@ pub const CONTROL_ROOTS: &[&str] = &[
 pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
 pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
 pub const TLS_CLIENT_DIR: &str = "/etc/openshell/tls/client";
+/// Destination-only trust staged by compute drivers for the network
+/// supervisor. This must remain separate from gateway client mTLS and the
+/// corporate-proxy CA path.
+pub const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str = "/etc/openshell-tls/network-additional-ca.crt";
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
@@ -108,6 +112,7 @@ mod tests {
             SUPERVISOR_CONTAINER_DIR,
             SUPERVISOR_CONTAINER_BINARY,
             TLS_CLIENT_DIR,
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
             TLS_CA_MOUNT_PATH,
             TLS_CERT_MOUNT_PATH,
             TLS_KEY_MOUNT_PATH,

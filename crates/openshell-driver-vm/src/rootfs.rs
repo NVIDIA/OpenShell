@@ -204,6 +204,18 @@ pub fn write_rootfs_image_file(
     result
 }
 
+/// Remove a driver-owned file from an ext4 image before guest launch.
+///
+/// `debugfs rm` reports a missing path on stdout while still exiting
+/// successfully, so this operation is idempotent for fresh overlays. The path
+/// is validated and quoted with the same rules as writes.
+pub fn remove_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<(), String> {
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
+    run_debugfs(image_path, &format!("rm {quoted_guest_path}"))
+}
+
 pub fn set_rootfs_image_file_mode(
     image_path: &Path,
     guest_path: &str,
@@ -837,6 +849,58 @@ fn run_debugfs_batch_file(image_path: &Path, command_path: &Path) -> Result<(), 
     ))
 }
 
+#[cfg(test)]
+pub fn read_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<Vec<u8>, String> {
+    run_debugfs_capture(
+        image_path,
+        &format!("cat {}", quoted_guest_path(guest_path)?),
+    )
+}
+
+#[cfg(test)]
+pub fn stat_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<String, String> {
+    let output = run_debugfs_capture(
+        image_path,
+        &format!("stat {}", quoted_guest_path(guest_path)?),
+    )?;
+    String::from_utf8(output).map_err(|error| format!("debugfs stat output is not UTF-8: {error}"))
+}
+
+#[cfg(test)]
+fn quoted_guest_path(guest_path: &str) -> Result<String, String> {
+    debugfs_quote_absolute_path(guest_path)
+        .ok_or_else(|| format!("invalid debugfs guest path '{guest_path}'"))
+}
+
+#[cfg(test)]
+fn run_debugfs_capture(image_path: &Path, command: &str) -> Result<Vec<u8>, String> {
+    let mut last_error = None;
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-R")
+            .arg(command)
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(output.stdout),
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) => last_error = Some(format!("run {label}: {error}")),
+        }
+    }
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
     let mut last_error = None;
     for candidate in e2fs_tool_candidates("debugfs") {
@@ -1359,6 +1423,13 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_rootfs_image_file_rejects_unsafe_paths_before_invoking_debugfs() {
+        let error = remove_rootfs_image_file(Path::new("/unused"), "relative/path")
+            .expect_err("relative guest paths must be rejected");
+        assert!(error.contains("invalid debugfs guest path"));
     }
 
     #[test]

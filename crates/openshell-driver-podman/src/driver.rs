@@ -56,6 +56,9 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
+    /// Gateway-owned normalized destination CA artifact staged into each
+    /// sandbox through the fixed supervisor mount contract.
+    network_trust_artifact: Option<PathBuf>,
     /// The host's IP on the bridge network, when that bridge exists in the
     /// gateway's network namespace (notably rootful Podman).
     network_gateway_ip: Option<String>,
@@ -74,6 +77,10 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
+            .field(
+                "network_trust_configured",
+                &self.network_trust_artifact.is_some(),
+            )
             .field("rootless", &self.rootless)
             .field("rootless_network_cmd", &self.rootless_network_cmd)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
@@ -345,7 +352,10 @@ fn resolve_socket_path(
 
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
-    pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
+    pub async fn new(
+        mut config: PodmanComputeConfig,
+        network_trust_artifact: Option<&Path>,
+    ) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -484,6 +494,7 @@ impl PodmanComputeDriver {
         Ok(Self {
             client,
             config,
+            network_trust_artifact: network_trust_artifact.map(Path::to_path_buf),
             network_gateway_ip,
             rootless,
             rootless_network_cmd,
@@ -968,6 +979,7 @@ impl PodmanComputeDriver {
                     &image_user,
                     supervisor_bin_path.as_deref(),
                     tls_secret_names.as_ref(),
+                    self.network_trust_artifact.as_deref(),
                 ) {
                     Ok(spec) => spec,
                     Err(e) => {
@@ -1384,6 +1396,7 @@ impl PodmanComputeDriver {
         Self {
             client,
             config,
+            network_trust_artifact: None,
             network_gateway_ip: None,
             rootless: false,
             rootless_network_cmd: String::new(),
@@ -2343,7 +2356,7 @@ mod tests {
             ..PodmanComputeConfig::default()
         };
 
-        let Err(err) = PodmanComputeDriver::new(config).await else {
+        let Err(err) = PodmanComputeDriver::new(config, None).await else {
             panic!("required network gateway discovery failure should prevent startup");
         };
 
@@ -2380,7 +2393,7 @@ mod tests {
             ..PodmanComputeConfig::default()
         };
 
-        let driver = PodmanComputeDriver::new(config)
+        let driver = PodmanComputeDriver::new(config, None)
             .await
             .expect("remote callbacks must not require bridge gateway inspection");
 
@@ -2635,6 +2648,7 @@ mod tests {
             &driver.config,
             None,
             Some(&first_devices),
+            None,
         )
         .unwrap();
 
@@ -2648,6 +2662,7 @@ mod tests {
             &driver.config,
             None,
             Some(&second_devices),
+            None,
         )
         .unwrap();
 

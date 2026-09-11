@@ -74,6 +74,7 @@ defaults-without-telemetry = []
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
 tempfile = "3"
+rcgen = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # smol-rs/polling drives the BSD/macOS parent-death detection in

@@ -195,39 +195,42 @@ async fn main() -> Result<()> {
         },
     );
 
-    let driver = PodmanComputeDriver::new(PodmanComputeConfig {
-        socket_path: args.podman_socket,
-        default_image: args.sandbox_image.unwrap_or_default(),
-        image_pull_policy: args.sandbox_image_pull_policy,
-        grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-        gateway_port: args.gateway_port,
-        host_gateway_ip: args
-            .host_gateway_ip
-            .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-        ssh_socket_path: args.sandbox_ssh_socket_path,
-        network_name: args.network_name,
-        stop_timeout_secs: args.stop_timeout,
-        supervisor_image: args
-            .supervisor_image
-            .unwrap_or_else(openshell_core::config::default_supervisor_image),
-        guest_tls_ca: args.podman_tls_ca,
-        guest_tls_cert: args.podman_tls_cert,
-        guest_tls_key: args.podman_tls_key,
-        provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
-        app_armor_profile: args.app_armor_profile,
-        sandbox_pids_limit: args.sandbox_pids_limit,
-        health_check_interval_secs: args.health_check_interval_secs,
-        https_proxy: args.sandbox_https_proxy,
-        no_proxy: args.sandbox_no_proxy,
-        proxy_auth_file: args.sandbox_proxy_auth_file,
-        proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
-        proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
-        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
-        userns: args.userns,
-        uidmap: args.uidmap,
-        gidmap: args.gidmap,
-        enable_bind_mounts: args.enable_bind_mounts,
-    })
+    let driver = PodmanComputeDriver::new(
+        PodmanComputeConfig {
+            socket_path: args.podman_socket,
+            default_image: args.sandbox_image.unwrap_or_default(),
+            image_pull_policy: args.sandbox_image_pull_policy,
+            grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            gateway_port: args.gateway_port,
+            host_gateway_ip: args
+                .host_gateway_ip
+                .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
+            ssh_socket_path: args.sandbox_ssh_socket_path,
+            network_name: args.network_name,
+            stop_timeout_secs: args.stop_timeout,
+            supervisor_image: args
+                .supervisor_image
+                .unwrap_or_else(openshell_core::config::default_supervisor_image),
+            guest_tls_ca: args.podman_tls_ca,
+            guest_tls_cert: args.podman_tls_cert,
+            guest_tls_key: args.podman_tls_key,
+            provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+            app_armor_profile: args.app_armor_profile,
+            sandbox_pids_limit: args.sandbox_pids_limit,
+            health_check_interval_secs: args.health_check_interval_secs,
+            https_proxy: args.sandbox_https_proxy,
+            no_proxy: args.sandbox_no_proxy,
+            proxy_auth_file: args.sandbox_proxy_auth_file,
+            proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+            proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+            userns: args.userns,
+            uidmap: args.uidmap,
+            gidmap: args.gidmap,
+            enable_bind_mounts: args.enable_bind_mounts,
+        },
+        None,
+    )
     .await
     .into_diagnostic()?;
 

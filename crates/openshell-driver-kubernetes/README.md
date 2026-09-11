@@ -113,6 +113,19 @@ namespace policy; the gateway receives only the verified sandbox ID.
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
 
+Additional sandbox destination roots use the global
+`[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
+Kubernetes driver key. Before sandbox creation, the in-process driver
+server-side-applies one normalized `ca.crt` ConfigMap named
+`openshell-network-additional-ca-<gateway-id>` in the selected shared, managed,
+or operator namespace. Combined topology mounts it only in the agent container
+that runs network supervision. Sidecar topology mounts it only in
+`openshell-network`; workload and init containers do not receive it. Both use
+the read-only `/etc/openshell-tls/network-additional-ca.crt` path and the
+`--network-additional-ca-bundle` argument. This material augments destination
+trust and remains separate from callback mTLS Secrets and corporate-proxy trust.
+Running supervisors load it only at startup.
+
 The driver forwards the canonical main-process specification to the process
 supervisor and sets pod `restartPolicy: Never`. Main-process environment
 overrides stay local to that child; the sidecar bootstrap retains the unmodified

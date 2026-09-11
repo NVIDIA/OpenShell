@@ -116,6 +116,11 @@ struct Args {
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
 
+    /// Gateway-owned normalized destination trust bundle. This hidden option is
+    /// supplied only by the in-process gateway VM factory.
+    #[arg(long, hide = true)]
+    network_additional_ca_bundle: Option<PathBuf>,
+
     /// Corporate forward proxy for supervisor TLS egress.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
     upstream_proxy: Option<String>,
@@ -278,6 +283,7 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        network_additional_ca_bundle: args.network_additional_ca_bundle.clone(),
         upstream_proxy: openshell_core::UpstreamProxyConfig {
             https_proxy: args.upstream_proxy.clone(),
             no_proxy: args.upstream_no_proxy.clone(),
@@ -713,6 +719,28 @@ mod tests {
         assert!(!args.upstream_proxy_auth_allow_insecure);
         assert!(!args.upstream_proxy_connect_by_hostname);
         assert!(args.upstream_proxy_ca_bundle.is_none());
+    }
+
+    #[test]
+    fn internal_network_trust_option_has_no_environment_alias() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--network-additional-ca-bundle",
+            "/var/lib/openshell/network/additional-ca.crt",
+        ]);
+        assert_eq!(
+            args.network_additional_ca_bundle.as_deref(),
+            Some(PathBuf::from("/var/lib/openshell/network/additional-ca.crt").as_path())
+        );
+
+        temp_env::with_var(
+            "OPENSHELL_VM_NETWORK_ADDITIONAL_CA_BUNDLE",
+            Some("/tmp/untrusted.crt"),
+            || {
+                let args = Args::parse_from(["openshell-driver-vm"]);
+                assert!(args.network_additional_ca_bundle.is_none());
+            },
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+mod network_trust;
 mod otel_tracing;
 mod pagination;
 mod persistence;
@@ -51,7 +52,7 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{Config, Error, ObjectLabels, Result};
+use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
@@ -249,6 +250,7 @@ pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
+    pub network_trust: Option<NetworkSupervisorTrustBundle>,
     pub compute_driver: ComputeDriverSelection,
     pub legacy_compute_driver_env_seen: bool,
 }
@@ -450,6 +452,7 @@ pub(crate) async fn run_server(
         config,
         config_file,
         guest_tls,
+        network_trust,
         compute_driver,
         legacy_compute_driver_env_seen: _,
     } = startup;
@@ -595,6 +598,7 @@ pub(crate) async fn run_server(
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
+        network_trust: network_trust.as_ref(),
         gateway_port: config.bind_address.port(),
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
@@ -1423,6 +1427,13 @@ impl ComputeDriverBuildContext<'_> {
             .map(compute::driver_config::GuestTlsPaths::as_paths)
     }
 
+    /// Gateway-normalized destination trust material for the network
+    /// supervisor. The bundle is absent when the global setting is omitted.
+    #[must_use]
+    pub fn network_trust_bundle(&self) -> Option<&NetworkSupervisorTrustBundle> {
+        self.config.driver_startup.network_trust
+    }
+
     /// Deserialize the selected driver's merged TOML table.
     pub fn driver_config<T>(&self) -> Result<T>
     where
@@ -1640,6 +1651,22 @@ fn resolve_configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
+    if driver_startup.network_trust.is_some()
+        && driver_startup.endpoint_overrides.contains_key(&name)
+    {
+        return Err(Error::config(format!(
+            "{} is configured but compute driver '{name}' uses an unsupported remote endpoint",
+            network_trust::CONFIG_FIELD
+        )));
+    }
+    if driver_startup.network_trust.is_some()
+        && !matches!(name.as_str(), "docker" | "podman" | "kubernetes" | "vm")
+    {
+        return Err(Error::config(format!(
+            "{} is configured but compute driver '{name}' is unsupported; use Docker, Podman, Kubernetes, or VM",
+            network_trust::CONFIG_FIELD
+        )));
+    }
     // An operator-provided endpoint replaces normal construction for the
     // selected name, including a compiled registration with the same name.
     // The gateway connects to it; it does not provision the remote driver.
@@ -1723,7 +1750,7 @@ mod tests {
         mint_gateway_extension_credential, serve_gateway_listener,
     };
     use openshell_core::{
-        Config,
+        Config, NetworkSupervisorTrustBundle,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use std::io::{Error, ErrorKind};
@@ -1876,13 +1903,31 @@ mod tests {
         config: &'a Config,
         file: Option<&'a super::config_file::ConfigFile>,
     ) -> crate::compute::driver_config::DriverStartupContext<'a> {
+        test_driver_startup_with_bundle(config, file, None)
+    }
+
+    fn test_driver_startup_with_bundle<'a>(
+        config: &'a Config,
+        file: Option<&'a super::config_file::ConfigFile>,
+        network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    ) -> crate::compute::driver_config::DriverStartupContext<'a> {
         crate::compute::driver_config::DriverStartupContext {
             file,
             guest_tls: None,
+            network_trust,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }
+    }
+
+    fn test_network_trust_bundle() -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            "sha256:fixture",
+            "/tmp/openshell-network-additional-ca.crt".into(),
+        )
     }
 
     fn test_compute_drivers() -> super::ComputeDriverRegistry {
@@ -2394,6 +2439,76 @@ mod tests {
             driver,
             ConfiguredComputeDriver::Remote { name } if name == "beta"
         ));
+    }
+
+    #[test]
+    fn network_trust_is_available_to_startup_context() {
+        let config = Config::new(None).with_compute_driver("docker");
+        let bundle = test_network_trust_bundle();
+        let startup = test_driver_startup_with_bundle(&config, None, Some(&bundle));
+
+        assert_eq!(
+            startup
+                .network_trust
+                .expect("configured trust bundle")
+                .certificate_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_endpoint_override_before_remote_connection() {
+        let config = Config::new(None)
+            .with_compute_driver("docker")
+            .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be discarded by a remote override");
+
+        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!error.to_string().contains("docker.sock"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unknown_remote_driver() {
+        let config = Config::new(None).with_compute_driver("kyma");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be silently ignored by a remote driver");
+
+        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("kyma"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unsupported_custom_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new("custom", 1, None, TestComputeDriverFactory)
+                    .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("custom drivers cannot consume the shared trust contract yet");
+
+        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("custom"));
     }
 
     #[tokio::test]

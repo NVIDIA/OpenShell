@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -72,6 +73,18 @@ rules:
       - pods
     verbs:
       - get
+  {{- end }}
+  {{- if and (ne $workspaceMode "shared") (get $supervisorNetwork "additionalCaConfigMapName") }}
+  # The Kubernetes driver server-side-applies one normalized destination CA
+  # ConfigMap in each selected managed or operator workspace namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - create
+      - patch
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}

@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "task": "network-supervisor-additional-ca",
+  "workflow": "rpi",
+  "status": "blocked",
+  "phase": "implementation",
+  "updated": "2026-09-11T20:11:51Z",
+  "artifacts": {
+    "task": "task.md",
+    "research_questions": "01-research-questions.md",
+    "research": "02-research.md",
+    "design": "03-design-discussion.md",
+    "outline": "04-structure-outline.md",
+    "implementation": "05-implementation.md",
+    "handoff": "handoff.md",
+    "pr": "pr.md"
+  },
+  "approvals": {
+    "design": true,
+    "outline": true
+  },
+  "waivers": [
+    "Slice 3 live Docker e2e deferred to CI by explicit user direction on 2026-09-11; no local or CI pass is claimed",
+    "All manual testing requirements waived by explicit user direction on 2026-09-11; corresponding scenarios remain required as automated e2e/integration tests that run in CI",
+    "Slice 5 live Kubernetes combined/sidecar e2e deferred to CI because Docker, Helm, k3d, and kind are unavailable locally; no local or CI pass is claimed",
+    "Slice 6 live VM additional-CA e2e deferred to CI because /dev/kvm and a prepared VM runtime/driver are unavailable locally; no local or CI pass is claimed"
+  ],
+  "current_slice": 8,
+  "next_action": "Obtain explicit authorization to push the committed branch, then dispatch/observe configured Docker, Kubernetes combined/sidecar, and VM CI e2e results"
+}

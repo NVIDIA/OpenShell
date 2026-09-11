@@ -127,6 +127,7 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -552,6 +553,7 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                network_additional_ca_bundle.as_deref(),
                 #[cfg(target_os = "linux")]
                 transparent_runtime,
             )

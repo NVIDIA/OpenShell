@@ -6,17 +6,18 @@
 use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+    OperatorNamespaceAllowlist, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    network_additional_ca_config_map_name, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    ServiceAccount, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
+    Secret, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -32,7 +33,6 @@ use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
-use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
     LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
@@ -53,6 +53,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::{NetworkSupervisorTrustBundle, driver_mounts};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -67,6 +68,7 @@ pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
+const NETWORK_ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-network-additional-ca";
 const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
 
 #[derive(Debug, thiserror::Error)]
@@ -288,12 +290,16 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     CLIENT_TLS_VOLUME_NAME,
     UPSTREAM_PROXY_AUTH_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+    NETWORK_ADDITIONAL_CA_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
     WORKSPACE_VOLUME_NAME,
 ];
 
-const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[
+    SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+];
 
 fn validate_kubernetes_driver_volumes(
     volumes: &[KubernetesDriverVolumeConfig],
@@ -411,6 +417,38 @@ fn validate_kubernetes_protected_path_conflicts(
     Ok(())
 }
 
+fn network_additional_ca_config_map(
+    namespace: &str,
+    name: &str,
+    gateway_id: &str,
+    bundle: &NetworkSupervisorTrustBundle,
+) -> Result<ConfigMap, KubernetesDriverError> {
+    let pem = String::from_utf8(bundle.normalized_pem().to_vec()).map_err(|_| {
+        KubernetesDriverError::Precondition(
+            "normalized network additional CA material is not UTF-8 PEM".to_string(),
+        )
+    })?;
+    Ok(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                (LABEL_GATEWAY_ID.to_string(), gateway_id.to_string()),
+            ])),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY.to_string(),
+            pem,
+        )])),
+        ..Default::default()
+    })
+}
+
 fn kubernetes_driver_volume_to_k8s(volume: &KubernetesDriverVolumeConfig) -> serde_json::Value {
     serde_json::to_value(Volume::from(volume)).expect("Volume serializes to JSON")
 }
@@ -463,6 +501,7 @@ pub struct KubernetesComputeDriver {
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -471,6 +510,13 @@ impl std::fmt::Debug for KubernetesComputeDriver {
             .field("namespace", &self.config.namespace)
             .field("default_image", &self.config.default_image)
             .field("grpc_endpoint", &self.config.grpc_endpoint)
+            .field(
+                "network_additional_ca",
+                &self
+                    .network_trust_bundle
+                    .as_ref()
+                    .map(|bundle| (bundle.certificate_count(), bundle.digest())),
+            )
             .finish()
     }
 }
@@ -490,16 +536,22 @@ impl KubernetesComputeDriver {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
             operator_allowlist: None,
+            network_trust_bundle: None,
         }
     }
 
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> Result<Self, KubernetesDriverError> {
         config
             .validate_configuration()
             .map_err(KubernetesDriverError::Precondition)?;
+        if network_trust_bundle.is_some() {
+            network_additional_ca_config_map_name(&config.gateway_id)
+                .map_err(KubernetesDriverError::Precondition)?;
+        }
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -548,6 +600,7 @@ impl KubernetesComputeDriver {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
             operator_allowlist,
+            network_trust_bundle,
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -899,6 +952,52 @@ impl KubernetesComputeDriver {
         }
 
         Ok(())
+    }
+
+    /// Apply the gateway-normalized destination trust bundle in the target namespace.
+    ///
+    /// Server-side apply gives each gateway one stable object per namespace and
+    /// replaces its `ca.crt` value when a restarted gateway has new material.
+    async fn ensure_network_additional_ca_config_map(
+        &self,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(bundle) = self.network_trust_bundle.as_ref() else {
+            return Ok(());
+        };
+        let name = network_additional_ca_config_map_name(&self.config.gateway_id)
+            .map_err(KubernetesDriverError::Precondition)?;
+        let config_map =
+            network_additional_ca_config_map(namespace, &name, &self.config.gateway_id, bundle)?;
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.patch(
+                &name,
+                &PatchParams::apply("openshell"),
+                &Patch::Apply(&config_map),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(
+                    namespace,
+                    config_map = %name,
+                    certificate_count = bundle.certificate_count(),
+                    digest = bundle.digest(),
+                    "applied network additional CA ConfigMap"
+                );
+                Ok(())
+            }
+            Ok(Err(error)) => Err(KubernetesDriverError::Message(format!(
+                "failed to apply network additional CA ConfigMap {name} in namespace {namespace}: {error}"
+            ))),
+            Err(_) => Err(KubernetesDriverError::Message(format!(
+                "timeout applying network additional CA ConfigMap {name} in namespace {namespace}"
+            ))),
+        }
     }
 
     /// Ensure the client TLS Secret exists in `namespace` by copying it from
@@ -1486,6 +1585,8 @@ impl KubernetesComputeDriver {
         if self.config.is_multi_namespace() {
             self.ensure_tls_secret(&target_namespace).await?;
         }
+        self.ensure_network_additional_ca_config_map(&target_namespace)
+            .await?;
 
         info!(
             sandbox_id = %sandbox.id,
@@ -1516,6 +1617,12 @@ impl KubernetesComputeDriver {
             .config
             .supervisor_image_pull_policy
             .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let network_additional_ca_config_map_name = self
+            .network_trust_bundle
+            .as_ref()
+            .map(|_| network_additional_ca_config_map_name(&self.config.gateway_id))
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         let params = SandboxPodParams {
@@ -1554,6 +1661,7 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
+            network_additional_ca_config_map_name: network_additional_ca_config_map_name.as_deref(),
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
         };
@@ -2873,6 +2981,7 @@ fn apply_supervisor_sideload_with_params(
             driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
         ];
         command.extend(upstream_proxy_cli_args(params));
+        command.extend(network_additional_ca_cli_args(params));
         container.insert("command".to_string(), serde_json::json!(command));
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -2905,6 +3014,15 @@ fn apply_supervisor_sideload_with_params(
             .as_array_mut();
         if let Some(env) = env {
             apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+        }
+        if params.network_additional_ca_config_map_name.is_some() {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(network_additional_ca_volume_mount());
+            }
         }
         if has_upstream_proxy_credentials(params) {
             let volume_mounts = container
@@ -2960,6 +3078,27 @@ fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
     args
+}
+
+fn network_additional_ca_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    params
+        .network_additional_ca_config_map_name
+        .map(|_| {
+            vec![
+                "--network-additional-ca-bundle".to_string(),
+                openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn network_additional_ca_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+        "mountPath": openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+        "subPath": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+        "readOnly": true,
+    })
 }
 
 fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
@@ -3131,6 +3270,7 @@ fn supervisor_sidecar_container(
         .extend(
             upstream_proxy_cli_args(params)
                 .into_iter()
+                .chain(network_additional_ca_cli_args(params))
                 .map(serde_json::Value::String),
         );
     if let Some(policy) = params.supervisor_image_pull_policy {
@@ -3145,6 +3285,12 @@ fn supervisor_sidecar_container(
                 "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
                 "readOnly": true,
             }));
+    }
+    if params.network_additional_ca_config_map_name.is_some() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(network_additional_ca_volume_mount());
     }
     if has_upstream_proxy_credentials(params) {
         container["volumeMounts"]
@@ -3566,6 +3712,7 @@ struct SandboxPodParams<'a> {
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
+    network_additional_ca_config_map_name: Option<&'a str>,
     /// Resolved sandbox UID for supervisor `runAsUser` and env var.
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
@@ -3605,6 +3752,7 @@ impl Default for SandboxPodParams<'_> {
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
+            network_additional_ca_config_map_name: None,
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
         }
@@ -4038,6 +4186,19 @@ fn sandbox_template_to_k8s_with_validated_config(
             "csi": {
                 "driver": "csi.spiffe.io",
                 "readOnly": true
+            }
+        }));
+    }
+    if let Some(config_map_name) = params.network_additional_ca_config_map_name {
+        volumes.push(serde_json::json!({
+            "name": NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+            "configMap": {
+                "name": config_map_name,
+                "defaultMode": 0o444,
+                "items": [{
+                    "key": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+                    "path": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+                }]
             }
         }));
     }
@@ -8766,6 +8927,264 @@ mod tests {
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
         );
+    }
+
+    fn test_network_trust_bundle() -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\ntest-normalized-ca\n-----END CERTIFICATE-----\n"
+                .to_vec(),
+            1,
+            "sha256:test-network-ca",
+            PathBuf::from("/gateway-owned/network-additional-ca.crt"),
+        )
+    }
+
+    #[test]
+    fn network_additional_ca_config_map_contains_normalized_material_and_management_labels() {
+        let bundle = test_network_trust_bundle();
+        let name = network_additional_ca_config_map_name("gateway-a").unwrap();
+        let config_map =
+            network_additional_ca_config_map("workspace-a", &name, "gateway-a", &bundle).unwrap();
+
+        assert_eq!(config_map.metadata.name.as_deref(), Some(name.as_str()));
+        assert_eq!(
+            config_map.metadata.namespace.as_deref(),
+            Some("workspace-a")
+        );
+        let labels = config_map.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).map(String::as_str),
+            Some(LABEL_MANAGED_BY_VALUE)
+        );
+        assert_eq!(
+            labels.get(LABEL_GATEWAY_ID).map(String::as_str),
+            Some("gateway-a")
+        );
+        assert_eq!(
+            config_map
+                .data
+                .as_ref()
+                .unwrap()
+                .get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY)
+                .map(String::as_bytes),
+            Some(bundle.normalized_pem())
+        );
+    }
+
+    fn assert_network_ca_command(command: &[serde_json::Value]) {
+        let pairs = command
+            .windows(2)
+            .filter(|pair| pair[0] == "--network-additional-ca-bundle")
+            .collect::<Vec<_>>();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0][1],
+            openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+        );
+    }
+
+    fn has_network_ca_mount(container: &serde_json::Value) -> bool {
+        container["volumeMounts"].as_array().is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                mount["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME
+                    || mount["mountPath"]
+                        == openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+            })
+        })
+    }
+
+    #[test]
+    fn combined_topology_mounts_network_ca_only_in_agent_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Combined,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            network_additional_ca_config_map_name: Some(
+                "openshell-network-additional-ca-gateway-a",
+            ),
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(has_network_ca_mount(agent));
+        assert_network_ca_command(agent["command"].as_array().unwrap());
+        for init in pod["spec"]["initContainers"].as_array().unwrap() {
+            assert!(!has_network_ca_mount(init));
+            assert!(
+                !init["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| { arg == "--network-additional-ca-bundle" })
+            );
+        }
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(
+            volume["configMap"]["name"],
+            "openshell-network-additional-ca-gateway-a"
+        );
+        assert_eq!(
+            volume["configMap"]["items"][0]["key"],
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY
+        );
+    }
+
+    #[test]
+    fn sidecar_topology_mounts_network_ca_only_in_network_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            network_additional_ca_config_map_name: Some(
+                "openshell-network-additional-ca-gateway-a",
+            ),
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert!(has_network_ca_mount(network));
+        assert_network_ca_command(network["command"].as_array().unwrap());
+
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(!has_network_ca_mount(agent));
+        assert!(
+            !agent["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| { arg == "--network-additional-ca-bundle" })
+        );
+        for init in pod["spec"]["initContainers"].as_array().unwrap() {
+            assert!(!has_network_ca_mount(init));
+            assert!(
+                !init["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| { arg == "--network-additional-ca-bundle" })
+            );
+        }
+    }
+
+    #[test]
+    fn unset_network_ca_keeps_pod_spec_free_of_delivery_material() {
+        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+            let params = SandboxPodParams {
+                topology,
+                supervisor_image: "supervisor-image:latest",
+                sandbox_uid: 1500,
+                sandbox_gid: 1500,
+                ..SandboxPodParams::default()
+            };
+            let pod = sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            );
+            assert!(!pod.to_string().contains(NETWORK_ADDITIONAL_CA_VOLUME_NAME));
+            assert!(!pod.to_string().contains("--network-additional-ca-bundle"));
+        }
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_is_applied_before_pod_delivery_and_api_errors_surface() {
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((request.method().clone(), request.uri().to_string()));
+                let response = http::Response::builder()
+                    .status(403)
+                    .header("content-type", "application/json")
+                    .body(http_body_util::Full::new(bytes::Bytes::from_static(
+                        br#"{"status":"Failure","message":"forbidden","reason":"Forbidden","code":403}"#,
+                    )))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "default");
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            gateway_id: "gateway-a".to_string(),
+            ..KubernetesComputeConfig::default()
+        });
+        driver.client = client;
+        driver.network_trust_bundle = Some(test_network_trust_bundle());
+
+        let error = driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ConfigMap"));
+        assert!(message.contains("workspace-a"));
+        assert!(!message.contains("test-normalized-ca"));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, http::Method::PATCH);
+        assert!(
+            requests[0]
+                .1
+                .contains("/namespaces/workspace-a/configmaps/")
+        );
+        assert!(requests[0].1.contains("fieldManager=openshell"));
+    }
+
+    #[tokio::test]
+    async fn absent_network_ca_does_not_call_config_map_api() {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+            panic!("no Kubernetes API request expected without a network trust bundle");
+            #[allow(unreachable_code)]
+            Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Empty::<
+                bytes::Bytes,
+            >::new()))
+        });
+        let client = Client::new(service, "default");
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        driver.client = client;
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

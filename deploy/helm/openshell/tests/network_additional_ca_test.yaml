@@ -1,0 +1,171 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: network additional CA delivery
+release:
+  name: openshell
+  namespace: my-namespace
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/clusterrole.yaml
+
+tests:
+  - it: omits the global additional CA setting by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.supervisor\.network\]'
+
+  - it: treats a missing supervisor network map as disabled
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.network: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.supervisor\.network\]'
+
+  - it: omits the gateway source mount by default
+    template: templates/statefulset.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: network-additional-ca-source
+          any: true
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: network-additional-ca-source
+          any: true
+
+  - it: omits shared namespace ConfigMap permissions by default
+    template: templates/role.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+          any: true
+
+  - it: omits cluster-wide ConfigMap permissions by default
+    template: templates/clusterrole.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+          any: true
+
+  - it: renders the global setting outside the Kubernetes driver table
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.supervisor\.network\]\s*additional_ca_cert_paths\s*=\s*\["/etc/openshell-tls/network-additional-ca-source/ca\.crt"\].*?\[openshell\.drivers\.kubernetes\]'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*additional_ca_cert_paths'
+
+  - it: mounts the operator source ConfigMap into the gateway
+    template: templates/statefulset.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: network-additional-ca-source
+            mountPath: /etc/openshell-tls/network-additional-ca-source/ca.crt
+            subPath: ca.crt
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: network-additional-ca-source
+            configMap:
+              name: private-destination-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+      - exists:
+          path: spec.template.metadata.annotations["checksum/gateway-config"]
+
+  - it: grants shared namespace ConfigMap apply permissions when workspace resources are external
+    template: templates/role.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      workspaceResources.enabled: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create", "patch"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["agents.x-k8s.io"]
+          any: true
+
+  - it: binds shared namespace ConfigMap permissions when workspace resources are external
+    template: templates/rolebinding.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      workspaceResources.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: grants managed namespace ConfigMap apply permissions through the ClusterRole
+    template: templates/clusterrole.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create", "patch"]
+
+  - it: omits a shared Role in managed workspace mode
+    template: templates/role.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: grants operator namespace ConfigMap apply permissions through the ClusterRole
+    template: templates/clusterrole.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create", "patch"]
+
+  - it: omits a shared Role in operator workspace mode
+    template: templates/role.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - hasDocuments:
+          count: 0

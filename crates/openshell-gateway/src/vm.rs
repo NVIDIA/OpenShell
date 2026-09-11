@@ -541,6 +541,7 @@ pub async fn spawn(
     gateway_name: &str,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
+    network_additional_ca_bundle: Option<&Path>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
@@ -585,6 +586,7 @@ pub async fn spawn(
         command.arg("--guest-tls-key").arg(tls.key);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    append_vm_network_trust_arg(&mut command, network_additional_ca_bundle);
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -641,6 +643,13 @@ fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
 }
 
 #[cfg(unix)]
+fn append_vm_network_trust_arg(command: &mut Command, bundle_path: Option<&Path>) {
+    if let Some(path) = bundle_path {
+        command.arg("--network-additional-ca-bundle").arg(path);
+    }
+}
+
+#[cfg(unix)]
 fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConfig) {
     let proxy = &config.upstream_proxy;
     if let Some(url) = proxy.https_proxy.as_ref() {
@@ -682,6 +691,7 @@ pub async fn spawn(
     _gateway_name: &str,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
+    _network_additional_ca_bundle: Option<&std::path::Path>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
@@ -759,7 +769,7 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args,
+        VmComputeConfig, append_otlp_args, append_vm_identity_args, append_vm_network_trust_arg,
         append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
@@ -850,6 +860,32 @@ mod tests {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_vm_proxy_and_spiffe_args(&mut command, &VmComputeConfig::default());
         assert_eq!(command.as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_only_the_internal_network_trust_path() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_network_trust_arg(
+            &mut command,
+            Some(PathBuf::from("/var/lib/openshell/network/additional-ca.crt").as_path()),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--network-additional-ca-bundle",
+                "/var/lib/openshell/network/additional-ca.crt"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+
+        let mut unset = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_network_trust_arg(&mut unset, None);
+        assert_eq!(unset.as_std().get_args().count(), 0);
     }
 
     #[test]
