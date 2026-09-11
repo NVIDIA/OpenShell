@@ -161,7 +161,8 @@ mod session {
     pub struct SecretJwt(Zeroizing<String>);
 
     impl SecretJwt {
-        fn new(value: String) -> Result<Self, SessionJwtError> {
+        pub fn parse(value: impl Into<String>) -> Result<Self, SessionJwtError> {
+            let value = value.into();
             if value.is_empty() || value.chars().any(char::is_whitespace) {
                 return Err(SessionJwtError::InvalidTokenEncoding);
             }
@@ -192,6 +193,93 @@ mod session {
         pub gateway: MintedSessionToken,
         pub sandbox: MintedSessionToken,
         pub credential_epoch: CredentialEpoch,
+    }
+
+    /// Refreshable Sandbox Protocol bearer credential shared by all streams on
+    /// the supervisor's current HTTP/2 connection.
+    #[derive(Clone)]
+    pub struct SessionBearerTokenSlot {
+        inner: Arc<std::sync::RwLock<Option<StoredBearer>>>,
+    }
+
+    #[derive(Clone)]
+    struct StoredBearer {
+        token: SecretJwt,
+        expires_at: i64,
+    }
+
+    impl SessionBearerTokenSlot {
+        #[must_use]
+        pub fn empty() -> Self {
+            Self {
+                inner: Arc::new(std::sync::RwLock::new(None)),
+            }
+        }
+
+        pub fn new(token: SecretJwt, expires_at: i64) -> Result<Self, SessionJwtError> {
+            let slot = Self::empty();
+            slot.update(token, expires_at)?;
+            Ok(slot)
+        }
+
+        pub fn update(&self, token: SecretJwt, expires_at: i64) -> Result<(), SessionJwtError> {
+            if expires_at <= 0 {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            *self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(StoredBearer { token, expires_at });
+            Ok(())
+        }
+
+        pub fn clear(&self) {
+            *self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+
+        #[must_use]
+        pub fn expires_at(&self) -> Option<i64> {
+            self.inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|stored| stored.expires_at)
+        }
+
+        pub fn authorization_metadata(
+            &self,
+        ) -> Result<tonic::metadata::AsciiMetadataValue, SessionJwtError> {
+            let stored = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stored = stored.as_ref().ok_or(SessionJwtError::TokenUnavailable)?;
+            if stored.expires_at <= SystemJwtClock.now_unix_seconds() {
+                return Err(SessionJwtError::Expired);
+            }
+            format!("Bearer {}", stored.token.expose_secret())
+                .parse()
+                .map_err(|_| SessionJwtError::InvalidTokenEncoding)
+        }
+    }
+
+    impl Default for SessionBearerTokenSlot {
+        fn default() -> Self {
+            Self::empty()
+        }
+    }
+
+    impl fmt::Debug for SessionBearerTokenSlot {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SessionBearerTokenSlot")
+                .field("expires_at", &self.expires_at())
+                .finish_non_exhaustive()
+        }
     }
 
     pub trait JwtClock: Send + Sync {
@@ -305,7 +393,7 @@ mod session {
             let token = encode(&header, &claims, &self.encoding_key)
                 .map_err(|_| SessionJwtError::SigningFailed)?;
             Ok(MintedSessionToken {
-                token: SecretJwt::new(token)?,
+                token: SecretJwt::parse(token)?,
                 expires_at,
                 token_id,
             })
@@ -471,6 +559,8 @@ mod session {
         SigningFailed,
         #[error("session token encoding is invalid")]
         InvalidTokenEncoding,
+        #[error("session token is unavailable")]
+        TokenUnavailable,
         #[error("session token is invalid")]
         InvalidToken,
         #[error("session token algorithm must be EdDSA")]
