@@ -9,6 +9,79 @@
 //! L7 endpoint field combinations, preventing drift between lint-time
 //! and runtime checks.
 
+use openshell_core::proto::{NetworkAccessPreset, NetworkEnforcementMode, NetworkTlsMode};
+
+#[allow(deprecated)]
+pub fn network_tls_mode_from_str(value: &str) -> Option<NetworkTlsMode> {
+    match value {
+        "" => Some(NetworkTlsMode::Unspecified),
+        "skip" => Some(NetworkTlsMode::Skip),
+        "terminate" => Some(NetworkTlsMode::Terminate),
+        "passthrough" => Some(NetworkTlsMode::Passthrough),
+        _ => None,
+    }
+}
+
+#[allow(deprecated)]
+pub fn network_tls_mode_to_str(value: i32) -> Option<&'static str> {
+    match NetworkTlsMode::try_from(value).ok()? {
+        NetworkTlsMode::Unspecified => Some(""),
+        NetworkTlsMode::Skip => Some("skip"),
+        NetworkTlsMode::Terminate => Some("terminate"),
+        NetworkTlsMode::Passthrough => Some("passthrough"),
+    }
+}
+
+pub fn network_enforcement_mode_from_str(value: &str) -> Option<NetworkEnforcementMode> {
+    match value {
+        "" => Some(NetworkEnforcementMode::Unspecified),
+        "enforce" => Some(NetworkEnforcementMode::Enforce),
+        "audit" => Some(NetworkEnforcementMode::Audit),
+        _ => None,
+    }
+}
+
+pub fn network_enforcement_mode_to_str(value: i32) -> Option<&'static str> {
+    match NetworkEnforcementMode::try_from(value).ok()? {
+        NetworkEnforcementMode::Unspecified => Some(""),
+        NetworkEnforcementMode::Enforce => Some("enforce"),
+        NetworkEnforcementMode::Audit => Some("audit"),
+    }
+}
+
+pub fn network_access_preset_from_str(value: &str) -> Option<NetworkAccessPreset> {
+    match value {
+        "" => Some(NetworkAccessPreset::Unspecified),
+        "read-only" => Some(NetworkAccessPreset::ReadOnly),
+        "read-write" => Some(NetworkAccessPreset::ReadWrite),
+        "full" => Some(NetworkAccessPreset::Full),
+        _ => None,
+    }
+}
+
+pub fn network_access_preset_to_str(value: i32) -> Option<&'static str> {
+    match NetworkAccessPreset::try_from(value).ok()? {
+        NetworkAccessPreset::Unspecified => Some(""),
+        NetworkAccessPreset::ReadOnly => Some("read-only"),
+        NetworkAccessPreset::ReadWrite => Some("read-write"),
+        NetworkAccessPreset::Full => Some("full"),
+    }
+}
+
+pub fn validate_endpoint_mode_values(tls: i32, enforcement: i32, access: i32) -> Vec<String> {
+    let mut errors = Vec::new();
+    if network_tls_mode_to_str(tls).is_none() {
+        errors.push(format!("unknown tls enum value {tls}"));
+    }
+    if network_enforcement_mode_to_str(enforcement).is_none() {
+        errors.push(format!("unknown enforcement enum value {enforcement}"));
+    }
+    if network_access_preset_to_str(access).is_none() {
+        errors.push(format!("unknown access enum value {access}"));
+    }
+    errors
+}
+
 /// Known L7 inspection protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {
@@ -105,6 +178,30 @@ mod agent_transport_tests {
         assert!(agent_authored_transport_rejection("", "skip").is_some());
         assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
     }
+}
+
+/// Validate the security-sensitive endpoint fields whose public representation
+/// is currently a string. Empty values preserve the documented defaults.
+pub fn validate_endpoint_modes(tls: &str, enforcement: &str, access: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if !matches!(tls, "" | "skip" | "terminate" | "passthrough") {
+        errors.push(format!(
+            "unknown tls value '{tls}' (expected skip, terminate, or passthrough)"
+        ));
+    }
+    if !matches!(enforcement, "" | "enforce" | "audit") {
+        errors.push(format!(
+            "unknown enforcement value '{enforcement}' (expected enforce or audit)"
+        ));
+    }
+    if !matches!(access, "" | "read-only" | "read-write" | "full") {
+        errors.push(format!(
+            "unknown access value '{access}' (expected read-only, read-write, or full)"
+        ));
+    }
+
+    errors
 }
 
 /// Fields extracted from an endpoint definition needed for L7 semantic
@@ -248,6 +345,27 @@ mod tests {
     fn valid_endpoint_produces_no_errors() {
         let errors = validate_l7_endpoint_semantics(&valid_rest_endpoint());
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn endpoint_modes_reject_unknown_values() {
+        let errors = validate_endpoint_modes("skp", "enforc", "read-wirte");
+
+        assert_eq!(errors.len(), 3);
+        assert!(errors[0].contains("unknown tls value 'skp'"));
+        assert!(errors[1].contains("unknown enforcement value 'enforc'"));
+        assert!(errors[2].contains("unknown access value 'read-wirte'"));
+    }
+
+    #[test]
+    fn endpoint_modes_accept_documented_values_and_defaults() {
+        for tls in ["", "skip", "terminate", "passthrough"] {
+            for enforcement in ["", "enforce", "audit"] {
+                for access in ["", "read-only", "read-write", "full"] {
+                    assert!(validate_endpoint_modes(tls, enforcement, access).is_empty());
+                }
+            }
+        }
     }
 
     #[test]

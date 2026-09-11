@@ -404,7 +404,7 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
                         host="storage.googleapis.com",
                         port=443,
                         protocol="rest",
-                        access="full",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
                         credential_binding=sandbox_pb2.NetworkCredentialBinding(
                             provider=provider_name
                         ),

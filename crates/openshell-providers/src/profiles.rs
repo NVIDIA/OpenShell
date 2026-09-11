@@ -16,7 +16,9 @@ use openshell_core::proto::{
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
-    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
+    L7EndpointFields, L7Protocol, network_access_preset_from_str, network_access_preset_to_str,
+    network_enforcement_mode_from_str, network_enforcement_mode_to_str, network_tls_mode_from_str,
+    network_tls_mode_to_str, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
     validate_l7_endpoint_semantics,
 };
 use serde::ser::SerializeStruct;
@@ -1430,9 +1432,10 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
-        tls: endpoint.tls.clone(),
-        enforcement: endpoint.enforcement.clone(),
-        access: endpoint.access.clone(),
+        tls: network_tls_mode_from_str(&endpoint.tls).map_or(-1, |value| value as i32),
+        enforcement: network_enforcement_mode_from_str(&endpoint.enforcement)
+            .map_or(-1, |value| value as i32),
+        access: network_access_preset_from_str(&endpoint.access).map_or(-1, |value| value as i32),
         rules: endpoint
             .rules
             .as_deref()
@@ -1479,9 +1482,14 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
-        tls: endpoint.tls.clone(),
-        access: endpoint.access.clone(),
-        enforcement: endpoint.enforcement.clone(),
+        tls: network_tls_mode_to_str(endpoint.tls)
+            .map_or_else(|| format!("unknown({})", endpoint.tls), str::to_owned),
+        access: network_access_preset_to_str(endpoint.access)
+            .map_or_else(|| format!("unknown({})", endpoint.access), str::to_owned),
+        enforcement: network_enforcement_mode_to_str(endpoint.enforcement).map_or_else(
+            || format!("unknown({})", endpoint.enforcement),
+            str::to_owned,
+        ),
         rules: if endpoint.rules.is_empty() {
             None
         } else {
@@ -2336,6 +2344,16 @@ pub fn validate_profile_set(
                     .unwrap_or(false),
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+            for msg in
+                validate_endpoint_modes(&endpoint.tls, &endpoint.enforcement, &endpoint.access)
+            {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -3367,7 +3385,8 @@ mod tests {
                 endpoint.host == "api.github.com"
                     && endpoint.protocol == "graphql"
                     && endpoint.path == "/graphql"
-                    && endpoint.access == "read-only"
+                    && endpoint.access
+                        == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
             }),
             "github profile should include read-only GraphQL endpoint"
         );
@@ -3377,9 +3396,9 @@ mod tests {
                 // transport endpoint (github.com) carries explicit rules
                 // instead so it can allow clone/fetch while blocking push.
                 if endpoint.host == "github.com" {
-                    endpoint.access.is_empty()
+                    endpoint.access == 0
                 } else {
-                    endpoint.access == "read-only"
+                    endpoint.access == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
                 }
             }),
             "github API endpoints should be read-only; git transport uses explicit rules"
@@ -3401,7 +3420,7 @@ mod tests {
         // The git transport carries explicit rules rather than an access preset
         // (an empty preset would otherwise expand to GET/HEAD/OPTIONS).
         assert!(
-            git_transport.access.is_empty(),
+            git_transport.access == 0,
             "git transport must use explicit rules, not an access preset"
         );
 
@@ -5157,7 +5176,10 @@ binaries:
         let proto = profile.to_proto();
 
         let graphql_ep = &proto.endpoints[0];
-        assert_eq!(graphql_ep.access, "read-only");
+        assert_eq!(
+            graphql_ep.access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert_eq!(graphql_ep.persisted_queries, "allow_registered");
         assert_eq!(graphql_ep.graphql_max_body_bytes, 131_072);
         assert_eq!(graphql_ep.path, "/graphql");
@@ -5172,7 +5194,10 @@ binaries:
         let rest_ep = &proto.endpoints[1];
         assert_eq!(rest_ep.port, 0);
         assert_eq!(rest_ep.ports, vec![443, 8443]);
-        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(
+            rest_ep.tls,
+            openshell_core::proto::NetworkTlsMode::Terminate as i32
+        );
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
         assert!(rest_ep.allow_uninspected_credentials);
@@ -5191,7 +5216,10 @@ binaries:
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].access, "read-only");
+        assert_eq!(
+            reprotoo.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
@@ -5907,6 +5935,35 @@ credentials:
     }
 
     // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_unknown_security_sensitive_endpoint_values() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-modes
+display_name: Invalid modes
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    tls: skp
+    enforcement: enforc
+    access: read-wirte
+",
+        )
+        .expect("string values should parse before semantic validation");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let message = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(message.contains("unknown tls value 'skp'"));
+        assert!(message.contains("unknown enforcement value 'enforc'"));
+        assert!(message.contains("unknown access value 'read-wirte'"));
+    }
 
     #[test]
     fn validate_rejects_protocol_without_rules_or_access() {

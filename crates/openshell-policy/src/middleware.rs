@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use openshell_core::middleware::{MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_SELECTOR_PATTERNS};
 use openshell_core::proto::{
     MiddlewareEndpointSelector, NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule,
-    SandboxPolicy,
+    NetworkTlsMode, SandboxPolicy,
 };
 use openshell_core::proto_struct::{
     ProtoStructError, json_object_to_struct, struct_to_json_object,
@@ -168,17 +168,21 @@ where
                 endpoints: rule
                     .endpoints
                     .into_iter()
-                    .map(|endpoint| NetworkEndpoint {
-                        host: endpoint.host,
-                        tls: endpoint.tls,
-                        ..Default::default()
+                    .map(|endpoint| {
+                        Ok(NetworkEndpoint {
+                            host: endpoint.host,
+                            tls: crate::network_tls_mode_from_str(&endpoint.tls)
+                                .ok_or_else(|| format!("unknown tls value '{}'", endpoint.tls))?
+                                as i32,
+                            ..Default::default()
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, String>>()?,
                 ..Default::default()
             };
-            (key, rule)
+            Ok((key, rule))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>, String>>()?;
     let policy = SandboxPolicy {
         network_middlewares,
         network_policies,
@@ -292,7 +296,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             };
             for endpoint in &rule.endpoints {
                 let overlaps_tls_skip = requires_inspection
-                    && endpoint.tls == "skip"
+                    && endpoint.tls == NetworkTlsMode::Skip as i32
                     && compiled_selector.as_ref().is_some_and(|selector| {
                         HostPattern::new(&endpoint.host)
                             .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))

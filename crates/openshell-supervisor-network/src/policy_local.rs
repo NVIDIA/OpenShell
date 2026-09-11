@@ -1198,9 +1198,14 @@ fn network_endpoint_from_json(
         host: endpoint.host,
         port,
         protocol: endpoint.protocol,
-        tls: endpoint.tls,
-        enforcement: endpoint.enforcement,
-        access: endpoint.access,
+        tls: openshell_policy::network_tls_mode_from_str(&endpoint.tls)
+            .ok_or_else(|| format!("unknown tls value '{}'", endpoint.tls))? as i32,
+        enforcement: openshell_policy::network_enforcement_mode_from_str(&endpoint.enforcement)
+            .ok_or_else(|| format!("unknown enforcement value '{}'", endpoint.enforcement))?
+            as i32,
+        access: openshell_policy::network_access_preset_from_str(&endpoint.access)
+            .ok_or_else(|| format!("unknown access value '{}'", endpoint.access))?
+            as i32,
         rules,
         allowed_ips: endpoint.allowed_ips,
         ports,
@@ -1553,7 +1558,10 @@ mod tests {
         let chunks = proposal_chunks_from_body(body).unwrap();
         let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
         assert!(endpoint.protocol.is_empty());
-        assert!(endpoint.tls.is_empty());
+        assert_eq!(
+            endpoint.tls,
+            openshell_core::proto::NetworkTlsMode::Unspecified as i32
+        );
     }
 
     #[test]

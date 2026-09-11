@@ -5835,8 +5835,11 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     };
     tags.push(layer_tag.to_string());
 
-    if !endpoint.access.is_empty() {
-        tags.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        tags.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
 
     for r in &endpoint.rules {
@@ -6981,7 +6984,7 @@ mod tests {
             host: "host.example.test".to_string(),
             port: 443,
             protocol: "rest".to_string(),
-            access: "read-only".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
         assert_eq!(

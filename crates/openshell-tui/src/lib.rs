@@ -1299,7 +1299,10 @@ fn render_policy_lines(
 
             // Rule header — include L7/TLS/allowed_ips annotation if any endpoint has it.
             let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
-            let has_tls_term = rule.endpoints.iter().any(|e| e.tls == "terminate");
+            let has_tls_term = rule
+                .endpoints
+                .iter()
+                .any(|e| openshell_policy::network_tls_mode_to_str(e.tls) == Some("terminate"));
             let has_allowed_ips = rule.endpoints.iter().any(|e| !e.allowed_ips.is_empty());
             let mut annotations = Vec::new();
             if has_l7 {
@@ -1372,10 +1375,14 @@ fn render_policy_lines(
                 }
 
                 // Access preset (if set instead of explicit rules).
-                if !ep.access.is_empty() && ep.rules.is_empty() {
+                if ep.access != 0 && ep.rules.is_empty() {
                     lines.push(Line::from(vec![
                         Span::styled("      Access: ", t.muted),
-                        Span::styled(ep.access.clone(), t.text),
+                        Span::styled(
+                            openshell_policy::network_access_preset_to_str(ep.access)
+                                .unwrap_or("unknown"),
+                            t.text,
+                        ),
                     ]));
                 }
             }
