@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -438,15 +439,16 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(mut raw) => {
                         release_queue_bytes(&consumer_health, raw.queued_bytes);
-                        match decode_raw(&mut raw) {
-                            Some(ev) => process_event(&index, ev),
-                            None => tracing::debug!(
+                        if let Some(ev) = decode_raw(&mut raw) {
+                            process_event(&index, ev);
+                        } else {
+                            tracing::debug!(
                                 target: "mxc_etw",
                                 id = raw.header.EventDescriptor.Id,
                                 opcode = raw.header.EventDescriptor.Opcode,
                                 pid = raw.header.ProcessId,
                                 "TDH decode failed for event"
-                            ),
+                            );
                         }
                         drain_and_emit(&index);
                         overload_reporter.report_if_due(&consumer_health, false);
@@ -724,7 +726,9 @@ fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
     health.stopped.store(true, Ordering::SeqCst);
 
     let expected = health.stopping.load(Ordering::SeqCst);
-    if !expected {
+    if expected {
+        tracing::debug!(target: "mxc_etw", code = status.0, "ETW ProcessTrace returned after stop");
+    } else {
         // The session went away without anyone asking it to (e.g. an external
         // `logman stop`, a provider error, or a dropped trace). Surface it — the
         // OCSF audit trail is now blind until the driver is restarted.
@@ -733,8 +737,6 @@ fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
             code = status.0,
             "ETW ProcessTrace terminated unexpectedly; MXC OCSF capture is no longer running"
         );
-    } else {
-        tracing::debug!(target: "mxc_etw", code = status.0, "ETW ProcessTrace returned after stop");
     }
 
     unsafe {
@@ -804,21 +806,19 @@ fn try_reserve_queue_bytes(health: &CaptureHealth, event_bytes: usize) -> bool {
         return false;
     }
 
-    match health
+    health
         .queued_bytes
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
             queued
                 .checked_add(event_bytes)
                 .filter(|total| *total <= EVENT_QUEUE_BYTE_CAPACITY)
-        }) {
-        Ok(previous) => {
+        })
+        .is_ok_and(|previous| {
             health
                 .queue_high_water_bytes
                 .fetch_max(previous + event_bytes, Ordering::Relaxed);
             true
-        }
-        Err(_) => false,
-    }
+        })
 }
 
 fn release_queue_bytes(health: &CaptureHealth, event_bytes: usize) {
@@ -907,7 +907,7 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
     rec.UserData = if raw.user_data.is_empty() {
         std::ptr::null_mut()
     } else {
-        raw.user_data.as_ptr() as *mut c_void
+        raw.user_data.as_mut_ptr().cast::<c_void>()
     };
     rec.ExtendedDataCount = u16::try_from(raw.ext_items.len()).unwrap_or(u16::MAX);
     rec.ExtendedData = if raw.ext_items.is_empty() {
@@ -1176,6 +1176,7 @@ fn format_property_value(
 ///   (no identity/CV) resolves via the ETW `ActivityId` it shares.
 /// - command text never establishes ownership, and the PID anchor is retired as
 ///   soon as the monitored `wxc-exec` child exits.
+///
 /// An ETW event that could not yet be attributed, held so it can be replayed
 /// once its sandbox's attribution is seeded.
 struct PendingEvent {
@@ -1249,7 +1250,7 @@ pub(crate) fn child_process_start_key(child: &tokio::process::Child) -> Result<u
         }
         return Err(format!(
             "NtQueryInformationProcess(ProcessTelemetryIdInformation) failed: status 0x{:08x}",
-            status.0 as u32
+            status.0.cast_unsigned()
         ));
     }
 }
@@ -1317,9 +1318,7 @@ impl AttributionIndex {
                     new = %sandbox_id,
                     "wxc-exec PID reused before prior sandbox was forgotten; rebinding attribution"
                 );
-                self.retired_sandboxes
-                    .entry(previous.sid.clone())
-                    .or_insert(now);
+                self.retired_sandboxes.entry(previous.sid).or_insert(now);
             } else if previous.process_start_key == process_start_key {
                 // Duplicate registration of the same live launch is idempotent.
                 self.by_pid.insert(wxc_pid, previous);
@@ -1388,11 +1387,11 @@ impl AttributionIndex {
         let expired_sandboxes = self
             .retired_sandboxes
             .iter()
-            .filter_map(|(sandbox_id, retired_at)| {
+            .filter(|&(_, retired_at)| {
                 now.checked_duration_since(*retired_at)
                     .is_some_and(|age| age >= RETIRED_CORRELATION_TTL)
-                    .then(|| sandbox_id.clone())
             })
+            .map(|(sandbox_id, _)| sandbox_id.clone())
             .collect::<HashSet<_>>();
         if expired_sandboxes.is_empty() {
             return;
@@ -1487,10 +1486,10 @@ impl AttributionIndex {
                 break;
             }
         }
-        if self.pending.len() >= PENDING_MAX {
-            if let Some(p) = self.pending.pop_front() {
-                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
-            }
+        if self.pending.len() >= PENDING_MAX
+            && let Some(p) = self.pending.pop_front()
+        {
+            tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
         }
         self.pending.push_back(PendingEvent { at: now, ev });
     }
@@ -1539,19 +1538,16 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         let mut idx = index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match idx.resolve(&ev) {
-            Some(sid) => {
-                let name = idx.name_of(&sid);
-                Some((sid, name, ev))
-            }
-            None => {
-                // Not attributable yet: ETW delivers the create/config burst the
-                // instant `wxc-exec` starts, which can beat the driver's
-                // `register_launch`. Hold the event for replay instead of dropping
-                // it (see `drain_and_emit`).
-                idx.buffer_unresolved(ev);
-                None
-            }
+        if let Some(sid) = idx.resolve(&ev) {
+            let name = idx.name_of(&sid);
+            Some((sid, name, ev))
+        } else {
+            // Not attributable yet: ETW delivers the create/config burst the
+            // instant `wxc-exec` starts, which can beat the driver's
+            // `register_launch`. Hold the event for replay instead of dropping
+            // it (see `drain_and_emit`).
+            idx.buffer_unresolved(ev);
+            None
         }
     };
 
@@ -1683,8 +1679,8 @@ fn map_lifecycle_create(ctx: &EventContext, sandbox_name: &str) -> OcsfEvent {
 /// config-ish fields the event carries ride along as `unmapped`, and
 /// `security_level` reflects any hardening signal present.
 fn map_config_state(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
-    let flag = |k: &str| ev.get(k).map(|v| v == "1").unwrap_or(false);
-    let nonzero = |k: &str| ev.get(k).map(|v| v != "0").unwrap_or(false);
+    let flag = |k: &str| ev.get(k).is_some_and(|v| v == "1");
+    let nonzero = |k: &str| ev.get(k).is_some_and(|v| v != "0");
     let hardened = flag("useLeastPrivilege") || flag("useAppContainer") || nonzero("agenticFlags");
     let security_level = if hardened {
         SecurityLevelId::Secure
@@ -1816,10 +1812,10 @@ fn map_process_started(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
 /// `ActivityError` / `FallbackError` → Detection Finding [2004] (informational).
 fn map_finding(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     let kind = ev.event_name.as_deref().unwrap_or("SandboxError");
-    let uid = ev
-        .cv_base()
-        .map(|cv| format!("{kind}:{cv}"))
-        .unwrap_or_else(|| format!("{kind}:{}", ev.process_id));
+    let uid = ev.cv_base().map_or_else(
+        || format!("{kind}:{}", ev.process_id),
+        |cv| format!("{kind}:{cv}"),
+    );
     DetectionFindingBuilder::new(ctx)
         .activity(ActivityId::Open) // finding label = "Create"
         .severity(SeverityId::Informational)
@@ -1836,7 +1832,6 @@ fn map_finding(ctx: &EventContext, ev: &DecodedEtwEvent) -> OcsfEvent {
 /// token, stripped of any directory prefix and surrounding quotes.
 fn exe_name(cmd_line: &str) -> String {
     let first = cmd_line
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("process")
@@ -1907,7 +1902,10 @@ fn guid_key(g: &GUID) -> Option<String> {
     if g.data1 == 0 && g.data2 == 0 && g.data3 == 0 && g.data4 == [0u8; 8] {
         return None;
     }
-    let tail: String = g.data4.iter().map(|b| format!("{b:02x}")).collect();
+    let mut tail = String::with_capacity(16);
+    for byte in &g.data4 {
+        write!(&mut tail, "{byte:02x}").expect("writing to a String cannot fail");
+    }
     Some(format!(
         "{:08x}-{:04x}-{:04x}-{tail}",
         g.data1, g.data2, g.data3
@@ -2044,10 +2042,14 @@ mod tests {
 
     #[test]
     fn extracts_process_start_key_from_etw_extended_data() {
-        let mut unrelated = EVENT_HEADER_EXTENDED_DATA_ITEM::default();
-        unrelated.ExtType = 1;
-        let mut process_key = EVENT_HEADER_EXTENDED_DATA_ITEM::default();
-        process_key.ExtType = EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY as u16;
+        let unrelated = EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: 1,
+            ..Default::default()
+        };
+        let process_key = EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY as u16,
+            ..Default::default()
+        };
         let expected = 0x0123_4567_89ab_cdef_u64;
 
         assert_eq!(
@@ -2300,7 +2302,9 @@ mod tests {
 
         idx.retired_sandboxes.insert(
             "sbx-1".into(),
-            Instant::now() - RETIRED_CORRELATION_TTL - Duration::from_millis(1),
+            Instant::now()
+                .checked_sub(RETIRED_CORRELATION_TTL + Duration::from_millis(1))
+                .expect("test duration is shorter than the monotonic clock epoch"),
         );
         assert!(
             idx.resolve(&late).is_none(),
@@ -2347,8 +2351,9 @@ mod tests {
 
         assert!(idx.resolve(&event_b).is_none());
         idx.buffer_unresolved(event_b);
-        idx.pending.back_mut().expect("buffered event").at =
-            Instant::now() - Duration::from_secs(3);
+        idx.pending.back_mut().expect("buffered event").at = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("test duration is shorter than the monotonic clock epoch");
         assert!(
             idx.drain_resolved().is_empty(),
             "elapsed time must not make a mismatched PID generation authoritative"
