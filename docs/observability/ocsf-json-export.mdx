@@ -160,6 +160,7 @@ The `class_uid` field identifies the event type:
 
 | `class_uid` | Class | Shorthand prefix |
 |---|---|---|
+| 0 | Base Event | `EVENT` |
 | 4001 | Network Activity | `NET:` |
 | 4002 | HTTP Activity | `HTTP:` |
 | 4007 | SSH Activity | `SSH:` |
@@ -171,6 +172,15 @@ The `class_uid` field identifies the event type:
 HTTP Activity records include request or response details. Rejections that have
 parsed a request, including early credential-binding failures, include safe
 method-only request context and the generated response.
+
+Connection-error records include the known peer or listening endpoint.
+
+Policy configuration warnings use Device Config State Change.
+
+Unix socket relay and relay-control notifications without a network endpoint
+use Base Event (`class_uid: 0`). Include these classes when filtering supervisor
+operational events. Relay-control records that previously appeared as `NET:*`
+now appear as `EVENT`.
 
 ## SIEM Schema Version Compatibility
 
