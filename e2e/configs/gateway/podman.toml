@@ -26,5 +26,6 @@ health_check_interval_secs = 10
 network_name = "openshell-e2e"
 grpc_endpoint = "http://host.containers.internal:8080"
 ssh_socket_path = "/run/openshell/ssh.sock"
+sandbox_runtime_image = "localhost/openshell/sandbox:e2e-vm"
 supervisor_image = "localhost/openshell/supervisor:e2e-vm"
 app_armor_profile = "Unconfined"
