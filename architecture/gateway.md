@@ -683,8 +683,14 @@ admits a fixed number of delivery workers and builds the latest full snapshot
 for each affected active sandbox. Delivery admission allows at least 64 workers,
 while snapshot build concurrency remains tied to database pool capacity. This
 absorbs scoped bursts without increasing concurrent database-backed builds.
-Fleet fanout waits for worker capacity before
-admitting another recipient. An async router owns session lookup, message
+Up to 1024 running or queued component keys retain pending work without storing
+configuration payloads. A FIFO dispatcher builds current state when capacity
+is available. Repeated mutations coalesce; mutations during delivery return the
+key to the tail for another pass. Fanout waits for pending capacity through fair
+admission, while direct overflow requests one coalesced all-connected repair
+pass. Two reserved fanout scopes keep that repair available when workspace
+fanout is full. Periodic reconciliation remains the fallback for build, route,
+or session failures. An async router owns session lookup, message
 sizing, sequence allocation, and enqueue. Its local implementation uses the
 process-local supervisor registry. A future HA implementation can resolve the
 gateway that owns a session and forward the same typed message without changing
