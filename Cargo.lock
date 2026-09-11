@@ -4146,6 +4146,7 @@ dependencies = [
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
+ "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
