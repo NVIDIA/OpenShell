@@ -112,13 +112,10 @@ pub struct VmComputeConfig {
     /// Host-side private key for the guest's mTLS client bundle.
     pub guest_tls_key: Option<PathBuf>,
 
-    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
-    /// for policy-approved TLS egress from VM sandboxes.
-    ///
-    /// Deployment-level configuration, not a per-sandbox setting: it is passed
-    /// to the driver, which passes it to the host supervisor. The supervisor
-    /// resolves `host.openshell.internal` to host loopback.
-    pub https_proxy: Option<String>,
+    /// Corporate forward-proxy settings passed to the VM driver. Flattening
+    /// preserves the shared local-driver TOML field names.
+    #[serde(flatten)]
+    pub upstream_proxy: UpstreamProxyConfig,
 
     /// Path on the gateway host to a PEM CA bundle trusted for the corporate
     /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
