@@ -120,7 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
@@ -158,12 +158,14 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
 
       - name: Lint
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
-          cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
+          cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
         env:
@@ -180,6 +182,16 @@ jobs:
           cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox
 
+      - name: Verify selective gateway compute-driver builds
+        run: |
+          cargo test -p openshell-gateway --all-targets --no-default-features
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
+
       - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
         run: tasks/scripts/verify-defaults-without-telemetry.sh
 
@@ -194,6 +206,11 @@ jobs:
             echo "ERROR: webpki-root-certs found in system CA roots build" >&2
             exit 1
           fi
+
+      - name: Verify Cargo lockfiles unchanged
+        run: |
+          tasks/scripts/check-cargo-lockfiles.sh
+          git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
 
   python:
     name: Python (${{ matrix.runner }})
@@ -231,6 +248,10 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test local gateway configuration helpers
+        run: |
+          bash tasks/scripts/test-gateway-pull-policy.sh
+          bash tasks/scripts/test-gateway-config.sh
   go:
     name: Go SDK
     needs: pr_metadata

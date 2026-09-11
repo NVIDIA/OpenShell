@@ -72,6 +72,75 @@ impl ContainerEngine {
     }
 }
 
+static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Builds a container image from a local Dockerfile via the active container
+/// engine and removes it on drop.
+///
+/// `openshell sandbox create --from` no longer builds local Dockerfiles
+/// itself (see the pre-0.1.0 breaking-change notes), so e2e tests that need a
+/// custom image build it out-of-band with this guard and pass the resulting
+/// `tag()` to `--from`.
+pub struct ImageGuard {
+    engine: ContainerEngine,
+    tag: String,
+}
+
+impl ImageGuard {
+    pub fn build(label: &str, dockerfile: &Path, context: &Path) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let unique = NEXT_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tag = format!("localhost/openshell-e2e-{label}-{timestamp}-{unique}:latest");
+        let output = engine
+            .command()
+            .args([
+                "build",
+                "--file",
+                dockerfile
+                    .to_str()
+                    .ok_or_else(|| "Dockerfile path must be UTF-8".to_string())?,
+                "--tag",
+                &tag,
+                context
+                    .to_str()
+                    .ok_or_else(|| "image context path must be UTF-8".to_string())?,
+            ])
+            .output()
+            .map_err(|err| format!("run {} build: {err}", engine.name()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} build failed (exit {:?}):\n{}{}",
+                engine.name(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(Self { engine, tag })
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+impl Drop for ImageGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["image", "rm", "--force", &self.tag])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 #[must_use]
 pub fn e2e_network_name() -> Option<String> {
     std::env::var("OPENSHELL_E2E_NETWORK_NAME")

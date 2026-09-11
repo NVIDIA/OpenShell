@@ -3,7 +3,7 @@
 
 //! Ergonomic builders for constructing OCSF events.
 //!
-//! Each event class has a builder that takes a `SandboxContext` reference
+//! Each event class has a builder that takes a `EventContext` reference
 //! and provides chainable methods for setting event fields.
 
 /// Generate the shared `severity`, `status`, and `message` setter methods that
@@ -180,7 +180,7 @@ use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 /// Passed to every event builder to populate shared OCSF fields
 /// (metadata, container, device, proxy endpoint).
 #[derive(Debug, Clone)]
-pub struct SandboxContext {
+pub struct EventContext {
     /// Sandbox unique identifier.
     pub sandbox_id: String,
     /// Sandbox display name.
@@ -197,7 +197,7 @@ pub struct SandboxContext {
     pub proxy_port: u16,
 }
 
-impl SandboxContext {
+impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
@@ -205,27 +205,31 @@ impl SandboxContext {
             version: OCSF_VERSION.to_string(),
             product: Product::openshell_sandbox(&self.product_version),
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
-            uid: Some(self.sandbox_id.clone()),
+            uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
         }
     }
 
-    /// Build the OCSF `Container` object.
+    /// Build the OCSF `Container` object when the event concerns a sandbox.
     #[must_use]
-    pub fn container(&self) -> Container {
-        Container {
+    pub fn container(&self) -> Option<Container> {
+        if self.sandbox_id.is_empty() {
+            return None;
+        }
+        Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            image: Some(Image {
+            image: (!self.container_image.is_empty()).then(|| Image {
                 name: self.container_image.clone(),
             }),
-        }
+        })
     }
 
-    /// Build the OCSF `Device` object.
+    /// Build the OCSF `Device` object, stamped with the host OS this build runs
+    /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::linux(&self.hostname)
+        Device::for_current_os(&self.hostname)
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -249,13 +253,15 @@ impl SandboxContext {
             base.set_message(m);
         }
         base.set_device(self.device());
-        base.set_container(self.container());
+        if let Some(container) = self.container() {
+            base.set_container(container);
+        }
     }
 }
 
 #[cfg(test)]
-pub(crate) fn test_sandbox_context() -> SandboxContext {
-    SandboxContext {
+pub(crate) fn test_sandbox_context() -> EventContext {
+    EventContext {
         sandbox_id: "sandbox-abc123".to_string(),
         sandbox_name: "my-sandbox".to_string(),
         container_image: "ghcr.io/openshell/sandbox:latest".to_string(),
@@ -277,13 +283,27 @@ mod tests {
         assert_eq!(meta.version, "1.8.0");
         assert_eq!(meta.product.name, "OpenShell Sandbox Supervisor");
         assert_eq!(meta.profiles.len(), 2);
-        assert_eq!(meta.uid.as_deref(), Some("sandbox-abc123"));
+        let uid = meta.uid.as_deref().expect("uid is set");
+        assert!(!uid.is_empty());
+        assert_ne!(uid, "sandbox-abc123");
+    }
+
+    #[test]
+    fn test_emitted_device_matches_vendored_schema() {
+        use crate::validation::schema::{
+            load_object_schema, validate_enum_value, validate_required_fields,
+        };
+
+        let device = serde_json::to_value(test_sandbox_context().device()).unwrap();
+        let schema = load_object_schema("device");
+        validate_required_fields(&device, &schema);
+        validate_enum_value(&device, "type_id", &schema);
     }
 
     #[test]
     fn test_sandbox_context_container() {
         let ctx = test_sandbox_context();
-        let container = ctx.container();
+        let container = ctx.container().expect("sandbox context has a container");
         assert_eq!(container.name, "my-sandbox");
         assert_eq!(container.uid.as_deref(), Some("sandbox-abc123"));
     }

@@ -44,16 +44,17 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    CpuResourceCapabilities, DriverCondition as SandboxCondition,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxSpec as SandboxSpec, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesResponse, GpuResourceCapabilities,
+    GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -497,19 +498,7 @@ impl KubernetesComputeDriver {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self, KubernetesDriverError> {
         config
-            .validate_workspace_mode()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_provider_spiffe_workload_api_socket_path()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_sandbox_identity_config()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_proxy_uid()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_upstream_proxy_config()
+            .validate_configuration()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -576,6 +565,20 @@ impl KubernetesComputeDriver {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         })
     }
 
@@ -1428,10 +1431,10 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     #[tracing::instrument(
-        name = "kubernetes.create_sandbox",
+        name = "kubernetes.provision",
         skip(self, sandbox),
         fields(
-            otel.name = "kubernetes.create_sandbox",
+            otel.name = "kubernetes.provision",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox.id,
             sandbox.name = %sandbox.name,
@@ -1503,12 +1506,24 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
+        let image_pull_policy = self
+            .config
+            .image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let supervisor_image_pull_policy = self
+            .config
+            .supervisor_image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
-            image_pull_policy: &self.config.image_pull_policy,
+            image_pull_policy,
             image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
-            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             topology: self.config.topology,
             proxy_uid: self.config.sidecar.proxy_uid,
@@ -1950,7 +1965,7 @@ impl KubernetesComputeDriver {
             loop {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                             if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
@@ -1963,7 +1978,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(obj)) => {
+                        Some(Event::Delete(obj)) => {
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -1978,21 +1993,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Restarted(objs)) => {
-                            for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
-                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        Some(Event::Init | Event::InitDone) => {}
                         None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
@@ -2001,7 +2002,7 @@ impl KubernetesComputeDriver {
                         }
                     },
                     event = event_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj)) => {
                             if let Some((sandbox_id, event)) = map_kube_event_to_platform(
                                 &sandbox_name_to_id,
                                 &agent_pod_to_id,
@@ -2017,8 +2018,8 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(_)) => {}
-                        Some(Event::Restarted(_)) => {
+                        Some(Event::Delete(_) | Event::InitApply(_) | Event::InitDone) => {}
+                        Some(Event::Init) => {
                             debug!(namespace = %namespace, "Kubernetes event watcher restarted");
                         }
                         None => {
@@ -2067,7 +2068,7 @@ where
         loop {
             tokio::select! {
                 event = sandbox_stream.next() => match event {
-                    Some(Event::Applied(obj)) => {
+                    Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
                         if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -2081,7 +2082,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Deleted(obj)) => {
+                    Some(Event::Delete(obj)) => {
                         if is_openshell_managed(&obj)
                             && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                         {
@@ -2095,22 +2096,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Restarted(objs)) => {
-                        for obj in objs {
-                            let ns = obj.metadata.namespace.clone()
-                                .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
-                                let event = WatchSandboxesEvent {
-                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                    )),
-                                };
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    Some(Event::Init | Event::InitDone) => {}
                     None => {
                         let _ = tx.send(Err(KubernetesDriverError::Message(
                             "sandbox watcher stream ended unexpectedly".to_string()
@@ -2303,7 +2289,6 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
             }]),
             ..Default::default()
         }),
-        status: None,
     }
 }
 
@@ -2753,13 +2738,13 @@ fn supervisor_volume_mount() -> serde_json::Value {
 /// available at `{SUPERVISOR_MOUNT_PATH}/openshell-sandbox`.
 fn supervisor_image_volume(
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
 ) -> serde_json::Value {
     let mut image_spec = serde_json::json!({
         "reference": supervisor_image,
     });
-    if !supervisor_image_pull_policy.is_empty() {
-        image_spec["pullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    if let Some(policy) = supervisor_image_pull_policy {
+        image_spec["pullPolicy"] = serde_json::json!(policy);
     }
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
@@ -2777,7 +2762,7 @@ fn supervisor_image_volume(
 /// emissary executor.
 fn supervisor_init_container(
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
 ) -> serde_json::Value {
     let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
     let mut spec = serde_json::json!({
@@ -2795,8 +2780,8 @@ fn supervisor_init_container(
             "readOnly": false
         }]
     });
-    if !supervisor_image_pull_policy.is_empty() {
-        spec["imagePullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    if let Some(policy) = supervisor_image_pull_policy {
+        spec["imagePullPolicy"] = serde_json::json!(policy);
     }
     spec
 }
@@ -2804,7 +2789,7 @@ fn supervisor_init_container(
 fn apply_supervisor_binary_source(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
     method: SupervisorSideloadMethod,
 ) {
     let volumes = spec
@@ -2938,7 +2923,7 @@ fn apply_supervisor_sideload_with_params(
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
     method: SupervisorSideloadMethod,
     sandbox_uid: u32,
     sandbox_gid: u32,
@@ -3148,8 +3133,8 @@ fn supervisor_sidecar_container(
                 .into_iter()
                 .map(serde_json::Value::String),
         );
-    if !params.supervisor_image_pull_policy.is_empty() {
-        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    if let Some(policy) = params.supervisor_image_pull_policy {
+        container["imagePullPolicy"] = serde_json::json!(policy);
     }
     if params.provider_spiffe_enabled {
         container["volumeMounts"]
@@ -3211,8 +3196,8 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             sidecar_tls_volume_mount(),
         ]
     });
-    if !params.supervisor_image_pull_policy.is_empty() {
-        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    if let Some(policy) = params.supervisor_image_pull_policy {
+        container["imagePullPolicy"] = serde_json::json!(policy);
     }
     if !params.client_tls_secret_name.is_empty() {
         container["volumeMounts"]
@@ -3412,7 +3397,7 @@ fn apply_supervisor_sidecar_topology(
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
-    image_pull_policy: &str,
+    image_pull_policy: Option<&str>,
     sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
@@ -3502,8 +3487,8 @@ fn apply_workspace_persistence(
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
             }]
         });
-        if !image_pull_policy.is_empty() {
-            init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+        if let Some(policy) = image_pull_policy {
+            init_spec["imagePullPolicy"] = serde_json::json!(policy);
         }
         init_containers.push(init_spec);
     }
@@ -3550,10 +3535,10 @@ fn default_workspace_volume_claim_templates(
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
-    image_pull_policy: &'a str,
+    image_pull_policy: Option<&'a str>,
     image_pull_secrets: &'a [String],
     supervisor_image: &'a str,
-    supervisor_image_pull_policy: &'a str,
+    supervisor_image_pull_policy: Option<&'a str>,
     supervisor_sideload_method: SupervisorSideloadMethod,
     topology: SupervisorTopology,
     proxy_uid: u32,
@@ -3591,10 +3576,10 @@ impl Default for SandboxPodParams<'_> {
     fn default() -> Self {
         Self {
             default_image: "",
-            image_pull_policy: "",
+            image_pull_policy: None,
             image_pull_secrets: &[],
             supervisor_image: "",
-            supervisor_image_pull_policy: "",
+            supervisor_image_pull_policy: None,
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
@@ -3919,11 +3904,8 @@ fn sandbox_template_to_k8s_with_validated_config(
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
-        if !params.image_pull_policy.is_empty() {
-            container.insert(
-                "imagePullPolicy".to_string(),
-                serde_json::json!(params.image_pull_policy),
-            );
+        if let Some(policy) = params.image_pull_policy {
+            container.insert("imagePullPolicy".to_string(), serde_json::json!(policy));
         }
     }
 
@@ -4225,7 +4207,7 @@ fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
 
 fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
     let mut value = serde_json::json!({
-        "type": profile.to_k8s_type()
+        "type": profile.kubernetes_type()
     });
     if let Some(localhost_profile) = profile.localhost_profile() {
         value["localhostProfile"] = serde_json::json!(localhost_profile);
@@ -4708,6 +4690,7 @@ fn spawn_namespace_label_watcher(
         let mut retry_attempt = 0;
         loop {
             let mut stream = watcher::watcher(ns_api.clone(), watcher_config.clone()).boxed();
+            let mut relisted_names = BTreeSet::new();
 
             loop {
                 let event = tokio::select! {
@@ -4720,37 +4703,9 @@ fn spawn_namespace_label_watcher(
                     }
                 };
                 match event {
-                    Ok(Some(Event::Applied(ns))) => {
+                    Ok(Some(event)) => {
                         retry_attempt = 0;
-                        if let Some(name) = ns.metadata.name.as_deref()
-                            && allowlist.insert(name.to_string())
-                        {
-                            info!(namespace = name, "operator namespace added to allowlist");
-                        }
-                    }
-                    Ok(Some(Event::Deleted(ns))) => {
-                        retry_attempt = 0;
-                        if let Some(name) = ns.metadata.name.as_deref()
-                            && allowlist.remove(name)
-                        {
-                            info!(
-                                namespace = name,
-                                "operator namespace removed from allowlist"
-                            );
-                        }
-                    }
-                    Ok(Some(Event::Restarted(namespaces))) => {
-                        retry_attempt = 0;
-                        let names: std::collections::BTreeSet<String> = namespaces
-                            .into_iter()
-                            .filter_map(|ns| ns.metadata.name)
-                            .collect();
-                        let count = names.len();
-                        allowlist.replace(names);
-                        info!(
-                            total = count,
-                            "operator namespace allowlist replaced from full relist"
-                        );
+                        apply_namespace_watch_event(&allowlist, &mut relisted_names, event);
                     }
                     Ok(None) => {
                         warn!("operator namespace watcher stream ended unexpectedly");
@@ -4792,12 +4747,53 @@ fn namespace_watcher_retry_delay(attempt: u32, jitter_seed: u64) -> Duration {
     Duration::from_secs(base_secs + jitter_secs)
 }
 
-fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+fn load_namespace_file(path: &Path) -> Result<BTreeSet<String>, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let names: Vec<String> = serde_json::from_str(&contents)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     Ok(names.into_iter().collect())
+}
+
+fn apply_namespace_watch_event(
+    allowlist: &OperatorNamespaceAllowlist,
+    relisted_names: &mut BTreeSet<String>,
+    event: Event<Namespace>,
+) {
+    match event {
+        Event::Apply(ns) => {
+            if let Some(name) = ns.metadata.name
+                && allowlist.insert(name.clone())
+            {
+                info!(namespace = name, "operator namespace added to allowlist");
+            }
+        }
+        Event::Delete(ns) => {
+            if let Some(name) = ns.metadata.name
+                && allowlist.remove(&name)
+            {
+                info!(
+                    namespace = name,
+                    "operator namespace removed from allowlist"
+                );
+            }
+        }
+        Event::Init => relisted_names.clear(),
+        Event::InitApply(ns) => {
+            if let Some(name) = ns.metadata.name {
+                relisted_names.insert(name);
+            }
+        }
+        Event::InitDone => {
+            // Readers must see a complete snapshot, including during interrupted relists.
+            let count = relisted_names.len();
+            allowlist.replace(std::mem::take(relisted_names));
+            info!(
+                total = count,
+                "operator namespace allowlist replaced from full relist"
+            );
+        }
+    }
 }
 
 fn spawn_namespace_file_watcher(
@@ -4945,12 +4941,13 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
 
         driver
@@ -4963,7 +4960,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "kubernetes.create_sandbox")
+            .find(|span| span.name == "kubernetes.provision")
             .expect("create operation span");
         assert!(matches!(
             span.status,
@@ -4977,15 +4974,16 @@ mod tests {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter)
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         let annotations = tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let span = tracing::info_span!("kubernetes.provision");
             let _entered = span.enter();
             let mut annotations = BTreeMap::new();
             add_trace_context_annotation(&mut annotations);
@@ -5045,7 +5043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_watcher_error_does_not_hide_restarted_recovery_event() {
+    async fn sandbox_watcher_error_does_not_hide_relist() {
         let recovered = DynamicObject {
             types: None,
             metadata: ObjectMeta {
@@ -5056,22 +5054,22 @@ mod tests {
         };
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(recovered)),
+            Ok(Event::InitDone),
         ]);
         let mut stream = continue_on_watcher_errors(source, "sandbox-resource");
 
+        assert!(matches!(stream.next().await, Some(Event::Init)));
         let event = stream
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(objects) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
+        let Event::InitApply(object) = event else {
+            panic!("expected kube-runtime recovery to emit InitApply");
         };
-        assert_eq!(objects.len(), 1);
-        assert_eq!(
-            objects[0].metadata.name.as_deref(),
-            Some("recovered-sandbox")
-        );
+        assert_eq!(object.metadata.name.as_deref(), Some("recovered-sandbox"));
+        assert!(matches!(stream.next().await, Some(Event::InitDone)));
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
@@ -5100,7 +5098,9 @@ mod tests {
         };
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(recovered)),
+            Ok(Event::InitDone),
         ])
         .chain(futures::stream::pending());
         let sandbox_stream = recovering_watcher_stream(source, "sandbox-resource").boxed();
@@ -5127,10 +5127,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kubernetes_event_watcher_error_does_not_hide_restarted_recovery_event() {
+    async fn kubernetes_event_watcher_error_does_not_hide_relist() {
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![KubeEventObj::default()])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(KubeEventObj::default())),
+            Ok(Event::InitDone),
         ]);
         let mut stream = continue_on_watcher_errors(source, "kubernetes-event");
 
@@ -5138,14 +5140,63 @@ mod tests {
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(events) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
-        };
-        assert_eq!(events.len(), 1);
+        assert!(matches!(event, Event::Init));
+        assert!(matches!(stream.next().await, Some(Event::InitApply(_))));
+        assert!(matches!(stream.next().await, Some(Event::InitDone)));
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
         );
+    }
+
+    #[test]
+    fn namespace_relist_replaces_only_completed_snapshots() {
+        let allowlist = OperatorNamespaceAllowlist::from_set(BTreeSet::from(["old".to_string()]));
+        let mut pending = BTreeSet::new();
+        let namespace = |name: &str| Namespace {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            ..Default::default()
+        };
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(
+            &allowlist,
+            &mut pending,
+            Event::InitApply(namespace("partial")),
+        );
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "old"));
+        assert!(!accepts_auth_namespace(
+            &config,
+            Some(&allowlist),
+            "partial"
+        ));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitApply(namespace("new")));
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitDone);
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "new"));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "old"));
+        assert!(!accepts_auth_namespace(
+            &config,
+            Some(&allowlist),
+            "partial"
+        ));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Apply(namespace("live")));
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "live"));
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Delete(namespace("live")));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "live"));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitDone);
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "new"));
     }
 
     fn authenticated_token_review(username: &str) -> TokenReviewStatus {
@@ -5355,7 +5406,7 @@ mod tests {
 
         assert_eq!(
             kubernetes_sandbox_stop_timeout(&sandbox),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             "an omitted grace period uses the Kubernetes 30-second default"
         );
 
@@ -6200,7 +6251,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "custom-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1500, // sandbox_uid
             1500, // sandbox_gid
@@ -6237,7 +6288,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1500,
             1600,
@@ -6284,7 +6335,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6311,7 +6362,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6398,7 +6449,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::ImageVolume,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6441,7 +6492,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_image_volume_omits_pull_policy_when_empty() {
+    fn supervisor_image_volume_omits_pull_policy_when_unspecified() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -6454,7 +6505,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "",
+            None,
             SupervisorSideloadMethod::ImageVolume,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6464,7 +6515,7 @@ mod tests {
         assert_eq!(volume["image"]["reference"], "supervisor-image:latest");
         assert!(
             volume["image"].get("pullPolicy").is_none(),
-            "pullPolicy should be omitted when empty"
+            "pullPolicy should be omitted when unspecified"
         );
     }
 
@@ -6474,7 +6525,7 @@ mod tests {
             topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             supervisor_image: "supervisor-image:latest",
-            supervisor_image_pull_policy: "IfNotPresent",
+            supervisor_image_pull_policy: Some("IfNotPresent"),
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
             client_tls_secret_name: "openshell-client-tls",
             proxy_uid: 2200,
@@ -7352,7 +7403,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "openshell/sandbox:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             1000, // sandbox_gid
         );
 
@@ -7411,7 +7462,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "my-custom-image:v2",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             1000,
         );
 
@@ -7435,7 +7486,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -8715,5 +8766,20 @@ mod tests {
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
         );
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_static_resource_support() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let resources = driver
+            .capabilities()
+            .unwrap()
+            .resource_capabilities
+            .unwrap();
+        assert!(resources.cpu.unwrap().limit_supported);
+        assert!(resources.memory.unwrap().limit_supported);
+        let gpu = resources.gpu.unwrap();
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
     }
 }

@@ -863,11 +863,8 @@ fn load_provider_profile_source(
     let mapping = value
         .as_mapping_mut()
         .ok_or_else(|| format!("provider profile {source} must be a YAML mapping"))?;
-    mapping.insert(
-        serde_yml::Value::String("id".to_string()),
-        serde_yml::Value::String(profile_id.to_string()),
-    );
-    let profile = serde_yml::from_value::<ProviderTypeProfile>(value)
+    mapping.insert("id", serde_yml::Value::String(profile_id.to_string()));
+    let profile = serde_yml::from_value::<ProviderTypeProfile>(&value)
         .map_err(|err| format!("failed to decode provider profile {source}: {err}"))?
         .to_proto();
     Ok(LoadedProviderProfile { profile })
@@ -1227,22 +1224,20 @@ async fn propagate_policy_to_running_sandboxes(
         .await
         .map_err(|err| format!("connect to gateway {gateway_endpoint} failed: {err}"))?;
     let mut client = OpenShellClient::new(channel);
-    let mut offset = 0_u32;
-    let limit = 100_u32;
+    let mut page_token = String::new();
     let correlation_id = format!("{}:{}", RELOAD_CORRELATION_PREFIX, now_secs());
     loop {
         let response = client
             .list_sandboxes(ListSandboxesRequest {
-                limit,
-                offset,
+                page_size: 100,
+                page_token,
                 label_selector: String::new(),
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
             .into_inner();
-        let count = response.sandboxes.len();
+        let next_page_token = response.next_page_token;
         for sandbox in response.sandboxes {
             if !sandbox_accepts_policy_reload(&sandbox) {
                 continue;
@@ -1260,6 +1255,7 @@ async fn propagate_policy_to_running_sandboxes(
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 })
                 .await;
@@ -1282,10 +1278,10 @@ async fn propagate_policy_to_running_sandboxes(
                 }
             }
         }
-        if count < usize::try_from(limit).unwrap_or(usize::MAX) {
+        if next_page_token.is_empty() {
             break;
         }
-        offset = offset.saturating_add(limit);
+        page_token = next_page_token;
     }
     Ok(())
 }

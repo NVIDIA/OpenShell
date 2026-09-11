@@ -5,12 +5,13 @@
 
 pub mod driver_config;
 pub mod lease;
+pub mod rootfs_tar;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectName, ObjectRecord, ObjectType,
-    POLICY_OBJECT_TYPE, Store, WriteCondition,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectListQuery, ObjectName, ObjectRecord,
+    ObjectType, POLICY_OBJECT_TYPE, Store, WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -27,11 +28,11 @@ use openshell_core::proto::compute::v1::{
     GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
-    ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
-    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
+    ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
+    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -75,7 +76,9 @@ mod traced_driver {
     use tonic::Status;
     use tracing::Instrument as _;
 
-    use super::SharedComputeDriver;
+    use super::{DriverWatchStream, SharedComputeDriver};
+
+    type TracedWatchStream = openshell_otel::TracedGrpcStream<DriverWatchStream>;
 
     #[derive(Clone)]
     pub(super) struct TracedDriver {
@@ -88,44 +91,82 @@ mod traced_driver {
             Self { inner, name }
         }
 
+        fn span(
+            &self,
+            rpc: openshell_otel::ComputeDriverRpc,
+            sandbox_id: Option<&str>,
+        ) -> tracing::Span {
+            let span = tracing::info_span!(
+                "driver",
+                otel.name = rpc.operation,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                driver.name = %self.name,
+                sandbox.id = tracing::field::Empty,
+                rpc.system.name = "grpc",
+                rpc.method = rpc.operation,
+                rpc.response.status_code = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            );
+            if let Some(sandbox_id) = sandbox_id {
+                span.record("sandbox.id", sandbox_id);
+            }
+            span
+        }
+
         /// Run one call across the driver boundary inside its span.
         ///
         /// Takes a closure rather than a future so the call cannot be built
         /// without going through here.
         pub(super) async fn call<T, Fut>(
             &self,
-            operation: &'static str,
+            rpc: openshell_otel::ComputeDriverRpc,
             sandbox_id: Option<&str>,
             call: impl FnOnce(SharedComputeDriver) -> Fut,
         ) -> Result<T, Status>
         where
             Fut: Future<Output = Result<T, Status>>,
         {
-            let span = tracing::info_span!(
-                "driver",
-                otel.name = operation,
-                otel.kind = "client",
-                otel.status_code = tracing::field::Empty,
-                driver.name = %self.name,
-                sandbox.id = tracing::field::Empty,
-                grpc.code = tracing::field::Empty,
-            );
-            if let Some(sandbox_id) = sandbox_id {
-                span.record("sandbox.id", sandbox_id);
-            }
+            let span = self.span(rpc, sandbox_id);
 
             let future = call(self.inner.clone());
             async {
                 let result = future.await;
-                if let Err(status) = &result {
-                    let current = tracing::Span::current();
-                    crate::otel_tracing::mark_error(&current);
-                    current.record("grpc.code", status.code() as i32);
+                let current = tracing::Span::current();
+                match &result {
+                    Ok(_) => {
+                        openshell_otel::record_grpc_status(&current, tonic::Code::Ok);
+                    }
+                    Err(status) => {
+                        openshell_otel::record_grpc_status(&current, status.code());
+                    }
                 }
                 result
             }
             .instrument(span)
             .await
+        }
+
+        /// Open a driver watch while keeping the client span alive with the stream.
+        pub(super) async fn watch(&self) -> Result<tonic::Response<DriverWatchStream>, Status> {
+            let span = self.span(openshell_otel::rpc::WATCH_SANDBOXES, None);
+            let result = self
+                .inner
+                .clone()
+                .watch_sandboxes(tonic::Request::new(super::WatchSandboxesRequest {}))
+                .instrument(span.clone())
+                .await;
+            match result {
+                Ok(response) => {
+                    let (metadata, inner, extensions) = response.into_parts();
+                    let stream: DriverWatchStream = Box::pin(TracedWatchStream::new(inner, span));
+                    Ok(tonic::Response::from_parts(metadata, stream, extensions))
+                }
+                Err(status) => {
+                    openshell_otel::record_grpc_status(&span, status.code());
+                    Err(status)
+                }
+            }
         }
     }
 }
@@ -265,14 +306,20 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Static portable resource request forms from the startup capability snapshot.
+    pub resource_capabilities: Option<DriverResourceCapabilities>,
+    /// Directory where rootfs tar files must be staged.
+    pub rootfs_tar_staging_dir: String,
+    /// Maximum rootfs tar file size in bytes.
+    pub rootfs_tar_max_bytes: u64,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 
 /// How long a sandbox can remain provisioning in the store without a
 /// corresponding backend resource before it is considered orphaned.
-const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
+const ORPHAN_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
 // Re-export the shared error type under the name used by this module.
 pub use openshell_core::ComputeDriverError as ComputeError;
@@ -564,6 +611,10 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
+    /// Gateway-issued staging slots for rootfs tar archives. Shared across
+    /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
+    /// table would make a token minted on one clone invisible to another.
+    rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -613,6 +664,9 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            resource_capabilities: capabilities.resource_capabilities,
+            rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
+            rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -668,6 +722,12 @@ impl ComputeRuntime {
             }
             Err(status) => return Err(compute_error_from_status(status)),
         };
+        let rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
+            (!driver_info.rootfs_tar_staging_dir.is_empty())
+                .then(|| PathBuf::from(&driver_info.rootfs_tar_staging_dir)),
+            driver_info.rootfs_tar_max_bytes,
+        ));
+        rootfs_tar_staging.sweep_orphans();
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
             driver_info,
@@ -683,6 +743,7 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
+            rootfs_tar_staging,
         })
     }
 
@@ -744,6 +805,15 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub(crate) fn rootfs_tar_staging(&self) -> &rootfs_tar::RootfsTarStagingRegistry {
+        &self.rootfs_tar_staging
+    }
+
+    /// The `template.driver_config` key whose block this gateway forwards.
+    ///
+    /// This is the *configured* driver name, which is not necessarily the name
+    /// the driver reports for itself in `driver_info.driver_name`.
+    #[must_use]
     pub fn configured_driver_name(&self) -> &str {
         &self.driver_info.name
     }
@@ -763,9 +833,11 @@ impl ComputeRuntime {
             credential: credential.to_string(),
         };
         self.driver
-            .call("driver.authenticate_sandbox", None, |driver| async move {
-                driver.authenticate_sandbox(Request::new(request)).await
-            })
+            .call(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                None,
+                |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
+            )
             .await
             .map(|response| response.into_inner().sandbox_id)
     }
@@ -793,11 +865,15 @@ impl ComputeRuntime {
         let workspace = workspace.to_string();
         match self
             .driver
-            .call("driver.ensure_workspace", None, |driver| async move {
-                driver
-                    .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::ENSURE_WORKSPACE,
+                None,
+                |driver| async move {
+                    driver
+                        .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
+                        .await
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -810,11 +886,15 @@ impl ComputeRuntime {
         let workspace = workspace.to_string();
         match self
             .driver
-            .call("driver.delete_workspace", None, |driver| async move {
-                driver
-                    .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::DELETE_WORKSPACE,
+                None,
+                |driver| async move {
+                    driver
+                        .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
+                        .await
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -824,11 +904,17 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
+        let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        // Peek, never consume: create runs the same path immediately after and
+        // must still find the token.
+        if let Some(token) = take_staging_token(&mut driver_sandbox) {
+            let staged = self.rootfs_tar_staging.peek(&token)?;
+            set_rootfs_tar_path(&mut driver_sandbox, &staged);
+        }
         self.driver
             .call(
-                "driver.validate_sandbox_create",
+                openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
                 Some(sandbox.object_id()),
                 |driver| async move {
                     driver
@@ -849,12 +935,25 @@ impl ComputeRuntime {
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
+        let mut sandbox = sandbox;
+
+        // Strip the staging token from the public sandbox before anything
+        // persists it: the object store copy is readable by every member of the
+        // workspace, and the token is a bearer credential for the staged
+        // archive. The driver gets the resolved path instead, on its own copy.
+        let staging_token = take_public_staging_token(&mut sandbox, &self.driver_info.name);
+        let mut staged = staging_token
+            .map(|token| self.rootfs_tar_staging.consume(&token))
+            .transpose()?;
+
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(staged) = staged.as_ref() {
+            set_rootfs_tar_path(&mut driver_sandbox, staged.path());
+        }
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
-        let mut sandbox = sandbox;
         let labels_map = sandbox.object_labels();
         let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
             None
@@ -901,7 +1000,7 @@ impl ComputeRuntime {
         match self
             .driver
             .call(
-                "driver.create_sandbox",
+                openshell_otel::rpc::CREATE_SANDBOX,
                 Some(sandbox.object_id()),
                 |driver| async move {
                     driver
@@ -914,6 +1013,12 @@ impl ComputeRuntime {
             .await
         {
             Ok(_) => {
+                // The driver now owns the staged archive and removes the
+                // request directory once it has built the disk. Every other
+                // arm lets the guard drop and clean up.
+                if let Some(staged) = staged.as_mut() {
+                    staged.disarm();
+                }
                 self.sandbox_watch_bus.notify(sandbox.object_id());
                 if let Some(metadata) = sandbox.metadata.as_mut() {
                     metadata.resource_version = result.resource_version;
@@ -1050,18 +1155,22 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let result = self
             .driver
-            .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.clone();
-                let sandbox_name = sandbox_name.clone();
-                async move {
-                    driver
-                        .stop_sandbox(Request::new(StopSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::STOP_SANDBOX,
+                Some(&sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.clone();
+                    let sandbox_name = sandbox_name.clone();
+                    async move {
+                        driver
+                            .stop_sandbox(Request::new(StopSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         match result {
@@ -1210,18 +1319,22 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let result = self
             .driver
-            .call("driver.start_sandbox", Some(&sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.clone();
-                let sandbox_name = sandbox_name.clone();
-                async move {
-                    driver
-                        .start_sandbox(Request::new(StartSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::START_SANDBOX,
+                Some(&sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.clone();
+                    let sandbox_name = sandbox_name.clone();
+                    async move {
+                        driver
+                            .start_sandbox(Request::new(StartSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         match result {
@@ -1505,7 +1618,7 @@ impl ComputeRuntime {
         let result = self
             .driver
             .call(
-                "driver.delete_sandbox",
+                openshell_otel::rpc::DELETE_SANDBOX,
                 Some(transition.deleting.object_id()),
                 |driver| {
                     let sandbox_id = transition.deleting.object_id().to_string();
@@ -2067,18 +2180,22 @@ impl ComputeRuntime {
                 let sandbox_name = sandbox.object_name().to_string();
                 match self
                     .driver
-                    .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
-                        let sandbox_id = sandbox_id.clone();
-                        let sandbox_name = sandbox_name.clone();
-                        async move {
-                            driver
-                                .stop_sandbox(Request::new(StopSandboxRequest {
-                                    sandbox_id,
-                                    sandbox_name,
-                                }))
-                                .await
-                        }
-                    })
+                    .call(
+                        openshell_otel::rpc::STOP_SANDBOX,
+                        Some(&sandbox_id),
+                        |driver| {
+                            let sandbox_id = sandbox_id.clone();
+                            let sandbox_name = sandbox_name.clone();
+                            async move {
+                                driver
+                                    .stop_sandbox(Request::new(StopSandboxRequest {
+                                        sandbox_id,
+                                        sandbox_name,
+                                    }))
+                                    .await
+                            }
+                        },
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -2175,18 +2292,22 @@ impl ComputeRuntime {
             let sandbox_name = sandbox.object_name().to_string();
             match self
                 .driver
-                .call("driver.start_sandbox", Some(&sandbox_id), |driver| {
-                    let sandbox_id = sandbox_id.clone();
-                    let sandbox_name = sandbox_name.clone();
-                    async move {
-                        driver
-                            .start_sandbox(Request::new(StartSandboxRequest {
-                                sandbox_id,
-                                sandbox_name,
-                            }))
-                            .await
-                    }
-                })
+                .call(
+                    openshell_otel::rpc::START_SANDBOX,
+                    Some(&sandbox_id),
+                    |driver| {
+                        let sandbox_id = sandbox_id.clone();
+                        let sandbox_name = sandbox_name.clone();
+                        async move {
+                            driver
+                                .start_sandbox(Request::new(StartSandboxRequest {
+                                    sandbox_id,
+                                    sandbox_name,
+                                }))
+                                .await
+                        }
+                    },
+                )
                 .await
             {
                 Ok(_) => {
@@ -2300,7 +2421,7 @@ impl ComputeRuntime {
                     match self
                         .driver
                         .call(
-                            "driver.stop_sandbox",
+                            openshell_otel::rpc::STOP_SANDBOX,
                             Some(&sandbox_id),
                             |driver| async move {
                                 driver
@@ -2347,7 +2468,7 @@ impl ComputeRuntime {
                     if let Err(err) = self
                         .driver
                         .call(
-                            "driver.start_sandbox",
+                            openshell_otel::rpc::START_SANDBOX,
                             Some(&sandbox_id),
                             |driver| async move {
                                 driver
@@ -2370,25 +2491,11 @@ impl ComputeRuntime {
     }
 
     async fn list_persisted_sandbox_ids(&self, operation: &str) -> Result<Vec<String>, String> {
-        let mut sandbox_ids = Vec::new();
-        let mut offset = 0u32;
-        loop {
-            let records = self
-                .store
-                .list_by_type(Sandbox::object_type(), LIFECYCLE_SWEEP_PAGE_SIZE, offset)
-                .await
-                .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))?;
-            let page_len = u32::try_from(records.len())
-                .map_err(|_| format!("sandbox page size overflow during {operation}"))?;
-            sandbox_ids.extend(records.into_iter().map(|record| record.id));
-            if page_len < LIFECYCLE_SWEEP_PAGE_SIZE {
-                break;
-            }
-            offset = offset
-                .checked_add(page_len)
-                .ok_or_else(|| format!("sandbox pagination offset overflow during {operation}"))?;
-        }
-        Ok(sandbox_ids)
+        self.store
+            .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
+            .await
+            .map(|records| records.into_iter().map(|record| record.id).collect())
+            .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
@@ -2569,17 +2676,7 @@ impl ComputeRuntime {
 
     async fn watch_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            // Spans the stream open, not its lifetime: the future resolves
-            // once the driver accepts the watch.
-            let mut stream = match self
-                .driver
-                .call("driver.watch_sandboxes", None, |driver| async move {
-                    driver
-                        .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
-                        .await
-                })
-                .await
-            {
+            let mut stream = match self.driver.watch().await {
                 Ok(response) => response.into_inner(),
                 Err(err) => {
                     warn!(error = %err, "Compute driver watch stream failed to start");
@@ -2647,13 +2744,20 @@ impl ComputeRuntime {
     )]
     async fn reconcile_store_with_backend(&self, grace_period: Duration) -> Result<(), String> {
         let sweep_started_at_ms = openshell_core::time::now_ms();
+        // Reclaims staging directories whose driver failed before its own
+        // cleanup ran, which the token table cannot see once consumed.
+        self.rootfs_tar_staging.sweep_orphans();
         let backend_sandboxes = self
             .driver
-            .call("driver.list_sandboxes", None, |driver| async move {
-                driver
-                    .list_sandboxes(Request::new(ListSandboxesRequest {}))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::LIST_SANDBOXES,
+                None,
+                |driver| async move {
+                    driver
+                        .list_sandboxes(Request::new(ListSandboxesRequest {}))
+                        .await
+                },
+            )
             .await
             .map_err(|e| e.to_string())
             .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?
@@ -2673,7 +2777,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list_by_type(Sandbox::object_type(), 500, 0)
+            .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
             .await
             .map_err(|e| e.to_string())
             .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
@@ -3281,18 +3385,22 @@ impl ComputeRuntime {
     async fn call_driver_delete_sandbox(&self, sandbox_id: &str, sandbox_name: &str) {
         let result = self
             .driver
-            .call("driver.delete_sandbox", Some(sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.to_string();
-                let sandbox_name = sandbox_name.to_string();
-                async move {
-                    driver
-                        .delete_sandbox(Request::new(DeleteSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         if let Err(status) = result {
@@ -3379,10 +3487,6 @@ impl ComputeRuntime {
             .await
     }
 
-    // TODO: introduce a per-sandbox cap on service endpoints and paginate
-    // this cleanup loop, or query by sandbox label instead of scanning the
-    // full workspace. Without a cap the flat 1,000-record page could miss
-    // endpoints in large workspaces.
     async fn cleanup_sandbox_service_endpoints(
         &self,
         sandbox_id: &str,
@@ -3390,7 +3494,10 @@ impl ComputeRuntime {
     ) -> Result<(), String> {
         let records = self
             .store
-            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
+            .collect_records(
+                ServiceEndpoint::object_type(),
+                ObjectListQuery::Workspace(workspace),
+            )
             .await
             .map_err(|e| format!("list service endpoints: {e}"))?;
 
@@ -3616,18 +3723,22 @@ impl ComputeRuntime {
     ) -> Result<Option<DriverSandbox>, String> {
         match self
             .driver
-            .call("driver.get_sandbox", Some(sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.to_string();
-                let sandbox_name = sandbox_name.to_string();
-                async move {
-                    driver
-                        .get_sandbox(Request::new(GetSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::GET_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .get_sandbox(Request::new(GetSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await
         {
             Ok(response) => {
@@ -3822,6 +3933,76 @@ fn driver_sandbox_template_from_public(
         driver_config: select_driver_config(&template.driver_config, driver_name)?,
         user_namespaces: template.user_namespaces,
     })
+}
+
+/// Remove the staging token from a driver-native sandbox, if present.
+///
+/// The driver config here has already been narrowed to the selected driver's
+/// block, so the token sits at the top level.
+fn take_staging_token(driver_sandbox: &mut DriverSandbox) -> Option<String> {
+    let config = driver_sandbox
+        .spec
+        .as_mut()?
+        .template
+        .as_mut()?
+        .driver_config
+        .as_mut()?;
+    match config.fields.remove(rootfs_tar::STAGING_TOKEN_FIELD)?.kind {
+        Some(prost_types::value::Kind::StringValue(token)) => Some(token),
+        _ => None,
+    }
+}
+
+/// Remove the staging token from the public sandbox, under the driver's key.
+///
+/// Called before the sandbox is persisted so the token never reaches the object
+/// store, where every workspace member could read it back.
+fn take_public_staging_token(sandbox: &mut Sandbox, driver_name: &str) -> Option<String> {
+    let config = sandbox
+        .spec
+        .as_mut()?
+        .template
+        .as_mut()?
+        .driver_config
+        .as_mut()?;
+    let Some(prost_types::value::Kind::StructValue(driver_config)) = config
+        .fields
+        .get_mut(driver_name)
+        .and_then(|v| v.kind.as_mut())
+    else {
+        return None;
+    };
+    match driver_config
+        .fields
+        .remove(rootfs_tar::STAGING_TOKEN_FIELD)?
+        .kind
+    {
+        Some(prost_types::value::Kind::StringValue(token)) => Some(token),
+        _ => None,
+    }
+}
+
+/// Substitute the gateway-resolved archive path into the driver-native copy.
+///
+/// This is the only writer of `rootfs_tar_path`; a caller-supplied value is
+/// rejected in request validation before it ever reaches here.
+fn set_rootfs_tar_path(driver_sandbox: &mut DriverSandbox, path: &Path) {
+    let Some(template) = driver_sandbox
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.template.as_mut())
+    else {
+        return;
+    };
+    let config = template.driver_config.get_or_insert_with(Default::default);
+    config.fields.insert(
+        rootfs_tar::ROOTFS_TAR_PATH_FIELD.to_string(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                path.to_string_lossy().into_owned(),
+            )),
+        },
+    );
 }
 
 fn select_driver_config(
@@ -4587,6 +4768,9 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
+                rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
         ))
     }
@@ -4731,6 +4915,9 @@ pub async fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: None,
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4744,6 +4931,7 @@ pub async fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
+        rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
     }
 }
 
@@ -4862,6 +5050,139 @@ mod tests {
         assert!(selected.fields.contains_key("pool"));
     }
 
+    /// The CLI builds `--from <rootfs tar>` config as `{"vm": {...}}`. Guard the
+    /// CLI-to-driver transport: the rootfs tar field and any pre-existing VM
+    /// setting must both survive driver selection. A top-level field would be
+    /// dropped silently here and never reach the VM driver.
+    #[test]
+    fn select_driver_config_forwards_cli_rootfs_tar_template_to_vm_driver() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "vm".to_string(),
+                struct_value([
+                    ("rootfs_tar_path", string_value("/staging/req-a/rootfs.tar")),
+                    ("gpu_device_ids", string_value("0000:2d:00.0")),
+                ]),
+            ))
+            .collect(),
+        };
+
+        let selected = select_driver_config(&Some(config), "vm").unwrap();
+        let selected = selected.expect("vm config should be selected");
+
+        assert!(selected.fields.contains_key("rootfs_tar_path"));
+        assert!(selected.fields.contains_key("gpu_device_ids"));
+    }
+
+    #[test]
+    fn select_driver_config_drops_top_level_rootfs_tar_path() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "rootfs_tar_path".to_string(),
+                string_value("/staging/req-a/rootfs.tar"),
+            ))
+            .collect(),
+        };
+
+        assert!(
+            select_driver_config(&Some(config), "vm").unwrap().is_none(),
+            "a top-level rootfs_tar_path never reaches the vm driver"
+        );
+    }
+
+    /// The staging token is a bearer credential for the staged archive, and the
+    /// persisted public sandbox is readable by every member of the workspace.
+    /// It must be stripped before anything writes that copy.
+    #[test]
+    fn take_public_staging_token_strips_it_from_the_public_sandbox() {
+        let mut sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(prost_types::Struct {
+                        fields: std::iter::once((
+                            "vm".to_string(),
+                            struct_value([
+                                ("rootfs_tar_staging_token", string_value("tok-abc")),
+                                ("gpu_device_ids", string_value("0000:2d:00.0")),
+                            ]),
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let token = take_public_staging_token(&mut sandbox, "vm");
+
+        assert_eq!(token.as_deref(), Some("tok-abc"));
+        let config = sandbox
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.driver_config.as_ref())
+            .expect("driver config");
+        let Some(prost_types::value::Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref()
+        else {
+            panic!("vm block must survive");
+        };
+        assert!(!vm.fields.contains_key("rootfs_tar_staging_token"));
+        assert!(
+            vm.fields.contains_key("gpu_device_ids"),
+            "other vm settings must be left intact"
+        );
+    }
+
+    #[test]
+    fn take_public_staging_token_ignores_other_drivers() {
+        let mut sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(prost_types::Struct {
+                        fields: std::iter::once((
+                            "docker".to_string(),
+                            struct_value([("rootfs_tar_staging_token", string_value("tok-abc"))]),
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(take_public_staging_token(&mut sandbox, "vm").is_none());
+    }
+
+    #[test]
+    fn set_rootfs_tar_path_writes_into_the_driver_copy() {
+        let mut driver_sandbox = DriverSandbox {
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        set_rootfs_tar_path(&mut driver_sandbox, Path::new("/staging/req-a/r.tar"));
+
+        let config = driver_sandbox
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.driver_config.as_ref())
+            .expect("driver config");
+        let Some(prost_types::value::Kind::StringValue(path)) =
+            config.fields["rootfs_tar_path"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_path must be a string");
+        };
+        assert_eq!(path, "/staging/req-a/r.tar");
+    }
+
     #[test]
     fn select_driver_config_rejects_non_object_matching_driver_block() {
         let config = prost_types::Struct {
@@ -4909,6 +5230,9 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
+                rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5250,6 +5574,9 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
+                rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5460,6 +5787,9 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
+                rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -5473,6 +5803,7 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
+            rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         }
     }
 
@@ -6466,7 +6797,11 @@ mod tests {
         .instrument(tracing::info_span!("request"))
         .await;
 
-        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-trace");
+        let driver_span = traced.span_with(
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "sandbox.id",
+            "sb-trace",
+        );
         test_exporter::assert_has_parent(&driver_span);
         assert_eq!(
             test_exporter::attribute(&driver_span, "driver.name").as_deref(),
@@ -6476,6 +6811,18 @@ mod tests {
         assert_eq!(
             test_exporter::attribute(&driver_span, "sandbox.id").as_deref(),
             Some("sb-trace"),
+        );
+        assert_eq!(
+            test_exporter::attribute(&driver_span, "rpc.method").as_deref(),
+            Some("openshell.compute.v1.ComputeDriver/CreateSandbox"),
+        );
+        assert!(
+            test_exporter::attribute(&driver_span, "rpc.service").is_none(),
+            "the current RPC semantic conventions integrate the service into rpc.method"
+        );
+        assert_eq!(
+            test_exporter::attribute(&driver_span, "rpc.response.status_code").as_deref(),
+            Some("OK"),
         );
         assert_eq!(
             driver_span.span_kind,
@@ -6489,6 +6836,39 @@ mod tests {
             ),
             "a successful driver call is not marked an error, got {:?}",
             driver_span.status
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_watch_client_span_lives_until_the_stream_completes() {
+        use futures::StreamExt as _;
+
+        use crate::otel_tracing::test_exporter;
+
+        let traced = test_exporter::install_traced();
+        let driver = TracedDriver::new(Arc::new(TestDriver::default()), "test-driver".to_string());
+        let response = driver.watch().await.expect("watch opens");
+        assert!(
+            traced
+                .finished_spans()
+                .iter()
+                .all(|span| span.name != "openshell.compute.v1.ComputeDriver/WatchSandboxes"),
+            "the client span must remain open while the response stream is alive"
+        );
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let spans = traced.finished_spans();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+            .expect("watch client span should finish with the stream");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert_eq!(
+            test_exporter::attribute(span, "rpc.response.status_code").as_deref(),
+            Some("OK"),
         );
     }
 
@@ -6623,7 +7003,11 @@ mod tests {
         .instrument(tracing::info_span!("request"))
         .await;
 
-        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-fail");
+        let driver_span = traced.span_with(
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "sandbox.id",
+            "sb-fail",
+        );
 
         assert!(
             matches!(
@@ -6634,8 +7018,8 @@ mod tests {
             driver_span.status
         );
         assert_eq!(
-            test_exporter::attribute(&driver_span, "grpc.code").as_deref(),
-            Some("14"),
+            test_exporter::attribute(&driver_span, "rpc.response.status_code").as_deref(),
+            Some("UNAVAILABLE"),
             "the gRPC code names the cause without reading the message"
         );
     }
@@ -9635,7 +10019,7 @@ mod tests {
             .iter()
             .find(|root| {
                 spans.iter().any(|span| {
-                    span.name == "driver.list_sandboxes"
+                    span.name == "openshell.compute.v1.ComputeDriver/ListSandboxes"
                         && span.span_context.trace_id() == root.span_context.trace_id()
                 }) && spans.iter().any(|span| {
                     span.name.starts_with("store.")
@@ -9648,7 +10032,7 @@ mod tests {
         let driver_span = spans
             .iter()
             .find(|span| {
-                span.name == "driver.list_sandboxes"
+                span.name == "openshell.compute.v1.ComputeDriver/ListSandboxes"
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the sweep records its driver call");
@@ -10685,7 +11069,7 @@ mod tests {
                 ..Default::default()
             }),
             template: Some(SandboxTemplate {
-                image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
                 driver_config: Some(prost_types::Struct {
                     fields: [
                         (

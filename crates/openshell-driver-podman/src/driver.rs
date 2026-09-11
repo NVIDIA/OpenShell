@@ -4,7 +4,7 @@
 //! Podman compute driver.
 
 use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
-use crate::config::PodmanComputeConfig;
+use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
@@ -13,8 +13,9 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    GatewayCallbackTopology, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -25,8 +26,9 @@ use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
 #[cfg(target_os = "macos")]
 use openshell_core::proto::compute::v1::GatewayLoopbackInterfaceRequirement;
 use openshell_core::proto::compute::v1::{
-    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse, GpuResourceRequirements,
-    gateway_listener_requirement::Selector,
+    CpuResourceCapabilities, DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse,
+    GpuResourceCapabilities, GpuResourceRequirements, MemoryResourceCapabilities,
+    ResourceCapabilities, gateway_listener_requirement::Selector,
 };
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, SocketAddr};
@@ -366,15 +368,10 @@ impl PodmanComputeDriver {
             }
         }
 
-        // Validate TLS configuration before connecting.  Partial configs
-        // (e.g. CA set but cert/key missing) are rejected early so operators
-        // get a clear error instead of a silent fallback to plaintext HTTP.
-        config.validate_tls_config()?;
-        config.validate_runtime_limits()?;
-        config.validate_host_gateway_ip()?;
-        config.validate_proxy_config()?;
-        config.canonicalize_userns()?;
-        config.validate_userns_mappings()?;
+        // Validate and normalize configuration before connecting. Partial TLS
+        // and invalid resource, proxy, SPIFFE, AppArmor, or userns settings
+        // fail before the runtime is contacted.
+        config.validate_configuration()?;
 
         let client = PodmanClient::new(socket_path);
 
@@ -411,11 +408,16 @@ impl PodmanComputeDriver {
                         info.host.cgroup_version
                     )));
                 }
+                validate_apparmor_support(
+                    config.app_armor_profile.as_ref(),
+                    info.host.security.apparmor_enabled,
+                )?;
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
                     rootless = info.host.security.rootless,
                     rootless_network_cmd = %info.host.rootless_network_cmd,
+                    apparmor_enabled = info.host.security.apparmor_enabled,
                     "Connected to Podman"
                 );
                 (info.host.security.rootless, info.host.rootless_network_cmd)
@@ -437,14 +439,10 @@ impl PodmanComputeDriver {
         // Auto-detect the gRPC callback endpoint before deciding whether this
         // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
-            let scheme = if config.tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!(
-                "{scheme}://host.containers.internal:{}",
-                config.gateway_port
+            config.grpc_endpoint = gateway_callback_endpoint(
+                GatewayCallbackTopology::Podman,
+                config.gateway_port,
+                config.tls_enabled(),
             );
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -516,6 +514,20 @@ impl PodmanComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         })
     }
 
@@ -728,10 +740,10 @@ impl PodmanComputeDriver {
 
     /// Create a sandbox container.
     #[tracing::instrument(
-        name = "podman.create_sandbox",
+        name = "podman.provision",
         skip(self, sandbox),
         fields(
-            otel.name = "podman.create_sandbox",
+            otel.name = "podman.provision",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox.id,
             sandbox.name = %sandbox.name,
@@ -791,7 +803,7 @@ impl PodmanComputeDriver {
                             .to_string(),
                     ));
                 }
-                let pull_policy = self.config.image_pull_policy.as_str();
+                let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
                 info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
                 self.client
                     .pull_image(image, pull_policy)
@@ -1387,6 +1399,26 @@ impl PodmanComputeDriver {
     }
 }
 
+fn validate_apparmor_support(
+    profile: Option<&openshell_core::AppArmorProfile>,
+    apparmor_enabled: bool,
+) -> Result<(), PodmanApiError> {
+    let requires_apparmor = matches!(
+        profile,
+        Some(
+            openshell_core::AppArmorProfile::RuntimeDefault
+                | openshell_core::AppArmorProfile::Localhost(_)
+        )
+    );
+    if requires_apparmor && !apparmor_enabled {
+        return Err(PodmanApiError::InvalidInput(
+            "app_armor_profile requires AppArmor, but Podman reports AppArmor is unavailable; install/enable AppArmor or use Unconfined explicitly"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn supervisor_image_pull_policy(image: &str) -> &'static str {
     if supervisor_image_should_refresh(image) {
         "newer"
@@ -1808,7 +1840,7 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let (socket_path, _requests, handle) = spawn_podman_stub(
             "trace-stop",
             vec![
@@ -1824,7 +1856,8 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         test_driver(socket_path.clone())
             .stop_sandbox("sandbox-1")
@@ -1857,7 +1890,7 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let (socket_path, _requests, handle) = spawn_podman_stub(
             "trace-create",
             vec![
@@ -1876,7 +1909,8 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         test_driver(socket_path.clone())
             .create_sandbox(&plain_sandbox("sandbox-trace", "demo"))
@@ -1889,7 +1923,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let create = spans
             .iter()
-            .find(|span| span.name == "podman.create_sandbox")
+            .find(|span| span.name == "podman.provision")
             .expect("create operation should be exported");
         for name in [
             "podman.prepare_images",
@@ -1917,7 +1951,7 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let (socket_path, _requests, handle) = spawn_podman_stub(
             "trace-image-failure",
             vec![
@@ -1929,7 +1963,8 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         test_driver(socket_path.clone())
             .create_sandbox(&plain_sandbox("sandbox-trace", "demo"))
@@ -1958,12 +1993,13 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         let (start_socket, _requests, start_handle) = spawn_podman_stub(
             "trace-start",
@@ -1990,7 +2026,8 @@ mod tests {
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
         test_driver(delete_socket.clone())
             .delete_sandbox("sandbox-1")
             .with_subscriber(subscriber)
@@ -2196,6 +2233,26 @@ mod tests {
             requirements[0].selector,
             Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
         );
+    }
+
+    #[test]
+    fn confined_apparmor_profiles_follow_podman_capability() {
+        use openshell_core::AppArmorProfile;
+
+        for profile in [
+            AppArmorProfile::RuntimeDefault,
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+        ] {
+            validate_apparmor_support(Some(&profile), true)
+                .expect("confined profile should be accepted when Podman reports AppArmor");
+            let error = validate_apparmor_support(Some(&profile), false)
+                .expect_err("confined profile must fail when AppArmor is unavailable");
+            assert!(error.to_string().contains("AppArmor is unavailable"));
+        }
+        validate_apparmor_support(Some(&AppArmorProfile::Unconfined), false)
+            .expect("Unconfined does not require AppArmor support");
+        validate_apparmor_support(None, false)
+            .expect("an omitted profile preserves Podman's runtime behavior");
     }
 
     #[test]
@@ -3104,5 +3161,20 @@ mod tests {
         assert!(userns_remaps_uids(Some("auto:size=65536")));
         assert!(userns_remaps_uids(Some("no-map")));
         assert!(userns_remaps_uids(Some("private")));
+    }
+
+    #[test]
+    fn capabilities_report_static_resource_support() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig::default());
+        let resources = driver
+            .capabilities()
+            .unwrap()
+            .resource_capabilities
+            .unwrap();
+        assert!(resources.cpu.unwrap().limit_supported);
+        assert!(resources.memory.unwrap().limit_supported);
+        let gpu = resources.gpu.unwrap();
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
     }
 }

@@ -28,6 +28,7 @@ const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
+    CONDITION_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
 };
 
 pub type WatchStream =
@@ -439,7 +440,12 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
             Some(HealthState { status }) if status == "starting" => {
                 ("False", "HealthCheckStarting", String::new())
             }
-            _ => ("False", CONDITION_STARTING, String::new()),
+            None => (
+                "True",
+                CONDITION_RUNNING,
+                "Container is running".to_string(),
+            ),
+            Some(_) => ("False", CONDITION_STARTING, String::new()),
         },
         "created" => ("False", "ContainerCreated", String::new()),
         "exited" | "stopped" => {
@@ -452,6 +458,11 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
                 (
                     "OOMKilled",
                     "Container was killed by the OOM killer".to_string(),
+                )
+            } else if state.exit_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+                (
+                    CONDITION_WORKSPACE_VALIDATION_FAILED,
+                    "OCI WorkingDir is not usable by the sandbox identity".to_string(),
                 )
             } else if matches!(state.exit_code, 137 | 143) {
                 (
@@ -579,6 +590,44 @@ mod tests {
     }
 
     #[test]
+    fn condition_running_without_healthcheck_is_ready() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: None,
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let cond = condition_from_state(&state);
+        assert_eq!(cond.r#type, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason, CONDITION_RUNNING);
+        assert_eq!(cond.message, "Container is running");
+        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+    }
+
+    #[test]
+    fn condition_running_with_pending_healthcheck_is_not_ready() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: Some(HealthState {
+                status: "starting".to_string(),
+            }),
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let condition = condition_from_state(&state);
+        assert_eq!(condition.r#type, "Ready");
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "HealthCheckStarting");
+    }
+
+    #[test]
     fn condition_oom_killed() {
         let state = ContainerState {
             status: "exited".to_string(),
@@ -610,6 +659,24 @@ mod tests {
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "ContainerExited");
         assert!(cond.message.contains("code 1"));
+    }
+
+    #[test]
+    fn condition_workspace_validation_exit_is_reported_explicitly() {
+        let state = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            oom_killed: false,
+            health: None,
+            started_at: None,
+            finished_at: Some("2026-04-14T12:00:00Z".to_string()),
+        };
+
+        let cond = condition_from_state(&state);
+
+        assert_eq!(cond.reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+        assert!(cond.message.contains("WorkingDir"));
     }
 
     #[test]

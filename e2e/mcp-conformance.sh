@@ -330,7 +330,8 @@ create_client_sandbox() {
   # for each scenario URL before executing the TypeScript client.
   python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" \
     "http://192.0.2.1:1/" "${policy_file}" \
-    "${ROOT}/e2e/mcp-conformance/policy-template.yaml" >/dev/null
+    "${ROOT}/e2e/mcp-conformance/policy-template.yaml" \
+    "${SPEC_VERSION}" >/dev/null
 
   echo "Creating MCP conformance client sandbox ${sandbox_name}..." >&2
   if ! "${openshell}" sandbox create \

@@ -74,9 +74,7 @@ COPY crates/openshell-prover/Cargo.toml   crates/openshell-prover/Cargo.toml
 COPY crates/openshell-core/build.rs       crates/openshell-core/build.rs
 COPY proto/ proto/
 
-# Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
-# by russh in openshell-sandbox/openshell-server) which is difficult to
-# cross-compile and unnecessary for the CLI binary.
+# Scope workspace to CLI crates only to avoid compiling unrelated runtimes.
 RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
 RUN mkdir -p crates/openshell-cli/src \

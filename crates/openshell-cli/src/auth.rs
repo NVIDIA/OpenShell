@@ -35,7 +35,7 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 /// Timeout for the browser auth flow.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Length of the confirmation code (alphanumeric characters).
 const CODE_LENGTH: usize = 7;

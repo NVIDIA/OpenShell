@@ -7,7 +7,8 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 - `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
-- A local gateway is available when using the default local Dockerfile source.
+- A local gateway and either Docker or Podman are available to build the
+  default sandbox image.
 
 ## Usage
 
@@ -19,7 +20,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox source. Local gateways build `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
+By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+
+The launcher queries the selected gateway and builds with its Docker or Podman
+compute driver. If `CONTAINER_ENGINE` is set, it must match that driver. Other
+gateway drivers cannot run this local-image launcher.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 

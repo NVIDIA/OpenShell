@@ -3,7 +3,7 @@
 
 //! Builder for HTTP Activity [4002] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{HttpActivityEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -30,7 +30,7 @@ pub struct HttpActivityBuilder<'a> {
 
 impl<'a> HttpActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext) -> Self {
+    pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
             activity: ActivityId::Unknown,

@@ -3,9 +3,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -106,6 +104,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -475,7 +480,10 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -488,7 +496,10 @@ impl OpenShell for TestOpenShell {
             .collect::<Vec<_>>();
         profiles.extend(self.state.profiles.lock().await.values().cloned());
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse { profiles },
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
         ))
     }
 
@@ -1155,8 +1166,6 @@ struct TestServer {
 }
 
 async fn run_server() -> TestServer {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -1354,7 +1363,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "table",
         "default",
@@ -1425,7 +1434,7 @@ async fn provider_list_json_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -1468,7 +1477,7 @@ async fn provider_list_yaml_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "yaml",
         "default",
@@ -1496,7 +1505,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -2917,7 +2926,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         })
         .await
         .expect("get provider should succeed")

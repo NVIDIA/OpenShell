@@ -4,8 +4,9 @@
 use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
+    CONDITION_WORKSPACE_VALIDATION_FAILED, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -37,7 +38,7 @@ fn test_sandbox() -> DriverSandbox {
             log_level: "debug".to_string(),
             environment: HashMap::from([("SPEC_ENV".to_string(), "spec".to_string())]),
             template: Some(DriverSandboxTemplate {
-                image: "ghcr.io/nvidia/openshell/sandbox:dev".to_string(),
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
@@ -95,8 +96,8 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
-        image_pull_policy: String::new(),
-        sandbox_namespace: "default".to_string(),
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        sandbox_label: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
         network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
@@ -120,11 +121,163 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
-        supports_gpu: false,
-        allow_all_default_gpu: false,
-        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        gpu: DockerGpuRuntimeCapabilities {
+            cdi_supported: false,
+            wsl_all_gpu_fallback_enabled: false,
+        },
+        sandbox_pids_limit: None,
         enable_bind_mounts: false,
+        upstream_proxy: UpstreamProxyConfig::default(),
+        provider_spiffe_workload_api_socket: None,
+        app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
+}
+
+#[test]
+fn docker_config_uses_canonical_sandbox_label_name() {
+    let config: DockerComputeConfig =
+        serde_json::from_value(serde_json::json!({ "sandbox_label": "tenant-a" })).unwrap();
+    assert_eq!(config.sandbox_label, "tenant-a");
+
+    let serialized = serde_json::to_value(config).unwrap();
+    assert_eq!(serialized["sandbox_label"], "tenant-a");
+    assert!(serialized.get("sandbox_namespace").is_none());
+}
+
+#[test]
+fn docker_config_rejects_legacy_sandbox_namespace() {
+    let error = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "sandbox_namespace": "tenant-a"
+    }))
+    .expect_err("legacy sandbox_namespace must be rejected");
+    assert!(error.to_string().contains("sandbox_namespace"));
+}
+
+#[test]
+fn docker_config_keeps_explicit_unconfined_apparmor_default() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(config.app_armor_profile, Some(AppArmorProfile::Unconfined));
+    let serialized = serde_json::to_value(config).expect("config should serialize");
+    assert_eq!(serialized["app_armor_profile"], "Unconfined");
+}
+
+#[test]
+fn docker_config_defaults_to_driver_owned_pids_limit() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(
+        config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
+        Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+    );
+}
+
+#[test]
+fn docker_config_rejects_invalid_pids_limits() {
+    let zero = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "sandbox_pids_limit": 0
+    }))
+    .expect_err("zero PID limit must be rejected");
+    assert!(zero.to_string().contains("invalid value: integer `0`"));
+
+    let negative: DockerComputeConfig = serde_json::from_value(serde_json::json!({
+        "sandbox_pids_limit": -1
+    }))
+    .expect("nonzero integer deserializes before semantic validation");
+    let error = validate_sandbox_pids_limit(negative.sandbox_pids_limit).unwrap_err();
+    assert!(error.to_string().contains("must be positive"));
+}
+
+#[test]
+fn docker_rejects_newer_image_pull_policy() {
+    let error = validate_image_pull_policy(ImagePullPolicy::Newer).unwrap_err();
+    assert!(error.to_string().contains("supported only by the Podman"));
+}
+
+#[test]
+fn docker_apparmor_profiles_render_and_require_daemon_capability() {
+    for (profile, expected) in [
+        (AppArmorProfile::RuntimeDefault, None),
+        (
+            AppArmorProfile::Unconfined,
+            Some(vec!["apparmor=unconfined".to_string()]),
+        ),
+        (
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+            Some(vec!["apparmor=openshell-supervisor".to_string()]),
+        ),
+    ] {
+        let mut config = runtime_config();
+        config.app_armor_profile = Some(profile.clone());
+        let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+        assert_eq!(body.host_config.unwrap().security_opt, expected);
+    }
+
+    let unavailable = SystemInfo::default();
+    assert!(
+        validate_docker_app_armor_profile(Some(&AppArmorProfile::Unconfined), &unavailable).is_ok()
+    );
+    for confined in [
+        AppArmorProfile::RuntimeDefault,
+        AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+    ] {
+        let error = validate_docker_app_armor_profile(Some(&confined), &unavailable)
+            .expect_err("confined profile requires daemon AppArmor support");
+        assert!(
+            error
+                .to_string()
+                .contains("Docker reports it is unavailable")
+        );
+    }
+
+    let available = SystemInfo {
+        security_options: Some(vec!["name=apparmor".to_string()]),
+        ..Default::default()
+    };
+    assert!(
+        validate_docker_app_armor_profile(
+            Some(&AppArmorProfile::Localhost(
+                "openshell-supervisor".to_string()
+            )),
+            &available
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn docker_config_uses_shared_proxy_contract_and_explicit_apparmor_default() {
+    let config: DockerComputeConfig = toml::from_str(
+        r#"
+https_proxy = "http://proxy.example:8080"
+no_proxy = ".svc"
+proxy_auth_file = "/run/secrets/proxy-auth"
+proxy_auth_allow_insecure = true
+app_armor_profile = "Localhost/openshell-supervisor"
+provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.upstream_proxy.https_proxy.as_deref(),
+        Some("http://proxy.example:8080")
+    );
+    assert_eq!(
+        config.app_armor_profile,
+        Some(AppArmorProfile::Localhost(
+            "openshell-supervisor".to_string()
+        ))
+    );
+    assert!(config.upstream_proxy.validate().is_ok());
+    assert!(
+        openshell_core::driver_utils::validate_provider_spiffe_unix_socket(
+            config
+                .provider_spiffe_workload_api_socket
+                .as_deref()
+                .unwrap()
+        )
+        .is_ok()
+    );
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
@@ -151,7 +304,7 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
 }
 
 fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
-    let allow_all_default_gpu = config.allow_all_default_gpu;
+    let wsl_all_gpu_fallback_enabled = config.gpu.wsl_all_gpu_fallback_enabled;
     DockerComputeDriver {
         docker: Arc::new(
             Docker::connect_with_http("http://127.0.0.1:2375", 1, bollard::API_DEFAULT_VERSION)
@@ -162,10 +315,167 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
             CdiGpuInventory::default(),
-            allow_all_default_gpu,
+            wsl_all_gpu_fallback_enabled,
         )),
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
     }
+}
+
+#[test]
+fn capabilities_report_static_resource_support() {
+    let mut config = runtime_config();
+    let capabilities = test_driver_with_config(config.clone()).capabilities();
+    let resources = capabilities.resource_capabilities.unwrap();
+    assert!(resources.cpu.unwrap().limit_supported);
+    assert!(resources.memory.unwrap().limit_supported);
+    let gpu = resources.gpu.unwrap();
+    assert!(!gpu.default_selection_supported);
+    assert!(!gpu.count_selection_supported);
+
+    config.gpu.cdi_supported = true;
+    let gpu = test_driver_with_config(config)
+        .capabilities()
+        .resource_capabilities
+        .unwrap()
+        .gpu
+        .unwrap();
+    assert!(gpu.default_selection_supported);
+    assert!(gpu.count_selection_supported);
+}
+
+type TestDriverClient =
+    openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+        tonic::transport::Channel,
+    >;
+
+fn request_with_traceparent<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse()
+            .unwrap(),
+    );
+    request
+}
+
+async fn fake_docker_with_no_containers() -> (String, JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let mut scratch = [0_u8; 4096_usize];
+            let _ = stream.read(&mut scratch).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                           Content-Type: application/json\r\n\
+                           Content-Length: 2\r\n\r\n[]",
+                )
+                .await;
+            let _ = stream.flush().await;
+        }
+    });
+    (format!("http://{address}"), server)
+}
+
+async fn standalone_traced_client() -> (
+    TestDriverClient,
+    tokio::sync::oneshot::Sender<()>,
+    JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = ComputeDriverService::new(test_driver_with_config(runtime_config()));
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
+            .add_service(ComputeDriverServer::new(service))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+    });
+    let client = TestDriverClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    (client, shutdown, server)
+}
+
+#[tokio::test]
+async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider)),
+    );
+    let _dispatch = tracing::dispatcher::set_default(&dispatch);
+    let (mut client, shutdown, server) = standalone_traced_client().await;
+
+    client
+        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+        .await
+        .expect("capabilities should succeed");
+    client
+        .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
+            sandbox: None,
+        }))
+        .await
+        .expect_err("missing sandbox should fail");
+    drop(client);
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("standalone test server should stop")
+        .expect("standalone test server should not panic")
+        .expect("standalone test server should stop cleanly");
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let capabilities = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
+        .expect("capabilities RPC span");
+    assert_eq!(
+        capabilities.span_context.trace_id().to_string(),
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+    assert_eq!(capabilities.parent_span_id.to_string(), "00f067aa0ba902b7");
+    assert!(capabilities.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.method"
+            && attribute.value.to_string() == "openshell.compute.v1.ComputeDriver/GetCapabilities"
+    }));
+    assert!(
+        capabilities
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.service"),
+        "the current RPC semantic conventions integrate the service into rpc.method"
+    );
+    let failed = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate")
+        .expect("failed RPC span");
+    assert!(matches!(
+        failed.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
@@ -174,7 +484,7 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
     use tracing::{Instrument as _, instrument::WithSubscriber as _};
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let gateway_exporter = InMemorySpanExporterBuilder::new().build();
     let gateway_provider = SdkTracerProvider::builder()
         .with_simple_exporter(gateway_exporter.clone())
@@ -184,19 +494,19 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         .with_simple_exporter(driver_exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry()
-        .with(openshell_otel::layer_excluding_target_prefix(
+        .with(openshell_otel::layer_excluding_target_prefixes(
             &gateway_provider,
             "gateway-test",
-            Some(otel_tracing::IN_PROCESS_TARGET_PREFIX),
+            otel_tracing::TRACING.in_process_targets(),
         ))
-        .with(otel_tracing::in_process_layer(&driver_provider));
+        .with(otel_tracing::TRACING.in_process_layer(&driver_provider));
     let service = ComputeDriverService::new_in_process(test_driver_with_config(runtime_config()));
 
     async {
         let gateway_span = tracing::info_span!(
             target: "openshell_server::compute",
             "driver",
-            otel.name = "driver.get_capabilities",
+            otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
             otel.kind = "client"
         );
         ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
@@ -209,6 +519,12 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         );
         drop(unrelated.enter());
         drop(unrelated);
+        let selected_backend = tracing::info_span!(
+            target: "openshell_driver_docker::compute",
+            "docker.operation"
+        );
+        drop(selected_backend.enter());
+        drop(selected_backend);
         Ok::<_, Status>(())
     }
     .with_subscriber(subscriber)
@@ -218,7 +534,7 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         let gateway_span = tracing::info_span!(
             target: "openshell_server::compute",
             "driver",
-            otel.name = "driver.validate_sandbox_create",
+            otel.name = "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
             otel.kind = "client"
         );
         ComputeDriver::validate_sandbox_create(
@@ -230,12 +546,12 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
     }
     .with_subscriber(
         tracing_subscriber::registry()
-            .with(openshell_otel::layer_excluding_target_prefix(
+            .with(openshell_otel::layer_excluding_target_prefixes(
                 &gateway_provider,
                 "gateway-test",
-                Some(otel_tracing::IN_PROCESS_TARGET_PREFIX),
+                otel_tracing::TRACING.in_process_targets(),
             ))
-            .with(otel_tracing::in_process_layer(&driver_provider)),
+            .with(otel_tracing::TRACING.in_process_layer(&driver_provider)),
     )
     .await
     .expect_err("missing sandbox should fail");
@@ -246,11 +562,11 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
     let driver_spans = driver_exporter.get_finished_spans().unwrap();
     let client = gateway_spans
         .iter()
-        .find(|span| span.name == "driver.get_capabilities")
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
         .unwrap();
     let server = driver_spans
         .iter()
-        .find(|span| span.name == "driver.get_capabilities")
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
         .expect("in-process server span");
     assert_eq!(
         server.span_context.trace_id(),
@@ -259,8 +575,18 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
     assert_eq!(server.parent_span_id, client.span_context.span_id());
     assert_eq!(server.span_kind, opentelemetry::trace::SpanKind::Server);
     assert!(server.attributes.iter().any(|attribute| {
-        attribute.key.as_str() == "rpc.grpc.status_code"
-            && attribute.value.to_string() == (tonic::Code::Ok as i32).to_string()
+        attribute.key.as_str() == "rpc.method"
+            && attribute.value.to_string() == "openshell.compute.v1.ComputeDriver/GetCapabilities"
+    }));
+    assert!(
+        server
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.service"),
+        "the current RPC semantic conventions integrate the service into rpc.method"
+    );
+    assert!(server.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.response.status_code" && attribute.value.to_string() == "OK"
     }));
     assert!(
         gateway_spans
@@ -274,17 +600,29 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
             .all(|span| span.name != "kubernetes.operation"),
         "the Docker provider must not claim unrelated driver spans"
     );
+    assert!(
+        gateway_spans
+            .iter()
+            .all(|span| span.name != "docker.operation"),
+        "the gateway provider must not claim the selected driver's backend spans"
+    );
+    assert!(
+        driver_spans
+            .iter()
+            .any(|span| span.name == "docker.operation"),
+        "the Docker provider must export backend spans from the selected driver"
+    );
     let failed = driver_spans
         .iter()
-        .find(|span| span.name == "driver.validate_sandbox_create")
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate")
         .expect("failed in-process server span");
     assert!(matches!(
         failed.status,
         opentelemetry::trace::Status::Error { .. }
     ));
     assert!(failed.attributes.iter().any(|attribute| {
-        attribute.key.as_str() == "rpc.grpc.status_code"
-            && attribute.value.to_string() == (tonic::Code::InvalidArgument as i32).to_string()
+        attribute.key.as_str() == "rpc.response.status_code"
+            && attribute.value.to_string() == "INVALID_ARGUMENT"
     }));
     gateway_provider.shutdown().unwrap();
     driver_provider.shutdown().unwrap();
@@ -296,12 +634,12 @@ async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
     async {
@@ -350,12 +688,12 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
     DockerComputeDriver::start_sandbox(&driver, "", "")
@@ -379,30 +717,37 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
 #[tokio::test]
 async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
     use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
-    use tracing::instrument::WithSubscriber as _;
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let mut config = runtime_config();
-    config.image_pull_policy = "unsupported".to_string();
+    config.image_pull_policy = ImagePullPolicy::Newer;
     let driver = test_driver_with_config(config);
 
-    driver
-        .provision_sandbox_inner(&test_sandbox())
-        .with_subscriber(subscriber)
-        .await
-        .expect_err("unsupported image pull policy should fail provisioning");
+    async {
+        driver
+            .provision_sandbox_inner(&test_sandbox())
+            .instrument(tracing::info_span!(
+                "docker.provision",
+                otel.status_code = tracing::field::Empty
+            ))
+            .await
+    }
+    .with_subscriber(subscriber)
+    .await
+    .expect_err("unsupported image pull policy should fail provisioning");
     provider.force_flush().unwrap();
 
     let spans = exporter.get_finished_spans().unwrap();
     let provision = spans
         .iter()
-        .find(|span| span.name == "docker.provision_sandbox")
+        .find(|span| span.name == "docker.provision")
         .expect("provisioning span should be exported");
     assert!(matches!(
         provision.status,
@@ -430,12 +775,12 @@ async fn background_provisioning_does_not_extend_the_scheduling_span_lifetime() 
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let dispatch = tracing::Dispatch::new(subscriber);
     let _dispatch = tracing::dispatcher::set_default(&dispatch);
 
@@ -472,30 +817,27 @@ async fn tracing_in_process_stream_span_lives_until_stream_failure() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::in_process_layer(&provider));
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
 
     async {
         let span = tracing::info_span!(
-            target: "openshell_driver_docker::otel_tracing",
+            target: otel_tracing::TRACING.in_process_target(),
             "driver_rpc",
-            otel.name = "driver.watch_sandboxes",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
-            rpc.grpc.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
         );
         let inner: WatchStream = Box::pin(futures::stream::iter([Err(Status::internal(
             "watch failed",
         ))]));
-        let mut stream = TracedWatchStream {
-            inner,
-            span,
-            finished: false,
-        };
+        let mut stream = TracedWatchStream::new(inner, span);
 
         provider.force_flush().unwrap();
         assert!(
@@ -516,7 +858,7 @@ async fn tracing_in_process_stream_span_lives_until_stream_failure() {
     let spans = exporter.get_finished_spans().unwrap();
     let span = spans
         .iter()
-        .find(|span| span.name == "driver.watch_sandboxes")
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
         .expect("watch server span should be exported when the stream ends");
     assert!(matches!(
         span.status,
@@ -531,28 +873,25 @@ async fn tracing_in_process_stream_records_ok_when_stream_completes() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::in_process_layer(&provider));
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
 
     async {
         let span = tracing::info_span!(
-            target: "openshell_driver_docker::otel_tracing",
+            target: otel_tracing::TRACING.in_process_target(),
             "driver_rpc",
-            otel.name = "driver.watch_sandboxes",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
-            rpc.grpc.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
         );
         let inner: WatchStream = Box::pin(futures::stream::empty());
-        let mut stream = TracedWatchStream {
-            inner,
-            span,
-            finished: false,
-        };
+        let mut stream = TracedWatchStream::new(inner, span);
 
         assert!(stream.next().await.is_none());
         drop(stream);
@@ -564,43 +903,39 @@ async fn tracing_in_process_stream_records_ok_when_stream_completes() {
     let spans = exporter.get_finished_spans().unwrap();
     let span = spans
         .iter()
-        .find(|span| span.name == "driver.watch_sandboxes")
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
         .expect("watch server span should be exported when the stream completes");
     assert!(span.attributes.iter().any(|attribute| {
-        attribute.key.as_str() == "rpc.grpc.status_code"
-            && attribute.value.to_string() == (tonic::Code::Ok as i32).to_string()
+        attribute.key.as_str() == "rpc.response.status_code" && attribute.value.to_string() == "OK"
     }));
     provider.shutdown().unwrap();
 }
 
 #[tokio::test]
-async fn tracing_in_process_stream_records_cancelled_when_dropped() {
+async fn tracing_in_process_stream_leaves_status_unset_when_dropped() {
     use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let _tracing_lock = otel_tracing::test_lock().await;
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
     let exporter = InMemorySpanExporterBuilder::new().build();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let subscriber = tracing_subscriber::registry().with(otel_tracing::in_process_layer(&provider));
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
 
     async {
         let span = tracing::info_span!(
-            target: "openshell_driver_docker::otel_tracing",
+            target: otel_tracing::TRACING.in_process_target(),
             "driver_rpc",
-            otel.name = "driver.watch_sandboxes",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
             otel.kind = "server",
             otel.status_code = tracing::field::Empty,
-            rpc.grpc.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
         );
         let inner: WatchStream = Box::pin(futures::stream::pending());
-        let stream = TracedWatchStream {
-            inner,
-            span,
-            finished: false,
-        };
+        let stream = TracedWatchStream::new(inner, span);
 
         drop(stream);
     }
@@ -611,16 +946,14 @@ async fn tracing_in_process_stream_records_cancelled_when_dropped() {
     let spans = exporter.get_finished_spans().unwrap();
     let span = spans
         .iter()
-        .find(|span| span.name == "driver.watch_sandboxes")
-        .expect("watch server span should be exported when the stream is cancelled");
-    assert!(matches!(
-        span.status,
-        opentelemetry::trace::Status::Error { .. }
-    ));
-    assert!(span.attributes.iter().any(|attribute| {
-        attribute.key.as_str() == "rpc.grpc.status_code"
-            && attribute.value.to_string() == (tonic::Code::Cancelled as i32).to_string()
-    }));
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+        .expect("watch server span should be exported when the stream is dropped");
+    assert!(matches!(span.status, opentelemetry::trace::Status::Unset));
+    assert!(
+        span.attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.response.status_code")
+    );
     provider.shutdown().unwrap();
 }
 
@@ -1048,13 +1381,13 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 }
 
 #[test]
-fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
+fn docker_pids_limit_uses_runtime_default_when_omitted() {
     assert_eq!(
-        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
-        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
+        docker_pids_limit(std::num::NonZeroI64::new(2048)).unwrap(),
+        Some(2048)
     );
-    assert_eq!(docker_pids_limit(0).unwrap(), None);
-    assert!(docker_pids_limit(-1).is_err());
+    assert_eq!(docker_pids_limit(None).unwrap(), None);
+    assert!(docker_pids_limit(std::num::NonZeroI64::new(-1)).is_err());
 }
 
 #[test]
@@ -1064,10 +1397,21 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 }
 
 #[test]
-fn container_create_body_sets_driver_owned_pids_limit() {
+fn container_create_body_omits_pids_limit_by_default() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
-    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
+    assert_eq!(host_config.pids_limit, None);
+}
+
+#[test]
+fn container_create_body_emits_configured_positive_pids_limit() {
+    let mut config = runtime_config();
+    config.sandbox_pids_limit = std::num::NonZeroI64::new(4096);
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert_eq!(
+        body.host_config.expect("host config").pids_limit,
+        Some(4096)
+    );
 }
 
 #[test]
@@ -1092,7 +1436,9 @@ fn build_environment_sets_docker_tls_paths() {
         })
         .expect("main-process transport");
     let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
-    assert_eq!(main.command, vec!["/bin/bash", "-l"]);
+    // An omitted command is forwarded empty; the supervisor resolves the default
+    // login shell against the sandbox image at startup.
+    assert!(main.command.is_empty());
     assert!(main.tty);
 }
 
@@ -2002,6 +2348,51 @@ fn build_environment_uses_token_file_without_raw_token_env() {
 }
 
 #[test]
+fn docker_container_projects_proxy_and_spiffe_without_credential_metadata() {
+    let mut config = runtime_config();
+    config.upstream_proxy = UpstreamProxyConfig {
+        https_proxy: Some("https://proxy.example:8443".to_string()),
+        no_proxy: Some(".svc".to_string()),
+        proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
+        proxy_auth_allow_insecure: None,
+        proxy_connect_by_hostname: Some(true),
+    };
+    config.provider_spiffe_workload_api_socket = Some(PathBuf::from("/run/spire/agent.sock"));
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let command = body.cmd.unwrap();
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-proxy", "https://proxy.example:8443"])
+    );
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-proxy-auth-file", UPSTREAM_PROXY_AUTH_MOUNT_PATH])
+    );
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-no-proxy", ".svc"])
+    );
+    assert!(command.contains(&"--upstream-proxy-connect-by-hostname".to_string()));
+    let binds = body.host_config.unwrap().binds.unwrap();
+    assert!(
+        binds
+            .iter()
+            .any(|bind| bind.contains(UPSTREAM_PROXY_AUTH_MOUNT_PATH))
+    );
+    assert!(binds.contains(&format!(
+        "/run/spire:{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}:ro"
+    )));
+    assert!(binds.iter().all(|bind| !bind.contains("rbind")));
+    let env = body.env.unwrap();
+    assert!(env.iter().any(|entry| entry
+        == "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/spiffe-workload-api/agent.sock"));
+    assert!(!env.iter().any(|entry| entry.contains("proxy-auth")));
+}
+
+#[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
         managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
@@ -2120,7 +2511,7 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 #[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(Some(2)));
 
@@ -2131,7 +2522,7 @@ fn validate_sandbox_accepts_gpu_count_request_shape() {
 #[test]
 fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -2147,7 +2538,7 @@ fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
 #[test]
 fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -2160,7 +2551,7 @@ fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
 #[test]
 fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -2181,7 +2572,7 @@ fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
 #[test]
 fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -2201,7 +2592,7 @@ fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
 #[test]
 fn validate_sandbox_rejects_gpu_count_mismatched_cdi_devices() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -2257,7 +2648,7 @@ fn validate_sandbox_auth_accepts_gateway_token() {
 #[test]
 fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -2287,7 +2678,7 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
 #[test]
 fn build_container_create_body_omits_devices_without_resolved_default_cdi_devices() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -2305,7 +2696,7 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 #[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -2329,7 +2720,7 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
 #[test]
 fn build_container_create_body_rejects_gpu_count_mismatched_cdi_devices() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -2376,7 +2767,7 @@ fn build_container_create_body_rejects_empty_cdi_devices() {
 #[test]
 fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
     let mut config = runtime_config();
-    config.supports_gpu = true;
+    config.gpu.cdi_supported = true;
     let driver = test_driver_with_config(config);
     driver.gpu_selector.refresh(
         CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
@@ -2532,10 +2923,10 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     // runtime config, not from `DriverSandbox.namespace`. The gateway
     // does not populate `DriverSandbox.namespace`, so a container created
     // with that empty value would not match subsequent list/get/find
-    // queries (which filter on `config.sandbox_namespace`), leaking
+    // queries (which filter on `config.sandbox_label`), leaking
     // sandboxes that the driver itself cannot observe.
     let mut config = runtime_config();
-    config.sandbox_namespace = "tenant-a".to_string();
+    config.sandbox_label = "tenant-a".to_string();
     let mut sandbox = test_sandbox();
     sandbox.namespace = "ignored-by-driver".to_string();
 
@@ -2716,8 +3107,17 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(snapshot.name, "demo");
     assert_eq!(snapshot.namespace, "docker-dev");
     assert!(snapshot.spec.is_none());
-    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
-    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
+    let pending = pending_map(&[&snapshot]);
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-123", "")
+            .unwrap()
+            .as_deref(),
+        Some("sbx-123")
+    );
+    assert_eq!(
+        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
+        Some("sbx-123")
+    );
 
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
@@ -2854,6 +3254,32 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
     })
     .unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn docker_automatic_tls_detection_is_fail_closed_for_partial_bundles() {
+    for mask in 0_u8..8 {
+        let config = DockerComputeConfig {
+            guest_tls_ca: (mask & 1 != 0).then(|| PathBuf::from("/tmp/ca.pem")),
+            guest_tls_cert: (mask & 2 != 0).then(|| PathBuf::from("/tmp/cert.pem")),
+            guest_tls_key: (mask & 4 != 0).then(|| PathBuf::from("/tmp/key.pem")),
+            ..Default::default()
+        };
+        assert_eq!(
+            docker_guest_tls_configured(&config),
+            mask != 0,
+            "TLS presence mask {mask:03b}"
+        );
+
+        if mask != 0 && mask != 7 {
+            let mut inferred = config;
+            inferred.grpc_endpoint = "https://host.openshell.internal:8080".to_string();
+            assert!(
+                docker_guest_tls_paths(&inferred).is_err(),
+                "partial TLS presence mask {mask:03b} must fail"
+            );
+        }
+    }
 }
 
 #[test]
@@ -3139,6 +3565,15 @@ fn ready_reason(sandbox: &DriverSandbox) -> &str {
         .expect("Ready condition present")
 }
 
+fn ready_message(sandbox: &DriverSandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
+        .map(|c| c.message.as_str())
+        .expect("Ready condition present")
+}
+
 #[test]
 fn docker_signal_kill_reclassified_as_runtime_restart() {
     // 137 (128+SIGKILL) and 143 (128+SIGTERM) mark an external termination —
@@ -3177,6 +3612,24 @@ fn docker_ordinary_exit_stays_terminal() {
 }
 
 #[test]
+fn docker_workspace_validation_exit_is_reported_explicitly() {
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        exit_code: Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        ..Default::default()
+    };
+
+    apply_docker_exit_classification(&mut sandbox, &state);
+
+    assert_eq!(
+        ready_reason(&sandbox),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert!(ready_message(&sandbox).contains("WorkingDir"));
+}
+
+#[test]
 fn docker_oom_kill_stays_terminal_despite_137() {
     // An OOM kill reports exit 137 but must NOT be treated as a recoverable
     // restart — it is a genuine failure and stays terminal.
@@ -3189,4 +3642,408 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     };
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+/// Minimal pending-map entry. Only the identity fields matter for lookup
+/// resolution, so the spec and status are left empty on purpose.
+fn pending_sandbox(id: &str, name: &str, workspace: &str) -> DriverSandbox {
+    DriverSandbox {
+        id: id.to_string(),
+        name: name.to_string(),
+        namespace: String::new(),
+        spec: None,
+        status: None,
+        workspace: workspace.to_string(),
+    }
+}
+
+fn pending_map(sandboxes: &[&DriverSandbox]) -> HashMap<String, PendingSandboxRecord> {
+    sandboxes
+        .iter()
+        .map(|sandbox| {
+            (
+                sandbox.id.clone(),
+                PendingSandboxRecord {
+                    sandbox: (*sandbox).clone(),
+                    task: None,
+                },
+            )
+        })
+        .collect()
+}
+
+async fn driver_with_pending(sandboxes: &[&DriverSandbox]) -> DockerComputeDriver {
+    let driver = test_driver_with_config(runtime_config());
+    for sandbox in sandboxes {
+        driver
+            .reserve_pending_sandbox(sandbox)
+            .await
+            .expect("reserving a distinct sandbox must succeed");
+    }
+    driver
+}
+
+fn pending_ids(pending: &HashMap<String, DriverSandbox>) -> Vec<String> {
+    let mut ids: Vec<String> = pending.keys().cloned().collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn resolve_pending_id_prefers_sandbox_id_over_sandbox_name() {
+    // The id is authoritative. A stale or mismatched name travelling in the
+    // same request must not change which record is resolved.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-alpha", "stale-name")
+            .unwrap()
+            .as_deref(),
+        Some("sbx-alpha")
+    );
+}
+
+#[test]
+fn resolve_pending_id_ignores_the_name_when_the_id_is_not_pending() {
+    // Regression for the `id OR name` match. `demo` exists in two workspaces:
+    // the beta copy is still provisioning, the alpha copy is already running.
+    // Deleting the alpha copy sends alpha's id plus the shared name. Matching
+    // on the name alone resolved to the beta record and evicted it, aborting
+    // an unrelated sandbox's provisioning task.
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let pending = pending_map(&[&beta]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-alpha", "demo").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn resolve_pending_id_falls_back_to_the_name_when_no_id_is_supplied() {
+    // Direct driver callers may omit the id; a unique name still resolves.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
+        Some("sbx-alpha")
+    );
+}
+
+#[test]
+fn resolve_pending_id_rejects_an_ambiguous_name_only_lookup() {
+    // Two pending sandboxes share a name across workspaces and the driver
+    // request carries no workspace. Picking either one would make the outcome
+    // depend on `HashMap` iteration order, so refuse instead.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let pending = pending_map(&[&alpha, &beta]);
+
+    let err = resolve_pending_id(&pending, "", "demo")
+        .expect_err("an ambiguous name-only lookup must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn resolve_pending_id_returns_none_without_any_identifier() {
+    // `require_sandbox_identifier` rejects this upstream, but the resolver
+    // stays total so an empty request can never match an arbitrary record.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(resolve_pending_id(&pending, "", "").unwrap(), None);
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_by_id_keeps_a_same_named_sandbox_in_another_workspace() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let removed = driver
+        .remove_pending_sandbox("sbx-alpha", "demo")
+        .await
+        .expect("an id-scoped removal must succeed")
+        .expect("the alpha record must be removed");
+
+    assert_eq!(removed.sandbox.id, "sbx-alpha");
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_by_a_unique_name_still_removes_the_record() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let removed = driver
+        .remove_pending_sandbox("", "demo")
+        .await
+        .expect("a unique name-only removal must succeed")
+        .expect("the alpha record must be removed");
+
+    assert_eq!(removed.sandbox.id, "sbx-alpha");
+    assert!(driver.pending_snapshot_map().await.is_empty());
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_rejects_an_ambiguous_name_and_keeps_both_records() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let err = driver
+        .remove_pending_sandbox("", "demo")
+        .await
+        .map(|record| record.map(|record| record.sandbox.id))
+        .expect_err("an ambiguous name-only removal must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha", "sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn pending_snapshot_by_id_ignores_a_same_named_sandbox_in_another_workspace() {
+    // `GetSandbox` falls through to the pending map when no container exists.
+    // Resolving by name there leaked another workspace's snapshot.
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&beta]).await;
+
+    assert!(
+        driver
+            .pending_snapshot("sbx-alpha", "demo")
+            .await
+            .expect("an id-scoped snapshot lookup must succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pending_snapshot_rejects_an_ambiguous_name_only_lookup() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let err = driver
+        .pending_snapshot("", "demo")
+        .await
+        .expect_err("an ambiguous name-only snapshot lookup must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_allows_the_same_name_in_a_different_workspace() {
+    // Sandbox names are unique per workspace, so this is a legitimate create.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    driver
+        .reserve_pending_sandbox(&beta)
+        .await
+        .expect("a same-named sandbox in another workspace must be allowed");
+
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha", "sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_rejects_a_duplicate_name_in_the_same_workspace() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let duplicate = pending_sandbox("sbx-other", "demo", "alpha");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let err = driver
+        .reserve_pending_sandbox(&duplicate)
+        .await
+        .expect_err("a duplicate name within one workspace must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha"]
+    );
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_rejects_a_duplicate_id() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let duplicate = pending_sandbox("sbx-alpha", "other-name", "beta");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let err = driver
+        .reserve_pending_sandbox(&duplicate)
+        .await
+        .expect_err("a duplicate sandbox id must be rejected regardless of workspace");
+
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha"]
+    );
+}
+
+fn managed_container_labels(
+    namespace: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        ),
+        (LABEL_SANDBOX_NAMESPACE.to_string(), namespace.to_string()),
+        (LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string()),
+        (LABEL_SANDBOX_NAME.to_string(), sandbox_name.to_string()),
+    ])
+}
+
+#[test]
+fn managed_container_identity_matches_on_id_despite_a_stale_name() {
+    // Requiring the name to agree with an authoritative id dropped the match
+    // and made the driver report a live sandbox as absent, stranding the
+    // container and leaking its token file.
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "stale-name"
+    ));
+}
+
+#[test]
+fn managed_container_identity_rejects_a_name_match_when_the_id_differs() {
+    // The mirror of the pending-map fix: a shared name must not stand in for
+    // an id that explicitly disagrees.
+    let labels = managed_container_labels("default", "sbx-beta", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "demo"
+    ));
+}
+
+#[test]
+fn managed_container_identity_falls_back_to_the_name_without_an_id() {
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(managed_container_identity_matches(
+        &labels, "default", "", "demo"
+    ));
+    assert!(!managed_container_identity_matches(
+        &labels, "default", "", "other"
+    ));
+}
+
+#[test]
+fn managed_container_identity_matches_nothing_without_an_identifier() {
+    // The label filters degenerate to "every managed container in the
+    // namespace" when neither identifier is supplied, so the predicate must
+    // not wave the container through.
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels, "default", "", ""
+    ));
+}
+
+#[test]
+fn managed_container_identity_requires_the_configured_namespace() {
+    let labels = managed_container_labels("other-namespace", "sbx-alpha", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "demo"
+    ));
+}
+
+#[tokio::test]
+async fn delete_sandbox_reclaims_token_file_when_container_and_pending_are_gone() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let (endpoint, server) = fake_docker_with_no_containers().await;
+
+    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
+        let config = runtime_config();
+        let mut driver = test_driver_with_config(config.clone());
+        driver.docker = Arc::new(
+            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
+        );
+
+        // Arrange the leak: token on disk, container gone, `pending` empty.
+        let token = openshell_core::driver_utils::sandbox_token_path(
+            "docker-sandbox-tokens",
+            Some(&config.sandbox_label),
+            "sandbox-1",
+        )
+        .unwrap();
+
+        fs::create_dir_all(token.parent().unwrap()).unwrap();
+        fs::write(&token, "jwt\n").unwrap();
+
+        let deleted = driver.delete_sandbox_inner("sandbox-1", "").await.unwrap();
+        assert!(!deleted, "nothing was removed, must not claim a deletion");
+        assert!(!token.exists(), "token file must be reclaimed");
+    })
+    .await;
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn delete_sandbox_by_name_only_leaves_the_namespace_directory_alone() {
+    // `DeleteSandbox` accepts a name without an id. With no id there is no
+    // token path to derive, so the cleanup must be a no-op: deriving a path
+    // from an empty id yields `<namespace>/sandbox.jwt`, whose parent is the
+    // shared namespace directory.
+    let state_dir = tempfile::tempdir().unwrap();
+    let (endpoint, server) = fake_docker_with_no_containers().await;
+
+    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
+        let config = runtime_config();
+        let mut driver = test_driver_with_config(config.clone());
+        driver.docker = Arc::new(
+            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
+        );
+
+        let namespace_dir = openshell_core::driver_utils::sandbox_token_path(
+            "docker-sandbox-tokens",
+            Some(&config.sandbox_label),
+            "sandbox-1",
+        )
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_path_buf();
+        fs::create_dir_all(&namespace_dir).unwrap();
+
+        let deleted = driver.delete_sandbox_inner("", "sandbox-1").await.unwrap();
+
+        assert!(!deleted, "nothing was removed, must not claim a deletion");
+        assert!(
+            namespace_dir.is_dir(),
+            "namespace directory must survive a name-only delete: {}",
+            namespace_dir.display()
+        );
+    })
+    .await;
+
+    server.abort();
 }

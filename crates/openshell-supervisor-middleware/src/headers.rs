@@ -16,6 +16,7 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 pub enum HeaderAuthority {
     Request,
     Response,
+    ResponseTrailers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub enum HeaderMutationError {
     InvalidExistingAction,
     MissingExistingAction { name: String },
     UnsupportedExistingAction,
+    AbsentTrailerName { name: String },
     Empty,
 }
 
@@ -47,6 +49,7 @@ impl HeaderMutationError {
             Self::InvalidExistingAction => "header_mutation_invalid_existing_action",
             Self::MissingExistingAction { .. } => "header_mutation_missing_existing_action",
             Self::UnsupportedExistingAction => "header_mutation_unsupported_existing_action",
+            Self::AbsentTrailerName { .. } => "trailer_mutation_absent_name",
             Self::Empty => "header_mutation_empty",
         }
     }
@@ -104,6 +107,10 @@ impl std::fmt::Display for HeaderMutationError {
                     "middleware returned unsupported on_existing action"
                 )
             }
+            Self::AbsentTrailerName { name } => write!(
+                formatter,
+                "middleware cannot create absent response trailer '{name}'"
+            ),
             Self::Empty => write!(formatter, "middleware returned an empty header mutation"),
         }
     }
@@ -133,6 +140,15 @@ pub fn apply(
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
                 validate_authority(authority, MutationKind::Write, &write.name, &name)?;
+                if authority == HeaderAuthority::ResponseTrailers
+                    && !existing_headers
+                        .iter()
+                        .any(|existing| existing.name.eq_ignore_ascii_case(&name))
+                {
+                    return Err(HeaderMutationError::AbsentTrailerName {
+                        name: write.name.clone(),
+                    });
+                }
                 if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
                         name: write.name.clone(),
@@ -229,6 +245,7 @@ fn validate_authority(
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
         }
+        HeaderAuthority::ResponseTrailers => is_response_protected(normalized_name),
     };
     if protected {
         return Err(HeaderMutationError::Protected {
@@ -648,6 +665,117 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn empty_response_trailers_accept_pass_through() {
+        assert_eq!(
+            apply(HeaderAuthority::ResponseTrailers, &[], &[], &[]),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn response_trailer_pass_through_preserves_fields_and_order() {
+        let existing = [
+            header("x-checksum", "one"),
+            header("x-trace", "middle"),
+            header("x-checksum", "two"),
+        ];
+
+        let updated = apply(HeaderAuthority::ResponseTrailers, &existing, &[], &[])
+            .expect("empty mutation list");
+
+        assert_eq!(updated, existing);
+    }
+
+    #[test]
+    fn response_trailer_mutations_modify_remove_and_preserve_order() {
+        let existing = [
+            header("x-checksum", "one"),
+            header("x-remove", "gone"),
+            header("x-trace", "middle"),
+            header("x-checksum", "two"),
+        ];
+
+        let updated = apply(
+            HeaderAuthority::ResponseTrailers,
+            &existing,
+            &[],
+            &[
+                write("X-Checksum", "replacement", ExistingHeaderAction::Overwrite),
+                remove("X-Remove"),
+                write("X-Trace", "last", ExistingHeaderAction::Append),
+            ],
+        )
+        .expect("permitted response trailer mutations");
+
+        assert_eq!(
+            updated,
+            vec![
+                header("x-trace", "middle"),
+                header("x-checksum", "replacement"),
+                header("x-trace", "last"),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_trailer_write_cannot_introduce_an_absent_name() {
+        let existing = [header("x-checksum", "one")];
+        let error = apply(
+            HeaderAuthority::ResponseTrailers,
+            &existing,
+            &[],
+            &[write(
+                "X-New-Trailer",
+                "value",
+                ExistingHeaderAction::Overwrite,
+            )],
+        )
+        .expect_err("absent response trailer name");
+
+        assert_eq!(
+            error,
+            HeaderMutationError::AbsentTrailerName {
+                name: "X-New-Trailer".into()
+            }
+        );
+    }
+
+    #[test]
+    fn response_trailer_removal_of_an_absent_name_is_a_noop() {
+        let existing = [header("x-checksum", "one")];
+        let updated = apply(
+            HeaderAuthority::ResponseTrailers,
+            &existing,
+            &[],
+            &[remove("X-Missing")],
+        )
+        .expect("absent response trailer removal");
+
+        assert_eq!(updated, existing);
+    }
+
+    #[test]
+    fn response_trailer_protected_fields_cannot_be_mutated() {
+        for mutation in [
+            write("Content-Length", "10", ExistingHeaderAction::Overwrite),
+            remove("Set-Cookie"),
+        ] {
+            let error = apply(
+                HeaderAuthority::ResponseTrailers,
+                &[
+                    header("content-length", "5"),
+                    header("set-cookie", "session=upstream"),
+                ],
+                &[],
+                &[mutation],
+            )
+            .expect_err("protected response trailer mutation");
+
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
         }
     }
 }

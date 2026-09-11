@@ -152,7 +152,7 @@ func TestFakeClient_AddSandbox_InList(t *testing.T) {
 	fc.AddSandbox("default", &types.Sandbox{Name: "sb-1"})
 	fc.AddSandbox("default", &types.Sandbox{Name: "sb-2"})
 
-	list, err := fc.Sandboxes().List(ctx, "default")
+	list, err := fc.Sandboxes().ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Len(t, list, 2)
 }

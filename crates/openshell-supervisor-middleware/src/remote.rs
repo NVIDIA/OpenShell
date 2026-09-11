@@ -3,12 +3,14 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::middleware::{
-    HttpRequestView, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
+use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent,
+    HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent, MiddlewareManifest,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -106,6 +108,7 @@ impl GrpcMiddlewareService {
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
     client: SupervisorMiddlewareClient<ExtensionChannel>,
+    response_client: HttpResponsePreReturnClient<ExtensionChannel>,
 }
 
 impl RemoteMiddlewareService {
@@ -133,7 +136,10 @@ impl RemoteMiddlewareService {
         let channel = InterceptedService::new(channel, interceptor);
 
         Ok(Self {
-            client: SupervisorMiddlewareClient::new(channel)
+            client: SupervisorMiddlewareClient::new(channel.clone())
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
+            response_client: HttpResponsePreReturnClient::new(channel)
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
@@ -173,6 +179,20 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         let mut client = self.client.clone();
         let responses = client
             .evaluate_web_socket_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        let mut client = self.response_client.clone();
+        let responses = client
+            .evaluate(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?

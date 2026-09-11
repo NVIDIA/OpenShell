@@ -16,7 +16,7 @@ import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
-import type { Provider } from './gen/datamodel_pb.js';
+import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
@@ -86,7 +86,7 @@ export interface Health {
 
 export interface SandboxSpec {
   name?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
   image?: string;
   labels?: Record<string, string>;
@@ -115,7 +115,7 @@ export interface SandboxSpec {
 
 export interface SandboxFromTemplateSpec {
   name?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
   templateName: string;
   labels?: Record<string, string>;
@@ -149,36 +149,41 @@ export interface SandboxWorkloadTemplateProvenance {
   resourceVersion: string;
 }
 
-export interface ListOptions {
-  limit?: number;
-  offset?: number;
+interface PaginationOptions {
+  /** Maximum resources requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
   labelSelector?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
-  workspace?: string;
-  /** List across all workspaces. Requires platform admin permission. */
-  allWorkspaces?: boolean;
 }
 
+/** Mutually exclusive named/default or all-workspaces list scope. */
+export type WorkspaceListScope =
+  | { workspace?: string; allWorkspaces?: false | undefined }
+  | { workspace?: never; allWorkspaces: true };
+
+export type ListOptions = PaginationOptions & WorkspaceListScope;
+
 export interface SandboxWorkspaceOptions {
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
 
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
 export interface SandboxTemplateWorkspaceOptions {
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
 
-export interface SandboxTemplateListOptions extends SandboxTemplateWorkspaceOptions {
-  limit?: number;
-  offset?: number;
+export type SandboxTemplateListOptions = WorkspaceListScope & {
+  /** Maximum templates requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
   /** Optional label selector in key=value comma-separated form. */
   labelSelector?: string;
-  /** List templates across all workspaces. Requires platform admin permission. */
-  allWorkspaces?: boolean;
-}
+};
 
 export interface ExecOptions extends SandboxWorkspaceOptions {
   workdir?: string;
@@ -491,8 +496,18 @@ function versionPin(value: string | undefined): bigint {
 
 const FORWARD_CHUNK = 64 * 1024;
 
-function workspaceOption(options?: SandboxWorkspaceOptions | null): string {
-  return options?.workspace ?? '';
+function workspaceName(options?: SandboxWorkspaceOptions | null): string {
+  const workspace = options?.workspace ?? 'default';
+  if (workspace.trim() === '') throw new SdkError('invalid_config', 'workspace must be non-empty');
+  return workspace;
+}
+
+function workspaceScope(options?: SandboxWorkspaceOptions | null): MessageInitShape<typeof WorkspaceSelectorSchema> {
+  return { selection: { case: 'workspace', value: workspaceName(options) } };
+}
+
+function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitShape<typeof WorkspaceSelectorSchema> {
+  return options?.allWorkspaces ? { selection: { case: 'allWorkspaces', value: {} } } : workspaceScope(options);
 }
 
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
@@ -510,11 +525,18 @@ function deadlineOptions(remainingMs: number, signal?: AbortSignal): CallOptions
   };
 }
 
-// Translate a poll failure at the wait boundary: caller cancellation and
-// deadline expiry become explicit SdkErrors; anything else propagates.
-function mapWaitError(err: unknown, name: string, deadline: number, signal?: AbortSignal): SdkError {
+// Translate a poll failure at the wait boundary: caller cancellation and the
+// poll's deadline signal both become explicit SdkErrors; anything else propagates.
+function mapWaitError(
+  err: unknown,
+  name: string,
+  deadline: number,
+  signal?: AbortSignal,
+  pollSignal?: AbortSignal,
+): SdkError {
   if (signal?.aborted) return new SdkError('connect', `wait for sandbox '${name}' aborted`);
-  if (Date.now() >= deadline) return new SdkError('connect', `timed out waiting for sandbox '${name}'`);
+  if (pollSignal?.aborted || Date.now() >= deadline)
+    return new SdkError('connect', `timed out waiting for sandbox '${name}'`);
   return err instanceof SdkError ? err : fromConnect(err);
 }
 
@@ -618,6 +640,47 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
+/** One response page from a list operation. */
+export interface Page<T> {
+  readonly items: T[];
+  readonly nextPageToken: string;
+}
+
+/** Lazy, single-pass iterator that fetches one RPC page per advance. */
+export class Pager<T> implements AsyncIterable<Page<T>> {
+  private nextToken: string | undefined;
+
+  constructor(
+    private readonly fetch: (pageToken: string) => Promise<Page<T>>,
+    pageToken = '',
+  ) {
+    this.nextToken = pageToken;
+  }
+
+  /** Fetch the next page, or return undefined after the final page. */
+  async nextPage(): Promise<Page<T> | undefined> {
+    if (this.nextToken === undefined) return undefined;
+    const page = await this.fetch(this.nextToken);
+    this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
+    return page;
+  }
+
+  /** Consume the pager and collect every remaining item. */
+  async all(): Promise<T[]> {
+    const items: T[] = [];
+    for await (const page of this) items.push(...page.items);
+    return items;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<Page<T>> {
+    for (;;) {
+      const page = await this.nextPage();
+      if (page === undefined) return;
+      yield page;
+    }
+  }
+}
+
 // ---- sandbox template client ----------------------------------------------
 
 // Reusable sandbox workload template lifecycle. Templates intentionally return
@@ -646,7 +709,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.createSandboxTemplate({
         template,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -659,7 +722,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.getSandboxTemplate({
         name,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -667,20 +730,25 @@ export class SandboxTemplateClient {
     }
   }
 
-  async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
-    try {
-      const allWorkspaces = options?.allWorkspaces ?? false;
-      const resp = await this.grpc.listSandboxTemplates({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
-        allWorkspaces,
-        labelSelector: options?.labelSelector ?? '',
-      });
-      return resp.templates;
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  list(options?: SandboxTemplateListOptions | null): Pager<SandboxWorkloadTemplate> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxTemplates({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        return { items: resp.templates, nextPageToken: resp.nextPageToken };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every sandbox template in this scope. */
+  async listAll(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
+    return this.list(options).all();
   }
 
   async delete(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<boolean> {
@@ -688,7 +756,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.deleteSandboxTemplate({
         name,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return resp.deleted;
     } catch (e) {
@@ -751,7 +819,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: spec.workspace ?? '',
+        workspaceScope: workspaceScope(spec),
         spec: specInit,
       });
       return sandboxRef(resp.sandbox);
@@ -766,7 +834,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: spec.workspace ?? '',
+        workspaceScope: workspaceScope(spec),
         spec: {
           providers: spec.providers ?? [],
           command: spec.command ?? [],
@@ -784,7 +852,7 @@ export class SandboxClient {
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.getSandbox(
-        { name, workspace: workspaceOption(options) },
+        { name, workspaceScope: workspaceScope(options) },
         requestCallOptions(options),
       );
       return sandboxRef(resp.sandbox);
@@ -793,25 +861,33 @@ export class SandboxClient {
     }
   }
 
-  async list(options?: ListOptions | null): Promise<SandboxRef[]> {
-    try {
-      const allWorkspaces = options?.allWorkspaces ?? false;
-      const resp = await this.grpc.listSandboxes({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        labelSelector: options?.labelSelector ?? '',
-        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
-        allWorkspaces,
-      });
-      return resp.sandboxes.map((s) => sandboxRef(s));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  list(options?: ListOptions | null): Pager<SandboxRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxes({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        return {
+          items: resp.sandboxes.map((sandbox) => sandboxRef(sandbox)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every sandbox in this scope. */
+  async listAll(options?: ListOptions | null): Promise<SandboxRef[]> {
+    return this.list(options).all();
   }
 
   async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {
     try {
-      const resp = await this.grpc.deleteSandbox({ name, workspace: workspaceOption(options) });
+      const resp = await this.grpc.deleteSandbox({ name, workspaceScope: workspaceScope(options) });
       return resp.deleted;
     } catch (e) {
       throw fromConnect(e);
@@ -829,13 +905,14 @@ export class SandboxClient {
       if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       let ref: SandboxRef;
+      const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
         ref = await this.get(name, {
-          ...deadlineOptions(deadline - Date.now(), signal),
+          ...pollOptions,
           workspace: options?.workspace,
         });
       } catch (e) {
-        throw mapWaitError(e, name, deadline, signal);
+        throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
       }
       if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
@@ -855,11 +932,12 @@ export class SandboxClient {
     for (;;) {
       if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
+      const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
-        await this.get(name, { ...deadlineOptions(deadline - Date.now(), signal), workspace: options?.workspace });
+        await this.get(name, { ...pollOptions, workspace: options?.workspace });
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
-        throw mapWaitError(e, name, deadline, signal);
+        throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
       }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       await waitSleep(delay, deadline, signal);
@@ -1298,7 +1376,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
     } catch (e) {
@@ -1316,7 +1394,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
     } catch (e) {
@@ -1326,7 +1404,10 @@ export class SandboxClient {
 
   async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
     try {
-      const resp = await this.grpc.listSandboxProviders({ sandboxName: name, workspace: workspaceOption(options) });
+      const resp = await this.grpc.listSandboxProviders({
+        sandboxName: name,
+        workspaceScope: workspaceScope(options),
+      });
       return resp.providers.map((p) => providerRef(p));
     } catch (e) {
       throw fromConnect(e);
@@ -1358,7 +1439,7 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       const result = updateConfigResult(resp);
       if (options?.wait)
@@ -1383,7 +1464,7 @@ export class SandboxClient {
         settingKey: key,
         settingValue: value,
         global: false,
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return updateConfigResult(resp);
     } catch (e) {
@@ -1404,10 +1485,11 @@ export class SandboxClient {
     let delay = 100;
     for (;;) {
       let config: SandboxConfig;
+      const pollOptions = deadlineOptions(deadline - Date.now());
       try {
-        config = await this.getConfig(name, { ...deadlineOptions(deadline - Date.now()), workspace });
+        config = await this.getConfig(name, { ...pollOptions, workspace });
       } catch (e) {
-        if (Date.now() >= deadline) {
+        if (pollOptions.signal?.aborted || Date.now() >= deadline) {
           throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
         }
         throw e instanceof SdkError ? e : fromConnect(e);

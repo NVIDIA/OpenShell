@@ -29,7 +29,7 @@ mod common;
 use bytes::Bytes;
 use common::{
     PkiBundle, build_tls_root, generate_pki, generate_rogue_pki, grpc_client_mtls,
-    install_rustls_provider, start_test_server,
+    start_test_server,
 };
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
@@ -160,7 +160,6 @@ fn https_client_no_cert(
 /// Valid client cert is accepted when a CA is configured.
 #[tokio::test]
 async fn mtls_valid_client_cert_accepted() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
@@ -204,7 +203,6 @@ async fn mtls_valid_client_cert_accepted() {
 /// always optional.  Auth is deferred to the application layer.
 #[tokio::test]
 async fn no_client_cert_accepted_with_ca_configured() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
@@ -250,7 +248,6 @@ async fn no_client_cert_accepted_with_ca_configured() {
 /// cert is presented.
 #[tokio::test]
 async fn bearer_header_reaches_server_without_client_cert() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
@@ -284,7 +281,6 @@ async fn bearer_header_reaches_server_without_client_cert() {
 /// client certs are optional — presented certs are still validated.
 #[tokio::test]
 async fn rogue_cert_rejected() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
@@ -333,7 +329,6 @@ async fn rogue_cert_rejected() {
 /// client certificates.  Clients connect with server-only TLS.
 #[tokio::test]
 async fn https_only_no_client_cert_required() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(

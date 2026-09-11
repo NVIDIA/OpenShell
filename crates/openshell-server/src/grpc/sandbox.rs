@@ -11,9 +11,13 @@
 
 use crate::ServerState;
 use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
+    AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
+    authorize_sandbox_workspace, authorize_workspace_selector,
 };
-use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
+use crate::pagination::Pagination;
+use crate::persistence::{
+    ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
+};
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -32,7 +36,10 @@ use openshell_core::proto::{
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
     tcp_forward_init,
 };
-use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::proto::{
+    BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
+    SandboxTemplate, SshSession,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
@@ -58,11 +65,11 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_dns1123_label, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
+    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
+use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
@@ -179,6 +186,73 @@ pub(super) async fn handle_create_sandbox(
     result
 }
 
+/// Allocate a gateway-owned staging slot for a local rootfs tar archive.
+///
+/// The caller writes the archive to the returned path and then names the token
+/// on `CreateSandbox`. It never names a filesystem path of its own choosing.
+pub(super) async fn handle_begin_rootfs_tar_staging(
+    state: &Arc<ServerState>,
+    request: Request<BeginRootfsTarStagingRequest>,
+) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+
+    let authz = authorize_workspace_selector(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        request.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
+
+    let subject = principal_subject(&principal)?;
+    let slot = state.compute.rootfs_tar_staging().begin(
+        &workspace,
+        &subject,
+        &request.file_name,
+        request.size_bytes,
+    )?;
+
+    Ok(Response::new(BeginRootfsTarStagingResponse {
+        staging_token: slot.token,
+        upload_path: slot.upload_path.to_string_lossy().into_owned(),
+        max_bytes: slot.max_bytes,
+        expires_at_ms: slot.expires_at_ms,
+    }))
+}
+
+/// Stable caller identity used to bind a staging slot to its requester.
+fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
+    match principal {
+        crate::auth::principal::Principal::User(user) => Ok(user.identity.subject.clone()),
+        _ => Err(Status::permission_denied(
+            "rootfs tar staging requires a user principal",
+        )),
+    }
+}
+
+/// Read the staging token a caller named for the active driver, without
+/// removing it. The gateway consumes it later, inside `create_sandbox`.
+fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String> {
+    let config = spec.template.as_ref()?.driver_config.as_ref()?;
+    let Kind::StructValue(driver_config) = config.fields.get(driver_name)?.kind.as_ref()? else {
+        return None;
+    };
+    match driver_config
+        .fields
+        .get(crate::compute::rootfs_tar::STAGING_TOKEN_FIELD)?
+        .kind
+        .as_ref()?
+    {
+        Kind::StringValue(token) => Some(token.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SandboxCreateTelemetryAttrs {
     requested_gpu: bool,
@@ -260,11 +334,11 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -297,16 +371,27 @@ async fn handle_create_sandbox_inner(
         (resolved, Some(provenance))
     };
 
-    // Every newly persisted sandbox has one explicit canonical process. This
-    // portable default also preserves compatibility with callers compiled
-    // before the main-process field was introduced.
+    // Leave an omitted command empty rather than persisting a concrete shell:
+    // the supervisor resolves the default login shell against the sandbox image
+    // (bash when present, otherwise /bin/sh on minimal images like Alpine),
+    // which the gateway cannot do since it does not see the sandbox filesystem.
+    // The default is an interactive login shell, so request a TTY.
     if spec.command.is_empty() {
-        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
         spec.tty = true;
     }
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
+
+    // A staging slot may only be redeemed by the caller it was issued to. This
+    // is the only point in the create path where the principal is in scope.
+    if let Some(token) = staging_token_in_spec(&spec, state.compute.configured_driver_name()) {
+        let subject = principal_subject(&principal)?;
+        state
+            .compute
+            .rootfs_tar_staging()
+            .authorize(&token, &workspace, &subject)?;
+    }
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -344,6 +429,16 @@ async fn handle_create_sandbox_inner(
     if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
+        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    }
+
+    // Process identity and MCP default materialization can increase the
+    // protobuf size. Recheck the exact canonical spec before any middleware or
+    // compute boundary can observe or persist it. The initial check remains
+    // above so requests that are already oversized still fail before I/O.
+    validate_sandbox_spec(&request.name, &spec)?;
+
+    if let Some(ref policy) = spec.policy {
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
@@ -574,11 +669,11 @@ pub(super) async fn handle_get_sandbox(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -604,65 +699,55 @@ pub(super) async fn handle_list_sandboxes(
 ) -> Result<Response<ListSandboxesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    if request.all_workspaces && !request.workspace.is_empty() {
-        return Err(Status::invalid_argument(
-            "all_workspaces and workspace are mutually exclusive",
-        ));
+    let scope = authorize_list_workspace_selector(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        request.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    if !request.label_selector.is_empty() {
+        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
     }
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-
-    let sandboxes: Vec<Sandbox> = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_all_messages(limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_all_messages_with_selector(&request.label_selector, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        }
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        None
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &request.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
+        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+            unreachable!("all-workspaces scope handled above")
+        };
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_messages(&workspace, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("list sandboxes with selector failed: {e}"))
-                })?
-        }
+        Some(workspace)
     };
-
-    Ok(Response::new(ListSandboxesResponse { sandboxes }))
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListSandboxes",
+        &[scope_fingerprint, &request.label_selector],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, selector) => ObjectListQuery::AllWorkspacesSelector(selector),
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+    };
+    let page = state
+        .store
+        .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListSandboxesResponse {
+        sandboxes: page.messages,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_create_sandbox_template(
@@ -675,11 +760,11 @@ pub(super) async fn handle_create_sandbox_template(
         .template
         .ok_or_else(|| Status::invalid_argument("template is required"))?;
     let metadata = template.metadata.clone().unwrap_or_default();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -765,11 +850,11 @@ pub(super) async fn handle_get_sandbox_template(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -793,67 +878,55 @@ pub(super) async fn handle_list_sandbox_templates(
 ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    if request.all_workspaces && !request.workspace.is_empty() {
-        return Err(Status::invalid_argument(
-            "all_workspaces and workspace are mutually exclusive",
-        ));
+    let scope = authorize_list_workspace_selector(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        request.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    if !request.label_selector.is_empty() {
+        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
     }
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-    let templates = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_all_messages::<SandboxWorkloadTemplate>(limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_all_messages_with_selector::<SandboxWorkloadTemplate>(
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        }
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        None
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &request.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
+        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+            unreachable!("all-workspaces scope handled above")
+        };
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if request.label_selector.is_empty() {
-            state
-                .store
-                .list_messages::<SandboxWorkloadTemplate>(&workspace, limit, request.offset)
-                .await
-                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
-        } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_messages_with_selector::<SandboxWorkloadTemplate>(
-                    &workspace,
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("list sandbox templates with selector failed: {e}"))
-                })?
-        }
+        Some(workspace)
     };
-    Ok(Response::new(ListSandboxTemplatesResponse { templates }))
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListSandboxTemplates",
+        &[scope_fingerprint, &request.label_selector],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = match (workspace.as_deref(), request.label_selector.as_str()) {
+        (None, "") => ObjectListQuery::AllWorkspaces,
+        (None, selector) => ObjectListQuery::AllWorkspacesSelector(selector),
+        (Some(workspace), "") => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), selector) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+    };
+    let page = state
+        .store
+        .list_message_page::<SandboxWorkloadTemplate>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?;
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListSandboxTemplatesResponse {
+        templates: page.messages,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_sandbox_template(
@@ -865,11 +938,11 @@ pub(super) async fn handle_delete_sandbox_template(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -951,11 +1024,11 @@ pub(super) async fn handle_list_sandbox_providers(
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -973,11 +1046,11 @@ pub(super) async fn handle_attach_sandbox_provider(
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -1122,11 +1195,11 @@ pub(super) async fn handle_detach_sandbox_provider(
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -1242,11 +1315,11 @@ async fn handle_delete_sandbox_inner(
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -1290,11 +1363,11 @@ async fn handle_stop_sandbox_inner(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -1334,11 +1407,11 @@ async fn handle_start_sandbox_inner(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -3073,6 +3146,7 @@ mod tests {
                 ..SandboxSpec::default()
             }),
             workload_template_name: "gpu-kata".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..CreateSandboxRequest::default()
         };
         let created = Sandbox {
@@ -3110,6 +3184,7 @@ mod tests {
                 ..SandboxSpec::default()
             }),
             workload_template_name: "missing-template".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..CreateSandboxRequest::default()
         };
 
@@ -3542,7 +3617,9 @@ mod tests {
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
                     name: "reused-name".to_string(),
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -3601,7 +3678,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3642,7 +3719,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3680,7 +3757,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3731,7 +3808,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3756,7 +3833,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3803,7 +3880,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-gcp".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3841,7 +3918,7 @@ mod tests {
             &state,
             authed_request(ListSandboxProvidersRequest {
                 sandbox_name: "work".to_string(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3871,7 +3948,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -4046,7 +4123,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4071,7 +4148,7 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4108,7 +4185,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4119,6 +4196,344 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    fn mcp_policy_with_options(
+        mcp: Option<openshell_core::proto::McpOptions>,
+    ) -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    // Keep this fixture valid independently of MCP version
+                    // defaulting: without allow-all, MCP endpoints require an
+                    // explicit method rule at the L7 validation boundary.
+                    rules: vec![openshell_core::proto::L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_policy_with_versions(versions: &[&str]) -> openshell_core::proto::SandboxPolicy {
+        mcp_policy_with_options(Some(openshell_core::proto::McpOptions {
+            versions: versions.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn mcp_padding_rule_name_for_policy_size(target_size: usize) -> String {
+        let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let mut policy = validate_and_canonicalize_policy(policy)
+            .expect("explicit default MCP policy must be canonicalizable");
+        policy.network_policies.insert(
+            "padding".to_string(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+
+        // The padding rule has no endpoints and therefore does not change the
+        // policy's behavior. Iterative adjustment accounts for protobuf varint
+        // length-prefix growth while targeting the exact encoded boundary.
+        for _ in 0..4 {
+            let current_size = policy.encoded_len();
+            if current_size == target_size {
+                break;
+            }
+
+            let padding = &mut policy
+                .network_policies
+                .get_mut("padding")
+                .expect("padding rule must exist")
+                .name;
+            if current_size < target_size {
+                padding.push_str(&"x".repeat(target_size - current_size));
+            } else {
+                let new_len = padding
+                    .len()
+                    .checked_sub(current_size - target_size)
+                    .expect("padding adjustment must remain nonnegative");
+                padding.truncate(new_len);
+            }
+        }
+
+        assert_eq!(policy.encoded_len(), target_size);
+        policy
+            .network_policies
+            .remove("padding")
+            .expect("padding rule must exist")
+            .name
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_canonicalizes_mcp_versions_before_persistence() {
+        let state = test_server_state().await;
+
+        handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "mcp-canonical".to_string(),
+                spec: Some(SandboxSpec {
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("supported MCP versions must be accepted");
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "mcp-canonical")
+            .await
+            .expect("stored sandbox lookup must succeed")
+            .expect("created sandbox must be persisted");
+        let policy = stored
+            .spec
+            .expect("sandbox spec")
+            .policy
+            .expect("sandbox policy");
+        let versions = &policy.network_policies["mcp"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options")
+            .versions;
+        assert_eq!(versions, &["2025-03-26", "2025-11-25"]);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_materializes_default_mcp_version_before_persistence() {
+        let state = test_server_state().await;
+        let cases = [
+            ("mcp-def-no-opts", None),
+            (
+                "mcp-def-empty",
+                Some(openshell_core::proto::McpOptions::default()),
+            ),
+            (
+                "mcp-def-explicit",
+                Some(openshell_core::proto::McpOptions {
+                    versions: vec!["2025-11-25".to_string()],
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let mut expected_policy = None;
+        let mut expected_bytes = None;
+
+        for (sandbox_name, mcp) in cases {
+            handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: sandbox_name.to_string(),
+                    spec: Some(SandboxSpec {
+                        policy: Some(mcp_policy_with_options(mcp)),
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("defaultable MCP versions must be accepted");
+
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .expect("stored sandbox lookup must succeed")
+                .expect("created sandbox must be persisted");
+            let policy = stored
+                .spec
+                .expect("sandbox spec")
+                .policy
+                .expect("sandbox policy");
+            let options = policy.network_policies["mcp"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options must be materialized before persistence");
+            assert_eq!(options.versions, ["2025-11-25"], "{sandbox_name}");
+
+            let encoded = policy.encode_to_vec();
+            if let Some(expected) = expected_policy.as_ref() {
+                assert_eq!(
+                    &policy, expected,
+                    "default spellings must persist the same canonical policy: {sandbox_name}"
+                );
+                assert_eq!(
+                    encoded,
+                    *expected_bytes
+                        .as_ref()
+                        .expect("canonical policy bytes accompany the expected policy"),
+                    "default spellings must persist identical policy bytes: {sandbox_name}"
+                );
+            } else {
+                expected_policy = Some(policy);
+                expected_bytes = Some(encoded);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_bounds_canonical_mcp_policy_size_for_all_default_spellings() {
+        let state = test_server_state().await;
+        let max_policy_size = super::super::MAX_POLICY_SIZE;
+
+        for (boundary, target_size, should_accept) in [
+            ("fit", max_policy_size, true),
+            ("over", max_policy_size + 1, false),
+        ] {
+            let padding_name = mcp_padding_rule_name_for_policy_size(target_size);
+            let cases = [
+                ("omitted", None),
+                ("empty", Some(openshell_core::proto::McpOptions::default())),
+                (
+                    "explicit",
+                    Some(openshell_core::proto::McpOptions {
+                        versions: vec!["2025-11-25".to_string()],
+                        ..Default::default()
+                    }),
+                ),
+            ];
+
+            for (spelling, mcp) in cases {
+                let sandbox_name = format!("mcp-{boundary}-{spelling}");
+                let mut policy = mcp_policy_with_options(mcp);
+                openshell_policy::ensure_sandbox_process_identity(&mut policy);
+                policy.network_policies.insert(
+                    "padding".to_string(),
+                    openshell_core::proto::NetworkPolicyRule {
+                        name: padding_name.clone(),
+                        ..Default::default()
+                    },
+                );
+
+                let raw_size = policy.encoded_len();
+                if spelling == "explicit" {
+                    assert_eq!(raw_size, target_size, "{sandbox_name}");
+                } else {
+                    assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
+                }
+
+                let canonical = validate_and_canonicalize_policy(policy.clone())
+                    .expect("defaultable MCP policy must be canonicalizable");
+                assert_eq!(canonical.encoded_len(), target_size, "{sandbox_name}");
+
+                let result = handle_create_sandbox(
+                    &state,
+                    authed_request(CreateSandboxRequest {
+                        name: sandbox_name.clone(),
+                        spec: Some(SandboxSpec {
+                            policy: Some(policy),
+                            ..Default::default()
+                        }),
+                        labels: HashMap::new(),
+                        annotations: HashMap::new(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        ..Default::default()
+                    }),
+                )
+                .await;
+
+                if should_accept {
+                    result.expect("canonical policy at the size limit must be accepted");
+                    let stored = state
+                        .store
+                        .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                        .await
+                        .expect("stored sandbox lookup must succeed")
+                        .expect("accepted sandbox must be persisted");
+                    let stored_policy = stored
+                        .spec
+                        .expect("sandbox spec")
+                        .policy
+                        .expect("sandbox policy");
+                    assert_eq!(stored_policy, canonical, "{sandbox_name}");
+                    assert_eq!(
+                        stored_policy.encoded_len(),
+                        max_policy_size,
+                        "{sandbox_name}"
+                    );
+                } else {
+                    let error = result.expect_err("oversized canonical policy must be rejected");
+                    assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+                    assert_eq!(
+                        error.message(),
+                        format!(
+                            "policy serialized size exceeds maximum ({target_size} > {max_policy_size})"
+                        ),
+                        "{sandbox_name}"
+                    );
+                    let stored = state
+                        .store
+                        .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                        .await
+                        .expect("stored sandbox lookup must succeed");
+                    assert!(
+                        stored.is_none(),
+                        "oversized policy must not persist sandbox {sandbox_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_invalid_mcp_versions_without_persisting() {
+        let state = test_server_state().await;
+        let cases: &[(&str, &[&str])] = &[
+            ("mcp-duplicate-versions", &["2025-11-25", "2025-11-25"]),
+            ("mcp-unsupported-version", &["2026-07-28"]),
+        ];
+
+        for &(sandbox_name, versions) in cases {
+            let error = handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: sandbox_name.to_string(),
+                    spec: Some(SandboxSpec {
+                        policy: Some(mcp_policy_with_versions(versions)),
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("invalid MCP versions must reject sandbox creation");
+
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .expect("stored sandbox lookup must succeed");
+            assert!(
+                stored.is_none(),
+                "invalid MCP versions must not persist sandbox {sandbox_name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4134,7 +4549,7 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4156,7 +4571,7 @@ mod tests {
             &state,
             authed_request(GetSandboxRequest {
                 name: "annotated".to_string(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -4195,7 +4610,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4220,7 +4635,7 @@ mod tests {
             &state,
             authed_request(GetSandboxRequest {
                 name: "partial-id".to_string(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -4260,7 +4675,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4292,7 +4707,7 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
@@ -4326,7 +4741,7 @@ mod tests {
                     }),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
-                    workspace: String::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     await_main_process_attachment: false,
                     workload_template_name: String::new(),
                 }),
@@ -4361,7 +4776,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(test_workload_template("gpu-kata")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4380,7 +4797,9 @@ mod tests {
             &state,
             authed_request(GetSandboxTemplateRequest {
                 name: "gpu-kata".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4394,10 +4813,11 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 label_selector: String::new(),
             }),
         )
@@ -4412,7 +4832,9 @@ mod tests {
             &state,
             authed_request(DeleteSandboxTemplateRequest {
                 name: "gpu-kata".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4424,7 +4846,9 @@ mod tests {
             &state,
             authed_request(GetSandboxTemplateRequest {
                 name: "gpu-kata".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4446,7 +4870,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(gpu),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4462,7 +4888,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(cpu),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4471,10 +4899,11 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 label_selector: "team=runtime".to_string(),
             }),
         )
@@ -4495,7 +4924,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(test_workload_template(" gpu-kata ")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4507,10 +4938,11 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 label_selector: String::new(),
             }),
         )
@@ -4543,7 +4975,7 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(template),
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -4555,10 +4987,11 @@ mod tests {
         let listed = handle_list_sandbox_templates(
             &state,
             authed_request(ListSandboxTemplatesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: "beta".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
                 label_selector: String::new(),
             }),
         )
@@ -4579,7 +5012,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(template),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4716,7 +5151,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(test_workload_template("overflow")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4745,7 +5182,9 @@ mod tests {
                     &state,
                     authed_request(CreateSandboxTemplateRequest {
                         template: Some(test_workload_template(&format!("overflow-{index}"))),
-                        workspace: "default".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
                     }),
                 )
                 .await
@@ -4843,7 +5282,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(test_workload_template("gpu-kata")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4874,7 +5315,9 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -4943,7 +5386,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(template),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -4956,7 +5401,9 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "default-image".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -4990,7 +5437,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(template),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -5003,7 +5452,9 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "default-gpu".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -5040,7 +5491,9 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "corrupt-template".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -5059,7 +5512,9 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 template: Some(test_workload_template("gpu-kata")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -5075,7 +5530,9 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -5098,7 +5555,9 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "Invalid_Template_Name".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -5124,7 +5583,9 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 workload_template_name: "missing-template".to_string(),
                 await_main_process_attachment: false,
             }),
@@ -5150,7 +5611,9 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
-                workspace: "missing-workspace".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "missing-workspace".to_string(),
+                )),
                 workload_template_name: String::new(),
                 await_main_process_attachment: false,
             }),
@@ -5187,7 +5650,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5234,7 +5697,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5289,7 +5752,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5336,7 +5799,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5363,7 +5826,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5562,7 +6025,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5614,7 +6077,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5677,7 +6140,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5729,7 +6192,7 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
-                workspace: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5810,7 +6273,7 @@ mod tests {
                         sandbox_name: "work".to_string(),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
-                        workspace: String::new(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     }),
                 )
                 .await
@@ -5894,7 +6357,9 @@ mod tests {
             &state,
             authed_request(GetSandboxRequest {
                 name: "shared-name".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -5907,7 +6372,9 @@ mod tests {
             &state,
             authed_request(GetSandboxRequest {
                 name: "shared-name".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -5919,11 +6386,12 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -5936,11 +6404,12 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: "beta".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -5960,11 +6429,12 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -5977,7 +6447,9 @@ mod tests {
             &state,
             authed_request(GetSandboxRequest {
                 name: "shared-name".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -6002,32 +6474,48 @@ mod tests {
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
         .await
         .unwrap()
         .into_inner();
         assert_eq!(listed.sandboxes.len(), 2);
-
-        // all_workspaces with non-empty workspace is rejected.
-        let err = handle_list_sandboxes(
+        let first_page = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 1,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: "default".to_string(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.sandboxes.len(), 1);
+        assert!(!first_page.next_page_token.is_empty());
+        let second_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                page_size: 100,
+                page_token: first_page.next_page_token,
+                label_selector: String::new(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(second_page.sandboxes.len(), 1);
+        assert!(second_page.next_page_token.is_empty());
+        assert_ne!(
+            first_page.sandboxes[0].object_id(),
+            second_page.sandboxes[0].object_id()
+        );
     }
 
     /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when
@@ -6063,7 +6551,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             non_member_request(CreateSandboxRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 spec: Some(SandboxSpec::default()),
                 ..Default::default()
             }),
@@ -6081,7 +6569,7 @@ mod tests {
         let err = handle_get_sandbox(
             &state,
             non_member_request(GetSandboxRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
             }),
         )
@@ -6097,7 +6585,7 @@ mod tests {
         let err = handle_list_sandboxes(
             &state,
             non_member_request(ListSandboxesRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -6113,7 +6601,7 @@ mod tests {
         let err = handle_list_sandbox_providers(
             &state,
             non_member_request(ListSandboxProvidersRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -6129,7 +6617,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             non_member_request(AttachSandboxProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -6145,7 +6633,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             non_member_request(DetachSandboxProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -6162,7 +6650,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
             }),
         )
@@ -6178,7 +6666,7 @@ mod tests {
             handle_stop_sandbox(
                 &state,
                 non_member_request(StopSandboxRequest {
-                    workspace: "no-such-ws".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                     name: "any".into(),
                 }),
             )
@@ -6186,7 +6674,7 @@ mod tests {
             handle_start_sandbox(
                 &state,
                 non_member_request(StartSandboxRequest {
-                    workspace: "no-such-ws".into(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                     name: "any".into(),
                 }),
             )

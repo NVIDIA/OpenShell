@@ -62,7 +62,7 @@ func ExampleClient_Providers() {
 	}
 
 	// List all providers
-	providers, err := client.Providers().List(ctx, "default")
+	providers, err := client.Providers().ListAll(ctx, "default")
 	if err != nil {
 		log.Fatal(err)
 	}

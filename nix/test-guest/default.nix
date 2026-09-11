@@ -27,6 +27,7 @@ let
 
   configurations = {
     docker = ./configuration/docker.yml;
+    podman-rootful = ./configuration/podman-rootful.yml;
     podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
     snapd = ./configuration/snapd.yml;
@@ -37,6 +38,15 @@ let
     "podman-rootless/fedora.yml"
     "podman-rootless/shared.yml"
     "podman-rootless/ubuntu.yml"
+  ];
+
+  provisionerRoles = [
+    "openshell-development"
+    "openshell-rpm"
+    "openshell-rpm-latest-release"
+    "gateway-podman"
+    "openshell-rpm-gateway-reinstall"
+    "openshell-rpm-gateway-upgrade"
   ];
 
   mkDistroProfile =
@@ -67,6 +77,13 @@ let
     }) configurationTasks)
   );
 
+  provisionerCatalog = pkgs.linkFarm "openshell-test-guest-provisioners" (
+    map (name: {
+      inherit name;
+      path = ./provisioners/roles/${name};
+    }) provisionerRoles
+  );
+
   runtimeInputs = [
     qemu
     pkgs.python3Packages.ansible-core
@@ -86,6 +103,7 @@ let
     export OPENSHELL_TEST_GUEST_RUNTIME=1
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
+    export OPENSHELL_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}

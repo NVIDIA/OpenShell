@@ -25,6 +25,16 @@ Sandbox community images are built outside this repository.
 
 ## Build Features
 
+Rust builds require Rust 1.94 or newer. TLS and certificate generation use
+AWS-LC, including the CLI and standalone examples. Native and cross-build
+environments must provide the C toolchain required by aws-lc-sys; the Nix
+development shells provide static AWS-LC libraries.
+
+SQLx uses AWS-LC with native certificate roots. The server enables
+`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
+that root selection independently of the crypto provider. Credential storage
+continues to use the same AES-256-GCM envelope format across backend changes.
+
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
@@ -147,6 +157,28 @@ in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
+The Nix flake exposes one development shell with target-specific toolchains.
+The shared `mkToolchain` function in `nix/toolchain/default.nix` assembles native
+libraries and Cargo environment settings. Linux and Darwin modules select the
+compiler and sysroot and generate the compiler wrapper for their platform.
+The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
+GCC environment, and sysroot assembly used by GNU Linux targets.
+The glibc build reuses a pinned historical Nixpkgs recipe with current build
+tools; its headers, shared libraries, and static archives are assembled into
+the sysroot from separate outputs.
+Each toolchain supplies its compiler driver, assembler, archiver, native
+libraries, and Cargo environment through derivation passthru. The shell omits
+an implicit host C compiler; Cargo builds select the appropriate tools with
+`--target`. GNU targets use a glibc 2.28 sysroot and static GCC runtimes, while
+musl targets produce static executables.
+
+On macOS, the shell also provides a native Darwin toolchain with static Z3
+and AWS-LC. Its Clang driver uses the pinned, unprocessed Apple SDK so system
+library stubs, including libiconv and libc++, retain their Apple install names.
+System libraries and frameworks remain dynamically linked. The deployment
+target matches the Nix host platform's minimum macOS version. The Rust toolchain
+does not propagate Nix's replacement system libraries into the link environment.
+
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
 embeds a `.dep-v0` section describing the Rust dependencies actually compiled
@@ -157,14 +189,15 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-The shared binary build action compiles release artifacts with `cargo auditable`.
+The shared binary build action uses the default Nix shell and compiles release
+artifacts with `cargo auditable build --target <triple>`. Verification and upload
+read binaries from `target/<triple>/release/`.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
-artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
-system install name, ad-hoc sign the modified binary, and fail if `otool -L`
-reports any remaining `/nix/store` dependency. Runtime and Syft verification
-run after that normalization. The CI image gains the pinned `cargo-auditable`
+artifact. The action checks each binary's `--version` output and leaves its
+linkage as produced by the Nix toolchain, without post-link rewriting or
+platform-specific linkage checks. The CI image gains the pinned `cargo-auditable`
 tool through `mise install --locked` but ships no auditable OpenShell binary of
 its own.
 
@@ -186,6 +219,8 @@ Runtime layout:
   gateway binaries must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
   gateway bundles z3, so the image does not need a distro-provided z3 runtime.
+  The base is pinned to a multi-architecture digest; distro security updates
+  require refreshing that digest and rebuilding the gateway image.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
@@ -196,7 +231,8 @@ Runtime layout:
   cache action runs. An explicitly configured VM runtime bundle is required to
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
-- **Supervisor**: Alpine base with `nftables`, static binary at
+- **Supervisor**: Alpine base with `nftables`; base packages are upgraded before
+  installing firewall tools to pick up distro security fixes. Static binary at
   `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
   linkage keeps the binary usable when the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes
@@ -255,6 +291,13 @@ miss before booting a disposable overlay. The separate cache app owns OCI
 pulls and explicit publication. OCI pulls require a trusted manifest digest
 and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
+
+CLI conformance runs after target provisioning. Action-free scenarios operate
+only through the configured OpenShell CLI. A versioned conformance plan may add
+an ordered sequence of target-supplied host-side actions, such as a gateway
+restart, while the scenario remains responsible for black-box sandbox
+continuity checks. The plan exposes opaque executable paths and timeouts rather
+than driver or package-manager configuration; target setup owns those details.
 
 ## Python Wheel Packaging
 
@@ -327,12 +370,32 @@ Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
 `schedule`, with `workflow_dispatch` kept for manual diagnostics; and
 `.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
-also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
-not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
+also callable through `workflow_call` and `workflow_dispatch`. CodeQL has no
+automatic `pull_request`, `merge_group`, or push trigger, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
 Codex Security is release-scoped rather than change-scoped, so it never runs on
-a pull request or merge group.
+a pull request or merge group automatically.
+
+`.github/workflows/security-scan.yml` is a manual and reusable parent for Codex
+Security, CodeQL, Trivy, Cargo Deny, and Actionlint/Zizmor. Each child runs
+independently against the supplied pre-release tag; Codex retains its cumulative
+stable-to-candidate range. The parent forwards OCI references to Trivy and
+publishes SARIF, including Codex results on manual parent runs. Codex publishes
+against the candidate commit on `main`; the other SARIF producers use the
+candidate tag and commit. Cargo Deny retains its self-hosted runner and CI
+container. Dependency Review and Trivy Changes remain separate comparison
+workflows. Existing standalone triggers remain active.
+
+The parent enforces HIGH/CRITICAL findings for Codex, CodeQL, Trivy, and Zizmor.
+Its `allow-high-critical` input disables that threshold while keeping execution
+and publication failures fatal. Each scanner evaluates its existing report
+after publication. Actionlint stays informational; Cargo Deny runs its native
+advisory check, which is independent of the severity override. Standalone
+finding policies are unchanged. Child concurrency groups distinguish the
+scanner as well as the caller, so sibling workflows cannot cancel one another.
+Codex retains its repository-wide release qualification group.
+See [CI.md](../CI.md#run-the-security-scans-together) for invocation examples.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -355,8 +418,8 @@ a pull request or merge group.
   integration targets the cfg override does not reach. Examples remain in scope,
   and E2E test code stays excluded because `e2e/` is not an analyzed path. Only
   Go requires a build; the other languages use build mode `none`. Analysis runs
-  on the nightly schedule or by manual dispatch. Results are uploaded to Code
-  Scanning and always retained as workflow artifacts.
+  on the nightly schedule, by manual dispatch, or through `workflow_call`.
+  Results are uploaded to Code Scanning and always retained as workflow artifacts.
 - **Codex Security** qualifies release candidates rather than individual
   changes. The job installs a pinned `@openai/codex-security` release into the
   runner temp directory before the repository is checked out and invokes it by
@@ -422,7 +485,9 @@ a pull request or merge group.
   `CODEX_SECURITY_STATE_DIR`, where every shell command the agent ran is
   recorded. No command at all is the signal that the sandbox failed to start.
 
-Findings never fail these checks; scanner and build failures do. A scanner that
+Findings do not fail standalone informational runs; reusable callers can enable
+HIGH/CRITICAL enforcement with `fail-on-findings`. Scanner and build failures
+always fail. A scanner that
 cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
 Graph API error, and a Codex Security range, scan, or export failure are all
 errors, which keeps an informational check from silently degrading into a no-op.
@@ -439,19 +504,43 @@ tags and gating stable promotion on qualification results are part of
 [RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
 implemented yet.
 
-See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
+## Artifact Scanning
+
+Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
+workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
+
+The standalone workflow scans deployment configuration and supplied OCI
+references independently of release publication. Detailed JSON reports feed the
+differential gate; the summary and published SARIF consolidate configuration
+findings across profiles while preserving resource identity and affected profiles.
+Images and packaged charts retain separate identities based on their full
+references. Publication batches respect GitHub's limit of 20 SARIF runs.
+
+The PR/merge-group gate scans base and candidate with the same scanner and rejects
+new `HIGH` or `CRITICAL` configuration findings. Its stable
+`OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
+Image CVEs need the standalone scan. The reporting and gate invariants are:
+
+- A structurally invalid Trivy report is an error, not an empty finding set.
+- Scanner failures prevent publication of incomplete analyses; findings alone
+  do not prevent publishing complete reports.
+- Findings compare per profile against the same baseline profile, by semantic
+  identity and count rather than line number; a profile absent from the baseline
+  falls back to that identity's maximum across all profiles.
+- The candidate's ignore file is validated, but the baseline's policy applies to
+  both scans, so an exemption takes effect only after merge.
+
+See [CI.md](../CI.md#artifact-scanning) for profiles, report paths, severity
+settings, exceptions, and the contributor and maintainer workflows.
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
+
+Rust CI rejects stale or modified Cargo lockfiles and runs Clippy for the
+workspace, E2E crate, and standalone examples.
 
 - Run `mise run pre-commit` before committing.
 - Run `mise run test` after code changes.

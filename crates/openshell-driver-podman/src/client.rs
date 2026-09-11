@@ -272,9 +272,13 @@ pub struct HostInfo {
 /// Podman returns `host.security.rootless: true` when the daemon is
 /// running without root privileges (rootless mode).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SecurityInfo {
     #[serde(default)]
     pub rootless: bool,
+    /// Whether the Podman host has `AppArmor` support enabled.
+    #[serde(default)]
+    pub apparmor_enabled: bool,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────
@@ -719,7 +723,7 @@ impl PodmanClient {
             url_encode(policy),
         );
         // Image pulls can be slow — use a generous timeout.
-        let pull_timeout = Duration::from_secs(600);
+        let pull_timeout = Duration::from_mins(10);
         let (status, bytes) = self
             .request(hyper::Method::POST, &path, None, pull_timeout)
             .await?;
@@ -959,13 +963,17 @@ mod tests {
                     "cgroupVersion": "v2",
                     "networkBackend": "netavark",
                     "rootlessNetworkCmd": "pasta",
-                    "security": {"rootless": true}
+                    "security": {
+                        "rootless": true,
+                        "apparmorEnabled": true
+                    }
                 }
             }"#,
         )
         .unwrap();
 
         assert!(info.host.security.rootless);
+        assert!(info.host.security.apparmor_enabled);
         assert_eq!(info.host.rootless_network_cmd, "pasta");
     }
 

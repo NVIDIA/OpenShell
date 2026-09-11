@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
-    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
+    map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -14,34 +15,85 @@ use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+
+#[cfg(test)]
+pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
+    SQLITE_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.sql.as_ref())
+}
+static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
+}
+
+fn push_label_selector(
+    sql: &mut QueryBuilder<Sqlite>,
+    label_selector: &str,
+) -> PersistenceResult<()> {
+    let mut labels: Vec<_> = super::parse_label_selector(label_selector)?
+        .into_iter()
+        .collect();
+    labels.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (key, value) in labels {
+        let escaped_key = key
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\'', "''");
+        sql.push(format!(
+            " AND json_extract(o.labels, '$.\"{escaped_key}\"') = "
+        ))
+        .push_bind(value);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
+    let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    connection.close().await.map_err(|e| map_db_error(&e))
 }
 
 impl SqliteStore {
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
-        self.pool.close().await;
+        self.close().await;
     }
 
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };
 
-        let options = SqliteConnectOptions::from_str(url)
+        let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
+
+        if is_in_memory {
+            if options.get_filename().as_os_str().is_empty()
+                || options.get_filename() == Path::new(":memory:")
+            {
+                let sequence = IN_MEMORY_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                options = options.filename(format!("file:openshell-in-memory-{sequence}"));
+            }
+            options = options.shared_cache(true);
+        }
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
@@ -55,6 +107,15 @@ impl SqliteStore {
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
 
+        let in_memory_keepalive = if is_in_memory {
+            let connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            Some(Arc::new(Mutex::new(Some(connection))))
+        } else {
+            None
+        };
+
         let pool = pool_options
             .connect_with(options)
             .await
@@ -65,7 +126,10 @@ impl SqliteStore {
             restrict_db_file_permissions(&path)?;
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            in_memory_keepalive,
+        })
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
@@ -88,6 +152,12 @@ impl SqliteStore {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
         self.pool.close().await;
+        if let Some(keepalive) = &self.in_memory_keepalive {
+            let connection = keepalive.lock().await.take();
+            if let Some(connection) = connection {
+                let _ = connection.close().await;
+            }
+        }
     }
 
     pub async fn put(
@@ -695,6 +765,93 @@ LIMIT ?2
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            "SELECT o.object_type, o.id, o.name, o.workspace, o.payload, \
+             o.created_at_ms, o.updated_at_ms, o.labels, o.resource_version \
+             FROM objects o WHERE o.object_type = ",
+        );
+        sql.push_bind(object_type);
+
+        match query {
+            ObjectListQuery::Workspace(workspace) => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+            }
+            ObjectListQuery::AllWorkspaces => {}
+            ObjectListQuery::Scope(scope) => {
+                sql.push(" AND o.scope = ").push_bind(scope);
+            }
+            ObjectListQuery::WorkspaceSelector {
+                workspace,
+                label_selector,
+            } => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+                push_label_selector(&mut sql, label_selector)?;
+            }
+            ObjectListQuery::AllWorkspacesSelector(label_selector) => {
+                push_label_selector(&mut sql, label_selector)?;
+            }
+            ObjectListQuery::Membership {
+                member_type,
+                member_name,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+            }
+            ObjectListQuery::MembershipSelector {
+                member_type,
+                member_name,
+                label_selector,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+                push_label_selector(&mut sql, label_selector)?;
+            }
+        }
+
+        if let Some(cursor) = after {
+            sql.push(" AND (o.created_at_ms, COALESCE(o.name, ''), o.workspace, o.id) > (")
+                .push_bind(cursor.created_at_ms)
+                .push(", ")
+                .push_bind(&cursor.name)
+                .push(", ")
+                .push_bind(&cursor.workspace)
+                .push(", ")
+                .push_bind(&cursor.id)
+                .push(")");
+        }
+        sql.push(
+            " ORDER BY o.created_at_ms ASC, COALESCE(o.name, '') ASC, \
+             o.workspace ASC, o.id ASC LIMIT ",
+        )
+        .push_bind(i64::from(limit));
+
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
     pub async fn list_with_membership(
         &self,
         object_type: &str,
@@ -782,7 +939,8 @@ AND EXISTS (
         )
         .unwrap();
 
-        let mut query = sqlx::query(&sql)
+        // Label paths above escape SQL quotes; all values remain bound parameters.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(object_type)
             .bind(member_type)
             .bind(member_name);
@@ -835,27 +993,24 @@ LIMIT ?3 OFFSET ?4
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        use super::parse_label_selector;
-
-        let required_labels = parse_label_selector(label_selector)?;
-        let all_records = self.list(object_type, workspace, u32::MAX, 0).await?;
-
-        let filtered: Vec<ObjectRecord> = all_records
-            .into_iter()
-            .filter(|record| {
-                let labels_json = record.labels.as_deref().unwrap_or("{}");
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_str(labels_json).unwrap_or_default();
-
-                required_labels
-                    .iter()
-                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
-            })
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-
-        Ok(filtered)
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            r#"SELECT o."object_type", o."id", o."name", o."workspace", o."payload", o."created_at_ms", o."updated_at_ms", o."labels", o."resource_version"
+FROM "objects" o
+WHERE o."object_type" = "#,
+        );
+        sql.push_bind(object_type).push(" AND o.\"workspace\" = ");
+        sql.push_bind(workspace);
+        push_label_selector(&mut sql, label_selector)?;
+        sql.push(" ORDER BY o.\"created_at_ms\" ASC, o.\"name\" ASC LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
     pub async fn list_all_with_selector(
@@ -865,27 +1020,23 @@ LIMIT ?3 OFFSET ?4
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        use super::parse_label_selector;
-
-        let required_labels = parse_label_selector(label_selector)?;
-        let all_records = self.list_by_type(object_type, u32::MAX, 0).await?;
-
-        let filtered: Vec<ObjectRecord> = all_records
-            .into_iter()
-            .filter(|record| {
-                let labels_json = record.labels.as_deref().unwrap_or("{}");
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_str(labels_json).unwrap_or_default();
-
-                required_labels
-                    .iter()
-                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
-            })
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-
-        Ok(filtered)
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            r#"SELECT o."object_type", o."id", o."name", o."workspace", o."payload", o."created_at_ms", o."updated_at_ms", o."labels", o."resource_version"
+FROM "objects" o
+WHERE o."object_type" = "#,
+        );
+        sql.push_bind(object_type);
+        push_label_selector(&mut sql, label_selector)?;
+        sql.push(" ORDER BY o.\"created_at_ms\" ASC, o.\"name\" ASC LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
     }
     pub async fn put_policy_revision(
         &self,
@@ -1120,6 +1271,32 @@ LIMIT ?3 OFFSET ?4
         .bind(sandbox_id)
         .bind(i64::from(limit))
         .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        rows.into_iter().map(row_to_policy_record).collect()
+    }
+
+    pub async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        let rows = sqlx::query(
+            r#"
+SELECT "id", "scope", "version", "status", "payload", "created_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "scope" = ?2 AND (?3 IS NULL OR "version" < ?3)
+ORDER BY "version" DESC
+LIMIT ?4
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(sandbox_id)
+        .bind(before_version)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

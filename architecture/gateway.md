@@ -2,17 +2,16 @@
 
 The gateway is the OpenShell control plane. It exposes the API used by the CLI,
 SDK, and TUI; persists platform state; manages provider credentials and
-inference configuration; and asks compute runtimes to create or delete sandbox
-workloads.
+attachments; and asks compute runtimes to create or delete sandbox workloads.
 
 ## Responsibilities
 
 - Authenticate clients and sandbox callbacks.
 - Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
-  settings, inference configuration, logs, watch streams, and relay forwarding.
+  settings, logs, watch streams, and relay forwarding.
 - Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
 - Persist domain objects in SQLite or Postgres.
-- Resolve provider credentials and inference bundles for sandbox supervisors.
+- Resolve endpoint-bound provider environments for sandbox supervisors.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
@@ -38,6 +37,20 @@ immediately without a grace period. Finalization is persisted separately from
 the exit result; the gateway deletes an ephemeral sandbox only after the
 finalized supervisor session disconnects.
 
+## Configuration Boundary
+
+The gateway accepts exactly schema version 2. Missing, legacy, and future
+versions fail before runtime construction, and driver settings belong only to
+`[openshell.drivers.<name>]`. The process does not migrate legacy files.
+Package lifecycle code may replace an exact package-generated v1 default, but
+it preserves edited configurations for explicit operator migration.
+
+Gateway listener TLS and sandbox callback TLS are separate inputs. A selected
+local Docker, Podman, or VM driver requires a complete guest bundle whenever
+the gateway listener uses TLS; package-managed local TLS can supply that bundle.
+Kubernetes instead projects guest credentials through its configured Secret.
+The gateway validates this requirement before constructing the selected driver.
+
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
@@ -55,6 +68,16 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
+select one non-empty workspace explicitly; `default` is an ordinary explicit
+name, not an omitted-value fallback. Sandbox, sandbox template, provider, and
+service list RPCs also accept an all-workspaces marker after Platform Admin
+authorization. Single-workspace handlers reject that marker. Platform-global
+policy operations require the selector to be absent, while workspace policy
+operations require it. The gateway authorizes the selected scope before
+performing resource lookup so malformed, unsupported, and unauthorized scopes
+have consistent behavior across resource types.
+
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway
 reuses it; sandbox JWT authentication and its RPC allowlist remain the callback
@@ -62,7 +85,7 @@ authorization boundary. When the primary listener does not cover the address,
 the gateway adds a callback-only listener. Additional callback listeners accept
 only gRPC methods classified as sandbox-callable by the gateway's generated
 authorization metadata. They reject user and administrator APIs, health,
-reflection, non-callback inference APIs, and HTTP routes before normal request
+reflection, and HTTP routes before normal request
 authentication. The operator-configured primary listener retains the full
 multiplexed API surface.
 
@@ -75,10 +98,9 @@ drivers are tracked in
 [#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
 
 The primary listener serves the gRPC reflection v1 protocol without application
-authentication. It advertises only the public `openshell.v1.OpenShell` and
-`openshell.inference.v1.Inference` services. TLS and client-certificate
-requirements still apply at the transport layer. Callback-only listeners reject
-reflection before authentication.
+authentication. It advertises only the public `openshell.v1.OpenShell` service.
+TLS and client-certificate requirements still apply at the transport layer.
+Callback-only listeners reject reflection before authentication.
 
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
@@ -198,7 +220,7 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. JWKS validation accepts RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519) signing keys. |
 
 The CLI persists the scopes requested during OIDC login in gateway metadata and
 reuses them when refreshing an access token. This preserves the intended API
@@ -252,10 +274,10 @@ controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
-The config default is
-`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
-gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
-shared deployments should set a positive TTL.
+Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
+single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
+Kubernetes and other shared deployments should set a positive TTL. Explicit
+zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -283,7 +305,6 @@ The gateway API is organized around platform objects and operational streams:
 | Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
 | Providers | Store provider records, discover credentials, resolve runtime environment. |
 | Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
-| Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
 | Observability | Push sandbox logs, stream sandbox status and logs to clients. |
 
 Domain objects use shared metadata: stable server-generated IDs, human-readable
@@ -305,7 +326,7 @@ The storage schema is intentionally narrow:
 | Column | Purpose |
 |---|---|
 | `id` | Stable gateway-generated object ID and primary key. |
-| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `ssh_session`, `inference_route`, `sandbox_policy`, or `draft_policy_chunk`. |
+| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `provider_profile`, `ssh_session`, `sandbox_policy`, or `draft_policy_chunk`. |
 | `name` | Human-readable name, unique within an object type when present. |
 | `scope` | Optional owner or namespace for scoped/versioned records, such as a sandbox ID for policy revisions. |
 | `version` | Optional monotonically increasing version for scoped records. |
@@ -315,6 +336,81 @@ The storage schema is intentionally narrow:
 | `payload` | Prost-encoded protobuf payload for the full domain object. |
 | `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
 | `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
+
+### Protobuf API and storage boundaries
+
+Public RPC contracts and durable protobuf formats have separate ownership. The
+`openshell.v1.OpenShell` service currently has 74 RPCs. Their request and
+response roots, streaming flags, and transitive message closure come from the
+public descriptor set generated by `openshell-core`; a fingerprint test in
+`openshell-server` requires this inventory to be reviewed whenever it changes.
+Compute-driver, credential-driver, gateway-interceptor, and
+supervisor-middleware services are compiled contracts for internal extension
+boundaries, not public gateway RPCs. The current public inventory has 74
+methods, 278 messages, and 12 enums
+(`0f14943574349d02bdc61076c8c5a59a98b627325564ef1a6d21d7941825dc46`).
+
+Storage-only messages live in the private, versioned
+`openshell.storage.v1` package under `crates/openshell-server/proto`. The server
+generates these types separately, so the public descriptor set and the Rust,
+Go, Python, and TypeScript client generation inputs do not advertise them.
+
+| Storage classification | Protobuf messages | Durable use |
+|---|---|---|
+| Encoded storage roots | `StoredProviderCredentialRefreshState`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. |
+| Nested storage-only type | `StoredRefreshMaterialDeletion` | Repeated child records inside provider refresh state. |
+| SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
+| Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
+| Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
+
+The 12 encoded durable roots above have a closure of 81 messages and eight
+enums (`920a5243dfb37ce709f0f562a47d17791a5ede90fd7f662ed01542abd60a0dfb`).
+Its intersection with the public RPC closure contains 71 messages and eight
+enums (`05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415`).
+The descriptor-derived test owns these full inventories; the tables here record
+the reviewed roots and classifications.
+
+| Dual-purpose encoded root | Current decision |
+|---|---|
+| `Sandbox` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `SandboxWorkloadTemplate` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `Provider` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `Workspace` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `WorkspaceMember` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `SshSession` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `ServiceEndpoint` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `SandboxPolicy` | Defer a storage twin; govern its complete dependency closure as durable. |
+
+The public/storage overlap is deliberate for the current format. Storage twins
+for the public roots are deferred: introducing them would require a broad
+conversion boundary, and Prost does not retain unknown fields through a
+decode-and-reencode conversion. Each root therefore carries a reviewed decision
+to remain dual-purpose, and its complete transitive dependency closure is also
+a durable format. Important embedded dependencies include `ObjectMeta`,
+`ProviderProfile`, `CredentialHandle`, `SandboxPolicy`, and
+`NetworkPolicyRule`. Global and sandbox settings additionally store an encoded
+`SandboxPolicy` inside their JSON envelope.
+
+Public API compatibility and storage compatibility are reviewed independently:
+
+- Public compatibility is evaluated from public service descriptors and SDK
+  generation inputs. Storage-only packages must never enter that closure.
+- `openshell.storage.v1` is frozen. Its test fingerprint covers message names,
+  field numbers, cardinality, scalar wire types, referenced types, map-entry
+  shapes, and optional presence. Keep its decoder available and introduce a
+  new versioned package plus an explicit migration or fallback decoder for a
+  format change; never reuse removed tags or names.
+- Checked-in synthetic byte fixtures were encoded with the former
+  `openshell.v1` declarations. Current storage types must continue to decode
+  them semantically, which proves the package move does not require a database
+  rewrite. Protobuf payload bytes do not encode a message's package name.
+- A change to a dual-purpose public message or any transitive durable
+  dependency requires both public-wire review and storage-migration review.
+  Wire-incompatible changes require a migration or fallback decoder and a
+  fixture for the earlier format.
+- Mixed-version writers are unsupported. An older Prost writer can discard
+  fields it does not know when it reads and rewrites a record, even when the
+  newer field is wire-compatible.
 
 Common resources use generic helpers that derive `object_type`, `id`, `name`,
 and labels from protobuf metadata traits before encoding the full message into
@@ -342,15 +438,19 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+For in-memory SQLite, the adapter retains a dedicated keepalive connection for
+the store lifetime. Operational connection replacement therefore preserves the
+shared in-memory schema and objects instead of creating an empty database.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is
 reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
 default WAL journal mode), which mirror the same sensitive contents.
 
-Persisted state includes sandboxes, providers, provider credential refresh
-state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records, and reusable sandbox workload templates. Provider refresh
+Persisted state includes sandboxes, providers, provider profiles, provider
+credential refresh state, SSH sessions, policy revisions, settings, deployment
+records, and reusable sandbox workload templates. Provider refresh
 state is stored as a separate object scoped to the provider instance through
 `objects.scope`. Its non-secret configuration remains inline, while refresh
 tokens, client secrets, private keys, and other secret source material are
@@ -448,11 +548,37 @@ modes:
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
   backfill and sandbox annotation updates).
 
-**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
-protobuf payloads from list results and hydrate `resource_version` from the
-authoritative database column into each decoded message, mirroring the
-`get_message` pattern. This ensures list responses carry correct versions
-without requiring callers to manually hydrate each record.
+**Lists.** Public list RPCs follow AIP-158: requests carry direct `page_size`
+and `page_token` fields, and responses carry `next_page_token`. The gateway
+clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
+Tokens bind the RPC and every request parameter except `page_size`, contain no
+authorization grant, and use immutable keyset cursors rather than database
+offsets. Each page repeats normal authentication and authorization. Pagination
+is weakly consistent under concurrent writes and deletes; it does not provide a
+historical snapshot.
+
+The token wire format is a private shared protobuf used only by the gateway.
+Public request and response messages repeat the standard AIP fields directly
+instead of wrapping them in a shared pagination message.
+
+The CLI returns paginated JSON and YAML as response-shaped envelopes containing
+the resource collection and `next_page_token`; table output reports a non-empty
+token on stderr. The TUI traverses complete workspace, provider, profile, and
+sandbox collections in one cancellable background refresh task, never overlaps
+periodic list refreshes, and discards results after a gateway or workspace
+change.
+
+Curated Rust, Python, Go, and TypeScript SDK list methods return lazy pagers.
+Advancing a pager issues one list RPC and exposes its continuation token;
+explicit `list_all` helpers are the only curated APIs that exhaust a collection.
+
+Persistence distinguishes one-page operations from exhaustive scans.
+`list_object_page` and `list_message_page` return one keyset page and its next
+cursor. `collect_records` and `collect_messages` exhaust those pages, fail on
+database or protobuf decode errors, and hydrate `resource_version` from the
+authoritative database column. Internal callers that require every matching
+record use the exhaustive helpers; bounded lookups continue to use page-level
+methods.
 
 **Deletes.** Delete operations are not yet CAS-protected -- the delete request
 protos do not carry `expected_resource_version`. A `delete_if` primitive exists
@@ -466,7 +592,6 @@ coverage:
 | Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
 | ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
-| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
 | Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
 
@@ -528,69 +653,25 @@ configuration, valid endpoint-bound static credentials from other attached
 providers, and the dynamic credential snapshot. Provider environment revisions
 include profile endpoint and binding changes.
 
-## Inference Resolution
+## Provider Environment Resolution
 
-Cluster inference routes store only `provider_name`, `model_id`, and optional
-timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
-style, and route-shaping metadata from the provider record when supervisors call
-`GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
+The gateway resolves only the providers attached to a sandbox. It combines each
+provider instance with its profile, returns non-secret configuration, and marks
+credentials with the profile's host, port, and path boundaries. The supervisor
+uses those bindings when it replaces credential placeholders in policy-allowed
+requests.
 
-The bundle carries enough information for sandbox-local routers to construct
-upstream URLs without re-deriving provider-specific routing logic. Each resolved
-route may include:
-
-| Field | Meaning |
-|---|---|
-| `model_in_path` | When true, the model identifier is part of the upstream URL path, not only the request body. |
-| `request_path_override` | Path override or suffix. With `model_in_path=false`, replaces the protocol-derived path; with `model_in_path=true`, appended after the model ID. |
-
-For standard providers these fields stay unset and the sandbox router uses default
-protocol paths. Vertex AI is model-aware: the gateway constructs the base URL
-from provider config (`VERTEX_AI_PROJECT_ID`, `VERTEX_AI_REGION`, optional
-`VERTEX_AI_PUBLISHER`) and emits route-shaping metadata so the sandbox router
-stays provider-agnostic.
-
-Host selection follows the configured region:
-
-| Region value | Vertex host |
-|---|---|
-| `global` | `aiplatform.googleapis.com` |
-| `us` or `eu` | `aiplatform.{region}.rep.googleapis.com` |
-| Any other (e.g. `us-central1`) | `{region}-aiplatform.googleapis.com` |
-
-Route shaping by publisher:
-
-- **Anthropic (Claude)** — `model_in_path=true`, base path under
-  `publishers/anthropic/models`, protocol `anthropic_messages` only. The gateway
-  resolves `request_path_override=:rawPredict`; the sandbox router keeps
-  `:rawPredict` for buffered requests and upgrades to `:streamRawPredict` only
-  for streaming proxy calls.
-- **All other models** (Gemini, third-party, unknown) — OpenAI-compatible
-  `.../endpoints/openapi` base with `request_path_override=/chat/completions`;
-  protocol `openai_chat_completions`.
-
-Callers may supply `GOOGLE_VERTEX_AI_BASE_URL` or `VERTEX_AI_BASE_URL` only for
-non-Anthropic routes. Anthropic base URL overrides are rejected because they
-cannot safely preserve model-path shaping and `anthropic_version` body
-adaptation. Overrides still pin `request_path_override=/chat/completions` and
-must use `https` with an official Vertex AI hostname (`aiplatform.googleapis.com`,
-`aiplatform.{us,eu}.rep.googleapis.com`, or `{region}-aiplatform.googleapis.com`).
-
-Header passthrough is protocol-dependent. Vertex Claude rawPredict routes strip
-client `anthropic-beta` headers; `anthropic-version` is not forwarded because
-the sandbox router injects `anthropic_version` into the request body for Vertex
-rawPredict. Non-Anthropic Vertex routes do not inherit Anthropic passthrough
-headers.
+Model selection, API protocol, request and response shapes, streaming behavior,
+and endpoint URL construction remain responsibilities of the workload's native
+client. The gateway does not parse or transform model API requests.
 
 For `google-vertex-ai` providers created with CLI `--from-gcloud-adc`, the CLI
 calls gateway `ConfigureProviderRefresh` with OAuth2 refresh material from gcloud
 ADC, then `RotateProviderCredential` to mint the first access token before
 reporting success. ADC-backed providers mint into `GOOGLE_VERTEX_AI_TOKEN`. A
 successful create therefore yields an immediately usable provider; failures roll
-back the provider record. Service-account JSON and private keys are gateway-side
-refresh bootstrap material only; sandbox runtime inference receives minted
-access tokens, not raw service-account material.
+back the provider record. Service-account JSON and private keys remain gateway-side
+refresh bootstrap material; sandboxes receive minted access tokens instead.
 
 ## Supervisor Relay
 
@@ -696,9 +777,10 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 ```
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
-Driver implementation settings live in the TOML driver tables. See
-`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
-0003 for the full schema.
+Driver implementation settings live exclusively in TOML driver tables. The
+selector is the singular `[openshell.gateway] compute_driver`; legacy
+`compute_drivers` lists are rejected. See `docs/reference/gateway-config.mdx`
+for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with
 `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
@@ -712,26 +794,20 @@ aliases, network names, and the sandbox JWT issuer.
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
-### Driver inheritance
+### Driver ownership
 
-`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
-`default_image`,
-`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
-`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
-driver's `[openshell.drivers.<name>]` table when the driver-specific table
-does not override them. The allowlist is per-driver so a gateway-wide
-default cannot land in a driver that does not understand it (e.g.
-`client_tls_secret_name` is K8s-only).
+`[openshell.gateway]` contains gateway process settings only. Each selected
+driver reads its own configuration exclusively from
+`[openshell.drivers.<name>]`; values are never inherited from gateway scope.
+Kubernetes owns `namespace`, `default_image`, `supervisor_image`,
+`client_tls_secret_name`, `service_account_name`, `host_gateway_ip`,
+`enable_user_namespaces`, and `sa_token_ttl_secs`. Docker uses
+`sandbox_label` instead of the legacy `sandbox_namespace` name. Podman and VM
+likewise own their image, endpoint, and runtime settings in their tables.
 
-`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
-`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
-Podman uses the lowercase enum `always | missing | never | newer`. No
-value means the same thing in both, so the key lives only under each
-driver's own table.
-
-Driver-specific values that are not part of the inheritance allowlist
-(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
-table.
+`image_pull_policy` uses the shared canonical vocabulary
+`always | if_not_present | never | newer`. Drivers translate it to their runtime
+APIs; `newer` is supported only by Podman and rejected by Docker and Kubernetes.
 
 ### OTLP export
 
@@ -762,9 +838,22 @@ identity and configured compute driver.
 
 The gateway forwards OTLP configuration, its configured gateway name, and W3C
 trace context to managed external drivers. Built-in drivers use dedicated
-in-process providers that preserve the same RPC trace boundary. Each driver
+in-process providers that preserve the same RPC trace boundary. A shared
+compute-driver tracing descriptor derives provider layers and standalone
+installation from each driver's service identity, and routes both the shared
+RPC boundary target and that driver's crate target prefix. A shared RPC tracer
+owns unary and streaming boundary outcomes. Each driver
 exports to the configured collector under its own service name and carries the
-gateway name as a resource attribute.
+gateway name and configured compute driver as resource attributes.
+Compute-driver client and server spans share the fully qualified protobuf
+operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`,
+in both the span name and `rpc.method`; the current RPC semantic conventions
+integrate the service into that fully qualified method and do not emit
+`rpc.service`. `service.name` and span kind distinguish the two sides.
+Backend-prefixed spans describe implementation work beneath that boundary.
+Streaming `WatchSandboxes` spans remain open for the stream lifetime on both
+sides. A terminal stream status records its outcome;
+consumer teardown without a terminal status leaves the span status unset.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at
@@ -792,7 +881,10 @@ system entry instead of pretending to delete package-manager owned state.
 - Gateway TLS and client certificate distribution are deployment concerns owned
   by the operator or packaging layer.
 - Compute runtimes own the mechanics of starting workloads and injecting
-  callback configuration.
+  callback configuration. Local Docker, Podman, and VM callback endpoints can
+  be derived from their fixed host aliases. Kubernetes requires an explicit
+  endpoint from deployment topology; Helm renders it from the gateway Service
+  name and namespace rather than inferring it from sandbox placement.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
   reachability and add a listener only when the primary does not cover it.

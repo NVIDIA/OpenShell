@@ -27,9 +27,9 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
-pub mod inference;
 pub mod jwt;
 pub mod local_api_socket;
+pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
@@ -45,16 +45,18 @@ pub mod provider_credentials;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;
+pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    Config, GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
-    GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
-    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig,
+    AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

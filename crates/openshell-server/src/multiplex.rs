@@ -17,9 +17,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use openshell_core::proto::{
-    inference_server::InferenceServer, open_shell_server::OpenShellServer,
-};
+use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -51,11 +49,9 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
-    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace_selector},
     gateway_listener::GatewayListenerScope,
-    http_router,
-    inference::InferenceService,
-    service_http_router,
+    http_router, service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -205,7 +201,7 @@ macro_rules! request_id_middleware {
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
-const REFLECTED_PROTO_ROOTS: &[&str] = &["openshell.proto", "inference.proto"];
+const REFLECTED_PROTO_ROOTS: &[&str] = &["openshell.proto"];
 
 /// Restrict reflection to the public gateway APIs and their imported types.
 fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::DecodeError> {
@@ -311,12 +307,9 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
-        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let reflection = tonic_reflection::server::Builder::configure()
             .register_file_descriptor_set(gateway_reflection_descriptor_set()?)
             .with_service_name("openshell.v1.OpenShell")
-            .with_service_name("openshell.inference.v1.Inference")
             .build_v1()?;
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
@@ -325,7 +318,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, inference, reflection),
+            GrpcRouter::new(openshell, reflection),
             authenticator_chain,
             authz_policy,
             self.state
@@ -597,11 +590,11 @@ async fn hydrate_update_provider_identity(
 
     let principal =
         principal.ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
-    let authorized = authorize_workspace(
+    let authorized = authorize_workspace_selector(
         state.store.as_ref(),
         &state.admin_role,
         principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -959,39 +952,30 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell`, Inference, and
-/// reflection services based on the request path prefix.
+/// Combined gRPC service that routes between `OpenShell` and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, I, R> {
+pub struct GrpcRouter<N, R> {
     openshell: N,
-    inference: I,
     reflection: R,
 }
 
-impl<N, I, R> GrpcRouter<N, I, R> {
-    fn new(openshell: N, inference: I, reflection: R) -> Self {
+impl<N, R> GrpcRouter<N, R> {
+    fn new(openshell: N, reflection: R) -> Self {
         Self {
             openshell,
-            inference,
             reflection,
         }
     }
 }
 
-const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, I, R, B> tower::Service<Request<B>> for GrpcRouter<N, I, R>
+impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
     N::Future: Send,
     N::Error: Send,
-    I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
-        + Clone
-        + Send
-        + 'static,
-    I::Future: Send,
     R: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
         + Clone
         + Send
@@ -1008,12 +992,7 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let path = req.uri().path();
-
-        if path.starts_with(INFERENCE_PATH_PREFIX) {
-            let mut svc = self.inference.clone();
-            Box::pin(async move { svc.ready().await?.call(req).await })
-        } else if path.starts_with(REFLECTION_PATH_PREFIX) {
+        if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
             let mut svc = self.reflection.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
@@ -1538,7 +1517,6 @@ mod tests {
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
             "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
             "/openshell.v1.OpenShell/RefreshSandboxToken",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
         ];
 
         for path in callback_paths {
@@ -1571,8 +1549,6 @@ mod tests {
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
             "/openshell.v1.OpenShell/CreateProvider",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
-            "/openshell.inference.v1.Inference/SetInferenceRoute",
         ];
 
         for path in rejected_grpc_paths {
@@ -1591,7 +1567,6 @@ mod tests {
         let paths = [
             "/grpc.health.v1.Health/Check",
             "/openshell.v1.OpenShell/ListSandboxes",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
             "/health",
             "/service",
         ];
@@ -1853,7 +1828,9 @@ mod tests {
                 )]),
                 ..Default::default()
             }),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         };
         let authed = crate::grpc::test_support::authed_request(());
@@ -2542,7 +2519,6 @@ mod tests {
             "/openshell.v1.OpenShell/CreateSandbox",
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
             "/metrics",
         ];
 
@@ -2565,7 +2541,6 @@ mod tests {
 
         let expected = [
             "GET",
-            "openshell.inference.v1.Inference/GetInferenceBundle",
             "openshell.v1.OpenShell/CreateSandbox",
             "openshell.v1.OpenShell/DeleteSandbox",
             "openshell.v1.OpenShell/ListSandboxes",
@@ -2591,13 +2566,6 @@ mod tests {
         assert_eq!(
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
-        );
-        assert_eq!(
-            otel_span_name(
-                &http::Method::POST,
-                "/openshell.inference.v1.Inference/GetInferenceBundle"
-            ),
-            "openshell.inference.v1.Inference/GetInferenceBundle"
         );
     }
 
@@ -2626,14 +2594,6 @@ mod tests {
     }
 
     #[test]
-    fn grpc_method_extracts_inference_service() {
-        assert_eq!(
-            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
-            "GetInferenceBundle"
-        );
-    }
-
-    #[test]
     fn grpc_method_handles_bare_path() {
         assert_eq!(grpc_method_from_path("Health"), "Health");
     }
@@ -2649,7 +2609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_router_dispatches_gateway_inference_and_reflection_paths() {
+    async fn grpc_router_dispatches_gateway_and_reflection_paths() {
         #[derive(Clone)]
         struct RouteRecorder {
             name: &'static str,
@@ -2676,15 +2636,10 @@ mod tests {
             name,
             calls: calls.clone(),
         };
-        let mut router = GrpcRouter::new(
-            service("openshell"),
-            service("inference"),
-            service("reflection"),
-        );
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2698,10 +2653,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(
-            *calls.lock().unwrap(),
-            vec!["openshell", "inference", "reflection"]
-        );
+        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
     }
 
     #[tokio::test]
@@ -2715,7 +2667,6 @@ mod tests {
         let reflection = tonic_reflection::server::Builder::configure()
             .register_file_descriptor_set(gateway_reflection_descriptor_set().unwrap())
             .with_service_name("openshell.v1.OpenShell")
-            .with_service_name("openshell.inference.v1.Inference")
             .build_v1()
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2727,7 +2678,7 @@ mod tests {
             tonic::Status::unauthenticated("OIDC credentials required"),
         )));
         let grpc = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(unrouted, unrouted, reflection),
+            GrpcRouter::new(unrouted, reflection),
             Some(AuthenticatorChain::new(vec![rejecting_oidc])),
             None,
             None,
@@ -2781,10 +2732,7 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(
-            names,
-            vec!["openshell.inference.v1.Inference", "openshell.v1.OpenShell",]
-        );
+        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
         server.abort();
     }
 
@@ -2798,7 +2746,6 @@ mod tests {
             .collect();
 
         assert!(names.contains("openshell.proto"));
-        assert!(names.contains("inference.proto"));
         assert!(names.contains("sandbox.proto"));
         assert!(!names.contains("compute_driver.proto"));
         assert!(!names.contains("credential_driver.proto"));
@@ -3143,27 +3090,6 @@ mod tests {
             ));
         }
 
-        #[tokio::test]
-        async fn sandbox_principal_can_fetch_inference_bundle() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
-            let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
-
-            let res = router
-                .call(empty_request(
-                    "/openshell.inference.v1.Inference/GetInferenceBundle",
-                ))
-                .await
-                .unwrap();
-
-            assert_eq!(res.status(), 200);
-            assert!(matches!(
-                seen.lock().unwrap().as_ref(),
-                Some(Principal::Sandbox(_))
-            ));
-        }
-
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -3197,7 +3123,6 @@ mod tests {
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
-                "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
                 let chain = AuthenticatorChain::new(vec![mock]);
@@ -3254,8 +3179,6 @@ mod tests {
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetInferenceRoute",
-                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

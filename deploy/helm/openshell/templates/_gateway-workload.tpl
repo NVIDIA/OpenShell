@@ -34,8 +34,10 @@ spec:
         - host.docker.internal
         - host.openshell.internal
   {{- end }}
+  {{- with .Values.podSecurityContext }}
   securityContext:
-    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   containers:
     - name: openshell-gateway
       securityContext:
@@ -87,8 +89,12 @@ spec:
         - name: openshell-data
           mountPath: /var/openshell
         {{- end }}
+        # ConfigMap directory mounts expose keys through atomic-writer symlinks,
+        # while the gateway intentionally rejects symlinked configuration.
+        # The checksum annotation above rolls pods when this subPath changes.
         - name: gateway-config
-          mountPath: /etc/openshell
+          mountPath: /etc/openshell/gateway.toml
+          subPath: gateway.toml
           readOnly: true
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt

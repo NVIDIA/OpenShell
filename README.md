@@ -108,7 +108,7 @@ bash examples/sandbox-policy-quickstart/demo.sh
 OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which does one of three things:
 
 - **Allows** — the destination and binary match a policy block.
-- **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
+- **Binds credentials to endpoints** — injects provider credentials only after policy admits a request to a profile-authorized endpoint.
 - **Denies** — blocks the request and logs it.
 
 | Component          | Role                                                                                         |
@@ -116,7 +116,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
 | **Sandbox**        | Isolated runtime with container supervision and policy-enforced egress routing.              |
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
-| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
+| **Provider Access** | Profile-defined endpoints, binary policy, and endpoint-bound credential injection for model APIs and other services. |
 
 OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
 
@@ -129,13 +129,15 @@ OpenShell applies defense in depth across four policy domains:
 | Filesystem | Prevents reads/writes outside allowed paths.        | Locked at sandbox creation. |
 | Network    | Blocks unauthorized outbound connections.           | Hot-reloadable at runtime.  |
 | Process    | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
-| Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
+| Providers  | Grants endpoint-bound credentials and network access. | Hot-reloadable at runtime. |
 
-Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
+Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; network policy and provider attachments can be updated on a running sandbox.
 
 ## Providers
 
 Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+
+Inference access uses the same provider workflow. Attach an inference-capable provider to a sandbox, call the provider's native endpoint, and select the model in the client. Provider profiles contribute the endpoint policy and bind credential placeholders to the authorized destination.
 
 ## GPU Support (Experimental)
 
@@ -159,8 +161,8 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
-| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw.       |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with managed inference using NemoClaw.   |
+| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with the NemoClaw blueprint.       |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with the NemoClaw blueprint.   |
 | [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 | [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
 
@@ -172,9 +174,9 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
 | `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
+| `openshell sandbox provider attach <sandbox> <provider>`   | Attach a provider to a running sandbox.         |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
-| `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
 | `openshell logs [name] --tail`                             | Stream sandbox logs.                            |
 | `openshell term`                                           | Launch the real-time terminal UI for debugging. |
 
@@ -192,11 +194,10 @@ grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
 grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
 ```
 
-The service list contains the public `openshell.v1.OpenShell` and
-`openshell.inference.v1.Inference` APIs. Reflection does not advertise the
-gateway's internal compute-driver, credential-driver, interceptor, or
-middleware services. For a TLS gateway, omit `-plaintext` and supply the CA and
-client certificate options required by the deployment.
+The service list contains the public `openshell.v1.OpenShell` API. Reflection
+does not advertise the gateway's internal compute-driver, credential-driver,
+interceptor, or middleware services. For a TLS gateway, omit `-plaintext` and
+supply the CA and client certificate options required by the deployment.
 
 ## Terminal UI
 
@@ -214,13 +215,19 @@ The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Na
 
 ## Community Sandboxes and BYOC
 
-Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, a local directory, or a container image:
+Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog or a container image:
 
 ```bash
 openshell sandbox create --from gemini             # community catalog
-openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
+docker build -t my-sandbox:latest ./my-sandbox-dir # Docker gateway
+openshell sandbox create --from my-sandbox:latest  # Docker built image
+podman build -t localhost/my-sandbox:latest ./my-sandbox-dir # Podman gateway
+openshell sandbox create --from localhost/my-sandbox:latest  # Podman built image
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
+
+Build with the container engine used by your local gateway. For a remote
+gateway, push the image to a registry that the gateway can pull from.
 
 See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
@@ -283,6 +290,21 @@ cargo build --release -p openshell-driver-vm --no-default-features --features de
 ```
 
 The resulting binaries contain no telemetry endpoint, no telemetry HTTP client, and no emission code. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches. Cargo has no way to subtract a single default feature, so `defaults-without-telemetry` must be paired with `--no-default-features`; passing it on its own leaves the defaults in place and fails the build rather than producing a binary that still emits.
+
+The gateway also exposes separate Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-docker`, `compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Disable the default feature set, then enable only the drivers and telemetry mode required by the target binary. For example:
+
+```shell
+# Docker only, with telemetry support.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+
+# Docker and VM only, with telemetry compiled out.
+cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
+
+# Windows MXC only, with telemetry support and bundled Z3.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
+```
+
+Regular builds retain their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC; the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 

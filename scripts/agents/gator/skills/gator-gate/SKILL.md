@@ -961,6 +961,7 @@ Required gates include at least:
 
 - `OpenShell / Branch Checks`
 - `OpenShell / Helm Lint`
+- `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
 - `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
 

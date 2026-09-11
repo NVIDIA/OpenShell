@@ -80,7 +80,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | --- | --- |
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
-| `debug-inference` | Diagnose managed, system, local, and direct external inference issues |
+| `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from `inference.local` |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
@@ -306,14 +306,19 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project requirements:
 
-- Rust 1.90+
+- Rust 1.94+
 - Python 3.11+
 - Docker (running)
+- CMake 3.16+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
-The `openshell-prover` crate links against Z3. On macOS and Linux, install the
-system Z3 development package; `z3-sys` discovers it through `pkg-config`.
+The `openshell-prover` crate links directly against Z3. The `openshell-server`
+crate depends on the prover, and the `openshell-gateway` binary crate depends
+on `openshell-server` in turn; both forward a `bundled-z3` feature down to
+`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on
+Z3. On macOS and Linux, install the system Z3 development package; `z3-sys`
+discovers it through `pkg-config`.
 
 ```bash
 # macOS
@@ -327,30 +332,51 @@ sudo dnf install z3-devel
 ```
 
 If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
-compiles Z3 from source during the Rust build:
+compiles Z3 from source during the Rust build and requires CMake 3.16+:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
 ```
 
-For x86-64 Windows MSVC builds, use one of these Z3 paths:
+For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
+- Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
+  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  build. Cargo reuses the extracted archive from its target directory. Windows
+  CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
+  preserves the archive in the architecture-specific Cargo target cache. For
+  cold local builds, you may set `READ_ONLY_GITHUB_TOKEN` to avoid anonymous
+  GitHub API rate limits.
 - System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
-  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
+  target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
   The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
   is set.
-- Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
+- Bundled Z3: for direct Cargo builds, pass `--features bundled-z3` so `z3-sys`
+  builds Z3 from source.
 
-Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
-the default search path, set `LIBCLANG_PATH` to the directory containing
-`libclang.dll`.
+`openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
+just this crate does not require `LIBCLANG_PATH`:
+
+```powershell
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
+```
+
+### Windows full build
+
+To build the full set of Windows binaries, including `openshell-gateway.exe`
+and `openshell.exe`, use the `windows:build:x64` mise task instead of a
+single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
+full build also compiles crates that use `bindgen` (e.g. the MXC driver on
+Windows), so it requires `libclang.dll`; if LLVM is not on the default search
+path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
-cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+mise run --skip-tools windows:build:x64
 ```
 
-To use a local x64 Z3 release with the Windows task wrapper:
+To use a local x64 Z3 release instead of the prebuilt download, set
+`Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
 $env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
@@ -470,9 +496,9 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a stable release tag is created.
+Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
-`docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
+`docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 

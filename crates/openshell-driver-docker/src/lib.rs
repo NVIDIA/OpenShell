@@ -21,12 +21,14 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
-    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
+    GatewayCallbackTopology, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
+    LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_IMAGE_BINARY_PATH,
+    extract_first_tar_entry, gateway_callback_endpoint, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
@@ -38,14 +40,15 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
-    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
+    DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GatewayListenerRequirement,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    GpuResourceCapabilities, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -54,15 +57,15 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
-use openshell_core::{Error, Result as CoreResult};
+use openshell_core::{
+    AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, UpstreamProxyConfig,
+};
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -81,6 +84,10 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
+    openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
+    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
@@ -121,10 +128,10 @@ pub struct DockerComputeConfig {
     pub default_image: String,
 
     /// Image pull policy for sandbox images.
-    pub image_pull_policy: String,
+    pub image_pull_policy: ImagePullPolicy,
 
-    /// Namespace label applied to Docker sandboxes.
-    pub sandbox_namespace: String,
+    /// Value of the `openshell.sandbox_namespace` label applied to Docker sandboxes.
+    pub sandbox_label: String,
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
@@ -157,13 +164,61 @@ pub struct DockerComputeConfig {
 
     /// Container cgroup PID limit for Docker-managed sandboxes.
     ///
-    /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
-    pub sandbox_pids_limit: i64,
+    /// Omit the field to use `OpenShell`'s 2048-process sandbox limit. Explicit
+    /// zero is invalid.
+    #[serde(
+        default = "openshell_core::config::default_sandbox_pids_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sandbox_pids_limit: Option<std::num::NonZeroI64>,
 
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+
+    /// Corporate forward-proxy settings supplied to the supervisor on argv.
+    /// The flattened fields retain the common `https_proxy`, `no_proxy`, and
+    /// `proxy_auth_*` gateway TOML contract.
+    #[serde(flatten)]
+    pub upstream_proxy: UpstreamProxyConfig,
+
+    /// Host UNIX socket to project into sandbox supervisors for provider
+    /// SPIFFE token exchange.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+
+    /// `AppArmor` confinement requested for sandbox containers. The explicit
+    /// default preserves the prior supervisor-compatible Docker behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_armor_profile: Option<AppArmorProfile>,
+}
+
+impl DockerComputeConfig {
+    /// Validate startup configuration without connecting to Docker.
+    pub fn validate_configuration(&self, gateway_bind_address: SocketAddr) -> CoreResult<()> {
+        if let Some(socket_path) = self.socket_path.as_deref()
+            && socket_path.to_str().is_none()
+        {
+            return Err(Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            )));
+        }
+        validate_sandbox_pids_limit(self.sandbox_pids_limit)?;
+        validate_image_pull_policy(self.image_pull_policy)?;
+        self.upstream_proxy.validate().map_err(Error::config)?;
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(Error::config)?;
+        }
+        parse_optional_host_gateway_ip(&self.host_gateway_ip)?;
+        if gateway_bind_address.port() == 0 {
+            return Err(Error::config(
+                "docker compute driver requires a fixed non-zero gateway bind port",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for DockerComputeConfig {
@@ -171,8 +226,8 @@ impl Default for DockerComputeConfig {
         Self {
             socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
-            image_pull_policy: String::new(),
-            sandbox_namespace: "default".to_string(),
+            image_pull_policy: ImagePullPolicy::default(),
+            sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
             supervisor_bin: None,
             supervisor_image: None,
@@ -182,8 +237,11 @@ impl Default for DockerComputeConfig {
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
-            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
+            upstream_proxy: UpstreamProxyConfig::default(),
+            provider_spiffe_workload_api_socket: None,
+            app_armor_profile: Some(AppArmorProfile::Unconfined),
         }
     }
 }
@@ -198,8 +256,8 @@ pub(crate) struct DockerGuestTlsPaths {
 #[derive(Debug, Clone)]
 struct DockerDriverRuntimeConfig {
     default_image: String,
-    image_pull_policy: String,
-    sandbox_namespace: String,
+    image_pull_policy: ImagePullPolicy,
+    sandbox_label: String,
     grpc_endpoint: String,
     network_name: String,
     gateway_route: DockerGatewayRoute,
@@ -210,10 +268,18 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    supports_gpu: bool,
-    allow_all_default_gpu: bool,
-    sandbox_pids_limit: i64,
+    gpu: DockerGpuRuntimeCapabilities,
+    sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
+    upstream_proxy: UpstreamProxyConfig,
+    provider_spiffe_workload_api_socket: Option<PathBuf>,
+    app_armor_profile: Option<AppArmorProfile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DockerGpuRuntimeCapabilities {
+    cdi_supported: bool,
+    wsl_all_gpu_fallback_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,55 +479,15 @@ fn default_true() -> bool {
 type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
-struct TracedWatchStream {
-    inner: WatchStream,
-    span: tracing::Span,
-    finished: bool,
-}
-
-impl Stream for TracedWatchStream {
-    type Item = Result<WatchSandboxesEvent, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let span = self.span.clone();
-        let _entered = span.enter();
-        let result = self.inner.as_mut().poll_next(cx);
-        if !self.finished {
-            match &result {
-                Poll::Ready(Some(Err(status))) => {
-                    openshell_otel::mark_error(&self.span);
-                    self.span
-                        .record("rpc.grpc.status_code", status.code() as i32);
-                    self.finished = true;
-                }
-                Poll::Ready(None) => {
-                    self.span
-                        .record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-                    self.finished = true;
-                }
-                Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
-            }
-        }
-        result
-    }
-}
-
-impl Drop for TracedWatchStream {
-    fn drop(&mut self) {
-        if !self.finished {
-            openshell_otel::mark_error(&self.span);
-            self.span
-                .record("rpc.grpc.status_code", tonic::Code::Cancelled as i32);
-        }
-    }
-}
+#[cfg(test)]
+type TracedWatchStream = openshell_otel::TracedGrpcStream<WatchStream>;
 
 /// Compute-driver service wrapper that preserves the standalone RPC trace
 /// boundary while Docker runs in the gateway process.
 #[derive(Clone)]
 pub struct ComputeDriverService {
     driver: DockerComputeDriver,
-    trace_in_process_rpc: bool,
+    rpc_tracer: openshell_otel::InProcessRpcTracer,
 }
 
 impl ComputeDriverService {
@@ -469,7 +495,7 @@ impl ComputeDriverService {
     pub fn new(driver: DockerComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: false,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::disabled(),
         }
     }
 
@@ -477,52 +503,8 @@ impl ComputeDriverService {
     pub fn new_in_process(driver: DockerComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: true,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::enabled(),
         }
-    }
-
-    fn in_process_rpc_span(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-    ) -> Option<tracing::Span> {
-        self.trace_in_process_rpc.then(|| {
-            tracing::info_span!(
-                target: "openshell_driver_docker::otel_tracing",
-                "driver_rpc",
-                otel.name = operation,
-                otel.kind = "server",
-                otel.status_code = tracing::field::Empty,
-                rpc.system = "grpc",
-                rpc.service = "openshell.compute.v1.ComputeDriver",
-                rpc.method = method,
-                rpc.grpc.status_code = tracing::field::Empty,
-            )
-        })
-    }
-
-    async fn trace_rpc<T>(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-        future: impl Future<Output = Result<T, Status>>,
-    ) -> Result<T, Status> {
-        use tracing::Instrument as _;
-
-        let Some(span) = self.in_process_rpc_span(operation, method) else {
-            return future.await;
-        };
-        let result = future.instrument(span.clone()).await;
-        match &result {
-            Ok(_) => {
-                span.record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-            }
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-            }
-        }
-        result
     }
 }
 
@@ -561,6 +543,7 @@ impl DockerComputeDriver {
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
     ) -> CoreResult<Self> {
+        docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -583,19 +566,19 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let supports_gpu = info
+        let cdi_supported = info
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let allow_all_default_gpu = docker_info_reports_wsl2(&info);
-        validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
+        let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
+        let gpu = DockerGpuRuntimeCapabilities {
+            cdi_supported,
+            wsl_all_gpu_fallback_enabled,
+        };
+        validate_docker_proxy_auth_file(&docker_config.upstream_proxy)?;
+        validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
-        if gateway_port == 0 {
-            return Err(Error::config(
-                "docker compute driver requires a fixed non-zero gateway bind port",
-            ));
-        }
         let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
@@ -605,13 +588,11 @@ impl DockerComputeDriver {
             docker_gateway_callback_bind_address(&gateway_route, gateway_bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
-            let scheme = if docker_guest_tls_configured(&docker_config) {
-                "https"
-            } else {
-                "http"
-            };
-            docker_config.grpc_endpoint =
-                format!("{scheme}://{HOST_OPENSHELL_INTERNAL}:{gateway_port}");
+            docker_config.grpc_endpoint = gateway_callback_endpoint(
+                GatewayCallbackTopology::Docker,
+                gateway_port,
+                docker_guest_tls_configured(&docker_config),
+            );
         }
         let grpc_endpoint = docker_container_openshell_endpoint(
             &docker_config.grpc_endpoint,
@@ -626,8 +607,8 @@ impl DockerComputeDriver {
             docker: Arc::new(docker),
             config: DockerDriverRuntimeConfig {
                 default_image: docker_config.default_image.clone(),
-                image_pull_policy: docker_config.image_pull_policy.clone(),
-                sandbox_namespace: docker_config.sandbox_namespace.clone(),
+                image_pull_policy: docker_config.image_pull_policy,
+                sandbox_label: docker_config.sandbox_label.clone(),
                 grpc_endpoint,
                 network_name,
                 gateway_route,
@@ -638,16 +619,20 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                supports_gpu,
-                allow_all_default_gpu,
+                gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                upstream_proxy: docker_config.upstream_proxy.clone(),
+                provider_spiffe_workload_api_socket: docker_config
+                    .provider_spiffe_workload_api_socket
+                    .clone(),
+                app_armor_profile: docker_config.app_armor_profile.clone(),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
-                allow_all_default_gpu,
+                gpu.wsl_all_gpu_fallback_enabled,
             )),
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
         };
@@ -668,6 +653,20 @@ impl DockerComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: self.config.gpu.cdi_supported,
+                    count_selection_supported: self.config.gpu.cdi_supported,
+                }),
+            }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         }
     }
 
@@ -699,7 +698,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -807,7 +806,7 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("query Docker daemon info", err))?;
         self.gpu_selector.refresh(
             docker_cdi_gpu_inventory(&info),
-            self.config.allow_all_default_gpu,
+            self.config.gpu.wsl_all_gpu_fallback_enabled,
         );
         Ok(())
     }
@@ -857,7 +856,7 @@ impl DockerComputeDriver {
             return Ok(Some(sandbox));
         }
 
-        Ok(self.pending_snapshot(sandbox_id, sandbox_name).await)
+        self.pending_snapshot(sandbox_id, sandbox_name).await
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -933,7 +932,7 @@ impl DockerComputeDriver {
         );
         self.publish_sandbox_snapshot(pending_sandbox_snapshot(
             sandbox,
-            &self.config.sandbox_namespace,
+            &self.config.sandbox_label,
             provisioning_condition(),
             false,
         ));
@@ -971,16 +970,6 @@ impl DockerComputeDriver {
         }
     }
 
-    #[tracing::instrument(
-        name = "docker.provision_sandbox",
-        skip(self, sandbox),
-        fields(
-            otel.name = "docker.provision_sandbox",
-            otel.status_code = tracing::field::Empty,
-            sandbox.id = %sandbox.id,
-            sandbox.name = %sandbox.name,
-        )
-    )]
     async fn provision_sandbox_inner(
         &self,
         sandbox: &DriverSandbox,
@@ -1140,7 +1129,9 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self.remove_pending_sandbox(sandbox_id, sandbox_name).await;
+        let pending = self
+            .remove_pending_sandbox(sandbox_id, sandbox_name)
+            .await?;
         if let Some(record) = pending.as_ref()
             && let Some(task) = record.task.as_ref()
         {
@@ -1174,6 +1165,11 @@ impl DockerComputeDriver {
                     }
                 }
             }
+            // Container gone and no in-memory record survived (gateway
+            // restarted after an out-of-band `docker rm`). DeleteSandbox is
+            // the only thing that ever reclaims the token file, so reclaim it
+            // here too.
+            cleanup_sandbox_token_file_for_delete(sandbox_id, None, &self.config);
             return Ok(false);
         };
         let Some(target) = summary_container_target(&container) else {
@@ -1205,7 +1201,10 @@ impl DockerComputeDriver {
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
         else {
-            if let Some(record) = self.remove_pending_sandbox(sandbox_id, sandbox_name).await {
+            if let Some(record) = self
+                .remove_pending_sandbox(sandbox_id, sandbox_name)
+                .await?
+            {
                 if let Some(task) = record.task {
                     task.abort();
                 }
@@ -1322,10 +1321,11 @@ impl DockerComputeDriver {
 
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let mut pending = self.pending.lock().await;
-        if pending
-            .values()
-            .any(|record| record.sandbox.id == sandbox.id || record.sandbox.name == sandbox.name)
-        {
+        if pending.values().any(|record| {
+            record.sandbox.id == sandbox.id
+                || (record.sandbox.name == sandbox.name
+                    && record.sandbox.workspace == sandbox.workspace)
+        }) {
             return Err(Status::already_exists("sandbox already exists"));
         }
 
@@ -1334,7 +1334,7 @@ impl DockerComputeDriver {
             PendingSandboxRecord {
                 sandbox: pending_sandbox_snapshot(
                     sandbox,
-                    &self.config.sandbox_namespace,
+                    &self.config.sandbox_label,
                     provisioning_condition(),
                     false,
                 ),
@@ -1348,12 +1348,12 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<DriverSandbox> {
+    ) -> Result<Option<DriverSandbox>, Status> {
         let pending = self.pending.lock().await;
-        pending
-            .values()
-            .find(|record| pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name))
-            .map(|record| record.sandbox.clone())
+        let Some(id) = resolve_pending_id(&pending, sandbox_id, sandbox_name)? else {
+            return Ok(None);
+        };
+        Ok(pending.get(&id).map(|record| record.sandbox.clone()))
     }
 
     async fn pending_snapshot_map(&self) -> HashMap<String, DriverSandbox> {
@@ -1373,12 +1373,12 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<PendingSandboxRecord> {
+    ) -> Result<Option<PendingSandboxRecord>, Status> {
         let mut pending = self.pending.lock().await;
-        let id = pending.iter().find_map(|(id, record)| {
-            pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name).then(|| id.clone())
-        })?;
-        pending.remove(&id)
+        let Some(id) = resolve_pending_id(&pending, sandbox_id, sandbox_name)? else {
+            return Ok(None);
+        };
+        Ok(pending.remove(&id))
     }
 
     async fn fail_pending_sandbox(
@@ -1389,7 +1389,7 @@ impl DockerComputeDriver {
         cleanup_sandbox_token_file(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
-            &self.config.sandbox_namespace,
+            &self.config.sandbox_label,
             error_condition(failure.reason, &failure.message),
             false,
         );
@@ -1595,7 +1595,7 @@ impl DockerComputeDriver {
     }
 
     async fn list_managed_container_summaries(&self) -> Result<Vec<ContainerSummary>, Status> {
-        let filters = managed_container_label_filters(&self.config.sandbox_namespace, []);
+        let filters = managed_container_label_filters(&self.config.sandbox_label, []);
         self.docker
             .list_containers(Some(
                 ListContainersOptionsBuilder::default()
@@ -1620,7 +1620,7 @@ impl DockerComputeDriver {
         }
 
         let filters =
-            managed_container_label_filters(&self.config.sandbox_namespace, label_filter_values);
+            managed_container_label_filters(&self.config.sandbox_label, label_filter_values);
         let containers = self
             .docker
             .list_containers(Some(
@@ -1633,21 +1633,14 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("find Docker sandbox container", err))?;
 
         Ok(containers.into_iter().find(|summary| {
-            let Some(labels) = summary.labels.as_ref() else {
-                return false;
-            };
-            let namespace_matches = labels
-                .get(LABEL_SANDBOX_NAMESPACE)
-                .is_some_and(|value| value == &self.config.sandbox_namespace);
-            let id_matches = sandbox_id.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_ID)
-                    .is_some_and(|value| value == sandbox_id);
-            let name_matches = sandbox_name.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_NAME)
-                    .is_some_and(|value| value == sandbox_name);
-            namespace_matches && id_matches && name_matches
+            summary.labels.as_ref().is_some_and(|labels| {
+                managed_container_identity_matches(
+                    labels,
+                    &self.config.sandbox_label,
+                    sandbox_id,
+                    sandbox_name,
+                )
+            })
         }))
     }
 
@@ -1656,9 +1649,8 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         image: &str,
     ) -> Result<DockerImageMetadata, Status> {
-        let policy = self.config.image_pull_policy.trim().to_ascii_lowercase();
-        let inspect = match policy.as_str() {
-            "" | "ifnotpresent" => {
+        let inspect = match self.config.image_pull_policy {
+            ImagePullPolicy::IfNotPresent => {
                 if let Ok(inspect) = self.docker.inspect_image(image).await {
                     self.publish_docker_progress(
                         sandbox_id,
@@ -1675,14 +1667,14 @@ impl DockerComputeDriver {
                         .map_err(|err| internal_status("inspect Docker image after pull", err))?
                 }
             }
-            "always" => {
+            ImagePullPolicy::Always => {
                 self.pull_image(sandbox_id, image).await?;
                 self.docker
                     .inspect_image(image)
                     .await
                     .map_err(|err| internal_status("inspect Docker image after pull", err))?
             }
-            "never" => match self.docker.inspect_image(image).await {
+            ImagePullPolicy::Never => match self.docker.inspect_image(image).await {
                 Ok(inspect) => {
                     self.publish_docker_progress(
                         sandbox_id,
@@ -1694,15 +1686,15 @@ impl DockerComputeDriver {
                 }
                 Err(err) if is_not_found_error(&err) => {
                     return Err(Status::failed_precondition(format!(
-                        "docker image '{image}' is not present locally and image_pull_policy=Never"
+                        "docker image '{image}' is not present locally and image_pull_policy = \"never\""
                     )));
                 }
                 Err(err) => return Err(internal_status("inspect Docker image", err)),
             },
-            other => {
-                return Err(Status::failed_precondition(format!(
-                    "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
-                )));
+            ImagePullPolicy::Newer => {
+                return Err(Status::failed_precondition(
+                    "image_pull_policy = \"newer\" is supported only by the Podman compute driver",
+                ));
             }
         };
 
@@ -1769,6 +1761,9 @@ impl DockerComputeDriver {
     }
 }
 
+// Standalone and in-process servers both use this wrapper. Delegating to the
+// driver's canonical tonic implementation keeps request validation and Docker
+// operation spans identical across both deployment modes.
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
@@ -1778,169 +1773,159 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
     {
-        self.trace_rpc(
-            "driver.authenticate_sandbox",
-            "authenticate_sandbox",
-            ComputeDriver::authenticate_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                ComputeDriver::authenticate_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_capabilities",
-            "get_capabilities",
-            ComputeDriver::get_capabilities(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_CAPABILITIES,
+                ComputeDriver::get_capabilities(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_gateway_listener_requirements(
         &self,
         request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_gateway_listener_requirements",
-            "get_gateway_listener_requirements",
-            ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
+                ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
+            )
+            .await
     }
 
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        self.trace_rpc(
-            "driver.validate_sandbox_create",
-            "validate_sandbox_create",
-            ComputeDriver::validate_sandbox_create(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
+                ComputeDriver::validate_sandbox_create(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_sandbox",
-            "get_sandbox",
-            ComputeDriver::get_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_SANDBOX,
+                ComputeDriver::get_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn list_sandboxes(
         &self,
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        self.trace_rpc(
-            "driver.list_sandboxes",
-            "list_sandboxes",
-            ComputeDriver::list_sandboxes(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::LIST_SANDBOXES,
+                ComputeDriver::list_sandboxes(&self.driver, request),
+            )
+            .await
     }
 
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.create_sandbox",
-            "create_sandbox",
-            ComputeDriver::create_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::CREATE_SANDBOX,
+                ComputeDriver::create_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.stop_sandbox",
-            "stop_sandbox",
-            ComputeDriver::stop_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::STOP_SANDBOX,
+                ComputeDriver::stop_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.start_sandbox",
-            "start_sandbox",
-            ComputeDriver::start_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::START_SANDBOX,
+                ComputeDriver::start_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.delete_sandbox",
-            "delete_sandbox",
-            ComputeDriver::delete_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                ComputeDriver::delete_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn watch_sandboxes(
         &self,
         request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        use tracing::Instrument as _;
-
-        let create_stream = ComputeDriver::watch_sandboxes(&self.driver, request);
-        let Some(span) = self.in_process_rpc_span("driver.watch_sandboxes", "watch_sandboxes")
-        else {
-            return create_stream.await;
+        let create_stream = async {
+            ComputeDriver::watch_sandboxes(&self.driver, request)
+                .await
+                .map(Response::into_inner)
         };
-        match create_stream.instrument(span.clone()).await {
-            Ok(response) => Ok(Response::new(Box::pin(TracedWatchStream {
-                inner: response.into_inner(),
-                span,
-                finished: false,
-            }))),
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-                Err(status)
-            }
-        }
+        self.rpc_tracer
+            .trace_stream(openshell_otel::rpc::WATCH_SANDBOXES, create_stream)
+            .await
+            .map(Response::new)
     }
 
     async fn ensure_workspace(
         &self,
         request: Request<EnsureWorkspaceRequest>,
     ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
-        self.trace_rpc(
-            "driver.ensure_workspace",
-            "ensure_workspace",
-            ComputeDriver::ensure_workspace(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::ENSURE_WORKSPACE,
+                ComputeDriver::ensure_workspace(&self.driver, request),
+            )
+            .await
     }
 
     async fn delete_workspace(
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        self.trace_rpc(
-            "driver.delete_workspace",
-            "delete_workspace",
-            ComputeDriver::delete_workspace(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::DELETE_WORKSPACE,
+                ComputeDriver::delete_workspace(&self.driver, request),
+            )
+            .await
     }
 }
 
@@ -2242,9 +2227,73 @@ fn pending_sandbox_snapshot(
     }
 }
 
-fn pending_sandbox_matches(sandbox: &DriverSandbox, sandbox_id: &str, sandbox_name: &str) -> bool {
-    (!sandbox_id.is_empty() && sandbox.id == sandbox_id)
-        || (!sandbox_name.is_empty() && sandbox.name == sandbox_name)
+/// Decides whether a managed container satisfies a lifecycle request.
+///
+/// `sandbox_id` is authoritative, matching [`resolve_pending_id`]. Requiring
+/// the name to agree as well would discard a correct id match whenever the
+/// caller pairs it with a stale name, leaving the container and its token file
+/// behind while the driver reports the sandbox as absent.
+///
+/// A request with no identifier matches nothing. `require_sandbox_identifier`
+/// rejects that upstream, but the label filters degenerate to "every managed
+/// container in the namespace", so this does not rely on the caller to guard it.
+fn managed_container_identity_matches(
+    labels: &HashMap<String, String>,
+    namespace: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> bool {
+    if labels
+        .get(LABEL_SANDBOX_NAMESPACE)
+        .is_none_or(|value| value != namespace)
+    {
+        return false;
+    }
+    if !sandbox_id.is_empty() {
+        return labels
+            .get(LABEL_SANDBOX_ID)
+            .is_some_and(|value| value == sandbox_id);
+    }
+    !sandbox_name.is_empty()
+        && labels
+            .get(LABEL_SANDBOX_NAME)
+            .is_some_and(|value| value == sandbox_name)
+}
+
+/// Resolves a lifecycle request to at most one pending sandbox id.
+///
+/// `sandbox_id` is authoritative: when the caller supplies one, the name is
+/// never consulted as an alternative. The name fallback rejects ambiguity
+/// instead of letting `HashMap` iteration order pick a match, because sandbox
+/// names are unique per workspace and the driver request carries no workspace.
+fn resolve_pending_id(
+    pending: &HashMap<String, PendingSandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(pending
+            .contains_key(sandbox_id)
+            .then(|| sandbox_id.to_string()));
+    }
+    if sandbox_name.is_empty() {
+        return Ok(None);
+    }
+
+    let mut matches = pending
+        .iter()
+        .filter(|(_, record)| record.sandbox.name == sandbox_name)
+        .map(|(id, _)| id.clone());
+
+    let Some(id) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(
+            "sandbox_name matches multiple pending sandboxes; specify sandbox_id",
+        ));
+    }
+    Ok(Some(id))
 }
 
 fn provisioning_condition() -> DriverCondition {
@@ -2688,6 +2737,49 @@ fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
         })
 }
 
+/// Verify the configured credential without exposing its contents. Docker
+/// bind-mounts the root-owned file directly, unlike Podman which uses a native
+/// secret object; this preflight makes a bad file fail before any sandbox is
+/// created.
+fn validate_docker_proxy_auth_file(config: &UpstreamProxyConfig) -> CoreResult<()> {
+    let Some(path) = config.proxy_auth_file.as_ref() else {
+        return Ok(());
+    };
+    let raw = openshell_core::driver_utils::read_upstream_proxy_credential_file(
+        path.to_str()
+            .ok_or_else(|| Error::config("proxy_auth_file must be valid UTF-8"))?,
+    )
+    .map_err(Error::config)?;
+    openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+        .map_err(|error| Error::config(format!("proxy_auth_file is invalid: {error}")))?;
+    Ok(())
+}
+
+/// Build immutable operator-owned proxy arguments. Credentials never appear on
+/// argv: only the fixed in-container root-only file path is supplied.
+fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = config.https_proxy.as_ref() {
+        args.extend(["--upstream-proxy".to_string(), url.clone()]);
+    }
+    if let Some(no_proxy) = config.no_proxy.as_ref() {
+        args.extend(["--upstream-no-proxy".to_string(), no_proxy.clone()]);
+    }
+    if config.proxy_auth_file.is_some() {
+        args.extend([
+            "--upstream-proxy-auth-file".to_string(),
+            UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
+        ]);
+    }
+    if config.proxy_auth_allow_insecure == Some(true) {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    if config.proxy_connect_by_hostname == Some(true) {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -2717,6 +2809,23 @@ fn build_binds(
             SANDBOX_TOKEN_MOUNT_PATH
         ));
     }
+    if let Some(path) = config.upstream_proxy.proxy_auth_file.as_ref() {
+        binds.push(format!(
+            "{}:{}:ro,z",
+            path.display(),
+            UPSTREAM_PROXY_AUTH_MOUNT_PATH
+        ));
+    }
+    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
+        let parent = socket.parent().ok_or_else(|| {
+            Status::failed_precondition("provider SPIFFE socket has no parent directory")
+        })?;
+        binds.push(format!(
+            "{}:{}:ro",
+            parent.display(),
+            PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+        ));
+    }
     Ok(binds)
 }
 
@@ -2733,7 +2842,7 @@ fn sandbox_token_host_path_by_id(
 ) -> Result<PathBuf, Status> {
     openshell_core::driver_utils::sandbox_token_path(
         "docker-sandbox-tokens",
-        Some(&config.sandbox_namespace),
+        Some(&config.sandbox_label),
         sandbox_id,
     )
     .map_err(|err| {
@@ -2897,6 +3006,15 @@ fn build_environment_for_oci_user(
         environment.insert(
             openshell_core::sandbox_env::TLS_KEY.to_string(),
             TLS_KEY_MOUNT_PATH.to_string(),
+        );
+    }
+    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref()
+        && let Ok(path) =
+            openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
+    {
+        environment.insert(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.to_string(),
+            path,
         );
     }
 
@@ -3090,13 +3208,13 @@ fn build_container_create_body_for_image(
         LABEL_SANDBOX_WORKSPACE.to_string(),
         sandbox.workspace.clone(),
     );
-    // The list/get/find paths filter by `config.sandbox_namespace`, so use
+    // The list/get/find paths filter by `config.sandbox_label`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
     // that the driver itself cannot find afterwards.
     labels.insert(
         LABEL_SANDBOX_NAMESPACE.to_string(),
-        config.sandbox_namespace.clone(),
+        config.sandbox_label.clone(),
     );
 
     Ok(ContainerCreateBody {
@@ -3109,7 +3227,11 @@ fn build_container_create_body_for_image(
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Replace the image CMD with the supervisor's resolved workspace
         // argument so Docker cannot append inherited image arguments.
-        cmd: Some(vec!["--workdir".to_string(), workspace_root]),
+        cmd: {
+            let mut args = vec!["--workdir".to_string(), workspace_root];
+            args.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+            Some(args)
+        },
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
@@ -3131,17 +3253,13 @@ fn build_container_create_body_for_image(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
-            // The sandbox supervisor needs to bind-mount `/run/netns`,
-            // mark it shared, and create per-process network namespaces.
-            // Docker's default AppArmor profile (`docker-default`) denies
-            // these mount operations even with CAP_SYS_ADMIN, so we opt
-            // out of AppArmor confinement for sandbox containers. The
-            // sandbox enforces its own security boundary via Landlock,
-            // seccomp, OPA policy evaluation, and the dedicated network
-            // namespace it sets up for the agent — AppArmor at the
-            // container layer is redundant relative to those controls
-            // and conflicts with them in this case.
-            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
+            // The default is explicitly Unconfined because the supervisor
+            // needs mount operations commonly denied by docker-default.
+            security_opt: config
+                .app_armor_profile
+                .as_ref()
+                .and_then(AppArmorProfile::oci_security_opt)
+                .map(|option| vec![option]),
             network_mode: Some(config.network_name.clone()),
             extra_hosts: Some(docker_extra_hosts(&config.gateway_route)),
             ..Default::default()
@@ -3426,26 +3544,55 @@ fn docker_resource_limits(
     })
 }
 
-fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
-    if value < 0 {
+fn validate_sandbox_pids_limit(value: Option<std::num::NonZeroI64>) -> CoreResult<()> {
+    if value.is_some_and(|limit| limit.get() < 0) {
         return Err(Error::config(
-            "docker sandbox_pids_limit must be zero or greater",
+            "docker sandbox_pids_limit must be positive when set",
         ));
     }
     Ok(())
 }
 
-fn docker_pids_limit(value: i64) -> Result<Option<i64>, Status> {
-    if value < 0 {
-        return Err(Status::failed_precondition(
-            "docker sandbox_pids_limit must be zero or greater",
+fn validate_image_pull_policy(policy: ImagePullPolicy) -> CoreResult<()> {
+    if policy == ImagePullPolicy::Newer {
+        return Err(Error::config(
+            "docker image_pull_policy = \"newer\" is supported only by the Podman compute driver",
         ));
     }
-    if value == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(value))
+    Ok(())
+}
+
+fn validate_docker_app_armor_profile(
+    profile: Option<&AppArmorProfile>,
+    info: &SystemInfo,
+) -> CoreResult<()> {
+    let requires_apparmor = matches!(
+        profile,
+        Some(AppArmorProfile::RuntimeDefault | AppArmorProfile::Localhost(_))
+    );
+    if !requires_apparmor {
+        return Ok(());
     }
+    let available = info.security_options.as_ref().is_some_and(|options| {
+        options
+            .iter()
+            .any(|option| option.to_ascii_lowercase().contains("apparmor"))
+    });
+    if !available {
+        return Err(Error::config(
+            "app_armor_profile requires AppArmor, but Docker reports it is unavailable; enable AppArmor on the daemon host or set app_armor_profile = \"Unconfined\" explicitly",
+        ));
+    }
+    Ok(())
+}
+
+fn docker_pids_limit(value: Option<std::num::NonZeroI64>) -> Result<Option<i64>, Status> {
+    if value.is_some_and(|limit| limit.get() < 0) {
+        return Err(Status::failed_precondition(
+            "docker sandbox_pids_limit must be positive when set",
+        ));
+    }
+    Ok(value.map(std::num::NonZeroI64::get))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -3576,8 +3723,10 @@ fn driver_status_from_summary(
 
 /// Refine an exited Docker sandbox's `Ready` condition from inspected state.
 ///
-/// A signal kill (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of
-/// a machine/daemon restart terminating a running container. Reclassify it from
+/// A workspace-validation exit is reported distinctly so users can repair the
+/// OCI working directory rather than diagnose a generic crash. A signal kill
+/// (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of a
+/// machine/daemon restart terminating a running container. Reclassify it from
 /// the generic terminal `ContainerExited` to the recoverable
 /// `ContainerRuntimeRestart` so gateway startup can revive it. OOM kills and
 /// ordinary application exits stay `ContainerExited` and terminal.
@@ -3585,7 +3734,7 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if state.oom_killed == Some(true) {
         return;
     }
-    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+    let Some(code) = state.exit_code else {
         return;
     };
     let Some(condition) = sandbox
@@ -3598,8 +3747,13 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if condition.reason != CONDITION_EXITED {
         return;
     }
-    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
-    condition.message = format!("Container terminated by signal (exit code {code})");
+    if code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+        condition.reason = CONDITION_WORKSPACE_VALIDATION_FAILED.to_string();
+        condition.message = "OCI WorkingDir is not usable by the sandbox identity".to_string();
+    } else if matches!(code, 137 | 143) {
+        condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+        condition.message = format!("Container terminated by signal (exit code {code})");
+    }
 }
 
 fn container_ready_condition(
@@ -3698,12 +3852,12 @@ fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Ve
 }
 
 fn managed_container_label_filters(
-    sandbox_namespace: &str,
+    sandbox_label: &str,
     extra_values: impl IntoIterator<Item = String>,
 ) -> HashMap<String, Vec<String>> {
     let mut values = vec![
         format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
-        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_namespace}"),
+        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_label}"),
     ];
     values.extend(extra_values);
     label_filters(values)
@@ -4067,8 +4221,8 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
     docker_config.guest_tls_ca.is_some()
-        && docker_config.guest_tls_cert.is_some()
-        && docker_config.guest_tls_key.is_some()
+        || docker_config.guest_tls_cert.is_some()
+        || docker_config.guest_tls_key.is_some()
 }
 
 pub(crate) fn docker_guest_tls_paths(

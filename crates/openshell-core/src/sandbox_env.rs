@@ -38,6 +38,9 @@ const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MainProcessConfig {
     pub version: u32,
+    /// Canonical command. Empty means "no command supplied": the supervisor
+    /// resolves the default login shell against the sandbox image. A non-empty
+    /// command is the exact program+args and is run verbatim.
     pub command: Vec<String>,
     pub tty: bool,
     #[serde(default)]
@@ -47,11 +50,15 @@ pub struct MainProcessConfig {
 impl MainProcessConfig {
     pub const VERSION: u32 = 1;
 
+    /// Default config for a sandbox created without a command. The command is
+    /// left empty on purpose: the supervisor picks a login shell that exists in
+    /// the sandbox image (bash when present, otherwise `/bin/sh`). A TTY is
+    /// requested because the default is an interactive login shell.
     #[must_use]
     pub fn scratch() -> Self {
         Self {
             version: Self::VERSION,
-            command: vec!["/bin/bash".to_string(), "-l".to_string()],
+            command: Vec::new(),
             tty: true,
             await_main_process_attachment: false,
         }
@@ -91,8 +98,13 @@ impl MainProcessConfig {
                 config.version
             ));
         }
-        if config.command.is_empty() || config.command[0].is_empty() {
-            return Err(format!("{MAIN_PROCESS_SPEC} command must not be empty"));
+        // An empty command is valid: it means "no command supplied", and the
+        // supervisor resolves the default login shell. Only a present-but-blank
+        // program is rejected.
+        if !config.command.is_empty() && config.command[0].is_empty() {
+            return Err(format!(
+                "{MAIN_PROCESS_SPEC} command program must not be empty"
+            ));
         }
         Ok(config)
     }
@@ -282,5 +294,41 @@ mod tests {
         assert_eq!(config, MainProcessConfig::scratch());
         let encoded = serde_json::to_string(&config).unwrap();
         assert_eq!(MainProcessConfig::decode(&encoded).unwrap(), config);
+    }
+
+    #[test]
+    fn omitted_command_stays_empty_for_supervisor_resolution() {
+        // No command supplied → empty command; the supervisor resolves the
+        // default login shell against the sandbox image.
+        let empty = crate::proto::compute::v1::DriverSandboxSpec::default();
+        assert!(
+            MainProcessConfig::from_driver_spec(Some(&empty))
+                .command
+                .is_empty()
+        );
+        assert!(MainProcessConfig::from_driver_spec(None).command.is_empty());
+
+        // An explicit command is preserved verbatim and never rewritten.
+        let explicit = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec!["/bin/bash".into(), "-l".into()],
+            tty: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            MainProcessConfig::from_driver_spec(Some(&explicit)).command,
+            vec!["/bin/bash".to_string(), "-l".to_string()]
+        );
+
+        // An empty command survives the transport round-trip.
+        let encoded = serde_json::to_string(&MainProcessConfig::scratch()).unwrap();
+        assert!(
+            MainProcessConfig::decode(&encoded)
+                .unwrap()
+                .command
+                .is_empty()
+        );
+
+        // A present-but-blank program is still rejected.
+        assert!(MainProcessConfig::decode(r#"{"version":1,"command":[""],"tty":false}"#).is_err());
     }
 }

@@ -20,7 +20,8 @@ type ProviderSpec = types.ProviderSpec
 type ProviderInterface interface {
 	Create(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
 	Get(ctx context.Context, workspace, name string) (*Provider, error)
-	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error)
+	List(workspace string, opts ...ListOptions) (*Pager[*Provider], error)
+	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error)
 	Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
 	Delete(ctx context.Context, workspace, name string) error
 	Ensure(ctx context.Context, workspace string, provider *Provider) (*Provider, error)

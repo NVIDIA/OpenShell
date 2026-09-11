@@ -426,6 +426,7 @@ fn telemetry_worker(rx: mpsc::Receiver<TelemetryEvent>) {
 
 #[cfg(feature = "telemetry")]
 fn publish_payload(endpoint: &str, payload: Value) -> Result<(), reqwest::Error> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     Client::builder()
         .use_rustls_tls()
         .tls_built_in_root_certs(true)

@@ -8,11 +8,8 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_docker::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "openshell-driver-docker", version = VERSION)]
@@ -46,24 +43,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) = openshell_driver_docker::otel_tracing::provider_for(
-        args.otlp_endpoint.as_deref(),
-        args.gateway_name.as_deref(),
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_docker::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
     );
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_docker::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
@@ -76,21 +64,15 @@ async fn main() -> Result<()> {
     let _cleanup =
         openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), "Starting Docker compute driver");
-    let result = tonic::transport::Server::builder()
-        .layer(compute_driver_rpc_layer())
+    tonic::transport::Server::builder()
+        .layer(openshell_otel::compute_driver_rpc_layer())
         .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
         .serve_with_incoming_shutdown(
             openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
             shutdown_signal(),
         )
         .await
-        .into_diagnostic();
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
-    }
-    result
+        .into_diagnostic()
 }
 
 async fn shutdown_signal() {

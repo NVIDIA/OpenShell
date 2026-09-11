@@ -23,7 +23,6 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
-openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
@@ -36,6 +35,7 @@ k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 socket2 = { workspace = true }
 nix = { workspace = true }
+libc = "0.2"
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
@@ -70,6 +70,7 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 # OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
@@ -85,12 +86,12 @@ base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
-ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
+sqlx-core = { workspace = true }
 reqwest = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sts = { workspace = true }
@@ -120,13 +121,18 @@ default = ["telemetry"]
 ## that contains no telemetry endpoint, HTTP client, or emission code.
 telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
+prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 test-support = []
 
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
 [dev-dependencies]
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
-rcgen = { version = "0.13", features = ["crypto", "pem"] }
-rsa = { version = "0.9", features = ["pem"] }
 base64 = { workspace = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
+rcgen = { workspace = true }
+rsa = { version = "0.9", features = ["pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"

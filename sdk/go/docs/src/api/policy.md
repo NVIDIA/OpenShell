@@ -48,10 +48,11 @@ fmt.Printf("Active version: %d, revision status: %s\n",
 
 ## List
 
-List all policy revisions for a sandbox.
+`List` returns a lazy pager over policy revisions for one sandbox. Use
+`ListAll` to collect every page.
 
 ```go
-revisions, err := client.Policy().List(ctx, "default", "my-sandbox")
+revisions, err := client.Policy().ListAll(ctx, "default", "my-sandbox")
 if err != nil {
     log.Fatal(err)
 }

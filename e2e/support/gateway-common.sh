@@ -176,7 +176,7 @@ e2e_write_gateway_jwt_config() {
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
   # Local Docker/Podman e2e gateways exercise the single-player default:
   # sandbox JWTs identify the supervisor and do not expire.
-  printf 'ttl_secs = 0\n\n'
+  printf '\n'
 }
 
 e2e_write_gateway_mtls_auth_config() {
@@ -218,11 +218,11 @@ e2e_build_gateway_binaries() {
   if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
     echo "Building openshell-gateway..."
     if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-      cargo build "${jobs[@]}" \
+      cargo build ${jobs[@]+"${jobs[@]}"} \
         -p openshell-gateway --bin openshell-gateway \
         --no-default-features --features telemetry
     else
-      cargo build "${jobs[@]}" \
+      cargo build ${jobs[@]+"${jobs[@]}"} \
         -p openshell-gateway --bin openshell-gateway
     fi
   else
@@ -231,7 +231,7 @@ e2e_build_gateway_binaries() {
 
   if [ -z "${OPENSHELL_BIN:-}" ]; then
     echo "Building openshell-cli..."
-    cargo build "${jobs[@]}" \
+    cargo build ${jobs[@]+"${jobs[@]}"} \
       -p openshell-cli
   else
     echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
@@ -265,7 +265,7 @@ e2e_build_external_driver() {
   else
     printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
     echo "Building external ${binary}..."
-    cargo build "${jobs[@]}" -p "${package}" --bin "${binary}"
+    cargo build ${jobs[@]+"${jobs[@]}"} -p "${package}" --bin "${binary}"
   fi
   if [ ! -x "${!output_var}" ]; then
     echo "ERROR: expected external driver binary at ${!output_var}" >&2

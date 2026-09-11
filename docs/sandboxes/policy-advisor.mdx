@@ -129,7 +129,7 @@ OpenShell has two proposal paths:
 | Path | Source | Typical rule shape |
 |---|---|---|
 | Mechanistic mapper | Aggregated denial summaries from the sandbox. | Groups by host, port, and binary. If L7 request samples are available, it can draft REST method and path rules. Otherwise it drafts an L4 endpoint. |
-| Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also propose L4 rules for opaque protocols. |
+| Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also omit `protocol` for endpoint-only access through the explicit proxy. |
 
 ### How proposal provenance works
 
@@ -189,7 +189,7 @@ For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one 
 }
 ```
 
-The current `policy.local` JSON shape covers L4 endpoints and REST method or path rules. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
+The current `policy.local` JSON shape covers explicit-proxy endpoints and REST method or path rules. Agent-authored proposals cannot set `protocol: tcp` or `tls: skip`, because those modes bypass application-authority inspection. When a task requires native TCP or a raw TLS tunnel, a developer must add the rule through the normal policy-authoring workflow. Omitting `protocol` remains supported and retains the explicit proxy's default TLS termination and HTTP authority checks. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
 
 Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
 

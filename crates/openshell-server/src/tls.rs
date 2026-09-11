@@ -15,10 +15,10 @@ use notify::event::EventKind;
 use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
-use rustls::crypto::ring::sign;
+use rustls::crypto::aws_lc_rs::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -329,6 +329,27 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
 
+/// Validate SNI certificate option relationships without reading certificate files.
+pub fn validate_external_cert_config(
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+) -> Result<()> {
+    match (external_cert_path, external_key_path) {
+        (Some(_), None) => Err(Error::tls(
+            "external_cert_path is set but external_key_path is missing",
+        )),
+        (None, Some(_)) => Err(Error::tls(
+            "external_key_path is set but external_cert_path is missing",
+        )),
+        (Some(_), Some(_)) if external_server_names.is_empty() => Err(Error::tls(
+            "external certificate is configured but external_server_names is empty — \
+             the external cert would never be served",
+        )),
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+    }
+}
+
 /// Build an SNI-based cert resolver when an external certificate is configured.
 /// Returns `None` when no external cert is configured (single-cert mode).
 fn build_cert_resolver(
@@ -338,30 +359,17 @@ fn build_cert_resolver(
     external_key_path: Option<&Path>,
     external_server_names: &[String],
 ) -> Result<Option<Arc<dyn ResolvesServerCert>>> {
-    match (external_cert_path, external_key_path) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(Error::tls(
-            "external_cert_path is set but external_key_path is missing",
-        )),
-        (None, Some(_)) => Err(Error::tls(
-            "external_key_path is set but external_cert_path is missing",
-        )),
-        (Some(ext_cert_path), Some(ext_key_path)) => {
-            if external_server_names.is_empty() {
-                return Err(Error::tls(
-                    "external certificate is configured but external_server_names is empty — \
-                     the external cert would never be served",
-                ));
-            }
-            let internal = load_certified_key(cert_path, key_path)?;
-            let external = load_certified_key(ext_cert_path, ext_key_path)?;
-            Ok(Some(Arc::new(DualCertResolver {
-                internal,
-                external,
-                external_names: external_server_names.to_vec(),
-            })))
-        }
-    }
+    validate_external_cert_config(external_cert_path, external_key_path, external_server_names)?;
+    let (Some(ext_cert_path), Some(ext_key_path)) = (external_cert_path, external_key_path) else {
+        return Ok(None);
+    };
+    let internal = load_certified_key(cert_path, key_path)?;
+    let external = load_certified_key(ext_cert_path, ext_key_path)?;
+    Ok(Some(Arc::new(DualCertResolver {
+        internal,
+        external,
+        external_names: external_server_names.to_vec(),
+    })))
 }
 
 /// Build a `ServerConfig` from certificate, key, and optional client CA files.
@@ -473,8 +481,8 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
-fn tls_ocsf_ctx() -> SandboxContext {
-    SandboxContext {
+fn tls_ocsf_ctx() -> EventContext {
+    EventContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
         container_image: "openshell/gateway".to_string(),
@@ -488,9 +496,7 @@ fn tls_ocsf_ctx() -> SandboxContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls_test_utils::{
-        generate_test_certs_with_ca, install_rustls_provider, write_test_file,
-    };
+    use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
     use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -532,7 +538,6 @@ mod tests {
 
     #[test]
     fn test_build_server_config() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let _ = generate_test_certs_with_ca(dir.path());
 
@@ -553,7 +558,6 @@ mod tests {
 
     #[test]
     fn test_reload_success() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -574,7 +578,6 @@ mod tests {
 
     #[test]
     fn test_reload_invalid_preserves_old() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -607,8 +610,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_handshake_and_reload() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -702,8 +703,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_serves_new_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -778,8 +777,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_shutdown() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -812,8 +809,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_detects_file_change() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -902,8 +897,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_mtls_ca_rotation() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (initial_ca_cert, initial_ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -1110,7 +1103,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_returns_none_when_no_external() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1127,7 +1119,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_cert_without_key() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1147,7 +1138,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_key_without_cert() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1167,7 +1157,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_empty_server_names() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1195,7 +1184,6 @@ mod tests {
 
     #[test]
     fn test_dual_cert_resolver_returns_external_on_sni_match() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1233,8 +1221,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_dual_cert_resolver_sni_selects_correct_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(

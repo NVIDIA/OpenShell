@@ -22,11 +22,19 @@ func newFakeProfileClient(closedFunc func() bool) *fakeProfileClient {
 }
 
 // List returns Unimplemented.
-func (c *fakeProfileClient) List(_ context.Context, _ string, _ ...v1.ListOptions) ([]*types.ProviderProfile, error) {
+func (c *fakeProfileClient) List(_ string, _ ...v1.ListOptions) (*v1.Pager[*types.ProviderProfile], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "List is not supported by the fake client"}
+}
+
+// ListAll returns Unimplemented.
+func (c *fakeProfileClient) ListAll(_ context.Context, _ string, _ ...v1.ListOptions) ([]*types.ProviderProfile, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "ListAll is not supported by the fake client"}
 }
 
 // Get returns Unimplemented.
