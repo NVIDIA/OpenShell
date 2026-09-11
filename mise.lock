@@ -156,6 +156,8 @@ provenance = "github-attestations"
 checksum = "sha256:66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e"
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501882467"
+provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:nextest-rs/nextest"."platforms.macos-arm64"]
 checksum = "sha256:4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07"
