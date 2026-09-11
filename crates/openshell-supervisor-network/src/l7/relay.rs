@@ -150,7 +150,18 @@ fn normalized_endpoint_host(host: &str) -> &str {
         .trim_end_matches('.')
 }
 
-async fn reject_request_authority_mismatch<W>(client: &mut W, ctx: &L7EvalContext) -> Result<()>
+fn method_only_request(method: &str) -> HttpRequest {
+    HttpRequest {
+        http_method: method.parse().expect("HTTP method parsing is infallible"),
+        url: None,
+    }
+}
+
+async fn reject_request_authority_mismatch<W>(
+    client: &mut W,
+    ctx: &L7EvalContext,
+    method: &str,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -165,7 +176,7 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_request_authority_mismatch_event(ctx));
+    ocsf_emit!(build_request_authority_mismatch_event(ctx, method));
     ocsf_emit!(build_request_authority_mismatch_finding(ctx));
     Ok(())
 }
@@ -275,9 +286,14 @@ where
     .await
 }
 
-fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+fn build_request_authority_mismatch_event(
+    ctx: &L7EvalContext,
+    method: &str,
+) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
+        .activity(ActivityId::for_http_method(method))
+        .http_request(method_only_request(method))
+        .http_response(openshell_ocsf::HttpResponse { code: 403 })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::High)
@@ -314,10 +330,16 @@ fn build_request_authority_mismatch_finding(ctx: &L7EvalContext) -> openshell_oc
 
 fn build_credential_resolution_event(
     ctx: &L7EvalContext,
+    method: &str,
     endpoint_mismatch: bool,
 ) -> openshell_ocsf::OcsfEvent {
+    let response_code = if endpoint_mismatch { 403 } else { 500 };
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
+        .activity(ActivityId::for_http_method(method))
+        .http_request(method_only_request(method))
+        .http_response(openshell_ocsf::HttpResponse {
+            code: response_code,
+        })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(if endpoint_mismatch {
@@ -359,6 +381,7 @@ fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_
 pub(crate) async fn reject_credential_resolution<W>(
     client: &mut W,
     ctx: &L7EvalContext,
+    method: &str,
     error: &secrets::UnresolvedPlaceholderError,
 ) -> Result<()>
 where
@@ -385,7 +408,11 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_credential_resolution_event(ctx, endpoint_mismatch));
+    ocsf_emit!(build_credential_resolution_event(
+        ctx,
+        method,
+        endpoint_mismatch
+    ));
 
     if endpoint_mismatch {
         ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
@@ -464,7 +491,7 @@ where
                 if let Some(observer) = observer {
                     observer.observe_credential_failure(error.is_endpoint_mismatch());
                 }
-                reject_credential_resolution(client, ctx, error).await?;
+                reject_credential_resolution(client, ctx, &request.action, error).await?;
                 Ok(None)
             } else if report
                 .downcast_ref::<crate::l7::rest::CredentialUnavailableError>()
@@ -724,14 +751,14 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
 
         let route_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -866,7 +893,7 @@ where
                 if let Some(observer) = observer.as_ref() {
                     observer.observe_credential_failure(error.is_endpoint_mismatch());
                 }
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -1588,7 +1615,7 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
@@ -1604,7 +1631,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -2043,7 +2070,7 @@ where
             if let Some(observer) = observer.as_ref() {
                 observer.observe(EndpointResult::PolicyDenied);
             }
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -2056,7 +2083,7 @@ where
                 if let Some(observer) = observer.as_ref() {
                     observer.observe_credential_failure(error.is_endpoint_mismatch());
                 }
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -2323,7 +2350,7 @@ where
         let req = parsed.request;
         let graphql_info = parsed.info;
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
@@ -2337,7 +2364,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -2988,7 +3015,7 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if close_if_stale(generation_guard, ctx) {
@@ -3001,7 +3028,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -3379,6 +3406,46 @@ mod tests {
     }
 
     #[test]
+    fn early_http_rejections_include_method_and_response() {
+        use openshell_ocsf::validation::{
+            load_class_schema, validate_enum_value, validate_required_fields,
+        };
+        let ctx = L7EvalContext {
+            host: "example.com".into(),
+            port: 443,
+            ..Default::default()
+        };
+        let schema = load_class_schema("http_activity");
+        for (event, method, response_code) in [
+            (
+                build_request_authority_mismatch_event(&ctx, "GET"),
+                "GET",
+                403,
+            ),
+            (
+                build_credential_resolution_event(&ctx, "POST", true),
+                "POST",
+                403,
+            ),
+            (
+                build_credential_resolution_event(&ctx, "HEAD", false),
+                "HEAD",
+                500,
+            ),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 4002);
+            assert_eq!(json["dst_endpoint"]["domain"], "example.com");
+            assert_eq!(json["action_id"], 2);
+            assert_eq!(json["http_request"]["http_method"], method);
+            assert!(json["http_request"].get("url").is_none());
+            assert_eq!(json["http_response"]["code"], response_code);
+            validate_required_fields(&json, &schema);
+            validate_enum_value(&json, "activity_id", &schema);
+        }
+    }
+
+    #[test]
     fn websocket_preflight_input_carries_real_sandbox_name() {
         let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
@@ -3555,7 +3622,7 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(ctx, true)
+        let activity = build_credential_resolution_event(ctx, "GET", true)
             .to_json()
             .expect("serialize credential mismatch activity");
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
@@ -3616,7 +3683,7 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(&ctx, true)
+        let activity = build_credential_resolution_event(&ctx, "GET", true)
             .to_json()
             .unwrap();
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
@@ -5208,7 +5275,7 @@ network_policies:
             forwarded.is_empty(),
             "mismatched request authority must not write upstream"
         );
-        let activity = build_request_authority_mismatch_event(&event_ctx)
+        let activity = build_request_authority_mismatch_event(&event_ctx, "GET")
             .to_json()
             .expect("serialize authority mismatch activity");
         assert_eq!(activity["status_detail"], "request_authority_mismatch");
