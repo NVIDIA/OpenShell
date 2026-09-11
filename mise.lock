@@ -134,6 +134,18 @@ checksum = "sha256:b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0ed
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060720"
 
+[[tools."github:mozilla/sccache"]]
+version = "0.16.0"
+backend = "github:mozilla/sccache"
+
+[tools."github:mozilla/sccache".options]
+asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
+
+[tools."github:mozilla/sccache"."platforms.linux-x64"]
+checksum = "sha256:aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060682"
+
 [[tools."github:nextest-rs/nextest"]]
 version = "cargo-nextest-0.9.143"
 backend = "github:nextest-rs/nextest"
