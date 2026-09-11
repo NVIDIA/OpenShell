@@ -406,7 +406,6 @@ pub struct CheckScope {
     pub model_version: &'static str,
     pub policy_version: u32,
     pub domains: &'static [CheckDomain],
-    pub assumptions: &'static [&'static str],
 }
 
 static DOMAINS: &[CheckDomain] = &[
@@ -414,18 +413,11 @@ static DOMAINS: &[CheckDomain] = &[
     CheckDomain::NetworkL4,
     CheckDomain::NetworkRest,
 ];
-static ASSUMPTIONS: &[&str] = &[
-    "Candidate and maximum use the same sandbox filesystem namespace and mount interpretation.",
-    "Network containment covers runtime configurations with binary identity checks enabled and disabled.",
-    "REST witnesses use canonical request methods and paths.",
-];
-
 fn check_scope() -> &'static CheckScope {
     static SCOPE: CheckScope = CheckScope {
         model_version: "maximum-boundary-v1",
         policy_version: 1,
         domains: DOMAINS,
-        assumptions: ASSUMPTIONS,
     };
     &SCOPE
 }
