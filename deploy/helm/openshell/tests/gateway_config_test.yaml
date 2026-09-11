@@ -273,6 +273,32 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*='
 
+  - it: uses the gateway built-in sandbox runtime image by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image\s*='
+
+  - it: renders independent sandbox runtime and supervisor image overrides
+    template: templates/gateway-config.yaml
+    set:
+      sandboxRuntime.image.repository: registry.example.com/openshell/sandbox
+      sandboxRuntime.image.tag: sandbox-build
+      sandboxRuntime.image.pullPolicy: Always
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.tag: supervisor-build
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/openshell/sandbox:sandbox-build"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image_pull_policy\s*=\s*"Always"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
+
   - it: renders a supervisor tag override with the official repository
     template: templates/gateway-config.yaml
     set:
