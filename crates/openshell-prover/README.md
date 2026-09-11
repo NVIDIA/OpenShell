@@ -14,6 +14,15 @@ fully composed candidate policy stays within an operator-supplied maximum. The
 the legacy proposal-risk queries answer different questions; gateway callers
 continue to use the proposal-risk API until the managed-policy migration.
 
+The containment model accepts ASCII literals in network binary selectors,
+endpoint host and path selectors, and REST allow and deny method and path
+selectors. It returns `unsupported_policy_shape` when either policy uses a
+non-ASCII literal in one of those fields. This boundary does not apply to
+filesystem paths or unrelated policy text. ASCII wildcards are modeled over the
+runtime match language and can therefore match non-ASCII runtime values. A
+solver string that cannot be decoded and validated exactly produces
+`invalid_witness` rather than counterexample evidence.
+
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
 chunk pass through (when the reviewer opts in via the

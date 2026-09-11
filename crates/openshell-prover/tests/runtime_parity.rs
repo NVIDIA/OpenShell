@@ -4,7 +4,7 @@
 //! Regression tests against the network supervisor's actual Rego policy.
 
 use openshell_prover::containment::{
-    CheckOptions, CheckResult, check_within_maximum, parse_policy_str,
+    CheckOptions, CheckResult, Counterexample, check_within_maximum, parse_policy_str,
 };
 use regorus::{Engine, Value};
 use serde_json::json;
@@ -26,11 +26,15 @@ fn check(maximum: &str, candidate: &str) -> CheckResult {
 }
 
 fn runtime_engine(policy: &str) -> Engine {
+    runtime_engine_with_identity(policy, true)
+}
+
+fn runtime_engine_with_identity(policy: &str, require_binary_identity: bool) -> Engine {
     let yaml: serde_yml::Value = serde_yml::from_str(policy).expect("valid policy YAML");
     let mut data = serde_json::to_value(yaml).expect("policy converts to JSON");
     data.as_object_mut().expect("policy is an object").insert(
         "runtime".to_owned(),
-        json!({ "require_binary_identity": true }),
+        json!({ "require_binary_identity": require_binary_identity }),
     );
 
     let mut engine = Engine::new();
@@ -81,6 +85,43 @@ fn eval_array_len(engine: &mut Engine, input: &Value, rule: &str) -> usize {
         Value::Undefined => 0,
         value => panic!("expected array from {rule}, got {value:?}"),
     }
+}
+
+#[test]
+fn underscore_host_counterexample_replays_at_runtime() {
+    let maximum = "version: 1\n";
+    let candidate = r"
+version: 1
+network_policies:
+  egress:
+    endpoints: [{ host: api_internal.example.com, ports: [443] }]
+    binaries: [{ path: /usr/bin/curl }]
+";
+    let result = check(maximum, candidate);
+    let CheckResult::Exceeds(evidence) = result else {
+        panic!("expected exceeding witness, got {result:?}");
+    };
+    let Counterexample::Network {
+        host,
+        binary_identity_required,
+        ..
+    } = evidence.counterexample()
+    else {
+        panic!("expected a network counterexample");
+    };
+    assert_eq!(host, "api_internal.example.com");
+
+    let input = runtime_input("/usr/bin/curl", &[], host, "GET");
+    assert!(eval_bool(
+        &mut runtime_engine_with_identity(candidate, *binary_identity_required),
+        &input,
+        "data.openshell.sandbox.allow_network"
+    ));
+    assert!(!eval_bool(
+        &mut runtime_engine_with_identity(maximum, *binary_identity_required),
+        &input,
+        "data.openshell.sandbox.allow_network"
+    ));
 }
 
 #[test]
@@ -142,6 +183,84 @@ fn recursive_path_globs_preserve_zero_directory_grants_and_denies() {
         } else {
             assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
         }
+    }
+}
+
+#[test]
+fn ascii_wildcards_match_unicode_runtime_paths_in_allows_and_denies() {
+    let candidate = r#"
+version: 1
+network_policies:
+  grant:
+    endpoints:
+      - host: api.example.com
+        ports: [443]
+        protocol: rest
+        enforcement: enforce
+        rules: [{ allow: { method: GET, path: "/items/*" } }]
+    binaries: [{ path: /usr/bin/curl }]
+"#;
+    let maximum = r#"
+version: 1
+network_policies:
+  grant:
+    endpoints:
+      - host: api.example.com
+        ports: [443]
+        protocol: rest
+        enforcement: enforce
+        rules: [{ allow: { method: GET, path: "/**" } }]
+        deny_rules: [{ method: GET, path: "/items/*" }]
+    binaries: [{ path: /usr/bin/curl }]
+"#;
+
+    for path in ["/items/é", "/items/汉", "/items/e\u{301}", "/items/😀"] {
+        let input: Value = serde_json::from_value(json!({
+            "exec": {"path": "/usr/bin/curl", "ancestors": [], "cmdline_paths": []},
+            "network": {"host": "api.example.com", "port": 443},
+            "request": {"method": "GET", "path": path, "query_params": {}}
+        }))
+        .unwrap();
+        assert!(
+            eval_bool(
+                &mut runtime_engine(candidate),
+                &input,
+                "data.openshell.sandbox.allow_request"
+            ),
+            "candidate should allow {path:?}"
+        );
+        assert!(
+            !eval_bool(
+                &mut runtime_engine(maximum),
+                &input,
+                "data.openshell.sandbox.allow_request"
+            ),
+            "maximum should deny {path:?}"
+        );
+    }
+    assert!(matches!(check(maximum, candidate), CheckResult::Exceeds(_)));
+
+    let binary_wildcard = r#"
+version: 1
+network_policies:
+  grant:
+    endpoints: [{ host: api.example.com, ports: [443] }]
+    binaries: [{ path: "/usr/bin/*" }]
+"#;
+    for binary in [
+        "/usr/bin/é",
+        "/usr/bin/汉",
+        "/usr/bin/e\u{301}",
+        "/usr/bin/😀",
+    ] {
+        assert!(
+            eval_bool(
+                &mut runtime_engine(binary_wildcard),
+                &runtime_input(binary, &[], "api.example.com", "GET"),
+                "data.openshell.sandbox.allow_network"
+            ),
+            "runtime binary wildcard should allow {binary:?}"
+        );
     }
 }
 

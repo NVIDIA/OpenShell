@@ -120,6 +120,68 @@ fn unsupported_policy_returns_reason_and_three() {
 }
 
 #[test]
+fn underscore_host_exceeds_an_empty_maximum() {
+    let output = check_json("candidate-underscore-host.yaml", "maximum-empty.yaml");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "exceeds_max");
+    assert_eq!(value["counterexample"]["host"], "api_internal.example.com");
+}
+
+#[test]
+fn non_ascii_network_literals_are_unsupported_in_both_inputs() {
+    for (candidate, maximum, input_label) in [
+        (
+            "candidate-unicode-network-selector.yaml",
+            "maximum-empty.yaml",
+            "candidate",
+        ),
+        (
+            "maximum-empty.yaml",
+            "candidate-unicode-network-selector.yaml",
+            "maximum",
+        ),
+    ] {
+        let output = check_json(candidate, maximum);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{input_label} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+        assert_eq!(value["result"], "unsupported");
+        assert_eq!(value["reason_code"], "unsupported_policy_shape");
+        assert!(
+            value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(input_label) && reason.contains("non-ASCII")),
+            "{value}"
+        );
+    }
+
+    let output = run(&[
+        "check",
+        fixture("candidate-unicode-network-selector.yaml")
+            .to_str()
+            .unwrap(),
+        "--maximum",
+        fixture("maximum-empty.yaml").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).expect("UTF-8 text output");
+    assert!(text.contains("result: unsupported"), "{text}");
+    assert!(text.contains("candidate policy"), "{text}");
+    assert!(text.contains("non-ASCII"), "{text}");
+}
+
+#[test]
 fn resource_exhaustion_is_inconclusive_and_returns_three() {
     let path = std::env::temp_dir().join(format!(
         "openshell-prover-resource-limit-{}.yaml",
