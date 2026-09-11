@@ -4325,7 +4325,7 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
     use std::sync::atomic::Ordering;
 
     let requested_revision = sandbox_config_revision(&snapshot);
-    if snapshot.config_revision == *current_config_revision {
+    if reloads_gateway_policy && snapshot.config_revision == *current_config_revision {
         return config_apply_result(
             ConfigComponent::SandboxConfig,
             requested_revision,
@@ -4396,24 +4396,60 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
                 }
                 Err(failure) => {
                     let failure_mode = snapshot.policy_validation_failure_mode;
-                    let error = match apply_gateway_runtime_reload_failure(
+                    let (outcome, error) = match apply_gateway_runtime_reload_failure(
                         &ctx.opa_engine,
                         failure,
                         failure_mode,
                         *has_last_valid_policy,
                         snapshot.version,
                     ) {
-                        Ok(
-                            GatewayRuntimeFailureDisposition::PolicyRejected { error, .. }
-                            | GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error }
-                            | GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                                error,
-                                ..
-                            },
-                        ) => error,
-                        Err(error) => error.to_string(),
+                        Ok(GatewayRuntimeFailureDisposition::PolicyRejected {
+                            error,
+                            disposition,
+                        }) => {
+                            emit_policy_validation_failure(
+                                &disposition,
+                                snapshot.version,
+                                &snapshot.policy_hash,
+                                &error,
+                            );
+                            let outcome = if disposition.previous_policy_active {
+                                ConfigApplyOutcome::FailedRetainedLastKnownGood
+                            } else {
+                                ConfigApplyOutcome::FailedClosed
+                            };
+                            (outcome, error)
+                        }
+                        Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error }) => {
+                            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .state(StateId::Other, "failed")
+                                .unmapped("version", serde_json::json!(snapshot.version))
+                                .unmapped("error", serde_json::json!(&error))
+                                .unmapped("previous_policy_active", serde_json::json!(true))
+                                .message(format!(
+                                    "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
+                                    snapshot.version
+                                ))
+                                .build());
+                            (ConfigApplyOutcome::FailedRetainedLastKnownGood, error)
+                        }
+                        Ok(GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                            error,
+                            active_generation,
+                        }) => {
+                            emit_transparent_tcp_expansion_rejection(
+                                snapshot.version,
+                                &snapshot.policy_hash,
+                                active_generation,
+                                &error,
+                            );
+                            (ConfigApplyOutcome::FailedRetainedLastKnownGood, error)
+                        }
+                        Err(error) => (ConfigApplyOutcome::FailedClosed, error.to_string()),
                     };
-                    Err(error)
+                    Err((outcome, error))
                 }
             }
         } else {
@@ -4471,15 +4507,7 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
                 None,
             )
         }
-        Err(error) => {
-            let outcome = if snapshot.policy_validation_failure_mode
-                == PolicyValidationFailureMode::RetainLastValid
-                && *has_last_valid_policy
-            {
-                ConfigApplyOutcome::FailedRetainedLastKnownGood
-            } else {
-                ConfigApplyOutcome::FailedClosed
-            };
+        Err((outcome, error)) => {
             let applied_revision = (outcome == ConfigApplyOutcome::FailedRetainedLastKnownGood)
                 .then_some(*current_stream_revision)
                 .flatten();
@@ -5964,6 +5992,120 @@ network_policies:
             transparent_tcp: TransparentTcpReloadState::default(),
             config_apply_rx: None,
             initial_stream_snapshot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_tcp_expansion_reports_retained_active_policy() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let engine = Arc::new(
+            OpaEngine::from_proto(&proto_policy_fixture()).expect("build initial OPA engine"),
+        );
+        let mut ctx = policy_poll_test_context(
+            Arc::clone(&engine),
+            LoadedPolicyOrigin::Gateway {
+                revision: None,
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: false,
+        };
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let mut candidate =
+            settings_poll_result(Some(proto_tcp_policy_fixture()), 2, PolicySource::Sandbox);
+        candidate.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let initial_revision = sandbox_config_revision(&initial);
+        let initial_generation = engine.current_generation();
+        let result = apply_stream_sandbox_snapshot(
+            &ctx,
+            &client,
+            candidate,
+            &mut initial.config_revision.clone(),
+            &mut Some(initial_revision),
+            &mut initial.version.clone(),
+            &mut initial.policy_hash.clone(),
+            &mut Vec::new(),
+            &mut false,
+            &mut MiddlewareRegistryStatus::Synchronized,
+            &mut std::collections::HashMap::new(),
+            true,
+            &mut true,
+        )
+        .await;
+
+        assert_eq!(engine.current_generation(), initial_generation);
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(
+            ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert_eq!(result.applied_revision, Some(initial_revision));
+        assert!(
+            result
+                .failure
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("without the transparent TCP substrate")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_snapshot_preserves_local_policy_override() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let engine = Arc::new(
+            OpaEngine::from_proto(&proto_policy_fixture()).expect("build local OPA engine"),
+        );
+        let ctx = policy_poll_test_context(
+            Arc::clone(&engine),
+            LoadedPolicyOrigin::LocalOverride,
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut current_config_revision = 0;
+        let mut current_revision = None;
+        let mut version = 0;
+        let mut hash = String::new();
+        let mut services = Vec::new();
+        let mut auth_enabled = false;
+        let mut registry_status = MiddlewareRegistryStatus::Synchronized;
+        let mut settings = std::collections::HashMap::new();
+        let mut has_last_valid_policy = true;
+        let initial_generation = engine.current_generation();
+
+        for _ in 0..2 {
+            let candidate =
+                settings_poll_result(Some(proto_tcp_policy_fixture()), 2, PolicySource::Sandbox);
+            let result = apply_stream_sandbox_snapshot(
+                &ctx,
+                &client,
+                candidate,
+                &mut current_config_revision,
+                &mut current_revision,
+                &mut version,
+                &mut hash,
+                &mut services,
+                &mut auth_enabled,
+                &mut registry_status,
+                &mut settings,
+                false,
+                &mut has_last_valid_policy,
+            )
+            .await;
+
+            assert_eq!(engine.current_generation(), initial_generation);
+            assert_eq!(
+                ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+                ConfigApplyOutcome::RetainedLocalOverride
+            );
+            assert!(result.applied_revision.is_none());
+            assert!(current_revision.is_none());
         }
     }
 
