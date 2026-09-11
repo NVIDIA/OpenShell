@@ -133,7 +133,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         log_level: "info".to_string(),
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
-        network_name: "openshell-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         gateway_tls_server_name: None,
         guest_tls: Some(DockerGuestTlsPaths {

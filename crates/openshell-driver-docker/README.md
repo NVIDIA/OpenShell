@@ -34,7 +34,7 @@ mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
-bypassed. Only the supervisor companion joins the managed bridge network.
+bypassed. Only the trusted supervisor companion uses the daemon host network.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
@@ -69,7 +69,8 @@ LSM decisions remain authoritative.
 | Exact non-root `user` and `group_add` | Gives sandbox and workload the same immutable UID/GID/group identity required for capability-free observation. |
 | `cap_drop = ALL`, no `cap_add`, no-new-privileges | Prevents either container from acquiring Linux capabilities. |
 | Docker default seccomp and AppArmor profiles | Retains runtime hardening; startup confirmation fails closed if nested seccomp notification is unavailable. |
-| `network_mode = none` on the workload | Removes direct external routes. The supervisor companion alone has bridge networking. |
+| `network_mode = none` on the workload | Removes direct external routes. |
+| `network_mode = host` on the supervisor | Lets the trusted supervisor originate approved gateway and upstream connections through the daemon host network. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Set `sandbox_pids_limit = 0` to use the runtime default. |
 | Private named volume | Carries a per-generation mutual-TLS sandbox/supervisor channel without sharing daemon-host paths. The sandbox consumes its server key at startup; only the supervisor receives the client key. |
