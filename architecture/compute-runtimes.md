@@ -425,6 +425,25 @@ identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
 The supervisor itself remains root so it can establish isolation before
 starting unprivileged children.
 
+When the Kubernetes driver seeds a fresh workspace PVC from the image, the
+seeded tree is written as the resolved sandbox UID/GID. The init container runs
+as root so it can read every source path, and rewrites ownership while building
+the transfer archive rather than chowning the workspace afterwards. Ownership
+must be established during seeding: `fsGroup` is applied by kubelet when the
+volume is mounted, which is before the init container writes anything, and the
+sidecar topology does not perform the supervisor's privileged workspace
+reconciliation. Modes and timestamps are not restored, so a nested read-only
+mount under the workspace is never chmod'ed during seeding.
+
+Two environments cannot restore ownership, and neither turns a permissions
+problem into a pod that will not start. The rewrite uses GNU tar extensions and
+the init container runs the sandbox image itself, so an image whose tar lacks
+them — a minimal base such as Alpine, which provides BusyBox tar — seeds with
+the previous flags instead. A writable backend can also accept the write but
+reject `chown`, root-squashed NFS being the usual case; extraction then retries
+without ownership. The sentinel is recorded when either attempt succeeds, so a
+workspace that never seeded is never marked initialized.
+
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway
