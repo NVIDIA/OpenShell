@@ -2,13 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Test Docker
+- name: Configure OpenShell gateway
   hosts: all
   gather_facts: false
-  tasks:
-    - name: List Docker containers
-      ansible.builtin.command:
-        argv:
-          - docker
-          - ps
-      changed_when: false
+  roles:
+    - openshell_gateway

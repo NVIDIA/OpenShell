@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Detect container runtime
+  ansible.builtin.include_tasks: detect.yaml
+
+- name: Create OpenShell state directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell
+    state: directory
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0700"
+
+- name: Prepare Podman gateway
+  ansible.builtin.include_tasks: podman.yaml
+  when: openshell_gateway_driver == "podman"
+
+- name: Create OpenShell configuration directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell
+    state: directory
+    mode: "0755"
+
+- name: Create OpenShell gateway PKI directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell/pki
+    state: directory
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0700"
+
+- name: Generate OpenShell gateway certificates
+  become: true
+  become_user: "{{ openshell_gateway_user }}"
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/openshell-gateway
+      - generate-certs
+      - --output-dir
+      - /var/lib/openshell/pki
+    creates: /var/lib/openshell/pki/jwt/signing.pem
+  environment:
+    HOME: "{{ openshell_gateway_home }}"
+
+- name: Configure OpenShell gateway
+  become: true
+  ansible.builtin.template:
+    src: "gateway-{{ openshell_gateway_driver }}.toml.j2"
+    dest: /etc/openshell/gateway.toml
+    mode: "0644"
+
+- name: Install OpenShell gateway service
+  become: true
+  ansible.builtin.template:
+    src: "gateway-{{ openshell_gateway_driver }}.service.j2"
+    dest: /etc/systemd/system/openshell-gateway.service
+    mode: "0644"
+
+- name: Start OpenShell gateway
+  become: true
+  ansible.builtin.systemd_service:
+    name: openshell-gateway.service
+    daemon_reload: true
+    enabled: true
+    state: started
+
+- name: Wait for OpenShell gateway
+  block:
+    - name: Wait for gateway port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 17670
+        timeout: 60
+
+  rescue:
+    - name: Read OpenShell gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - openshell-gateway.service
+          - --no-pager
+          - --lines
+          - "100"
+      changed_when: false
+      failed_when: false
+      register: openshell_gateway_logs
+
+    - name: Show OpenShell gateway logs
+      ansible.builtin.debug:
+        var: openshell_gateway_logs.stdout_lines
+
+    - name: Report OpenShell gateway startup failure
+      ansible.builtin.fail:
+        msg: OpenShell gateway did not start

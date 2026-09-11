@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use blake3::Hasher;
 
 use crate::config::{Machine, Scenario};
@@ -12,12 +13,12 @@ use super::layer::{cached_layer, hash_file, hash_files};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
-pub async fn setup(machine: &Machine, scenario: &Scenario) -> PathBuf {
+pub async fn setup(machine: &Machine, scenario: &Scenario) -> Result<PathBuf> {
     if scenario.setup.playbooks.is_empty() {
-        return machine.base_image.clone();
+        return Ok(machine.base_image.clone());
     }
 
-    let hash = setup_hash(machine, scenario);
+    let hash = setup_hash(machine, scenario)?;
     cached_layer(
         &machine.base_image,
         &hash,
@@ -28,14 +29,16 @@ pub async fn setup(machine: &Machine, scenario: &Scenario) -> PathBuf {
     .await
 }
 
-fn setup_hash(machine: &Machine, scenario: &Scenario) -> String {
+fn setup_hash(machine: &Machine, scenario: &Scenario) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(SETUP_CACHE_VERSION);
-    hash_file(&mut hasher, &machine.base_image);
+    hash_file(&mut hasher, &machine.base_image)
+        .with_context(|| format!("failed to hash base image for machine {:?}", machine.name))?;
     hasher.update(&[u8::from(scenario.setup.use_galaxy)]);
     if scenario.setup.use_galaxy {
-        hash_file(&mut hasher, Path::new(&crate::ansible::requirements_path()));
+        hash_file(&mut hasher, Path::new(&crate::ansible::requirements_path()))
+            .context("failed to hash Ansible Galaxy requirements")?;
     }
-    hash_files(&mut hasher, &scenario.setup.playbooks);
-    hasher.finalize().to_hex().to_string()
+    hash_files(&mut hasher, &scenario.setup.playbooks).context("failed to hash setup playbooks")?;
+    Ok(hasher.finalize().to_hex().to_string())
 }

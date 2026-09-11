@@ -69,7 +69,7 @@
             zizmor
             zstd
           ]
-          ++ pkgs.lib.optionals (system == "x86_64-linux") [
+          ++ [
             pkgs.python3Packages.ansible-core
             pkgs.sshpass
             testMachines.package
@@ -121,17 +121,21 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
-        testMachines =
-          if system == "x86_64-linux" then import ./tests/config.nix { inherit pkgs; } else null;
+        testMachines = import ./tests/config.nix { inherit pkgs toolchains; };
+        tmachineArtifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
       in
       {
-        apps.test-guest = testGuest.app;
-        apps.test-guest-cache = testGuest.cacheApp;
+        apps = {
+          test-guest = testGuest.app;
+          test-guest-cache = testGuest.cacheApp;
+          tmachine-artifacts = {
+            type = "app";
+            program = "${tmachineArtifacts}/bin/tmachine-artifacts";
+          };
+        };
 
         packages = {
           vm-runtime = vmRuntime;
-        }
-        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
           tmachine-unwrapped = testMachines.unwrapped;
@@ -142,7 +146,7 @@
 
           env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
 
-          shellHook = pkgs.lib.optionalString (system == "x86_64-linux") ''
+          shellHook = ''
             export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
           '';
         };

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Copy OpenShell supervisor image
+  become: true
+  ansible.builtin.copy:
+    src: "{{ openshell_supervisor_image }}"
+    dest: /var/lib/openshell/supervisor.tar
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0600"
+
+- name: Load OpenShell supervisor image
+  become: true
+  become_user: "{{ openshell_gateway_user }}"
+  ansible.builtin.command:
+    argv:
+      - podman
+      - load
+      - --input
+      - /var/lib/openshell/supervisor.tar
+  environment:
+    HOME: "{{ openshell_gateway_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ openshell_gateway_uid }}"

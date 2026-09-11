@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=OpenShell gateway
+After=network-online.target
+{% block unit %}{% endblock %}
+
+[Service]
+User={{ openshell_gateway_user }}
+Group={{ openshell_gateway_user }}
+Environment=HOME={{ openshell_gateway_home }}
+{% block service %}{% endblock %}
+ExecStart=/usr/local/bin/openshell-gateway --config /etc/openshell/gateway.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

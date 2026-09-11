@@ -4,12 +4,14 @@
 [package]
 name = "tmachine"
 version = "0.1.0"
+authors = ["Simon Scatton <sscatton@nvidia.com>"]
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [dependencies]
+anyhow = { version = "1.0.100", default-features = false, features = ["std"] }
 blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
 clap = { version = "4.6.6", default-features = false, features = ["std", "derive", "help", "usage", "color"] }
 directories = { version = "6.0.0", default-features = false }

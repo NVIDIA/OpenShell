@@ -1,0 +1,12 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "gateway.toml.j2" %}
+{% block driver %}
+[openshell.drivers.podman]
+socket_path = "{{ openshell_runtime_socket }}"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+image_pull_policy = "if_not_present"
+supervisor_image = "docker.io/openshell/supervisor:tmachine"
+network_name = "tmachine"
+health_check_interval_secs = 10
+{% endblock %}
