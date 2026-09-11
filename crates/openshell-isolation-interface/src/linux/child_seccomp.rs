@@ -193,6 +193,7 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     for syscall in [
         libc::SYS_prlimit64,
         libc::SYS_sched_setaffinity,
+        libc::SYS_sched_setattr,
         libc::SYS_sched_setparam,
         libc::SYS_sched_setscheduler,
     ] {
@@ -417,6 +418,18 @@ mod tests {
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
             {
                 unsafe { libc::_exit(5) };
+            }
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setattr,
+                    sandbox_tgid,
+                    std::ptr::null::<libc::c_void>(),
+                    0,
+                )
+            } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(11) };
             }
             if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETOWN, sandbox_tgid) } != -1
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)

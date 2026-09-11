@@ -235,7 +235,7 @@ fn tls_client_config(tls: &BoundaryClientTls) -> Result<rustls::ClientConfig, Ba
                 "supervisor TLS private-key PEM contains no private key".to_string(),
             )
         })?;
-    rustls::ClientConfig::builder()
+    rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(roots)
         .with_client_auth_cert(certificate_chain, private_key)
         .map_err(|error| {
@@ -1733,6 +1733,12 @@ mod tests {
     }
 
     fn test_certificate() -> TestCertificate {
+        test_certificate_with_protocol_versions(&[&rustls::version::TLS13])
+    }
+
+    fn test_certificate_with_protocol_versions(
+        protocol_versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> TestCertificate {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let material = generate_boundary_mutual_tls_material().expect("generate test material");
         let certificates = rustls_pemfile::certs(&mut material.sandbox_certificate_pem.as_bytes())
@@ -1752,7 +1758,7 @@ mod tests {
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
             .build()
             .expect("build client verifier");
-        let server_config = rustls::ServerConfig::builder()
+        let server_config = rustls::ServerConfig::builder_with_protocol_versions(protocol_versions)
             .with_client_cert_verifier(verifier)
             .with_single_cert(certificates, private_key)
             .expect("build test TLS server config");
@@ -2013,6 +2019,27 @@ mod tests {
             }
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_tcp_rejects_tls12_only_server() {
+        let certificate = test_certificate_with_protocol_versions(&[&rustls::version::TLS12]);
+        let (address, server) = spawn_tls_boundary(certificate.server_config, "a".repeat(32)).await;
+        let client_config = tls_client_config(&certificate.client_tls).expect("client TLS config");
+        let server_name =
+            rustls::pki_types::ServerName::try_from(certificate.client_tls.server_name.clone())
+                .expect("server name");
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect to TLS test server");
+
+        assert!(
+            tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect(server_name, stream)
+                .await
+                .is_err()
+        );
+        server.await.expect("TLS test server task");
     }
 
     #[tokio::test]
