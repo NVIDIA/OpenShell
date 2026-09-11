@@ -34,21 +34,25 @@ jobs:
             dev_shell: .#devShells.x86_64-linux.musl
             package: openshell-sandbox
             binary: openshell-sandbox
-          - triple: x86_64-unknown-linux-musl
+            interpreter: ""
+          - triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.musl
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
             package: openshell-supervisor
             binary: openshell-supervisor
+            interpreter: /lib64/ld-linux-x86-64.so.2
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
             dev_shell: .#devShells.aarch64-linux.musl
             package: openshell-sandbox
             binary: openshell-sandbox
-          - triple: aarch64-unknown-linux-musl
+            interpreter: ""
+          - triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.musl
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
             package: openshell-supervisor
             binary: openshell-supervisor
+            interpreter: /lib/ld-linux-aarch64.so.1
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: ${{ matrix.package }}
@@ -58,5 +62,6 @@ jobs:
       dev-shell: ${{ matrix.dev_shell }}
       cargo-version: ${{ inputs.cargo-version }}
       image-tag: ${{ inputs.image-tag }}
+      interpreter: ${{ matrix.interpreter }}
       checkout-ref: ${{ inputs.checkout-ref }}
     secrets: inherit

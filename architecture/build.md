@@ -85,38 +85,18 @@ The gateway bundles z3 into the release binary so Linux packages, standalone
 tarballs, and gateway images do not depend on distro-specific z3 shared-library
 SONAMEs.
 
-The supervisor is the one binary whose libc is selectable, because it is the one
-binary executed inside a userland OpenShell does not control. `SUPERVISOR_LIBC`
-chooses between `musl` (default) and `glibc-static`. Both produce a fully static
-binary; the choice does not change the runtime layout or the supervisor image base.
-Static linkage is a hard requirement rather than a preference, so both variants
-are verified by `tasks/scripts/verify-static-binary.sh`, which fails the build on
-any `PT_INTERP` or `DT_NEEDED` entry.
-
-The two variants differ only in build-time constraints:
-
-| | `musl` (default) | `glibc-static` |
-|---|---|---|
-| Cross-compiles | yes, via `cargo zigbuild` | no — must build natively per architecture |
-| Host requirement | zig + cargo-zigbuild | glibc static libraries (`glibc-static` on Fedora/RHEL, `libc6-dev` on Debian/Ubuntu) |
-| libc license | MIT | LGPL-2.1-or-later, statically linked |
-
-`cargo zigbuild` cannot produce the `glibc-static` variant: `zig cc` accepts
-`-static` for `*-linux-gnu` targets and emits a dynamically linked binary
-anyway. The staging script therefore refuses to cross-compile that variant
-instead of silently degrading linkage.
-
-Selecting `glibc-static` statically links LGPL glibc into a redistributed
-binary, which carries relinking obligations that musl (MIT) does not. Treat the
-default as the shipping configuration unless that has been reviewed.
+The workload-side `openshell-sandbox` binary is statically linked with musl so
+drivers can stage it into an arbitrary agent image without depending on that
+image's libc. The host-side `openshell-supervisor` binary is dynamically linked
+with glibc and built with the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
 The Docker image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
-prebuilt binary. The gateway image is built from `deploy/docker/Dockerfile.gateway`
-and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
-Dockerfile compiles Rust — both copy a staged binary out of
+prebuilt binary. The gateway, sandbox, and supervisor images use distinct
+Dockerfiles under `deploy/docker/`. None of the Dockerfiles compile Rust; they
+copy staged binaries out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Local binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
@@ -195,14 +175,12 @@ Runtime layout:
   cache action runs. An explicitly configured VM runtime bundle is required to
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
-- **Sandbox and supervisor**: Alpine base with separate static
-  `/openshell-sandbox` and `/openshell-supervisor` binaries (musl by default;
-  see `SUPERVISOR_LIBC` above). Static linkage keeps the sandbox executable
-  usable when a driver stages it into an arbitrary workload image. The image
-  entrypoint is the external supervisor; drivers copy only the sandbox binary
-  into the workload trust domain. The VM driver bundles both builds
-  (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
-  `SUPERVISOR_LIBC`.
+- **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
+  musl `/openshell-sandbox` binary and its guest bootstrap helper runtime.
+  Drivers stage this binary into the workload trust domain.
+- **Supervisor**: Debian-based `openshell/supervisor` image containing only the
+  dynamically linked GNU `/openshell-supervisor` binary. GNU supervisor builds
+  must not reference `GLIBC_*` symbols newer than `GLIBC_2.28`.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

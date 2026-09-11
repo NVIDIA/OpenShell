@@ -56,6 +56,23 @@ build:
             - deploy/docker/Dockerfile.supervisor
             - tasks/scripts/docker-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
+    - image: openshell/sandbox
+      context: ../../..
+      custom:
+        buildCommand: |
+          CONTAINER_ENGINE_TARGET=local-k8s-cluster \
+          IMAGE_NAME="${IMAGE%:*}" \
+          IMAGE_TAG="${IMAGE##*:}" \
+          tasks/scripts/docker-build-image.sh sandbox
+        dependencies:
+          paths:
+            - Cargo.toml
+            - Cargo.lock
+            - crates/**
+            - proto/**
+            - deploy/docker/Dockerfile.sandbox
+            - tasks/scripts/docker-build-image.sh
+            - tasks/scripts/stage-prebuilt-binaries.sh
 deploy:
   helm:
     releases:

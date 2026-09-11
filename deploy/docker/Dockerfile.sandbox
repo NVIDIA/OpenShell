@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The static musl sandbox binary is staged under
+# deploy/docker/.build/prebuilt-binaries/<arch>/.
+#
+# Alpine also supplies the trusted helper runtime used by VM guest init for its
+# one-shot filesystem and loopback setup. Network enforcement stays outside
+# this runtime; the capability-free sandbox never receives nftables or iptables
+# tooling.
+
+FROM alpine:3.22 AS sandbox
+
+ARG TARGETARCH
+
+RUN apk add --no-cache iproute2 \
+    && mkdir -p /openshell-runtime \
+    && cp -aL /bin /sbin /lib /usr/bin /usr/sbin /usr/lib /openshell-runtime/ \
+    && mkdir -p /openshell-runtime/etc \
+    && if [ -d /etc/iproute2 ]; then cp -aL /etc/iproute2 /openshell-runtime/etc/; fi \
+    && test -x /openshell-runtime/bin/sh \
+    && test -x /openshell-runtime/sbin/ip
+
+# Keep the binary root-owned for image-volume mounts and executable by the
+# sandbox runtime's non-root UID.
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+
+ENTRYPOINT ["/openshell-sandbox"]

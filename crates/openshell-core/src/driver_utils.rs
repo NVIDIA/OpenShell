@@ -134,7 +134,10 @@ pub const CONDITION_STOPPED: &str = "ContainerStopped";
 /// All compute drivers must launch this binary as the container entrypoint to
 /// start the sandboxed environment.  The value must be kept in sync with the
 /// path used when building the `openshell-sandbox` image layer.
-pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+pub const SANDBOX_RUNTIME_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
+/// Legacy name for [`SANDBOX_RUNTIME_IMAGE_BINARY_PATH`].
+pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = SANDBOX_RUNTIME_IMAGE_BINARY_PATH;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 ///

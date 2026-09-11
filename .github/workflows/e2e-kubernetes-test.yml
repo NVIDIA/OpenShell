@@ -76,7 +76,7 @@ on:
         description: "Space-separated published images to preload into kind"
         required: false
         type: string
-        default: "gateway supervisor"
+        default: "gateway sandbox supervisor"
 
 permissions:
   actions: read
