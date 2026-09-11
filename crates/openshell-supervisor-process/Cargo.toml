@@ -39,7 +39,10 @@ rustix = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capctl = "0.2.4"
+futures-util = { version = "0.3", default-features = false }
 landlock = "0.4"
+netlink-packet-route = "0.19"
+rtnetlink = "0.14"
 seccompiler = "0.5"
 socket2 = { workspace = true }
 tempfile = "3"
