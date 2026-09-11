@@ -48,9 +48,9 @@ mod session {
     pub const GATEWAY_SESSION_JWT_TYPE: &str = "openshell-gateway-session+jwt";
     pub const SANDBOX_SESSION_JWT_TYPE: &str = "openshell-sandbox-session+jwt";
     pub const SANDBOX_SESSION_AUDIENCE: &str = "openshell-sandbox";
-    pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
-    pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_secs(60);
-    pub const MAX_SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+    pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
+    pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
+    pub const MAX_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
     pub const MAX_SESSION_CLOCK_LEEWAY: Duration = Duration::from_secs(30);
 
     const GATEWAY_ISSUER_PREFIX: &str = "openshell-gateway:";

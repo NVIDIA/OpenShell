@@ -2258,7 +2258,7 @@ mod tests {
     async fn fake_tls_proxy(
         tls_identity: &str,
     ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
-        install_crypto_provider();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec![tls_identity.to_string()])
             .unwrap()

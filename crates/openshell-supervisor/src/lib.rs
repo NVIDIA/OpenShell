@@ -32,7 +32,7 @@ use openshell_core::PolicyValidationFailureMode;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId,
+    DetectionFindingBuilder, DispositionId, EventContext, FindingInfo, OcsfEvent, SeverityId,
     StateId, StatusId, ocsf_emit,
 };
 
@@ -307,7 +307,6 @@ pub async fn run_sandbox(
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
     health_socket_path: Option<std::path::PathBuf>,
-    inference_routes: Option<String>,
     ocsf_enabled: Arc<AtomicBool>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     topology_descriptor: openshell_isolation_interface::contract::TopologyDescriptor,
@@ -333,7 +332,7 @@ pub async fn run_sandbox(
             |s| s.trim().to_string(),
         );
 
-        if !openshell_ocsf::ctx::set_ctx(SandboxContext {
+        if !openshell_ocsf::ctx::set_ctx(EventContext {
             sandbox_id: sandbox_id.clone().unwrap_or_default(),
             sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
             container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
@@ -600,7 +599,6 @@ pub async fn run_sandbox(
             sandbox_id.as_deref(),
             sandbox_name_for_agg.as_deref(),
             openshell_endpoint_for_proxy.as_deref(),
-            inference_routes.as_deref(),
             denial_tx,
             activity_tx,
             agent_proposals.clone(),
