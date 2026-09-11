@@ -115,8 +115,13 @@ The driver manages the deterministic name
 `server.sandboxJwt.gatewayId`, or the chart fullname when unset). Its `get` and
 `patch` permissions must be restricted to that exact name; `create` must remain
 a separate unrestricted ConfigMap permission because Kubernetes cannot apply
-`resourceNames` to create authorization. If you render the TOML setting outside
-this Helm value, grant that same split RBAC policy in every sandbox namespace.
+`resourceNames` to create authorization. Enabling this therefore gives the
+gateway/driver service account namespace-wide ConfigMap-create authority. In
+managed/operator modes, the chart's ClusterRoleBinding makes that permission
+cluster-wide for the bound service account; use a dedicated service account and
+scoped bindings when that boundary matters. If you render the TOML setting
+outside this Helm value, grant that same split RBAC policy in every sandbox
+namespace.
 
 Disabling the setting intentionally does not delete driver-managed ConfigMaps:
 the driver has no list/delete permissions, and a shared or operator namespace

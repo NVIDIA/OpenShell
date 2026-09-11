@@ -78,7 +78,10 @@ rules:
   # The Kubernetes driver reads and server-side-applies only its deterministic,
   # gateway-scoped destination CA ConfigMap in selected namespaces. CREATE
   # cannot use resourceNames because Kubernetes authorizes it before the name
-  # is available.
+  # is available. This is a namespace-wide ConfigMap-create capability when
+  # bound through a Role, and becomes cluster-wide when this ClusterRole is
+  # bound cluster-wide; use a dedicated service account and scoped bindings
+  # when that boundary matters.
   - apiGroups:
       - ""
     resources:

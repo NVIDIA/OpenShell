@@ -51,7 +51,9 @@ rules:
   {{- if $additionalCaEnabled }}
   # The Kubernetes driver reads and server-side-applies only its deterministic,
   # gateway-scoped destination CA ConfigMap. CREATE cannot use resourceNames:
-  # Kubernetes authorizes creates before the object name is available.
+  # Kubernetes authorizes creates before the object name is available. This is
+  # a namespace-wide ConfigMap-create capability; use a dedicated gateway
+  # service account when that boundary matters.
   - apiGroups:
       - ""
     resources:
