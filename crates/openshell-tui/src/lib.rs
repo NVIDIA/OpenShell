@@ -1374,9 +1374,8 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
         let template = if has_custom_image {
-            let resolved = openshell_core::image::resolve_community_image(&image);
             Some(openshell_core::proto::SandboxTemplate {
-                image: resolved,
+                image: image.clone(),
                 ..Default::default()
             })
         } else {
