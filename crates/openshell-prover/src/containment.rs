@@ -631,28 +631,12 @@ fn check_within_maximum_inner(
             }
             NetworkSolve::Incomplete(result) => return result,
         }
-        let ambiguous_binary_paths = ambiguous_candidate_binary_paths(maximum, candidate);
-        if binary_identity_required && !ambiguous_binary_paths.is_empty() {
-            let exact_maximum =
-                maximum_without_ambiguous_binary_globs(maximum, candidate, &ambiguous_binary_paths);
-            match solve_network_mode(
-                &exact_maximum,
-                candidate,
-                true,
-                started,
-                options.timeout,
-                cancelled,
-            ) {
-                NetworkSolve::Within => {}
-                NetworkSolve::Exceeds(_) => {
-                    return unsupported(
-                        ReasonCode::UnresolvedBinaryPath,
-                        "network containment depends on image-specific binary symlink resolution"
-                            .to_owned(),
-                    );
-                }
-                NetworkSolve::Incomplete(result) => return result,
-            }
+        if binary_identity_required && has_ambiguous_candidate_binary_path(maximum, candidate) {
+            return unsupported(
+                ReasonCode::UnresolvedBinaryPath,
+                "network containment depends on image-specific binary symlink resolution"
+                    .to_owned(),
+            );
         }
     }
     if unresolved_exact_deny_symlink(maximum, candidate) {
@@ -673,6 +657,9 @@ fn solve_network_mode(
     timeout: Duration,
     cancelled: Option<&AtomicBool>,
 ) -> NetworkSolve {
+    if network_is_structurally_contained(maximum, candidate, binary_identity_required) {
+        return NetworkSolve::Within;
+    }
     let solver = Solver::new();
     let action = symbolic_action(if binary_identity_required {
         "strict_maximum_policy_action"
@@ -772,6 +759,100 @@ fn solver_check(solver: &Solver, cancelled: Option<&AtomicBool>) -> SatResult {
 
 fn unsupported(code: ReasonCode, reason: String) -> CheckResult {
     CheckResult::Unsupported(ReasonEvidence { code, reason })
+}
+
+/// Prove straightforward REST containment without invoking the solver. This
+/// covers the common case where selectors are identical and the candidate only
+/// narrows explicit method/path grants. More complex unions still use Z3.
+fn network_is_structurally_contained(
+    maximum: &ContainmentPolicy,
+    candidate: &ContainmentPolicy,
+    binary_identity_required: bool,
+) -> bool {
+    if maximum
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .any(|endpoint| !endpoint.deny_rules.is_empty())
+    {
+        return false;
+    }
+    candidate.network_policies.values().all(|candidate_rule| {
+        maximum.network_policies.values().any(|maximum_rule| {
+            rule_structurally_contains(maximum_rule, candidate_rule, binary_identity_required)
+        })
+    })
+}
+
+fn rule_structurally_contains(
+    maximum: &NetworkRule,
+    candidate: &NetworkRule,
+    binary_identity_required: bool,
+) -> bool {
+    (!binary_identity_required
+        || candidate.binaries.iter().all(|candidate_binary| {
+            maximum
+                .binaries
+                .iter()
+                .any(|maximum_binary| maximum_binary.path == candidate_binary.path)
+        }))
+        && candidate.endpoints.iter().all(|candidate_endpoint| {
+            maximum.endpoints.iter().any(|maximum_endpoint| {
+                rest_endpoint_structurally_contains(maximum_endpoint, candidate_endpoint)
+            })
+        })
+}
+
+fn rest_endpoint_structurally_contains(maximum: &Endpoint, candidate: &Endpoint) -> bool {
+    if maximum.protocol_kind() != Protocol::Rest
+        || candidate.protocol_kind() != Protocol::Rest
+        || !maximum.host.eq_ignore_ascii_case(&candidate.host)
+        || maximum.path != candidate.path
+        || !candidate
+            .effective_ports()
+            .iter()
+            .all(|port| maximum.effective_ports().contains(port))
+        || !maximum.access.is_empty()
+        || !candidate.access.is_empty()
+        || !maximum.deny_rules.is_empty()
+        || !candidate.deny_rules.is_empty()
+    {
+        return false;
+    }
+
+    candidate.rules.iter().all(|candidate_rule| {
+        if candidate_rule.allow.method.is_empty() {
+            return false;
+        }
+        maximum.rules.iter().any(|maximum_rule| {
+            method_pattern_contains(&maximum_rule.allow.method, &candidate_rule.allow.method)
+                && path_pattern_contains(&maximum_rule.allow.path, &candidate_rule.allow.path)
+        })
+    })
+}
+
+fn method_pattern_contains(maximum: &str, candidate: &str) -> bool {
+    maximum == "*"
+        || maximum.eq_ignore_ascii_case(candidate)
+        || (maximum.eq_ignore_ascii_case("GET") && candidate.eq_ignore_ascii_case("HEAD"))
+}
+
+fn path_pattern_contains(maximum: &str, candidate: &str) -> bool {
+    // Inputs are already validated. Keep this sufficient proof deliberately
+    // limited to equality and a terminal recursive path segment.
+    let maximum = if maximum.is_empty() { "**" } else { maximum };
+    let candidate = if candidate.is_empty() {
+        "**"
+    } else {
+        candidate
+    };
+    maximum == candidate
+        || maximum == "**"
+        || maximum.strip_suffix("/**").is_some_and(|prefix| {
+            candidate
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 fn symbolic_action(name: &str) -> SymbolicAction {
@@ -1186,69 +1267,37 @@ fn unresolved_workdir_reason(
     None
 }
 
-fn ambiguous_candidate_binary_paths(
+fn has_ambiguous_candidate_binary_path(
     maximum: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
-) -> Vec<String> {
-    let maximum_binaries = maximum
-        .network_policies
-        .values()
-        .flat_map(|rule| &rule.binaries)
-        .map(|binary| binary.path.as_str())
-        .collect::<Vec<_>>();
-    candidate
-        .network_policies
-        .values()
-        .flat_map(|rule| &rule.binaries)
-        .map(|binary| binary.path.as_str())
-        .filter(|path| !path.contains('*'))
-        .filter(|path| {
-            maximum_binaries.iter().any(|maximum| {
-                maximum.contains('*')
-                    && *maximum != "/**"
-                    && glob::Pattern::new(maximum).is_ok_and(|pattern| pattern.matches(path))
-            })
-        })
-        .map(str::to_owned)
-        .collect()
-}
-
-fn maximum_without_ambiguous_binary_globs(
-    maximum: &ContainmentPolicy,
-    candidate: &ContainmentPolicy,
-    ambiguous_candidate_paths: &[String],
-) -> ContainmentPolicy {
-    let mut exact_maximum = maximum.clone();
-    for rule in exact_maximum.network_policies.values_mut() {
-        let endpoints = rule.endpoints.clone();
-        rule.binaries.retain(|binary| {
-            let shared_by_equivalent_rule =
+) -> bool {
+    maximum.network_policies.values().any(|maximum_rule| {
+        maximum_rule
+            .binaries
+            .iter()
+            .filter(|binary| binary.path.contains('*') && binary.path != "/**")
+            .any(|maximum_binary| {
                 candidate.network_policies.values().any(|candidate_rule| {
-                    endpoint_authority_sets_equal(&candidate_rule.endpoints, &endpoints)
-                        && candidate_rule
-                            .binaries
-                            .iter()
-                            .any(|candidate_binary| candidate_binary.path == binary.path)
-                });
-            let authorizes_ambiguous_exact =
-                candidate.network_policies.values().any(|candidate_rule| {
-                    endpoint_authority_sets_overlap(&candidate_rule.endpoints, &endpoints)
-                        && candidate_rule.binaries.iter().any(|candidate_binary| {
-                            !candidate_binary.path.contains('*')
-                                && ambiguous_candidate_paths.contains(&candidate_binary.path)
-                                && glob::Pattern::new(&binary.path)
-                                    .is_ok_and(|pattern| pattern.matches(&candidate_binary.path))
-                        })
-                });
-            !binary.path.contains('*')
-                || binary.path == "/**"
-                || (shared_by_equivalent_rule && !authorizes_ambiguous_exact)
-                || !ambiguous_candidate_paths.iter().any(|candidate| {
-                    glob::Pattern::new(&binary.path).is_ok_and(|pattern| pattern.matches(candidate))
+                    endpoint_authority_sets_overlap(
+                        &candidate_rule.endpoints,
+                        &maximum_rule.endpoints,
+                    ) && candidate_rule.binaries.iter().any(|candidate_binary| {
+                        !candidate_binary.path.contains('*')
+                            && glob::Pattern::new(&maximum_binary.path)
+                                .is_ok_and(|pattern| pattern.matches(&candidate_binary.path))
+                            && !maximum.network_policies.values().any(|exact_rule| {
+                                endpoint_authority_sets_equal(
+                                    &candidate_rule.endpoints,
+                                    &exact_rule.endpoints,
+                                ) && exact_rule
+                                    .binaries
+                                    .iter()
+                                    .any(|exact_binary| exact_binary.path == candidate_binary.path)
+                            })
+                    })
                 })
-        });
-    }
-    exact_maximum
+            })
+    })
 }
 
 fn unresolved_exact_deny_symlink(
@@ -1291,6 +1340,14 @@ fn unresolved_exact_deny_symlink(
     })
 }
 
+fn endpoint_authority_sets_overlap(left: &[Endpoint], right: &[Endpoint]) -> bool {
+    left.iter().any(|endpoint| {
+        right
+            .iter()
+            .any(|other| endpoint_authority_may_overlap(endpoint, other))
+    })
+}
+
 fn endpoint_authority_sets_equal(left: &[Endpoint], right: &[Endpoint]) -> bool {
     left.iter().all(|endpoint| {
         right
@@ -1299,14 +1356,6 @@ fn endpoint_authority_sets_equal(left: &[Endpoint], right: &[Endpoint]) -> bool 
     }) && right.iter().all(|endpoint| {
         left.iter()
             .any(|other| endpoint_authority_equal(endpoint, other))
-    })
-}
-
-fn endpoint_authority_sets_overlap(left: &[Endpoint], right: &[Endpoint]) -> bool {
-    left.iter().any(|endpoint| {
-        right
-            .iter()
-            .any(|other| endpoint_authority_may_overlap(endpoint, other))
     })
 }
 
@@ -1954,19 +2003,23 @@ mod tests {
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/node }]\n",
         );
         let result = check_within_maximum(&maximum, &candidate, options());
-        assert!(matches!(
-            result,
-            CheckResult::Exceeds(ref evidence)
-                if matches!(
-                    evidence.counterexample(),
-                    Counterexample::Network {
-                        binary: Some(binary),
-                        ancestor_binary: Some(ancestor),
-                        binary_identity_required: true,
-                        ..
-                    } if binary == "/usr/bin/curl" && ancestor == "/usr/bin/python3"
-                )
-        ));
+        assert!(
+            matches!(
+                result,
+                CheckResult::Exceeds(ref evidence)
+                    if matches!(
+                        evidence.counterexample(),
+                        Counterexample::Network {
+                            binary: Some(binary),
+                            ancestor_binary: Some(ancestor),
+                            binary_identity_required: true,
+                            ..
+                        } if (binary == "/usr/bin/curl" && ancestor == "/usr/bin/python3")
+                            || (binary == "/usr/bin/python3" && ancestor == "/usr/bin/curl")
+                    )
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -2044,11 +2097,28 @@ mod tests {
         let broader_method = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        assert!(matches!(
-            check_within_maximum(&maximum, &narrower, options()),
-            CheckResult::Within(_)
-        ));
+        let result = check_within_maximum(&maximum, &narrower, options());
+        assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
         let result = check_within_maximum(&maximum, &broader_method, options());
+        assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
+    }
+
+    #[test]
+    fn structural_path_containment_requires_a_recursive_segment_boundary() {
+        assert!(path_pattern_contains("/repos/**", "/repos/NVIDIA/**"));
+        assert!(!path_pattern_contains("/repos/**", "/repository/NVIDIA/**"));
+        assert!(!path_pattern_contains("/repos**", "/repos/NVIDIA/**"));
+    }
+
+    #[test]
+    fn structural_fast_path_does_not_ignore_separate_maximum_denies() {
+        let maximum = parse(
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: full, deny_rules: [{ method: GET, path: '/repos/private/**' }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
+        );
+        let candidate = parse(
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/private/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
+        );
+        let result = check_within_maximum(&maximum, &candidate, options());
         assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
     }
 
@@ -2082,11 +2152,15 @@ mod tests {
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
         );
-        assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
-            CheckResult::Unsupported(ref evidence)
-                if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
-        ));
+        let result = check_within_maximum(&maximum, &candidate, options());
+        assert!(
+            matches!(
+                result,
+                CheckResult::Unsupported(ref evidence)
+                    if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -2101,6 +2175,18 @@ mod tests {
             check_within_maximum(&maximum, &candidate, options()),
             CheckResult::Within(_)
         ));
+    }
+
+    #[test]
+    fn redundant_maximum_glob_does_not_hide_equivalent_exact_containment() {
+        let maximum = parse(
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  glob:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+        );
+        let candidate = parse(
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+        );
+        let result = check_within_maximum(&maximum, &candidate, options());
+        assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
     }
 
     #[test]
