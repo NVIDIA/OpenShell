@@ -1483,6 +1483,11 @@ pub fn build_isolation_specs(
     supervisor.cap_drop = vec!["ALL".into()];
     supervisor.cap_add.clear();
     supervisor.seccomp_profile_path.clear();
+    // The trusted supervisor originates approved egress from the Podman host
+    // network. The workload remains fenced by network=none.
+    supervisor.netns.nsmode = "host".into();
+    supervisor.networks.clear();
+    supervisor.portmappings.clear();
     supervisor.devices = None;
     supervisor.image_volumes.clear();
     supervisor.volumes = vec![NamedVolume {
@@ -1689,6 +1694,9 @@ mod tests {
         assert_eq!(specs.workload.netns.nsmode, "none");
         assert!(specs.workload.networks.is_empty());
         assert!(specs.workload.portmappings.is_empty());
+        assert_eq!(specs.supervisor.netns.nsmode, "host");
+        assert!(specs.supervisor.networks.is_empty());
+        assert!(specs.supervisor.portmappings.is_empty());
         assert!(specs.workload.env.is_empty());
         assert_eq!(specs.workload.unsetenv, vec!["LD_PRELOAD", "HTTP_PROXY"]);
         assert!(specs.workload.secrets.is_empty());
