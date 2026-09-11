@@ -71,6 +71,10 @@ mod linux {
     const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
     const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
     const MEDIATION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
+    const AUTHENTICATED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    const ENFORCEMENT_LOSS_TERMINATION_GRACE: Duration =
+        Duration::from_secs(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS as u64);
+    const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
@@ -437,6 +441,10 @@ mod linux {
             tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
                 stream,
                 _connection_alive: connection_shutdown.clone(),
+                _disconnect: TransportDisconnectGuard {
+                    runtime: Arc::downgrade(&runtime),
+                    connection_id,
+                },
             })]),
             tokio_stream::pending(),
         );
@@ -464,7 +472,7 @@ mod linux {
                 let _ = shutdown.changed().await;
             })
             .await;
-        runtime.unregister_connection(connection_id);
+        runtime.transport_disconnected(connection_id);
         result.map_err(|error| format!("serve boundary gRPC connection: {error}"))
     }
 
@@ -473,6 +481,20 @@ mod linux {
         // Dropping the actual HTTP/2 transport stops all detached stream
         // bridges, including on keepalive failure or task cancellation.
         _connection_alive: tokio::sync::watch::Sender<()>,
+        _disconnect: TransportDisconnectGuard,
+    }
+
+    struct TransportDisconnectGuard {
+        runtime: std::sync::Weak<BoundaryRuntime>,
+        connection_id: SandboxConnectionId,
+    }
+
+    impl Drop for TransportDisconnectGuard {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.runtime.upgrade() {
+                runtime.transport_disconnected(self.connection_id);
+            }
+        }
     }
 
     impl tokio::io::AsyncRead for GrpcServerIo {
@@ -869,6 +891,19 @@ mod linux {
                 .map_err(|error| format!("write control frame: {error}"));
         }
         match request.request.clone() {
+            Request::TerminateBoundary => {
+                let response = runtime
+                    .process_runtime
+                    .block_on(runtime.terminate_boundary());
+                return write_frame(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        request_id: request.request_id,
+                        response,
+                    },
+                )
+                .map_err(|error| format!("write boundary termination response: {error}"));
+            }
             Request::Exec { spec } => {
                 let started =
                     match runtime.start_exec(&request.request_id, &request.payload_digest, spec) {
@@ -1034,12 +1069,16 @@ mod linux {
             _ => {}
         }
         let is_attach = matches!(&request.request, Request::Attach { .. });
+        let is_confirm = matches!(&request.request, Request::Confirm);
         let response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
             runtime.commit_attach(principal)?;
+        }
+        if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
+            runtime.commit_confirm(principal)?;
         }
         write_frame(&mut stream, &response)
             .map_err(|error| format!("write control frame: {error}"))?;
@@ -1054,6 +1093,8 @@ mod linux {
             Mutex<std::collections::HashMap<SandboxConnectionId, tokio::sync::watch::Sender<()>>>,
         process_runtime: tokio::runtime::Handle,
         state: Mutex<RuntimeState>,
+        supervisor_connection: Mutex<SupervisorConnectionState>,
+        next_recovery_id: AtomicU64,
         /// The wire policy bound at first attach, so an idempotent attach retry
         /// carrying a different policy is denied instead of silently keeping
         /// the first policy.
@@ -1240,6 +1281,15 @@ mod linux {
         Running(Arc<ManagedProcess>),
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SupervisorConnectionState {
+        AwaitingConfirmation,
+        Connected(SandboxConnectionId),
+        Frozen { recovery_id: u64 },
+        Terminating,
+        Terminal,
+    }
+
     #[derive(Clone)]
     struct PreparedBoundary {
         network_broker: NetworkBroker,
@@ -1279,6 +1329,8 @@ mod linux {
                 config,
                 process_runtime,
                 state: Mutex::new(RuntimeState::AwaitingAttach),
+                supervisor_connection: Mutex::new(SupervisorConnectionState::AwaitingConfirmation),
+                next_recovery_id: AtomicU64::new(1),
                 attached_policy: Mutex::new(None),
                 started_agent: Mutex::new(None),
                 next_exec_id: AtomicU64::new(1),
@@ -1311,9 +1363,15 @@ mod linux {
             if matches!(request, Request::Attach { .. }) {
                 return Ok(());
             }
-            self.connections
-                .require_active(principal)
-                .map_err(|error| error.to_string())
+            if matches!(request, Request::Confirm) {
+                self.connections
+                    .require_attached(principal)
+                    .map_err(|error| error.to_string())
+            } else {
+                self.connections
+                    .require_active(principal)
+                    .map_err(|error| error.to_string())
+            }
         }
 
         fn commit_attach(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
@@ -1322,6 +1380,48 @@ mod linux {
                 .attach(principal)
                 .map_err(|error| error.to_string())?
             {
+                self.close_connection(replaced);
+            }
+            Ok(())
+        }
+
+        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+            let replaced = self
+                .connections
+                .confirm(principal)
+                .map_err(|error| error.to_string())?;
+            let process = {
+                let state = lock(&self.state);
+                match &*state {
+                    RuntimeState::Running(process) => Some(process.clone()),
+                    RuntimeState::AwaitingAttach
+                    | RuntimeState::Bound(_)
+                    | RuntimeState::Ready(_) => None,
+                }
+            };
+            {
+                let mut connection = lock(&self.supervisor_connection);
+                if matches!(
+                    *connection,
+                    SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
+                ) {
+                    self.connections.mark_terminal();
+                    return Err("sandbox session is terminating".to_string());
+                }
+                if matches!(*connection, SupervisorConnectionState::Frozen { .. })
+                    && let Some(process) = process
+                {
+                    if !process.boundary_runtime.resume() {
+                        return Err("frozen workload could not be resumed".to_string());
+                    }
+                    tracing::info!(
+                        connection_id = ?principal.connection_id(),
+                        "Sandbox Protocol connection recovered; workload resumed"
+                    );
+                }
+                *connection = SupervisorConnectionState::Connected(principal.connection_id());
+            }
+            if let Some(replaced) = replaced {
                 self.close_connection(replaced);
             }
             Ok(())
@@ -1342,9 +1442,166 @@ mod linux {
             }
         }
 
-        fn unregister_connection(&self, connection_id: SandboxConnectionId) {
-            lock(&self.connection_shutdowns).remove(&connection_id);
-            self.connections.disconnect(connection_id);
+        fn transport_disconnected(self: &Arc<Self>, connection_id: SandboxConnectionId) {
+            let shutdown = lock(&self.connection_shutdowns).remove(&connection_id);
+            if let Some(shutdown) = shutdown {
+                let _ = shutdown.send(());
+            }
+            if !self.connections.disconnect(connection_id) {
+                return;
+            }
+
+            let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
+            let process = {
+                let state = lock(&self.state);
+                match &*state {
+                    RuntimeState::Running(process) => Some(process.clone()),
+                    RuntimeState::AwaitingAttach
+                    | RuntimeState::Bound(_)
+                    | RuntimeState::Ready(_) => None,
+                }
+            };
+            {
+                let mut connection = lock(&self.supervisor_connection);
+                if !matches!(
+                    *connection,
+                    SupervisorConnectionState::Connected(active) if active == connection_id
+                ) {
+                    return;
+                }
+                if let Some(process) = &process {
+                    let _ = process.boundary_runtime.freeze();
+                }
+                *connection = SupervisorConnectionState::Frozen { recovery_id };
+            }
+            tracing::warn!(
+                recovery_id,
+                "Sandbox Protocol connection lost; workload frozen pending authenticated recovery"
+            );
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(openshell_ocsf::FindingInfo::new(
+                        "sandbox-supervisor-connection-lost",
+                        "Sandbox Supervisor Connection Lost",
+                    ))
+                    .message("Sandbox Protocol connection lost; workload frozen")
+                    .build()
+            );
+            let runtime = Arc::downgrade(self);
+            self.process_runtime.spawn(async move {
+                tokio::time::sleep(AUTHENTICATED_RECONNECT_TIMEOUT).await;
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.expire_recovery(recovery_id).await;
+                }
+            });
+        }
+
+        async fn expire_recovery(&self, recovery_id: u64) {
+            let process = {
+                let mut connection = lock(&self.supervisor_connection);
+                if *connection != (SupervisorConnectionState::Frozen { recovery_id }) {
+                    return;
+                }
+                *connection = SupervisorConnectionState::Terminating;
+                let state = lock(&self.state);
+                match &*state {
+                    RuntimeState::Running(process) => Some(process.clone()),
+                    RuntimeState::AwaitingAttach
+                    | RuntimeState::Bound(_)
+                    | RuntimeState::Ready(_) => None,
+                }
+            };
+            self.connections.mark_terminal();
+            tracing::error!(
+                recovery_id,
+                "Sandbox Protocol recovery deadline expired; terminating workload"
+            );
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(openshell_ocsf::FindingInfo::new(
+                        "sandbox-supervisor-recovery-expired",
+                        "Sandbox Supervisor Recovery Expired",
+                    ))
+                    .message("Supervisor recovery expired; terminating sandbox workload")
+                    .build()
+            );
+            if let Some(process) = process
+                && let Err(error) = Self::terminate_process_tree(&process, true).await
+            {
+                tracing::error!(%error, "sandbox workload did not terminate after recovery loss");
+                return;
+            }
+            *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
+        }
+
+        async fn terminate_boundary(&self) -> Response {
+            {
+                let mut connection = lock(&self.supervisor_connection);
+                if *connection == SupervisorConnectionState::Terminal {
+                    return Response::BoundaryTerminated;
+                }
+                *connection = SupervisorConnectionState::Terminating;
+            }
+            // Revocation happens before process shutdown so no concurrent or
+            // replacement connection can race the terminal transition.
+            self.connections.mark_terminal();
+            let process = {
+                let state = lock(&self.state);
+                match &*state {
+                    RuntimeState::Running(process) => Some(process.clone()),
+                    RuntimeState::AwaitingAttach
+                    | RuntimeState::Bound(_)
+                    | RuntimeState::Ready(_) => None,
+                }
+            };
+            if let Some(process) = process
+                && let Err(error) = Self::terminate_process_tree(&process, false).await
+            {
+                return guest_error(BoundaryErrorKind::Process, error);
+            }
+            *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
+            Response::BoundaryTerminated
+        }
+
+        async fn terminate_process_tree(
+            process: &ManagedProcess,
+            enforcement_was_lost: bool,
+        ) -> Result<(), String> {
+            if enforcement_was_lost {
+                let _ = process
+                    .boundary_runtime
+                    .begin_enforcement_loss_termination();
+            } else {
+                let _ = process.boundary_runtime.begin_termination();
+            }
+            if Self::wait_for_process_tree_exit(process, ENFORCEMENT_LOSS_TERMINATION_GRACE).await {
+                return Ok(());
+            }
+
+            process.boundary_runtime.force_kill();
+            if Self::wait_for_process_tree_exit(process, FORCE_KILL_REAP_TIMEOUT).await {
+                Ok(())
+            } else {
+                Err("owned workload processes remain after forced termination".to_string())
+            }
+        }
+
+        async fn wait_for_process_tree_exit(process: &ManagedProcess, timeout: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            while process.boundary_runtime.has_registered_processes()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            !process.boundary_runtime.has_registered_processes()
         }
 
         fn shutdown(&self) {
@@ -1437,6 +1694,7 @@ mod linux {
                     |_| Response::MediationReady,
                 ),
                 Request::Exec { .. }
+                | Request::TerminateBoundary
                 | Request::AttachProcess { .. }
                 | Request::LoopbackConnect { .. }
                 | Request::AcceptNetwork => guest_error(
@@ -3364,14 +3622,127 @@ mod linux {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn disconnected_session_reconfirms_before_becoming_active() {
+            let (runtime, token) = availability_test_runtime();
+            let first_id = SandboxConnectionId::new();
+            let first = runtime
+                .authenticate_request(first_id, bearer_request((), &token).metadata())
+                .expect("first principal");
+            runtime.commit_attach(&first).expect("attach first");
+            runtime.commit_confirm(&first).expect("confirm first");
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(first_id)
+            );
+
+            runtime.transport_disconnected(first_id);
+            let connection_state = *lock(&runtime.supervisor_connection);
+            let recovery_id = match connection_state {
+                SupervisorConnectionState::Frozen { recovery_id } => recovery_id,
+                state => panic!("expected frozen connection, got {state:?}"),
+            };
+            let replacement_id = SandboxConnectionId::new();
+            let replacement = runtime
+                .authenticate_request(replacement_id, bearer_request((), &token).metadata())
+                .expect("replacement principal");
+            runtime
+                .commit_attach(&replacement)
+                .expect("reattach replacement");
+            assert_eq!(
+                runtime.connections.require_active(&replacement),
+                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::ConnectionNotAttached)
+            );
+            runtime
+                .commit_confirm(&replacement)
+                .expect("reconfirm replacement");
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(replacement_id)
+            );
+
+            runtime.expire_recovery(recovery_id).await;
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(replacement_id),
+                "stale recovery deadline must not terminate a reconfirmed session"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn expired_recovery_makes_the_session_terminal() {
+            let (runtime, token) = availability_test_runtime();
+            let connection_id = SandboxConnectionId::new();
+            let principal = runtime
+                .authenticate_request(connection_id, bearer_request((), &token).metadata())
+                .expect("test principal");
+            runtime.commit_attach(&principal).expect("attach");
+            runtime.commit_confirm(&principal).expect("confirm");
+            runtime.transport_disconnected(connection_id);
+            let connection_state = *lock(&runtime.supervisor_connection);
+            let recovery_id = match connection_state {
+                SupervisorConnectionState::Frozen { recovery_id } => recovery_id,
+                state => panic!("expected frozen connection, got {state:?}"),
+            };
+
+            runtime.expire_recovery(recovery_id).await;
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+            let replacement_id = SandboxConnectionId::new();
+            let replacement = runtime
+                .authenticate_request(replacement_id, bearer_request((), &token).metadata())
+                .expect("replacement principal");
+            assert!(runtime.commit_attach(&replacement).is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn explicit_shutdown_acknowledges_terminal_session_state() {
+            let (runtime, token) = availability_test_runtime();
+            let connection_id = SandboxConnectionId::new();
+            let principal = runtime
+                .authenticate_request(connection_id, bearer_request((), &token).metadata())
+                .expect("test principal");
+            runtime.commit_attach(&principal).expect("attach");
+            runtime.commit_confirm(&principal).expect("confirm");
+
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+            assert_eq!(
+                runtime.connections.require_active(&principal),
+                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::TerminalSession)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn grpc_blackhole_expires_connection_and_releases_mediation_lease() {
             let (runtime, token) = availability_test_runtime();
+            let connection_id = SandboxConnectionId::new();
+            let principal = runtime
+                .authenticate_request(connection_id, bearer_request((), &token).metadata())
+                .expect("test principal");
+            runtime
+                .connections
+                .attach(&principal)
+                .expect("attach test connection");
+            runtime
+                .connections
+                .confirm(&principal)
+                .expect("confirm test connection");
+            *lock(&runtime.supervisor_connection) =
+                SupervisorConnectionState::Connected(connection_id);
             let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let server_address = server_listener.local_addr().unwrap();
             let server_runtime = runtime.clone();
             let server = tokio::spawn(async move {
                 let (stream, _) = server_listener.accept().await.unwrap();
-                serve_grpc(Box::new(stream), server_runtime, SandboxConnectionId::new()).await
+                serve_grpc(Box::new(stream), server_runtime, connection_id).await
             });
             let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy_address = proxy_listener.local_addr().unwrap();
@@ -3442,6 +3813,10 @@ mod linux {
                 .connections
                 .attach(&principal)
                 .expect("attach test connection");
+            runtime
+                .connections
+                .confirm(&principal)
+                .expect("confirm test connection");
             let (mut replacement, task) = request_test_mediation(runtime, principal).await;
             let ready: ResponseEnvelope =
                 openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut replacement)
@@ -3482,6 +3857,10 @@ mod linux {
                 .connections
                 .attach(&principal)
                 .expect("attach test connection");
+            runtime
+                .connections
+                .confirm(&principal)
+                .expect("confirm test connection");
             let (mut first, first_task) =
                 request_test_mediation(runtime.clone(), principal.clone()).await;
             let ready: ResponseEnvelope =

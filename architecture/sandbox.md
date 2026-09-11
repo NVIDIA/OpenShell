@@ -29,9 +29,12 @@ bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
-connection cancels its stream bridges before releasing the exclusive DNS
-mediation lease; an authenticated replacement waits for release instead of
-preempting a live supervisor. Idle healthy connections remain usable.
+connection freezes the owned workload process tree and cancels its stream
+bridges before releasing the exclusive DNS mediation lease. The supervisor has
+30 seconds to reconnect, replay attach, and reconfirm the boundary. Confirmation
+resumes the workload; expiration terminates it. A credential replacement does
+not displace the active connection until the new connection is confirmed. Idle
+healthy connections remain usable.
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
@@ -574,11 +577,14 @@ environment variables do not configure the separately isolated supervisor.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely
   re-evaluate.
-- If the supervisor relay drops, the sandbox can keep running, but connect and
-  exec operations fail until the supervisor registers again. A replacement
-  supervisor replays the identical sandbox lifecycle and receives the existing
-  process handle. The sandbox rejects changed launch inputs and releases the
-  single main-process attachment when the old supervisor transport closes.
+- If the supervisor relay drops, the sandbox stops the canonical agent and exec
+  process groups, rejects new runtime operations, and closes mediated streams.
+  A replacement supervisor has 30 seconds to authenticate, replay the identical
+  attach, and reconfirm the boundary. Successful confirmation resumes the
+  process tree; otherwise the sandbox sends `SIGTERM`, waits the normal stop
+  grace period, sends `SIGKILL` to survivors, and makes the session terminal.
+  Explicit supervisor shutdown uses the same terminal transition and requires
+  an acknowledgement before treating the boundary as stopped.
 - If the canonical main process exits, the supervisor durably reports the
   normalized result immediately. A foreground create declares a one-shot main
   attachment, so the supervisor accepts it even after a fast process exits,
