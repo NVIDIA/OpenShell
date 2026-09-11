@@ -794,7 +794,16 @@ fn connect_socket(
             // The worker owns its quota: an unresponsive supervisor must not
             // retain a blocked syscall or worker slot indefinitely.
             let _slot = slot;
-            let result = await_network_decision(&decision_rx, decision_timeout);
+            let result = match decision_rx.recv_timeout(decision_timeout) {
+                Ok(decision) => decision,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = worker_listener.respond_errno(notification.id, libc::ETIMEDOUT);
+                    return;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable)
+                }
+            };
             match result {
                 TcpOpenDecision::Denied(reason) => {
                     let _ =
@@ -827,15 +836,6 @@ fn connect_socket(
         })
         .map_err(|error| io::Error::other(format!("start network-open worker: {error}")))?;
     Ok(())
-}
-
-fn await_network_decision(
-    decision: &std::sync::mpsc::Receiver<TcpOpenDecision>,
-    timeout: Duration,
-) -> TcpOpenDecision {
-    decision
-        .recv_timeout(timeout)
-        .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable))
 }
 
 const fn tcp_denial_errno(reason: TcpOpenDenial) -> i32 {

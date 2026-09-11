@@ -375,7 +375,7 @@ mod tests {
                 mat.public_key_pem.as_bytes(),
                 mat.kid,
                 "test-gateway",
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
             )
             .expect("session authority"),
         );

@@ -3012,7 +3012,7 @@ mod linux {
     fn load_tls_server_config(
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> io::Result<rustls::ServerConfig> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
         let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
             .collect::<Result<Vec<_>, _>>()?;

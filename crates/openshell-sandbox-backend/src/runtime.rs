@@ -205,7 +205,7 @@ fn validate_client_tls(tls: &SandboxTlsClientConfig) -> Result<(), BackendError>
 }
 
 fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfig, BackendError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certificates = rustls_pemfile::certs(&mut tls.trust_anchor_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -2095,7 +2095,7 @@ mod tests {
     fn test_certificate_with_protocol_versions(
         protocol_versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> TestCertificate {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let material =
             generate_sandbox_tls_material(test_session_id()).expect("generate test material");
         let certificates = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
