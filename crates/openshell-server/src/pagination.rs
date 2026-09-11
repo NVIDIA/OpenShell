@@ -165,6 +165,78 @@ fn fingerprint(parameters: &[&str]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn message_body<'a>(proto: &'a str, message: &str) -> &'a str {
+        let marker = format!("message {message} {{");
+        let start = proto
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{message} message must exist"))
+            + marker.len();
+        proto[start..]
+            .split_once("\n}")
+            .unwrap_or_else(|| panic!("{message} message must close"))
+            .0
+    }
+
+    fn message_documentation<'a>(proto: &'a str, message: &str) -> &'a str {
+        let marker = format!("message {message} {{");
+        let message_start = proto
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{message} message must exist"));
+        let documentation_start = proto[..message_start]
+            .rfind("\n\n")
+            .map_or(0, |boundary| boundary + 2);
+        &proto[documentation_start..message_start]
+    }
+
+    #[test]
+    fn every_public_list_rpc_is_paginated_or_explicitly_bounded() {
+        let proto = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../proto/openshell.proto"
+        ));
+        let normalized = proto.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        let mut remaining = normalized.as_str();
+
+        while let Some(start) = remaining.find("rpc List") {
+            remaining = &remaining[start + "rpc ".len()..];
+            let (method, after_request) = remaining
+                .split_once('(')
+                .expect("List RPC must declare a request type");
+            let (_, after_returns) = after_request
+                .split_once("returns (")
+                .expect("List RPC must declare a response type");
+            let (response, after_response) = after_returns
+                .split_once(')')
+                .expect("List RPC response type must close");
+            let request = format!("{method}Request");
+
+            if method == "ListSandboxProviders" {
+                assert!(
+                    message_documentation(proto, &request)
+                        .contains("bounded list intentionally has no pagination"),
+                    "{request} must document why it has no pagination"
+                );
+                assert!(message_body(proto, response).contains("complete bounded set"));
+            } else {
+                let request_body = message_body(proto, &request);
+                assert!(
+                    request_body.contains("int32 page_size"),
+                    "{request} must declare page_size"
+                );
+                assert!(
+                    request_body.contains("string page_token"),
+                    "{request} must declare page_token"
+                );
+                assert!(
+                    message_body(proto, response).contains("string next_page_token"),
+                    "{response} must declare next_page_token"
+                );
+            }
+
+            remaining = after_response;
+        }
+    }
+
     #[test]
     fn page_size_defaults_clamps_and_rejects_negative_values() {
         assert_eq!(

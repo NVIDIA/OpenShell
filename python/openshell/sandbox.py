@@ -47,11 +47,12 @@ class Page(Generic[T]):
 
 
 class Pager(Generic[T]):
-    """Lazy, single-pass iterator that fetches one RPC page per advance."""
+    """Lazy, single-pass iterator over the continuation-token contract."""
 
     def __init__(self, fetch: Callable[[str], Page[T]], page_token: str = "") -> None:
         self._fetch = fetch
         self._page_token: str | None = page_token
+        self._consumed_page_tokens: set[str] = set()
 
     def __iter__(self) -> Pager[T]:
         return self
@@ -59,8 +60,14 @@ class Pager(Generic[T]):
     def __next__(self) -> Page[T]:
         if self._page_token is None:
             raise StopIteration
-        page = self._fetch(self._page_token)
-        self._page_token = page.next_page_token or None
+        page_token = self._page_token
+        page = self._fetch(page_token)
+        if page_token:
+            self._consumed_page_tokens.add(page_token)
+        next_page_token = page.next_page_token
+        if next_page_token and next_page_token in self._consumed_page_tokens:
+            raise SandboxError("pager received a repeated continuation token")
+        self._page_token = next_page_token or None
         return page
 
     def all(self) -> builtins.list[T]:

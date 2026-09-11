@@ -544,13 +544,22 @@ modes:
   backfill and sandbox annotation updates).
 
 **Lists.** Public list RPCs follow AIP-158: requests carry direct `page_size`
-and `page_token` fields, and responses carry `next_page_token`. The gateway
-clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
+and `page_token` fields, and responses carry `next_page_token`. The sole
+exception is `ListSandboxProviders`: a sandbox can have at most 32 attached
+providers, so the gateway returns its complete bounded result in one response
+and does not expose pagination fields. The gateway clamps page sizes to 1,000
+and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
 authorization grant, and use immutable keyset cursors rather than database
 offsets. Each page repeats normal authentication and authorization. Pagination
 is weakly consistent under concurrent writes and deletes; it does not provide a
 historical snapshot.
+
+Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
+`ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
+by `(created_at_ms, name, workspace, id)`. `ListProviderProfiles` sorts
+ascending by `(id, scope)`, and `ListSandboxPolicies` sorts by descending policy
+version. `ListSandboxProviders` preserves the sandbox's attachment order.
 
 The token wire format is a private shared protobuf used only by the gateway.
 Public request and response messages repeat the standard AIP fields directly
@@ -566,6 +575,16 @@ change.
 Curated Rust, Python, Go, and TypeScript SDK list methods return lazy pagers.
 Advancing a pager issues one list RPC and exposes its continuation token;
 explicit `list_all` helpers are the only curated APIs that exhaust a collection.
+
+**Migration.** This pagination contract is a breaking replacement for the
+former `limit`/`offset` list APIs. Protocol clients must send `page_size` and
+resume only with the returned `next_page_token`; an empty token is the sole
+completion signal. SDK callers that need every item must use the explicit
+full-iteration helper (for example, Rust's `list_all_sandboxes`) rather than
+awaiting `list_sandboxes`, which now returns one-page `Pager` state. Callers
+that need one page should advance that pager once and retain its token. Internal
+full scans use the reusable iteration helpers from the persistence pagination
+audit rather than manually advancing offsets.
 
 Persistence distinguishes one-page operations from exhaustive scans.
 `list_object_page` and `list_message_page` return one keyset page and its next
