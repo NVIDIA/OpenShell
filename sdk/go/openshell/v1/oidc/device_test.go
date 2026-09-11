@@ -149,37 +149,8 @@ func TestDeviceLogin_AlwaysRequestsOpenIDScope(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			resetDiscoveryCache()
 
-			var requestedScope string
-			var scopeSeen atomic.Bool
-			mux := http.NewServeMux()
-			var srv *httptest.Server
-
-			mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"issuer":                        srv.URL,
-					"authorization_endpoint":        srv.URL + "/authorize",
-					"token_endpoint":                srv.URL + "/token",
-					"device_authorization_endpoint": srv.URL + "/device",
-				})
-			})
-			mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
-				_ = r.ParseForm()
-				requestedScope = r.Form.Get("scope")
-				scopeSeen.Store(true)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"device_code":      "test-device-code",
-					"user_code":        "ABCD-1234",
-					"verification_uri": "https://example.com/activate",
-					"expires_in":       300,
-					"interval":         1,
-				})
-			})
-			mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(tokenResponseJSON("device-access-token", "", 3600)))
-			})
-
-			srv = httptest.NewServer(mux)
-			t.Cleanup(srv.Close)
+			scope := &capturedScope{}
+			srv := setupScopeCapturingDeviceProvider(t, scope)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -192,10 +163,124 @@ func TestDeviceLogin_AlwaysRequestsOpenIDScope(t *testing.T) {
 
 			_, err := DeviceLogin(ctx, opts...)
 			require.NoError(t, err)
-			require.True(t, scopeSeen.Load(), "device authorization endpoint was not called")
-			assert.Equal(t, tt.want, requestedScope)
+			assert.Equal(t, tt.want, scope.get(t))
 		})
 	}
+}
+
+// DeviceLogin must honor the gateway's configured oidc_scopes the way the
+// Rust CLI does (see build_scopes in crates/openshell-cli/src/oidc_auth.rs),
+// while an explicit WithScopes still wins.
+func TestDeviceLogin_GatewayScopes(t *testing.T) {
+	tests := []struct {
+		name         string
+		gatewayScope string
+		opts         []LoginOption
+		want         string
+	}{
+		{
+			name:         "gateway scopes are used when the caller sets none",
+			gatewayScope: "openid sandbox:read sandbox:write",
+			want:         "openid sandbox:read sandbox:write",
+		},
+		{
+			name:         "gateway scopes gain openid",
+			gatewayScope: "sandbox:read",
+			want:         "openid sandbox:read",
+		},
+		{
+			name:         "explicit scopes win over gateway scopes",
+			gatewayScope: "sandbox:read",
+			opts:         []LoginOption{WithScopes("sandbox:admin")},
+			want:         "openid sandbox:admin",
+		},
+		{
+			name:         "empty gateway scopes fall back to the defaults",
+			gatewayScope: "",
+			want:         "openid profile email",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDiscoveryCache()
+
+			scope := &capturedScope{}
+			srv := setupScopeCapturingDeviceProvider(t, scope)
+
+			fakeConfig := &gateway.Config{
+				Name:         "device-gw",
+				Endpoint:     "gateway.example.com:443",
+				Dir:          t.TempDir(),
+				OIDCIssuer:   srv.URL,
+				OIDCClientID: "gw-device-client",
+				OIDCScopes:   tt.gatewayScope,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			opts := append([]LoginOption{
+				WithGateway("device-gw"),
+				WithDisplayFunc(func(_, _ string) {}),
+				withGatewayResolver(func(string) (*gateway.Config, error) {
+					return fakeConfig, nil
+				}),
+			}, tt.opts...)
+
+			_, err := DeviceLogin(ctx, opts...)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, scope.get(t))
+		})
+	}
+}
+
+// capturedScope records the scope parameter seen by a mock provider.
+type capturedScope struct {
+	value string
+	seen  atomic.Bool
+}
+
+func (c *capturedScope) get(t *testing.T) string {
+	t.Helper()
+	require.True(t, c.seen.Load(), "the authorization request was never made")
+	return c.value
+}
+
+// setupScopeCapturingDeviceProvider serves a device-flow provider that records
+// the scope parameter sent to the device authorization endpoint.
+func setupScopeCapturingDeviceProvider(t *testing.T, scope *capturedScope) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                        srv.URL,
+			"authorization_endpoint":        srv.URL + "/authorize",
+			"token_endpoint":                srv.URL + "/token",
+			"device_authorization_endpoint": srv.URL + "/device",
+		})
+	})
+	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		scope.value = r.Form.Get("scope")
+		scope.seen.Store(true)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device_code":      "test-device-code",
+			"user_code":        "ABCD-1234",
+			"verification_uri": "https://example.com/activate",
+			"expires_in":       300,
+			"interval":         1,
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(tokenResponseJSON("device-access-token", "", 3600)))
+	})
+
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func TestDeviceLogin_MissingIssuer(t *testing.T) {

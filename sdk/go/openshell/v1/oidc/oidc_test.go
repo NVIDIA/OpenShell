@@ -246,6 +246,77 @@ func TestLogin_AlwaysRequestsOpenIDScope(t *testing.T) {
 	}
 }
 
+// Login must honor the gateway's configured oidc_scopes the way the Rust CLI
+// does (see commands/gateway.rs, which passes metadata.oidc_scopes into the
+// interactive flow), while an explicit WithScopes still wins.
+func TestLogin_GatewayScopes(t *testing.T) {
+	tests := []struct {
+		name         string
+		gatewayScope string
+		opts         []LoginOption
+		want         string
+	}{
+		{
+			name:         "gateway scopes are used when the caller sets none",
+			gatewayScope: "openid sandbox:read sandbox:write",
+			want:         "openid sandbox:read sandbox:write",
+		},
+		{
+			name:         "gateway scopes gain openid",
+			gatewayScope: "sandbox:read",
+			want:         "openid sandbox:read",
+		},
+		{
+			name:         "explicit scopes win over gateway scopes",
+			gatewayScope: "sandbox:read",
+			opts:         []LoginOption{WithScopes("sandbox:admin")},
+			want:         "openid sandbox:admin",
+		},
+		{
+			name:         "empty gateway scopes fall back to the defaults",
+			gatewayScope: "",
+			want:         "openid profile email",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDiscoveryCache()
+
+			provider := setupMockProvider(t)
+			var prompt strings.Builder
+
+			fakeConfig := &gateway.Config{
+				Name:         "login-gw",
+				Endpoint:     "gateway.example.com:443",
+				Dir:          t.TempDir(),
+				OIDCIssuer:   provider.URL,
+				OIDCClientID: "gw-login-client",
+				OIDCScopes:   tt.gatewayScope,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			opts := append([]LoginOption{
+				WithInMemory(),
+				WithKeyboardFlow(),
+				withInput(strings.NewReader("keyboard-auth-code\n")),
+				withOutput(&prompt),
+				withGatewayResolver(func(string) (*gateway.Config, error) {
+					return fakeConfig, nil
+				}),
+			}, tt.opts...)
+
+			_, err := Login(ctx, "login-gw", opts...)
+			require.NoError(t, err)
+
+			authURL := extractAuthURL(t, prompt.String())
+			assert.Equal(t, tt.want, authURL.Query().Get("scope"))
+		})
+	}
+}
+
 // extractAuthURL pulls the authorization URL out of the keyboard-flow prompt.
 func extractAuthURL(t *testing.T, prompt string) *url.URL {
 	t.Helper()
