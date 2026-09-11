@@ -1902,13 +1902,10 @@ fn guid_key(g: &GUID) -> Option<String> {
     if g.data1 == 0 && g.data2 == 0 && g.data3 == 0 && g.data4 == [0u8; 8] {
         return None;
     }
-    let tail = g
-        .data4
-        .iter()
-        .fold(String::with_capacity(16), |mut tail, b| {
-            write!(tail, "{b:02x}").expect("writing to a String cannot fail");
-            tail
-        });
+    let mut tail = String::with_capacity(16);
+    for byte in &g.data4 {
+        write!(&mut tail, "{byte:02x}").expect("writing to a String cannot fail");
+    }
     Some(format!(
         "{:08x}-{:04x}-{:04x}-{tail}",
         g.data1, g.data2, g.data3
@@ -2307,7 +2304,7 @@ mod tests {
             "sbx-1".into(),
             Instant::now()
                 .checked_sub(RETIRED_CORRELATION_TTL + Duration::from_millis(1))
-                .expect("test retirement timestamp is representable"),
+                .expect("test duration is shorter than the monotonic clock epoch"),
         );
         assert!(
             idx.resolve(&late).is_none(),
@@ -2356,7 +2353,7 @@ mod tests {
         idx.buffer_unresolved(event_b);
         idx.pending.back_mut().expect("buffered event").at = Instant::now()
             .checked_sub(Duration::from_secs(3))
-            .expect("test event timestamp is representable");
+            .expect("test duration is shorter than the monotonic clock epoch");
         assert!(
             idx.drain_resolved().is_empty(),
             "elapsed time must not make a mismatched PID generation authoritative"
