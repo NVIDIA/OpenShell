@@ -401,5 +401,9 @@ MXC ETW attribution never treats command text as ownership evidence. It uses the
 driver-owned `wxc-exec` PID as the initial anchor and retains bounded PID
 lifetime records plus established identity, activity, and correlation-vector
 links for a five-second late-event window. PID resolution compares the event's
-ETW producer timestamp with those lifetimes. Events delayed inside ETW can
-therefore resolve after process exit without crossing a PID-reuse boundary.
+ETW producer timestamp with those lifetimes and delays PID-only attribution long
+enough for launch registration to expose reuse. A recorded process retirement
+provides an exact generation boundary. If a new owner displaces an unretired PID,
+PID-only events in the unknowable interval fail closed instead of being assigned
+to either sandbox; established strong correlations remain eligible during the
+late-event window.

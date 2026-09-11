@@ -82,8 +82,12 @@ that child is alive; command text is never an ownership key. The process monitor
 retires the live PID at exit. Its bounded process lifetime and any identity,
 activity, and correlation-vector links learned from it remain available for five
 seconds so already in-flight ETW records can arrive. PID resolution uses the
-event's ETW producer timestamp, so delayed delivery can resolve after process
-exit without crossing a PID-reuse boundary.
+event's ETW producer timestamp and holds PID-only records for two seconds so a
+new launch registration can expose PID reuse before attribution. A normal
+retirement provides an exact generation boundary for delayed delivery. If a new
+owner displaces a still-live registration, the boundary is unknowable and
+PID-only records in that gap remain unattributed; established strong correlations
+can still resolve legitimate late records.
 
 ## Prerequisites (live runs)
 
