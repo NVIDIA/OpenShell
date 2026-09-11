@@ -841,7 +841,7 @@ pub async fn run_sandbox(
         let (exit_code, mut retain_access) = tokio::select! {
             result = wait => (result?, true),
             () = &mut proxy_exited => {
-                let _ = agent.terminate().await;
+                let _ = running.terminate().await;
                 return Err(miette::miette!(
                     "control-mode proxy accept loop exited unexpectedly"
                 ));
@@ -863,6 +863,12 @@ pub async fn run_sandbox(
                         128_i32.saturating_add(signal)
                     }
                 };
+                running
+                    .terminate()
+                    .await
+                    .map_err(|error| miette::miette!(
+                        "sandbox did not acknowledge terminal state: {error}"
+                    ))?;
                 (exit_code, false)
             }
         };

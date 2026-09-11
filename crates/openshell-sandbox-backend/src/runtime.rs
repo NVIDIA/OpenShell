@@ -13,7 +13,7 @@ use std::mem::size_of;
 use std::os::fd::{FromRawFd as _, IntoRawFd as _};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::proto::{BoundaryChunk, isolation_boundary_client::IsolationBoundaryClient};
@@ -387,6 +387,7 @@ struct RemoteRunning {
     loopback_connector: Arc<RemoteLoopbackConnector>,
 }
 
+#[async_trait]
 impl RunningBoundary for RemoteRunning {
     fn agent(&self) -> Arc<dyn BoundaryProcess> {
         self.process.clone()
@@ -398,6 +399,15 @@ impl RunningBoundary for RemoteRunning {
 
     fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
         self.loopback_connector.clone()
+    }
+
+    async fn terminate(&self) -> Result<(), BackendError> {
+        let response = self
+            .process
+            .client
+            .call_idempotent(Request::TerminateBoundary)
+            .await?;
+        expect_response(response, "boundary_terminated")
     }
 }
 
@@ -942,11 +952,14 @@ struct BoundaryClient {
     attach_request: std::sync::Mutex<Option<RequestEnvelope>>,
     confirm_request: std::sync::Mutex<Option<RequestEnvelope>>,
     reconnect: tokio::sync::Mutex<()>,
+    next_connection_generation: AtomicU64,
     credential_monitor_started: AtomicBool,
 }
 
+#[derive(Clone)]
 struct CachedGrpcChannel {
     credential_epoch: openshell_core::jwt::CredentialEpoch,
+    generation: u64,
     channel: tonic::transport::Channel,
 }
 
@@ -963,6 +976,7 @@ impl BoundaryClient {
             attach_request: std::sync::Mutex::new(None),
             confirm_request: std::sync::Mutex::new(None),
             reconnect: tokio::sync::Mutex::new(()),
+            next_connection_generation: AtomicU64::new(1),
             credential_monitor_started: AtomicBool::new(false),
         }
     }
@@ -991,7 +1005,10 @@ impl BoundaryClient {
                         }
                         return Ok(response);
                     }
-                    Err(BackendError::Unavailable(_)) => {
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) =>
+                    {
+                        self.recover_after_unavailable().await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1007,31 +1024,44 @@ impl BoundaryClient {
     }
 
     async fn call_wait(&self, request: Request) -> Result<Response, BackendError> {
-        const WAIT_RECONNECT_ATTEMPTS: usize = 3;
         let envelope = Self::prepare_request(request)?;
-        for attempt in 1..=WAIT_RECONNECT_ATTEMPTS {
+        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
+        loop {
             match self.exchange_envelope(&envelope).await {
                 Ok(response) => return Ok(response),
-                Err(BackendError::Unavailable(_)) if attempt < WAIT_RECONNECT_ATTEMPTS => {
+                Err(BackendError::Unavailable(message))
+                    if is_transport_unavailable(&message)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    self.recover_after_unavailable().await?;
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(BackendError::Unavailable(
-            "boundary wait retry budget exhausted".to_string(),
-        ))
     }
 
     async fn call_stream(
         &self,
         request: Request,
     ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, self.open_exchange(request))
-            .await
-            .map_err(|_| {
-                BackendError::Unavailable("boundary stream request timed out".to_string())
-            })?
+        let envelope = Self::prepare_request(request)?;
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                match self.open_exchange_envelope(&envelope).await {
+                    Ok(response) => return Ok(response),
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) =>
+                    {
+                        self.recover_after_unavailable().await?;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| BackendError::Unavailable("boundary stream request timed out".to_string()))?
     }
 
     async fn call_stream_idempotent(
@@ -1043,7 +1073,10 @@ impl BoundaryClient {
             loop {
                 match self.open_exchange_envelope(&envelope).await {
                     Ok(response) => return Ok(response),
-                    Err(BackendError::Unavailable(_)) => {
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) =>
+                    {
+                        self.recover_after_unavailable().await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1189,9 +1222,66 @@ impl BoundaryClient {
         self.exchange_on_channel(channel.clone(), &confirm).await?;
         *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch,
+            generation: self
+                .next_connection_generation
+                .fetch_add(1, Ordering::Relaxed),
             channel,
         });
         *self.mediation.lock().await = None;
+        Ok(())
+    }
+
+    /// Replace a failed physical transport and replay the authenticated
+    /// lifecycle needed to make the new HTTP/2 connection authoritative.
+    async fn recover_after_unavailable(&self) -> Result<(), BackendError> {
+        let observed_generation = self
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .map(|cached| cached.generation);
+        let _reconnect = self.reconnect.lock().await;
+        if self
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .map(|cached| cached.generation)
+            != observed_generation
+        {
+            return Ok(());
+        }
+
+        *self.grpc_channel.lock().await = None;
+        *self.mediation.lock().await = None;
+        let attach = self
+            .attach_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(attach) = attach else {
+            return Ok(());
+        };
+        let confirm = self
+            .confirm_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let credential_epoch = self.sandbox_bearer.credential_epoch().ok_or_else(|| {
+            BackendError::Unavailable("Sandbox Protocol credential unavailable".to_string())
+        })?;
+        let channel = self.build_grpc_channel().await?;
+        self.exchange_on_channel(channel.clone(), &attach).await?;
+        if let Some(confirm) = confirm {
+            self.exchange_on_channel(channel.clone(), &confirm).await?;
+        }
+        *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            credential_epoch,
+            generation: self
+                .next_connection_generation
+                .fetch_add(1, Ordering::Relaxed),
+            channel,
+        });
         Ok(())
     }
 
@@ -1256,11 +1346,24 @@ impl BoundaryClient {
         }
         // The boundary owns exclusive-lease retirement and bounds replacement
         // waiting. Never multiply that deadline with message-matching retries.
-        let session = tokio::time::timeout(REQUEST_TIMEOUT, self.open_mediation_session())
-            .await
-            .map_err(|_| {
-                BackendError::Unavailable("boundary mediation attach timed out".to_string())
-            })??;
+        let session = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                match self.open_mediation_session().await {
+                    Ok(session) => return Ok(session),
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) =>
+                    {
+                        self.recover_after_unavailable().await?;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            BackendError::Unavailable("boundary mediation attach timed out".to_string())
+        })??;
         *state = Some(session.clone());
         Ok(session)
     }
@@ -1307,6 +1410,9 @@ impl BoundaryClient {
         let channel = self.build_grpc_channel().await?;
         *state = Some(CachedGrpcChannel {
             credential_epoch,
+            generation: self
+                .next_connection_generation
+                .fetch_add(1, Ordering::Relaxed),
             channel: channel.clone(),
         });
         Ok(channel)
@@ -1575,6 +1681,7 @@ fn expect_response(response: Response, expected: &str) -> Result<(), BackendErro
             | (Response::Confirmed { .. }, "confirmed")
             | (Response::Signaled, "signaled")
             | (Response::Terminated, "terminated")
+            | (Response::BoundaryTerminated, "boundary_terminated")
     );
     if matches {
         Ok(())
@@ -1599,6 +1706,10 @@ fn guest_error(kind: crate::boundary_protocol::BoundaryErrorKind, message: Strin
         BoundaryErrorKind::Terminated => BackendError::Terminated(message),
         BoundaryErrorKind::Process => BackendError::Process(message),
     }
+}
+
+fn is_transport_unavailable(message: &str) -> bool {
+    !message.starts_with("boundary process leaf:")
 }
 
 #[cfg(test)]
@@ -1701,26 +1812,51 @@ mod tests {
                     };
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
-                        response: if matches!(envelope.request, Request::OpenMediation) {
-                            Response::Error {
+                        response: match envelope.request {
+                            Request::Attach { .. } => Response::Attached {
+                                snapshot: crate::boundary_protocol::SessionSnapshotWire {
+                                    generation: "test-generation".to_string(),
+                                    processes: Vec::new(),
+                                },
+                            },
+                            Request::Confirm => Response::Confirmed {
+                                evidence: Box::new(test_confirmation_evidence()),
+                            },
+                            Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "a mediation session is already active".to_string(),
-                            }
-                        } else if matches!(envelope.request, Request::Wait { .. }) {
-                            Response::Exited {
+                            },
+                            Request::Wait { .. } => Response::Exited {
                                 status: ExitStatusWire::Exited(23),
-                            }
-                        } else if matches!(envelope.request, Request::Exec { .. }) {
-                            Response::ExecStarted {
+                            },
+                            Request::Exec { .. } => Response::ExecStarted {
                                 process_id: "test-generation:exec:1".to_string(),
                                 pty: false,
+                            },
+                            Request::AttachProcess { .. } => {
+                                Response::ProcessAttached { terminal: false }
                             }
-                        } else if matches!(envelope.request, Request::AttachProcess { .. }) {
-                            Response::ProcessAttached { terminal: false }
-                        } else {
-                            Response::Confirmed {
-                                evidence: Box::new(test_confirmation_evidence()),
+                            Request::Signal { .. } | Request::ExecSignal { .. } => {
+                                Response::Signaled
                             }
+                            Request::Terminate { .. } => Response::Terminated,
+                            Request::TerminateBoundary => Response::BoundaryTerminated,
+                            Request::UpdateProviderEnvironment { revision, .. } => {
+                                Response::ProviderEnvironmentUpdated { revision }
+                            }
+                            Request::Resize { .. } => Response::Resized,
+                            Request::LoopbackConnect { .. } => Response::PortConnected,
+                            Request::StartAgent {
+                                provider_env_revision,
+                                ..
+                            } => Response::Started {
+                                process_id: "test-generation:main:0".to_string(),
+                                provider_env_revision,
+                            },
+                            Request::AcceptNetwork => Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
+                                message: "no pending network request".to_string(),
+                            },
                         },
                     }) {
                         Ok(response) => response,
@@ -1787,6 +1923,7 @@ mod tests {
         );
         *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
+            generation: 1,
             channel,
         });
         // A caller may try again later, but each call makes exactly one
@@ -1800,6 +1937,66 @@ mod tests {
             assert!(client.mediation.lock().await.is_none());
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_attach_and_confirm_on_a_new_physical_connection() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server_accepted = accepted.clone();
+        let server_config = certificate.server_config.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                server_accepted.fetch_add(1, Ordering::AcqRel);
+                let service = TestGrpcBoundary {
+                    wait_for_half_close: false,
+                    expected_token: "a".repeat(32),
+                    requests: server_requests.clone(),
+                };
+                tokio::spawn(async move {
+                    tonic::transport::Server::builder()
+                        .add_service(IsolationBoundaryServer::new(service))
+                        .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
+                            TestTlsIo(Box::new(stream)),
+                        )]))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let client = BoundaryClient::new(
+            tls_topology(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        let attach = Request::Attach {
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            resource_claims: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(
+            client.call_idempotent(attach).await.unwrap(),
+            Response::Attached { .. }
+        ));
+        assert!(matches!(
+            client.call_idempotent(Request::Confirm).await.unwrap(),
+            Response::Confirmed { .. }
+        ));
+
+        client.recover_after_unavailable().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("replacement connection accepted")
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        assert_eq!(requests.load(Ordering::Acquire), 4);
     }
 
     #[tokio::test]
@@ -2378,7 +2575,7 @@ mod tests {
                 })
                 .await
                 .expect("large TLS request"),
-            Response::Confirmed { .. }
+            Response::Started { .. }
         ));
         server.abort();
     }
@@ -2439,7 +2636,7 @@ mod tests {
             .await
             .expect("large Unix TLS request timed out")
             .expect("large Unix TLS request"),
-            Response::Confirmed { .. }
+            Response::Started { .. }
         ));
         server.abort();
         let _ = std::fs::remove_file(socket_path);

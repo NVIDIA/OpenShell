@@ -123,6 +123,7 @@ struct ActiveConnection {
 #[derive(Debug, Default)]
 struct ConnectionState {
     active: Option<ActiveConnection>,
+    pending: Option<ActiveConnection>,
     highest_epoch: Option<CredentialEpoch>,
     terminal: bool,
 }
@@ -134,8 +135,10 @@ pub struct SandboxConnectionRegistry {
 }
 
 impl SandboxConnectionRegistry {
-    /// Attach a fully authenticated connection. The returned ID identifies the
-    /// older connection that must be closed after the replacement is committed.
+    /// Stage a fully authenticated connection for confirmation. The returned
+    /// ID identifies an older unconfirmed candidate that may be closed. The
+    /// current active connection remains authoritative until [`Self::confirm`]
+    /// promotes this candidate.
     pub fn attach(
         &self,
         principal: &SandboxProtocolPrincipal,
@@ -158,22 +161,81 @@ impl SandboxConnectionRegistry {
             if epoch <= active.epoch {
                 return Err(SandboxAuthError::StaleCredentialEpoch);
             }
-            state.highest_epoch = Some(epoch);
-            state.active = Some(ActiveConnection {
-                id: principal.connection_id,
-                epoch,
-            });
-            return Ok(Some(active.id));
         }
         if state.highest_epoch.is_some_and(|highest| epoch < highest) {
             return Err(SandboxAuthError::StaleCredentialEpoch);
         }
+        if let Some(pending) = state.pending {
+            if pending.id == principal.connection_id && pending.epoch == epoch {
+                return Ok(None);
+            }
+            if epoch < pending.epoch {
+                return Err(SandboxAuthError::StaleCredentialEpoch);
+            }
+        }
+        let replaced = state.pending.map(|pending| pending.id);
         state.highest_epoch = Some(epoch);
-        state.active = Some(ActiveConnection {
+        state.pending = Some(ActiveConnection {
             id: principal.connection_id,
             epoch,
         });
-        Ok(None)
+        Ok(replaced)
+    }
+
+    /// Promote an attached, confirmed candidate to the active connection. The
+    /// returned ID is the previously active connection, which may now be
+    /// closed without creating an unsupervised interval.
+    pub fn confirm(
+        &self,
+        principal: &SandboxProtocolPrincipal,
+    ) -> Result<Option<SandboxConnectionId>, SandboxAuthError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal {
+            return Err(SandboxAuthError::TerminalSession);
+        }
+        if state
+            .active
+            .is_some_and(|active| active.id == principal.connection_id)
+        {
+            return Ok(None);
+        }
+        let pending = state
+            .pending
+            .filter(|pending| pending.id == principal.connection_id)
+            .ok_or(SandboxAuthError::ConnectionNotAttached)?;
+        let replaced = state.active.map(|active| active.id);
+        state.active = Some(pending);
+        state.pending = None;
+        Ok(replaced)
+    }
+
+    /// Confirm may run on either the active connection (an idempotent replay)
+    /// or its staged replacement. Other operations require the active one.
+    pub fn require_attached(
+        &self,
+        principal: &SandboxProtocolPrincipal,
+    ) -> Result<(), SandboxAuthError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal {
+            return Err(SandboxAuthError::TerminalSession);
+        }
+        if state
+            .active
+            .is_some_and(|active| active.id == principal.connection_id)
+            || state
+                .pending
+                .is_some_and(|pending| pending.id == principal.connection_id)
+        {
+            Ok(())
+        } else {
+            Err(SandboxAuthError::ConnectionNotAttached)
+        }
     }
 
     pub fn require_active(
@@ -196,17 +258,26 @@ impl SandboxConnectionRegistry {
         Ok(())
     }
 
-    pub fn disconnect(&self, connection_id: SandboxConnectionId) {
+    /// Remove a physical connection. Returns `true` only when it was the
+    /// confirmed active connection and recovery must begin.
+    pub fn disconnect(&self, connection_id: SandboxConnectionId) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
+        let was_active = state
             .active
-            .is_some_and(|active| active.id == connection_id)
-        {
+            .is_some_and(|active| active.id == connection_id);
+        if was_active {
             state.active = None;
         }
+        if state
+            .pending
+            .is_some_and(|pending| pending.id == connection_id)
+        {
+            state.pending = None;
+        }
+        was_active
     }
 
     pub fn mark_terminal(&self) {
@@ -216,6 +287,7 @@ impl SandboxConnectionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.terminal = true;
         state.active = None;
+        state.pending = None;
     }
 }
 
@@ -348,9 +420,12 @@ mod tests {
         let registry = SandboxConnectionRegistry::default();
         assert_eq!(registry.attach(&first), Ok(None));
         assert_eq!(registry.attach(&first), Ok(None));
+        assert_eq!(registry.confirm(&first), Ok(None));
+        assert_eq!(registry.confirm(&first), Ok(None));
 
-        registry.disconnect(first_id);
+        assert!(registry.disconnect(first_id));
         assert_eq!(registry.attach(&first), Ok(None));
+        assert_eq!(registry.confirm(&first), Ok(None));
         registry.mark_terminal();
         assert_eq!(
             registry.require_active(&first),
@@ -360,5 +435,45 @@ mod tests {
             registry.attach(&first),
             Err(SandboxAuthError::TerminalSession)
         );
+    }
+
+    #[test]
+    fn replacement_does_not_displace_active_connection_before_confirm() {
+        let (first_authenticator, first_token) = fixture(1);
+        let first_id = SandboxConnectionId::new();
+        let first = first_authenticator
+            .authenticate(first_id, &metadata(first_token.token.expose_secret()))
+            .expect("first principal");
+        let (replacement_authenticator, replacement_token) = fixture(2);
+        let replacement_id = SandboxConnectionId::new();
+        let replacement = replacement_authenticator
+            .authenticate(
+                replacement_id,
+                &metadata(replacement_token.token.expose_secret()),
+            )
+            .expect("replacement principal");
+        let registry = SandboxConnectionRegistry::default();
+        registry.attach(&first).expect("attach first");
+        registry.confirm(&first).expect("confirm first");
+
+        assert_eq!(registry.attach(&replacement), Ok(None));
+        registry
+            .require_active(&first)
+            .expect("first remains active");
+        assert_eq!(
+            registry.require_active(&replacement),
+            Err(SandboxAuthError::ConnectionNotAttached)
+        );
+        registry
+            .require_attached(&replacement)
+            .expect("replacement may confirm");
+        assert_eq!(registry.confirm(&replacement), Ok(Some(first_id)));
+        assert_eq!(
+            registry.require_active(&first),
+            Err(SandboxAuthError::ConnectionNotAttached)
+        );
+        registry
+            .require_active(&replacement)
+            .expect("replacement became active");
     }
 }
