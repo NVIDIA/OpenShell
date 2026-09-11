@@ -186,9 +186,9 @@ const PROXY_POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const PROXY_POD_FENCE_QUIESCE_WINDOW: Duration = Duration::from_secs(6);
 const PROXY_POD_FENCE_QUIESCE_INTERVAL: Duration = Duration::from_secs(2);
 /// A pre-created fence may legitimately have no Sandbox CR while create is in flight.
-const PROXY_POD_ORPHAN_FENCE_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+const PROXY_POD_ORPHAN_FENCE_MIN_AGE: Duration = Duration::from_mins(5);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const PROXY_POD_BOOTSTRAP_GRACE: Duration = Duration::from_secs(5 * 60);
+const PROXY_POD_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
 fn random_proxy_pod_token() -> String {
     use std::fmt::Write as _;
@@ -3884,7 +3884,7 @@ impl KubernetesComputeDriver {
             loop {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                             if let Ok((kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &namespace, obj).await {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
@@ -3897,7 +3897,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(obj)) => {
+                        Some(Event::Delete(obj)) => {
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -3912,21 +3912,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Restarted(objs)) => {
-                            for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &namespace, obj).await {
-                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        Some(Event::Init | Event::InitDone) => {}
                         None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
@@ -3935,7 +3921,7 @@ impl KubernetesComputeDriver {
                         }
                     },
                     event = event_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                             if let Some((sandbox_id, event)) = map_kube_event_to_platform(
                                 &sandbox_name_to_id,
                                 &agent_pod_to_id,
@@ -3951,8 +3937,8 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(_)) => {}
-                        Some(Event::Restarted(_)) => {
+                        Some(Event::Delete(_)) => {}
+                        Some(Event::Init | Event::InitDone) => {
                             debug!(namespace = %namespace, "Kubernetes event watcher restarted");
                         }
                         None => {
@@ -4186,7 +4172,7 @@ where
         loop {
             tokio::select! {
                 event = sandbox_stream.next() => match event {
-                    Some(Event::Applied(obj)) => {
+                    Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
                         if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &ns, obj).await {
@@ -4200,7 +4186,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Deleted(obj)) => {
+                    Some(Event::Delete(obj)) => {
                         if is_openshell_managed(&obj)
                             && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                         {
@@ -4214,22 +4200,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Restarted(objs)) => {
-                        for obj in objs {
-                            let ns = obj.metadata.namespace.clone()
-                                .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &ns, obj).await {
-                                let event = WatchSandboxesEvent {
-                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                    )),
-                                };
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    Some(Event::Init | Event::InitDone) => {}
                     None => {
                         let _ = tx.send(Err(KubernetesDriverError::Message(
                             "sandbox watcher stream ended unexpectedly".to_string()
@@ -4422,7 +4393,6 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
             }]),
             ..Default::default()
         }),
-        status: None,
     }
 }
 
@@ -6456,6 +6426,7 @@ fn spawn_namespace_label_watcher(
 
     tokio::spawn(async move {
         let mut retry_attempt = 0;
+        let mut relisted_names = std::collections::BTreeSet::new();
         loop {
             let mut stream = watcher::watcher(ns_api.clone(), watcher_config.clone()).boxed();
 
@@ -6470,7 +6441,7 @@ fn spawn_namespace_label_watcher(
                     }
                 };
                 match event {
-                    Ok(Some(Event::Applied(ns))) => {
+                    Ok(Some(Event::Apply(ns))) => {
                         retry_attempt = 0;
                         if let Some(name) = ns.metadata.name.as_deref()
                             && allowlist.insert(name.to_string())
@@ -6478,7 +6449,7 @@ fn spawn_namespace_label_watcher(
                             info!(namespace = name, "operator namespace added to allowlist");
                         }
                     }
-                    Ok(Some(Event::Deleted(ns))) => {
+                    Ok(Some(Event::Delete(ns))) => {
                         retry_attempt = 0;
                         if let Some(name) = ns.metadata.name.as_deref()
                             && allowlist.remove(name)
@@ -6489,14 +6460,20 @@ fn spawn_namespace_label_watcher(
                             );
                         }
                     }
-                    Ok(Some(Event::Restarted(namespaces))) => {
+                    Ok(Some(Event::Init)) => {
                         retry_attempt = 0;
-                        let names: std::collections::BTreeSet<String> = namespaces
-                            .into_iter()
-                            .filter_map(|ns| ns.metadata.name)
-                            .collect();
-                        let count = names.len();
-                        allowlist.replace(names);
+                        relisted_names.clear();
+                    }
+                    Ok(Some(Event::InitApply(ns))) => {
+                        retry_attempt = 0;
+                        if let Some(name) = ns.metadata.name {
+                            relisted_names.insert(name);
+                        }
+                    }
+                    Ok(Some(Event::InitDone)) => {
+                        retry_attempt = 0;
+                        let count = relisted_names.len();
+                        allowlist.replace(std::mem::take(&mut relisted_names));
                         info!(
                             total = count,
                             "operator namespace allowlist replaced from full relist"
@@ -6842,24 +6819,18 @@ mod tests {
             },
             data: serde_json::json!({}),
         };
-        let source = futures::stream::iter([
-            Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
-        ]);
+        let source =
+            futures::stream::iter([Err(expired_watch_error()), Ok(Event::InitApply(recovered))]);
         let mut stream = continue_on_watcher_errors(source, "sandbox-resource");
 
         let event = stream
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(objects) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
+        let Event::InitApply(object) = event else {
+            panic!("expected kube-runtime recovery to emit InitApply");
         };
-        assert_eq!(objects.len(), 1);
-        assert_eq!(
-            objects[0].metadata.name.as_deref(),
-            Some("recovered-sandbox")
-        );
+        assert_eq!(object.metadata.name.as_deref(), Some("recovered-sandbox"));
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
@@ -6886,11 +6857,9 @@ mod tests {
             },
             data: serde_json::json!({}),
         };
-        let source = futures::stream::iter([
-            Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
-        ])
-        .chain(futures::stream::pending());
+        let source =
+            futures::stream::iter([Err(expired_watch_error()), Ok(Event::InitApply(recovered))])
+                .chain(futures::stream::pending());
         let sandbox_stream = recovering_watcher_stream(source, "sandbox-resource").boxed();
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
         let mut outward = cluster_wide_watch_stream(
@@ -6924,7 +6893,7 @@ mod tests {
     async fn kubernetes_event_watcher_error_does_not_hide_restarted_recovery_event() {
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![KubeEventObj::default()])),
+            Ok(Event::InitApply(KubeEventObj::default())),
         ]);
         let mut stream = continue_on_watcher_errors(source, "kubernetes-event");
 
@@ -6932,10 +6901,9 @@ mod tests {
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(events) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
+        let Event::InitApply(_event) = event else {
+            panic!("expected kube-runtime recovery to emit InitApply");
         };
-        assert_eq!(events.len(), 1);
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
@@ -7150,7 +7118,7 @@ mod tests {
             "spec": {"podSelector": {}}
         }))
         .unwrap();
-        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_hours(490_896);
         assert!(!proxy_pod_fence_is_old_enough(
             &policy,
             created + PROXY_POD_ORPHAN_FENCE_MIN_AGE - Duration::from_secs(1)
@@ -7200,7 +7168,7 @@ mod tests {
 
     #[test]
     fn proxy_pod_bootstrap_marker_and_age_gate_rollback() {
-        let started = Duration::from_secs(1_767_225_600);
+        let started = Duration::from_hours(490_896);
         let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -7304,7 +7272,7 @@ mod tests {
 
         assert_eq!(
             kubernetes_sandbox_stop_timeout(&sandbox),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             "an omitted grace period uses the Kubernetes 30-second default"
         );
 
