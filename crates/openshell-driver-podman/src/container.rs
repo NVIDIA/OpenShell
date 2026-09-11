@@ -534,7 +534,7 @@ fn build_env(
     );
     env.insert(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
-        config.sandbox_ssh_socket_path.clone(),
+        config.ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
@@ -664,8 +664,8 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
     }
 }
 
-fn podman_pids_limit(value: i64) -> Option<i64> {
-    if value > 0 { Some(value) } else { None }
+fn podman_pids_limit(value: Option<std::num::NonZeroI64>) -> Option<i64> {
+    value.map(std::num::NonZeroI64::get)
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -1150,11 +1150,14 @@ fn build_base_spec(
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path,
+                    config.ssh_socket_path,
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config.health_check_interval_secs * 1_000_000_000,
+            interval: config
+                .health_check_interval_secs
+                .map_or(10, std::num::NonZeroU64::get)
+                * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -1526,8 +1529,11 @@ pub fn build_isolation_specs(
         "--socket".into(),
         "/run/openshell/supervisor-health.sock".into(),
     ];
-    supervisor.healthconfig.interval =
-        input.config.health_check_interval_secs.max(1) * 1_000_000_000;
+    supervisor.healthconfig.interval = input
+        .config
+        .health_check_interval_secs
+        .map_or(10, std::num::NonZeroU64::get)
+        * 1_000_000_000;
     Ok(IsolationSpecs {
         workload,
         supervisor,
@@ -1794,7 +1800,7 @@ mod tests {
         );
         assert_eq!(
             spec["resource_limits"]["PidsLimit"].as_i64(),
-            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+            openshell_core::config::default_sandbox_pids_limit().map(std::num::NonZeroI64::get)
         );
     }
 
@@ -1802,7 +1808,7 @@ mod tests {
     fn container_spec_can_inherit_runtime_pids_limit() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.sandbox_pids_limit = 0;
+        config.sandbox_pids_limit = None;
         let spec = build_container_spec(&sandbox, &config);
 
         assert!(spec["resource_limits"].get("PidsLimit").is_none());
@@ -2161,7 +2167,7 @@ mod tests {
     fn container_spec_healthcheck_interval_from_config() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.health_check_interval_secs = 30;
+        config.health_check_interval_secs = std::num::NonZeroU64::new(30);
         let spec = build_container_spec(&sandbox, &config);
 
         let interval = spec["healthconfig"]["Interval"]
@@ -2587,7 +2593,7 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
-            sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
+            ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
     }
