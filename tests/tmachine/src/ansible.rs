@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use tokio::process::Command;
 
 pub fn requirements_path() -> PathBuf {
@@ -23,10 +24,11 @@ pub async fn install_roles() {
     assert!(status.success());
 }
 
-pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) {
+pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
     let mut command = Command::new("ansible-playbook");
     for (name, path) in inputs {
-        let path = std::fs::canonicalize(path).unwrap();
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve input {name:?} from {}", path.display()))?;
         command
             .arg("--extra-vars")
             .arg(format!("{name}={}", path.display()));
@@ -35,4 +37,5 @@ pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) {
     let status = command.arg(playbook).status().await.unwrap();
 
     assert!(status.success());
+    Ok(())
 }

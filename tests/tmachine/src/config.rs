@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -48,8 +49,10 @@ pub struct Testsuite {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Self {
-        let yaml = std::fs::read_to_string(path).unwrap();
-        serde_saphyr::from_str(&yaml).unwrap()
+    pub fn load(path: &Path) -> Result<Self> {
+        let yaml = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration from {}", path.display()))?;
+        serde_saphyr::from_str(&yaml)
+            .with_context(|| format!("failed to parse configuration from {}", path.display()))
     }
 }
