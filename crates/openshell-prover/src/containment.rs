@@ -2118,8 +2118,9 @@ mod tests {
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/private/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
-        assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
+        assert!(!network_is_structurally_contained(
+            &maximum, &candidate, true
+        ));
     }
 
     #[test]
