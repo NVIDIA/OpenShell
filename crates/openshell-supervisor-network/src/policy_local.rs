@@ -1110,19 +1110,7 @@ fn network_rule_from_json(
     let binaries = rule
         .binaries
         .into_iter()
-        .map(|binary| {
-            let mut proposal_binary = NetworkBinary {
-                path: binary.path,
-                ..Default::default()
-            };
-            // The deprecated harness bit is ignored by policy YAML, but OPA
-            // maps it to advisor_proposed to preserve the SSRF two-step flow.
-            #[allow(deprecated)]
-            {
-                proposal_binary.harness = true;
-            }
-            proposal_binary
-        })
+        .map(|binary| NetworkBinary { path: binary.path })
         .collect();
 
     Ok(NetworkPolicyRule {
@@ -1472,10 +1460,7 @@ mod tests {
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
         assert!(rule.endpoints[0].advisor_proposed);
-        #[allow(deprecated)]
-        {
-            assert!(rule.binaries[0].harness);
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/gh");
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
@@ -2020,7 +2005,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
@@ -2044,7 +2028,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         }
     }
@@ -2119,7 +2102,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 })));
             })

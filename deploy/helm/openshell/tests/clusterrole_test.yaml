@@ -9,6 +9,12 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: includes the release namespace in the ClusterRole name
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-node-reader-my-namespace
+
   - it: grants managed namespace NetworkPolicy apply permissions
     set:
       server.drivers.kubernetes.workspaceMode: managed

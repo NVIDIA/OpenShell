@@ -27,6 +27,16 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^name\s*=\s*"production-us-west"$'
 
+  - it: renders schema version 2 and the Kubernetes compute driver selector
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\]\s*version\s*=\s*2'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?compute_driver\s*=\s*"kubernetes"'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
@@ -34,6 +44,23 @@ tests:
     asserts:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
+
+  - it: mounts gateway.toml as a regular read-only subPath file
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-config
+            mountPath: /etc/openshell/gateway.toml
+            subPath: gateway.toml
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-config
+            configMap:
+              name: openshell-config
 
   - it: renders a StatefulSet by default
     template: templates/statefulset.yaml
@@ -138,12 +165,77 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
 
-  - it: renders the sandbox service account name under [openshell.drivers.kubernetes]
+  - it: omits pull policies by default so Kubernetes applies its own defaults
     template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*(image_pull_policy|supervisor_image_pull_policy)\s*='
+
+  - it: renders canonical image pull policies in the Kubernetes driver table
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: if_not_present
+      supervisor.image.pullPolicy: never
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"if_not_present".*?supervisor_image_pull_policy\s*=\s*"never"'
+
+  - it: translates legacy Kubernetes pull policy values to canonical gateway values
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: Always
+      supervisor.image.pullPolicy: IfNotPresent
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"always".*?supervisor_image_pull_policy\s*=\s*"if_not_present"'
+
+  - it: rejects unsupported sandbox image pull policies
+    template: templates/statefulset.yaml
+    set:
+      server.sandboxImagePullPolicy: Sometimes
+    asserts:
+      - failedTemplate:
+          errorMessage: 'image pull policy "Sometimes" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
+
+  - it: rejects unsupported supervisor image pull policies
+    template: templates/statefulset.yaml
+    set:
+      supervisor.image.pullPolicy: newer
+    asserts:
+      - failedTemplate:
+          errorMessage: 'image pull policy "newer" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
+
+  - it: renders driver-owned Kubernetes settings only in its driver table
+    template: templates/gateway-config.yaml
+    set:
+      server.hostGatewayIP: 10.0.0.1
+      server.enableUserNamespaces: true
+      supervisor.image.tag: test
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace".*?default_image\s*=.*?supervisor_image\s*=.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?client_tls_secret_name\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?enable_user_namespaces\s*=\s*true.*?sa_token_ttl_secs\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'guest_tls_(ca|cert|key)\s*='
+
+  - it: renders user namespace enablement under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.enableUserNamespaces: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?enable_user_namespaces\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?enable_user_namespaces'
 
   - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
@@ -571,6 +663,13 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-config
+            mountPath: /etc/openshell/gateway.toml
+            subPath: gateway.toml
+            readOnly: true
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
@@ -732,3 +831,98 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name."
+
+  - it: does not render the schema-v1 compute_drivers selector
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?m)^\\s*compute_drivers\\s*="
+
+  - it: uses the release fullname and namespace for default Kubernetes settings
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)name\\s*=\\s*\\\"openshell\\\".*?\\[openshell\\.drivers\\.kubernetes\\].*?namespace\\s*=\\s*\\\"my-namespace\\\".*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\""
+
+  - it: uses an explicit server grpc endpoint verbatim
+    template: templates/gateway-config.yaml
+    set:
+      server.grpcEndpoint: https://gateway.example.test:9443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?grpc_endpoint\\s*=\\s*\\\"https://gateway\\.example\\.test:9443\\\""
+
+  - it: uses HTTP callback and omits client TLS secret when TLS is disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.disableTls: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?grpc_endpoint\\s*=\\s*\\\"http://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\""
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: "client_tls_secret_name\\s*="
+
+  - it: accepts Always pull policy spelling for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: Always
+      supervisor.image.pullPolicy: Always
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"always\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"always\\\""
+
+  - it: accepts IfNotPresent pull policy spelling for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: IfNotPresent
+      supervisor.image.pullPolicy: IfNotPresent
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"if_not_present\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"if_not_present\\\""
+
+  - it: accepts Never pull policy spelling for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: Never
+      supervisor.image.pullPolicy: Never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""
+
+  - it: accepts canonical lowercase pull policies for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: always
+      supervisor.image.pullPolicy: always
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"always\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"always\\\""
+
+  - it: accepts canonical if_not_present pull policies for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: if_not_present
+      supervisor.image.pullPolicy: if_not_present
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"if_not_present\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"if_not_present\\\""
+
+  - it: accepts canonical never pull policies for sandbox and supervisor
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: never
+      supervisor.image.pullPolicy: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""

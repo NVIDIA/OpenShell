@@ -216,8 +216,14 @@ struct ContainerSpec {
     cap_add: Vec<String>,
     no_new_privileges: bool,
     seccomp_profile_path: String,
+    /// Podman's container create API accepts `AppArmor` through the dedicated
+    /// `apparmor_profile` `SpecGenerator` field. This is not Docker's
+    /// `security_opt` representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apparmor_profile: Option<String>,
     image_pull_policy: String,
-    healthconfig: HealthConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    healthconfig: Option<HealthConfig>,
     resource_limits: ResourceLimits,
     /// Env-type secrets: map of `ENV_VAR_NAME → secret_name`.
     /// Podman's libpod `SpecGenerator` uses `secret_env` (a flat map) for
@@ -334,8 +340,15 @@ struct SecretMount {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
-    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
-    pids_limit: Option<i64>,
+    // Podman's libpod API consumes the OCI LinuxResources shape. A Docker-style
+    // scalar PidsLimit is silently ignored and leaves the runtime default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pids: Option<PidsLimits>,
+}
+
+#[derive(Serialize)]
+struct PidsLimits {
+    limit: i64,
 }
 
 #[derive(Serialize)]
@@ -526,7 +539,7 @@ fn build_env(
     );
     env.insert(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
-        config.sandbox_ssh_socket_path.clone(),
+        config.ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
@@ -652,12 +665,10 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
-        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
+        pids: config
+            .sandbox_pids_limit
+            .map(|limit| PidsLimits { limit: limit.get() }),
     }
-}
-
-fn podman_pids_limit(value: i64) -> Option<i64> {
-    if value > 0 { Some(value) } else { None }
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -940,6 +951,14 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn podman_apparmor_profile(profile: Option<&openshell_core::AppArmorProfile>) -> Option<String> {
+    match profile {
+        None | Some(openshell_core::AppArmorProfile::RuntimeDefault) => None,
+        Some(openshell_core::AppArmorProfile::Unconfined) => Some("unconfined".to_string()),
+        Some(openshell_core::AppArmorProfile::Localhost(profile)) => Some(profile.clone()),
+    }
+}
+
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
@@ -1175,21 +1194,22 @@ pub fn build_container_spec_for_image(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
+        apparmor_profile: podman_apparmor_profile(config.app_armor_profile.as_ref()),
         image_pull_policy: "never".to_string(),
-        healthconfig: HealthConfig {
+        healthconfig: config.health_check_interval_secs.map(|interval_secs| HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path,
+                    config.ssh_socket_path,
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config.health_check_interval_secs * 1_000_000_000,
+            interval: interval_secs.get() * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
-        },
+        }),
         resource_limits,
         secret_env: BTreeMap::new(),
         secrets: {
@@ -1544,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_applies_cpu_and_memory_limits() {
+    fn container_spec_applies_resource_limits() {
         use openshell_core::proto::compute::v1::{
             DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
         };
@@ -1561,7 +1581,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let mut config = test_config();
+        config.sandbox_pids_limit = std::num::NonZeroI64::new(2048);
         let spec = build_container_spec(&sandbox, &config);
 
         assert_eq!(
@@ -1573,8 +1594,8 @@ mod tests {
             Some(2 * 1024 * 1024 * 1024)
         );
         assert_eq!(
-            spec["resource_limits"]["PidsLimit"].as_i64(),
-            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+            spec["resource_limits"]["pids"]["limit"].as_i64(),
+            Some(2048)
         );
     }
 
@@ -1582,10 +1603,44 @@ mod tests {
     fn container_spec_can_inherit_runtime_pids_limit() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.sandbox_pids_limit = 0;
+        config.sandbox_pids_limit = None;
         let spec = build_container_spec(&sandbox, &config);
 
-        assert!(spec["resource_limits"].get("PidsLimit").is_none());
+        assert!(spec["resource_limits"].get("pids").is_none());
+    }
+
+    #[test]
+    fn container_spec_uses_podman_apparmor_profile_field() {
+        let sandbox = test_sandbox("test-id", "test-name");
+
+        for (profile, expected) in [
+            (openshell_core::AppArmorProfile::Unconfined, "unconfined"),
+            (
+                openshell_core::AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+                "openshell-supervisor",
+            ),
+        ] {
+            let mut config = test_config();
+            config.app_armor_profile = Some(profile);
+            let spec = build_container_spec(&sandbox, &config);
+
+            assert_eq!(spec["apparmor_profile"].as_str(), Some(expected));
+            assert!(spec.get("security_opt").is_none());
+        }
+    }
+
+    #[test]
+    fn container_spec_omits_podman_apparmor_profile_for_runtime_default() {
+        let sandbox = test_sandbox("test-id", "test-name");
+
+        for profile in [None, Some(openshell_core::AppArmorProfile::RuntimeDefault)] {
+            let mut config = test_config();
+            config.app_armor_profile = profile;
+            let spec = build_container_spec(&sandbox, &config);
+
+            assert!(spec.get("apparmor_profile").is_none());
+            assert!(spec.get("security_opt").is_none());
+        }
     }
 
     #[test]
@@ -1961,7 +2016,8 @@ mod tests {
     #[test]
     fn container_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
-        let config = test_config();
+        let mut config = test_config();
+        config.health_check_interval_secs = std::num::NonZeroU64::new(10);
         let spec = build_container_spec(&sandbox, &config);
 
         let healthcheck = spec["healthconfig"]["test"]
@@ -1978,10 +2034,17 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_omits_healthcheck_when_disabled() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert!(spec.get("healthconfig").is_none());
+    }
+
+    #[test]
     fn container_spec_healthcheck_interval_from_config() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.health_check_interval_secs = 30;
+        config.health_check_interval_secs = std::num::NonZeroU64::new(30);
         let spec = build_container_spec(&sandbox, &config);
 
         let interval = spec["healthconfig"]["Interval"]
@@ -2407,7 +2470,7 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
-            sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
+            ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
     }

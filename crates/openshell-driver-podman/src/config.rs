@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
-use std::str::FromStr;
+
+use openshell_core::{AppArmorProfile, ImagePullPolicy};
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
@@ -11,59 +13,14 @@ pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
 /// Default Podman stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_PODMAN_STOP_TIMEOUT_SECS: u32 = 45;
 
-// Re-export the shared default so existing imports inside this crate keep working.
-pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
-
-/// Image pull policy for sandbox and supervisor images.
-///
-/// Controls when the Podman driver fetches a newer copy of an OCI image
-/// from the registry.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImagePullPolicy {
-    /// Always pull, even if a local copy exists.
-    Always,
-    /// Pull only when no local copy exists (default).
-    #[default]
-    Missing,
-    /// Never pull; fail if not available locally.
-    Never,
-    /// Pull only if the remote image is newer.
-    Newer,
-}
-
-impl ImagePullPolicy {
-    /// Return the policy string expected by the Podman libpod API.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::Missing => "missing",
-            Self::Never => "never",
-            Self::Newer => "newer",
-        }
-    }
-}
-
-impl std::fmt::Display for ImagePullPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ImagePullPolicy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "always" => Ok(Self::Always),
-            "missing" => Ok(Self::Missing),
-            "never" => Ok(Self::Never),
-            "newer" => Ok(Self::Newer),
-            other => Err(format!(
-                "invalid pull policy '{other}'; expected one of: always, missing, never, newer"
-            )),
-        }
+/// Translate the shared pull-policy vocabulary to the Podman libpod API.
+#[must_use]
+pub const fn podman_image_pull_policy(policy: ImagePullPolicy) -> &'static str {
+    match policy {
+        ImagePullPolicy::Always => "always",
+        ImagePullPolicy::IfNotPresent => "missing",
+        ImagePullPolicy::Never => "never",
+        ImagePullPolicy::Newer => "newer",
     }
 }
 
@@ -90,7 +47,7 @@ pub struct PodmanComputeConfig {
     /// default.  Defaults to [`openshell_core::config::DEFAULT_SERVER_PORT`].
     pub gateway_port: u16,
     /// Unix socket path the in-container supervisor bridges relay traffic to.
-    pub sandbox_ssh_socket_path: String,
+    pub ssh_socket_path: String,
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
@@ -120,8 +77,13 @@ pub struct PodmanComputeConfig {
     pub guest_tls_key: Option<PathBuf>,
     /// Container cgroup PID limit for Podman-managed sandboxes.
     ///
-    /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
-    pub sandbox_pids_limit: i64,
+    /// Omit the field to use `OpenShell`'s 2048-process sandbox limit. Explicit
+    /// zero is invalid.
+    #[serde(
+        default = "openshell_core::config::default_sandbox_pids_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sandbox_pids_limit: Option<NonZeroI64>,
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
@@ -129,14 +91,19 @@ pub struct PodmanComputeConfig {
     /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
     /// supervisors for provider token exchange client assertions.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+    /// `AppArmor` confinement requested for sandbox containers. Omission sends
+    /// no override and preserves Podman's runtime-selected profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_armor_profile: Option<AppArmorProfile>,
     /// Health check interval in seconds for sandbox containers.
     ///
     /// Podman runs the health check command at this interval to determine
     /// container readiness. Lower values detect readiness faster but
     /// increase process churn (each check spawns a conmon subprocess).
-    /// Set to `0` to disable health checks entirely.
-    /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
-    pub health_check_interval_secs: u64,
+    /// Omit the field to disable health checks entirely. Explicit zero is
+    /// invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_interval_secs: Option<NonZeroU64>,
     /// Corporate forward proxy URL passed to the in-container supervisor
     /// (e.g. `http://proxy.corp.com:8080` or `https://proxy.corp.com:3130`).
     ///
@@ -217,8 +184,6 @@ pub struct PodmanComputeConfig {
     pub gidmap: Vec<String>,
 }
 
-pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
-
 /// Parse a single `"container_id:host_id:size"` mapping entry.
 ///
 /// Returns `(container_id, host_id, size)` on success.
@@ -256,6 +221,30 @@ pub fn parse_id_map_entry(
 }
 
 impl PodmanComputeConfig {
+    /// Validate and normalize startup configuration without connecting to Podman.
+    pub fn validate_configuration(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        self.validate_tls_config()?;
+        self.validate_runtime_limits()?;
+        self.validate_host_gateway_ip()?;
+        self.validate_proxy_config()?;
+        self.validate_app_armor_profile()?;
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            let raw = socket.to_str().ok_or_else(|| {
+                crate::client::PodmanApiError::InvalidInput(
+                    "provider_spiffe_workload_api_socket must be valid UTF-8".to_string(),
+                )
+            })?;
+            // Preserve pass-through support for an explicitly configured
+            // container-reachable Workload API TCP endpoint.
+            if !raw.starts_with("tcp:") {
+                openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                    .map_err(crate::client::PodmanApiError::InvalidInput)?;
+            }
+        }
+        self.canonicalize_userns()?;
+        self.validate_userns_mappings()
+    }
+
     /// Returns `true` when all three TLS paths are configured.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
@@ -298,9 +287,9 @@ impl PodmanComputeConfig {
 
     /// Validate runtime resource-limit configuration.
     pub fn validate_runtime_limits(&self) -> Result<(), crate::client::PodmanApiError> {
-        if self.sandbox_pids_limit < 0 {
+        if self.sandbox_pids_limit.is_some_and(|limit| limit.get() < 0) {
             return Err(crate::client::PodmanApiError::InvalidInput(
-                "sandbox_pids_limit must be zero or greater".to_string(),
+                "sandbox_pids_limit must be positive when set".to_string(),
             ));
         }
         Ok(())
@@ -318,91 +307,19 @@ impl PodmanComputeConfig {
     /// the URL is rejected because it would otherwise be stored in
     /// `gateway.toml` and exposed in container metadata.
     pub fn validate_proxy_config(&self) -> Result<(), crate::client::PodmanApiError> {
-        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
-        let proxy_secure = if let Some(url) = &self.https_proxy {
-            let addr = parse_upstream_proxy_url(url).map_err(|err| {
-                crate::client::PodmanApiError::InvalidInput(match err {
-                    UpstreamProxyUrlError::Empty => {
-                        "https_proxy must not be empty when set".to_string()
-                    }
-                    UpstreamProxyUrlError::InlineCredentials => {
-                        "https_proxy must not embed credentials in the URL; supply them via \
-                         proxy_auth_file so they are not stored in config or container metadata"
-                            .to_string()
-                    }
-                    err => format!("https_proxy {err}"),
-                })
-            })?;
-            addr.secure
-        } else {
-            false
-        };
-
-        // The supervisor treats a present-but-empty driver-supplied argument
-        // as a fatal misconfiguration, so never accept (and later pass) one.
-        if let Some(list) = self.no_proxy.as_deref() {
-            if list.trim().is_empty() {
-                return Err(crate::client::PodmanApiError::InvalidInput(
-                    "no_proxy must not be empty when set; omit it instead".to_string(),
-                ));
-            }
-            // A bypass list only makes sense relative to a proxy boundary. An
-            // operator who set one believed proxying was in effect, so accepting
-            // it while all egress dials directly would hide a fail-open state.
-            if self.https_proxy.is_none() {
-                return Err(crate::client::PodmanApiError::InvalidInput(
-                    "no_proxy is set but no https_proxy is configured".to_string(),
-                ));
-            }
+        // Keep the Podman-only CA-bundle behaviour below, but delegate the
+        // shared URL, bypass-list, credential-file, and acknowledgement
+        // contract to openshell-core so Docker and VM cannot drift.
+        openshell_core::UpstreamProxyConfig {
+            https_proxy: self.https_proxy.clone(),
+            no_proxy: self.no_proxy.clone(),
+            proxy_auth_file: self.proxy_auth_file.as_ref().map(PathBuf::from),
+            proxy_auth_allow_insecure: self.proxy_auth_allow_insecure,
+            proxy_connect_by_hostname: self.proxy_connect_by_hostname,
         }
+        .validate()
+        .map_err(crate::client::PodmanApiError::InvalidInput)?;
 
-        if let Some(path) = self.proxy_auth_file.as_deref() {
-            if path.trim().is_empty() {
-                return Err(crate::client::PodmanApiError::InvalidInput(
-                    "proxy_auth_file must not be empty when set".to_string(),
-                ));
-            }
-            if self.https_proxy.is_none() {
-                return Err(crate::client::PodmanApiError::InvalidInput(
-                    "proxy_auth_file is set but no https_proxy is configured".to_string(),
-                ));
-            }
-            // Basic auth over the plain-TCP proxy connection is readable by
-            // anyone on the network path; sending it requires an explicit
-            // operator acknowledgement rather than being an implicit side
-            // effect of configuring credentials. For an https:// proxy the
-            // credential is inside the verified TLS session, so the
-            // acknowledgement is unnecessary (but tolerated).
-            if self.proxy_auth_allow_insecure != Some(true) && !proxy_secure {
-                return Err(crate::client::PodmanApiError::InvalidInput(
-                    "proxy_auth_file sends the credential as cleartext Basic auth over the \
-                     plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
-                     = true to accept that exposure, or remove proxy_auth_file"
-                        .to_string(),
-                ));
-            }
-        } else if self.proxy_auth_allow_insecure.is_some() {
-            // The acknowledgement without credentials means the operator
-            // believed an auth file was configured; surface the mismatch.
-            return Err(crate::client::PodmanApiError::InvalidInput(
-                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
-            ));
-        }
-
-        // The CONNECT-target mode only means something relative to a proxy
-        // boundary the operator believed was in effect.
-        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
-            return Err(crate::client::PodmanApiError::InvalidInput(
-                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
-            ));
-        }
-
-        // A CA bundle only makes sense relative to a proxy boundary (an
-        // https:// proxy handshake, or a TLS-intercepting proxy's re-sign CA).
-        // Mirror the proxy_auth_file pairing so a stray setting cannot hide a
-        // fail-open state. The file's readability and certificate content are
-        // checked at sandbox-create time (see the driver) and fail closed in
-        // the supervisor.
         if let Some(path) = self.proxy_ca_bundle.as_deref() {
             if path.trim().is_empty() {
                 return Err(crate::client::PodmanApiError::InvalidInput(
@@ -501,6 +418,18 @@ impl PodmanComputeConfig {
     }
 
     /// Validate optional host gateway override.
+    /// Validate `AppArmor` syntax before contacting the runtime. Drivers check
+    /// runtime availability after querying their backend.
+    pub fn validate_app_armor_profile(&self) -> Result<(), crate::client::PodmanApiError> {
+        if matches!(self.app_armor_profile, Some(AppArmorProfile::Localhost(ref name)) if name.is_empty())
+        {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "app_armor_profile Localhost profile must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
         let trimmed = self.host_gateway_ip.trim();
         if trimmed.is_empty() {
@@ -536,7 +465,7 @@ impl Default for PodmanComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
-            sandbox_ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
@@ -544,10 +473,11 @@ impl Default for PodmanComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
-            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             provider_spiffe_workload_api_socket: None,
-            health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+            app_armor_profile: None,
+            health_check_interval_secs: None,
             https_proxy: None,
             no_proxy: None,
             proxy_auth_file: None,
@@ -566,10 +496,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
         f.debug_struct("PodmanComputeConfig")
             .field("socket_path", &self.socket_path)
             .field("default_image", &self.default_image)
-            .field("image_pull_policy", &self.image_pull_policy.as_str())
+            .field("image_pull_policy", &self.image_pull_policy)
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("gateway_port", &self.gateway_port)
-            .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
+            .field("ssh_socket_path", &self.ssh_socket_path)
             .field("network_name", &self.network_name)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
@@ -583,6 +513,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
                 "provider_spiffe_workload_api_socket",
                 &self.provider_spiffe_workload_api_socket,
             )
+            .field("app_armor_profile", &self.app_armor_profile)
             .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
@@ -606,12 +537,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_sets_health_check_interval() {
-        let cfg = PodmanComputeConfig::default();
+    fn shared_image_pull_policies_map_to_podman_vocabulary() {
+        for (policy, expected) in [
+            (ImagePullPolicy::Always, "always"),
+            (ImagePullPolicy::IfNotPresent, "missing"),
+            (ImagePullPolicy::Never, "never"),
+            (ImagePullPolicy::Newer, "newer"),
+        ] {
+            assert_eq!(podman_image_pull_policy(policy), expected);
+        }
+    }
+
+    #[test]
+    fn config_uses_canonical_ssh_socket_path_name() {
+        let config: PodmanComputeConfig =
+            serde_json::from_value(serde_json::json!({ "ssh_socket_path": "/run/test.sock" }))
+                .unwrap();
+        assert_eq!(config.ssh_socket_path, "/run/test.sock");
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["ssh_socket_path"], "/run/test.sock");
+        assert!(serialized.get("sandbox_ssh_socket_path").is_none());
+    }
+
+    #[test]
+    fn config_rejects_legacy_sandbox_ssh_socket_path() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "sandbox_ssh_socket_path": "/run/test.sock"
+        }))
+        .expect_err("legacy sandbox_ssh_socket_path must be rejected");
+        assert!(error.to_string().contains("sandbox_ssh_socket_path"));
+    }
+
+    #[test]
+    fn default_config_disables_health_checks() {
         assert_eq!(
-            cfg.health_check_interval_secs,
-            DEFAULT_HEALTH_CHECK_INTERVAL_SECS
+            PodmanComputeConfig::default().health_check_interval_secs,
+            None
         );
+    }
+
+    #[test]
+    fn omitted_apparmor_profile_preserves_runtime_default() {
+        let config: PodmanComputeConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("omitted AppArmor profile should deserialize");
+        assert_eq!(config.app_armor_profile, None);
+
+        let serialized = serde_json::to_value(config).expect("config should serialize");
+        assert!(serialized.get("app_armor_profile").is_none());
+    }
+
+    #[test]
+    fn explicit_apparmor_profiles_round_trip() {
+        for value in [
+            "RuntimeDefault",
+            "Unconfined",
+            "Localhost/openshell-supervisor",
+        ] {
+            let config: PodmanComputeConfig = serde_json::from_value(serde_json::json!({
+                "app_armor_profile": value,
+            }))
+            .expect("explicit AppArmor profile should deserialize");
+            let serialized = serde_json::to_value(config).expect("config should serialize");
+            assert_eq!(serialized["app_armor_profile"], value);
+        }
     }
 
     #[test]
@@ -623,9 +612,21 @@ mod tests {
     #[test]
     fn default_config_sets_driver_owned_pids_limit() {
         let cfg = PodmanComputeConfig::default();
-        assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
+        assert_eq!(
+            cfg.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
         assert!(!cfg.enable_bind_mounts);
-        assert!(cfg.validate_runtime_limits().is_ok());
+    }
+
+    #[test]
+    fn omitted_pids_limit_uses_driver_owned_default() {
+        let cfg: PodmanComputeConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("default Podman config should deserialize");
+        assert_eq!(
+            cfg.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
     }
 
     #[test]
@@ -655,13 +656,28 @@ mod tests {
     }
 
     #[test]
-    fn runtime_limit_validation_rejects_negative_pids_limit() {
-        let cfg = PodmanComputeConfig {
-            sandbox_pids_limit: -1,
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg.validate_runtime_limits().unwrap_err();
-        assert!(err.to_string().contains("sandbox_pids_limit"));
+    fn runtime_limit_rejects_invalid_pids_limits() {
+        let zero = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "sandbox_pids_limit": 0
+        }))
+        .expect_err("zero PID limit must be rejected");
+        assert!(zero.to_string().contains("invalid value: integer `0`"));
+
+        let negative: PodmanComputeConfig = serde_json::from_value(serde_json::json!({
+            "sandbox_pids_limit": -1
+        }))
+        .expect("nonzero integer deserializes before semantic validation");
+        let error = negative.validate_runtime_limits().unwrap_err();
+        assert!(error.to_string().contains("must be positive"));
+    }
+
+    #[test]
+    fn health_check_interval_rejects_zero() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "health_check_interval_secs": 0
+        }))
+        .expect_err("zero health-check interval must be rejected");
+        assert!(error.to_string().contains("invalid value: integer `0`"));
     }
 
     // ── Proxy config validation ───────────────────────────────────────

@@ -46,6 +46,8 @@ Run Rust tests only:
 mise run test:rust     # cargo test --workspace
 ```
 
+Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
+
 ## Python Unit Tests
 
 Python unit tests use the `*_test.py` suffix convention (not `test_*` prefix)

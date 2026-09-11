@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: ClusterRoleBinding RBAC
+templates:
+  - templates/clusterrolebinding.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: includes the release namespace in the ClusterRoleBinding name
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-node-reader-my-namespace
+
+  - it: references the namespace-scoped ClusterRole in roleRef
+    asserts:
+      - equal:
+          path: roleRef.name
+          value: openshell-node-reader-my-namespace
+
+  - it: binds the service account in the release namespace
+    asserts:
+      - contains:
+          path: subjects
+          content:
+            kind: ServiceAccount
+            name: openshell
+            namespace: my-namespace
