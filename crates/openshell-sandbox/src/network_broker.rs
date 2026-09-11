@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use openshell_binary_identity::ProcfsIdentityResolver;
 use openshell_isolation_interface::contract::{
-    BinaryIdentity, DnsTransport, NetworkOpenResult, NetworkSocketMetadata, ResolveError,
+    BinaryIdentity, DnsTransport, NetworkSocketMetadata, ResolveError, TcpOpenDecision,
+    TcpOpenDenial,
 };
 use openshell_isolation_interface::linux::seccomp_notify::{Notification, NotificationListener};
 use openshell_isolation_interface::linux::socket_registry::{
@@ -104,19 +105,16 @@ pub struct PendingTcpOpen {
     pub(crate) socket: NetworkSocketMetadata,
     pub(crate) notification_to_queue: Duration,
     pub(crate) queued_at: Instant,
-    decision: std::sync::mpsc::SyncSender<NetworkOpenResult>,
+    decision: std::sync::mpsc::SyncSender<TcpOpenDecision>,
     relay: oneshot::Receiver<io::Result<TcpStream>>,
 }
 
 impl PendingTcpOpen {
-    pub(crate) async fn complete(
-        self,
-        decision: NetworkOpenResult,
-    ) -> io::Result<Option<TcpStream>> {
+    pub(crate) async fn complete(self, decision: TcpOpenDecision) -> io::Result<Option<TcpStream>> {
         self.decision
             .send(decision)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network broker stopped"))?;
-        if matches!(decision, NetworkOpenResult::Denied { .. }) {
+        if matches!(decision, TcpOpenDecision::Denied(_)) {
             return Ok(None);
         }
         self.relay
@@ -798,10 +796,11 @@ fn connect_socket(
             let _slot = slot;
             let result = await_network_decision(&decision_rx, decision_timeout);
             match result {
-                NetworkOpenResult::Denied { errno } => {
-                    let _ = worker_listener.respond_errno(notification.id, errno);
+                TcpOpenDecision::Denied(reason) => {
+                    let _ =
+                        worker_listener.respond_errno(notification.id, tcp_denial_errno(reason));
                 }
-                NetworkOpenResult::RelayReady => {
+                TcpOpenDecision::RelayReady => {
                     match worker_listener.validate_id(notification.id).and_then(|()| {
                         establish_relay(
                             &registry,
@@ -831,17 +830,22 @@ fn connect_socket(
 }
 
 fn await_network_decision(
-    decision: &std::sync::mpsc::Receiver<NetworkOpenResult>,
+    decision: &std::sync::mpsc::Receiver<TcpOpenDecision>,
     timeout: Duration,
-) -> NetworkOpenResult {
+) -> TcpOpenDecision {
     decision
         .recv_timeout(timeout)
-        .unwrap_or_else(|error| NetworkOpenResult::Denied {
-            errno: match error {
-                std::sync::mpsc::RecvTimeoutError::Timeout => libc::ETIMEDOUT,
-                std::sync::mpsc::RecvTimeoutError::Disconnected => libc::ECANCELED,
-            },
-        })
+        .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable))
+}
+
+const fn tcp_denial_errno(reason: TcpOpenDenial) -> i32 {
+    match reason {
+        TcpOpenDenial::PolicyDenied
+        | TcpOpenDenial::IdentityUnavailable
+        | TcpOpenDenial::InvalidDestination => libc::EACCES,
+        TcpOpenDenial::ResourceExhausted => libc::EAGAIN,
+        TcpOpenDenial::MediationUnavailable => libc::ECANCELED,
+    }
 }
 
 fn ensure_dns_source_bound(fd: RawFd, family: InetFamily) -> io::Result<SocketAddr> {
@@ -1822,7 +1826,7 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
         assert!(
             runtime
-                .block_on(pending.complete(NetworkOpenResult::RelayReady))
+                .block_on(pending.complete(TcpOpenDecision::RelayReady))
                 .is_err()
         );
     }
@@ -2100,7 +2104,7 @@ mod tests {
         assert_eq!(pending.destination, "203.0.113.7:443".parse().unwrap());
         assert!(pending.socket.socket_cookie != 0);
         let mut relay = runtime
-            .block_on(pending.complete(NetworkOpenResult::RelayReady))
+            .block_on(pending.complete(TcpOpenDecision::RelayReady))
             .expect("complete relay")
             .expect("authorized relay stream");
         let mut request = [0_u8; 7];
@@ -2129,9 +2133,7 @@ mod tests {
         let pending = runtime.block_on(broker.accept()).expect("pending TCP open");
         assert!(
             runtime
-                .block_on(pending.complete(NetworkOpenResult::Denied {
-                    errno: libc::EACCES,
-                }))
+                .block_on(pending.complete(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)),)
                 .expect("complete denial")
                 .is_none()
         );

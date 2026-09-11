@@ -102,6 +102,10 @@ struct Args {
     #[arg(long)]
     topology_payload_file: PathBuf,
 
+    /// Protected gateway-issued credentials for this exact sandbox launch.
+    #[arg(long)]
+    auth_bundle_file: PathBuf,
+
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
 }
@@ -117,6 +121,21 @@ fn topology(args: &Args) -> Result<TopologyDescriptor> {
         backend_name: args.topology_backend_name.clone(),
         payload,
     })
+}
+
+fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle> {
+    let bytes = std::fs::read(&args.auth_bundle_file).map_err(|error| {
+        miette::miette!(
+            "read supervisor authentication bundle {}: {error}",
+            args.auth_bundle_file.display()
+        )
+    })?;
+    let bundle = serde_json::from_slice::<openshell_core::jwt::SupervisorAuthBundle>(&bytes)
+        .map_err(|error| miette::miette!("decode supervisor authentication bundle: {error}"))?;
+    bundle
+        .validate()
+        .map_err(|error| miette::miette!("validate supervisor authentication bundle: {error}"))?;
+    Ok(bundle)
 }
 
 fn validate_main_exit_marker(marker: Option<&Path>) -> Result<()> {
@@ -151,6 +170,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let topology = topology(&args)?;
+    let auth_bundle = auth_bundle(&args)?;
 
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -282,6 +302,7 @@ fn main() -> Result<()> {
             ocsf_enabled,
             upstream_proxy_args,
             topology,
+            auth_bundle,
             admitted_isolation_backend,
             args.main_exit_marker,
         )
