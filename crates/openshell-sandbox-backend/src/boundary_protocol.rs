@@ -472,6 +472,9 @@ pub enum Request {
     Terminate {
         process_id: String,
     },
+    /// Permanently end this sandbox session and acknowledge that every owned
+    /// workload process has been terminated.
+    TerminateBoundary,
     Exec {
         spec: ExecSpecWire,
     },
@@ -508,6 +511,7 @@ impl Request {
                 | Self::Exec { .. }
                 | Self::Signal { .. }
                 | Self::Terminate { .. }
+                | Self::TerminateBoundary
                 | Self::ExecSignal { .. }
                 | Self::Resize { .. }
         )
@@ -577,6 +581,7 @@ impl fmt::Debug for Request {
                 .debug_struct("Terminate")
                 .field("process_id", process_id)
                 .finish(),
+            Self::TerminateBoundary => formatter.write_str("TerminateBoundary"),
             Self::Exec { spec } => formatter.debug_tuple("Exec").field(spec).finish(),
             Self::ExecSignal { process_id, signal } => formatter
                 .debug_struct("ExecSignal")
@@ -635,6 +640,7 @@ pub enum Response {
     },
     Signaled,
     Terminated,
+    BoundaryTerminated,
     ExecStarted {
         process_id: String,
         pty: bool,
