@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
 pub struct DockerBoundarySpec {
@@ -96,10 +96,9 @@ mod tests {
     #[test]
     fn provisioning_binds_container_and_image_claims() {
         let session_id = openshell_core::SandboxSessionId::new();
-        let tls = openshell_isolation_interface::boundary_protocol::generate_sandbox_tls_material(
-            session_id,
-        )
-        .unwrap();
+        let tls =
+            openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(session_id)
+                .unwrap();
         let provisioned = DockerBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),

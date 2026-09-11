@@ -60,11 +60,11 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Error, Result as CoreResult};
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryTopology, GatewayVerificationKey, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
-use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use opentelemetry::trace::TraceContextExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
