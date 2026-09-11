@@ -138,6 +138,18 @@ jobs:
       target-suffix: unknown-linux-gnu
     secrets: inherit
 
+  build-sandbox-image:
+    needs: build-sandbox
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+    secrets: inherit
+
   build-supervisor-image:
     needs: build-sandbox
     permissions:
@@ -146,13 +158,12 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       component: supervisor
-      binary: openshell-sandbox
-      additional-binary: openshell-supervisor
-      target-suffix: unknown-linux-musl
+      binary: openshell-supervisor
+      target-suffix: unknown-linux-gnu
     secrets: inherit
 
   docker-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -164,7 +175,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -186,7 +197,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway-image, build-supervisor-image, release-dev]
+    needs: [build-gateway-image, build-sandbox-image, build-supervisor-image, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -197,7 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway supervisor; do
+          for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
               --prefer-index=false \
