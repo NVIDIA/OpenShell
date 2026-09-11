@@ -16,11 +16,11 @@
 #
 # Sandbox image overrides:
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
-#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
 #
 # The default community sandbox image uses :latest. This wrapper refreshes it
-# before starting the gateway, while the Docker driver defaults to IfNotPresent
-# so local Dockerfile-built images remain usable.
+# before starting the gateway, while the Docker driver defaults to
+# if_not_present so local Dockerfile-built images remain usable.
 #
 set -euo pipefail
 
@@ -450,7 +450,7 @@ echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}}"
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}}"
 if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
   echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
   exit 2
@@ -501,8 +501,11 @@ toml_string() {
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 {
-  printf '[openshell]\nversion = 1\n\n'
-  printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  printf '[openshell]\nversion = 2\n\n'
+  printf '[openshell.gateway]\nlog_level = "info"\n'
+  printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
+  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
+  printf 'guest_tls_key = %s\n\n'      "$(toml_string "${PKI_DIR}/client/tls.key")"
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
     e2e_write_gateway_mtls_auth_config
@@ -514,14 +517,11 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
-    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
-    printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-    printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-    printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
     printf 'enable_bind_mounts = true\n'
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
     if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
@@ -532,7 +532,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
-    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
@@ -560,7 +560,7 @@ GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
-  --drivers docker
+  --compute-driver docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

@@ -726,7 +726,6 @@ mod tests {
                 endpoints: vec![left],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -737,7 +736,6 @@ mod tests {
                 endpoints: vec![right],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
