@@ -90,7 +90,7 @@ fn contained_policy_returns_stable_json_and_zero() {
 
 #[test]
 fn exceeding_policy_returns_counterexample_and_one() {
-    let output = check_json("candidate-exceeds.yaml", "maximum.yaml");
+    let output = check_json("candidate-exceeds.yaml", "maximum-no-write.yaml");
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -268,44 +268,112 @@ fn fifo_input_is_rejected_without_blocking() {
 #[cfg(unix)]
 #[test]
 fn sigint_interrupts_the_check_with_exit_130() {
-    let path = std::env::temp_dir().join(format!(
-        "openshell-prover-cancellation-{}.yaml",
+    let directory = std::env::temp_dir().join(format!(
+        "openshell-prover-cancellation-{}",
         std::process::id()
     ));
-    let mut source = String::from("version: 1\nnetwork_policies:\n");
-    for index in 0..500 {
-        writeln!(
-            source,
-            "  rule-{index}:\n    endpoints: [{{ host: host-{index}.example.com, port: 443 }}]\n    binaries: [{{ path: /usr/bin/curl }}]"
+    fs::create_dir_all(&directory).unwrap();
+    let policy = |paths: Vec<String>| {
+        serde_json::json!({
+            "version": 1,
+            "network_policies": {"many": {
+                "binaries": [{"path": "/usr/bin/curl"}],
+                "endpoints": [{"host": "api.example.com", "port": 443,
+                    "protocol": "rest", "enforcement": "enforce",
+                    "rules": paths.into_iter().map(|path| serde_json::json!({
+                        "allow": {"method": "GET", "path": path}
+                    })).collect::<Vec<_>>()
+                }]
+            }}
+        })
+    };
+    let candidate = directory.join("candidate.yaml");
+    let maximum = directory.join("maximum.yaml");
+    fs::write(
+        &candidate,
+        policy(vec!["/route*/**/tail*".into()]).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &maximum,
+        policy(
+            (0..300)
+                .map(|index| format!("/route{index}/**/tail*"))
+                .collect(),
         )
-        .unwrap();
-    }
-    fs::write(&path, source).expect("write cancellation policy");
+        .to_string(),
+    )
+    .unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_openshell-prover"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell-prover"))
         .args([
             "check",
-            path.to_str().expect("UTF-8 temporary path"),
+            candidate.to_str().expect("UTF-8 temporary path"),
             "--maximum",
-            path.to_str().expect("UTF-8 temporary path"),
+            maximum.to_str().expect("UTF-8 temporary path"),
             "--output",
             "json",
+            "--timeout",
+            "10s",
         ])
         .stdout(Stdio::piped())
         .spawn()
         .expect("start cancellable prover");
-    thread::sleep(Duration::from_millis(25));
+    // Different policies force a real solve; an identical pair can exit via
+    // the equality shortcut before SIGINT ever exercises Z3's signal handling.
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "fixture must still be solving when interrupted"
+    );
     let signal = Command::new("kill")
         .args(["-s", "INT", &child.id().to_string()])
         .status()
         .expect("send SIGINT");
     assert!(signal.success());
     let output = child.wait_with_output().expect("wait for cancelled prover");
-    fs::remove_file(path).expect("remove cancellation policy");
+    fs::remove_dir_all(directory).expect("remove cancellation policies");
     assert_eq!(output.status.code(), Some(130));
     let value: Value =
         serde_json::from_slice(&output.stdout).expect("structured cancellation JSON");
     assert_eq!(value["result"], "inconclusive");
     assert_eq!(value["reason_code"], "cancelled");
     assert_eq!(value["exit_code"], 130);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_descendants_require_sandbox_path_resolution() {
+    let directory =
+        std::env::temp_dir().join(format!("openshell-prover-symlink-{}", std::process::id()));
+    let safe = directory.join("safe");
+    let outside = directory.join("outside");
+    fs::create_dir_all(&safe).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, safe.join("link")).unwrap();
+    for access in ["read_only", "read_write"] {
+        let candidate = directory.join("candidate.yaml");
+        let maximum = directory.join("maximum.yaml");
+        for (file, path) in [(&candidate, safe.join("link")), (&maximum, safe.clone())] {
+            fs::write(
+                file,
+                serde_json::json!({"version": 1, "filesystem_policy": {access: [path]}})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        let output = run(&[
+            "check",
+            candidate.to_str().unwrap(),
+            "--maximum",
+            maximum.to_str().unwrap(),
+            "--output",
+            "json",
+        ]);
+        assert_eq!(output.status.code(), Some(3));
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["result"], "unsupported");
+        assert_eq!(value["reason_code"], "unresolved_filesystem_path");
+    }
+    fs::remove_dir_all(directory).unwrap();
 }

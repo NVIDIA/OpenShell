@@ -358,6 +358,7 @@ pub enum ReasonCode {
     UnsupportedPolicyShape,
     UnresolvedWorkdir,
     UnresolvedBinaryPath,
+    UnresolvedFilesystemPath,
     SolverTimeout,
     SolverUnknown,
     ResourceLimit,
@@ -372,6 +373,7 @@ impl ReasonCode {
             Self::UnsupportedPolicyShape => "unsupported_policy_shape",
             Self::UnresolvedWorkdir => "unresolved_workdir",
             Self::UnresolvedBinaryPath => "unresolved_binary_path",
+            Self::UnresolvedFilesystemPath => "unresolved_filesystem_path",
             Self::SolverTimeout => "solver_timeout",
             Self::SolverUnknown => "solver_unknown",
             Self::ResourceLimit => "resource_limit",
@@ -609,8 +611,9 @@ fn check_within_maximum_inner(
     if maximum == candidate {
         return CheckResult::Within(WithinEvidence);
     }
-    if let Some(counterexample) = filesystem_counterexample(maximum, candidate) {
-        return CheckResult::Exceeds(ExceedsEvidence(counterexample));
+    let filesystem_result = check_filesystem(maximum, candidate);
+    if let Some(result @ CheckResult::Exceeds(_)) = filesystem_result {
+        return result;
     }
     let started = Instant::now();
     for binary_identity_required in [false, true] {
@@ -659,7 +662,7 @@ fn check_within_maximum_inner(
                 .to_owned(),
         );
     }
-    CheckResult::Within(WithinEvidence)
+    filesystem_result.unwrap_or(CheckResult::Within(WithinEvidence))
 }
 
 fn solve_network_mode(
@@ -691,6 +694,11 @@ fn solve_network_mode(
     }
     let mut params = Params::new();
     params.set_u32("timeout", remaining_ms);
+    if cancelled.is_some() {
+        // The caller owns SIGINT. Z3's handler would replace it during check(),
+        // leaving the cancellation flag unset even when the solve is interrupted.
+        params.set_bool("ctrl_c", false);
+    }
     solver.set_params(&params);
     let solve_result = solver_check(&solver, cancelled);
     if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -1341,10 +1349,10 @@ fn endpoint_authority_equal(left: &Endpoint, right: &Endpoint) -> bool {
     rules_equal && denies_equal && left == right
 }
 
-fn filesystem_counterexample(
+fn check_filesystem(
     maximum: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
-) -> Option<Counterexample> {
+) -> Option<CheckResult> {
     let mut maximum_writes = maximum.filesystem_policy.read_write.clone();
     if maximum.filesystem_policy.include_workdir {
         maximum_writes.push(WORKDIR_SYMBOL.to_owned());
@@ -1352,36 +1360,49 @@ fn filesystem_counterexample(
     let mut maximum_reads = maximum.filesystem_policy.read_only.clone();
     maximum_reads.extend(maximum_writes.iter().cloned());
 
-    candidate
-        .filesystem_policy
-        .read_write
-        .iter()
-        .find(|path| !path_is_covered(path, &maximum_writes))
-        .map(|path| Counterexample::Filesystem {
-            access: FilesystemAccess::Write,
-            path: path.clone(),
-        })
-        .or_else(|| {
-            candidate
-                .filesystem_policy
-                .read_only
-                .iter()
-                .find(|path| !path_is_covered(path, &maximum_reads))
-                .map(|path| Counterexample::Filesystem {
-                    access: FilesystemAccess::Read,
-                    path: path.clone(),
-                })
-        })
+    let mut unresolved = None;
+    for (access, candidates, maxima) in [
+        (
+            FilesystemAccess::Write,
+            &candidate.filesystem_policy.read_write,
+            &maximum_writes,
+        ),
+        (
+            FilesystemAccess::Read,
+            &candidate.filesystem_policy.read_only,
+            &maximum_reads,
+        ),
+    ] {
+        for path in candidates {
+            if path_is_covered(path, maxima) {
+                continue;
+            }
+            if maxima.is_empty() {
+                return Some(CheckResult::Exceeds(ExceedsEvidence(
+                    Counterexample::Filesystem {
+                        access,
+                        path: path.clone(),
+                    },
+                )));
+            }
+            // Landlock resolves paths in the sandbox. Lexical descendants can
+            // point outside an ancestor, and unrelated paths can alias it.
+            unresolved = Some(unsupported(
+                ReasonCode::UnresolvedFilesystemPath,
+                format!(
+                    "filesystem {access} containment for '{path}' depends on sandbox path resolution; use matching paths in candidate and maximum",
+                    access = access.as_str()
+                ),
+            ));
+        }
+    }
+    unresolved
 }
 
 fn path_is_covered(candidate: &str, maximum_paths: &[String]) -> bool {
-    maximum_paths.iter().any(|maximum| {
-        maximum == "/"
-            || candidate == maximum
-            || candidate
-                .strip_prefix(maximum)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
+    maximum_paths
+        .iter()
+        .any(|maximum| maximum == "/" || candidate == maximum)
 }
 
 fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(ReasonCode, String)> {
@@ -1707,6 +1728,9 @@ fn glob_regex(pattern: &str, separator: &str) -> Regexp {
     if pattern == "**" {
         return Regexp::full();
     }
+    if separator == "/" {
+        return path_glob_regex(pattern);
+    }
     let mut parts = Vec::new();
     let mut chars = pattern.chars().peekable();
     while let Some(character) = chars.next() {
@@ -1733,6 +1757,46 @@ fn glob_regex(pattern: &str, separator: &str) -> Regexp {
     } else {
         let refs = parts.iter().collect::<Vec<_>>();
         Regexp::concat(&refs)
+    }
+}
+
+fn path_glob_regex(pattern: &str) -> Regexp {
+    let mut parts = Vec::new();
+    let mut segments = pattern.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segment == "**" {
+            // glob.match collapses consecutive recursive components. A middle
+            // ** includes its following slash and can match zero directories.
+            while segments.peek() == Some(&"**") {
+                segments.next();
+            }
+            let recursive = Regexp::full();
+            parts.push(if segments.peek().is_some() {
+                Regexp::union(&[
+                    &Regexp::literal(""),
+                    &Regexp::concat(&[&recursive, &Regexp::literal("/")]),
+                ])
+            } else {
+                recursive
+            });
+        } else {
+            for character in segment.chars() {
+                // Embedded stars, including **, cannot cross a separator.
+                parts.push(if character == '*' {
+                    non_separator_regex("/").star()
+                } else {
+                    Regexp::literal(&character.to_string())
+                });
+            }
+            if segments.peek().is_some() {
+                parts.push(Regexp::literal("/"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        Regexp::literal("")
+    } else {
+        Regexp::concat(&parts.iter().collect::<Vec<_>>())
     }
 }
 
@@ -1777,16 +1841,14 @@ mod tests {
     fn filesystem_containment_and_counterexample() {
         let maximum =
             parse("version: 1\nfilesystem_policy: { read_only: [/usr], read_write: [/tmp] }\n");
-        let within = parse(
-            "version: 1\nfilesystem_policy: { read_only: [/usr/bin], read_write: [/tmp/cache] }\n",
-        );
+        let within = parse("version: 1\nfilesystem_policy: { read_only: [/usr, /tmp] }\n");
         let exceeds = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
         assert!(matches!(
             check_within_maximum(&maximum, &within, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&maximum, &exceeds, options()),
+            check_within_maximum(&parse("version: 1\n"), &exceeds, options()),
             CheckResult::Exceeds(_)
         ));
     }
@@ -2122,10 +2184,9 @@ mod tests {
 
     #[test]
     fn containment_is_transitive() {
-        let broad = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
-        let middle = parse("version: 1\nfilesystem_policy: { read_write: [/workspace/project] }\n");
-        let narrow =
-            parse("version: 1\nfilesystem_policy: { read_write: [/workspace/project/cache] }\n");
+        let broad = parse("version: 1\nfilesystem_policy: { read_write: [/workspace, /tmp] }\n");
+        let middle = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
+        let narrow = parse("version: 1\nfilesystem_policy: { read_only: [/workspace] }\n");
         assert!(matches!(
             check_within_maximum(&broad, &middle, options()),
             CheckResult::Within(_)
@@ -2280,6 +2341,96 @@ mod tests {
                 parsed.filesystem_policy.read_only[0],
                 openshell_core::paths::normalize_path(path)
             );
+        }
+    }
+
+    #[test]
+    fn filesystem_comparisons_do_not_assume_path_ancestry_or_distinctness() {
+        for access in ["read_only", "read_write"] {
+            let maximum = parse(&format!(
+                "version: 1\nfilesystem_policy: {{ {access}: [/safe] }}\n"
+            ));
+            for path in [
+                "/safe/link",
+                "/safe/child/file",
+                "/elsewhere",
+                "/safe-prefix",
+            ] {
+                let candidate = parse(&format!(
+                    "version: 1\nfilesystem_policy: {{ {access}: [{path}] }}\n"
+                ));
+                assert!(
+                    matches!(
+                        check_within_maximum(&maximum, &candidate, options()),
+                        CheckResult::Unsupported(ref evidence)
+                            if evidence.reason_code() == ReasonCode::UnresolvedFilesystemPath
+                    ),
+                    "access={access} path={path}"
+                );
+            }
+            let matching = parse(&format!(
+                "version: 1\nfilesystem_policy: {{ {access}: [/safe, /safe] }}\n"
+            ));
+            assert!(matches!(
+                check_within_maximum(&maximum, &matching, options()),
+                CheckResult::Within(_)
+            ));
+            let root = parse(&format!(
+                "version: 1\nfilesystem_policy: {{ {access}: [/] }}\n"
+            ));
+            assert!(matches!(
+                check_within_maximum(&root, &maximum, options()),
+                CheckResult::Within(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn path_globs_match_the_runtime_builtin() {
+        let mut runtime = regorus::Engine::new();
+        for pattern in [
+            "/a/**/b",
+            "/**/b",
+            "/a/**/**/b",
+            "/a/**",
+            "/a/**/**",
+            "/a/**/",
+            "/a/*/b",
+            "/a/x**/b",
+            "/a/**x/b",
+            "/a/***/b",
+            "/a/**/x*/**/b",
+        ] {
+            for path in [
+                "/a/b",
+                "/a/x/b",
+                "/a/x/y/b",
+                "/b",
+                "/a/",
+                "/a",
+                "/a/xb",
+                "/a/x/z/xb/y/b",
+                "/a/c",
+            ] {
+                let query = format!(
+                    "glob.match({}, [\"/\"], {})",
+                    serde_json::to_string(pattern).unwrap(),
+                    serde_json::to_string(path).unwrap()
+                );
+                let actual = runtime.eval_query(query, false).unwrap();
+                let expected = actual.result[0].expressions[0].value == regorus::Value::from(true);
+                let solver = Solver::new();
+                solver.assert(
+                    Z3String::from_str(path)
+                        .unwrap()
+                        .regex_matches(&glob_regex(pattern, "/")),
+                );
+                assert_eq!(
+                    solver.check() == SatResult::Sat,
+                    expected,
+                    "pattern={pattern} path={path}"
+                );
+            }
         }
     }
 }

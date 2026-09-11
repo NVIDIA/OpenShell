@@ -72,9 +72,9 @@ Create the fully composed candidate policy:
 version: 1
 filesystem_policy:
   read_only:
-    - /usr/bin
+    - /usr
   read_write:
-    - /tmp/cache
+    - /tmp
 ```
 
 Run the check:
@@ -155,7 +155,16 @@ state. In particular:
   the configuration and identities that expose the additional authority.
 - REST containment witnesses use canonical request methods and paths.
 - Both files are interpreted in the same sandbox filesystem namespace and
-  mount model. The CLI does not resolve sandbox paths against the host.
+  mount model, with stable path resolution when enforcement rules are created.
+  The CLI does not resolve sandbox paths against the host.
+- Filesystem containment supports removing grants and reducing write grants to
+  read-only grants at matching paths. A maximum grant for `/` also covers other
+  paths for the same access. Comparisons between different paths otherwise
+  return `unsupported` with `reason_code: unresolved_filesystem_path`: a lexical
+  child can resolve outside its parent through a symlink, and unrelated paths
+  can resolve to the same object. This includes narrowing `/tmp` to `/tmp/cache`.
+  If the maximum grants no access of the requested kind, adding that access
+  returns `exceeds_max`.
 
 Use the [Policy Schema Reference](/reference/policy-schema) for the full policy
 language. A successful prover result covers only the scope reported in its

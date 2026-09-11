@@ -84,6 +84,68 @@ fn eval_array_len(engine: &mut Engine, input: &Value, rule: &str) -> usize {
 }
 
 #[test]
+fn recursive_path_globs_preserve_zero_directory_grants_and_denies() {
+    let policy = |grant: &str, deny: Option<&str>, endpoint: &str| {
+        json!({
+            "version": 1,
+            "network_policies": {"n": {
+                "binaries": [{"path": "/usr/bin/curl"}],
+                "endpoints": [{
+                    "host": "api.example.com", "ports": [443],
+                    "protocol": "rest", "enforcement": "enforce", "path": endpoint,
+                    "rules": [{"allow": {"method": "GET", "path": grant}}],
+                    "deny_rules": deny.into_iter().map(|path| json!({"method": "GET", "path": path})).collect::<Vec<_>>()
+                }]
+            }}
+        }).to_string()
+    };
+    for (maximum, candidate, within) in [
+        (
+            policy("/**", Some("/a/**/b"), ""),
+            policy("/a/b", None, ""),
+            false,
+        ),
+        (
+            policy("/a/**/b", Some("/a/b"), ""),
+            policy("/a/**/b", None, ""),
+            false,
+        ),
+        (policy("/a/**/b", None, ""), policy("/a/b", None, ""), true),
+        (
+            policy("/**", None, "/a/**/b"),
+            policy("/a/b", None, ""),
+            true,
+        ),
+    ] {
+        let input: Value = serde_json::from_value(json!({
+            "exec": {"path": "/usr/bin/curl", "ancestors": [], "cmdline_paths": []},
+            "network": {"host": "api.example.com", "port": 443},
+            "request": {"method": "GET", "path": "/a/b", "query_params": {}}
+        }))
+        .unwrap();
+        assert!(eval_bool(
+            &mut runtime_engine(&candidate),
+            &input,
+            "data.openshell.sandbox.allow_request"
+        ));
+        assert_eq!(
+            eval_bool(
+                &mut runtime_engine(&maximum),
+                &input,
+                "data.openshell.sandbox.allow_request"
+            ),
+            within
+        );
+        let result = check(&maximum, &candidate);
+        if within {
+            assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
+        } else {
+            assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
+        }
+    }
+}
+
+#[test]
 fn intra_label_host_wildcard_matches_empty_suffix_at_runtime() {
     let maximum = r#"
 version: 1
