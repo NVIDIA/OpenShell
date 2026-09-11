@@ -650,6 +650,7 @@ pub trait ReadyBoundary: Send {
 ///
 /// All interface accessors return owned `Arc`s so a consumer can retain them
 /// past any later state consumption.
+#[async_trait]
 pub trait RunningBoundary: Send + Sync {
     /// The admitted agent process handle.
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
@@ -657,6 +658,11 @@ pub trait RunningBoundary: Send + Sync {
     fn exec(&self) -> Arc<dyn BoundaryExec>;
     /// The loopback connection interface used by port forwarding and service exposure.
     fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
+    /// Permanently terminate the boundary's owned process tree and return only
+    /// after the backend has acknowledged terminal state. A driver may use
+    /// destruction of the outer runtime as fallback proof when this operation
+    /// cannot complete.
+    async fn terminate(&self) -> Result<(), BackendError>;
 }
 
 // ============================================================================
