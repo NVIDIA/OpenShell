@@ -141,10 +141,34 @@ pub async fn handle_refresh_sandbox_token(
         );
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
+    let session_authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("sandbox session minting is not configured"))?;
 
     ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
 
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    let authorization_values = request.metadata().get_all("authorization");
+    let mut authorization_values = authorization_values.iter();
+    let authorization = authorization_values
+        .next()
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
+    if authorization_values.next().is_some() {
+        return Err(Status::unauthenticated("duplicate authorization metadata"));
+    }
+    let gateway_token = authorization
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
+    let gateway_token = openshell_core::jwt::SecretJwt::parse(gateway_token)
+        .map_err(|error| Status::unauthenticated(error.to_string()))?;
+
+    let authentication = state.sandbox_auth_sessions.refresh(
+        &sandbox.sandbox_id,
+        &gateway_token,
+        session_authority,
+    )?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -186,9 +210,27 @@ pub async fn handle_refresh_sandbox_token(
     );
 
     Ok(Response::new(RefreshSandboxTokenResponse {
-        token: minted.token,
-        expires_at_ms: minted.expires_at_ms,
+        token: authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string(),
+        expires_at_ms: authentication
+            .supervisor
+            .gateway_expires_at
+            .saturating_mul(1000),
         extension_credentials,
+        sandbox_token: authentication
+            .supervisor
+            .sandbox_token
+            .expose_secret()
+            .to_string(),
+        sandbox_expires_at_ms: authentication
+            .supervisor
+            .sandbox_expires_at
+            .saturating_mul(1000),
+        session_id: authentication.supervisor.session_id.to_string(),
+        credential_epoch: authentication.supervisor.credential_epoch.get(),
     }))
 }
 
@@ -284,7 +326,7 @@ mod tests {
     use crate::ServerState;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
-    use crate::auth::sandbox_jwt::SandboxJwtIssuer;
+    use crate::auth::sandbox_jwt::{SandboxJwtIssuer, SandboxSessionJwtAuthority};
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
@@ -321,12 +363,34 @@ mod tests {
         // We don't need the authenticator for these tests; only the issuer.
         let issuer = SandboxJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
-            mat.kid,
+            mat.kid.clone(),
             "test-gateway",
             Duration::from_secs(3600),
         )
         .unwrap();
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));
+        let authority = Arc::new(
+            SandboxSessionJwtAuthority::from_pem(
+                mat.signing_key_pem.as_bytes(),
+                mat.public_key_pem.as_bytes(),
+                mat.kid,
+                "test-gateway",
+                Duration::from_secs(3600),
+            )
+            .expect("session authority"),
+        );
+        let authentication = authority
+            .mint_launch(
+                "sandbox-a",
+                openshell_core::SandboxSessionId::new(),
+                openshell_core::jwt::CredentialEpoch::new(1).expect("epoch"),
+            )
+            .expect("launch authentication");
+        state
+            .sandbox_auth_sessions
+            .activate("sandbox-a", &authentication, &authority)
+            .expect("active session");
+        state.sandbox_session_jwt_authority = Some(authority);
         let state = Arc::new(state);
         insert_sandbox(&state, "sandbox-a").await;
         state
@@ -365,6 +429,20 @@ mod tests {
         })
     }
 
+    fn authorize_refresh(state: &ServerState, request: &mut Request<RefreshSandboxTokenRequest>) {
+        let authentication = state
+            .sandbox_auth_sessions
+            .authentication("sandbox-a")
+            .expect("active authentication");
+        let value = format!(
+            "Bearer {}",
+            authentication.supervisor.gateway_token.expose_secret()
+        )
+        .parse()
+        .expect("authorization metadata");
+        request.metadata_mut().insert("authorization", value);
+    }
+
     #[tokio::test]
     async fn current_user_returns_gateway_validated_identity() {
         let mut req = Request::new(GetCurrentUserRequest {});
@@ -396,6 +474,7 @@ mod tests {
             extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+        authorize_refresh(&state, &mut req);
         let resp = handle_refresh_sandbox_token(&state, req)
             .await
             .expect("refresh OK")

@@ -50,6 +50,7 @@ fn test_sandbox() -> DriverSandbox {
             tty: false,
             await_main_process_attachment: false,
             workload_identity: None,
+            launch_authentication: Vec::new(),
         }),
         status: None,
         workspace: String::new(),

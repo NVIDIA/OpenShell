@@ -37,7 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
-use openshell_isolation_interface::contract::{DnsMediationSource, NetworkMediationSource};
+use openshell_isolation_interface::contract::NetworkMediationSource;
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -201,7 +201,6 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
-    dns_mediation_source: Option<Arc<dyn DnsMediationSource>>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -430,7 +429,7 @@ pub async fn run_networking(
         (None, None)
     };
 
-    let mediated_policy_dns = if let Some(source) = dns_mediation_source {
+    let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;

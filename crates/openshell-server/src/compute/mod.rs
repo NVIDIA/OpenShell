@@ -936,6 +936,22 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
+        self.create_sandbox_authenticated(
+            sandbox,
+            sandbox_token,
+            None,
+            await_main_process_attachment,
+        )
+        .await
+    }
+
+    pub async fn create_sandbox_authenticated(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        launch_authentication: Option<Vec<u8>>,
+        await_main_process_attachment: bool,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -998,6 +1014,7 @@ impl ComputeRuntime {
         }
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
+            spec.launch_authentication = launch_authentication.unwrap_or_default();
         }
         match self
             .driver
@@ -1218,10 +1235,21 @@ impl ComputeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_sandbox(
         &self,
         workspace: &str,
         name: &str,
+    ) -> Result<Sandbox, Status> {
+        self.start_sandbox_authenticated(workspace, name, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn start_sandbox_authenticated(
+        &self,
+        workspace: &str,
+        name: &str,
+        launch_authentication: Vec<u8>,
     ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
@@ -1298,6 +1326,7 @@ impl ComputeRuntime {
                         previous,
                         starting,
                         lifecycle_guard,
+                        launch_authentication,
                     )
                     .await
             }
@@ -1318,6 +1347,7 @@ impl ComputeRuntime {
         previous: Sandbox,
         starting: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
+        launch_authentication: Vec<u8>,
     ) -> Result<Sandbox, Status> {
         let result = self
             .driver
@@ -1332,6 +1362,7 @@ impl ComputeRuntime {
                             .start_sandbox(Request::new(StartSandboxRequest {
                                 sandbox_id,
                                 sandbox_name,
+                                launch_authentication,
                             }))
                             .await
                     }
@@ -2305,6 +2336,7 @@ impl ComputeRuntime {
                                 .start_sandbox(Request::new(StartSandboxRequest {
                                     sandbox_id,
                                     sandbox_name,
+                                    launch_authentication: Vec::new(),
                                 }))
                                 .await
                         }
@@ -2477,6 +2509,7 @@ impl ComputeRuntime {
                                     .start_sandbox(Request::new(StartSandboxRequest {
                                         sandbox_id: driver_sandbox_id,
                                         sandbox_name,
+                                        launch_authentication: Vec::new(),
                                     }))
                                     .await
                             },
@@ -3993,6 +4026,7 @@ fn driver_sandbox_spec_from_public(
                 .and_then(|policy| policy.process.as_ref())
                 .map_or_else(String::new, |process| process.run_as_group.clone()),
         }),
+        launch_authentication: Vec::new(),
     })
 }
 

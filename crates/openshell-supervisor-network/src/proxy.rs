@@ -28,7 +28,7 @@ use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderC
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_isolation_interface::contract::{
     BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
-    NetworkMediationSource, NetworkOpenResult, PendingNetworkOpen, ResolveError,
+    NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
 };
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, DispositionId, Endpoint,
@@ -432,7 +432,7 @@ impl ProxyHandle {
                 let accepts = FuturesUnordered::new();
                 for _ in 0..MEDIATION_ACCEPT_WINDOW {
                     let source = source.clone();
-                    accepts.push(async move { source.accept().await }.boxed());
+                    accepts.push(async move { source.accept_tcp().await }.boxed());
                 }
                 accepts
             });
@@ -455,7 +455,7 @@ impl ProxyHandle {
                         pending = accepts.next() => {
                             let pending = pending.expect("accept window is never empty");
                             let source = source.clone();
-                            accepts.push(async move { source.accept().await }.boxed());
+                            accepts.push(async move { source.accept_tcp().await }.boxed());
                             match pending {
                                 Ok(connection) => {
                                     let tx = preauthorized_tx.clone();
@@ -628,20 +628,20 @@ impl ProxyHandle {
 }
 
 async fn preauthorize_transparent_open(
-    connection: PendingNetworkOpen,
+    connection: PendingTcpOpen,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
     opa_engine: &OpaEngine,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
 ) -> Option<AcceptedProxyConnection> {
-    let PendingNetworkOpen {
+    let PendingTcpOpen {
         stream,
         binary_identity,
         destination,
         socket: _,
         policy_generation: _,
         timing,
-        result,
+        decision: completion,
     } = connection;
     let _timing = NetworkOpenTimingGuard {
         timing,
@@ -657,9 +657,7 @@ async fn preauthorize_transparent_open(
                 &error.to_string(),
                 "transparent_tcp_mapping_denied",
             );
-            let _ = result.send(NetworkOpenResult::Denied {
-                errno: libc::EACCES,
-            });
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
         }
     };
@@ -677,9 +675,12 @@ async fn preauthorize_transparent_open(
                 reason,
                 "transparent_tcp_policy_denied",
             );
-            let _ = result.send(NetworkOpenResult::Denied {
-                errno: libc::EACCES,
-            });
+            let denial = if binary_identity.is_err() {
+                TcpOpenDenial::IdentityUnavailable
+            } else {
+                TcpOpenDenial::PolicyDenied
+            };
+            let _ = completion.send(TcpOpenDecision::Denied(denial));
             return None;
         }
         if let Err(denial) =
@@ -692,9 +693,7 @@ async fn preauthorize_transparent_open(
                 &denial.reason,
                 "transparent_tcp_destination_denied",
             );
-            let _ = result.send(NetworkOpenResult::Denied {
-                errno: libc::EACCES,
-            });
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
         }
         if let Some(mapping) = policy_dns_store.and_then(|store| {
@@ -714,9 +713,7 @@ async fn preauthorize_transparent_open(
                     "policy DNS produced an invalid pinned destination",
                     "transparent_tcp_destination_denied",
                 );
-                let _ = result.send(NetworkOpenResult::Denied {
-                    errno: libc::EACCES,
-                });
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
             };
             decision.endpoint.destination = Some(plan);
@@ -743,13 +740,11 @@ async fn preauthorize_transparent_open(
                     &denial.reason,
                     "transparent_tcp_destination_denied",
                 );
-                let _ = result.send(NetworkOpenResult::Denied {
-                    errno: libc::EACCES,
-                });
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
             }
         };
-        if result.send(NetworkOpenResult::RelayReady).is_err() {
+        if completion.send(TcpOpenDecision::RelayReady).is_err() {
             return None;
         }
         return Some((
@@ -762,7 +757,7 @@ async fn preauthorize_transparent_open(
             }),
         ));
     }
-    if result.send(NetworkOpenResult::RelayReady).is_err() {
+    if completion.send(TcpOpenDecision::RelayReady).is_err() {
         return None;
     }
     Some((
@@ -7029,9 +7024,9 @@ process:
         };
         let pending = |destination: &str| {
             let (stream, _peer) = tokio::io::duplex(64);
-            let (result, completion) = tokio::sync::oneshot::channel();
+            let (decision, completion) = tokio::sync::oneshot::channel();
             (
-                PendingNetworkOpen {
+                PendingTcpOpen {
                     stream: Box::new(stream),
                     binary_identity: identity(),
                     destination: destination.parse().unwrap(),
@@ -7042,7 +7037,7 @@ process:
                     },
                     policy_generation: engine.current_generation(),
                     timing: MediationTiming::default(),
-                    result,
+                    decision,
                 },
                 completion,
             )
@@ -7054,7 +7049,7 @@ process:
                 .await
                 .is_some()
         );
-        assert_eq!(allowed_result.await.unwrap(), NetworkOpenResult::RelayReady);
+        assert_eq!(allowed_result.await.unwrap(), TcpOpenDecision::RelayReady);
 
         let (unsafe_destination, unsafe_result) = pending("169.254.169.254:80");
         assert!(
@@ -7064,9 +7059,7 @@ process:
         );
         assert_eq!(
             unsafe_result.await.unwrap(),
-            NetworkOpenResult::Denied {
-                errno: libc::EACCES
-            }
+            TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
         );
 
         let (denied, denied_result) = pending("203.0.113.8:443");
@@ -7077,9 +7070,7 @@ process:
         );
         assert_eq!(
             denied_result.await.unwrap(),
-            NetworkOpenResult::Denied {
-                errno: libc::EACCES
-            }
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
         );
     }
 
@@ -7107,10 +7098,23 @@ process:
 
     #[async_trait::async_trait]
     impl NetworkMediationSource for FailedMediationSource {
-        async fn accept(
+        async fn accept_tcp(
             &self,
         ) -> std::result::Result<
-            PendingNetworkOpen,
+            PendingTcpOpen,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Err(
+                openshell_isolation_interface::contract::BackendError::Unavailable(
+                    "test source unavailable".to_string(),
+                ),
+            )
+        }
+
+        async fn accept_dns(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::PendingDnsQuery,
             openshell_isolation_interface::contract::BackendError,
         > {
             Err(
