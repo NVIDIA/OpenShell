@@ -8,6 +8,7 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::driver_mounts;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
@@ -16,7 +17,6 @@ use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
     tcp_forward_init,
 };
-use openshell_core::{ObjectId, driver_mounts};
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -74,6 +74,7 @@ impl Editor {
 struct SshSessionConfig {
     proxy_command: String,
     sandbox_id: String,
+    sandbox_name: String,
     gateway_url: String,
     token: String,
     main_terminal: bool,
@@ -88,10 +89,10 @@ async fn ssh_session_config(
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
-    // Resolve sandbox name to id.
+    // Resolve the sandbox and retain its ID for local lifecycle tracking.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
+            sandbox_name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
@@ -105,7 +106,8 @@ async fn ssh_session_config(
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox_name: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
@@ -150,7 +152,7 @@ async fn ssh_session_config(
     let proxy_command = build_proxy_command(
         &exe_command,
         &gateway_url,
-        &session.sandbox_id,
+        name,
         &session.token,
         gateway_name,
     );
@@ -158,6 +160,7 @@ async fn ssh_session_config(
     Ok(SshSessionConfig {
         proxy_command,
         sandbox_id: session.sandbox_id.clone(),
+        sandbox_name: name.to_string(),
         gateway_url,
         token: session.token,
         main_terminal: sandbox.spec.as_ref().is_none_or(|spec| spec.tty),
@@ -1425,7 +1428,7 @@ async fn sandbox_sync_down_directory(
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1436,8 +1439,9 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_id: sandbox_id.to_string(),
-                service_id: format!("ssh-proxy:{sandbox_id}"),
+                sandbox_name: sandbox_name.to_string(),
+                workspace_scope: None,
+                service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
             },
@@ -1530,7 +1534,7 @@ pub async fn sandbox_ssh_proxy_by_name(
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
-        &session.sandbox_id,
+        &session.sandbox_name,
         &session.token,
         tls,
     )

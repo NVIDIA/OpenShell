@@ -297,7 +297,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let request = request.into_inner();
         let sandbox = sandbox_with_phase_ws(
-            &request.name,
+            request.sandbox_name.as_str(),
             proto::SandboxPhase::Stopped,
             selected_workspace(&request.workspace_scope).unwrap_or("default"),
         );
@@ -313,7 +313,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let request = request.into_inner();
         let sandbox = sandbox_with_phase_ws(
-            &request.name,
+            request.sandbox_name.as_str(),
             proto::SandboxPhase::Starting,
             selected_workspace(&request.workspace_scope).unwrap_or("default"),
         );
@@ -328,7 +328,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::GetSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = req.name;
+        let name = req.sandbox_name.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
         *self.state.last_get_workspace.lock().await =
             selected_workspace(&req.workspace_scope).map(str::to_string);
@@ -399,7 +399,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::DeleteSandboxRequest>,
     ) -> Result<Response<proto::DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
-        *self.state.last_delete_name.lock().await = Some(req.name);
+        *self.state.last_delete_name.lock().await = Some(req.sandbox_name.clone());
         *self.state.last_delete_workspace.lock().await =
             selected_workspace(&req.workspace_scope).map(str::to_string);
         Ok(Response::new(proto::DeleteSandboxResponse {
@@ -1104,7 +1104,7 @@ async fn stop_and_start_map_requests_and_phases() {
     let stopped = client.stop_sandbox("sleepy").await.unwrap();
     assert_eq!(stopped.phase, SandboxPhase::Stopped);
     let stop = state.last_stop.lock().await.clone().unwrap();
-    assert_eq!(stop.name, "sleepy");
+    assert_eq!(Some(stop.sandbox_name.as_str()), Some("sleepy"));
     assert_eq!(selected_workspace(&stop.workspace_scope), Some("default"));
 
     let started = client
@@ -1114,7 +1114,7 @@ async fn stop_and_start_map_requests_and_phases() {
         .unwrap();
     assert_eq!(started.phase, SandboxPhase::Starting);
     let start = state.last_start.lock().await.clone().unwrap();
-    assert_eq!(start.name, "sleepy");
+    assert_eq!(Some(start.sandbox_name.as_str()), Some("sleepy"));
     assert_eq!(selected_workspace(&start.workspace_scope), Some("team-a"));
 }
 
@@ -1247,7 +1247,7 @@ async fn exec_buffers_stdout_stderr_and_exit() {
     assert_eq!(result.stderr, b"warn\n");
 
     let observed = state.last_exec_request.lock().await.clone().unwrap();
-    assert_eq!(observed.sandbox_id, "id-my-box");
+    assert_eq!(observed.sandbox_name, "my-box");
     assert_eq!(
         observed.command,
         vec!["echo".to_string(), "hello".to_string()]
@@ -1569,7 +1569,7 @@ async fn delete_workspace_returns_ack() {
 }
 
 #[tokio::test]
-async fn sandbox_ref_includes_workspace_field() {
+async fn sandbox_result_includes_workspace_field() {
     let state = Arc::new(MockState {
         phase_sequence: vec![proto::SandboxPhase::Ready],
         ..Default::default()

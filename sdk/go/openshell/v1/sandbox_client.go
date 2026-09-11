@@ -89,7 +89,7 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		Name:           name,
+		SandboxName:    name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -136,7 +136,7 @@ func (s *sandboxClient) list(ctx context.Context, req *pb.ListSandboxesRequest, 
 
 func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {
 	_, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
-		Name:           name,
+		SandboxName:    name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -147,7 +147,7 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
-		Name:           name,
+		SandboxName:    name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -158,7 +158,7 @@ func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sand
 
 func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
-		Name:           name,
+		SandboxName:    name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -169,9 +169,9 @@ func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*San
 
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
-		SandboxName:             sandboxName,
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
+		SandboxName:             sandboxName,
 		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -185,9 +185,9 @@ func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error) {
 	resp, err := s.client.DetachSandboxProvider(ctx, &pb.DetachSandboxProviderRequest{
-		SandboxName:             sandboxName,
 		ProviderName:            providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
+		SandboxName:             sandboxName,
 		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -287,15 +287,14 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 	if len(opts) > 0 {
 		watchOpts = opts[0]
 	}
-
-	sb, err := s.Get(ctx, workspace, name)
-	if err != nil {
+	if _, err := s.Get(ctx, workspace, name); err != nil {
 		return nil, err
 	}
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	stream, err := s.client.WatchSandbox(streamCtx, &pb.WatchSandboxRequest{
-		Id:             sb.ID,
+		SandboxName:    name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		FollowStatus:   true,
 		StopOnTerminal: watchOpts.StopOnTerminal,
 	})
@@ -361,18 +360,16 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 }
 
 func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error) {
-	sb, err := s.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := s.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	cfg := types.ApplyLogOptions(opts)
 	req := &pb.GetSandboxLogsRequest{
-		SandboxId:      sb.ID,
+		SandboxName:    sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		Lines:          cfg.Lines(),
 		Sources:        cfg.Sources(),
 		MinLevel:       cfg.MinLevel(),
-		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if !cfg.Since().IsZero() {
 		req.SinceMs = converter.MillisFromTime(cfg.Since())

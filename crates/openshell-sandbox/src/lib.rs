@@ -209,7 +209,7 @@ pub async fn run_sandbox(
     } else {
         load_policy(
             sandbox_id.clone(),
-            sandbox,
+            sandbox.clone(),
             openshell_endpoint.clone(),
             policy_rules,
             policy_data,
@@ -733,8 +733,9 @@ pub async fn run_sandbox(
 
     // Spawn background policy poll task (gRPC mode only).
     if !process_uses_sidecar_control
-        && let (Some(id), Some(endpoint), Some(engine)) = (
+        && let (Some(id), Some(sandbox_name), Some(endpoint), Some(engine)) = (
             sandbox_id.as_deref(),
+            sandbox.as_deref(),
             openshell_endpoint.as_deref(),
             opa_engine.as_ref(),
         )
@@ -754,6 +755,7 @@ pub async fn run_sandbox(
         let poll_ctx = PolicyPollLoopContext {
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
+            sandbox_name: sandbox_name.to_string(),
             opa_engine: poll_engine,
             loaded_policy_origin,
             entrypoint_pid: poll_pid,
@@ -2368,14 +2370,16 @@ async fn load_policy(
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
-    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    if let (Some(id), Some(sandbox_name), Some(endpoint)) =
+        (&sandbox_id, &sandbox, &openshell_endpoint)
+    {
         info!(
             sandbox_id = %id,
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
         let mut snapshot = grpc_retry("Policy fetch", || {
-            openshell_core::grpc_client::fetch_settings_snapshot(endpoint, id)
+            openshell_core::grpc_client::fetch_settings_snapshot(endpoint, sandbox_name)
         })
         .await?;
 
@@ -2411,7 +2415,6 @@ async fn load_policy(
             snapshot = grpc_retry("Policy discovery sync", || {
                 openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
-                    id,
                     sandbox,
                     &discovered,
                     &ws,
@@ -2438,7 +2441,6 @@ async fn load_policy(
             if let Some(sandbox_name) = sandbox.as_deref() {
                 match openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
-                    id,
                     sandbox_name,
                     &sync_policy,
                     &snapshot.workspace,
@@ -3332,6 +3334,7 @@ async fn report_initial_policy_failure(
 struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
+    sandbox_name: String,
     opa_engine: Arc<OpaEngine>,
     /// Source of the policy currently loaded into OPA. This distinguishes an
     /// explicit local-file override from an unbound gateway revision so the
@@ -3777,7 +3780,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
-    match client.poll_settings(&ctx.sandbox_id).await {
+    match client.poll_settings(&ctx.sandbox_name).await {
         Ok(result) => {
             let _ = ctx.workspace_tx.send(client.workspace());
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
@@ -3844,7 +3847,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             result
         } else {
             tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
-            match client.poll_settings(&ctx.sandbox_id).await {
+            match client.poll_settings(&ctx.sandbox_name).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
                     result
@@ -5076,6 +5079,7 @@ network_policies:
         PolicyPollLoopContext {
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
+            sandbox_name: "sandbox-test".to_string(),
             opa_engine,
             loaded_policy_origin,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),

@@ -3213,13 +3213,6 @@ impl App {
     // Helpers
     // ------------------------------------------------------------------
 
-    /// Get the ID of the currently selected sandbox.
-    pub fn selected_sandbox_id(&self) -> Option<&str> {
-        self.sandbox_ids
-            .get(self.sandbox_selected)
-            .map(String::as_str)
-    }
-
     /// Get the name of the currently selected sandbox.
     pub fn selected_sandbox_name(&self) -> Option<&str> {
         self.sandbox_names

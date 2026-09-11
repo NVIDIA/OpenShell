@@ -314,7 +314,7 @@
 //
 // Read a policy back from revision history:
 //
-//	revisions, err := client.Policy().List(ctx, "default")
+//	revisions, err := client.Policy().List(ctx, "default", "my-sandbox")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -328,7 +328,7 @@
 //
 // List gateway-global policy revisions (no sandbox name or workspace needed):
 //
-//	revisions, err := client.Policy().List(ctx, "", v1.WithListGlobal(true))
+//	revisions, err := client.Policy().List(ctx, "", "", v1.WithListGlobal(true))
 //	if err != nil {
 //	    log.Fatal(err)
 //	}

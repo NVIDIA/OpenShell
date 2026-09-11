@@ -180,13 +180,15 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		return nil, nil
 	}
 	req := &pb.UpdateConfigRequest{
-		Name:                    cu.Name,
 		SettingKey:              cu.SettingKey,
 		SettingValue:            SettingValueToProto(cu.SettingValue),
 		DeleteSetting:           cu.DeleteSetting,
 		Global:                  cu.Global,
 		ExpectedResourceVersion: cu.ExpectedResourceVersion,
 		Annotations:             CopyStringMap(cu.Annotations),
+	}
+	if !cu.Global {
+		req.SandboxName = cu.Name
 	}
 
 	// Convert typed SDK SandboxPolicy to proto SandboxPolicy.

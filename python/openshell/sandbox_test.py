@@ -53,6 +53,10 @@ def _request_selects_all_workspaces(request: Any) -> bool:
     return request.workspace_scope.WhichOneof("selection") == "all_workspaces"
 
 
+def _request_sandbox_name(request: Any) -> str:
+    return cast("str", request.sandbox_name)
+
+
 def _client_credentials_fixture() -> dict[str, Any]:
     return json.loads(
         (
@@ -431,7 +435,12 @@ def test_exec_sends_stdin_payload() -> None:
     stub = _FakeStub()
     client = _client_with_fake_stub(stub)
 
-    result = client.exec("sandbox-1", ["python", "-c", "print('ok')"], stdin=b"payload")
+    result = client.exec(
+        "sandbox-1",
+        ["python", "-c", "print('ok')"],
+        workspace="default",
+        stdin=b"payload",
+    )
 
     assert result.exit_code == 0
     assert stub.request is not None
@@ -445,7 +454,7 @@ def test_exec_python_serializes_callable_payload() -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    result = client.exec_python("sandbox-1", add, args=(2, 3))
+    result = client.exec_python("sandbox-1", add, workspace="default", args=(2, 3))
 
     assert result.exit_code == 0
     assert stub.request is not None
@@ -1993,7 +2002,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox_name(request),
                 workspace=_request_workspace(request) or "default",
             )
         )
@@ -2017,7 +2026,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox_name(request),
                 phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
                 workspace=_request_workspace(request) or "default",
             )
@@ -2033,7 +2042,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
-                request.name,
+                _request_sandbox_name(request),
                 phase=openshell_pb2.SANDBOX_PHASE_STARTING,
                 workspace=_request_workspace(request) or "default",
             )
@@ -2429,13 +2438,13 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
 
     stopped = client.stop("job-1", workspace="team-a")
     assert stub.stop_request is not None
-    assert stub.stop_request.name == "job-1"
+    assert _request_sandbox_name(stub.stop_request) == "job-1"
     assert _request_workspace(stub.stop_request) == "team-a"
     assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
 
     starting = client.start("job-1", workspace="team-a")
     assert stub.start_request is not None
-    assert stub.start_request.name == "job-1"
+    assert _request_sandbox_name(stub.start_request) == "job-1"
     assert _request_workspace(stub.start_request) == "team-a"
     assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
@@ -2460,7 +2469,7 @@ def test_wait_ready_handles_terminal_main_process_results(
             return SimpleNamespace(
                 sandbox=_make_sandbox_proto(
                     "sandbox-1",
-                    request.name,
+                    _request_sandbox_name(request),
                     phase=phase,
                     workspace=_request_workspace(request) or "default",
                 )

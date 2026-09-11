@@ -121,33 +121,76 @@ impl Drop for WatchSandboxStream {
     }
 }
 
-/// Fetch a sandbox by ID and authorize the caller in one step, returning
-/// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
-/// cannot distinguish the two cases (CWE-203).
-pub(super) async fn fetch_and_authorize_sandbox(
+/// Resolve a public sandbox name and authorize its persisted workspace.
+/// Missing and unauthorized objects deliberately share one response so names
+/// cannot be used as an existence oracle.
+pub(super) async fn resolve_and_authorize_sandbox_name(
     state: &Arc<ServerState>,
     principal: &crate::auth::principal::Principal,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
+    min_role: MinWorkspaceRole,
 ) -> Result<Sandbox, Status> {
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if sandbox_name.is_empty() {
+        return Err(Status::invalid_argument("sandbox_name is required"));
+    }
+    let sandbox = match principal {
+        crate::auth::principal::Principal::Sandbox(sandbox_principal) => {
+            let sandbox = state
+                .store
+                .get_message::<Sandbox>(&sandbox_principal.sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+            sandbox.filter(|sandbox| {
+                sandbox.metadata.as_ref().is_some_and(|metadata| {
+                    metadata.name == sandbox_name
+                        && workspace_scope.is_none_or(|scope| {
+                            crate::auth::workspace_authz::selected_workspace_name(Some(scope))
+                                .is_ok_and(|workspace| workspace == sandbox.object_workspace())
+                        })
+                })
+            })
+        }
+        crate::auth::principal::Principal::User(_)
+        | crate::auth::principal::Principal::Anonymous => {
+            let workspace = crate::auth::workspace_authz::selected_workspace_name(workspace_scope)?;
+            state
+                .store
+                .get_message_by_name::<Sandbox>(workspace, sandbox_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        }
+    };
+    let sandbox = match sandbox {
+        Some(sandbox) => sandbox,
+        None if matches!(principal, crate::auth::principal::Principal::Sandbox(_)) => {
+            return Err(Status::permission_denied(
+                "sandbox not found or not owned by caller",
+            ));
+        }
+        None => return Err(Status::not_found("sandbox not found")),
+    };
+
     authorize_sandbox_workspace(
         &state.store,
         &state.admin_role,
         principal,
         sandbox.object_workspace(),
-        MinWorkspaceRole::User,
+        min_role,
     )
     .await
-    .map_err(|e| {
-        if e.code() == tonic::Code::PermissionDenied {
+    .map_err(|error| {
+        if error.code() == tonic::Code::PermissionDenied {
             Status::not_found("sandbox not found")
         } else {
-            e
+            error
+        }
+    })?;
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(|error| {
+        if error.code() == tonic::Code::PermissionDenied {
+            Status::permission_denied("sandbox not found or not owned by caller")
+        } else {
+            error
         }
     })?;
     Ok(sandbox)
@@ -663,28 +706,14 @@ pub(super) async fn handle_get_sandbox(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &req.sandbox_name,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-
-    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -1037,18 +1066,15 @@ pub(super) async fn handle_list_sandbox_providers(
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &req.sandbox_name,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    let sandbox = sandbox_by_name(state, &workspace, &req.sandbox_name).await?;
+    let workspace = sandbox.object_workspace().to_string();
     let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
     Ok(Response::new(ListSandboxProvidersResponse { providers }))
 }
@@ -1059,17 +1085,18 @@ pub(super) async fn handle_attach_sandbox_provider(
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &request.sandbox_name,
         request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .ensure_active()?;
+    let workspace =
+        super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
+            .await?
+            .ensure_active()?;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -1098,7 +1125,7 @@ pub(super) async fn handle_attach_sandbox_provider(
         })?;
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
+    let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -1133,7 +1160,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     {
         candidate_spec.providers.push(request.provider_name.clone());
     }
-    validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
+    validate_sandbox_spec(&sandbox_name, &candidate_spec)?;
     let provider_profile_catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -1190,7 +1217,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached = attached.load(Ordering::Relaxed);
 
     info!(
-        sandbox_name = %request.sandbox_name,
+        sandbox_name = %sandbox_name,
         provider_name = %request.provider_name,
         attached,
         "AttachSandboxProvider request completed successfully"
@@ -1208,17 +1235,15 @@ pub(super) async fn handle_detach_sandbox_provider(
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &request.sandbox_name,
         request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
+    let workspace = sandbox.object_workspace().to_string();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -1233,7 +1258,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     }
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
+    let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -1289,7 +1314,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached = detached.load(Ordering::Relaxed);
 
     info!(
-        sandbox_name = %request.sandbox_name,
+        sandbox_name = %sandbox_name,
         provider_name = %request.provider_name,
         detached,
         "DetachSandboxProvider request completed successfully"
@@ -1324,21 +1349,16 @@ async fn handle_delete_sandbox_inner(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let name = req.name;
-    if name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &req.sandbox_name,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
+    let workspace = sandbox.object_workspace().to_string();
+    let name = sandbox.object_name().to_string();
 
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
@@ -1373,22 +1393,18 @@ async fn handle_stop_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &req.sandbox_name,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
-    info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
+    let workspace = resolved.object_workspace();
+    let name = resolved.object_name();
+    let sandbox = state.compute.stop_sandbox(workspace, name).await?;
+    info!(sandbox_name = %name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -1417,42 +1433,21 @@ async fn handle_start_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-    let authz = authorize_workspace_selector(
-        &state.store,
-        &state.admin_role,
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
         &principal,
+        &req.sandbox_name,
         req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
-    info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
+    let workspace = resolved.object_workspace();
+    let name = resolved.object_name();
+    let sandbox = state.compute.start_sandbox(workspace, name).await?;
+    info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
-}
-
-async fn sandbox_by_name(
-    state: &Arc<ServerState>,
-    workspace: &str,
-    name: &str,
-) -> Result<Sandbox, Status> {
-    if name.is_empty() {
-        return Err(Status::invalid_argument("sandbox_name is required"));
-    }
-
-    state
-        .store
-        .get_message_by_name::<Sandbox>(workspace, name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 async fn providers_for_sandbox(
@@ -1503,12 +1498,15 @@ pub(super) async fn handle_watch_sandbox(
 ) -> Result<Response<WatchSandboxStream>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.id.is_empty() {
-        return Err(Status::invalid_argument("id is required"));
-    }
-    let sandbox_id = req.id.clone();
-
-    let _sandbox = fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.sandbox_name,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let sandbox_id = sandbox.object_id().to_string();
 
     let follow_status = req.follow_status;
     let follow_logs = req.follow_logs;
@@ -1762,9 +1760,6 @@ pub(super) async fn handle_exec_sandbox(
 
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
     if req.command.is_empty() {
         return Err(Status::invalid_argument("command is required"));
     }
@@ -1775,7 +1770,14 @@ pub(super) async fn handle_exec_sandbox(
     }
     validate_exec_request_fields(&req)?;
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.sandbox_name,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1891,7 +1893,14 @@ pub(super) async fn handle_forward_tcp(
 
     let target = validate_tcp_forward_init(&init)?;
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &init.sandbox_name,
+        init.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
 
     // The main process may finish between minting the SSH token and opening
     // its transport. Keep the relay reachable until terminal delivery is
@@ -2049,10 +2058,6 @@ fn decrement_ssh_connection_count(counts: &std::sync::Mutex<HashMap<String, u32>
 }
 
 fn validate_tcp_forward_init(init: &TcpForwardInit) -> Result<relay_open::Target, Status> {
-    if init.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-
     if let Some(target) = init.target.as_ref() {
         return match target {
             tcp_forward_init::Target::Ssh(_) => {
@@ -2184,9 +2189,6 @@ fn validate_interactive_exec_start(
         ));
     };
 
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
     if req.command.is_empty() {
         return Err(Status::invalid_argument("command is required"));
     }
@@ -2216,7 +2218,14 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let req = validate_interactive_exec_start(first_msg)?;
 
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.sandbox_name,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -2294,11 +2303,15 @@ pub(super) async fn handle_create_ssh_session(
 ) -> Result<Response<CreateSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-
-    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let sandbox = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.sandbox_name,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let sandbox_id = sandbox.object_id().to_string();
 
     if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -2322,7 +2335,7 @@ pub(super) async fn handle_create_ssh_session(
             workspace: sandbox.object_workspace().to_string(),
             deletion_timestamp_ms: 0,
         }),
-        sandbox_id: req.sandbox_id.clone(),
+        sandbox_id: sandbox_id.clone(),
         token: token.clone(),
         revoked: false,
         expires_at_ms,
@@ -2363,7 +2376,7 @@ pub(super) async fn handle_create_ssh_session(
     };
 
     Ok(Response::new(CreateSshSessionResponse {
-        sandbox_id: req.sandbox_id,
+        sandbox_id,
         token,
         gateway_host,
         gateway_port: gateway_port.into(),
@@ -3265,7 +3278,8 @@ mod tests {
     fn build_remote_exec_command_basic() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string(), "-la".to_string()],
             ..Default::default()
         };
@@ -3276,7 +3290,8 @@ mod tests {
     fn build_remote_exec_command_with_env_and_workdir() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec![
                 "python".to_string(),
                 "-c".to_string(),
@@ -3296,7 +3311,8 @@ mod tests {
     fn build_remote_exec_command_rejects_null_bytes_in_args() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
         };
@@ -3307,7 +3323,8 @@ mod tests {
     fn build_remote_exec_command_rejects_newlines_in_workdir() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
@@ -3320,7 +3337,8 @@ mod tests {
     fn build_remote_exec_command_accepts_multiline_script() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -3337,7 +3355,8 @@ mod tests {
     fn build_remote_exec_command_multiline_with_single_quotes() {
         use openshell_core::proto::ExecSandboxRequest;
         let req = ExecSandboxRequest {
-            sandbox_id: "test".to_string(),
+            sandbox_name: "test".to_string(),
+            workspace_scope: None,
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -3357,7 +3376,8 @@ mod tests {
     fn tcp_forward_init_allows_loopback_targets() {
         for host in ["127.0.0.1", "::1", "localhost"] {
             let init = TcpForwardInit {
-                sandbox_id: "sbx".to_string(),
+                sandbox_name: "sbx".to_string(),
+                workspace_scope: None,
                 service_id: String::new(),
                 target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                     host: host.to_string(),
@@ -3372,7 +3392,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_allows_ssh_target() {
         let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
+            sandbox_name: "sbx".to_string(),
+            workspace_scope: None,
             target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
             ..Default::default()
         };
@@ -3385,7 +3406,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_rejects_non_loopback_targets() {
         let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
+            sandbox_name: "sbx".to_string(),
+            workspace_scope: None,
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                 host: "example.com".to_string(),
@@ -3404,7 +3426,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_rejects_invalid_port() {
         let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
+            sandbox_name: "sbx".to_string(),
+            workspace_scope: None,
             service_id: String::new(),
             target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
                 host: "127.0.0.1".to_string(),
@@ -3423,7 +3446,8 @@ mod tests {
     #[test]
     fn tcp_forward_init_requires_target() {
         let init = TcpForwardInit {
-            sandbox_id: "sbx".to_string(),
+            sandbox_name: "sbx".to_string(),
+            workspace_scope: None,
             ..Default::default()
         };
         assert_eq!(
@@ -3586,7 +3610,8 @@ mod tests {
             handle_watch_sandbox(
                 &state,
                 authed_request(WatchSandboxRequest {
-                    id: sandbox.object_id().to_string(),
+                    sandbox_name: "watched".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 }),
             )
@@ -3629,7 +3654,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
-                    name: "reused-name".to_string(),
+                    sandbox_name: "reused-name".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -3689,9 +3714,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3730,9 +3755,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3768,9 +3793,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3819,9 +3844,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3844,9 +3869,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3891,9 +3916,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "work-gcp".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -3959,9 +3984,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -4011,7 +4036,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_exec_rejects_missing_sandbox_id() {
+    fn interactive_exec_rejects_missing_sandbox_name() {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
@@ -4021,7 +4046,7 @@ mod tests {
         };
         let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("sandbox_id"));
+        assert!(err.message().contains("sandbox_name"));
     }
 
     #[test]
@@ -4029,7 +4054,8 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_id: "test-id".to_string(),
+                sandbox_name: "test-id".to_string(),
+                workspace_scope: None,
                 ..Default::default()
             })),
         };
@@ -4043,7 +4069,8 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_id: "test-id".to_string(),
+                sandbox_name: "test-id".to_string(),
+                workspace_scope: None,
                 command: vec!["bash".to_string()],
                 environment: std::iter::once(("bad key!".to_string(), "val".to_string())).collect(),
                 ..Default::default()
@@ -4059,7 +4086,8 @@ mod tests {
         use openshell_core::proto::exec_sandbox_input;
         let msg = ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_id: "test-id".to_string(),
+                sandbox_name: "test-id".to_string(),
+                workspace_scope: None,
                 command: vec!["bash".to_string()],
                 tty: true,
                 cols: 120,
@@ -4068,7 +4096,7 @@ mod tests {
             })),
         };
         let req = validate_interactive_exec_start(Some(msg)).unwrap();
-        assert_eq!(req.sandbox_id, "test-id");
+        assert_eq!(req.sandbox_name, "test-id");
         assert_eq!(req.command, vec!["bash"]);
         assert!(req.tty);
         assert_eq!(req.cols, 120);
@@ -4080,14 +4108,15 @@ mod tests {
         let state = test_server_state().await;
 
         let req = ExecSandboxRequest {
-            sandbox_id: "nonexistent".to_string(),
+            sandbox_name: "nonexistent".to_string(),
+            workspace_scope: None,
             command: vec!["bash".to_string()],
             tty: true,
             ..Default::default()
         };
         let sandbox_result = state
             .store
-            .get_message::<Sandbox>(&req.sandbox_id)
+            .get_message_by_name::<Sandbox>("default", &req.sandbox_name)
             .await
             .unwrap();
         assert!(sandbox_result.is_none());
@@ -4583,7 +4612,7 @@ mod tests {
         let fetched = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                name: "annotated".to_string(),
+                sandbox_name: "annotated".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -4647,7 +4676,7 @@ mod tests {
         let fetched_process = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                name: "partial-id".to_string(),
+                sandbox_name: "partial-id".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
@@ -5661,9 +5690,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5708,9 +5737,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5763,9 +5792,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5810,9 +5839,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: long_name,
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5837,9 +5866,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: long_name,
                 expected_resource_version: 0,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -5865,7 +5894,8 @@ mod tests {
             handle_create_ssh_session(
                 &state1,
                 authed_request(CreateSshSessionRequest {
-                    sandbox_id: "sandbox-work".to_string(),
+                    sandbox_name: "work".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
             )
             .await
@@ -5876,7 +5906,8 @@ mod tests {
             handle_create_ssh_session(
                 &state2,
                 authed_request(CreateSshSessionRequest {
-                    sandbox_id: "sandbox-work".to_string(),
+                    sandbox_name: "work".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
             )
             .await
@@ -5929,7 +5960,8 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_id: "sandbox-work".to_string(),
+                sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await;
@@ -5957,7 +5989,8 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_id: "sandbox-work".to_string(),
+                sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -6036,9 +6069,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -6088,9 +6121,9 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -6151,9 +6184,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -6203,9 +6236,9 @@ mod tests {
             &state,
             authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await
@@ -6284,9 +6317,9 @@ mod tests {
                     &state_clone,
                     authed_request(AttachSandboxProviderRequest {
                         sandbox_name: "work".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
-                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     }),
                 )
                 .await
@@ -6369,7 +6402,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                name: "shared-name".to_string(),
+                sandbox_name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6384,7 +6417,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                name: "shared-name".to_string(),
+                sandbox_name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -6459,7 +6492,7 @@ mod tests {
         let got = handle_get_sandbox(
             &state,
             authed_request(GetSandboxRequest {
-                name: "shared-name".to_string(),
+                sandbox_name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -6499,10 +6532,9 @@ mod tests {
         assert_eq!(listed.sandboxes.len(), 2);
     }
 
-    /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when
-    /// calling workspace-scoped sandbox RPCs with a workspace they do not belong
-    /// to.  If `authorize_workspace` ran *after* a store lookup the error code
-    /// would leak whether the workspace name exists (CWE-203 oracle).
+    /// Workspace collection operations reject non-members, while operations on
+    /// a sandbox reference hide both missing and unauthorized sandboxes as
+    /// `NOT_FOUND` to avoid an object-existence oracle.
     #[tokio::test]
     async fn non_member_gets_permission_denied_not_workspace_oracle() {
         use crate::auth::identity::{Identity, IdentityProvider};
@@ -6550,16 +6582,16 @@ mod tests {
         let err = handle_get_sandbox(
             &state,
             non_member_request(GetSandboxRequest {
+                sandbox_name: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
-                name: "any".into(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_get_sandbox should reject non-members with PermissionDenied"
+            Code::NotFound,
+            "handle_get_sandbox should hide unauthorized sandbox existence"
         );
 
         // --- handle_list_sandboxes ---
@@ -6582,22 +6614,23 @@ mod tests {
         let err = handle_list_sandbox_providers(
             &state,
             non_member_request(ListSandboxProvidersRequest {
+                sandbox_name: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
-                ..Default::default()
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_list_sandbox_providers should reject non-members with PermissionDenied"
+            Code::NotFound,
+            "handle_list_sandbox_providers should hide unauthorized sandbox existence"
         );
 
         // --- handle_attach_sandbox_provider ---
         let err = handle_attach_sandbox_provider(
             &state,
             non_member_request(AttachSandboxProviderRequest {
+                sandbox_name: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -6606,14 +6639,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_attach_sandbox_provider should reject non-members with PermissionDenied"
+            Code::NotFound,
+            "handle_attach_sandbox_provider should hide unauthorized sandbox existence"
         );
 
         // --- handle_detach_sandbox_provider ---
         let err = handle_detach_sandbox_provider(
             &state,
             non_member_request(DetachSandboxProviderRequest {
+                sandbox_name: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -6622,8 +6656,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_detach_sandbox_provider should reject non-members with PermissionDenied"
+            Code::NotFound,
+            "handle_detach_sandbox_provider should hide unauthorized sandbox existence"
         );
 
         // --- handle_delete_sandbox ---
@@ -6631,49 +6665,49 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
+                sandbox_name: ("any").to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
-                name: "any".into(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_delete_sandbox should reject non-members with PermissionDenied"
+            Code::NotFound,
+            "handle_delete_sandbox should hide unauthorized sandbox existence"
         );
 
         for result in [
             handle_stop_sandbox(
                 &state,
                 non_member_request(StopSandboxRequest {
+                    sandbox_name: ("any").to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
-                    name: "any".into(),
                 }),
             )
             .await,
             handle_start_sandbox(
                 &state,
                 non_member_request(StartSandboxRequest {
+                    sandbox_name: ("any").to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
-                    name: "any".into(),
                 }),
             )
             .await,
         ] {
             assert_eq!(
                 result.unwrap_err().code(),
-                Code::PermissionDenied,
-                "lifecycle handlers should reject non-members"
+                Code::NotFound,
+                "lifecycle handlers should hide unauthorized sandbox existence"
             );
         }
     }
 
-    /// ID-based data-plane handlers must return `NOT_FOUND` — never
+    /// Name-based data-plane handlers must return `NOT_FOUND` — never
     /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
     /// cross-workspace sandbox existence cannot be inferred (CWE-203).
     #[tokio::test]
-    async fn id_based_handlers_hide_cross_workspace_sandboxes() {
+    async fn name_based_handlers_hide_cross_workspace_sandboxes() {
         use crate::auth::identity::{Identity, IdentityProvider};
         use crate::auth::principal::{Principal, UserPrincipal};
         use tonic::Code;
@@ -6703,7 +6737,8 @@ mod tests {
         let err = handle_watch_sandbox(
             &state,
             non_member_request(WatchSandboxRequest {
-                id: "sandbox-cross-ws".into(),
+                sandbox_name: "cross-ws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("other-workspace")),
                 ..Default::default()
             }),
         )
@@ -6719,7 +6754,8 @@ mod tests {
         let err = handle_create_ssh_session(
             &state,
             non_member_request(CreateSshSessionRequest {
-                sandbox_id: "sandbox-cross-ws".into(),
+                sandbox_name: "cross-ws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("other-workspace")),
             }),
         )
         .await
@@ -6743,7 +6779,8 @@ mod tests {
         let response = handle_create_ssh_session(
             &state,
             authed_request(CreateSshSessionRequest {
-                sandbox_id: "sandbox-ws-test".to_string(),
+                sandbox_name: "ws-test".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )
         .await

@@ -49,7 +49,7 @@ pub fn write_forward_pid(
 /// Find the PID of a backgrounded SSH forward by searching for the matching
 /// SSH process.  Falls back to `pgrep` since SSH `-f` forks a new process
 /// whose PID we cannot capture directly.
-pub fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
+pub fn find_ssh_forward_pid(sandbox_name: &str, port: u16) -> Option<u32> {
     // Use pgrep only as a broad process source. The command line still needs a
     // second exact check before the PID can be tracked or signaled, otherwise a
     // requested port such as 80 can substring-match an existing 8080 forward.
@@ -62,7 +62,7 @@ pub fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
         .lines()
         .rev()
         .filter_map(|l| l.trim().parse::<u32>().ok())
-        .find(|pid| pid_matches_openshell_ssh_forward(*pid, port, Some(sandbox_id)))
+        .find(|pid| pid_matches_openshell_ssh_forward(*pid, port, Some(sandbox_name)))
 }
 
 /// Record read from a forward PID file.
@@ -103,12 +103,12 @@ pub fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Validate that a PID belongs to the expected `OpenShell` SSH forward.
-pub fn pid_matches_openshell_ssh_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> bool {
+pub fn pid_matches_openshell_ssh_forward(pid: u32, port: u16, sandbox_name: Option<&str>) -> bool {
     let Some(argv) = process_forward_match_tokens(pid) else {
         return false;
     };
     let tokens: Vec<&str> = argv.iter().map(String::as_str).collect();
-    args_match_ssh_forward(&tokens, port, sandbox_id)
+    args_match_ssh_forward(&tokens, port, sandbox_name)
 }
 
 /// Read a process command line as matcher tokens.
@@ -210,14 +210,14 @@ struct ProxyCommandMatch {
 }
 
 /// Match an `OpenShell` SSH forward by proxy ownership and outer SSH args.
-fn args_match_ssh_forward(args: &[&str], port: u16, sandbox_id: Option<&str>) -> bool {
+fn args_match_ssh_forward(args: &[&str], port: u16, sandbox_name: Option<&str>) -> bool {
     if args.first().and_then(|arg| arg.rsplit('/').next()) != Some("ssh") {
         return false;
     }
-    let Some(proxy) = find_proxy_command_match(args, sandbox_id) else {
+    let Some(proxy) = find_proxy_command_match(args, sandbox_name) else {
         return false;
     };
-    if sandbox_id.is_some() && !proxy.sandbox_id_requirement_met {
+    if sandbox_name.is_some() && !proxy.sandbox_id_requirement_met {
         return false;
     }
     outer_ssh_forward_matches(
@@ -229,12 +229,15 @@ fn args_match_ssh_forward(args: &[&str], port: u16, sandbox_id: Option<&str>) ->
 
 /// Test-only wrapper for flat command lines.
 #[cfg(test)]
-fn command_matches_ssh_forward(command: &str, port: u16, sandbox_id: Option<&str>) -> bool {
+fn command_matches_ssh_forward(command: &str, port: u16, sandbox_name: Option<&str>) -> bool {
     let args = command.split_whitespace().collect::<Vec<_>>();
-    args_match_ssh_forward(&args, port, sandbox_id)
+    args_match_ssh_forward(&args, port, sandbox_name)
 }
 
-fn find_proxy_command_match(args: &[&str], sandbox_id: Option<&str>) -> Option<ProxyCommandMatch> {
+fn find_proxy_command_match(
+    args: &[&str],
+    sandbox_name: Option<&str>,
+) -> Option<ProxyCommandMatch> {
     for (index, arg) in args.iter().enumerate().skip(1) {
         let Some(prefix_has_no_command) = parse_ssh_prefix_before_proxy(args, index) else {
             continue;
@@ -244,25 +247,25 @@ fn find_proxy_command_match(args: &[&str], sandbox_id: Option<&str>) -> Option<P
         }
 
         let mut current = index + 1;
-        let mut sandbox_id_requirement_met = sandbox_id.is_none();
+        let mut sandbox_name_requirement_met = sandbox_name.is_none();
         while current < args.len() {
             let arg = args[current];
             if is_outer_ssh_option_start(arg) || arg == "sandbox" {
                 return Some(ProxyCommandMatch {
                     outer_ssh_args_start: current,
-                    sandbox_id_requirement_met,
+                    sandbox_id_requirement_met: sandbox_name_requirement_met,
                     prefix_has_no_command,
                 });
             }
 
-            if let Some(value) = arg.strip_prefix("--sandbox-id=") {
-                sandbox_id_requirement_met |= sandbox_id == Some(value);
+            if let Some(value) = arg.strip_prefix("--sandbox-name=") {
+                sandbox_name_requirement_met |= sandbox_name == Some(value);
                 current += 1;
                 continue;
             }
-            if arg == "--sandbox-id" {
+            if arg == "--sandbox-name" {
                 let value = args.get(current + 1)?;
-                sandbox_id_requirement_met |= sandbox_id == Some(*value);
+                sandbox_name_requirement_met |= sandbox_name == Some(*value);
                 current += 2;
                 continue;
             }
@@ -410,14 +413,14 @@ pub fn stop_forward(name: &str, port: u16) -> Result<bool> {
         return Ok(false);
     };
     let pid = record.pid;
-    let Some(sandbox_id) = expected_sandbox_id_from_record(&record) else {
+    let Some(_) = expected_sandbox_id_from_record(&record) else {
         // Legacy PID records do not prove process ownership.
         let _ = std::fs::remove_file(&pid_path);
         return Ok(false);
     };
 
     if pid_is_alive(pid) {
-        if !pid_matches_openshell_ssh_forward(pid, port, Some(sandbox_id)) {
+        if !pid_matches_openshell_ssh_forward(pid, port, Some(name)) {
             let _ = std::fs::remove_file(&pid_path);
             return Ok(false);
         }
@@ -496,11 +499,10 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
             && let Some(record) = read_forward_pid(&stem[..dash_pos], port)
         {
             // Revalidate ownership so PID reuse does not look like a live forward.
-            let validated_alive =
-                expected_sandbox_id_from_record(&record).is_some_and(|sandbox_id| {
-                    pid_is_alive(record.pid)
-                        && pid_matches_openshell_ssh_forward(record.pid, port, Some(sandbox_id))
-                });
+            let validated_alive = expected_sandbox_id_from_record(&record).is_some_and(|_| {
+                pid_is_alive(record.pid)
+                    && pid_matches_openshell_ssh_forward(record.pid, port, Some(&stem[..dash_pos]))
+            });
             forwards.push(ForwardInfo {
                 sandbox_name: stem[..dash_pos].to_string(),
                 port,
@@ -798,20 +800,20 @@ pub fn shell_escape(value: &str) -> String {
 /// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
 ///
 /// Every interpolated argument is shell-escaped so that server-supplied values
-/// (gateway URL, sandbox id, token, gateway name) cannot inject shell
+/// (gateway URL, sandbox name, token, gateway name) cannot inject shell
 /// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
 pub fn build_proxy_command(
     exe: &str,
     gateway_url: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
     token: &str,
     gateway_name: &str,
 ) -> String {
     format!(
-        "{} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
+        "{} ssh-proxy --gateway {} --sandbox-name {} --token {} --gateway-name {}",
         shell_escape(exe),
         shell_escape(gateway_url),
-        shell_escape(sandbox_id),
+        shell_escape(sandbox_name),
         shell_escape(token),
         shell_escape(gateway_name),
     )
@@ -1218,7 +1220,7 @@ mod tests {
         // An empty value must become `''` rather than disappearing — otherwise
         // downstream argv splitting would misalign.
         let cmd = build_proxy_command("exe", "gw", "", "tok", "name");
-        assert!(cmd.contains("--sandbox-id ''"));
+        assert!(cmd.contains("--sandbox-name ''"));
     }
 
     #[test]
@@ -1232,7 +1234,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox-id sb-123 --token tok.456 --gateway-name name_1"
+            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox-name sb-123 --token tok.456 --gateway-name name_1"
         );
     }
 
@@ -1451,8 +1453,8 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_matches_exact_l_argument() {
-        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
-        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L80:127.0.0.1:80 sandbox";
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L80:127.0.0.1:80 sandbox";
 
         assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
         assert!(command_matches_ssh_forward(compact, 80, Some("sbx-1")));
@@ -1460,8 +1462,8 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_matches_bind_prefixed_l_argument() {
-        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:80:127.0.0.1:80 sandbox";
-        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L[::1]:80:127.0.0.1:80 sandbox";
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 127.0.0.1:80:127.0.0.1:80 sandbox";
+        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L[::1]:80:127.0.0.1:80 sandbox";
 
         assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
         assert!(command_matches_ssh_forward(compact, 80, Some("sbx-1")));
@@ -1469,15 +1471,15 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_rejects_substring_port_collision() {
-        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:8080 sandbox";
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:8080 sandbox";
 
         assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
 
     #[test]
     fn ssh_forward_command_requires_matching_sandbox_id() {
-        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 -N -L 80:127.0.0.1:80 sandbox";
-        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-2 -N -L 80:127.0.0.1:80 sandbox";
+        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
         assert!(command_matches_ssh_forward(equals, 80, Some("sbx-1")));
@@ -1486,8 +1488,8 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_rejects_sandbox_id_prefix_collision() {
-        let split = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-10 -N -L 80:127.0.0.1:80 sandbox";
-        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id=sbx-10 -N -L 80:127.0.0.1:80 sandbox";
+        let split = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-10 -N -L 80:127.0.0.1:80 sandbox";
+        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name=sbx-10 -N -L 80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(split, 80, Some("sbx-1")));
         assert!(!command_matches_ssh_forward(equals, 80, Some("sbx-1")));
@@ -1495,9 +1497,9 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_rejects_host_port_ambiguity() {
-        let wrong_remote_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:8080 sandbox";
-        let wrong_local_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:80 sandbox";
-        let wrong_remote_host = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:localhost:80 sandbox";
+        let wrong_remote_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 80:127.0.0.1:8080 sandbox";
+        let wrong_local_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:80 sandbox";
+        let wrong_remote_host = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N -L 80:localhost:80 sandbox";
 
         assert!(!command_matches_ssh_forward(
             wrong_remote_port,
@@ -1518,14 +1520,14 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_matches_path_basenames_and_bind_variants() {
-        let command = "/usr/bin/ssh -o ProxyCommand=/usr/local/bin/ssh-proxy --sandbox-id=sbx-1 -N -L localhost:80:127.0.0.1:80 sandbox";
+        let command = "/usr/bin/ssh -o ProxyCommand=/usr/local/bin/ssh-proxy --sandbox-name=sbx-1 -N -L localhost:80:127.0.0.1:80 sandbox";
 
         assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
 
     #[test]
     fn ssh_forward_command_matches_generated_forward_shape() {
-        let command = "/usr/bin/ssh -N -o ProxyCommand=/path/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id sbx-1 --token tok_123 --gateway-name local -o ExitOnForwardFailure=yes -L 127.0.0.1:80:127.0.0.1:80 -f sandbox";
+        let command = "/usr/bin/ssh -N -o ProxyCommand=/path/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-name sbx-1 --token tok_123 --gateway-name local -o ExitOnForwardFailure=yes -L 127.0.0.1:80:127.0.0.1:80 -f sandbox";
 
         assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
@@ -1548,7 +1550,7 @@ mod tests {
     fn expand_proxy_command_arg_splits_value_and_keeps_prefix() {
         let exe = "/Application Support/openshell";
         let arg = format!(
-            "ProxyCommand={} ssh-proxy --sandbox-id sbx-1",
+            "ProxyCommand={} ssh-proxy --sandbox-name sbx-1",
             shell_escape(exe)
         );
         assert_eq!(
@@ -1556,7 +1558,7 @@ mod tests {
             vec![
                 format!("ProxyCommand={exe}"),
                 "ssh-proxy".to_string(),
-                "--sandbox-id".to_string(),
+                "--sandbox-name".to_string(),
                 "sbx-1".to_string(),
             ]
         );
@@ -1572,7 +1574,7 @@ mod tests {
         // ProxyCommand element and matches correctly.
         let exe = "/Application Support/openshell";
         let proxy_arg = format!(
-            "ProxyCommand={} ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id sbx-1 --token tok_123 --gateway-name local",
+            "ProxyCommand={} ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-name sbx-1 --token tok_123 --gateway-name local",
             shell_escape(exe)
         );
         // Mirror process_forward_match_tokens: the ProxyCommand element is expanded.
@@ -1600,8 +1602,8 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_rejects_proxy_name_collisions() {
-        let wrong_ssh = "notssh ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
-        let wrong_proxy = "ssh -o ProxyCommand=/usr/local/bin/not-ssh-proxy --sandbox-id=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let wrong_ssh = "notssh ssh-proxy --sandbox-name sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let wrong_proxy = "ssh -o ProxyCommand=/usr/local/bin/not-ssh-proxy --sandbox-name=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(wrong_ssh, 80, Some("sbx-1")));
         assert!(!command_matches_ssh_forward(wrong_proxy, 80, Some("sbx-1")));
@@ -1609,24 +1611,25 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_rejects_non_ssh_process_with_matching_tokens() {
-        let command = "python3 /tmp/ssh ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let command =
+            "python3 /tmp/ssh ssh-proxy --sandbox-name sbx-1 -N -L 80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
 
     #[test]
     fn ssh_forward_command_rejects_bare_ssh_proxy_destination() {
-        let command = "ssh ssh-proxy --sandbox-id sbx-1 -N -L80:127.0.0.1:80 sandbox";
+        let command = "ssh ssh-proxy --sandbox-name sbx-1 -N -L80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
 
     #[test]
     fn ssh_forward_command_rejects_remote_command_l_argument() {
-        let remote_arg = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N sandbox -L 80:127.0.0.1:80";
-        let missing_no_command = "ssh ssh-proxy --sandbox-id sbx-1 -L 80:127.0.0.1:80 sandbox";
-        let remote_command_lookalike = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 real-host echo -N -L 80:127.0.0.1:80 sandbox";
-        let sandbox_id_in_remote_command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 real-host --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let remote_arg = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 -N sandbox -L 80:127.0.0.1:80";
+        let missing_no_command = "ssh ssh-proxy --sandbox-name sbx-1 -L 80:127.0.0.1:80 sandbox";
+        let remote_command_lookalike = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-1 real-host echo -N -L 80:127.0.0.1:80 sandbox";
+        let sandbox_id_in_remote_command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-name sbx-2 real-host --sandbox-name sbx-1 -N -L 80:127.0.0.1:80 sandbox";
 
         assert!(!command_matches_ssh_forward(remote_arg, 80, Some("sbx-1")));
         assert!(!command_matches_ssh_forward(

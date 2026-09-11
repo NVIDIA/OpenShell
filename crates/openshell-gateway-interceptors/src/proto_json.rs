@@ -454,12 +454,12 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = UpdateConfigRequest {
-            name: "demo".to_string(),
+            sandbox_name: "demo".to_string(),
+            workspace_scope: Some(workspace_selector("default")),
             annotations: HashMap::from([(
                 "openshell.nvidia.com/policy-signature".to_string(),
                 "signed".to_string(),
             )]),
-            workspace_scope: Some(workspace_selector("default")),
             ..Default::default()
         };
         let bytes = request.encode_to_vec();

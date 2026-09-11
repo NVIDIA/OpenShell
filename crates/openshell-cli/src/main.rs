@@ -644,7 +644,7 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `openshell ssh-proxy --gateway <url> --sandbox-name <name> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
     ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
@@ -655,9 +655,9 @@ enum Commands {
         #[arg(long, short = 'g')]
         gateway: Option<String>,
 
-        /// Sandbox id. Required in token mode.
+        /// Sandbox name. Required in token mode.
         #[arg(long)]
-        sandbox_id: Option<String>,
+        sandbox_name: Option<String>,
 
         /// SSH session token. Required in token mode.
         #[arg(long)]
@@ -2137,7 +2137,7 @@ enum ServiceCommands {
         offset: u32,
 
         /// List services across all workspaces (overrides --workspace).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sandbox")]
         all_workspaces: bool,
 
         /// Output format.
@@ -3778,15 +3778,15 @@ async fn run_async() -> Result<()> {
         }
         Some(Commands::SshProxy {
             gateway,
-            sandbox_id,
+            sandbox_name,
             token,
             server,
             gateway_name,
             name,
         }) => {
-            match (gateway, sandbox_id, token, server, gateway_name, name) {
+            match (gateway, sandbox_name, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, gateway_name_opt, _) => {
+                (Some(gw), Some(sandbox_name), Some(tok), _, gateway_name_opt, _) => {
                     let mut effective_tls = match gateway_name_opt {
                         Some(ref g) => tls.with_gateway_name(g),
                         None => tls,
@@ -3794,7 +3794,7 @@ async fn run_async() -> Result<()> {
                     if let Some(ref g) = gateway_name_opt {
                         apply_auth(&mut effective_tls, g)?;
                     }
-                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
+                    run::sandbox_ssh_proxy(&gw, &sandbox_name, &tok, &effective_tls).await?;
                 }
                 // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(g), Some(n)) => {
@@ -3820,7 +3820,7 @@ async fn run_async() -> Result<()> {
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-id/--token or --gateway-name/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox-name/--token or --gateway-name/--name (or --server/--name)"
                     ));
                 }
             }
@@ -4470,8 +4470,8 @@ mod tests {
             "ssh-proxy",
             "--gateway",
             "https://gw.example.com:8080/proxy/connect",
-            "--sandbox-id",
-            "sbx-123",
+            "--sandbox-name",
+            "my-box",
             "--token",
             "tok-abc",
             "--gateway-name",
@@ -4482,7 +4482,7 @@ mod tests {
         match cli.command {
             Some(Commands::SshProxy {
                 gateway,
-                sandbox_id,
+                sandbox_name,
                 token,
                 gateway_name,
                 ..
@@ -4492,7 +4492,7 @@ mod tests {
                     Some("https://gw.example.com:8080/proxy/connect"),
                     "gateway URL must land in SshProxy.gateway, not the global flag"
                 );
-                assert_eq!(sandbox_id.as_deref(), Some("sbx-123"));
+                assert_eq!(sandbox_name.as_deref(), Some("my-box"));
                 assert_eq!(token.as_deref(), Some("tok-abc"));
                 assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
             }
@@ -6057,6 +6057,19 @@ mod tests {
             }
             other => panic!("expected service list command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_list_rejects_sandbox_with_all_workspaces() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "list",
+            "my-sandbox",
+            "--all-workspaces",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

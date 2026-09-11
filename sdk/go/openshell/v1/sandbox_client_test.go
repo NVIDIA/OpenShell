@@ -82,9 +82,10 @@ func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequ
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetSandboxName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	cloned := proto.Clone(sb).(*pb.Sandbox)
 	return &pb.SandboxResponse{Sandbox: cloned}, nil
@@ -117,20 +118,22 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
-	_, ok := s.sandboxes[req.GetName()]
+	name := req.GetSandboxName()
+	_, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
-	delete(s.sandboxes, req.GetName())
+	delete(s.sandboxes, name)
 	return &pb.DeleteSandboxResponse{Deleted: true}, nil
 }
 
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetSandboxName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
@@ -139,9 +142,10 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sb, ok := s.sandboxes[req.GetName()]
+	name := req.GetSandboxName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
 	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
@@ -153,9 +157,10 @@ func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.Att
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
-	sb, ok := s.sandboxes[req.GetSandboxName()]
+	name := req.GetSandboxName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetSandboxName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	sb.Spec.Providers = append(sb.Spec.Providers, req.GetProviderName())
 	return &pb.AttachSandboxProviderResponse{Sandbox: sb, Attached: true}, nil
@@ -167,9 +172,10 @@ func (s *mockSandboxServer) DetachSandboxProvider(_ context.Context, req *pb.Det
 	if s.detachErr != nil {
 		return nil, s.detachErr
 	}
-	sb, ok := s.sandboxes[req.GetSandboxName()]
+	name := req.GetSandboxName()
+	sb, ok := s.sandboxes[name]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetSandboxName())
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
 	return &pb.DetachSandboxProviderResponse{Sandbox: sb, Detached: true}, nil
 }
@@ -924,7 +930,7 @@ func TestSandboxWatch_MidStreamErrorDeliveredAsStatusError(t *testing.T) {
 
 // --- T016: Watch name-to-ID resolution verification tests ---
 
-func TestSandboxWatch_ResolvesNameToID(t *testing.T) {
+func TestSandboxWatch_UsesName(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["my-sandbox"] = &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{Id: "resolved-id-123", Name: "my-sandbox"},
@@ -945,12 +951,12 @@ func TestSandboxWatch_ResolvesNameToID(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	// Verify the WatchSandboxRequest.Id contains the resolved ID, not the name
+	// Verify the WatchSandboxRequest reference contains the resolved ID, not the name.
 	mock.mu.Lock()
 	req := mock.watchRequest
 	mock.mu.Unlock()
 	require.NotNil(t, req)
-	assert.Equal(t, "resolved-id-123", req.GetId(), "Watch should send resolved sandbox ID, not the name")
+	assert.Equal(t, "my-sandbox", req.GetSandboxName())
 }
 
 func TestSandboxWatch_ResolutionError(t *testing.T) {
@@ -1161,7 +1167,7 @@ func TestSandboxGetLogs(t *testing.T) {
 
 	// Verify name→id resolution: the proto request should contain the sandbox ID
 	mock.mu.Lock()
-	assert.Equal(t, "sb-id-123", mock.getLogsRequest.GetSandboxId())
+	assert.Equal(t, "log-sb", mock.getLogsRequest.GetSandboxName())
 	mock.mu.Unlock()
 }
 
@@ -1195,7 +1201,7 @@ func TestSandboxGetLogs_WithOptions(t *testing.T) {
 	mock.mu.Lock()
 	req := mock.getLogsRequest
 	mock.mu.Unlock()
-	assert.Equal(t, "sb-id-opts", req.GetSandboxId())
+	assert.Equal(t, "opts-sb", req.GetSandboxName())
 	assert.Equal(t, uint32(50), req.GetLines())
 	assert.Equal(t, since.UnixMilli(), req.GetSinceMs())
 	assert.Equal(t, []string{"gateway", "sandbox"}, req.GetSources())

@@ -117,7 +117,7 @@ func TestExecRequestToProto(t *testing.T) {
 	})
 
 	require.NotNil(t, req)
-	assert.Equal(t, "sb-1", req.SandboxId)
+	assert.Equal(t, "sb-1", req.GetSandboxName())
 	assert.Equal(t, []string{"ls", "-la"}, req.Command)
 	assert.Equal(t, "/home/user", req.Workdir)
 	assert.Equal(t, map[string]string{"FOO": "bar"}, req.Environment)
@@ -128,7 +128,7 @@ func TestExecRequestToProto_NilOptions(t *testing.T) {
 	req := ExecRequestToProto("sb-2", []string{"echo", "hi"}, nil)
 
 	require.NotNil(t, req)
-	assert.Equal(t, "sb-2", req.SandboxId)
+	assert.Equal(t, "sb-2", req.GetSandboxName())
 	assert.Equal(t, []string{"echo", "hi"}, req.Command)
 	assert.Empty(t, req.Workdir)
 	assert.Nil(t, req.Environment)
@@ -141,7 +141,7 @@ func TestExecRequestToProto_Interactive(t *testing.T) {
 	})
 
 	require.NotNil(t, req)
-	assert.Equal(t, "sb-3", req.SandboxId)
+	assert.Equal(t, "sb-3", req.GetSandboxName())
 	assert.Equal(t, []string{"/bin/bash"}, req.Command)
 	assert.Equal(t, "/root", req.Workdir)
 	assert.Equal(t, map[string]string{"TERM": "xterm"}, req.Environment)
