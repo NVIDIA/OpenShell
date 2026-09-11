@@ -438,22 +438,30 @@ impl MxcComputeBackend {
 
         Ok(())
     }
-    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), tonic::Status> {
-        let (sandbox_id, lifecycle_gate) = {
+    pub async fn stop_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<(), tonic::Status> {
+        let lifecycle_gate = {
             let registry = self.registry.lock().await;
-            let entry = registry
-                .values()
-                .find(|entry| entry.sandbox.name == sandbox_name)
-                .ok_or_else(|| {
-                    tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
-                })?;
-            (entry.sandbox.id.clone(), entry.lifecycle_gate.clone())
+            let entry = registry.get(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+
+            if entry.sandbox.name != sandbox_name {
+                return Err(tonic::Status::failed_precondition(
+                    "sandbox_id did not match sandbox_name",
+                ));
+            }
+
+            entry.lifecycle_gate.clone()
         };
 
         let _lifecycle_guard = lifecycle_gate.lock().await;
         let (iso_id, mut isolation_stopped, cancel, monitor_task) = {
             let mut registry = self.registry.lock().await;
-            let entry = registry.get_mut(&sandbox_id).ok_or_else(|| {
+            let entry = registry.get_mut(sandbox_id).ok_or_else(|| {
                 tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
             })?;
             (
@@ -481,7 +489,7 @@ impl MxcComputeBackend {
         }
 
         let mut registry = self.registry.lock().await;
-        if let Some(entry) = registry.get_mut(&sandbox_id) {
+        if let Some(entry) = registry.get_mut(sandbox_id) {
             entry.isolation_stopped = isolation_stopped;
             entry.phase_state = PhaseState::Stopped;
             entry.sandbox = make_sandbox_with_condition(
@@ -931,6 +939,19 @@ mod lifecycle_tests {
             status: None,
         }
     }
+
+    fn driver_sandbox_named(
+        id: &str,
+        name: &str,
+        workspace: &str,
+        command: Vec<String>,
+    ) -> DriverSandbox {
+        let mut sandbox = driver_sandbox_with_command(id, "", command);
+        sandbox.name = name.to_string();
+        sandbox.workspace = workspace.to_string();
+        sandbox
+    }
+
     fn fs_policy(read_write: &[&str]) -> SandboxPolicy {
         SandboxPolicy {
             filesystem: Some(FilesystemPolicy {
@@ -967,6 +988,38 @@ mod lifecycle_tests {
     {
         for _ in 0..100 {
             if let Some(sandbox) = backend.get_sandbox(name).await
+                && pred(&sandbox)
+            {
+                return Some(sandbox);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    /// Look a sandbox up by its stable id.
+    ///
+    /// `get_sandbox` resolves by name, so it cannot address an individual entry
+    /// once two sandboxes in different workspaces share one.
+    async fn sandbox_by_id(backend: &MxcComputeBackend, id: &str) -> Option<DriverSandbox> {
+        backend
+            .list_sandboxes()
+            .await
+            .into_iter()
+            .find(|sandbox| sandbox.id == id)
+    }
+
+    /// Poll a specific sandbox id until the predicate matches or the deadline hits.
+    async fn wait_for_id<F>(
+        backend: &MxcComputeBackend,
+        id: &str,
+        mut pred: F,
+    ) -> Option<DriverSandbox>
+    where
+        F: FnMut(&DriverSandbox) -> bool,
+    {
+        for _ in 0..100 {
+            if let Some(sandbox) = sandbox_by_id(backend, id).await
                 && pred(&sandbox)
             {
                 return Some(sandbox);
@@ -1209,12 +1262,126 @@ mod lifecycle_tests {
         let running = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&running).unwrap().reason, "AgentRunning");
 
-        tokio::time::timeout(Duration::from_secs(5), backend.stop_sandbox("sb-stop"))
-            .await
-            .expect("stop should not wait for the child sleep")
-            .expect("stop should terminate and reap the child");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.stop_sandbox("sb-stop", "sb-stop"),
+        )
+        .await
+        .expect("stop should not wait for the child sleep")
+        .expect("stop should terminate and reap the child");
         let stopped = backend.get_sandbox("sb-stop").await.unwrap();
         assert_eq!(ready_condition(&stopped).unwrap().reason, "Stopped");
+    }
+
+    #[tokio::test]
+    async fn stop_targets_the_requested_id_when_two_workspaces_share_a_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let sleeper = || {
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("$null = '{share}'; Start-Sleep -Seconds 60"),
+            ]
+        };
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+
+        // Sandbox names are unique per workspace, not globally, so "demo" is a
+        // legal name in both. The driver registry is one flat map keyed by id and
+        // holds both entries at once.
+        for (id, workspace) in [("sb-alpha", "alpha"), ("sb-beta", "beta")] {
+            let sandbox = with_policy(
+                driver_sandbox_named(id, "demo", workspace, sleeper()),
+                fs_policy(&[&share]),
+            );
+            backend
+                .create_sandbox(&sandbox)
+                .await
+                .expect("create accepted");
+        }
+        for id in ["sb-alpha", "sb-beta"] {
+            wait_for_id(&backend, id, |sandbox| {
+                ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+            })
+            .await
+            .unwrap_or_else(|| panic!("{id} should start"));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.stop_sandbox("sb-beta", "demo"),
+        )
+        .await
+        .expect("stop should not wait for the child sleep")
+        .expect("stop should terminate the requested sandbox");
+
+        let beta = sandbox_by_id(&backend, "sb-beta")
+            .await
+            .expect("sb-beta should still be registered");
+        assert_eq!(
+            ready_condition(&beta).unwrap().reason,
+            "Stopped",
+            "the sandbox named by sandbox_id should be stopped"
+        );
+
+        // The load-bearing assertion. Resolving by name alone picks whichever
+        // entry the registry's hash order yields first, so a name-based lookup
+        // fails this intermittently rather than every run.
+        let alpha = sandbox_by_id(&backend, "sb-alpha")
+            .await
+            .expect("sb-alpha should still be registered");
+        assert_eq!(
+            ready_condition(&alpha).unwrap().reason,
+            "AgentRunning",
+            "a same-named sandbox in another workspace must keep running"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_a_sandbox_id_that_does_not_match_the_sandbox_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = with_policy(
+            driver_sandbox_named(
+                "sb-alpha",
+                "demo",
+                "alpha",
+                vec!["cmd".into(), "/c".into(), "exit 0".into()],
+            ),
+            fs_policy(&[&share]),
+        );
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+
+        let status = backend
+            .stop_sandbox("sb-alpha", "some-other-name")
+            .await
+            .expect_err("a mismatched name must not stop the sandbox");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let alpha = sandbox_by_id(&backend, "sb-alpha")
+            .await
+            .expect("sb-alpha should still be registered");
+        assert_ne!(
+            ready_condition(&alpha).map(|condition| condition.reason),
+            Some("Stopped".into()),
+            "a rejected stop must not mutate the sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_reports_not_found_for_an_unknown_sandbox_id() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let status = backend
+            .stop_sandbox("sb-missing", "demo")
+            .await
+            .expect_err("an unknown id must not fall back to a name match");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
