@@ -251,6 +251,8 @@ namespace roots. These checks do not make host bind mounts safe.
 
 The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. When `socket_path` is not set, the driver probes known socket paths, then uses the `podman` CLI to resolve the active native or machine-backed connection. It fails to start if neither method finds a socket.
 
+The agent workload uses `network=none`. Its trusted supervisor companion uses Podman's host network for gateway callbacks and policy-approved upstream connections.
+
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
