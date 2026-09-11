@@ -291,6 +291,7 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
+        self.client.start_credential_monitor();
         ConfirmedBoundary::try_new(
             Box::new(RemoteReady {
                 client: self.client,
@@ -936,8 +937,17 @@ async fn dispatch_client_mediation_frame(
 struct BoundaryClient {
     topology: BoundaryTopology,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
-    grpc_channel: tokio::sync::Mutex<Option<tonic::transport::Channel>>,
+    grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
+    attach_request: std::sync::Mutex<Option<RequestEnvelope>>,
+    confirm_request: std::sync::Mutex<Option<RequestEnvelope>>,
+    reconnect: tokio::sync::Mutex<()>,
+    credential_monitor_started: AtomicBool,
+}
+
+struct CachedGrpcChannel {
+    credential_epoch: openshell_core::jwt::CredentialEpoch,
+    channel: tonic::transport::Channel,
 }
 
 impl BoundaryClient {
@@ -950,15 +960,37 @@ impl BoundaryClient {
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
+            attach_request: std::sync::Mutex::new(None),
+            confirm_request: std::sync::Mutex::new(None),
+            reconnect: tokio::sync::Mutex::new(()),
+            credential_monitor_started: AtomicBool::new(false),
         }
     }
 
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
+        let remember_attach = matches!(request, Request::Attach { .. });
+        let remember_confirm = matches!(request, Request::Confirm);
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
                 match self.exchange_envelope(&envelope).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        if remember_attach {
+                            *self
+                                .attach_request
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(envelope.clone());
+                        }
+                        if remember_confirm {
+                            *self
+                                .confirm_request
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(envelope.clone());
+                        }
+                        return Ok(response);
+                    }
                     Err(BackendError::Unavailable(_)) => {
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
@@ -1103,8 +1135,116 @@ impl BoundaryClient {
         &self,
         kind: GrpcStreamKind,
     ) -> Result<BoundaryDuplexStream, BackendError> {
+        self.ensure_current_credential_connection().await?;
         let channel = self.grpc_channel().await?;
         open_grpc_client_stream(channel, kind, &self.sandbox_bearer).await
+    }
+
+    async fn ensure_current_credential_connection(&self) -> Result<(), BackendError> {
+        let credential_epoch = self.sandbox_bearer.credential_epoch().ok_or_else(|| {
+            BackendError::Unavailable("Sandbox Protocol credential unavailable".to_string())
+        })?;
+        if self
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|cached| cached.credential_epoch == credential_epoch)
+        {
+            return Ok(());
+        }
+
+        let _reconnect = self.reconnect.lock().await;
+        if self
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cached| cached.credential_epoch == credential_epoch)
+        {
+            return Ok(());
+        }
+        let attach = self
+            .attach_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                BackendError::Unavailable(
+                    "cannot rotate Sandbox Protocol connection before attach".to_string(),
+                )
+            })?;
+        let confirm = self
+            .confirm_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                BackendError::Unavailable(
+                    "cannot rotate Sandbox Protocol connection before confirmation".to_string(),
+                )
+            })?;
+        let channel = self.build_grpc_channel().await?;
+        self.exchange_on_channel(channel.clone(), &attach).await?;
+        self.exchange_on_channel(channel.clone(), &confirm).await?;
+        *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            credential_epoch,
+            channel,
+        });
+        *self.mediation.lock().await = None;
+        Ok(())
+    }
+
+    fn start_credential_monitor(self: &Arc<Self>) {
+        if self.credential_monitor_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                if let Err(error) = client.ensure_current_credential_connection().await {
+                    tracing::warn!(%error, "failed to rotate Sandbox Protocol connection");
+                }
+            }
+        });
+    }
+
+    async fn exchange_on_channel(
+        &self,
+        channel: tonic::transport::Channel,
+        envelope: &RequestEnvelope,
+    ) -> Result<Response, BackendError> {
+        let request_id = envelope.request_id.clone();
+        let mut stream =
+            open_grpc_client_stream(channel, GrpcStreamKind::Exchange, &self.sandbox_bearer)
+                .await?;
+        let frame = encode_frame(envelope)
+            .map_err(|error| BackendError::Process(format!("encode control request: {error}")))?;
+        stream.write_all(&frame).await.map_err(|error| {
+            BackendError::Unavailable(format!("write boundary control request: {error}"))
+        })?;
+        stream.flush().await.map_err(|error| {
+            BackendError::Unavailable(format!("flush boundary control request: {error}"))
+        })?;
+        let response =
+            crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
+                .await
+                .map_err(|error| {
+                    BackendError::Unavailable(format!("read boundary control response: {error}"))
+                })?;
+        if response.request_id != request_id {
+            return Err(BackendError::Process(
+                "boundary response ID did not match request ID".to_string(),
+            ));
+        }
+        match response.response {
+            Response::Error { kind, message } => Err(guest_error(kind, message)),
+            response => Ok(response),
+        }
     }
 
     async fn mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
@@ -1158,9 +1298,21 @@ impl BoundaryClient {
 
     async fn grpc_channel(&self) -> Result<tonic::transport::Channel, BackendError> {
         let mut state = self.grpc_channel.lock().await;
-        if let Some(channel) = state.as_ref() {
-            return Ok(channel.clone());
+        if let Some(cached) = state.as_ref() {
+            return Ok(cached.channel.clone());
         }
+        let credential_epoch = self.sandbox_bearer.credential_epoch().ok_or_else(|| {
+            BackendError::Unavailable("Sandbox Protocol credential unavailable".to_string())
+        })?;
+        let channel = self.build_grpc_channel().await?;
+        *state = Some(CachedGrpcChannel {
+            credential_epoch,
+            channel: channel.clone(),
+        });
+        Ok(channel)
+    }
+
+    async fn build_grpc_channel(&self) -> Result<tonic::transport::Channel, BackendError> {
         let topology = self.topology.clone();
         let endpoint =
             tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
@@ -1182,7 +1334,6 @@ impl BoundaryClient {
             .map_err(|error| {
                 BackendError::Unavailable(format!("start boundary gRPC channel: {error}"))
             })?;
-        *state = Some(channel.clone());
         Ok(channel)
     }
 
@@ -1634,7 +1785,10 @@ mod tests {
             tls_topology(address, test_certificate().client_tls),
             test_bearer(&"a".repeat(32)),
         );
-        *client.grpc_channel.lock().await = Some(channel);
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
+            channel,
+        });
         // A caller may try again later, but each call makes exactly one
         // bounded attach attempt and preserves the server's typed denial.
         for expected_requests in 1..=2 {
@@ -1795,8 +1949,12 @@ mod tests {
     }
 
     fn test_bearer(token: &str) -> SessionBearerTokenSlot {
-        SessionBearerTokenSlot::new(SecretJwt::parse(token).expect("test bearer"), i64::MAX)
-            .expect("test bearer slot")
+        SessionBearerTokenSlot::new(
+            SecretJwt::parse(token).expect("test bearer"),
+            i64::MAX,
+            openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
+        )
+        .expect("test bearer slot")
     }
 
     async fn spawn_tls_boundary(

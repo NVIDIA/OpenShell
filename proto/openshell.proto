@@ -785,6 +785,14 @@ message RefreshSandboxTokenResponse {
   // Fresh credentials for the requested, policy-authorized extension
   // services. These remain in supervisor memory and are never persisted.
   repeated ExtensionServiceCredential extension_credentials = 3;
+  // Fresh Sandbox Protocol bearer token from the same atomic refresh.
+  string sandbox_token = 4 [(openshell.options.v1.secret) = true];
+  // Absolute Sandbox Protocol token expiry, milliseconds since the epoch.
+  int64 sandbox_expires_at_ms = 5;
+  // Launch generation to which both refreshed credentials are bound.
+  string session_id = 6;
+  // Monotonic Sandbox Protocol connection replacement order.
+  uint64 credential_epoch = 7;
 }
 
 

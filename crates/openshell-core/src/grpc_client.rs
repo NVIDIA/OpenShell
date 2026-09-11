@@ -70,6 +70,9 @@ static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 
+#[cfg(feature = "jwt")]
+static SANDBOX_BEARER_SLOT: OnceLock<crate::jwt::SessionBearerTokenSlot> = OnceLock::new();
+
 #[derive(Clone, Debug)]
 enum RefreshMode {
     GatewayJwt(TokenSource),
@@ -92,6 +95,22 @@ fn install_token_slot(token: &str) -> Result<TokenSlot> {
     let slot: TokenSlot = Arc::new(RwLock::new(bearer));
     let _ = TOKEN_SLOT.set(slot.clone());
     Ok(TOKEN_SLOT.get().cloned().unwrap_or(slot))
+}
+
+/// Install the gateway-session credential supplied in trusted supervisor
+/// launch state before any gateway client is constructed.
+#[cfg(feature = "jwt")]
+pub fn install_supervisor_auth_bundle(
+    bundle: &crate::jwt::SupervisorAuthBundle,
+) -> Result<crate::jwt::SessionBearerTokenSlot> {
+    install_token_slot(bundle.gateway_token.expose_secret())?;
+    let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::File));
+    let slot = bundle
+        .sandbox_bearer_slot()
+        .into_diagnostic()
+        .wrap_err("invalid Sandbox Protocol credential")?;
+    let _ = SANDBOX_BEARER_SLOT.set(slot.clone());
+    Ok(SANDBOX_BEARER_SLOT.get().cloned().unwrap_or(slot))
 }
 
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
@@ -360,7 +379,8 @@ async fn refresh_token_loop(
             .await
         {
             Ok(resp) => {
-                let new_token = resp.into_inner().token;
+                let response = resp.into_inner();
+                let new_token = response.token;
                 match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
                     Ok(value) => {
                         if let Ok(mut guard) = slot.write() {
@@ -369,6 +389,18 @@ async fn refresh_token_loop(
                         }
                     }
                     Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
+                }
+                #[cfg(feature = "jwt")]
+                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+                    let update =
+                        crate::jwt::SecretJwt::parse(response.sandbox_token).and_then(|token| {
+                            let epoch =
+                                crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
+                            sandbox_slot.update(token, response.sandbox_expires_at_ms / 1000, epoch)
+                        });
+                    if let Err(error) = update {
+                        warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
+                    }
                 }
             }
             Err(status) => {
@@ -467,6 +499,23 @@ async fn refresh_extension_credentials_with_client(
     // is a superset of what the dedicated renewal loop would do, so letting it
     // land early is harmless.
     install_token_slot(&response.token)?;
+    #[cfg(feature = "jwt")]
+    if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+        let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid Sandbox Protocol token")?;
+        let epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid Sandbox Protocol credential epoch")?;
+        match sandbox_slot.update(token, response.sandbox_expires_at_ms / 1000, epoch) {
+            Ok(()) | Err(crate::jwt::SessionJwtError::StaleCredentialEpoch) => {}
+            Err(error) => {
+                return Err(miette::miette!(
+                    "gateway returned an invalid Sandbox Protocol credential: {error}"
+                ));
+            }
+        }
+    }
 
     // Validate the whole response before mutating any slot, so a malformed or
     // partial reply cannot leave the store half-rotated.

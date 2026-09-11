@@ -499,26 +499,49 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
-    // that bootstrap through another authentication mechanism may ignore it.
-    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
-        issuer.mint(&id).map(|minted| {
-            tracing::info!(
-                sandbox_id = %id,
-                "minted sandbox JWT"
-            );
-            minted.token
-        })
-    });
-    let sandbox_token = match sandbox_token {
-        Some(Ok(token)) => Some(token),
-        Some(Err(status)) => return Err(status),
-        None => None,
+    let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
+        let authentication = authority.mint_launch(
+            &id,
+            openshell_core::SandboxSessionId::new(),
+            openshell_core::jwt::CredentialEpoch::new(1)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )?;
+        state
+            .sandbox_auth_sessions
+            .activate(&id, &authentication, authority)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Some(authentication)
+    } else {
+        None
     };
+    let sandbox_token = if let Some(authentication) = &launch_authentication {
+        Some(
+            authentication
+                .supervisor
+                .gateway_token
+                .expose_secret()
+                .to_string(),
+        )
+    } else if let Some(issuer) = &state.sandbox_jwt_issuer {
+        Some(issuer.mint(&id)?.token)
+    } else {
+        None
+    };
+    let launch_authentication = launch_authentication
+        .map(|authentication| {
+            serde_json::to_vec(&authentication)
+                .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
+        })
+        .transpose()?;
 
     let sandbox = state
         .compute
-        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .create_sandbox_authenticated(
+            sandbox,
+            sandbox_token,
+            launch_authentication,
+            await_main_process_attachment,
+        )
         .await?;
 
     info!(
@@ -1327,6 +1350,9 @@ async fn handle_delete_sandbox_inner(
         .await?
         .name;
 
+    if let Ok(current) = sandbox_by_name(state, &workspace, &name).await {
+        state.sandbox_auth_sessions.deactivate(current.object_id());
+    }
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
@@ -1374,6 +1400,8 @@ async fn handle_stop_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let current = sandbox_by_name(state, &workspace, &req.name).await?;
+    state.sandbox_auth_sessions.deactivate(current.object_id());
     let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
@@ -1418,7 +1446,35 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    let current = sandbox_by_name(state, &workspace, &req.name).await?;
+    let launch_authentication = if current.phase() == SandboxPhase::Ready as i32 {
+        Vec::new()
+    } else if let Some(authentication) = state
+        .sandbox_auth_sessions
+        .authentication(current.object_id())
+    {
+        serde_json::to_vec(&authentication)
+            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
+    } else if let Some(authority) = &state.sandbox_session_jwt_authority {
+        let authentication = authority.mint_launch(
+            current.object_id(),
+            openshell_core::SandboxSessionId::new(),
+            openshell_core::jwt::CredentialEpoch::new(1)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )?;
+        state
+            .sandbox_auth_sessions
+            .activate(current.object_id(), &authentication, authority)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        serde_json::to_vec(&authentication)
+            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
+    } else {
+        Vec::new()
+    };
+    let sandbox = state
+        .compute
+        .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
+        .await?;
     info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
