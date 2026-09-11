@@ -201,6 +201,28 @@ pub struct DockerComputeConfig {
     pub enable_bind_mounts: bool,
 }
 
+impl DockerComputeConfig {
+    /// Validate startup configuration without connecting to Docker.
+    pub fn validate_configuration(&self, gateway_bind_address: SocketAddr) -> CoreResult<()> {
+        if let Some(socket_path) = self.socket_path.as_deref()
+            && socket_path.to_str().is_none()
+        {
+            return Err(Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            )));
+        }
+        validate_sandbox_pids_limit(self.sandbox_pids_limit)?;
+        parse_optional_host_gateway_ip(&self.host_gateway_ip)?;
+        if gateway_bind_address.port() == 0 {
+            return Err(Error::config(
+                "docker compute driver requires a fixed non-zero gateway bind port",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
