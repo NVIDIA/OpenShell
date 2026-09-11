@@ -5,7 +5,7 @@
 //!
 //! Encodes sandbox policies, binary capabilities, and credential scopes as Z3
 //! SMT constraints, then checks reachability queries to detect data exfiltration
-//! paths and write-bypass violations.
+//! paths.
 
 pub mod accepted_risks;
 pub mod credentials;
