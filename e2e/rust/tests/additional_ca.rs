@@ -21,6 +21,7 @@ const NETWORK_CA_PATH: &str = "/etc/openshell-tls/network-additional-ca.crt";
 const GATEWAY_CA_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const READY_MARKER: &str = "additional-ca-e2e-ready";
 const NETWORK_CA_VOLUME: &str = "openshell-network-additional-ca";
+const UPSTREAM_HOSTNAME_VALIDATION_DIAGNOSTIC: &str = "upstream TLS hostname validation failed";
 
 fn driver() -> Result<&'static str, String> {
     match std::env::var("OPENSHELL_E2E_DRIVER").as_deref() {
@@ -361,6 +362,138 @@ fn inspect_vm_overlay() -> Result<(), String> {
     Ok(())
 }
 
+fn supervisor_hostname_validation_seen(output: &str) -> bool {
+    output.contains(UPSTREAM_HOSTNAME_VALIDATION_DIAGNOSTIC)
+        && output.contains(MISMATCH_HOST)
+        && !output.contains("-----BEGIN CERTIFICATE-----")
+}
+
+#[cfg(feature = "e2e-vm")]
+fn vm_supervisor_output() -> Result<String, String> {
+    let state_dir = std::env::var("OPENSHELL_E2E_VM_STATE_DIR")
+        .map_err(|error| format!("VM state directory missing: {error}"))?;
+    let mut output = String::new();
+    for entry in std::fs::read_dir(std::path::Path::new(&state_dir).join("sandboxes"))
+        .map_err(|error| format!("read VM sandbox state: {error}"))?
+        .filter_map(Result::ok)
+    {
+        let console = entry.path().join("rootfs-console.log");
+        if console.is_file() {
+            output.push_str(
+                &std::fs::read_to_string(&console).map_err(|error| {
+                    format!("read VM serial log {}: {error}", console.display())
+                })?,
+            );
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+fn local_supervisor_output(driver: &str, sandbox_name: &str) -> Result<String, String> {
+    let container_engine = ContainerEngine::from_env().map_err(|error| error.clone())?;
+    let network = std::env::var("OPENSHELL_E2E_NETWORK_NAME")
+        .or_else(|_| std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME"))
+        .map_err(|error| format!("wrapper must export sandbox network: {error}"))?;
+    let output = engine_command(&container_engine)
+        .args(["ps", "-aq", "--filter"])
+        .arg(format!("network={network}"))
+        .output()
+        .map_err(|error| format!("run {driver} ps for supervisor diagnostic: {error}"))?;
+    let ids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let [container_id] = ids.as_slice() else {
+        return Err(format!(
+            "expected one {driver} container for {sandbox_name}, found {ids:?}"
+        ));
+    };
+    let output = engine_command(&container_engine)
+        .args(["logs", container_id])
+        .output()
+        .map_err(|error| format!("read {driver} supervisor log: {error}"))?;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn kubernetes_supervisor_output(identity: &str) -> Result<String, String> {
+    let mut parts = identity.split('/');
+    let namespace = parts.next().ok_or("namespace missing")?;
+    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
+    let pod = parts.next().ok_or("pod name missing")?;
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            namespace,
+            "logs",
+            pod,
+            "--all-containers=true",
+        ])
+        .output()
+        .map_err(|error| format!("read Kubernetes supervisor log: {error}"))?;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn assert_supervisor_rejected_hostname_mismatch(
+    driver: &str,
+    sandbox_name: &str,
+    kubernetes_identity: Option<&str>,
+) -> Result<(), String> {
+    // The workload's curl output only proves the client-to-supervisor MITM
+    // leg. Require the supervisor's explicit *upstream* hostname-validation
+    // diagnostic as well, so a direct fixture-leaf rejection cannot satisfy
+    // this test.
+    for _ in 0..30 {
+        let output = match driver {
+            "vm" => {
+                #[cfg(feature = "e2e-vm")]
+                {
+                    vm_supervisor_output()
+                }
+                #[cfg(not(feature = "e2e-vm"))]
+                {
+                    Err("VM test compiled without e2e-vm feature".to_string())
+                }
+            }
+            "docker" | "podman" => {
+                #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+                {
+                    local_supervisor_output(driver, sandbox_name)
+                }
+                #[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
+                {
+                    Err("local-driver test compiled without its driver feature".to_string())
+                }
+            }
+            "kubernetes" => kubernetes_supervisor_output(
+                kubernetes_identity.ok_or("Kubernetes staging identity missing")?,
+            ),
+            other => return Err(format!("unsupported driver {other}")),
+        }?;
+        if supervisor_hostname_validation_seen(&output) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "{driver} supervisor never reported upstream hostname validation for {MISMATCH_HOST}"
+    ))
+}
+
 fn replace_staged_material(driver: &str, kubernetes_identity: Option<&str>) -> Result<(), String> {
     if driver == "kubernetes" {
         return replace_kubernetes_config_map_with_invalid_material(
@@ -379,6 +512,118 @@ fn replace_staged_material(driver: &str, kubernetes_identity: Option<&str>) -> R
         .map_err(|error| format!("replace gateway-owned CA artifact: {error}"))
 }
 
+fn restart_kubernetes_sandbox_from_existing_resource(identity: &str) -> Result<String, String> {
+    let mut parts = identity.split('/');
+    let namespace = parts.next().ok_or("namespace missing")?;
+    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
+    let pod = parts.next().ok_or("pod name missing")?;
+    let previous = kubectl_json(&["-n", namespace, "get", "pod", pod, "-o", "json"])?;
+    let previous_uid = previous["metadata"]["uid"]
+        .as_str()
+        .ok_or("original pod UID missing")?
+        .to_string();
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
+    // Delete only the workload Pod. Its existing OpenShell Sandbox resource
+    // remains managed by the controller and recreates the Pod, avoiding a new
+    // driver `ensure`/server-side-apply request against our deliberately
+    // mutated ConfigMap.
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            namespace,
+            "delete",
+            "pod",
+            pod,
+            "--wait=false",
+        ])
+        .output()
+        .map_err(|error| format!("restart existing Kubernetes sandbox pod: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "restart existing Kubernetes sandbox pod failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(previous_uid)
+}
+
+fn recreated_kubernetes_pod(identity: &str, previous_uid: &str) -> Result<String, String> {
+    let mut parts = identity.split('/');
+    let namespace = parts.next().ok_or("namespace missing")?;
+    let config_map = parts.next().ok_or("ConfigMap name missing")?;
+    let _previous_pod = parts.next().ok_or("pod name missing")?;
+    let pods = kubectl_json(&["-n", namespace, "get", "pods", "-o", "json"])?;
+    pods["items"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|pod| {
+                let uses_config_map = pod["spec"]["volumes"].as_array().is_some_and(|volumes| {
+                    volumes
+                        .iter()
+                        .any(|volume| volume["configMap"]["name"].as_str() == Some(config_map))
+                });
+                let uid = pod["metadata"]["uid"].as_str()?;
+                let name = pod["metadata"]["name"].as_str()?;
+                (uses_config_map && uid != previous_uid).then(|| name.to_string())
+            })
+        })
+        .ok_or_else(|| {
+            "distinct recreated pod using destination CA ConfigMap not found".to_string()
+        })
+}
+
+fn assert_kubernetes_invalid_staged_material_fails_closed(identity: &str) -> Result<(), String> {
+    let previous_uid = restart_kubernetes_sandbox_from_existing_resource(identity)?;
+    let mut parts = identity.split('/');
+    let namespace = parts.next().ok_or("namespace missing")?;
+    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
+    let _previous_pod = parts.next().ok_or("pod name missing")?;
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
+
+    for _ in 0..120 {
+        if let Ok(pod) = recreated_kubernetes_pod(identity, &previous_uid) {
+            let output = Command::new("kubectl")
+                .args([
+                    "--context",
+                    &context,
+                    "-n",
+                    namespace,
+                    "logs",
+                    &pod,
+                    "--all-containers=true",
+                ])
+                .output()
+                .map_err(|error| format!("read restarted Kubernetes sandbox logs: {error}"))?;
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if logs.contains("additional destination CA bundle")
+                || logs.contains("invalid staged destination CA bundle")
+            {
+                if logs.contains("-----BEGIN CERTIFICATE-----")
+                    || logs.contains("-----BEGIN PRIVATE KEY-----")
+                {
+                    return Err(
+                        "Kubernetes supervisor validation log disclosed CA material".to_string()
+                    );
+                }
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(
+        "recreated Kubernetes sandbox lacked stable supervisor additional-CA validation evidence"
+            .to_string(),
+    )
+}
+
 async fn assert_invalid_staged_material_fails_closed(policy_path: &str) {
     let startup_error = match SandboxGuard::create(&["--policy", policy_path, "--", "true"]).await {
         Ok(mut unexpected) => {
@@ -390,6 +635,12 @@ async fn assert_invalid_staged_material_fails_closed(policy_path: &str) {
     assert!(
         startup_error.contains("error phase") || startup_error.contains("failed"),
         "invalid staged trust did not fail sandbox startup: {startup_error}"
+    );
+    assert!(
+        startup_error.contains("--network-additional-ca-bundle")
+            || startup_error.contains("additional destination CA bundle")
+            || startup_error.contains("invalid staged destination CA bundle"),
+        "invalid staged trust lacked stable supervisor additional-CA validation evidence: {startup_error}"
     );
     assert!(
         !startup_error.contains("-----BEGIN CERTIFICATE-----")
@@ -555,11 +806,20 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
 response="$(curl --fail --silent --show-error --max-time 30 '{matching_url}')"
 test "$response" = '{{"additional_ca":"trusted"}}'
 set +e
-curl --fail --silent --show-error --max-time 15 --connect-to '{mismatch_connect}' '{mismatch_url}' >/tmp/mismatch.out 2>/tmp/mismatch.err
+curl --fail --silent --show-error --verbose --max-time 15 --connect-to '{mismatch_connect}' '{mismatch_url}' >/tmp/mismatch.out 2>/tmp/mismatch.err
 mismatch_status=$?
 set -e
-if [ "$mismatch_status" -ne 60 ]; then
-  echo "hostname mismatch returned curl status $mismatch_status, expected 60" >&2
+# The client must successfully validate OpenShell's generated MITM leaf for
+# the requested hostname. A curl 60 here would only show that curl rejected a
+# fixture leaf; the supervisor-specific upstream diagnostic is asserted below.
+if [ "$mismatch_status" -eq 0 ] || [ "$mismatch_status" -eq 60 ]; then
+  echo "hostname mismatch returned curl status $mismatch_status; expected post-MITM upstream failure" >&2
+  cat /tmp/mismatch.err >&2
+  exit 1
+fi
+if ! grep -Fq 'SSL certificate verify ok' /tmp/mismatch.err; then
+  echo "hostname mismatch never completed TLS verification against the OpenShell MITM leaf" >&2
+  cat /tmp/mismatch.err >&2
   exit 1
 fi
 curl --fail --silent --show-error --max-time 30 https://example.com/ >/dev/null
@@ -608,6 +868,13 @@ while true; do sleep 1; done"#
         }
     };
 
+    assert_supervisor_rejected_hostname_mismatch(
+        driver,
+        &sandbox.name,
+        kubernetes_identity.as_deref(),
+    )
+    .expect("supervisor rejected the upstream hostname mismatch after client MITM verification");
+
     replace_staged_material(driver, kubernetes_identity.as_deref())
         .expect("replace staged destination trust with invalid material");
     if driver == "kubernetes" {
@@ -629,7 +896,16 @@ while true; do sleep 1; done"#
         );
     }
 
-    assert_invalid_staged_material_fails_closed(policy_path).await;
+    if driver == "kubernetes" {
+        assert_kubernetes_invalid_staged_material_fails_closed(
+            kubernetes_identity
+                .as_deref()
+                .expect("Kubernetes staging identity must be present"),
+        )
+        .expect("recreated existing Kubernetes sandbox rejects invalid staged trust");
+    } else {
+        assert_invalid_staged_material_fails_closed(policy_path).await;
+    }
 
     sandbox.cleanup().await;
     remove_configuration_and_restart(driver)
