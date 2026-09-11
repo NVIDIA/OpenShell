@@ -5,24 +5,21 @@
 
 use std::net::SocketAddr;
 
-use clap::{Parser, Subcommand};
+use clap::builder::{PossibleValue, PossibleValuesParser};
+use clap::{Parser, Subcommand, ValueEnum as _};
 use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol};
 
 #[derive(Debug, Parser)]
 #[command(
     about = "Measure native and seccomp-filtered socket performance",
-    long_about = "Measure native and seccomp-filtered socket performance. UDP unconnected means destination-bearing SOCK_DGRAM traffic, not SOCK_RAW. General external UDP and SOCK_RAW are currently denied by the sandbox."
+    long_about = "Measure native and seccomp-filtered TCP socket performance."
 )]
 struct Cli {
     /// Benchmark layer: native, filtered, or all.
     #[arg(long, default_value = "all", value_parser = ["native", "filtered", "all"])]
     layer: String,
-    /// Protocol: tcp-connect, tcp-stream, udp-connected, udp-unconnected, or all.
-    #[arg(
-        long,
-        default_value = "all",
-        value_parser = ["tcp-connect", "tcp-stream", "udp-connected", "udp-unconnected", "all"]
-    )]
+    /// Implemented protocol to benchmark, or all.
+    #[arg(long, default_value = "all", value_parser = protocol_value_parser())]
     protocol: String,
     #[arg(long, default_value_t = 10_000)]
     iterations: u64,
@@ -34,6 +31,16 @@ struct Cli {
     payload_bytes: usize,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn protocol_value_parser() -> PossibleValuesParser {
+    let mut values = vec![PossibleValue::new("all")];
+    values.extend(
+        Protocol::value_variants()
+            .iter()
+            .filter_map(clap::ValueEnum::to_possible_value),
+    );
+    PossibleValuesParser::new(values)
 }
 
 #[derive(Debug, Subcommand)]
