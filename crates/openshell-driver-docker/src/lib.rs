@@ -114,6 +114,7 @@ const LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE: &str = "capability-free";
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
+const SUPERVISOR_NETWORK_MODE: &str = "host";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
 const TOPOLOGY_PAYLOAD_FILE: &str = "topology.payload";
@@ -238,7 +239,6 @@ struct DockerDriverRuntimeConfig {
     log_level: String,
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
-    network_name: String,
     supervisor_grpc_endpoint: String,
     gateway_tls_server_name: Option<String>,
     guest_tls: Option<DockerGuestTlsPaths>,
@@ -878,7 +878,6 @@ impl DockerComputeDriver {
                 log_level: gateway_log_level.to_string(),
                 sandbox_binary,
                 supervisor_image_id,
-                network_name,
                 supervisor_grpc_endpoint,
                 gateway_tls_server_name,
                 guest_tls,
@@ -4597,7 +4596,10 @@ async fn spawn_docker_control_process(
             start_interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
         }),
         host_config: Some(HostConfig {
-            network_mode: Some(config.network_name.clone()),
+            // The supervisor is trusted infrastructure and originates all
+            // approved upstream connections. Keep it on the daemon host's
+            // network while the workload remains fenced by network=none.
+            network_mode: Some(SUPERVISOR_NETWORK_MODE.to_string()),
             mounts: Some(vec![Mount {
                 target: Some(BOUNDARY_MOUNT_PATH.to_string()),
                 source: Some(docker_channel_volume_name(sandbox, config)),
