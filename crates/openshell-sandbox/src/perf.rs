@@ -214,8 +214,8 @@ pub fn run_worker(
         }));
     }
     drop(sender);
-    let started = Instant::now();
     barrier.wait();
+    let started = Instant::now();
     let mut samples = Vec::new();
     for result in receiver {
         samples.extend(result?);
