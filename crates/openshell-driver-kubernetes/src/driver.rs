@@ -59,11 +59,11 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
     generate_sandbox_tls_material,
 };
-use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use rand::RngCore as _;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
