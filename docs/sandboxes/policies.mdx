@@ -609,7 +609,9 @@ openshell policy set --global --policy ./global-policy.yaml
 
 When a global policy is configured:
 
-- The global payload is applied in full for all sandboxes.
+- The global payload supplies the dynamic policy fields for all sandboxes.
+- Each sandbox keeps the startup-only `ui` section from its own creation policy;
+  a global policy containing `ui` is rejected.
 - Sandbox-level policy updates are rejected until the global policy is removed.
 
 To restore sandbox-level policy control, delete the global policy setting:

@@ -157,12 +157,19 @@ Omit the entire section when the workload does not need a UI surface.
 | `allow_input_injection` | bool | No | `true`, `false` | Allows synthetic keyboard or pointer input. Defaults to `false`. |
 
 MXC `process_container` enforces this section on Windows and advertises complete
-support through the compute-driver capability contract. OpenShell rejects any
-explicit UI section, including `{}`, with MXC `isolation_session` because
-current MXC rejects the top-level `ui` object there. Docker, Podman, Kubernetes,
-VM, and older or partial extension drivers also advertise no support, so the
-gateway rejects explicit UI policy before validation or provisioning. Omitting
-the section preserves each runtime's existing behavior.
+support through the compute-driver capability contract. MXC's `disable` switch
+suppresses the other UI fields, so a clipboard or input-injection grant on this
+backend also requires `allow_graphical_ui: true`; OpenShell rejects a grant that
+MXC would ignore. OpenShell rejects any explicit UI section, including `{}`, with
+MXC `isolation_session` because current MXC rejects the top-level `ui` object
+there. Docker, Podman, Kubernetes, VM, and older or partial extension drivers
+also advertise no support, so the gateway rejects explicit UI policy before
+validation or provisioning. Omitting the section preserves each runtime's
+existing behavior.
+
+UI is a per-sandbox startup contract and cannot be set in a gateway-global
+policy. A global policy changes dynamic policy fields while each sandbox keeps
+the UI controls applied from its own policy at creation.
 
 Example:
 

@@ -837,6 +837,11 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 				RunAsUser:  "sandbox",
 				RunAsGroup: "sandbox-group",
 			},
+			UI: &types.UIPolicy{
+				AllowGraphicalUI:    true,
+				Clipboard:           types.UIClipboardAccessRead,
+				AllowInputInjection: true,
+			},
 			NetworkPolicies: map[string]types.NetworkPolicyRule{
 				"web": {
 					Name: "web",
@@ -874,6 +879,10 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	require.NotNil(t, p.Process)
 	assert.Equal(t, "sandbox", p.Process.RunAsUser)
 	assert.Equal(t, "sandbox-group", p.Process.RunAsGroup)
+	require.NotNil(t, p.UI)
+	assert.True(t, p.UI.AllowGraphicalUI)
+	assert.Equal(t, types.UIClipboardAccessRead, p.UI.Clipboard)
+	assert.True(t, p.UI.AllowInputInjection)
 
 	require.Len(t, p.NetworkPolicies, 1)
 	webRule, ok := p.NetworkPolicies["web"]
@@ -886,19 +895,23 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	// Deep-copy isolation: mutate input spec, verify stored copy unchanged
 	spec.Policy.Version = 99
 	spec.Policy.Filesystem.ReadOnly[0] = "mutated"
+	spec.Policy.UI.Clipboard = types.UIClipboardAccessAll
 	spec.Policy.NetworkPolicies["web"] = types.NetworkPolicyRule{Name: "mutated"}
 
 	got2, err := sc.Get(ctx, "default", "policy-sb")
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), got2.Spec.Policy.Version)
 	assert.Equal(t, "/etc", got2.Spec.Policy.Filesystem.ReadOnly[0])
+	assert.Equal(t, types.UIClipboardAccessRead, got2.Spec.Policy.UI.Clipboard)
 	assert.Equal(t, "web", got2.Spec.Policy.NetworkPolicies["web"].Name)
 
 	// Deep-copy isolation: mutate returned object, verify store unchanged
 	got.Spec.Policy.Filesystem.ReadWrite[0] = "mutated"
+	got.Spec.Policy.UI.AllowInputInjection = false
 	got3, err := sc.Get(ctx, "default", "policy-sb")
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp", got3.Spec.Policy.Filesystem.ReadWrite[0])
+	assert.True(t, got3.Spec.Policy.UI.AllowInputInjection)
 }
 
 func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {
