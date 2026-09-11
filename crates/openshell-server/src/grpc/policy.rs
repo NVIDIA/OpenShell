@@ -10886,7 +10886,7 @@ mod tests {
             &state,
             with_user(Request::new(UpdateConfigRequest {
                 name: "rejected-policy".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 policy: Some(test_policy_with_rule("rejected", "api.example.com")),
                 expected_resource_version: u64::MAX,
                 ..Default::default()
@@ -10932,7 +10932,7 @@ mod tests {
             &state,
             with_user(Request::new(UpdateConfigRequest {
                 name: "published-policy".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 policy: Some(test_policy_with_rule("published", "api.example.com")),
                 ..Default::default()
             })),
