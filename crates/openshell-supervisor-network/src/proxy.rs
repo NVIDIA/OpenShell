@@ -35,8 +35,9 @@ use openshell_isolation_interface::contract::{
     NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
 };
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse,
-    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, BaseEventBuilder, DispositionId, Endpoint, HttpActivityBuilder,
+    HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
+    Url as OcsfUrl, ocsf_emit,
 };
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -113,6 +114,54 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
     "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
+
+fn build_connection_error_event(
+    peer_addr: SocketAddr,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .message(message)
+        .build()
+}
+
+fn build_proxy_connection_error_event(
+    peer_addr: Option<SocketAddr>,
+    transparent_destination: Option<SocketAddr>,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    if let Some(peer_addr) = peer_addr {
+        return build_connection_error_event(peer_addr, message);
+    }
+    if let Some(destination) = transparent_destination {
+        return NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_ip(destination.ip(), destination.port()))
+            .message(message)
+            .build();
+    }
+
+    BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity_name("Proxy connection failure")
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
+
+fn build_mediation_lane_failure_event(message: String) -> openshell_ocsf::OcsfEvent {
+    BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity_name("Network mediation source failure")
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
 
 fn build_credential_endpoint_mismatch_event(
     method: &str,
@@ -426,6 +475,10 @@ impl ProxyHandle {
                 };
                 match accepted {
                     Ok((stream, supplied_identity, socket_addrs, transparent_destination)) => {
+                        let peer_addr = socket_addrs.map(|(workload_addr, _)| workload_addr);
+                        let transparent_destination_addr = transparent_destination
+                            .as_ref()
+                            .map(|transparent| transparent.destination);
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
                         let opa = opa_engine.clone();
@@ -476,57 +529,30 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Proxy connection error: {err}"))
-                                    .build();
-                                ocsf_emit!(event);
+                                ocsf_emit!(build_proxy_connection_error_event(
+                                    peer_addr,
+                                    transparent_destination_addr,
+                                    format!("Proxy connection error: {err}"),
+                                ));
                             }
                         });
                     }
                     Err(ProxyAcceptError::Source(err)) => {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(format!(
-                                "Network-mediation source failed; proxy accept loop exiting: {err}"
-                            ))
-                            .build();
-                        ocsf_emit!(event);
+                        ocsf_emit!(build_mediation_lane_failure_event(format!(
+                            "Network-mediation source failed; proxy accept loop exiting: {err}"
+                        )));
                         break;
                     }
                     Err(ProxyAcceptError::Listener(err)) => {
-                        match classify_accept_error(
+                        let action = classify_accept_error(
                             &err,
                             &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
-                        ) {
-                            AcceptAction::Terminal => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::High)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept loop exiting on terminal error: {err}",
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
-                                break;
-                            }
-                            AcceptAction::Retry { backoff, severity } => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(severity)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept error (retrying in {}ms): {err}",
-                                        backoff.as_millis(),
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
+                        );
+                        ocsf_emit!(build_accept_error_event(local_addr, &err, &action));
+                        match action {
+                            AcceptAction::Terminal => break,
+                            AcceptAction::Retry { backoff, .. } => {
                                 tokio::time::sleep(backoff).await;
                             }
                         }
@@ -800,7 +826,7 @@ impl TransparentTcpHandle {
                     );
                 }
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
+                    let Ok((stream, peer_addr)) = listener.accept().await else {
                         break;
                     };
                     set_tcp_nodelay_best_effort(&stream);
@@ -826,14 +852,10 @@ impl TransparentTcpHandle {
                         )
                         .await
                         {
-                            ocsf_emit!(
-                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Transparent TCP connection error: {error}"))
-                                    .build()
-                            );
+                            ocsf_emit!(build_connection_error_event(
+                                peer_addr,
+                                format!("Transparent TCP connection error: {error}")
+                            ));
                         }
                     });
                 }
@@ -1274,6 +1296,33 @@ enum AcceptAction {
     },
 }
 
+fn build_accept_error_event(
+    local_addr: SocketAddr,
+    err: &std::io::Error,
+    action: &AcceptAction,
+) -> openshell_ocsf::OcsfEvent {
+    let (severity, message) = match action {
+        AcceptAction::Terminal => (
+            SeverityId::High,
+            format!("Proxy accept loop exiting on terminal error: {err}"),
+        ),
+        AcceptAction::Retry { backoff, severity } => (
+            *severity,
+            format!(
+                "Proxy accept error (retrying in {}ms): {err}",
+                backoff.as_millis()
+            ),
+        ),
+    };
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
+        .severity(severity)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
+
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
@@ -1693,16 +1742,29 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
-fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Other)
+fn build_forward_parse_error_ocsf_event(
+    peer_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
         .http_response(HttpResponse {
             code: StatusCode::BAD_REQUEST.as_u16(),
         })
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
-        .message(format!("FORWARD parse error for {path}"))
-        .build()
+        .message(format!("FORWARD parse error for {path}"));
+    match peer_addr {
+        Some(peer_addr) => builder
+            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .build(),
+        None => builder.build(),
+    }
 }
 
 /// Build the rejection event for an absolute-form request whose scheme is not
@@ -4181,9 +4243,12 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
 
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
+                    let event = openshell_ocsf::ConfigStateChangeBuilder::new(
+                        openshell_ocsf::ctx::ctx(),
+                    )
                         .severity(SeverityId::Medium)
+                        .status(StatusId::Success)
+                        .state(openshell_ocsf::StateId::Other, "warning")
                         .message(format!(
                             "allowed_ips entry has a very broad CIDR {n} (/{}) < /{MIN_SAFE_PREFIX_LEN}; \
                              this may expose control-plane services on the same network",
@@ -4848,12 +4913,21 @@ async fn handle_forward_proxy(
         .as_ref()
         .and_then(EndpointObservationSender::capture);
     let mut endpoint_observer = None;
+    let workload_peer_addr = socket_addrs.map(|(workload, _)| workload);
+    // The connection handlers below require a workload address for policy and
+    // accounting. OCSF events must instead use `workload_peer_addr`, because
+    // the unspecified fallback is not an observed network endpoint.
+    let workload_addr = workload_peer_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let mut telemetry_path = forward_telemetry_path(target_uri);
     // 1. Parse the absolute-form URI. Every external forward target is
     // canonicalized below before credential binding, policy-path evaluation,
     // upstream bytes, or telemetry consume it.
     let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
-        ocsf_emit!(build_forward_parse_error_ocsf_event(&telemetry_path));
+        ocsf_emit!(build_forward_parse_error_ocsf_event(
+            workload_peer_addr,
+            method,
+            &telemetry_path
+        ));
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
@@ -4923,10 +4997,6 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let workload_addr = socket_addrs.map_or_else(
-        || SocketAddr::from(([0, 0, 0, 0], 0)),
-        |(workload, _)| workload,
-    );
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = if let Some(identity) = supplied_identity {
         authorize_supplied_identity(&opa_engine, intent, identity)
@@ -7544,6 +7614,87 @@ network_policies:
     }
 
     #[test]
+    fn accept_errors_include_the_listening_endpoint() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let addr = "127.0.0.1:3128".parse().unwrap();
+        let error = std::io::Error::other("accept failed");
+        for action in [
+            AcceptAction::Terminal,
+            AcceptAction::Retry {
+                backoff: std::time::Duration::from_millis(250),
+                severity: SeverityId::Low,
+            },
+        ] {
+            let event = build_accept_error_event(addr, &error, &action);
+            let json = event.to_json().unwrap();
+            validate_required_fields(&json, &load_class_schema("network_activity"));
+            assert_eq!(json["dst_endpoint"]["ip"], "127.0.0.1");
+            assert_eq!(json["dst_endpoint"]["port"], 3128);
+            assert!(json["message"].as_str().unwrap().contains("accept failed"));
+        }
+    }
+
+    #[test]
+    fn connection_errors_include_the_known_peer() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let schema = load_class_schema("network_activity");
+        let json = build_connection_error_event(peer, "Proxy connection error".to_string())
+            .to_json()
+            .unwrap();
+        assert_eq!(json["class_uid"], 4001);
+        assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(json["src_endpoint"]["port"], 54321);
+        validate_required_fields(&json, &schema);
+    }
+
+    #[test]
+    fn forward_parse_errors_include_http_context_and_peer() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let json =
+            build_forward_parse_error_ocsf_event(Some(peer), "GET", "/[INVALID_REQUEST_TARGET]")
+                .to_json()
+                .unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert_eq!(json["activity_name"], "Get");
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert!(json["http_request"].get("url").is_none());
+        assert_eq!(json["http_response"]["code"], 400);
+        assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(json["src_endpoint"]["port"], 54321);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
+    fn forward_parse_errors_without_a_peer_do_not_fabricate_an_endpoint() {
+        let json = build_forward_parse_error_ocsf_event(None, "GET", "/[INVALID_REQUEST_TARGET]")
+            .to_json()
+            .unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert!(json.get("src_endpoint").is_none());
+        assert!(json.get("dst_endpoint").is_none());
+    }
+
+    #[test]
+    fn endpointless_proxy_failures_are_base_events() {
+        for event in [
+            build_proxy_connection_error_event(None, None, "connection failed".to_string()),
+            build_mediation_lane_failure_event("source failed".to_string()),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 0);
+            assert_ne!(json["activity_name"], "Stop");
+            assert_eq!(json["status"], "Failure");
+        }
+    }
+
+    #[test]
     fn middleware_failure_response_uses_platform_text_without_policy_guidance() {
         let response = build_middleware_failure_response("api-policy");
         let response = String::from_utf8(response).expect("UTF-8 error response");
@@ -7883,9 +8034,13 @@ network_policies:
         assert!(!serialized.contains("real-secret"), "{serialized}");
         assert!(!serialized.contains("?token="), "{serialized}");
 
-        let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
-            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
-        ))
+        let malformed = build_forward_parse_error_ocsf_event(
+            Some("127.0.0.1:12345".parse().unwrap()),
+            "GET",
+            &forward_telemetry_path(
+                "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+            ),
+        )
         .to_json()
         .unwrap();
         assert_eq!(
