@@ -456,6 +456,13 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 
 The gateway and supervisor images should use the same release tag. A stale supervisor image can make sandbox behavior lag behind gateway policy or protocol changes.
 
+For vulnerability reports, record the running image digest and scan that exact
+artifact. The gateway includes a pinned Distroless base; the supervisor includes
+Alpine packages updated at image build time. A dependency or base-image fix only
+reaches deployed containers after rebuilding, publishing, and redeploying the
+images. Compare findings against the SBOM for that digest, not just its mutable
+`latest` or `dev` tag.
+
 For plaintext local evaluation, confirm the chart has:
 
 ```bash

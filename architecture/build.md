@@ -219,6 +219,8 @@ Runtime layout:
   gateway binaries must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
   gateway bundles z3, so the image does not need a distro-provided z3 runtime.
+  The base is pinned to a multi-architecture digest; distro security updates
+  require refreshing that digest and rebuilding the gateway image.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
@@ -229,7 +231,8 @@ Runtime layout:
   cache action runs. An explicitly configured VM runtime bundle is required to
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
-- **Supervisor**: Alpine base with `nftables`, static binary at
+- **Supervisor**: Alpine base with `nftables`; base packages are upgraded before
+  installing firewall tools to pick up distro security fixes. Static binary at
   `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
   linkage keeps the binary usable when the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes
