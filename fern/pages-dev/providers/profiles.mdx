@@ -436,7 +436,7 @@ environment value under the actual environment variable key.
 
 `endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
 
-`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
+`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox. Write each binary as a scalar path. OpenShell also accepts the transitional object form `- path: /usr/bin/example` and exports it as a scalar. The removed `harness` property is rejected; delete it from profiles created before 0.1.0.
 
 `inference_capable` is informational metadata that marks profiles intended for
 model and inference APIs. It does not grant access, select a model, configure a
