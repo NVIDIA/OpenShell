@@ -123,6 +123,7 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
             binary_identity: Err(ResolveError::Failed(
                 "mock DNS attribution unavailable".to_string(),
             )),
+            timing: MediationTiming::default(),
             response,
         })
     }

@@ -20,6 +20,7 @@ use crate::contract::{
     BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal, DriverFenceEvidence,
     ExecSpec, ResolveError, SandboxConfirmEvidence, TopologyDescriptor,
 };
+use openshell_core::SandboxSessionId;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkMode, NetworkPolicy,
     ProcessPolicy, ProxyPolicy, SandboxPolicy,
@@ -39,6 +40,122 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+/// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
+/// Authentication is configured separately and is identical for every variant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxTransport {
+    Unix {
+        socket_path: PathBuf,
+    },
+    Tcp {
+        /// Stable logical Kubernetes Service authority used for diagnostics.
+        authority: String,
+        /// Explicit connection candidates resolved by the compute driver.
+        addresses: Vec<std::net::SocketAddr>,
+    },
+    Vsock {
+        guest_cid: u32,
+        port: u32,
+    },
+}
+
+/// Supervisor-side, generation-pinned TLS server authentication.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxTlsClientConfig {
+    pub server_name: String,
+    pub trust_anchor_pem: String,
+}
+
+impl fmt::Debug for SandboxTlsClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxTlsClientConfig")
+            .field("server_name", &self.server_name)
+            .field("trust_anchor_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Sandbox-side TLS server files staged by the compute driver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxTlsServerConfig {
+    pub certificate_chain_path: PathBuf,
+    pub private_key_path: PathBuf,
+}
+
+/// Fresh, server-only TLS material for one sandbox session.
+#[derive(Clone)]
+pub struct SandboxTlsMaterial {
+    pub server_name: String,
+    pub trust_anchor_pem: String,
+    pub certificate_chain_pem: String,
+    pub private_key_pem: String,
+}
+
+impl fmt::Debug for SandboxTlsMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxTlsMaterial")
+            .field("server_name", &self.server_name)
+            .field("trust_anchor_pem", &"<redacted>")
+            .field("certificate_chain_pem", &"<redacted>")
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Generate a generation-pinned TLS server identity for the Sandbox Protocol.
+///
+/// The CA private key is local to this function and is discarded after the
+/// server leaf is signed. The JWT, rather than certificate time, determines
+/// caller authorization and renewal.
+pub fn generate_sandbox_tls_material(
+    session_id: SandboxSessionId,
+) -> Result<SandboxTlsMaterial, BackendError> {
+    let server_name = format!("sandbox.{session_id}.openshell.internal");
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
+    ca_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "OpenShell sandbox session CA");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+        BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
+    })?;
+
+    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
+        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+    })?;
+    let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
+        .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
+    sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
+    sandbox_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
+    sandbox_params
+        .distinguished_name
+        .push(DnType::CommonName, "OpenShell sandbox runtime");
+    sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let sandbox = sandbox_params
+        .signed_by(&sandbox_key, &ca, &ca_key)
+        .map_err(|error| {
+            BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
+        })?;
+
+    Ok(SandboxTlsMaterial {
+        server_name,
+        trust_anchor_pem: ca.pem(),
+        certificate_chain_pem: sandbox.pem(),
+        private_key_pem: sandbox_key.serialize_pem(),
+    })
+}
+
 /// Control-side endpoint for a driver-provisioned boundary.
 /// Supervisor-side mutual-TLS identity for one sandbox generation.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1250,5 +1367,37 @@ mod tests {
             "uid-1".to_string(),
         )]))
         .expect("opaque resource identity should be valid");
+    }
+
+    #[test]
+    fn sandbox_tls_identity_is_unique_per_session_and_redacted() {
+        let first_session = SandboxSessionId::new();
+        let second_session = SandboxSessionId::new();
+        let first = generate_sandbox_tls_material(first_session).expect("first TLS material");
+        let second = generate_sandbox_tls_material(second_session).expect("second TLS material");
+
+        assert_eq!(
+            first.server_name,
+            format!("sandbox.{first_session}.openshell.internal")
+        );
+        assert_ne!(first.server_name, second.server_name);
+        assert_ne!(first.trust_anchor_pem, second.trust_anchor_pem);
+        assert!(first.certificate_chain_pem.contains("BEGIN CERTIFICATE"));
+        assert!(first.private_key_pem.contains("BEGIN PRIVATE KEY"));
+
+        let debug = format!("{first:?}");
+        assert!(!debug.contains(&first.private_key_pem));
+        assert!(!debug.contains(&first.certificate_chain_pem));
+    }
+
+    #[test]
+    fn sandbox_transport_does_not_embed_authentication_material() {
+        let transport = SandboxTransport::Tcp {
+            authority: "sandbox.default.svc.cluster.local".to_string(),
+            addresses: vec!["192.0.2.10:8443".parse().expect("test address")],
+        };
+        let encoded = serde_json::to_vec(&transport).expect("encode transport");
+        let decoded: SandboxTransport = serde_json::from_slice(&encoded).expect("decode transport");
+        assert_eq!(decoded, transport);
     }
 }

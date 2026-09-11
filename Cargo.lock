@@ -4043,6 +4043,7 @@ dependencies = [
  "chrono",
  "glob",
  "ipnet",
+ "jsonwebtoken",
  "miette",
  "nix 0.29.0",
  "openshell-extension-core",
@@ -4069,6 +4070,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
