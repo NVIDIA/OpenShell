@@ -63,10 +63,6 @@ pub mod inference {
     pub use super::generated::openshell::inference::v1;
 }
 
-pub mod isolation {
-    pub use super::generated::openshell::isolation::v1;
-}
-
 pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
 }
