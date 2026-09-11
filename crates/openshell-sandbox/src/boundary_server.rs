@@ -2772,10 +2772,11 @@ mod linux {
                     "boundary TLS private-key file contains no private key",
                 )
             })?;
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certificates, private_key)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         for path in [&tls.certificate_chain_path, &tls.private_key_path] {
             std::fs::remove_file(path)?;
