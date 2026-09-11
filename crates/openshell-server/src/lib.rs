@@ -599,6 +599,7 @@ pub(crate) async fn run_server(
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
         network_trust: network_trust.as_ref(),
+        network_trust_configured: network_trust.is_some(),
         gateway_port: config.bind_address.port(),
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
@@ -1079,6 +1080,16 @@ pub trait ComputeDriverFactory: Send + Sync {
     /// Whether [`Self::validate_config`] fully validates this factory's
     /// configuration without runtime side effects.
     fn supports_config_preflight(&self) -> bool {
+        false
+    }
+
+    /// Whether this factory can propagate the gateway-owned destination trust
+    /// bundle to its network supervisor.
+    ///
+    /// The default is deliberately conservative: out-of-tree, remote, and
+    /// otherwise unannotated drivers must explicitly opt in before a
+    /// configured additional CA bundle can be used with them.
+    fn supports_network_supervisor_trust(&self) -> bool {
         false
     }
 
@@ -1651,19 +1662,11 @@ fn resolve_configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
-    if driver_startup.network_trust.is_some()
-        && driver_startup.endpoint_overrides.contains_key(&name)
-    {
+    let network_trust_configured =
+        driver_startup.network_trust.is_some() || driver_startup.network_trust_configured;
+    if network_trust_configured && driver_startup.endpoint_overrides.contains_key(&name) {
         return Err(Error::config(format!(
             "{} is configured but compute driver '{name}' uses an unsupported remote endpoint",
-            network_trust::CONFIG_FIELD
-        )));
-    }
-    if driver_startup.network_trust.is_some()
-        && !matches!(name.as_str(), "docker" | "podman" | "kubernetes" | "vm")
-    {
-        return Err(Error::config(format!(
-            "{} is configured but compute driver '{name}' is unsupported; use Docker, Podman, Kubernetes, or VM",
             network_trust::CONFIG_FIELD
         )));
     }
@@ -1675,9 +1678,21 @@ fn resolve_configured_compute_driver(
     }
 
     if let Some(registration) = registry.get(&name) {
+        if network_trust_configured && !registration.factory.supports_network_supervisor_trust() {
+            return Err(Error::config(format!(
+                "{} is configured but compute driver '{name}' does not support network trust propagation",
+                network_trust::CONFIG_FIELD
+            )));
+        }
         return Ok(ConfiguredComputeDriver::Registered(registration.clone()));
     }
 
+    if network_trust_configured {
+        return Err(Error::config(format!(
+            "{} is configured but remote compute driver '{name}' is unsupported because it cannot propagate network trust",
+            network_trust::CONFIG_FIELD
+        )));
+    }
     Ok(ConfiguredComputeDriver::Remote { name })
 }
 
@@ -1915,6 +1930,7 @@ mod tests {
             file,
             guest_tls: None,
             network_trust,
+            network_trust_configured: network_trust.is_some(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
@@ -2509,6 +2525,50 @@ mod tests {
 
         assert!(error.to_string().contains("additional_ca_cert_paths"));
         assert!(error.to_string().contains("custom"));
+        assert!(error.to_string().contains("network trust propagation"));
+    }
+
+    #[derive(Clone, Copy)]
+    struct TrustPropagatingTestFactory;
+
+    #[async_trait::async_trait]
+    impl super::ComputeDriverFactory for TrustPropagatingTestFactory {
+        fn supports_network_supervisor_trust(&self) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _context: super::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<super::ComputeDriverInstance> {
+            unreachable!("selection tests do not construct the driver")
+        }
+    }
+
+    #[test]
+    fn configured_network_trust_accepts_explicitly_capable_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "custom",
+                    1,
+                    None,
+                    TrustPropagatingTestFactory,
+                )
+                .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+
+        let driver = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect("an explicitly capable registration accepts destination trust");
+        assert!(matches!(driver, ConfiguredComputeDriver::Registered(_)));
     }
 
     #[tokio::test]

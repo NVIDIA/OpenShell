@@ -191,22 +191,38 @@ pub async fn tls_connect_upstream(
 ) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
     let connector = TlsConnector::from(Arc::clone(client_config));
     let server_name = ServerName::try_from(hostname.to_string()).into_diagnostic()?;
-    let tls_stream = connector
-        .connect(server_name, upstream)
-        .await
-        .into_diagnostic()?;
-    Ok(tls_stream)
+    match connector.connect(server_name, upstream).await {
+        Ok(tls_stream) => Ok(tls_stream),
+        Err(error) if is_hostname_validation_error(&error) => Err(error)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("upstream TLS hostname validation failed for {hostname}")),
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+fn is_hostname_validation_error(error: &std::io::Error) -> bool {
+    let Some(rustls::Error::InvalidCertificate(certificate_error)) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+    else {
+        return false;
+    };
+    matches!(
+        certificate_error,
+        rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::NotValidForNameContext { .. }
+    )
 }
 
 /// Build a rustls `ClientConfig` using the configured CA root source.
 ///
-/// In `bundled-ca-roots` mode this uses Mozilla roots from `webpki-roots` overlaid
-/// with any locally-installed CAs from `system_ca_bundle` (e.g. corporate or private
-/// CAs added to `/etc/pki/ca-trust`). Duplicates with the Mozilla bundle are harmless.
+/// In `bundled-ca-roots` mode this uses Mozilla roots from `webpki-roots`
+/// overlaid with `system_ca_bundle`, preserving the existing system/corporate
+/// trust behavior. Explicit additional destination roots remain additive.
 ///
-/// Without `bundled-ca-roots` this starts with the platform/native trust store
-/// and overlays `system_ca_bundle`. The overlay preserves explicitly staged
-/// corporate-proxy roots even when they are not installed in the native store.
+/// Without `bundled-ca-roots` this uses the platform/native trust store and
+/// preserves the previous behavior of ignoring `system_ca_bundle`. Explicit
+/// additional destination roots are still added in that feature variant.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
     build_upstream_client_config_with_additional(system_ca_bundle, None)
 }
@@ -238,8 +254,8 @@ fn build_upstream_root_store(
     #[cfg(feature = "bundled-ca-roots")]
     {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        // Overlay system/corporate CAs so custom trust anchors are honoured in
-        // default upstream builds. Duplicates with webpki-roots are harmless.
+        // Preserve the pre-feature system/corporate overlay behavior for the
+        // default bundled-roots build. Duplicates are harmless.
         let (added, ignored) = load_pem_certs_into_store(&mut root_store, system_ca_bundle);
         if added > 0 {
             tracing::debug!(added, "loaded system CA certificates for upstream TLS");
@@ -254,20 +270,8 @@ fn build_upstream_root_store(
 
     #[cfg(not(feature = "bundled-ca-roots"))]
     {
+        let _ = system_ca_bundle;
         add_native_roots(&mut root_store)?;
-        // Native roots cover host-installed anchors, while this explicit
-        // overlay also carries a driver-staged corporate-proxy CA. Duplicate
-        // system roots are harmless.
-        let (added, ignored) = load_pem_certs_into_store(&mut root_store, system_ca_bundle);
-        if added > 0 {
-            tracing::debug!(added, "loaded system CA certificates for upstream TLS");
-        }
-        if ignored > 0 {
-            tracing::warn!(
-                ignored,
-                "some system CA certificates could not be parsed and were ignored"
-            );
-        }
     }
 
     if let Some(pem) = additional_ca_bundle {
@@ -381,13 +385,36 @@ fn append_pem(target: &mut String, pem: &str) {
 /// Read, strictly validate, and canonicalize the supervisor's explicitly
 /// requested staged destination bundle.
 pub fn read_additional_ca_bundle(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).into_diagnostic().wrap_err_with(|| {
-        format!(
-            "failed to read --network-additional-ca-bundle at {}",
+    let path_string = path.to_str().ok_or_else(|| {
+        miette!(
+            "failed to read --network-additional-ca-bundle at {}: path is not valid UTF-8",
             path.display()
         )
     })?;
-    let certificates = strict_pem_certificates(&bytes, "--network-additional-ca-bundle")
+    let metadata = std::fs::metadata(path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to stat --network-additional-ca-bundle at {}",
+                path.display()
+            )
+        })?;
+    let shared_cap = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+    if metadata.len() > u64::try_from(shared_cap).expect("usize always fits in u64") {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} exceeds the shared {shared_cap}-byte limit",
+            path.display()
+        ));
+    }
+    // Retain the bounded regular-file read as a second boundary check. This
+    // covers material replaced after driver staging and avoids unbounded
+    // supervisor reads from a malicious mount.
+    let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+        path_string,
+        "additional destination CA bundle (--network-additional-ca-bundle)",
+    )
+    .map_err(|error| miette!("{error}"))?;
+    let certificates = strict_pem_certificates(pem.as_bytes(), "--network-additional-ca-bundle")
         .wrap_err_with(|| format!("invalid staged destination CA bundle at {}", path.display()))?;
     let mut roots = rustls::RootCertStore::empty();
     let expected = certificates.len();
@@ -478,6 +505,7 @@ fn canonical_pem(certificates: &[CertificateDer<'static>]) -> String {
 /// Returns `(added, ignored)` counts. Invalid or unparseable certificates
 /// are silently ignored, matching the behavior of
 /// `RootCertStore::add_parsable_certificates`.
+#[cfg(any(feature = "bundled-ca-roots", test))]
 fn load_pem_certs_into_store(
     root_store: &mut rustls::RootCertStore,
     pem_data: &str,
@@ -814,6 +842,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn staged_additional_bundle_enforces_shared_one_mib_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-additional.pem");
+        let size = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1;
+        std::fs::write(&path, vec![b'x'; size]).unwrap();
+        let error = read_additional_ca_bundle(&path).unwrap_err().to_string();
+        assert!(error.contains("--network-additional-ca-bundle"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "{}-byte limit",
+                openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES
+            )),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn additional_root_trusts_matching_hostname_and_rejects_mismatch() {
         const HOSTNAME: &str = "private.destination.test";
@@ -844,7 +889,22 @@ mod tests {
         let error = handshake(HOSTNAME, "wrong.destination.test")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("certificate"), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("upstream TLS hostname validation failed"),
+            "{error:?}"
+        );
+        assert!(format!("{error:?}").contains("certificate not valid for name"));
+    }
+
+    #[cfg(not(feature = "bundled-ca-roots"))]
+    #[test]
+    fn native_roots_do_not_overlay_the_system_bundle() {
+        let baseline = build_upstream_root_store("", None).unwrap();
+        let system_only = generate_ca_pem();
+        let with_system = build_upstream_root_store(&system_only, None).unwrap();
+        assert_eq!(with_system.len(), baseline.len());
     }
 
     #[test]

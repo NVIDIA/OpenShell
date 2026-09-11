@@ -9,10 +9,11 @@
 //! path from the TOML file.
 
 use base64::Engine as _;
+use openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
 use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -22,31 +23,63 @@ pub const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_cert_
 const ARTIFACT_DIRECTORY: &str = "network-supervisor";
 const ARTIFACT_FILE: &str = "additional-ca.crt";
 
-/// Read, strictly validate, normalize, and stage configured destination roots.
+/// Normalized source material that has not yet been staged as a state artifact.
 ///
-/// An absent or empty list preserves the legacy startup behavior and returns
-/// `None`.  Once a path is configured, every PEM item in every file must be a
-/// usable X.509 certificate.  No valid subset is accepted when another item is
-/// malformed or is a private key.
-pub fn load_from_config(
-    config: &SupervisorNetworkFileSection,
-) -> Result<Option<NetworkSupervisorTrustBundle>> {
-    if config.additional_ca_cert_paths.is_empty() {
-        return Ok(None);
+/// Configuration preflight intentionally uses this type rather than a
+/// [`NetworkSupervisorTrustBundle`], so it can validate operator-provided
+/// sources without creating state directories or files.
+pub struct NormalizedNetworkSupervisorTrust {
+    normalized_pem: Vec<u8>,
+    certificate_count: usize,
+    digest: String,
+}
+
+impl NormalizedNetworkSupervisorTrust {
+    pub fn certificate_count(&self) -> usize {
+        self.certificate_count
     }
 
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Read and strictly normalize configured destination roots without writing a
+/// gateway state artifact.
+///
+/// An absent or empty list preserves the legacy startup behavior and returns
+/// `None`. Once a path is configured, every PEM item in every file must be a
+/// usable X.509 certificate. No valid subset is accepted when another item is
+/// malformed or is a private key.
+pub fn normalize_from_config(
+    config: &SupervisorNetworkFileSection,
+) -> Result<Option<NormalizedNetworkSupervisorTrust>> {
+    normalize_sources(&config.additional_ca_cert_paths)
+}
+
+pub fn stage_normalized(
+    normalized: NormalizedNetworkSupervisorTrust,
+) -> Result<NetworkSupervisorTrustBundle> {
     let state_dir = openshell_core::paths::openshell_state_dir().map_err(|error| {
         Error::config(format!(
             "failed to resolve network trust state directory: {error}"
         ))
     })?;
-    normalize_and_stage(&config.additional_ca_cert_paths, &state_dir)
+    stage_normalized_in(normalized, &state_dir)
 }
 
+#[cfg(test)]
 fn normalize_and_stage(
     source_paths: &[PathBuf],
     state_dir: &Path,
 ) -> Result<Option<NetworkSupervisorTrustBundle>> {
+    let Some(normalized) = normalize_sources(source_paths)? else {
+        return Ok(None);
+    };
+    stage_normalized_in(normalized, state_dir).map(Some)
+}
+
+fn normalize_sources(source_paths: &[PathBuf]) -> Result<Option<NormalizedNetworkSupervisorTrust>> {
     if source_paths.is_empty() {
         return Ok(None);
     }
@@ -57,22 +90,94 @@ fn normalize_and_stage(
         if source_path.as_os_str().is_empty() {
             return Err(config_error(source_path, "path entry is empty"));
         }
-        let source = fs::read(source_path).map_err(|error| {
-            config_error(source_path, format_args!("could not be read: {error}"))
-        })?;
+        let source = read_source_bounded(source_path)?;
         let (pem, count) = normalize_source(source_path, &source)?;
-        normalized.extend_from_slice(&pem);
+        append_normalized(source_path, &mut normalized, &pem)?;
         certificate_count += count;
     }
 
-    let digest = format!("sha256:{:x}", Sha256::digest(&normalized));
-    let artifact_path = stage_artifact(state_dir, &normalized)?;
-    Ok(Some(NetworkSupervisorTrustBundle::new(
-        normalized,
+    Ok(Some(NormalizedNetworkSupervisorTrust {
+        digest: format!("sha256:{:x}", Sha256::digest(&normalized)),
+        normalized_pem: normalized,
         certificate_count,
-        digest,
+    }))
+}
+
+fn read_source_bounded(source_path: &Path) -> Result<Vec<u8>> {
+    let path_metadata = fs::symlink_metadata(source_path)
+        .map_err(|error| config_error(source_path, format_args!("could not be read: {error}")))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(config_error(source_path, "is not a regular file"));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Avoid blocking on a path replaced with a FIFO after the preflight
+        // metadata check. Validate the opened handle below to close the race.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(source_path)
+        .map_err(|error| config_error(source_path, format_args!("could not be read: {error}")))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| config_error(source_path, format_args!("could not be read: {error}")))?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(config_error(source_path, "is not a regular file"));
+    }
+    if opened_metadata.len() > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES as u64 {
+        return Err(config_error(
+            source_path,
+            format_args!(
+                "exceeds the maximum readable size of {MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES} bytes"
+            ),
+        ));
+    }
+
+    let mut source = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1) as u64)
+        .read_to_end(&mut source)
+        .map_err(|error| config_error(source_path, format_args!("could not be read: {error}")))?;
+    if source.len() > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES {
+        return Err(config_error(
+            source_path,
+            format_args!(
+                "exceeds the maximum readable size of {MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(source)
+}
+
+fn append_normalized(source_path: &Path, destination: &mut Vec<u8>, source: &[u8]) -> Result<()> {
+    let combined_size = destination.len().saturating_add(source.len());
+    if combined_size > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES {
+        return Err(config_error(
+            source_path,
+            format_args!(
+                "combined normalized trust bundle exceeds the maximum size of {MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES} bytes"
+            ),
+        ));
+    }
+    destination.extend_from_slice(source);
+    Ok(())
+}
+
+fn stage_normalized_in(
+    normalized: NormalizedNetworkSupervisorTrust,
+    state_dir: &Path,
+) -> Result<NetworkSupervisorTrustBundle> {
+    let artifact_path = stage_artifact(state_dir, &normalized.normalized_pem)?;
+    Ok(NetworkSupervisorTrustBundle::new(
+        normalized.normalized_pem,
+        normalized.certificate_count,
+        normalized.digest,
         artifact_path,
-    )))
+    ))
 }
 
 fn normalize_source(source_path: &Path, source: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -140,37 +245,56 @@ fn validate_pem_envelope(source_path: &Path, source: &[u8]) -> Result<()> {
             "contains malformed PEM data: input is not UTF-8 PEM text",
         )
     })?;
-    let mut in_block = false;
+    let mut begin_label = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if !in_block {
-            if line.starts_with("-----BEGIN ") && line.ends_with("-----") {
-                in_block = true;
-            } else {
-                return Err(config_error(
-                    source_path,
-                    "contains non-PEM content outside certificate blocks",
-                ));
+        if let Some(expected_label) = begin_label {
+            if let Some(end_label) = pem_label(line, "-----END ") {
+                if end_label != expected_label {
+                    return Err(config_error(
+                        source_path,
+                        "contains malformed PEM data: END label does not match BEGIN label",
+                    ));
+                }
+                begin_label = None;
+            } else if pem_label(line, "-----BEGIN ").is_some()
+                || !line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            {
+                return Err(config_error(source_path, "contains malformed PEM data"));
             }
-        } else if line.starts_with("-----END ") && line.ends_with("-----") {
-            in_block = false;
-        } else if !line
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-        {
-            return Err(config_error(source_path, "contains malformed PEM data"));
+        } else if let Some(label) = pem_label(line, "-----BEGIN ") {
+            begin_label = Some(label);
+        } else {
+            return Err(config_error(
+                source_path,
+                "contains non-PEM content outside certificate blocks",
+            ));
         }
     }
-    if in_block {
+    if begin_label.is_some() {
         return Err(config_error(
             source_path,
             "contains malformed PEM data: unterminated PEM block",
         ));
     }
     Ok(())
+}
+
+/// Return a syntactically valid PEM boundary label. Labels are intentionally
+/// compared byte-for-byte, preventing a certificate body from being paired
+/// with a differently labelled END line.
+fn pem_label<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let label = line.strip_prefix(prefix)?.strip_suffix("-----")?;
+    (!label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' '))
+    .then_some(label)
 }
 
 fn stage_artifact(state_dir: &Path, normalized: &[u8]) -> Result<PathBuf> {
@@ -429,5 +553,87 @@ mod tests {
         assert!(message.contains(CONFIG_FIELD));
         assert!(message.contains(&source.display().to_string()));
         assert!(!message.contains(fixture_body));
+    }
+
+    #[test]
+    fn accepts_normalized_output_exactly_at_the_bundle_limit() {
+        let source = Path::new("exact-limit.pem");
+        let mut normalized = Vec::new();
+        append_normalized(
+            source,
+            &mut normalized,
+            &vec![b'x'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES],
+        )
+        .expect("an exactly-at-limit normalized bundle is permitted");
+        assert_eq!(normalized.len(), MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES);
+    }
+
+    #[test]
+    fn rejects_combined_normalized_output_over_the_bundle_limit_without_staging() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = source_dir.path().join("over-limit.pem");
+        let mut normalized = vec![b'x'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES];
+        let error = append_normalized(&source, &mut normalized, b"x")
+            .expect_err("a normalized bundle over the shared limit must be rejected");
+        let message = error.to_string();
+        assert!(message.contains(CONFIG_FIELD));
+        assert!(message.contains("combined normalized trust bundle exceeds"));
+        assert!(message.contains(&MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES.to_string()));
+        assert!(!state_dir.path().join(ARTIFACT_DIRECTORY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_and_device_sources_without_blocking() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let fifo = source_dir.path().join("destination-ca.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create FIFO");
+
+        assert_rejected(&fifo, state_dir.path(), "is not a regular file");
+        assert_rejected(
+            Path::new("/dev/zero"),
+            state_dir.path(),
+            "is not a regular file",
+        );
+    }
+
+    #[test]
+    fn rejects_over_limit_source_reads_without_leaking_source_contents() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "oversized.pem",
+            vec![b's'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1],
+        );
+        let error = normalize_and_stage(std::slice::from_ref(&source), state_dir.path())
+            .expect_err("source reads must be bounded");
+        let message = error.to_string();
+        assert!(message.contains(CONFIG_FIELD));
+        assert!(message.contains("maximum readable size"));
+        assert!(message.contains(&MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES.to_string()));
+        assert!(!message.contains(&"s".repeat(32)));
+        assert!(!state_dir.path().join(ARTIFACT_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn rejects_mismatched_pem_boundary_labels() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "mismatched-label.pem",
+            "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n",
+        );
+        assert_rejected(
+            &source,
+            state_dir.path(),
+            "END label does not match BEGIN label",
+        );
     }
 }

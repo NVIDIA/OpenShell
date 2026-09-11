@@ -169,8 +169,13 @@ s.close()')"
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
+# Keep every gateway-created artifact, including normalized additional CA
+# material, under this invocation's disposable state root. Set this before
+# starting either fixture or gateway so no host-global XDG fallback is used.
 export XDG_CONFIG_HOME="${RUN_STATE_DIR}/config"
 export XDG_DATA_HOME="${RUN_STATE_DIR}/data"
+export XDG_STATE_HOME="${RUN_STATE_DIR}/state"
+mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
 
 GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
 GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
@@ -407,7 +412,23 @@ fi
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
-  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  additional_ca_artifact="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  if [ ! -f "${additional_ca_artifact}" ]; then
+    echo "ERROR: expected normalized additional CA artifact was not created under XDG_STATE_HOME" >&2
+    exit 1
+  fi
+  # Both paths exist after gateway initialization; plain `realpath` is
+  # portable across GNU and BSD/macOS implementations.
+  state_root="$(realpath "${XDG_STATE_HOME}")"
+  artifact_path="$(realpath "${additional_ca_artifact}")"
+  case "${artifact_path}" in
+    "${state_root}"/*) ;;
+    *)
+      echo "ERROR: normalized additional CA artifact escaped XDG_STATE_HOME" >&2
+      exit 1
+      ;;
+  esac
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${artifact_path}"
   export OPENSHELL_E2E_GATEWAY_CONFIG="${GATEWAY_CONFIG}"
 fi
 e2e_export_gateway_restart_metadata \

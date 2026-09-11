@@ -75,16 +75,25 @@ rules:
       - get
   {{- end }}
   {{- if and (ne $workspaceMode "shared") (get $supervisorNetwork "additionalCaConfigMapName") }}
-  # The Kubernetes driver server-side-applies one normalized destination CA
-  # ConfigMap in each selected managed or operator workspace namespace.
+  # The Kubernetes driver reads and server-side-applies only its deterministic,
+  # gateway-scoped destination CA ConfigMap in selected namespaces. CREATE
+  # cannot use resourceNames because Kubernetes authorizes it before the name
+  # is available.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - {{ include "openshell.networkAdditionalCaConfigMapName" . | quote }}
+    verbs:
+      - get
+      - patch
   - apiGroups:
       - ""
     resources:
       - configmaps
     verbs:
-      - get
       - create
-      - patch
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}

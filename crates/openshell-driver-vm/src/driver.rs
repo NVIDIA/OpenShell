@@ -6348,9 +6348,24 @@ async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
 ///
 /// This check happens for every sandbox preparation, including preserved
 /// overlays, so a missing, replaced, non-regular, oversized, or unusable
-/// artifact fails before VM launch. Certificate contents never appear in the
-/// returned diagnostic.
+/// artifact fails before VM launch. It delegates to the shared
+/// `MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES` bounded-reader contract also
+/// used by the supervisor, keeping both deployable limits identical.
+/// Certificate contents never appear in the returned diagnostic.
 async fn read_sandbox_network_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
+    let metadata = tokio::fs::metadata(path).await.map_err(|err| {
+        Status::failed_precondition(format!(
+            "network additional CA artifact '{}' could not be stat'd: {err}",
+            path.display()
+        ))
+    })?;
+    let shared_cap = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+    if metadata.len() > u64::try_from(shared_cap).expect("usize always fits in u64") {
+        return Err(Status::failed_precondition(format!(
+            "network additional CA artifact '{}' exceeds the shared {shared_cap}-byte limit",
+            path.display()
+        )));
+    }
     let path_owned = path.to_path_buf();
     let display_path = path.display().to_string();
     tokio::task::spawn_blocking(move || {
@@ -10808,6 +10823,26 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg.contains("/var/lib/openshell")));
         assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+    }
+
+    #[tokio::test]
+    async fn network_trust_rejects_material_over_the_shared_one_mib_cap() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let artifact = base.join("oversized-additional-ca.crt");
+        let size = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1;
+        fs::write(&artifact, vec![b'x'; size]).unwrap();
+
+        let error = read_sandbox_network_ca_bundle(&artifact)
+            .await
+            .expect_err("oversized network trust must fail before staging");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains(&format!(
+            "{}-byte limit",
+            openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES
+        )));
+        assert!(!error.message().contains("-----BEGIN CERTIFICATE-----"));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]
