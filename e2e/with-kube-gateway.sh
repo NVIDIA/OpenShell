@@ -106,6 +106,11 @@ VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_SOURCE_CONFIG_MAP="openshell-e2e-network-ca-source"
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
@@ -291,6 +296,11 @@ cleanup() {
   if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
       --ignore-not-found >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${ADDITIONAL_CA_SERVER_PID}" ]; then
+    kill "${ADDITIONAL_CA_SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${ADDITIONAL_CA_SERVER_PID}" >/dev/null 2>&1 || true
   fi
 
   if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
@@ -486,6 +496,89 @@ require_cmd() {
     echo "ERROR: $1 is required to run Helm-backed e2e tests" >&2
     exit 2
   fi
+}
+
+start_additional_ca_fixture() {
+  require_cmd openssl
+  require_cmd python3
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+prepare_additional_ca_source() {
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --from-file="ca.crt=${ADDITIONAL_CA_DIR}/ca.crt" \
+    --dry-run=client -o yaml | kctl apply -f -
+}
+
+configure_additional_ca_gateway() {
+  local workload_ref old_checksum new_checksum old_pod_uids current_pod_uids
+  local service_account changed_source
+
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  old_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o json \
+    | jq -r '.spec.template.metadata.annotations["checksum/gateway-config"]')"
+
+  # Upgrade through the production chart value. A changed rendered TOML file
+  # must change the pod-template checksum and roll the gateway.
+  helmctl upgrade "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+    --namespace "${NAMESPACE}" --reuse-values \
+    --set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --wait --timeout 5m
+  new_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o json \
+    | jq -r '.spec.template.metadata.annotations["checksum/gateway-config"]')"
+  if [ -z "${old_checksum}" ] || [ "${old_checksum}" = "${new_checksum}" ]; then
+    echo "ERROR: enabling additional CA delivery did not change the gateway config checksum" >&2
+    return 1
+  fi
+
+  kctl -n "${NAMESPACE}" get configmap "${RELEASE_NAME}-config" \
+    -o jsonpath='{.data.gateway\.toml}' \
+    | grep -Fq 'additional_ca_cert_paths = ["/etc/openshell-tls/network-additional-ca-source/ca.crt"]'
+  kctl -n "${NAMESPACE}" get "${workload_ref}" -o json \
+    | jq -e --arg name "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" '
+        .spec.template.spec.volumes[]
+        | select(.name == "network-additional-ca-source")
+        | .configMap.name == $name
+      ' >/dev/null
+
+  service_account="$(kctl -n "${NAMESPACE}" get "${workload_ref}" \
+    -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+  for verb in get create patch; do
+    kctl auth can-i "${verb}" configmaps -n "${NAMESPACE}" \
+      --as="system:serviceaccount:${NAMESPACE}:${service_account}" \
+      | grep -Fxq yes
+  done
+
+  # Updating only the operator-owned source ConfigMap must not mutate the
+  # workload or roll a pod. Duplicate certificate blocks remain valid input.
+  old_pod_uids="$(kctl -n "${NAMESPACE}" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)"
+  changed_source="${ADDITIONAL_CA_DIR}/ca-updated.crt"
+  cat "${ADDITIONAL_CA_DIR}/ca.crt" "${ADDITIONAL_CA_DIR}/ca.crt" >"${changed_source}"
+  kctl -n "${NAMESPACE}" create configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --from-file="ca.crt=${changed_source}" \
+    --dry-run=client -o yaml | kctl apply -f -
+  sleep 5
+  current_pod_uids="$(kctl -n "${NAMESPACE}" get pods \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort)"
+  if [ "${old_pod_uids}" != "${current_pod_uids}" ]; then
+    echo "ERROR: changing only the additional CA source ConfigMap rolled the gateway" >&2
+    return 1
+  fi
+  if [ "${new_checksum}" != "$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o json \
+    | jq -r '.spec.template.metadata.annotations["checksum/gateway-config"]')" ]; then
+    echo "ERROR: changing only the additional CA source changed the gateway config checksum" >&2
+    return 1
+  fi
+
+  # The source is consumed at gateway startup, so explicitly restart after an
+  # out-of-band source update before running the sandbox trust assertions.
+  kctl -n "${NAMESPACE}" rollout restart "${workload_ref}"
+  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=180s
 }
 
 configure_fixture_container_engine() {
@@ -770,6 +863,20 @@ if [ -z "${HOST_GATEWAY_IP}" ]; then
   echo "         Set OPENSHELL_E2E_HOST_GATEWAY_IP to override." >&2
 fi
 
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  require_cmd jq
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the in-process Kubernetes driver." >&2
+    exit 2
+  fi
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: additional CA e2e requires a host gateway IP." >&2
+    exit 2
+  fi
+  start_additional_ca_fixture
+  prepare_additional_ca_source
+fi
+
 # Import locally-available gateway/supervisor images into the k3d cluster so
 # devs working off local builds don't depend on the configured registry. For
 # kind clusters (used by CI), images must be loaded before this script runs —
@@ -1044,6 +1151,13 @@ else
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    configure_additional_ca_gateway
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+  fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \

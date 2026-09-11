@@ -322,6 +322,15 @@ fn prepare_server_config_with_drivers(
     } else {
         None
     };
+    // Normalize sources now, but defer artifact staging until the selected
+    // driver has been proven able to propagate the bundle. This keeps a
+    // rejected startup/preflight from leaving gateway state behind.
+    let normalized_network_trust = file
+        .as_ref()
+        .map(|file| crate::network_trust::normalize_from_config(&file.openshell.supervisor.network))
+        .transpose()
+        .map_err(|error| miette::miette!("{error}"))?
+        .flatten();
     if let Some(file) = file.as_ref() {
         merge_file_into_args(args, &file.openshell.gateway, matches);
     }
@@ -557,10 +566,46 @@ fn prepare_server_config_with_drivers(
         config.gateway_jwt = Some(jwt);
     }
 
+    if let Some(normalized) = normalized_network_trust.as_ref() {
+        // Use the same resolver as runtime construction, with the explicit
+        // configuration marker but no synthetic/staged artifact. This rejects
+        // remote endpoints and factories that have not opted into trust
+        // propagation before any state is written.
+        let driver_startup = crate::compute::driver_config::DriverStartupContext {
+            file: file.as_ref(),
+            guest_tls: guest_tls.as_ref(),
+            network_trust: None,
+            network_trust_configured: true,
+            gateway_port: config.bind_address.port(),
+            gateway_tls_enabled: config.tls.is_some(),
+            endpoint_overrides: &config.compute_driver_endpoints,
+        };
+        crate::validate_compute_driver_config(
+            compute_drivers,
+            compute_driver.name(),
+            &config.name,
+            config.bind_address,
+            &config.log_level,
+            driver_startup,
+            false,
+        )
+        .map_err(|error| {
+            miette::miette!(
+                "Network supervisor additional destination trust configured: certificate_count={} digest={}: {error}",
+                normalized.certificate_count(),
+                normalized.digest()
+            )
+        })?;
+    }
+    let network_trust = normalized_network_trust
+        .map(crate::network_trust::stage_normalized)
+        .transpose()?;
+
     Ok(ServerStartupConfig {
         config,
         config_file: file,
         guest_tls,
+        network_trust,
         compute_driver,
         legacy_compute_driver_env_seen,
     })
@@ -597,6 +642,13 @@ async fn run_from_args(
 
     if prepared.legacy_compute_driver_env_seen {
         warn!("OPENSHELL_DRIVERS is deprecated; migrate to OPENSHELL_COMPUTE_DRIVER");
+    }
+    if let Some(bundle) = prepared.network_trust.as_ref() {
+        info!(
+            certificate_count = bundle.certificate_count(),
+            digest = bundle.digest(),
+            "Network supervisor additional destination trust configured"
+        );
     }
 
     let has_client_ca = prepared
@@ -679,6 +731,10 @@ impl crate::ComputeDriverFactory for PreflightTestFactory {
     }
 
     fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
+    fn supports_network_supervisor_trust(&self) -> bool {
         true
     }
 
@@ -784,6 +840,12 @@ fn run_effective_config_preflight(
         let empty_file = ConfigFile::default();
         let semantic_file = file.as_ref().unwrap_or(&empty_file);
         validate_preflight_semantics(&run, matches, semantic_file, selected_registration)?;
+        // Preflight must exercise the same full source parsing as startup,
+        // while deliberately leaving state artifacts untouched.
+        let network_trust_configured = crate::network_trust::normalize_from_config(
+            &semantic_file.openshell.supervisor.network,
+        )?
+        .is_some();
 
         let mut endpoint_overrides = BTreeMap::new();
         if let Some(selection) = selection.as_ref()
@@ -794,6 +856,8 @@ fn run_effective_config_preflight(
         let driver_startup = crate::compute::driver_config::DriverStartupContext {
             file: file.as_ref(),
             guest_tls: None,
+            network_trust: None,
+            network_trust_configured,
             gateway_port: run.port,
             gateway_tls_enabled: !run.disable_tls,
             endpoint_overrides: &endpoint_overrides,
@@ -1227,6 +1291,10 @@ mod tests {
         }
 
         fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
+        fn supports_network_supervisor_trust(&self) -> bool {
             true
         }
 
@@ -2126,6 +2194,53 @@ mod tests {
     }
 
     #[test]
+    fn config_preflight_normalizes_network_trust_without_creating_an_artifact() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        let state_parent = tempfile::tempdir().unwrap();
+        let state_home = state_parent.path().join("not-created");
+        let source = source_home.path().join("destination-ca.pem");
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state_home.to_str().unwrap());
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "test",
+            "--disable-tls",
+        ]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("valid trust source and capable selected driver pass preflight");
+
+        assert!(
+            !state_home.exists(),
+            "preflight must not create a normalized trust artifact"
+        );
+    }
+
+    #[test]
     fn config_preflight_explicit_path_overrides_environment_selection() {
         let _lock = ENV_LOCK
             .lock()
@@ -2523,6 +2638,107 @@ mod tests {
             None,
             test_registry("local", true, true).get("local")
         ));
+    }
+
+    #[test]
+    fn prepare_server_config_normalizes_global_network_trust_before_driver_startup() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap());
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        let source = source_dir.path().join("destination-ca.pem");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config_path = config_dir.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+            "--compute-driver",
+            "local",
+        ]);
+        let prepared = super::prepare_server_config_with_drivers(
+            &mut args,
+            &matches,
+            &detected_local_registry(),
+        )
+        .expect("global network trust should normalize during startup preparation");
+        let bundle = prepared.network_trust.expect("normalized trust bundle");
+        assert_eq!(bundle.certificate_count(), 1);
+        assert!(bundle.artifact_path().is_file());
+        assert_eq!(std::fs::read(bundle.artifact_path()).unwrap(), bundle.pem());
+    }
+
+    #[test]
+    fn prepare_server_config_rejects_network_trust_endpoint_override_without_artifact() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap());
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["destination.example".into()])
+            .expect("test certificate");
+        let source = source_dir.path().join("destination-ca.pem");
+        std::fs::write(&source, certificate.cert.pem()).unwrap();
+        let config_path = config_dir.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+            "--compute-driver",
+            "local",
+            "--compute-driver-socket",
+            "/tmp/local.sock",
+        ]);
+        let result = super::prepare_server_config_with_drivers(
+            &mut args,
+            &matches,
+            &detected_local_registry(),
+        );
+        let Err(error) = result else {
+            panic!("network trust cannot be silently discarded by a remote endpoint");
+        };
+
+        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("unsupported remote endpoint"));
+        assert!(
+            !state.path().join("network-supervisor").exists(),
+            "rejected endpoint override must not stage a trust artifact"
+        );
     }
 
     #[test]

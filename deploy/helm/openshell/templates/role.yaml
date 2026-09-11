@@ -1,5 +1,8 @@
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
+{{- $workspaceResourcesEnabled := include "openshell.workspaceResourcesEnabled" . -}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
+{{- if and (eq $workspaceMode "shared") (or $workspaceResourcesEnabled $additionalCaEnabled) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -10,6 +13,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if $workspaceResourcesEnabled }}
   - apiGroups:
       - agents.x-k8s.io
     resources:
@@ -43,4 +47,27 @@ rules:
       - pods
     verbs:
       - get
+  {{- end }}
+  {{- if $additionalCaEnabled }}
+  # The Kubernetes driver reads and server-side-applies only its deterministic,
+  # gateway-scoped destination CA ConfigMap. CREATE cannot use resourceNames:
+  # Kubernetes authorizes creates before the object name is available. This is
+  # a namespace-wide ConfigMap-create capability; use a dedicated gateway
+  # service account when that boundary matters.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - {{ include "openshell.networkAdditionalCaConfigMapName" . | quote }}
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+  {{- end }}
 {{- end }}

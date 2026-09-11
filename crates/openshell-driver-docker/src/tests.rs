@@ -120,6 +120,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cert: PathBuf::from("/tmp/tls.crt"),
             key: PathBuf::from("/tmp/tls.key"),
         }),
+        network_trust_artifact: None,
         daemon_version: "28.0.0".to_string(),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
@@ -2415,6 +2416,15 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
         create_body.cmd,
         Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|config| config.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .all(|bind| !bind.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)))
+    );
     assert_eq!(
         create_body
             .labels
@@ -2450,6 +2460,129 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
             .and_then(|endpoints| endpoints.get(DEFAULT_DOCKER_NETWORK_NAME)),
         Some(&EndpointSettings::default())
     );
+}
+
+#[test]
+fn configured_network_trust_adds_one_read_only_bind_and_operator_argument() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    fs::write(&artifact, b"normalized certificate fixture").unwrap();
+    let mut config = runtime_config();
+    config.network_trust_artifact = Some(artifact.clone());
+
+    let create_body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let binds = create_body.host_config.unwrap().binds.unwrap();
+    let destination_binds = binds
+        .iter()
+        .filter(|bind| bind.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destination_binds,
+        vec![&format!(
+            "{}:{NETWORK_ADDITIONAL_CA_BUNDLE_PATH}:ro,z",
+            artifact.display()
+        )]
+    );
+
+    let command = create_body.cmd.unwrap();
+    let argument_positions = command
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            (argument == "--network-additional-ca-bundle").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(argument_positions, vec![2]);
+    assert_eq!(
+        command.get(argument_positions[0] + 1).map(String::as_str),
+        Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+    );
+    assert!(create_body.env.unwrap().iter().all(|entry| {
+        !entry.contains("NETWORK_ADDITIONAL_CA")
+            && !entry.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+    }));
+}
+
+#[test]
+fn user_command_and_environment_cannot_replace_network_trust_argument() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    fs::write(&artifact, b"normalized certificate fixture").unwrap();
+    let mut config = runtime_config();
+    config.network_trust_artifact = Some(artifact);
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.command = vec![
+        "--network-additional-ca-bundle".to_string(),
+        "/tmp/user-controlled.crt".to_string(),
+    ];
+    spec.environment.insert(
+        "SSL_CERT_FILE".to_string(),
+        "/tmp/user-controlled.crt".to_string(),
+    );
+
+    let command = build_container_create_body(&sandbox, &config)
+        .unwrap()
+        .cmd
+        .unwrap();
+    let arguments = command
+        .windows(2)
+        .filter(|args| args[0] == "--network-additional-ca-bundle")
+        .collect::<Vec<_>>();
+    assert_eq!(arguments.len(), 1);
+    assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+    assert!(!command.iter().any(|arg| arg == "/tmp/user-controlled.crt"));
+}
+
+#[test]
+fn user_mount_cannot_replace_network_trust_destination() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("user-ca.crt");
+    fs::write(&source, b"user-controlled fixture").unwrap();
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": source,
+            "target": NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+        }]
+    })));
+
+    let error = build_container_create_body(&sandbox, &config)
+        .expect_err("user mount must not mask network trust material");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("reserved OpenShell path"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn missing_network_trust_artifact_fails_container_spec_without_material() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing-additional-ca.crt");
+    let mut config = runtime_config();
+    config.network_trust_artifact = Some(missing.clone());
+
+    let error = build_container_create_body(&test_sandbox(), &config)
+        .expect_err("missing gateway-owned artifact must fail closed");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("failed to stage network additional CA artifact")
+    );
+    assert!(error.message().contains(&missing.display().to_string()));
+    assert!(!error.message().contains("BEGIN CERTIFICATE"));
 }
 
 #[test]

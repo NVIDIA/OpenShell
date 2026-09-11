@@ -231,6 +231,11 @@ struct Args {
     /// re-signed upstream certificates and the sandbox trust bundle.
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
+
+    /// Driver-staged PEM roots that augment destination TLS trust. This is an
+    /// operator-owned argv input and deliberately has no environment alias.
+    #[arg(long)]
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -712,6 +717,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            args.network_additional_ca_bundle,
         )
         .await
     });
@@ -750,6 +756,7 @@ fn resolve_default_command(command: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
@@ -848,6 +855,30 @@ mod tests {
     fn mode_rejects_empty_value() {
         let err = "".parse::<Mode>().unwrap_err();
         assert!(err.contains("at least one"));
+    }
+
+    #[test]
+    fn network_additional_ca_bundle_is_operator_only_and_proxy_independent() {
+        let path = openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+        let args =
+            Args::try_parse_from(["openshell-sandbox", "--network-additional-ca-bundle", path])
+                .expect("dedicated destination trust argument should parse");
+        assert_eq!(
+            args.network_additional_ca_bundle.as_deref(),
+            Some(Path::new(path))
+        );
+        assert!(args.upstream_proxy.is_none());
+        assert!(args.upstream_proxy_ca_bundle.is_none());
+
+        let command = Args::command();
+        let argument = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "network_additional_ca_bundle")
+            .expect("argument metadata");
+        assert!(
+            argument.get_env().is_none(),
+            "sandbox environment must not select destination trust material"
+        );
     }
 
     #[cfg(target_os = "linux")]

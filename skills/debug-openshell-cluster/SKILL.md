@@ -325,6 +325,71 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
 
+#### Additional destination CA ConfigMap
+
+When `supervisor.network.additionalCaConfigMapName` is set, Helm must mount the
+**source** operator ConfigMap's `ca.crt` key into the gateway at
+`/etc/openshell-tls/network-additional-ca-source/ca.crt`. The rendered
+`gateway.toml` must contain the global (not Kubernetes-driver-local) setting:
+
+```toml
+[openshell.supervisor.network]
+additional_ca_cert_paths = ["/etc/openshell-tls/network-additional-ca-source/ca.crt"]
+```
+
+Inspect the source, render, and live gateway mount before inspecting sandbox
+pods:
+
+```bash
+helm -n openshell get values openshell | grep -A3 additionalCaConfigMapName
+kubectl -n openshell get configmap <source-configmap> -o jsonpath='{.data.ca\.crt}' >/dev/null
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A2 '^\[openshell.supervisor.network\]'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="network-additional-ca-source")]}{"\n"}'
+```
+
+At sandbox creation, the Kubernetes driver normalizes the source and manages
+`openshell-network-additional-ca-<effective-gateway-id>` in the target sandbox
+namespace. The effective gateway ID is `server.sandboxJwt.gatewayId`, or the
+chart fullname when it is unset. The managed ConfigMap must have
+`openshell.ai/managed-by=openshell` and the matching
+`openshell.ai/gateway-id` label. The chart grants `get`/`patch` only on this
+exact name and separate unrestricted `create` (Kubernetes cannot restrict a
+create with `resourceNames`). Enabling this gives the gateway/driver service
+account namespace-wide ConfigMap-create authority. In managed/operator modes,
+the chart's ClusterRoleBinding makes that permission cluster-wide for the bound
+service account; prefer a dedicated service account and scoped bindings when
+that boundary matters. Check both the object and authorization:
+
+```bash
+kubectl -n <sandbox-namespace> get configmap \
+  openshell-network-additional-ca-<effective-gateway-id> --show-labels
+kubectl auth can-i get configmaps/openshell-network-additional-ca-<effective-gateway-id> \
+  -n <sandbox-namespace> --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i patch configmaps/openshell-network-additional-ca-<effective-gateway-id> \
+  -n <sandbox-namespace> --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i create configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+```
+
+A `not owned by this gateway` error means the deterministic name exists with
+foreign or mismatched labels; do not relabel it blindly. Investigate its owner
+and either remove/rename the foreign object after confirming it is unused, or
+use the matching gateway identity. A server-side-apply conflict from a
+previous OpenShell field manager should self-heal after ownership validation
+because the driver force-applies the managed object. Any error deliberately
+omits certificate contents; inspect the source object separately rather than
+copying PEM into logs or tickets.
+
+Changing source ConfigMap contents does not reload the gateway or a running
+supervisor: restart the gateway to reread/normalize it, then recreate or
+restart affected sandboxes. Removing the Helm setting means newly created or
+recreated sandbox pods have no additional-CA volume/mount, but existing running
+pods retain startup trust until restarted. The driver intentionally has no
+cluster-wide list/delete permission; unused managed ConfigMaps can remain.
+After all sandboxes are migrated, verify the exact name and labels above and
+explicitly delete that ConfigMap in each applicable namespace. Do not add broad
+list/delete RBAC as a cleanup workaround.
+
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
 retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and

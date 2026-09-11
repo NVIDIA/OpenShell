@@ -9,7 +9,7 @@
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{Error, Result};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -109,6 +109,14 @@ impl GuestTlsPaths {
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
     pub guest_tls: Option<&'a GuestTlsPaths>,
+    /// A staged artifact for runtime driver construction. This is deliberately
+    /// absent during effective-config preflight.
+    pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    /// Whether destination trust sources were configured and normalized.
+    ///
+    /// This remains available during preflight so selection can reject a
+    /// driver that cannot propagate trust, without fabricating an artifact.
+    pub network_trust_configured: bool,
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
@@ -229,6 +237,8 @@ mod tests {
         DriverStartupContext {
             file,
             guest_tls: None,
+            network_trust: None,
+            network_trust_configured: false,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides,

@@ -137,6 +137,11 @@ PODMAN_SOCKET=""
 GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_PORT=""
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
   echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
@@ -151,6 +156,7 @@ cleanup() {
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
   e2e_stop_process "${DRIVER_PID}" "external Podman compute driver"
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
 
   local sandbox_ids=""
   if command -v podman >/dev/null 2>&1; then
@@ -205,6 +211,11 @@ cleanup() {
     echo "=== podman service log (preserved for debugging) ==="
     cat "${PODMAN_SERVICE_LOG}" || true
     echo "=== end podman service log ==="
+  fi
+  if [ "${exit_code}" -ne 0 ] && [ -f "${ADDITIONAL_CA_SERVER_LOG}" ]; then
+    echo "=== additional CA HTTPS fixture log ==="
+    cat "${ADDITIONAL_CA_SERVER_LOG}" || true
+    echo "=== end additional CA HTTPS fixture log ==="
   fi
 
   if [ -n "${PODMAN_SERVICE_PID}" ]; then
@@ -434,6 +445,10 @@ ensure_podman_supervisor_image() {
 }
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the wrapper-managed Podman gateway." >&2
+    exit 2
+  fi
   case "${OPENSHELL_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
@@ -579,6 +594,19 @@ PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
 export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
+start_additional_ca_fixture() {
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the in-process Podman driver." >&2
+    exit 2
+  fi
+  start_additional_ca_fixture
+fi
+
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -603,6 +631,10 @@ ensure_e2e_podman_network "${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_DRIVER="podman"
 export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  export OPENSHELL_E2E_GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 e2e_generate_gateway_jwt "${JWT_DIR}"
@@ -626,6 +658,20 @@ e2e_write_podman_gateway_config \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
   "${OPENSHELL_OIDC_ISSUER:-}"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  CONFIG_WITH_ADDITIONAL_CA="${GATEWAY_CONFIG}.additional-ca"
+  awk -v ca_path="$(e2e_podman_toml_string "${ADDITIONAL_CA_DIR}/ca.crt")" '
+    !inserted && $0 == "[openshell.drivers.podman]" {
+      print "[openshell.supervisor.network]"
+      print "additional_ca_cert_paths = [" ca_path "]"
+      print ""
+      inserted = 1
+    }
+    { print }
+    END { if (!inserted) exit 42 }
+  ' "${GATEWAY_CONFIG}" >"${CONFIG_WITH_ADDITIONAL_CA}"
+  mv "${CONFIG_WITH_ADDITIONAL_CA}" "${GATEWAY_CONFIG}"
+fi
 if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
   cp "${GATEWAY_CONFIG}" "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE}"
 fi

@@ -29,7 +29,7 @@ on:
         required: false
         type: string
         default: >-
-          [{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"}]
+          [{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"},{"suite":"additional-ca","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"OPENSHELL_E2E_PODMAN_TEST=additional_ca mise run --no-deps --skip-deps e2e:podman"}]
 
 permissions:
   actions: read

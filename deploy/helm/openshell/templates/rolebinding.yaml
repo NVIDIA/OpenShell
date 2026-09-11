@@ -1,5 +1,7 @@
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
+{{- if and (eq $workspaceMode "shared") (or (include "openshell.workspaceResourcesEnabled" .) $additionalCaEnabled) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1

@@ -51,6 +51,9 @@ supervisor:
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
   topology: "combined"
+  network:
+    # -- Existing operator-managed ConfigMap containing additional destination CA certificates in the ca.crt key. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sidecar:
     # -- UID for relaxed long-running network sidecars in sidecar topology.
     # Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants

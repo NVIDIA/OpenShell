@@ -44,6 +44,98 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+# Generate one ephemeral private destination CA and matching-host HTTPS fixture
+# for every compute-driver lane. The caller owns cleanup of the returned PID.
+e2e_start_additional_ca_fixture() {
+  local fixture_dir=$1
+  local fixture_log=$2
+  local pid_var=$3
+  local port_var=$4
+  local fixture_pid fixture_port
+
+  mkdir -p "${fixture_dir}"
+  (
+    umask 077
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+      -out "${fixture_dir}/ca.key" >/dev/null 2>&1
+    openssl req -x509 -new -key "${fixture_dir}/ca.key" \
+      -out "${fixture_dir}/ca.crt" -days 1 \
+      -subj '/CN=OpenShell additional CA e2e' \
+      -addext 'basicConstraints=critical,CA:TRUE' \
+      -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+      -out "${fixture_dir}/server.key" >/dev/null 2>&1
+    openssl req -new -key "${fixture_dir}/server.key" \
+      -out "${fixture_dir}/server.csr" \
+      -subj '/CN=host.openshell.internal' >/dev/null 2>&1
+    cat >"${fixture_dir}/server.ext" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:host.openshell.internal
+EOF
+    openssl x509 -req -in "${fixture_dir}/server.csr" \
+      -CA "${fixture_dir}/ca.crt" -CAkey "${fixture_dir}/ca.key" \
+      -CAcreateserial -out "${fixture_dir}/server.crt" -days 1 \
+      -extfile "${fixture_dir}/server.ext" >/dev/null 2>&1
+  )
+
+  fixture_port="$(e2e_pick_port)"
+  python3 -u - "${fixture_port}" \
+    "${fixture_dir}/server.crt" "${fixture_dir}/server.key" \
+    >"${fixture_log}" 2>&1 <<'PY' &
+import http.server
+import ssl
+import sys
+
+port = int(sys.argv[1])
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[2], sys.argv[3])
+
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Hostname-mismatch probes intentionally abort during TLS setup.
+        pass
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"additional_ca":"trusted"}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+server = Server(('0.0.0.0', port), Handler)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+print('additional-ca-server-listening', flush=True)
+server.serve_forever()
+PY
+  fixture_pid=$!
+  printf -v "${pid_var}" '%s' "${fixture_pid}"
+  printf -v "${port_var}" '%s' "${fixture_port}"
+
+  local elapsed=0
+  while [ "${elapsed}" -lt 30 ]; do
+    if ! kill -0 "${fixture_pid}" 2>/dev/null; then
+      echo "ERROR: additional CA HTTPS fixture exited before becoming ready" >&2
+      return 1
+    fi
+    if curl -kfsS --max-time 2 "https://127.0.0.1:${fixture_port}/" >/dev/null 2>&1; then
+      export OPENSHELL_E2E_ADDITIONAL_CA_PORT="${fixture_port}"
+      export OPENSHELL_E2E_ADDITIONAL_CA_CERT="${fixture_dir}/ca.crt"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "ERROR: additional CA HTTPS fixture did not become ready" >&2
+  return 1
+}
+
 e2e_generate_pki() {
   local gateway_bin=$1
   local pki_dir=$2

@@ -65,6 +65,8 @@ const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOK
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
+const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
@@ -479,6 +481,45 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
         args.push(PROXY_CA_MOUNT_PATH.to_string());
     }
     args
+}
+
+/// Build the destination-trust argument independently of corporate proxy
+/// configuration. The gateway-owned host path is never exposed in argv.
+fn network_trust_cli_args(network_trust_artifact: Option<&Path>) -> Vec<String> {
+    network_trust_artifact.map_or_else(Vec::new, |_| {
+        vec![
+            "--network-additional-ca-bundle".to_string(),
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+        ]
+    })
+}
+
+fn network_trust_mount(path: &Path) -> Result<Mount, ComputeDriverError> {
+    let source = path.to_str().ok_or_else(|| {
+        ComputeDriverError::Precondition(format!(
+            "network additional CA artifact path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    driver_mounts::validate_absolute_mount_source(source, "network additional CA artifact")
+        .map_err(ComputeDriverError::Precondition)?;
+    if !path.is_file() {
+        return Err(ComputeDriverError::Precondition(format!(
+            "failed to stage network additional CA artifact: '{}' does not exist or is not a file",
+            path.display()
+        )));
+    }
+
+    let mut options = vec!["ro".into(), "rbind".into()];
+    if is_selinux_enabled() {
+        options.push("z".into());
+    }
+    Ok(Mount {
+        kind: "bind".into(),
+        source: source.to_string(),
+        destination: NETWORK_ADDITIONAL_CA_BUNDLE_PATH.into(),
+        options,
+    })
 }
 
 fn build_env(
@@ -1000,7 +1041,13 @@ pub fn try_build_container_spec_with_token(
     } else {
         None
     };
-    build_container_spec_with_token_and_gpu_devices(sandbox, config, token_secret_name, cdi_devices)
+    build_container_spec_with_token_and_gpu_devices(
+        sandbox,
+        config,
+        token_secret_name,
+        cdi_devices,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1009,6 +1056,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     config: &PodmanComputeConfig,
     token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
+    network_trust_artifact: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     build_container_spec_for_image(
@@ -1021,6 +1069,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         "",
         None,
         None,
+        network_trust_artifact,
     )
 }
 
@@ -1035,6 +1084,7 @@ pub fn build_container_spec_for_image(
     oci_user: &str,
     supervisor_bin_path: Option<&Path>,
     tls_secret_names: Option<&[String; 3]>,
+    network_trust_artifact: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
@@ -1091,6 +1141,7 @@ pub fn build_container_spec_for_image(
         driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
     ];
     command.extend(upstream_proxy_cli_args(config));
+    command.extend(network_trust_cli_args(network_trust_artifact));
 
     let container_spec = ContainerSpec {
         name,
@@ -1324,6 +1375,12 @@ pub fn build_container_spec_for_image(
                     destination: TLS_KEY_MOUNT_PATH.into(),
                     options: ro,
                 });
+            }
+            // Stage gateway-normalized destination trust independently of
+            // corporate proxy trust. The fixed guest path is operator-owned,
+            // read-only, and never exposed through the sandbox environment.
+            if let Some(network_trust_artifact) = network_trust_artifact {
+                m.push(network_trust_mount(network_trust_artifact)?);
             }
             // Bind-mount the corporate proxy CA bundle read-only when
             // configured. A CA certificate is not secret, so unlike the proxy
@@ -1673,6 +1730,7 @@ mod tests {
             "app:staff",
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1760,6 +1818,7 @@ mod tests {
             &config,
             None,
             Some(&gpu_devices),
+            None,
         )
         .unwrap();
 
@@ -1781,7 +1840,8 @@ mod tests {
         let config = test_config();
 
         let spec =
-            build_container_spec_with_token_and_gpu_devices(&sandbox, &config, None, None).unwrap();
+            build_container_spec_with_token_and_gpu_devices(&sandbox, &config, None, None, None)
+                .unwrap();
 
         assert!(spec.get("devices").is_none());
     }
@@ -2273,6 +2333,187 @@ mod tests {
             ),
             "no CA bundle mount without operator config"
         );
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| { m["destination"].as_str() == Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH) }),
+            "no destination CA mount without global config"
+        );
+        assert!(
+            !spec_command(&spec)
+                .iter()
+                .any(|arg| arg == "--network-additional-ca-bundle"),
+            "no destination CA argument without global config"
+        );
+    }
+
+    fn build_spec_with_network_trust(
+        sandbox: &DriverSandbox,
+        config: &PodmanComputeConfig,
+        artifact: &Path,
+    ) -> Result<Value, ComputeDriverError> {
+        let image = resolve_image(sandbox, config);
+        build_container_spec_for_image(
+            sandbox,
+            config,
+            None,
+            None,
+            image,
+            image,
+            "",
+            None,
+            None,
+            Some(artifact),
+        )
+    }
+
+    #[test]
+    fn destination_trust_is_staged_for_rootful_and_rootless_specs_without_enabling_proxy() {
+        let artifact =
+            crate::test_utils::unique_socket_path("network-trust-spec").with_extension("crt");
+        std::fs::write(&artifact, b"normalized certificate fixture").unwrap();
+
+        for userns in [None, Some("auto".to_string())] {
+            let sandbox = test_sandbox("network-ca-id", "network-ca-name");
+            let config = PodmanComputeConfig {
+                userns,
+                ..test_config()
+            };
+            let spec = build_spec_with_network_trust(&sandbox, &config, &artifact).unwrap();
+            let mounts = spec["mounts"].as_array().expect("mounts array");
+            let destination_mounts = mounts
+                .iter()
+                .filter(|mount| {
+                    mount["destination"].as_str() == Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(destination_mounts.len(), 1);
+            assert_eq!(destination_mounts[0]["source"].as_str(), artifact.to_str());
+            assert_eq!(destination_mounts[0]["type"].as_str(), Some("bind"));
+            assert!(
+                destination_mounts[0]["options"]
+                    .as_array()
+                    .expect("mount options")
+                    .iter()
+                    .any(|option| option.as_str() == Some("ro"))
+            );
+
+            let command = spec_command(&spec);
+            let arguments = command
+                .windows(2)
+                .filter(|args| args[0] == "--network-additional-ca-bundle")
+                .collect::<Vec<_>>();
+            assert_eq!(arguments.len(), 1);
+            assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+            assert!(
+                !command
+                    .iter()
+                    .any(|arg| arg.starts_with("--upstream-proxy"))
+            );
+            assert!(
+                spec["env"]
+                    .as_object()
+                    .expect("env object")
+                    .iter()
+                    .all(|(key, value)| {
+                        !key.contains("NETWORK_ADDITIONAL_CA")
+                            && value.as_str() != Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+                    })
+            );
+        }
+
+        let _ = std::fs::remove_file(artifact);
+    }
+
+    #[test]
+    fn destination_trust_and_proxy_ca_keep_distinct_mounts_and_arguments() {
+        let artifact =
+            crate::test_utils::unique_socket_path("network-proxy-trust").with_extension("crt");
+        std::fs::write(&artifact, b"normalized certificate fixture").unwrap();
+        let sandbox = test_sandbox("network-proxy-id", "network-proxy-name");
+        let mut config = test_config();
+        config.https_proxy = Some("https://proxy.corp.com:3130".to_string());
+        config.proxy_ca_bundle = Some("/host/proxy-ca.pem".to_string());
+
+        let spec = build_spec_with_network_trust(&sandbox, &config, &artifact).unwrap();
+        let command = spec_command(&spec);
+        assert!(command.windows(2).any(|args| {
+            args == [
+                "--network-additional-ca-bundle",
+                NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+            ]
+        }));
+        assert!(command.windows(2).any(|args| {
+            args == [
+                "--upstream-proxy-ca-bundle",
+                "/etc/openshell/tls/proxy/ca-bundle.pem",
+            ]
+        }));
+        let destinations = spec["mounts"]
+            .as_array()
+            .expect("mounts array")
+            .iter()
+            .filter_map(|mount| mount["destination"].as_str())
+            .collect::<Vec<_>>();
+        assert!(destinations.contains(&NETWORK_ADDITIONAL_CA_BUNDLE_PATH));
+        assert!(destinations.contains(&"/etc/openshell/tls/proxy/ca-bundle.pem"));
+
+        let _ = std::fs::remove_file(artifact);
+    }
+
+    #[test]
+    fn missing_destination_trust_artifact_fails_closed_without_material() {
+        let artifact =
+            crate::test_utils::unique_socket_path("missing-network-trust").with_extension("crt");
+        let error = build_spec_with_network_trust(
+            &test_sandbox("missing-ca-id", "missing-ca-name"),
+            &test_config(),
+            &artifact,
+        )
+        .expect_err("missing gateway-owned artifact must fail staging");
+
+        assert!(matches!(error, ComputeDriverError::Precondition(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to stage network additional CA artifact")
+        );
+        assert!(error.to_string().contains(&artifact.display().to_string()));
+        assert!(!error.to_string().contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn sandbox_inputs_cannot_replace_destination_trust_launch_contract() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let artifact =
+            crate::test_utils::unique_socket_path("protected-network-trust").with_extension("crt");
+        std::fs::write(&artifact, b"normalized certificate fixture").unwrap();
+        let mut sandbox = test_sandbox("protected-ca-id", "protected-ca-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            command: vec![
+                "--network-additional-ca-bundle".to_string(),
+                "/tmp/user-ca.crt".to_string(),
+            ],
+            environment: std::collections::HashMap::from([(
+                "OPENSHELL_NETWORK_ADDITIONAL_CA_BUNDLE".to_string(),
+                "/tmp/user-ca.crt".to_string(),
+            )]),
+            template: Some(DriverSandboxTemplate::default()),
+            ..Default::default()
+        });
+
+        let spec = build_spec_with_network_trust(&sandbox, &test_config(), &artifact).unwrap();
+        let command = spec_command(&spec);
+        let arguments = command
+            .windows(2)
+            .filter(|args| args[0] == "--network-additional-ca-bundle")
+            .collect::<Vec<_>>();
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+        assert!(!command.iter().any(|arg| arg == "/tmp/user-ca.crt"));
+
+        let _ = std::fs::remove_file(artifact);
     }
 
     #[test]
@@ -2909,25 +3150,33 @@ mod tests {
     fn driver_config_rejects_reserved_mount_targets() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
-        let mut sandbox = test_sandbox("test-id", "test-name");
-        sandbox.spec = Some(DriverSandboxSpec {
-            template: Some(DriverSandboxTemplate {
-                driver_config: Some(json_struct(serde_json::json!({
-                    "mounts": [{
-                        "type": "volume",
-                        "source": "work-nfs",
-                        "target": "/etc/openshell/tls/client"
-                    }]
-                }))),
+        for target in [
+            "/etc/openshell/tls/client",
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+        ] {
+            let mut sandbox = test_sandbox("test-id", "test-name");
+            sandbox.spec = Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "mounts": [{
+                            "type": "volume",
+                            "source": "work-nfs",
+                            "target": target
+                        }]
+                    }))),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let config = test_config();
+            });
+            let config = test_config();
 
-        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+            let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.to_string().contains("reserved OpenShell path"));
+            assert!(
+                err.to_string().contains("reserved OpenShell path"),
+                "target {target}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -3356,6 +3605,7 @@ mod tests {
             image,
             "",
             Some(Path::new("/host/cache/openshell-sandbox")),
+            None,
             None,
         )
         .unwrap();

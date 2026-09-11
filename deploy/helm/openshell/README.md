@@ -77,6 +77,69 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
+### Additional destination CAs
+
+Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
+TLS destinations signed by a private CA:
+
+```shell
+kubectl create configmap private-destination-ca -n openshell \
+  --from-file=ca.crt=/path/to/ca.crt
+```
+
+Then set the source ConfigMap name:
+
+```yaml
+supervisor:
+  network:
+    additionalCaConfigMapName: private-destination-ca
+```
+
+The chart mounts the source into the gateway and renders
+`[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
+and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
+separate managed ConfigMap in each target sandbox namespace and mounts it only
+into the container that runs network supervision. The configured roots augment
+default destination trust. They do not configure the corporate proxy, OIDC, or
+gateway callback mTLS trust.
+
+Changing only the source ConfigMap does not roll or reload the gateway. Restart
+the gateway, then recreate or restart affected sandboxes to use the new roots.
+Removing `additionalCaConfigMapName` removes the global TOML setting; newly
+created or recreated sandbox pods then have no additional-CA volume or mount.
+Existing running sandbox supervisors retain their startup trust until they are
+restarted or recreated.
+
+The driver manages the deterministic name
+`openshell-network-additional-ca-<effective-gateway-id>` (the effective ID is
+`server.sandboxJwt.gatewayId`, or the chart fullname when unset). Its `get` and
+`patch` permissions must be restricted to that exact name; `create` must remain
+a separate unrestricted ConfigMap permission because Kubernetes cannot apply
+`resourceNames` to create authorization. Enabling this therefore gives the
+gateway/driver service account namespace-wide ConfigMap-create authority. In
+managed/operator modes, the chart's ClusterRoleBinding makes that permission
+cluster-wide for the bound service account; use a dedicated service account and
+scoped bindings when that boundary matters. If you render the TOML setting
+outside this Helm value, grant that same split RBAC policy in every sandbox
+namespace.
+
+Disabling the setting intentionally does not delete driver-managed ConfigMaps:
+the driver has no list/delete permissions, and a shared or operator namespace
+may contain resources still used by another gateway instance. After all
+affected sandboxes are restarted, identify an unused object by its exact name
+and the labels `openshell.ai/managed-by=openshell` and matching
+`openshell.ai/gateway-id`, then delete it explicitly in the target namespace:
+
+```shell
+kubectl -n <sandbox-namespace> get configmap \
+  openshell-network-additional-ca-<effective-gateway-id> --show-labels
+kubectl -n <sandbox-namespace> delete configmap \
+  openshell-network-additional-ca-<effective-gateway-id>
+```
+
+A configured CA can authenticate every policy-permitted TLS endpoint with a
+matching certificate chain and hostname. Scope private CAs accordingly.
+
 ### Database backend
 
 By default, OpenShell uses SQLite and runs the gateway as a StatefulSet so the
@@ -300,6 +363,7 @@ discovery endpoint or its TLS CA.
 | supervisor.image.pullPolicy | string | `nil` | Sandbox supervisor pull policy. Leave unset to use the Kubernetes image default. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
 | supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| supervisor.network.additionalCaConfigMapName | string | `""` | Existing operator-managed ConfigMap containing additional destination CA certificates in the ca.crt key. Empty disables additional destination trust. |
 | supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
 | supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |

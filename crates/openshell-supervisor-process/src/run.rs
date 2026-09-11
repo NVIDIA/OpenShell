@@ -32,6 +32,7 @@ use openshell_core::activity::ActivitySender;
 #[cfg(target_os = "linux")]
 use openshell_core::denial::DenialEvent;
 
+use crate::child_env::TlsEnvironmentMode;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::process::{
@@ -242,6 +243,15 @@ pub async fn run_process(
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
 
+    // Generated interception trust must override workload choices. Explicit
+    // destination roots without interception are additive, so preserve every
+    // caller-provided TLS setting and fill only missing ones.
+    let tls_environment_mode = if matches!(policy.network.mode, NetworkMode::Proxy) {
+        TlsEnvironmentMode::ForceOpenShell
+    } else {
+        TlsEnvironmentMode::FillMissing
+    };
+
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         program,
@@ -253,6 +263,7 @@ pub async fn run_process(
         enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )?;
 
@@ -266,6 +277,7 @@ pub async fn run_process(
         resolved_process_identity,
         enforcement_mode,
         ca_file_paths.as_ref(),
+        tls_environment_mode,
         &provider_env,
     )?;
 
@@ -309,6 +321,7 @@ pub async fn run_process(
                 netns_fd,
                 proxy_url,
                 ca_paths,
+                tls_environment_mode,
                 provider_credentials_clone,
                 user_env_clone,
                 resolved_process_identity,

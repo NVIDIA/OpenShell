@@ -278,12 +278,22 @@ jobs:
   vm-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: managed
+            test_name: ""
+          - suite: additional-ca
+            test_name: additional_ca
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
+      suite-name: ${{ matrix.suite }}
+      test-name: ${{ matrix.test_name }}
       conformance-artifact-prefix: openshell-conformance
 
   docker-external-driver-e2e:
@@ -356,14 +366,27 @@ jobs:
             agent_sandbox_version: v0.5.0
             topology: combined
             extra_helm_values: ""
+            test_name: ""
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
             topology: combined
             extra_helm_values: ""
+            test_name: ""
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
             topology: sidecar
             extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
+            test_name: ""
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+            topology: combined-additional-ca
+            extra_helm_values: ""
+            test_name: additional_ca
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+            topology: sidecar-additional-ca
+            extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
+            test_name: additional_ca
     permissions:
       actions: read
       contents: read
@@ -374,6 +397,7 @@ jobs:
       job-name: Kubernetes E2E (Rust smoke, ${{ matrix.topology }}, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       extra-helm-values: ${{ matrix.extra_helm_values }}
+      test-name: ${{ matrix.test_name }}
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
