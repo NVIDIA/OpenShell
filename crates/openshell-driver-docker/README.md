@@ -118,11 +118,12 @@ openshell sandbox create \
 
 ## Runtime Image
 
-`supervisor_image` must contain `/openshell-sandbox` and
-`/openshell-supervisor`. The driver extracts the sandbox binary as bytes and
-stages it into the stopped workload. It starts the supervisor binary directly
-in the companion container. Release and gateway image builds bake a matching
-supervisor image tag into the binary.
+`sandbox_runtime_image` contains the statically linked musl
+`/openshell-sandbox` binary. The driver extracts that binary as bytes and
+stages it into the stopped workload. `supervisor_image` contains the
+dynamically linked glibc `/openshell-supervisor` binary that runs in the
+host-networked supervisor container. Release and gateway image builds bake
+matching image tags into the binary.
 
 ## Callback and TLS
 

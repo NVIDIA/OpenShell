@@ -337,6 +337,31 @@ resolve_docker_supervisor_image() {
   printf '%s\n' "openshell/supervisor:dev"
 }
 
+resolve_docker_sandbox_runtime_image() {
+  if [ -n "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+
+  if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+
+  if [ -n "${CI:-}" ]; then
+    if [ -z "${IMAGE_TAG:-}" ]; then
+      echo "ERROR: IMAGE_TAG must be set in CI when no Docker sandbox runtime image override is provided." >&2
+      exit 2
+    fi
+
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
+    return 0
+  fi
+
+  printf '%s\n' "openshell/sandbox:dev"
+}
+
 docker_pull_with_retry() {
   local image=$1
   local attempts=4
@@ -384,6 +409,27 @@ build_local_docker_supervisor_image_if_required() {
   exit 2
 }
 
+build_local_docker_sandbox_runtime_image_if_required() {
+  local image=$1
+
+  if [ "${image}" != "openshell/sandbox:dev" ]; then
+    return 0
+  fi
+
+  local daemon_arch
+  daemon_arch="$(ce_info_arch)"
+
+  echo "Building local Docker sandbox runtime image ${image} for linux/${daemon_arch}..."
+  CONTAINER_ENGINE=docker DOCKER_PLATFORM="linux/${daemon_arch}" IMAGE_TAG=dev \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "ERROR: expected sandbox runtime image '${image}' after local build." >&2
+  exit 2
+}
+
 ensure_docker_supervisor_image() {
   local image=$1
 
@@ -398,6 +444,23 @@ ensure_docker_supervisor_image() {
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
   echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  exit 2
+}
+
+ensure_docker_sandbox_runtime_image() {
+  local image=$1
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Pulling Docker sandbox runtime image ${image}..."
+  if docker_pull_with_retry "${image}"; then
+    return 0
+  fi
+
+  echo "ERROR: sandbox runtime image '${image}' is not available." >&2
+  echo "       Build it, push it, or set OPENSHELL_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -447,6 +510,11 @@ SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
 build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
 ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
 echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
+
+SANDBOX_RUNTIME_IMAGE="$(resolve_docker_sandbox_runtime_image)"
+build_local_docker_sandbox_runtime_image_if_required "${SANDBOX_RUNTIME_IMAGE}"
+ensure_docker_sandbox_runtime_image "${SANDBOX_RUNTIME_IMAGE}"
+echo "Using Docker sandbox runtime image: ${SANDBOX_RUNTIME_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -523,6 +591,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'enable_bind_mounts = true\n'
+    printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
     if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
       printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
@@ -541,6 +610,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
     printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
     printf 'enable_bind_mounts = true\n'
+    printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
     if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
       printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"

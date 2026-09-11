@@ -26,12 +26,10 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
-    GatewayCallbackRoute, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
-    LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
-    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_IMAGE_BINARY_PATH,
-    extract_first_tar_entry, gateway_callback_endpoint, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    GatewayCallbackRoute, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -171,8 +169,10 @@ pub struct DockerComputeConfig {
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
-    /// Image containing the trusted `openshell-sandbox` and
-    /// `openshell-supervisor` binaries.
+    /// Image containing the trusted `openshell-sandbox` binary.
+    pub sandbox_runtime_image: Option<String>,
+
+    /// Image containing the trusted `openshell-supervisor` binary.
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -209,6 +209,7 @@ impl Default for DockerComputeConfig {
             image_pull_policy: String::new(),
             sandbox_namespace: "default".to_string(),
             grpc_endpoint: String::new(),
+            sandbox_runtime_image: None,
             supervisor_image: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -855,13 +856,19 @@ impl DockerComputeDriver {
             .clone()
             .unwrap_or_else(openshell_core::config::default_supervisor_image);
         let supervisor_image_id =
-            ensure_supervisor_container_image(&docker, &supervisor_image).await?;
+            ensure_runtime_image(&docker, &supervisor_image, "supervisor").await?;
+        let sandbox_runtime_image = docker_config
+            .sandbox_runtime_image
+            .clone()
+            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image);
+        let sandbox_runtime_image_id =
+            ensure_runtime_image(&docker, &sandbox_runtime_image, "sandbox runtime").await?;
         let sandbox_binary = Arc::new(
-            extract_supervisor_binary_bytes(&docker, &supervisor_image_id)
+            extract_sandbox_binary_bytes(&docker, &sandbox_runtime_image_id)
                 .await
                 .map_err(|error| {
                     Error::config(format!(
-                        "failed to load trusted sandbox binary from Docker image '{supervisor_image}': {error}"
+                        "failed to load trusted sandbox binary from Docker image '{sandbox_runtime_image}': {error}"
                     ))
                 })?,
         );
@@ -5903,7 +5910,7 @@ fn sanitize_docker_name(value: &str) -> String {
         .to_string()
 }
 
-async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
+async fn pull_runtime_image(docker: &Docker, image: &str, role: &str) -> CoreResult<()> {
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
             from_image: Some(image.to_string()),
@@ -5915,57 +5922,61 @@ async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
     while let Some(result) = stream.next().await {
         result.map_err(|err| {
             Error::config(format!(
-                "failed to pull docker supervisor image '{image}': {err}",
+                "failed to pull Docker {role} image '{image}': {err}",
             ))
         })?;
     }
     Ok(())
 }
 
-async fn ensure_supervisor_container_image(docker: &Docker, image: &str) -> CoreResult<String> {
+async fn ensure_runtime_image(docker: &Docker, image: &str, role: &str) -> CoreResult<String> {
     let local_image_present = docker.inspect_image(image).await.is_ok();
     if supervisor_image_should_refresh(image) {
-        info!(image = image, "Refreshing mutable docker supervisor image");
-        if let Err(error) = pull_supervisor_image(docker, image).await {
+        info!(
+            image = image,
+            role, "Refreshing mutable Docker runtime image"
+        );
+        if let Err(error) = pull_runtime_image(docker, image, role).await {
             if !local_image_present {
                 return Err(error);
             }
             warn!(
                 image = image,
                 error = %error,
-                "failed to refresh mutable Docker supervisor image; using the local image",
+                "failed to refresh mutable Docker runtime image; using the local image",
             );
         }
     } else if !local_image_present {
-        pull_supervisor_image(docker, image).await?;
+        pull_runtime_image(docker, image, role).await?;
     }
     let inspect = docker.inspect_image(image).await.map_err(|error| {
         Error::config(format!(
-            "failed to inspect Docker supervisor image '{image}': {error}"
+            "failed to inspect Docker {role} image '{image}': {error}"
         ))
     })?;
     inspect.id.filter(|id| !id.is_empty()).ok_or_else(|| {
         Error::config(format!(
-            "Docker supervisor image '{image}' has no immutable image ID"
+            "Docker {role} image '{image}' has no immutable image ID"
         ))
     })
 }
 
-/// Create a short-lived container from `image`, stream out the supervisor
+/// Create a short-lived container from `image`, stream out the sandbox
 /// binary as a tar archive, and return the untarred file bytes. The
 /// container is always removed, even on error paths.
-async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreResult<Vec<u8>> {
+async fn extract_sandbox_binary_bytes(docker: &Docker, image: &str) -> CoreResult<Vec<u8>> {
     let bytes =
-        extract_supervisor_path_archive(docker, image, SUPERVISOR_IMAGE_BINARY_PATH, true).await?;
+        extract_runtime_path_archive(docker, image, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, true)
+            .await?;
     if !bytes.starts_with(b"\x7fELF") {
         return Err(Error::config(format!(
-            "Docker supervisor image '{image}' contains an invalid sandbox binary"
+            "Docker sandbox runtime image '{image}' contains an invalid sandbox binary"
         )));
     }
     Ok(bytes)
 }
 
-async fn extract_supervisor_path_archive(
+async fn extract_runtime_path_archive(
     docker: &Docker,
     image: &str,
     path: &str,
@@ -5981,7 +5992,7 @@ async fn extract_supervisor_path_archive(
             ),
             ContainerCreateBody {
                 image: Some(image.to_string()),
-                entrypoint: Some(vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()]),
+                entrypoint: Some(vec![path.to_string()]),
                 cmd: Some(Vec::new()),
                 ..Default::default()
             },
@@ -6006,7 +6017,7 @@ async fn extract_supervisor_path_archive(
         warn!(
             container = container_name,
             error = %remove_err,
-            "Failed to remove supervisor extractor container",
+            "Failed to remove runtime image extractor container",
         );
     }
     result
