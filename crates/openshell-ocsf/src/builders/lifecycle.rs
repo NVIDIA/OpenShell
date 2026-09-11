@@ -13,6 +13,7 @@ use crate::objects::Product;
 pub struct AppLifecycleBuilder<'a> {
     ctx: &'a EventContext,
     activity: ActivityId,
+    app_name: Option<String>,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -24,10 +25,18 @@ impl<'a> AppLifecycleBuilder<'a> {
         Self {
             ctx,
             activity: ActivityId::Unknown,
+            app_name: None,
             severity: SeverityId::Informational,
             status: None,
             message: None,
         }
+    }
+
+    /// Identify a supervisor component whose lifecycle is being reported.
+    #[must_use]
+    pub fn app_name(mut self, name: impl Into<String>) -> Self {
+        self.app_name = Some(name.into());
+        self
     }
 
     #[must_use]
@@ -46,10 +55,11 @@ impl<'a> AppLifecycleBuilder<'a> {
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
 
-        OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent {
-            base,
-            app: Product::openshell_sandbox(&self.ctx.product_version),
-        })
+        let mut app = Product::openshell_sandbox(&self.ctx.product_version);
+        if let Some(name) = self.app_name {
+            app.name = name;
+        }
+        OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent { base, app })
     }
 }
 
@@ -60,6 +70,26 @@ impl_builder_setters!(AppLifecycleBuilder);
 mod tests {
     use super::*;
     use crate::builders::test_sandbox_context;
+
+    #[test]
+    fn component_start_failure_identifies_component() {
+        let ctx = test_sandbox_context();
+        let json = AppLifecycleBuilder::new(&ctx)
+            .app_name("OpenShell Bypass Monitor")
+            .activity(ActivityId::Reset)
+            .status(StatusId::Failure)
+            .build()
+            .to_json()
+            .unwrap();
+        assert_eq!(json["app"]["name"], "OpenShell Bypass Monitor");
+        assert_eq!(json["app"]["vendor_name"], "OpenShell");
+        assert_eq!(json["activity_name"], "Start");
+        assert_eq!(json["status"], "Failure");
+        crate::validation::validate_required_fields(
+            &json,
+            &crate::validation::load_class_schema("application_lifecycle"),
+        );
+    }
 
     #[test]
     fn test_app_lifecycle_builder() {
