@@ -234,6 +234,9 @@ tonic-prost = "0.14"
 tower = "0.5"
 url = "2"
 nix = { version = "0.29", features = ["user"] }
+openshell-sdk = { path = "../../crates/openshell-sdk", features = ["extension"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
 
 [dev-dependencies]
 serial_test = "3"

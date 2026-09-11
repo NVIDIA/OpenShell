@@ -574,6 +574,8 @@ fi
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
+export OPENSHELL_E2E_GATEWAY_CLIENT_CERT="${PKI_DIR}/client/tls.crt"
+export OPENSHELL_E2E_GATEWAY_CLIENT_KEY="${PKI_DIR}/client/tls.key"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
@@ -735,6 +737,7 @@ else
 fi
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+export OPENSHELL_E2E_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
 
 if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
