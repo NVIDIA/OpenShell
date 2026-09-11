@@ -68,7 +68,12 @@ fn device_identifies_the_sandbox_environment() {
 
     assert_eq!(json["device"]["type_id"], 99);
     assert_eq!(json["device"]["type"], "Sandbox");
-    assert_eq!(json["device"]["os"]["name"], "Linux");
+    let expected_os = if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+    assert_eq!(json["device"]["os"]["name"], expected_os);
 }
 
 #[test]

@@ -1248,6 +1248,7 @@ mod tests {
         assert!(validate_guest_spiffe_tcp_endpoint("unix:/run/spire/agent.sock", true).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn credential_file_rejects_fifo_without_hanging() {
         // A FIFO with no writer would block a blocking open() forever. The
