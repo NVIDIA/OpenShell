@@ -14,7 +14,9 @@ On native Windows, the MXC driver cannot rely on Linux Landlock or setuid. It
 maps portable static filesystem and UI controls from `SandboxPolicy` into MXC
 configuration. UI controls are available only with the MXC
 `process_container` backend; all omitted UI fields retain deny-by-default
-values, and other compute runtimes reject an explicit UI policy.
+values, and other compute runtimes reject an explicit UI policy. MXC ignores
+clipboard and input-injection fields when graphical UI is disabled, so the
+mapper rejects those otherwise-unenforceable combinations.
 
 ## Policy Areas
 
@@ -231,8 +233,11 @@ generation, and whether the previous policy is active. Static controls,
 such as filesystem allowlists and process identity, require a new sandbox
 because they are applied before the child process starts.
 
-Gateway-global policy can override sandbox-scoped policy. Use it sparingly
-because it changes the effective access model for every sandbox on the gateway.
+Gateway-global policy can override sandbox-scoped dynamic policy. Use it
+sparingly because it changes the effective access model for every sandbox on
+the gateway. A global policy cannot contain `ui`; effective-policy reads retain
+the per-sandbox UI contract recorded at creation so a global update cannot
+misrepresent startup enforcement.
 
 ## Policy Advisor
 

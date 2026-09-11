@@ -1089,6 +1089,46 @@ fn c_processcontainer_absent_or_empty_ui_is_default_deny() {
 }
 
 #[test]
+fn b_processcontainer_rejects_clipboard_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            clipboard: UiClipboardAccess::Read as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["clipboard"], "none");
+    assert_single_loss(
+        &result.loss,
+        "ui.clipboard",
+        "error",
+        "clipboard grant suppressed by ui.disable",
+    );
+}
+
+#[test]
+fn b_processcontainer_rejects_input_injection_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            allow_input_injection: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["injection"], false);
+    assert_single_loss(
+        &result.loss,
+        "ui.allow_input_injection",
+        "error",
+        "input-injection grant suppressed by ui.disable",
+    );
+}
+
+#[test]
 fn b_isolation_session_omits_absent_ui_and_rejects_explicit_ui() {
     let opts = MxcMappingOptions {
         containment: "isolation_session".into(),
@@ -1118,13 +1158,14 @@ fn a_split_maps_ui_to_mxc_and_omits_it_from_proxy_policy() {
     let policy = SandboxPolicy {
         version: 1,
         ui: Some(UiPolicy {
+            allow_graphical_ui: true,
             clipboard: UiClipboardAccess::Write as i32,
             ..Default::default()
         }),
         ..Default::default()
     };
     let result = split_policy(&policy, &pc_split_opts()).expect("split");
-    assert_eq!(result.mxc_config["ui"]["disable"], true);
+    assert_eq!(result.mxc_config["ui"]["disable"], false);
     assert_eq!(result.mxc_config["ui"]["clipboard"], "write");
     assert_eq!(result.mxc_config["ui"]["injection"], false);
     assert!(result.proxy_policy.ui.is_none());

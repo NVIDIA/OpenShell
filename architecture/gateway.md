@@ -491,9 +491,11 @@ leave an ambiguous final dynamic-token state or a deleted custom profile that is
 still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
-config path. A gateway-global policy can override sandbox-scoped policy. The
-sandbox supervisor polls for config revisions and hot-reloads dynamic policy
-when the policy engine accepts the update.
+config path. A gateway-global policy can override sandbox-scoped dynamic policy.
+Startup-only UI remains anchored to each sandbox's creation policy, and global
+policy writes containing UI are rejected. The sandbox supervisor polls for
+config revisions and hot-reloads dynamic policy when the policy engine accepts
+the update.
 
 External supervisor middleware registration is operator-owned configuration
 under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to

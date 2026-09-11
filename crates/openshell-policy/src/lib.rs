@@ -2176,6 +2176,7 @@ fn validate_and_canonicalize_mcp_policy_schema(
         .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
+    canonicalize_ui_defaults(&mut policy);
     validate_mcp_policy_schema(&policy, McpVersionPresence::RequireMaterialized)
         .map_err(|violations| PolicyValidationError { violations })?;
     Ok(policy)
@@ -2198,11 +2199,26 @@ pub fn validate_and_canonicalize_sandbox_policy(
         .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
+    canonicalize_ui_defaults(&mut policy);
     debug_assert!(
         validate_sandbox_policy(&policy).is_ok(),
         "validated MCP canonicalization must preserve every policy invariant"
     );
     Ok(policy)
+}
+
+/// Materialize protobuf UI defaults that have a distinct canonical enum value.
+///
+/// Proto3 clients commonly leave `clipboard` at `Unspecified(0)`. `OpenShell`
+/// defines that value as deny, so canonical policy state stores the equivalent
+/// explicit `None(1)`. This keeps protobuf, YAML, hashes, and static-field
+/// comparisons stable across a serialize/parse round trip.
+fn canonicalize_ui_defaults(policy: &mut SandboxPolicy) {
+    if let Some(ui) = policy.ui.as_mut()
+        && ui.clipboard == UiClipboardAccess::Unspecified as i32
+    {
+        ui.clipboard = UiClipboardAccess::None as i32;
+    }
 }
 
 /// Replace absent protobuf MCP options and empty revision lists with the
@@ -2364,6 +2380,29 @@ network_policies:
             let reparsed = parse_sandbox_policy(&serialized).expect("UI policy reparses");
             assert_eq!(reparsed, policy);
         }
+    }
+
+    #[test]
+    fn ui_unspecified_clipboard_canonicalizes_to_none_across_yaml_round_trip() {
+        let raw = SandboxPolicy {
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: UiClipboardAccess::Unspecified as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let canonical = validate_and_canonicalize_sandbox_policy(raw)
+            .expect("unspecified clipboard must be a valid deny default");
+        assert_eq!(
+            canonical.ui.as_ref().expect("UI remains present").clipboard,
+            UiClipboardAccess::None as i32
+        );
+
+        let yaml = serialize_sandbox_policy(&canonical).expect("canonical UI serializes");
+        let reparsed = parse_sandbox_policy(&yaml).expect("canonical UI reparses");
+        assert_eq!(reparsed, canonical);
     }
 
     #[test]

@@ -351,6 +351,31 @@ mod tests {
     }
 
     #[test]
+    fn embedded_rejects_ui_grants_suppressed_by_disable() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        for ui in [
+            UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            },
+            UiPolicy {
+                allow_input_injection: true,
+                ..Default::default()
+            },
+        ] {
+            let policy = SandboxPolicy {
+                ui: Some(ui),
+                ..Default::default()
+            };
+            let error = EmbeddedPolicyMapper
+                .map(Some(&policy), &processcontainer_ctx())
+                .expect_err("MXC cannot enforce UI grants while UI is disabled");
+            assert!(matches!(error, MapError::Unsupported(_)));
+        }
+    }
+
+    #[test]
     fn embedded_split_normalizes_paths_and_returns_proxy_handoff() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
         let mapper = EmbeddedPolicyMapper;

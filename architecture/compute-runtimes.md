@@ -113,7 +113,10 @@ report false. When `ui` is explicitly present, including as `{}`, the gateway
 rejects create before the driver validation RPC or provisioning unless this
 capability is true. An absent section bypasses this gate and preserves the
 runtime's existing behavior. The startup snapshot is also exposed through
-gateway info so clients can discover the selected runtime's support.
+gateway info so clients can discover the selected runtime's support. UI cannot
+be supplied by a gateway-global policy because it is applied at startup. When a
+global dynamic policy is active, effective-policy reads retain the UI block from
+the sandbox's creation policy.
 
 The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
