@@ -3989,7 +3989,7 @@ async fn delete_sandbox_reclaims_token_file_when_container_and_pending_are_gone(
         // Arrange the leak: token on disk, container gone, `pending` empty.
         let token = openshell_core::driver_utils::sandbox_token_path(
             "docker-sandbox-tokens",
-            Some(&config.sandbox_namespace),
+            Some(&config.sandbox_label),
             "sandbox-1",
         )
         .unwrap();
@@ -4024,7 +4024,7 @@ async fn delete_sandbox_by_name_only_leaves_the_namespace_directory_alone() {
 
         let namespace_dir = openshell_core::driver_utils::sandbox_token_path(
             "docker-sandbox-tokens",
-            Some(&config.sandbox_namespace),
+            Some(&config.sandbox_label),
             "sandbox-1",
         )
         .unwrap()
