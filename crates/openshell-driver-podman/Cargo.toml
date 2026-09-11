@@ -18,6 +18,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false, features = ["driver-extraction"] }
 openshell-otel = { path = "../openshell-otel" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 tar = "0.4"
 uuid = { workspace = true }
 

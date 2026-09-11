@@ -9,12 +9,12 @@ use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 
 pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
 pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
