@@ -1406,17 +1406,6 @@ async fn build_compute_runtime(
     let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
-    if config
-        .gateway_jwt
-        .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
-        && !driver.is_local_singleplayer(registry)
-    {
-        warn!(
-            "Gateway configured with non-expiring sandbox JWTs; set gateway_jwt.ttl_secs > 0 for shared deployments"
-        );
-    }
-
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -1499,15 +1488,6 @@ impl ConfiguredComputeDriver {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
-        }
-    }
-
-    fn is_local_singleplayer(&self, registry: &ComputeDriverRegistry) -> bool {
-        match self {
-            Self::Registered(registration) => registration.is_local_singleplayer(),
-            Self::Remote { name } => registry
-                .get(name)
-                .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
         }
     }
 

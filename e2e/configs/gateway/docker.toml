@@ -18,7 +18,7 @@ signing_key_path = ".cache/openshell-e2e/gateway-jwt/signing.pem"
 public_key_path = ".cache/openshell-e2e/gateway-jwt/public.pem"
 kid_path = ".cache/openshell-e2e/gateway-jwt/kid"
 gateway_id = "openshell-e2e"
-ttl_secs = 0
+ttl_secs = 3600
 
 [openshell.drivers.docker]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

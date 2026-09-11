@@ -340,7 +340,7 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
+ttl_secs = 3600
 
 [[openshell.gateway.interceptors]]
 name = "provider-governance"

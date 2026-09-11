@@ -277,7 +277,7 @@ kid_path = "${JWT_DIR}/kid"
 gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
-ttl_secs = 0
+ttl_secs = 3600
 
 [openshell.drivers.vm]
 EOF

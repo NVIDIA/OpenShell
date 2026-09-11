@@ -174,9 +174,8 @@ e2e_write_gateway_jwt_config() {
   printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
   printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
-  # Local Docker/Podman e2e gateways exercise the single-player default:
-  # sandbox JWTs identify the supervisor and do not expire.
-  printf 'ttl_secs = 0\n\n'
+  # Session tokens use the maximum supported one-hour lifetime.
+  printf 'ttl_secs = 3600\n\n'
 }
 
 e2e_write_gateway_mtls_auth_config() {

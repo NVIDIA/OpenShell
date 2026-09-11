@@ -54,7 +54,7 @@
       public_key_path = "{{ openshell_gateway_state_root }}/pki/jwt/public.pem"
       kid_path = "{{ openshell_gateway_state_root }}/pki/jwt/kid"
       gateway_id = "openshell-test-guest"
-      ttl_secs = 0
+      ttl_secs = 3600
 
       [openshell.drivers.podman]
       default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

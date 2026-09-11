@@ -522,8 +522,7 @@ pub struct GatewayJwtConfig {
     /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. A value of 0 disables expiration and is
-    /// intended only for local single-player deployments.
+    /// Token lifetime in seconds. Must be between 60 and 3600 seconds.
     #[serde(default = "default_sandbox_token_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -533,7 +532,7 @@ fn default_gateway_id() -> String {
 }
 
 const fn default_sandbox_token_ttl_secs() -> u64 {
-    0
+    3600
 }
 
 fn default_roles_claim() -> String {
@@ -914,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+    fn gateway_jwt_ttl_defaults_to_one_hour() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
             "public_key_path": "/tmp/public.pem",
@@ -922,7 +921,7 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with default ttl");
 
-        assert_eq!(cfg.ttl_secs, 0);
+        assert_eq!(cfg.ttl_secs, 3600);
     }
 
     #[test]
