@@ -93,10 +93,11 @@ openshell-prover check candidate.yaml \
 ```
 
 The JSON object includes the result, exit code, input paths, prover version,
-model scope, checked policy version, modeled domains, and assumptions. An
-exceeding result also includes a filesystem or network counterexample.
-Automation should use `result` and `reason_code` instead of parsing the
-human-readable explanation.
+model version, checked policy version, and modeled domains. The documented
+semantics and environmental conditions for that scope are tied to its model
+version. An exceeding result also includes a filesystem or network
+counterexample. Automation should use `result` and `reason_code` instead of
+parsing the human-readable explanation.
 
 The solver has a finite 10-second default budget. Set a different positive
 budget with an integer followed by `ms`, `s`, or `m`:
@@ -152,6 +153,7 @@ state. In particular:
   identity enforcement enabled and disabled. When enabled, grants and denies
   match the executable or an ancestor identity. Network counterexamples report
   the configuration and identities that expose the additional authority.
+- REST containment witnesses use canonical request methods and paths.
 - Both files are interpreted in the same sandbox filesystem namespace and
   mount model. The CLI does not resolve sandbox paths against the host.
 

@@ -76,7 +76,6 @@ struct ScopeJson<'a> {
     model_version: &'a str,
     policy_version: u32,
     domains: Vec<&'a str>,
-    assumptions: &'a [&'a str],
 }
 
 #[derive(Debug, Serialize)]
@@ -358,7 +357,6 @@ fn scope_json(scope: &CheckScope) -> ScopeJson<'_> {
         model_version: scope.model_version,
         policy_version: scope.policy_version,
         domains: scope.domains.iter().map(|domain| domain.as_str()).collect(),
-        assumptions: scope.assumptions,
     }
 }
 
@@ -415,10 +413,6 @@ fn render_text(mut writer: impl Write, envelope: &Envelope<'_>) -> Result<(), St
             scope.domains.join(",")
         )
         .map_err(|error| format!("failed to write output: {error}"))?;
-        for assumption in scope.assumptions {
-            writeln!(writer, "assumption: {}", escape_terminal(assumption))
-                .map_err(|error| format!("failed to write output: {error}"))?;
-        }
     }
     if let Some(counterexample) = &envelope.counterexample {
         match counterexample {

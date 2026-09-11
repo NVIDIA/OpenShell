@@ -77,7 +77,14 @@ fn contained_policy_returns_stable_json_and_zero() {
     assert_eq!(value["check"], "maximum_boundary");
     assert_eq!(value["result"], "within_max");
     assert_eq!(value["exit_code"], 0);
-    assert!(value["scope"]["domains"].is_array());
+    assert_eq!(
+        value["scope"],
+        serde_json::json!({
+            "model_version": "maximum-boundary-v1",
+            "policy_version": 1,
+            "domains": ["filesystem", "network_l4", "network_rest"]
+        })
+    );
     assert!(value["counterexample"].is_null());
 }
 
