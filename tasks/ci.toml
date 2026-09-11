@@ -54,6 +54,7 @@ description = "Run repository lint checks"
 depends = [
   "license:check",
   "rust:format:check",
+  "rust:lockfiles:check",
   "rust:lint",
   "python:format:check",
   "python:lint",

@@ -329,6 +329,27 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
 
+/// Validate SNI certificate option relationships without reading certificate files.
+pub fn validate_external_cert_config(
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+) -> Result<()> {
+    match (external_cert_path, external_key_path) {
+        (Some(_), None) => Err(Error::tls(
+            "external_cert_path is set but external_key_path is missing",
+        )),
+        (None, Some(_)) => Err(Error::tls(
+            "external_key_path is set but external_cert_path is missing",
+        )),
+        (Some(_), Some(_)) if external_server_names.is_empty() => Err(Error::tls(
+            "external certificate is configured but external_server_names is empty — \
+             the external cert would never be served",
+        )),
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+    }
+}
+
 /// Build an SNI-based cert resolver when an external certificate is configured.
 /// Returns `None` when no external cert is configured (single-cert mode).
 fn build_cert_resolver(
@@ -338,30 +359,17 @@ fn build_cert_resolver(
     external_key_path: Option<&Path>,
     external_server_names: &[String],
 ) -> Result<Option<Arc<dyn ResolvesServerCert>>> {
-    match (external_cert_path, external_key_path) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(Error::tls(
-            "external_cert_path is set but external_key_path is missing",
-        )),
-        (None, Some(_)) => Err(Error::tls(
-            "external_key_path is set but external_cert_path is missing",
-        )),
-        (Some(ext_cert_path), Some(ext_key_path)) => {
-            if external_server_names.is_empty() {
-                return Err(Error::tls(
-                    "external certificate is configured but external_server_names is empty — \
-                     the external cert would never be served",
-                ));
-            }
-            let internal = load_certified_key(cert_path, key_path)?;
-            let external = load_certified_key(ext_cert_path, ext_key_path)?;
-            Ok(Some(Arc::new(DualCertResolver {
-                internal,
-                external,
-                external_names: external_server_names.to_vec(),
-            })))
-        }
-    }
+    validate_external_cert_config(external_cert_path, external_key_path, external_server_names)?;
+    let (Some(ext_cert_path), Some(ext_key_path)) = (external_cert_path, external_key_path) else {
+        return Ok(None);
+    };
+    let internal = load_certified_key(cert_path, key_path)?;
+    let external = load_certified_key(ext_cert_path, ext_key_path)?;
+    Ok(Some(Arc::new(DualCertResolver {
+        internal,
+        external,
+        external_names: external_server_names.to_vec(),
+    })))
 }
 
 /// Build a `ServerConfig` from certificate, key, and optional client CA files.

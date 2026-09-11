@@ -6422,7 +6422,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn import_provider_profiles_preserves_advanced_proto_policy_fields() {
         let state = test_server_state().await;
         let response = handle_import_provider_profiles(
@@ -6455,7 +6454,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/advanced".to_string(),
-                            harness: true,
                         }],
                         inference_capable: false,
                         discovery: None,
@@ -6498,7 +6496,7 @@ mod tests {
         );
         assert!(endpoint.allow_encoded_slash);
         assert_eq!(endpoint.path, "/v1");
-        assert!(fetched.binaries[0].harness);
+        assert_eq!(fetched.binaries[0].path, "/usr/bin/advanced");
     }
 
     #[tokio::test]

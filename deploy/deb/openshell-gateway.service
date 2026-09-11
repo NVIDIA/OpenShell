@@ -8,6 +8,7 @@ Type=simple
 StateDirectory=openshell/gateway
 Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls
 EnvironmentFile=-%E/openshell/gateway.env
+ExecStartPre=/usr/bin/openshell-gateway config preflight
 ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
 ExecStart=/usr/bin/openshell-gateway
 Restart=on-failure
