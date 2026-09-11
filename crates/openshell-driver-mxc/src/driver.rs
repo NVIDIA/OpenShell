@@ -464,6 +464,16 @@ impl MxcComputeBackend {
             let entry = registry.get_mut(sandbox_id).ok_or_else(|| {
                 tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
             })?;
+            // The registry lock was released while this request waited for the
+            // gate. Every create mints a fresh gate, so an entry whose gate is a
+            // different allocation is a replacement registered under the same id
+            // rather than the sandbox validated above. Once this check passes the
+            // held gate blocks delete, so the remaining steps stay on this entry.
+            if !Arc::ptr_eq(&entry.lifecycle_gate, &lifecycle_gate) {
+                return Err(tonic::Status::aborted(
+                    "sandbox was replaced while the stop request waited",
+                ));
+            }
             (
                 entry.iso_sandbox_id.clone(),
                 entry.isolation_stopped,
@@ -533,6 +543,13 @@ impl MxcComputeBackend {
             let Some(entry) = registry.get_mut(sandbox_id) else {
                 return Ok(false);
             };
+            // See stop_sandbox: a gate that is a different allocation means the
+            // requested sandbox is already gone and this id now belongs to a
+            // replacement, which this request must not remove. Deleting nothing
+            // keeps the operation idempotent.
+            if !Arc::ptr_eq(&entry.lifecycle_gate, &lifecycle_gate) {
+                return Ok(false);
+            }
             (
                 entry.iso_sandbox_id.clone(),
                 entry.isolation_stopped,
@@ -1372,6 +1389,62 @@ mod lifecycle_tests {
             Some("Stopped".into()),
             "a rejected stop must not mutate the sandbox"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_when_the_sandbox_is_replaced_while_it_waits_for_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let backend = Arc::new(MxcComputeBackend::new_mocked(MxcComputeConfig::default()));
+        let sandbox = with_policy(
+            driver_sandbox_named(
+                "sb-reused",
+                "demo",
+                "alpha",
+                vec!["cmd".into(), "/c".into(), "exit 0".into()],
+            ),
+            fs_policy(&[&share]),
+        );
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+
+        // Hold the original gate so the stop request parks after validating the
+        // id and name but before it touches the entry.
+        let original_gate = {
+            let registry = backend.registry.lock().await;
+            registry
+                .get("sb-reused")
+                .expect("original registered")
+                .lifecycle_gate
+                .clone()
+        };
+        let held = original_gate.lock_owned().await;
+
+        let stopper = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.stop_sandbox("sb-reused", "demo").await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Stand in for a delete followed by a create that reuses the id. The
+        // registry is edited directly because the gateway mints a fresh UUID per
+        // create and cannot produce a reused id; this exercises the driver's own
+        // guard rather than a reachable gateway sequence.
+        {
+            let mut registry = backend.registry.lock().await;
+            let mut entry = registry.remove("sb-reused").expect("original registered");
+            entry.lifecycle_gate = Arc::new(Mutex::new(()));
+            registry.insert("sb-reused".into(), entry);
+        }
+        drop(held);
+
+        let status = stopper
+            .await
+            .expect("stop task joined")
+            .expect_err("stop must not act on a sandbox that replaced the requested one");
+        assert_eq!(status.code(), tonic::Code::Aborted);
     }
 
     #[tokio::test]
