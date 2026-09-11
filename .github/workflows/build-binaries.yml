@@ -77,6 +77,24 @@ jobs:
     timeout-minutes: 60
     steps: *build_steps
 
+  prover:
+    name: openshell-prover (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-prover-cli
+      BINARY: openshell-prover
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
   gateway:
     name: openshell-gateway (${{ matrix.triple }})
     env:

@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-prover-cli"
+description = "Standalone OpenShell policy maximum checker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-prover"
+path = "src/main.rs"
+
+[features]
+bundled-z3 = ["openshell-prover/bundled-z3"]
+prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
+
+[dependencies]
+clap.workspace = true
+openshell-prover = { path = "../openshell-prover" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+signal-hook.workspace = true
+
+[lints]
+workspace = true

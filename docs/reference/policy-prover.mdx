@@ -1,0 +1,160 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Standalone Policy Prover"
+sidebar-title: "Policy Prover"
+description: "Install and use the standalone OpenShell policy prover to check a local candidate policy against a managed maximum."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Maximum, Containment, CI"
+position: 4
+---
+
+`openshell-prover` checks whether the authority in a local candidate policy is
+contained within a local maximum policy. The command reads files from the host
+and does not connect to an OpenShell gateway.
+
+The candidate must be the fully composed effective policy after the proposed
+change, including any provider-contributed authority. The maximum is an
+operator-owned ceiling. It does not grant authority by itself.
+
+## Install the Prover
+
+Download the archive for your platform from the
+[OpenShell releases](https://github.com/NVIDIA/OpenShell/releases) page:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `openshell-prover-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64 | `openshell-prover-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple Silicon | `openshell-prover-aarch64-apple-darwin.tar.gz` |
+
+Download `openshell-prover-checksums-sha256.txt` from the same release. On
+Linux, verify the selected archive before extracting it:
+
+```shell
+archive=openshell-prover-x86_64-unknown-linux-musl.tar.gz
+grep " ${archive}$" openshell-prover-checksums-sha256.txt | sha256sum --check
+tar -xzf "${archive}"
+mkdir -p ~/.local/bin
+install -m 0755 openshell-prover ~/.local/bin/openshell-prover
+```
+
+On macOS, use `shasum` for verification:
+
+```shell
+archive=openshell-prover-aarch64-apple-darwin.tar.gz
+grep " ${archive}$" openshell-prover-checksums-sha256.txt | shasum -a 256 --check
+tar -xzf "${archive}"
+mkdir -p ~/.local/bin
+install -m 0755 openshell-prover ~/.local/bin/openshell-prover
+```
+
+The release archive includes the solver linkage required by the executable.
+It does not require the main `openshell` command, a gateway configuration, or
+a separate Z3 installation.
+
+## Check a Policy Boundary
+
+Create a maximum policy:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+    - /etc
+  read_write:
+    - /tmp
+```
+
+Create the fully composed candidate policy:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr/bin
+  read_write:
+    - /tmp/cache
+```
+
+Run the check:
+
+```shell
+openshell-prover check candidate.yaml --maximum maximum.yaml
+```
+
+A contained candidate prints `result: within_max` and exits with status `0`.
+Use JSON when a script consumes the result:
+
+```shell
+openshell-prover check candidate.yaml \
+  --maximum maximum.yaml \
+  --output json
+```
+
+The JSON object includes the result, exit code, input paths, prover version,
+model scope, checked policy version, modeled domains, and assumptions. An
+exceeding result also includes a filesystem or network counterexample.
+Automation should use `result` and `reason_code` instead of parsing the
+human-readable explanation.
+
+The solver has a finite 10-second default budget. Set a different positive
+budget with an integer followed by `ms`, `s`, or `m`:
+
+```shell
+openshell-prover check candidate.yaml \
+  --maximum maximum.yaml \
+  --timeout 30s \
+  --output json
+```
+
+## Exit Codes
+
+| Exit | Result | Meaning |
+|---|---|---|
+| `0` | `within_max` | Containment was established for the reported model scope. |
+| `1` | `exceeds_max` | The candidate exceeds the maximum; inspect the counterexample. |
+| `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
+| `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
+| `130` | `inconclusive` when graceful handling completes | The user interrupted the command with Ctrl-C on Unix; a second or very early interruption may prevent output. |
+
+Only exit `0` means the verification succeeded. Treat unsupported and
+inconclusive results as failures in CI.
+
+## Interpretation and Limits
+
+The initial containment model covers filesystem paths, L4 network authority,
+and enforced REST method and path authority, including explicit REST denies.
+The result object reports the domains used for each check. Policies that use
+recognized authority outside that model return `unsupported` rather than
+silently ignoring it.
+
+Containment means `Allowed(candidate)` is a subset of `Allowed(maximum)` under
+the reported model. It does not establish least privilege, automatic approval
+eligibility, semantic safety, or equivalence to a running sandbox's kernel
+state. In particular:
+
+- The command does not fetch the current sandbox policy or compose provider
+  rules. The caller must supply the effective candidate.
+- The command does not apply, approve, or persist a policy.
+- A policy inside a review-required region can pass containment and still
+  require human review.
+- Environment-dependent authority, such as an unresolved image workdir,
+  returns `unsupported` when the result depends on that missing context.
+- Binary comparisons that can change when an image resolves an exact selector
+  through a symlink return `unsupported`. This covers exact candidate grants
+  under maximum globs and exact maximum denies replaced by candidate globs.
+  Use matching exact canonical paths when possible.
+- Policies with overlapping L4 and enforced REST endpoints return
+  `unsupported` because inspection selection depends on the complete set of
+  matching runtime endpoint configurations.
+- Network containment checks both supported runtime configurations: binary
+  identity enforcement enabled and disabled. When enabled, grants and denies
+  match the executable or an ancestor identity. Network counterexamples report
+  the configuration and identities that expose the additional authority.
+- Both files are interpreted in the same sandbox filesystem namespace and
+  mount model. The CLI does not resolve sandbox paths against the host.
+
+Use the [Policy Schema Reference](/reference/policy-schema) for the full policy
+language. A successful prover result covers only the scope reported in its
+evidence.
