@@ -20,10 +20,10 @@ use crate::AgentSpec;
 use crate::contract::{
     BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
     BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
-    BoundaryTerminal, ConfirmedBoundary, DnsMediationSource, ExecSession, ExecSpec,
-    IsolationBackend, LoopbackTarget, MediatedDnsQuery, MediationTiming, NetworkMediationSource,
-    NetworkOpenResult, PendingNetworkOpen, ProcessAttachment, ReadyBoundary, RunningBoundary,
-    SandboxContext, VerifiedTopologyDescriptor,
+    BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
+    MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
+    ReadyBoundary, RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial,
+    VerifiedTopologyDescriptor,
 };
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -112,10 +112,7 @@ impl IsolationBackend for RemoteIsolationBackend {
             agent: sandbox.agent,
             policy: sandbox.policy,
             sandbox_id: sandbox.sandbox_id,
-            mediation: Arc::new(RemoteNetworkMediation {
-                client: client.clone(),
-            }),
-            dns_mediation: Arc::new(RemoteDnsMediation { client }),
+            mediation: Arc::new(RemoteNetworkMediation { client }),
             host_gateway_ip,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
@@ -274,7 +271,6 @@ struct RemoteBound {
     policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
     mediation: Arc<RemoteNetworkMediation>,
-    dns_mediation: Arc<RemoteDnsMediation>,
     host_gateway_ip: Option<std::net::IpAddr>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
@@ -289,10 +285,6 @@ struct RemoteBound {
 impl BoundBoundary for RemoteBound {
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
         self.mediation.clone()
-    }
-
-    fn dns_mediation_source(&self) -> Option<Arc<dyn DnsMediationSource>> {
-        Some(self.dns_mediation.clone())
     }
 
     fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
@@ -753,7 +745,7 @@ struct RemoteNetworkMediation {
 
 #[async_trait]
 impl NetworkMediationSource for RemoteNetworkMediation {
-    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError> {
+    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
         let (stream, response) = self.client.open_exchange(Request::AcceptNetwork).await?;
         let Response::NetworkConnected {
             identity,
@@ -765,10 +757,10 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         else {
             return Err(unexpected_response("network_connected", &response));
         };
-        let (result, completion) = tokio::sync::oneshot::channel();
+        let (decision, completion) = tokio::sync::oneshot::channel();
         let (proxy_stream, transport_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(complete_network_open(stream, transport_stream, completion));
-        Ok(PendingNetworkOpen {
+        Ok(PendingTcpOpen {
             stream: Box::new(proxy_stream),
             binary_identity: identity.into_result(),
             destination,
@@ -781,19 +773,11 @@ impl NetworkMediationSource for RemoteNetworkMediation {
                 sandbox_queue_wait: Duration::from_micros(timing.queue_wait_us),
                 supervisor_received_at: Instant::now(),
             },
-            result,
+            decision,
         })
     }
-}
 
-/// Pulls sandbox DNS wire exchanges over authenticated control streams.
-struct RemoteDnsMediation {
-    client: Arc<BoundaryClient>,
-}
-
-#[async_trait]
-impl DnsMediationSource for RemoteDnsMediation {
-    async fn accept(&self) -> Result<MediatedDnsQuery, BackendError> {
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
         loop {
             let session = self.client.mediation_session().await?;
             match session.accept_dns().await {
@@ -808,11 +792,11 @@ impl DnsMediationSource for RemoteDnsMediation {
 async fn complete_network_open(
     mut boundary: BoundaryDuplexStream,
     mut transport: tokio::io::DuplexStream,
-    completion: tokio::sync::oneshot::Receiver<NetworkOpenResult>,
+    completion: tokio::sync::oneshot::Receiver<TcpOpenDecision>,
 ) {
-    let decision = completion.await.unwrap_or(NetworkOpenResult::Denied {
-        errno: cancellation_errno(),
-    });
+    let decision = completion
+        .await
+        .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
     let Ok(payload) = serde_json::to_vec(&decision) else {
         return;
     };
@@ -826,19 +810,8 @@ async fn complete_network_open(
     {
         return;
     }
-    if matches!(decision, NetworkOpenResult::RelayReady) {
+    if matches!(decision, TcpOpenDecision::RelayReady) {
         let _ = tokio::io::copy_bidirectional(&mut boundary, &mut transport).await;
-    }
-}
-
-const fn cancellation_errno() -> i32 {
-    #[cfg(unix)]
-    {
-        libc::ECANCELED
-    }
-    #[cfg(not(unix))]
-    {
-        125
     }
 }
 
@@ -850,7 +823,7 @@ struct OutboundMediationFrame {
 }
 
 struct ClientMediationSession {
-    dns: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<MediatedDnsQuery>>,
+    dns: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PendingDnsQuery>>,
     healthy: Arc<AtomicBool>,
 }
 
@@ -875,7 +848,7 @@ impl ClientMediationSession {
         self.healthy.load(Ordering::Acquire)
     }
 
-    async fn accept_dns(&self) -> Result<MediatedDnsQuery, BackendError> {
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
         self.dns.lock().await.recv().await.ok_or_else(|| {
             BackendError::Unavailable("persistent DNS mediation session ended".to_string())
         })
@@ -884,7 +857,7 @@ impl ClientMediationSession {
 
 async fn run_client_mediation(
     stream: BoundaryDuplexStream,
-    dns_tx: tokio::sync::mpsc::Sender<MediatedDnsQuery>,
+    dns_tx: tokio::sync::mpsc::Sender<PendingDnsQuery>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (outbound_tx, mut outbound_rx) =
@@ -913,7 +886,7 @@ async fn run_client_mediation(
 
 async fn dispatch_client_mediation_frame(
     frame: MediationFrame,
-    dns_tx: &tokio::sync::mpsc::Sender<MediatedDnsQuery>,
+    dns_tx: &tokio::sync::mpsc::Sender<PendingDnsQuery>,
     outbound: &tokio::sync::mpsc::Sender<OutboundMediationFrame>,
 ) -> std::io::Result<()> {
     match frame.kind {
@@ -941,8 +914,8 @@ async fn dispatch_client_mediation_frame(
                 }
             });
             dns_tx
-                .send(MediatedDnsQuery {
-                    request: query.request,
+                .send(PendingDnsQuery {
+                    message: query.request,
                     transport: query.transport,
                     binary_identity: query.identity.into_result(),
                     timing: MediationTiming {
@@ -1747,7 +1720,7 @@ mod tests {
             );
         });
         let query = session.accept_dns().await.unwrap();
-        assert_eq!(query.request, [1, 2, 3]);
+        assert_eq!(query.message, [1, 2, 3]);
         assert_eq!(
             query.binary_identity.unwrap().binary_path,
             PathBuf::from("/usr/bin/dig")
@@ -1851,6 +1824,7 @@ mod tests {
     fn sandbox() -> SandboxContext {
         SandboxContext {
             sandbox_id: "sandbox-1".to_string(),
+            session_id: openshell_core::SandboxSessionId::new(),
             policy: SandboxPolicy {
                 version: 1,
                 filesystem: FilesystemPolicy::default(),
@@ -1913,6 +1887,7 @@ mod tests {
             authenticated_supervisor: true,
             session_epoch: "test-session".to_string(),
             driver_fence: test_driver_fence(),
+            runtime_exit_terminates_workload: true,
             resource_claims: std::collections::BTreeMap::new(),
         }
     }
