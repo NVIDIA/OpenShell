@@ -22,7 +22,13 @@ import {
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import {
+  ConfigUpdateConsistency,
+  ConfigUpdateOperationState,
+  OpenShell,
+  SandboxPhase,
+  ServiceStatus,
+} from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
@@ -1005,14 +1011,14 @@ describe('config / policy', () => {
     });
   });
 
-  it('setPolicy sends global=false + version pin and (wait) polls until the hash matches', async () => {
+  it('setPolicy asks the gateway to wait for the durable apply operation', async () => {
     let updateReq: {
       name?: string;
       global?: boolean;
       expectedResourceVersion?: bigint;
       policy?: unknown;
+      consistency?: ConfigUpdateConsistency;
     } = {};
-    let configCalls = 0;
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
       updateConfig: (req) => {
@@ -1022,20 +1028,10 @@ describe('config / policy', () => {
           policyHash: 'target',
           settingsRevision: 10n,
           deleted: false,
-        };
-      },
-      getSandboxConfig: () => {
-        configCalls += 1;
-        const policyHash = configCalls >= 2 ? 'target' : 'stale';
-        return {
-          policy: { version: 1, networkPolicies: {} },
-          version: 5,
-          policyHash,
-          settings: {},
-          configRevision: 1n,
-          policySource: PolicySource.SANDBOX,
-          globalPolicyVersion: 0,
-          providerEnvRevision: 0n,
+          operation: {
+            operationId: 'operation-1',
+            state: ConfigUpdateOperationState.APPLIED,
+          },
         };
       },
     });
@@ -1052,32 +1048,34 @@ describe('config / policy', () => {
     expect(updateReq.global).toBe(false);
     expect(updateReq.expectedResourceVersion).toBe(7n);
     expect(updateReq.policy).toBeDefined();
+    expect(updateReq.consistency).toBe(ConfigUpdateConsistency.WAIT_FOR_APPLY);
     expect(result.version).toBe(5);
     expect(result.policyHash).toBe('target');
     expect(result.settingsRevision).toBe('10');
-    expect(configCalls).toBeGreaterThanOrEqual(2);
+    expect(result.operationId).toBe('operation-1');
+    expect(result.operationState).toBe(ConfigUpdateOperationState.APPLIED);
   });
 
-  // Fix #4 residual: setPolicy(..., {wait:true}) must not hang forever when the
-  // getConfig poll stalls. Each poll RPC is bounded by the remaining deadline,
-  // so a getSandboxConfig that never settles on its own is aborted and the wait
-  // rejects instead of pending forever. The handler resolves only on the call
-  // signal firing, proving the per-poll deadline (not the sleep loop) is what
-  // bounds the returned promise.
-  it('setPolicy wait rejects when the config poll stalls past the deadline', async () => {
+  it('setPolicy rejects a terminal failed durable operation', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
-      updateConfig: () => ({ version: 5, policyHash: 'target', settingsRevision: 10n, deleted: false }),
-      getSandboxConfig: (_req, ctx) =>
-        new Promise((_resolve, reject) => {
-          ctx.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
-        }),
+      updateConfig: () => ({
+        version: 5,
+        policyHash: 'target',
+        settingsRevision: 10n,
+        deleted: false,
+        operation: {
+          operationId: 'operation-2',
+          state: ConfigUpdateOperationState.FAILED,
+          sanitizedError: 'runtime rejected policy',
+        },
+      }),
     });
 
-    await expect(
-      sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true, waitTimeoutSecs: 0.2 }),
-    ).rejects.toMatchObject({ code: 'connect' });
-  }, 5000);
+    await expect(sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true })).rejects.toThrow(
+      /runtime rejected policy/,
+    );
+  });
 
   it('setSetting upserts a single sandbox-scoped setting (global=false)', async () => {
     let req: {

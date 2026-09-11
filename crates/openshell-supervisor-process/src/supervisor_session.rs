@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     ConfigApplyFailure, ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult,
@@ -25,10 +26,6 @@ use openshell_core::proto::{
     RelayOpen, RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
     SupervisorMessage, TcpRelayTarget, config_snapshot_revision, config_update, gateway_message,
     relay_open, supervisor_message,
-};
-use openshell_core::proto::{
-    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-    SUPERVISOR_PROTOCOL_REVISION,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder, OcsfEvent,
@@ -127,6 +124,7 @@ fn update_component_and_revision(
                         policy_version: snapshot.version,
                         policy_source: snapshot.policy_source,
                         global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
                     },
                 )),
             }),
@@ -654,24 +652,12 @@ async fn run_prepared_session(
 fn validate_gateway_protocol_revision(
     gateway_revision: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match gateway_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
-            warn!(
-                "supervisor session: gateway uses Stage 1 stream semantics; polling remains active"
-            );
-            Ok(())
-        }
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            warn!(
-                "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
-            );
-            Ok(())
-        }
-        other => Err(format!(
-            "supervisor protocol revision mismatch: supervisor requires {SUPERVISOR_PROTOCOL_REVISION}, gateway offered {other}"
-        )
-        .into()),
+    if gateway_revision == SUPERVISOR_PROTOCOL_REVISION {
+        Ok(())
+    } else {
+        Err(format!(
+            "supervisor protocol revision mismatch: supervisor requires {SUPERVISOR_PROTOCOL_REVISION}, gateway offered {gateway_revision}"
+        ).into())
     }
 }
 
@@ -730,6 +716,7 @@ fn bootstrap_components(
                         policy_version: snapshot.version,
                         policy_source: snapshot.policy_source,
                         global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
                     },
                 )),
             }),
@@ -1240,10 +1227,9 @@ mod target_tests {
     use super::*;
 
     #[test]
-    fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
+    fn gateway_protocol_revision_accepts_only_current_peer() {
         assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_gateway_protocol_revision(PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION - 1).is_err());
     }
 
     #[test]

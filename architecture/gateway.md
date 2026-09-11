@@ -598,12 +598,13 @@ interleave a profile mutation with a sandbox provider-set mutation that would
 leave an ambiguous final dynamic-token state or a deleted custom profile that is
 still referenced by a sandbox.
 
-Policy and runtime settings are delivered together through the effective sandbox
-config path. A gateway-global policy can override sandbox-scoped policy. The
-gateway pushes complete snapshots to active supervisor sessions and periodically
-rebuilds them to repair missed delivery. Supervisors hot-reload accepted policy
-and acknowledge the exact revision. The legacy poller remains as a mixed-version
-compatibility path during this stage.
+Policy and runtime settings are delivered together through the supervisor
+configuration stream. A gateway-global policy can override sandbox-scoped
+policy. The gateway pushes complete snapshots to active supervisor sessions and
+owner reconciliation rebuilds them to repair missed delivery. Supervisors
+hot-reload accepted policy and acknowledge the exact revision. Gateway and
+supervisor protocol revisions must match; there is no configuration polling
+compatibility path.
 
 External supervisor middleware registration is operator-owned configuration
 under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
@@ -670,12 +671,22 @@ mutation handlers.
 
 Current supervisors establish the stream before gateway-owned runtime
 initialization, apply bootstrap and live snapshots directly, and persist only
-compact component observations from their results. Previous-revision
-supervisors retain polling as a rollout fallback, and owner reconciliation
+compact component observations from their results. The protocol is
+release-matched and no polling compatibility path remains. Owner reconciliation
 repairs missed or failed delivery from current database state. Snapshot build,
 fanout, or enqueue failure cannot fail a mutation that already committed.
 Provider snapshots may contain credentials and must not be persisted or
 included in logs.
+
+For sandbox-scoped policy and settings mutations, the gateway atomically stores
+the desired state and a durable operation whose target is the exact policy and
+settings revision tuple. Server-side `WAIT_FOR_APPLY` reads this durable record
+until a correlated stream result or authoritative lifecycle transition makes it
+terminal. Pending-operation reconciliation provides crash recovery and can run
+on a gateway other than the request handler; local notifications are wake-up
+hints only. Operations persist revisions, outcome, timestamps, response
+metadata, and bounded sanitized errors, never complete configuration payloads
+or credentials.
 
 See [sandbox configuration delivery](sandbox.md#supervisor-configuration-delivery)
 for bootstrap, revision, and supervisor application semantics.

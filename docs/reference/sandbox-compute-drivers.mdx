@@ -502,7 +502,7 @@ network sidecar owns gateway authentication and writes local policy/provider
 state to the process supervisor over a local control socket, so the agent
 container does not mount the sandbox bootstrap token or client TLS secret in
 the default sidecar path. The provider environment is refreshed by the network
-sidecar after settings polls and streamed to the process supervisor so future
+sidecar from gateway stream snapshots and forwarded to the process supervisor so future
 child processes can see updated provider env without gateway access in the
 agent container.
 Sidecar mode keeps gateway session and SSH behavior. The process supervisor

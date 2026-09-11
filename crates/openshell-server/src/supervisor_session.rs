@@ -15,16 +15,13 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigComponent, ConfigComponentApplyResult,
     ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicySource,
     RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
     Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage,
     config_snapshot_revision, config_update, gateway_message, relay_open, supervisor_message,
-};
-use openshell_core::proto::{
-    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-    SUPERVISOR_PROTOCOL_REVISION,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 use openshell_core::{ObjectId, ObjectWorkspace};
@@ -162,6 +159,7 @@ fn build_config_update(
                         policy_version: snapshot.version,
                         policy_source: snapshot.policy_source,
                         global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
                     },
                 )),
             };
@@ -206,6 +204,7 @@ fn config_message_revision(message: &SupervisorConfigMessage) -> ConfigSnapshotR
                     policy_version: snapshot.version,
                     policy_source: snapshot.policy_source,
                     global_policy_version: snapshot.global_policy_version,
+                    settings_revision: snapshot.settings_revision,
                 },
             )),
         },
@@ -1042,7 +1041,6 @@ pub async fn handle_connect_supervisor(
     };
 
     let sandbox_id = hello.sandbox_id.clone();
-    let stream_applies_config = hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION;
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
@@ -1052,44 +1050,36 @@ pub async fn handle_connect_supervisor(
     }
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
-    let bootstrap_timeout = if stream_applies_config {
-        crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
-    } else {
-        crate::config_delivery::OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
+    let bootstrap = match crate::config_delivery::build_config_bootstrap(
+        state,
+        &sandbox,
+        crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+    )
+    .await
+    {
+        Ok(bootstrap) => {
+            counter!(
+                "openshell_supervisor_config_bootstrap_total",
+                "outcome" => "built"
+            )
+            .increment(1);
+            bootstrap
+        }
+        Err(error) => {
+            counter!(
+                "openshell_supervisor_config_bootstrap_total",
+                "outcome" => "build_failed"
+            )
+            .increment(1);
+            warn!(
+                sandbox_id = %sandbox_id,
+                error_code = ?error.code(),
+                "failed to build supervisor configuration bootstrap"
+            );
+            return Err(error);
+        }
     };
-    let bootstrap =
-        match crate::config_delivery::build_config_bootstrap(state, &sandbox, bootstrap_timeout)
-            .await
-        {
-            Ok(bootstrap) => {
-                counter!(
-                    "openshell_supervisor_config_bootstrap_total",
-                    "outcome" => "built"
-                )
-                .increment(1);
-                Some(bootstrap)
-            }
-            Err(error) => {
-                counter!(
-                    "openshell_supervisor_config_bootstrap_total",
-                    "outcome" => "build_failed"
-                )
-                .increment(1);
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error_code = ?error.code(),
-                    "failed to build supervisor configuration bootstrap"
-                );
-                if stream_applies_config {
-                    return Err(error);
-                }
-                None
-            }
-        };
-    let expected_bootstrap_revisions = bootstrap
-        .as_ref()
-        .map(bootstrap_revision_fence)
-        .unwrap_or_default();
+    let expected_bootstrap_revisions = bootstrap_revision_fence(&bootstrap);
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -1103,11 +1093,11 @@ pub async fn handle_connect_supervisor(
     // keeps a concurrent ConfigUpdate from becoming the first stream message.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut accepted = GatewayMessage {
+    let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
             heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
-            bootstrap,
+            bootstrap: Some(bootstrap),
             protocol_revision: hello.protocol_revision,
         })),
     };
@@ -1117,17 +1107,9 @@ pub async fn handle_connect_supervisor(
             "outcome" => "payload_too_large"
         )
         .increment(1);
-        if stream_applies_config {
-            return Err(Status::resource_exhausted(
-                "supervisor configuration bootstrap exceeds the stream message limit",
-            ));
-        }
-        let Some(gateway_message::Payload::SessionAccepted(accepted_payload)) =
-            accepted.payload.as_mut()
-        else {
-            unreachable!("constructed SessionAccepted payload")
-        };
-        accepted_payload.bootstrap = None;
+        return Err(Status::resource_exhausted(
+            "supervisor configuration bootstrap exceeds the stream message limit",
+        ));
     }
     if tx.send(accepted).await.is_err() {
         return Err(Status::internal("failed to send session accepted"));
@@ -1154,11 +1136,6 @@ pub async fn handle_connect_supervisor(
             .await;
     }
 
-    if !stream_applies_config {
-        let _ =
-            mark_supervisor_initialized(state, &sandbox_id, &session_id, &hello.instance_id).await;
-    }
-
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -1169,7 +1146,6 @@ pub async fn handle_connect_supervisor(
             &sandbox_id_clone,
             &session_id,
             &instance_id,
-            stream_applies_config,
             &expected_bootstrap_revisions,
             &tx,
             &mut inbound,
@@ -1210,28 +1186,13 @@ pub async fn handle_connect_supervisor(
     Ok(Response::new(stream))
 }
 
-fn validate_protocol_revision(sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
-    match supervisor_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_previous_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: Stage 1 supervisor is using polling compatibility"
-            );
-            Ok(())
-        }
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_legacy_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: supervisor predates the protocol handshake; recreate the sandbox before the next gateway upgrade"
-            );
-            Ok(())
-        }
-        other => Err(Status::failed_precondition(format!(
-            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {other}"
-        ))),
+fn validate_protocol_revision(_sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
+    if supervisor_revision == SUPERVISOR_PROTOCOL_REVISION {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {supervisor_revision}"
+        )))
     }
 }
 
@@ -1297,7 +1258,6 @@ async fn run_session_loop(
     sandbox_id: &str,
     session_id: &str,
     instance_id: &str,
-    stream_applies_config: bool,
     expected_bootstrap_revisions: &[(ConfigComponent, ConfigSnapshotRevision)],
     tx: &mpsc::Sender<GatewayMessage>,
     inbound: &mut tonic::Streaming<SupervisorMessage>,
@@ -1309,7 +1269,7 @@ async fn run_session_loop(
     heartbeat_timer.tick().await;
     let bootstrap_timeout = tokio::time::sleep(Duration::from_mins(2));
     tokio::pin!(bootstrap_timeout);
-    let mut bootstrap_complete = !stream_applies_config;
+    let mut bootstrap_complete = false;
 
     loop {
         tokio::select! {
@@ -1321,8 +1281,7 @@ async fn run_session_loop(
                 match msg {
                     Ok(Some(msg)) => {
                         let bootstrap_succeeded = match msg.payload.as_ref() {
-                            Some(supervisor_message::Payload::ConfigBootstrapResult(result))
-                                if stream_applies_config =>
+                            Some(supervisor_message::Payload::ConfigBootstrapResult(result)) =>
                             {
                                 match validate_bootstrap_result(
                                     &result.results,
@@ -1346,7 +1305,6 @@ async fn run_session_loop(
                             state,
                             sandbox_id,
                             session_id,
-                            stream_applies_config,
                             msg,
                         ).await;
                         match bootstrap_succeeded {
@@ -1419,7 +1377,6 @@ async fn handle_supervisor_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
-    stream_applies_config: bool,
     msg: SupervisorMessage,
 ) {
     match msg.payload {
@@ -1470,29 +1427,33 @@ async fn handle_supervisor_message(
                 );
                 return;
             }
-            if let Some(result) = result.result.as_ref()
-                && let Err(error) = record_component_apply_result(state, sandbox_id, result).await
-            {
-                state
-                    .supervisor_sessions
-                    .retry_config_update_after_persistence_failure(sandbox_id, session_id, result);
-                warn!(
-                    sandbox_id,
-                    session_id,
-                    component = result.component,
-                    error = %error,
-                    "failed to persist supervisor configuration result"
-                );
+            if let Some(result) = result.result.as_ref() {
+                let persisted = record_component_apply_result(state, sandbox_id, result).await;
+                let completed = if persisted.is_ok() {
+                    crate::config_update_operation::complete_from_apply_result(
+                        state, sandbox_id, result,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = persisted.and(completed) {
+                    state
+                        .supervisor_sessions
+                        .retry_config_update_after_persistence_failure(
+                            sandbox_id, session_id, result,
+                        );
+                    warn!(
+                        sandbox_id,
+                        session_id,
+                        component = result.component,
+                        error = %error,
+                        "failed to persist supervisor configuration result"
+                    );
+                }
             }
         }
         Some(supervisor_message::Payload::ConfigBootstrapResult(result)) => {
-            if !stream_applies_config {
-                debug!(
-                    sandbox_id,
-                    session_id, "ignored bootstrap result from polling-compatibility supervisor"
-                );
-                return;
-            }
             if !state
                 .supervisor_sessions
                 .is_current_session(sandbox_id, session_id)
@@ -1500,9 +1461,16 @@ async fn handle_supervisor_message(
                 return;
             }
             for component in &result.results {
-                if let Err(error) =
-                    record_component_apply_result(state, sandbox_id, component).await
-                {
+                let persisted = record_component_apply_result(state, sandbox_id, component).await;
+                let completed = if persisted.is_ok() {
+                    crate::config_update_operation::complete_from_apply_result(
+                        state, sandbox_id, component,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = persisted.and(completed) {
                     warn!(
                         sandbox_id,
                         session_id,
@@ -1537,6 +1505,7 @@ fn bootstrap_revision_fence(
                         policy_version: snapshot.version,
                         policy_source: snapshot.policy_source,
                         global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
                     },
                 )),
             },
@@ -1826,10 +1795,9 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_protocol_revision_accepts_current_and_legacy_peers() {
+    fn supervisor_protocol_revision_accepts_only_current_peer() {
         assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION - 1).is_err());
     }
 
     #[test]
@@ -1937,6 +1905,7 @@ mod tests {
         assert!(observation.observed_at_ms > 0);
     }
 
+    #[allow(dead_code)]
     async fn first_gateway_message(
         harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
     ) -> GatewayMessage {
@@ -1945,60 +1914,6 @@ mod tests {
             .expect("gateway response before timeout")
             .expect("stream open")
             .expect("gateway message")
-    }
-
-    #[tokio::test]
-    async fn legacy_supervisor_without_protocol_revision_is_accepted() {
-        let state = state_with_sandbox("sb-legacy").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-legacy",
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("legacy supervisor must connect");
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted.protocol_revision,
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .is_current_session("sb-legacy", &accepted.session_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_one_supervisor_uses_polling_compatibility() {
-        let state = state_with_sandbox("sb-stage-one").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-stage-one",
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("Stage 1 supervisor must connect");
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted.protocol_revision,
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .is_current_session("sb-stage-one", &accepted.session_id)
-        );
     }
 
     #[tokio::test]

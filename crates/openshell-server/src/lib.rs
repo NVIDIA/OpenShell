@@ -19,6 +19,7 @@ pub mod cli;
 mod compute;
 mod config_delivery;
 pub mod config_file;
+mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
@@ -730,6 +731,7 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     config_delivery::spawn_owner_reconciler(state.clone(), Duration::from_secs(30));
+    config_update_operation::spawn_reconciler(state.clone(), Duration::from_secs(5));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     // Create the multiplexed service

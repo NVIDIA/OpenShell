@@ -24,11 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, open_shell_client::OpenShellClient,
-    workspace_selector,
+    GetSandboxConfigRequest, IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk,
+    PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, open_shell_client::OpenShellClient, workspace_selector,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -822,38 +821,6 @@ pub async fn sync_policy_and_fetch_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
-/// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
-///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
-pub async fn fetch_provider_environment(
-    endpoint: &str,
-    sandbox_id: &str,
-) -> Result<ProviderEnvironmentResult> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
-
-    let mut client = connect(endpoint).await?;
-
-    let response = client
-        .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
-            sandbox_id: sandbox_id.to_string(),
-            supports_static_credential_bindings: true,
-        })
-        .await
-        .into_diagnostic()?;
-
-    let inner = response.into_inner();
-    Ok(ProviderEnvironmentResult {
-        environment: inner.environment,
-        provider_env_revision: inner.provider_env_revision,
-        credential_expires_at_ms: inner.credential_expires_at_ms,
-        dynamic_credentials: inner.dynamic_credentials,
-        static_credential_bindings: inner.static_credential_bindings,
-        non_secret_environment_keys: inner.non_secret_environment_keys,
-    })
-}
-
 pub async fn exchange_provider_subject_token(
     endpoint: &str,
     sandbox_id: &str,
@@ -905,14 +872,14 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 
 /// A reusable gRPC client for the `OpenShell` service.
 ///
-/// Wraps a tonic channel connected once and reused for policy polling
-/// and status reporting, avoiding per-request TLS handshake overhead.
+/// Wraps a tonic channel connected once and reused for status reporting and
+/// extension-credential rotation, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
-    /// the store, so the middleware registry and the polling loop that rotates
+    /// the store, so the middleware registry and the stream loop that rotates
     /// it observe the same slots.
     extension_credentials: ExtensionCredentialStore,
 }
@@ -924,6 +891,7 @@ pub struct SettingsPollResult {
     pub version: u32,
     pub policy_hash: String,
     pub config_revision: u64,
+    pub settings_revision: u64,
     pub policy_source: PolicySource,
     /// Effective settings keyed by name.
     pub settings: HashMap<String, crate::proto::EffectiveSetting>,
@@ -945,6 +913,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         version: inner.version,
         policy_hash: inner.policy_hash,
         config_revision: inner.config_revision,
+        settings_revision: inner.settings_revision,
         policy_source: PolicySource::try_from(inner.policy_source)
             .unwrap_or(PolicySource::Unspecified),
         settings: inner.settings,
@@ -967,6 +936,7 @@ impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
             version: inner.version,
             policy_hash: inner.policy_hash,
             config_revision: inner.config_revision,
+            settings_revision: inner.settings_revision,
             policy_source: PolicySource::try_from(inner.policy_source)
                 .unwrap_or(PolicySource::Unspecified),
             settings: inner.settings,
@@ -1149,7 +1119,7 @@ impl CachedOpenShellClient {
         endpoint: &str,
         extension_credentials: ExtensionCredentialStore,
     ) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
+        debug!(endpoint = %endpoint, "Connecting reusable openshell gRPC client");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
@@ -1222,7 +1192,7 @@ impl CachedOpenShellClient {
     }
 
     /// Rotate every credential currently retained by the installed registry.
-    /// This remains available when configuration polling fails independently.
+    /// This remains available independently of streamed configuration updates.
     pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
         let names = self.extension_credentials.names();
         if names.is_empty() || !self.extension_credentials.needs_refresh(&names, now_ms()) {

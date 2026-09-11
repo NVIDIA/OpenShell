@@ -4,7 +4,7 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation};
 use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
@@ -21,6 +21,7 @@ pub struct AtomicPolicyRevisionWrite {
     pub expected_resource_version: u64,
     pub annotations: HashMap<String, String>,
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    pub operation: Option<StoredConfigUpdateOperation>,
 }
 
 pub fn policy_record_for_atomic_write(

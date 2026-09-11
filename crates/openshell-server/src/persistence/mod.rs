@@ -28,6 +28,14 @@ pub const CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE: &str = "config_component_obs
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
+/// Optional sandbox projection committed with a settings mutation and its
+/// durable operation.
+pub struct AtomicSandboxProjection<'a> {
+    pub sandbox_id: &'a str,
+    pub payload: &'a [u8],
+    pub expected_resource_version: u64,
+}
+
 /// Maximum number of object ids sent in one set-based delete statement.
 ///
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
@@ -363,6 +371,32 @@ impl Store {
             payload,
             labels,
             condition
+        ))
+    }
+
+    /// Write desired state and its durable update operation in one database
+    /// transaction. Used by sandbox-scoped settings mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_if_with_operation(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        condition: WriteCondition,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        sandbox_projection: Option<&AtomicSandboxProjection<'_>>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.put_if_with_operation(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            condition,
+            operation,
+            sandbox_projection
         ))
     }
 

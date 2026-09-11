@@ -187,6 +187,14 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		Global:                  cu.Global,
 		ExpectedResourceVersion: cu.ExpectedResourceVersion,
 		Annotations:             CopyStringMap(cu.Annotations),
+		IdempotencyKey:          cu.IdempotencyKey,
+		WaitTimeoutSecs:         cu.WaitTimeoutSeconds,
+	}
+	switch cu.Consistency {
+	case v1.ConfigUpdateWaitForApply:
+		req.Consistency = pb.ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_APPLY
+	case v1.ConfigUpdateCommitOnly:
+		req.Consistency = pb.ConfigUpdateConsistency_CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY
 	}
 
 	// Convert typed SDK SandboxPolicy to proto SandboxPolicy.
@@ -296,11 +304,21 @@ func ConfigUpdateResultFromProto(resp *pb.UpdateConfigResponse) *v1.ConfigUpdate
 	if resp == nil {
 		return nil
 	}
-	return &v1.ConfigUpdateResult{
+	result := &v1.ConfigUpdateResult{
 		Version:          resp.GetVersion(),
 		PolicyHash:       resp.GetPolicyHash(),
 		SettingsRevision: resp.GetSettingsRevision(),
 		Deleted:          resp.GetDeleted(),
 		Annotations:      CopyStringMap(resp.GetAnnotations()),
 	}
+	if operation := resp.GetOperation(); operation != nil {
+		result.Operation = &v1.ConfigUpdateOperation{
+			OperationID:    operation.GetOperationId(),
+			SandboxID:      operation.GetSandboxId(),
+			State:          operation.GetState().String(),
+			Outcome:        operation.GetOutcome().String(),
+			SanitizedError: operation.GetSanitizedError(),
+		}
+	}
+	return result
 }

@@ -150,6 +150,48 @@ impl ObjectWorkspace for StoredConfigComponentObservation {
     }
 }
 
+impl ObjectId for StoredConfigUpdateOperation {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredConfigUpdateOperation {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredConfigUpdateOperation {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredConfigUpdateOperation {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredConfigUpdateOperation {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredConfigUpdateOperation {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,13 +201,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "a623124c961f3a56af58a4ab148c12985e5efaec1ad23441031f5cd5b073fe22";
+        "643012c48073e4cc64f07d50e33a7e24048f112ffefd34e22c03aa5d90b60cfb";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e173ad118e822557efcfc92ace7042bbc7bdd35e709c503abb123de378e9e7cb";
+        "763b83a9d1ca5ec7e9588d1239f62bec85fac0f6fcdf59de8f8f886156bd953e";
     const DURABLE_SCHEMA_SHA256: &str =
-        "60f2f912d45bb8bdc6bbf9a62a27b03aad2e65d8564b3f5832d19803a239ac79";
+        "72da642ec0c2fa94e47dc153d384eee59bd616d213a7c55a28574e9e15c6fb73";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "0d1b24b78becb0025512f35fe320b0d91d0728d3239eabf78cdf99e599eb6af2";
+        "45854a0762542ffb1c5028551471ca85aa7cfb8e4aa7e35d12b20892fc564ef4";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -178,23 +220,25 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
-    const STORAGE_MESSAGE_NAMES: [&str; 8] = [
+    const STORAGE_MESSAGE_NAMES: [&str; 9] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
         "StoredConfigComponentObservation",
+        "StoredConfigUpdateOperation",
         "StoredDraftChunk",
         "StoredPolicyRevision",
         "StoredProviderCredentialRefreshState",
         "StoredProviderProfile",
         "StoredRefreshMaterialDeletion",
     ];
-    const DURABLE_ROOTS: [&str; 13] = [
+    const DURABLE_ROOTS: [&str; 14] = [
         ".openshell.datamodel.v1.Provider",
         ".openshell.datamodel.v1.Workspace",
         ".openshell.sandbox.v1.SandboxPolicy",
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
         ".openshell.storage.v1.StoredConfigComponentObservation",
+        ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshState",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.v1.Sandbox",
@@ -531,13 +575,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (291, 15)
+            (288, 17)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (84, 11)
+            (87, 12)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (73, 11));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (74, 12));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,

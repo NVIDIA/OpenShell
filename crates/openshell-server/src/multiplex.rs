@@ -1426,7 +1426,6 @@ mod tests {
             "/openshell.v1.OpenShell/GetSandboxConfig",
             "/openshell.v1.OpenShell/ReportPolicyStatus",
             "/openshell.v1.OpenShell/PushSandboxLogs",
-            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
             "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
             "/openshell.v1.OpenShell/RefreshSandboxToken",
         ];
@@ -2860,7 +2859,6 @@ mod tests {
                 "/openshell.v1.OpenShell/ReportPolicyStatus",
                 "/openshell.v1.OpenShell/PushSandboxLogs",
                 "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
                 "/openshell.v1.OpenShell/ConnectSupervisor",
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",

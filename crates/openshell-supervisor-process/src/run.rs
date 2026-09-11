@@ -6,7 +6,7 @@
 //! Spawns the SSH server, optional supervisor session, the entrypoint child
 //! process, and waits for it to exit (with optional timeout). Long-running
 //! background tasks that aren't strictly tied to the workload's lifetime
-//! (policy poll loop, denial aggregator, symlink resolver) live in the
+//! (stream configuration loop, denial aggregator, symlink resolver) live in the
 //! orchestrator, not here.
 
 use miette::{IntoDiagnostic, Result};
@@ -125,17 +125,9 @@ pub async fn run_process(
         )?;
     }
 
-    // Eagerly fetch initial settings and install the agent skill if the
-    // proposals flag is on at startup, rather than waiting for the policy
-    // poll loop's first tick. In offline/file-mode there is no gateway, so
-    // the flag stays at its default (false) and no skill is installed.
-    install_initial_agent_skill(
-        sandbox_id,
-        openshell_endpoint,
-        &agent_proposals,
-        prepared_supervisor_session.is_none(),
-    )
-    .await;
+    // Stream bootstrap has already initialized the proposal flag in online
+    // mode. Offline/file mode retains the local default.
+    install_initial_agent_skill(&agent_proposals);
 
     // Provider token grants may mount supervisor-only identity sockets such as
     // the SPIFFE Workload API. Prepare the child mount namespace that hides
@@ -733,42 +725,9 @@ fn ssh_proxy_url_for_policy(
     proxy.http_addr.map(|addr| format!("http://{addr}"))
 }
 
-/// Eagerly fetch initial settings and install the agent-driven policy
-/// proposal skill if the flag is on at startup.
-///
-/// Without this, the skill would only get installed on the policy poll
-/// loop's first false→true transition, which can be ~10 s after launch —
-/// long enough for an agent to start running without seeing it.
-///
-/// Best-effort: any failure (no gateway, RPC error, install failure) is
-/// logged but does not fail sandbox startup.
-async fn install_initial_agent_skill(
-    sandbox_id: Option<&str>,
-    openshell_endpoint: Option<&str>,
-    agent_proposals: &AgentProposals,
-    fetch_settings: bool,
-) {
-    use openshell_core::proto::setting_value;
-
-    if fetch_settings
-        && let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
-        && let Ok(client) =
-            openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await
-        && let Ok(result) = client.poll_settings(id).await
-    {
-        let initial = result
-            .settings
-            .get(openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
-            .and_then(|es| es.value.as_ref())
-            .and_then(|sv| sv.value.as_ref())
-            .and_then(|v| match v {
-                setting_value::Value::BoolValue(b) => Some(*b),
-                _ => None,
-            })
-            .unwrap_or(false);
-        agent_proposals.set_enabled(initial);
-    }
-
+/// Install the agent-driven policy proposal skill when enabled by the stream
+/// bootstrap. Best-effort installation does not fail sandbox startup.
+fn install_initial_agent_skill(agent_proposals: &AgentProposals) {
     if agent_proposals.enabled() {
         match crate::skills::install_static_skills() {
             Ok(installed) => info!(

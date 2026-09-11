@@ -1816,8 +1816,10 @@ type SandboxConfigSnapshot struct {
 	Workspace                      string                         `protobuf:"bytes,10,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	PolicyValidationFailureMode    string                         `protobuf:"bytes,11,opt,name=policy_validation_failure_mode,json=policyValidationFailureMode,proto3" json:"policy_validation_failure_mode,omitempty"`
 	ExtensionAuthenticationEnabled bool                           `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
-	unknownFields                  protoimpl.UnknownFields
-	sizeCache                      protoimpl.SizeCache
+	// Monotonic revision of the sandbox-scoped settings row.
+	SettingsRevision uint64 `protobuf:"varint,13,opt,name=settings_revision,json=settingsRevision,proto3" json:"settings_revision,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SandboxConfigSnapshot) Reset() {
@@ -1934,6 +1936,13 @@ func (x *SandboxConfigSnapshot) GetExtensionAuthenticationEnabled() bool {
 	return false
 }
 
+func (x *SandboxConfigSnapshot) GetSettingsRevision() uint64 {
+	if x != nil {
+		return x.SettingsRevision
+	}
+	return 0
+}
+
 // Response containing effective sandbox settings and policy.
 type GetSandboxConfigResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1970,8 +1979,10 @@ type GetSandboxConfigResponse struct {
 	// False also covers older gateways that do not advertise this capability;
 	// supervisors preserve their legacy unauthenticated connection behavior.
 	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
-	unknownFields                  protoimpl.UnknownFields
-	sizeCache                      protoimpl.SizeCache
+	// Monotonic revision of the sandbox-scoped settings row.
+	SettingsRevision uint64 `protobuf:"varint,13,opt,name=settings_revision,json=settingsRevision,proto3" json:"settings_revision,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -2086,6 +2097,13 @@ func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
 		return x.ExtensionAuthenticationEnabled
 	}
 	return false
+}
+
+func (x *GetSandboxConfigResponse) GetSettingsRevision() uint64 {
+	if x != nil {
+		return x.SettingsRevision
+	}
+	return 0
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2353,7 +2371,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xcb\x06\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xf8\x06\n" +
 	"\x15SandboxConfigSnapshot\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2368,10 +2386,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
-	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x12+\n" +
+	"\x11settings_revision\x18\r \x01(\x04R\x10settingsRevision\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd1\x06\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xfe\x06\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2386,7 +2405,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
-	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x12+\n" +
+	"\x11settings_revision\x18\r \x01(\x04R\x10settingsRevision\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +

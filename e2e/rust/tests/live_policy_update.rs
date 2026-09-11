@@ -12,7 +12,7 @@
 //!
 //! These tests replace the Python e2e tests `test_live_policy_update_and_logs`
 //! and `test_live_policy_update_from_empty_network_policies`, which were flaky
-//! due to hard-coded 90s poll timeouts. The Rust tests use the CLI's built-in
+//! due to hard-coded 90s wait timeouts. The Rust tests use the CLI's built-in
 //! `--wait` flag for reliable synchronization.
 //!
 //! Note: the removed Python tests also covered `GetSandboxLogs` RPC and
@@ -595,11 +595,11 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 
 /// An explicit local Rego/data override remains authoritative even when the
 /// sandbox has a gateway policy and that policy changes while it is running.
-/// Gateway polling must continue for settings and providers without replacing
+/// Gateway stream updates must continue for settings and providers without replacing
 /// the locally loaded OPA engine.
 #[cfg(feature = "e2e-docker")]
 #[tokio::test]
-async fn local_policy_override_survives_gateway_policy_polls() {
+async fn local_policy_override_survives_gateway_stream_updates() {
     let (_image_context, image) = write_local_override_image().expect("write local override image");
 
     let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
@@ -632,8 +632,8 @@ async fn local_policy_override_survives_gateway_policy_polls() {
     .await
     .expect("create sandbox with local policy override");
 
-    // Allow several one-second poll intervals. Before the fix, the first poll
-    // immediately reloaded gateway policy A over the local override.
+    // Allow enough time for initial stream reconciliation. Before the fix, the
+    // first gateway snapshot reloaded policy A over the local override.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     let initial_logs = run_cli(&[
         "logs",
@@ -660,7 +660,7 @@ async fn local_policy_override_survives_gateway_policy_polls() {
     );
     assert!(
         !initial_logs.output.contains("Policy reloaded successfully"),
-        "the first gateway poll must not replace the local policy:\n{}",
+        "the first gateway stream snapshot must not replace the local policy:\n{}",
         initial_logs.output
     );
 

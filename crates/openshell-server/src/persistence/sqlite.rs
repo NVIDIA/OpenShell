@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicSandboxProjection, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord,
+    PersistenceError, PersistenceResult, PolicyRecord, WriteCondition, WriteResult,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -35,6 +35,45 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+
+async fn insert_update_operation_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    record: &crate::storage_proto::StoredConfigUpdateOperation,
+    now_ms: i64,
+) -> PersistenceResult<()> {
+    let metadata = record
+        .metadata
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Encode("update operation metadata missing".to_string()))?;
+    let operation = record
+        .operation
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Encode("update operation payload missing".to_string()))?;
+    let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+        .unwrap_or_default();
+    sqlx::query(
+        r#"
+INSERT INTO "objects" (
+    "object_type", "id", "name", "workspace", "scope", "version", "status", "payload",
+    "created_at_ms", "updated_at_ms", "labels", "resource_version"
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, '{}', 1)
+"#,
+    )
+    .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+    .bind(&metadata.id)
+    .bind(&metadata.name)
+    .bind(&metadata.workspace)
+    .bind(&operation.sandbox_id)
+    .bind(Option::<i64>::None)
+    .bind(state.as_str_name())
+    .bind(record.encode_to_vec())
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| map_db_error(&error))?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -319,6 +358,102 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 })
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_if_with_operation(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        condition: WriteCondition,
+        operation_record: &crate::storage_proto::StoredConfigUpdateOperation,
+        sandbox_projection: Option<&AtomicSandboxProjection<'_>>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_db_error(&error))?;
+        let resource_version = match condition {
+            WriteCondition::MustCreate => {
+                sqlx::query(
+                    r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)
+"#,
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(name)
+                .bind(workspace)
+                .bind(payload)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| map_db_error(&error))?;
+                1
+            }
+            WriteCondition::MatchResourceVersion(expected) => {
+                let result = sqlx::query(
+                    r#"
+UPDATE "objects"
+SET "payload" = ?4, "updated_at_ms" = ?5, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(i64::try_from(expected).unwrap_or(i64::MAX))
+                .bind(payload)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| map_db_error(&error))?;
+                if result.rows_affected() != 1 {
+                    return Err(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    });
+                }
+                expected.saturating_add(1)
+            }
+            WriteCondition::Unconditional => {
+                return Err(PersistenceError::Config(
+                    "atomic settings operation requires a CAS condition".to_string(),
+                ));
+            }
+        };
+        if let Some(projection) = sandbox_projection {
+            let result = sqlx::query(
+                r#"
+UPDATE "objects"
+SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1
+WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4
+"#,
+            )
+            .bind(projection.sandbox_id)
+            .bind(projection.payload)
+            .bind(now_ms)
+            .bind(i64::try_from(projection.expected_resource_version).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| map_db_error(&error))?;
+            if result.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: None,
+                });
+            }
+        }
+        insert_update_operation_sqlite(&mut tx, operation_record, now_ms).await?;
+        tx.commit().await.map_err(|error| map_db_error(&error))?;
+        Ok(WriteResult {
+            resource_version,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
     }
 
     pub async fn delete_if(
@@ -1196,6 +1331,39 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         .execute(&mut *tx)
         .await
         .map_err(|e| map_db_error(&e))?;
+
+        if let Some(operation_record) = write.operation.as_ref() {
+            let metadata = operation_record.metadata.as_ref().ok_or_else(|| {
+                PersistenceError::Encode("update operation metadata missing".to_string())
+            })?;
+            let operation = operation_record.operation.as_ref().ok_or_else(|| {
+                PersistenceError::Encode("update operation payload missing".to_string())
+            })?;
+            let operation_state =
+                openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+                    .unwrap_or_default();
+            sqlx::query(
+                r#"
+INSERT INTO "objects" (
+    "object_type", "id", "name", "workspace", "scope", "version", "status", "payload",
+    "created_at_ms", "updated_at_ms", "labels", "resource_version"
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, '{}', 1)
+"#,
+            )
+            .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+            .bind(&metadata.id)
+            .bind(&metadata.name)
+            .bind(&metadata.workspace)
+            .bind(&operation.sandbox_id)
+            .bind(Option::<i64>::None)
+            .bind(operation_state.as_str_name())
+            .bind(operation_record.encode_to_vec())
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        }
 
         sqlx::query(
             r#"
