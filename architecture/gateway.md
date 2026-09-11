@@ -699,6 +699,11 @@ each component at most once per sandbox pass.
 Operation records and their idempotency keys currently have no automatic
 expiration. The gateway retains both until an explicit deletion contract is
 defined, so an idempotency key cannot be reused merely because time passed.
+On startup, the gateway decodes every existing operation and repairs its SQL
+scope, state, and retry-time projection before selective reconciliation starts.
+The repair is restart-safe and does not change operation resource versions.
+Gateways that share a database must be upgraded together while this projection
+is introduced. An older gateway does not maintain these query columns.
 
 See [sandbox configuration delivery](sandbox.md#supervisor-configuration-delivery)
 for bootstrap, revision, and supervisor application semantics.

@@ -1181,6 +1181,72 @@ async fn operation_cas_updates_sql_state_and_due_index_together() {
 }
 
 #[tokio::test]
+async fn operation_projection_repair_decodes_authoritative_payload_without_version_churn() {
+    use openshell_core::proto::ConfigUpdateOperationState;
+
+    let store = test_store().await;
+    let sandbox = policy_test_sandbox("operation-repair-sandbox", "operation-repair-sandbox");
+    store.put_message(&sandbox).await.unwrap();
+    let operation = config_operation_for(&sandbox, 0, 1);
+    let operation_id = operation.operation.as_ref().unwrap().operation_id.clone();
+    store
+        .put_if_with_operation(
+            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+            "operation-repair-settings",
+            sandbox.object_name(),
+            "default",
+            br#"{"revision":1,"settings":{}}"#,
+            super::WriteCondition::MustCreate,
+            &operation,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let terminal = store
+        .update_message_cas::<crate::storage_proto::StoredConfigUpdateOperation, _>(
+            &operation_id,
+            0,
+            |record| {
+                record.operation.as_mut().unwrap().state =
+                    ConfigUpdateOperationState::Applied.into();
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_pending_config_operations_for_scope(sandbox.object_id())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "generic legacy writes leave the SQL projection stale"
+    );
+
+    let version = terminal.metadata.as_ref().unwrap().resource_version;
+    assert!(
+        store
+            .repair_config_operation_projection(&terminal, version)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .list_pending_config_operations_for_scope(sandbox.object_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let repaired = store
+        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.metadata.unwrap().resource_version, version);
+}
+
+#[tokio::test]
 async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
     let store = test_store().await;
     let first_sandbox = policy_test_sandbox("operation-query-a", "operation-query-a");
@@ -1189,7 +1255,7 @@ async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
     store.put_message(&second_sandbox).await.unwrap();
 
     let mut first = config_operation_for(&first_sandbox, 0, 1);
-    first.next_attempt_at_ms = 20;
+    first.next_attempt_at_ms = 10;
     let first_id = first.operation.as_ref().unwrap().operation_id.clone();
     let mut second = config_operation_for(&second_sandbox, 0, 1);
     second.next_attempt_at_ms = 10;
@@ -1225,7 +1291,25 @@ async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
         .await
         .unwrap();
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].operation.as_ref().unwrap().operation_id, second_id);
+    let first_page_id = due[0].operation.as_ref().unwrap().operation_id.clone();
+    assert!([&first_id, &second_id].contains(&&first_page_id));
+
+    let mut completed = due[0].clone();
+    completed.operation.as_mut().unwrap().state =
+        openshell_core::proto::ConfigUpdateOperationState::Applied.into();
+    let version = completed.metadata.as_ref().unwrap().resource_version;
+    store
+        .update_config_operation_cas(&completed, version)
+        .await
+        .unwrap();
+    let next_page = store
+        .list_due_config_update_operations(i64::MAX, 1)
+        .await
+        .unwrap();
+    assert_eq!(next_page.len(), 1);
+    let second_page_id = &next_page[0].operation.as_ref().unwrap().operation_id;
+    assert_ne!(second_page_id, &first_page_id);
+    assert!([&first_id, &second_id].contains(&second_page_id));
 }
 
 #[tokio::test]

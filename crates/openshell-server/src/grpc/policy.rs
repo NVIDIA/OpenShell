@@ -18,9 +18,10 @@ use crate::auth::workspace_authz::{
 };
 use crate::config_update_operation::{self, CommittedResponse, OperationTarget};
 use crate::pagination::Pagination;
+#[cfg(test)]
+use crate::persistence::ObjectType;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
-    PolicyRecord, Store,
+    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace, PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
@@ -1641,19 +1642,41 @@ async fn current_effective_policy_for_sandbox(
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    current_effective_policy_for_sandbox_from_inputs(
+        state,
+        catalog,
+        &global_settings,
+        &provider_records,
+        sandbox,
+        sandbox_id,
+    )
+    .await
+}
+
+async fn current_effective_policy_for_sandbox_from_inputs(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    global_settings: &StoredSettings,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    if let Some(global_policy) = decode_policy_from_global_settings(global_settings)? {
         // A global policy is the complete effective policy. Dormant sandbox
         // history and specs may predate the current schema, but they must not
         // prevent the valid global policy from being served.
-        return apply_effective_policy_context(
-            state,
+        return apply_effective_policy_context_from_records(
             catalog,
-            workspace,
-            &provider_names,
+            provider_records,
             global_policy,
             PolicySource::Global,
-        )
-        .await;
+        );
     }
 
     let policy = if let Some(record) = state
@@ -1672,15 +1695,12 @@ async fn current_effective_policy_for_sandbox(
         }
     };
 
-    apply_effective_policy_context(
-        state,
+    apply_effective_policy_context_from_records(
         catalog,
-        workspace,
-        &provider_names,
+        provider_records,
         policy,
         PolicySource::Sandbox,
     )
-    .await
 }
 
 async fn effective_policy_for_source(
@@ -1715,17 +1735,26 @@ async fn apply_effective_policy_context(
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
-    mut policy: ProtoSandboxPolicy,
+    policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    clear_provider_credentialed_markers(&mut policy);
-    let mut provider_context = provider_policy_context_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    apply_effective_policy_context_from_records(catalog, &provider_records, policy, policy_source)
+}
+
+fn apply_effective_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    mut policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    clear_provider_credentialed_markers(&mut policy);
+    let mut provider_context = provider_policy_context_from_records(catalog, provider_records);
     if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
@@ -2034,6 +2063,23 @@ async fn validate_policy_credential_bindings_for_sandbox(
     .await?;
     validate_policy_credential_binding_context(catalog, &records, policy, &bindings)?;
     Ok(bindings)
+}
+
+fn validate_policy_credential_bindings_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    let bindings = policy_static_credential_endpoint_bindings(Some(policy))?;
+    let has_signing = policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| !endpoint.credential_signing.is_empty())
+    });
+    if bindings.is_empty() && !has_signing {
+        return Ok(());
+    }
+    validate_policy_credential_binding_context(catalog, records, policy, &bindings)
 }
 
 async fn provider_policy_layers_for_sandbox(
@@ -2430,6 +2476,12 @@ pub async fn build_sandbox_config_snapshot(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        &workspace,
+        &sandbox_provider_names,
+    )
+    .await?;
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let global_policy = decode_policy_from_global_settings(&global_settings)?;
@@ -2488,16 +2540,10 @@ pub async fn build_sandbox_config_snapshot(
             }
         };
 
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let mut provider_policy_context = provider_policy_context_with_catalog(
-        state.store.as_ref(),
-        &provider_profile_catalog,
-        &workspace,
-        &sandbox_provider_names,
-    )
-    .await?;
+    let mut provider_policy_context =
+        provider_policy_context_from_records(&provider_profile_catalog, &provider_records);
 
     if matches!(policy_source, PolicySource::Global)
         && let Ok(Some(global_rev)) = state
@@ -2575,23 +2621,17 @@ pub async fn build_sandbox_config_snapshot(
         state.sandbox_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
-        validate_policy_credential_bindings_for_sandbox(
-            state.as_ref(),
+        validate_policy_credential_bindings_from_records(
             &provider_profile_catalog,
-            &workspace,
-            &sandbox_provider_names,
+            &provider_records,
             policy,
-        )
-        .await?;
+        )?;
     }
-    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
-        state.store.as_ref(),
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         &provider_profile_catalog,
-        &workspace,
-        &sandbox_provider_names,
+        &provider_records,
         &policy_credential_bindings,
-    )
-    .await?;
+    )?;
 
     Ok(SandboxConfigSnapshot {
         policy,
@@ -2774,6 +2814,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     .await
 }
 
+#[cfg(test)]
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -3001,16 +3042,23 @@ async fn provider_policy_context_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
+    let records =
+        super::provider::load_provider_environment_records(store, workspace, provider_names)
+            .await?;
+    Ok(provider_policy_context_from_records(catalog, &records))
+}
+
+fn provider_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> ProviderPolicyContext {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
     let mut endpointless_provider_names = HashSet::new();
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
 
         let provider_type = provider.r#type.trim();
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
@@ -3026,12 +3074,12 @@ async fn provider_policy_context_with_catalog(
             continue;
         };
 
-        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
+        if !super::provider::provider_profile_endpoints_are_active(&profile, provider) {
             endpointless_provider_names.insert(name.clone());
             continue;
         }
 
-        let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+        let rule_name = openshell_policy::provider_rule_name(name);
         let mut rule = profile.network_policy_rule(&rule_name);
         if rule.endpoints.is_empty() {
             endpointless_provider_names.insert(name.clone());
@@ -3054,11 +3102,11 @@ async fn provider_policy_context_with_catalog(
         });
     }
 
-    Ok(ProviderPolicyContext {
+    ProviderPolicyContext {
         layers,
         credentialed_scopes,
         endpointless_provider_names,
-    })
+    }
 }
 
 fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
@@ -3277,10 +3325,12 @@ pub async fn build_provider_environment_snapshot(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_for_sandbox(
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let effective_policy = current_effective_policy_for_sandbox_from_inputs(
         state.as_ref(),
         &provider_profile_catalog,
-        &workspace,
+        &global_settings,
+        &provider_records,
         sandbox,
         &sandbox_id,
     )
@@ -21737,8 +21787,25 @@ mod tests {
         .unwrap()
         .into_inner();
         let operation = response.operation.unwrap();
-        let requested_revision = operation.target_revision.unwrap();
         let operation_id = operation.operation_id.clone();
+        let snapshot = build_sandbox_config_snapshot(&state, &sandbox)
+            .await
+            .unwrap();
+        config_update_operation::associate_pending_with_snapshot(
+            &state,
+            sandbox.object_id(),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        let requested_revision = config_update_operation::get_record(&state, &operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .unwrap()
+            .target_revision
+            .unwrap();
         let waiter_state = state.clone();
         let waiter = tokio::spawn(async move {
             config_update_operation::wait_for_terminal(&waiter_state, &operation_id, 5).await

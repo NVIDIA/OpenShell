@@ -481,6 +481,38 @@ RETURNING resource_version
         }))
     }
 
+    pub async fn repair_config_operation_projection(
+        &self,
+        record: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        let metadata = record.metadata.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation metadata missing".to_string())
+        })?;
+        let operation = record.operation.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation payload missing".to_string())
+        })?;
+        let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+            .unwrap_or_default();
+        let result = sqlx::query(
+            r"
+UPDATE objects
+SET scope = $4, status = $5, next_attempt_at_ms = $6
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(&metadata.id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .bind(&operation.sandbox_id)
+        .bind(state.as_str_name())
+        .bind(record.next_attempt_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn list_pending_config_operations_for_scope(
         &self,
         scope: &str,

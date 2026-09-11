@@ -3,7 +3,8 @@
 
 //! Durable completion tracking for sandbox-scoped desired-state updates.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{StreamExt as _, stream};
@@ -15,7 +16,7 @@ use openshell_core::proto::{
     SandboxPhase, UpdateConfigResponse, config_snapshot_revision,
 };
 use tonic::Status;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
@@ -28,6 +29,47 @@ const MAX_TRANSITION_RETRIES: usize = 8;
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_mins(1);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_SANITIZED_ERROR_BYTES: usize = 1_024;
+
+/// Gateway-local wakeups for callers waiting on one durable operation.
+#[derive(Debug, Clone)]
+pub struct OperationWatchBus {
+    inner: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<()>>>>,
+}
+
+impl OperationWatchBus {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn sender_for(&self, operation_id: &str) -> tokio::sync::broadcast::Sender<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("operation watch bus lock poisoned");
+        inner
+            .entry(operation_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(16).0)
+            .clone()
+    }
+
+    pub fn subscribe(&self, operation_id: &str) -> tokio::sync::broadcast::Receiver<()> {
+        self.sender_for(operation_id).subscribe()
+    }
+
+    pub fn notify(&self, operation_id: &str) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("operation watch bus lock poisoned")
+            .remove(operation_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+}
 
 impl ObjectType for StoredConfigUpdateOperation {
     fn object_type() -> &'static str {
@@ -47,7 +89,7 @@ pub struct CommittedResponse {
     pub policy_hash: String,
     pub settings_revision: u64,
     pub deleted: bool,
-    pub annotations: std::collections::HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
 }
 
 pub fn operation_name(sandbox_id: &str, idempotency_key: &str, operation_id: &str) -> String {
@@ -156,6 +198,60 @@ pub async fn get_record(
         .map_err(|error| Status::internal(format!("fetch update operation failed: {error}")))
 }
 
+/// Rebuild operation query columns from protobuf payloads before selective
+/// reconciliation starts. Re-running after an interrupted startup is safe.
+pub async fn repair_query_projections(state: &ServerState) -> Result<(), Status> {
+    let mut offset = 0;
+    let mut repaired = 0_u64;
+    loop {
+        let records = state
+            .store
+            .list_all_messages::<StoredConfigUpdateOperation>(OPERATION_SCAN_PAGE_SIZE, offset)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("list update operations for repair failed: {error}"))
+            })?;
+        let page_len = records.len();
+        for mut record in records {
+            for _ in 0..MAX_TRANSITION_RETRIES {
+                let Some(metadata) = record.metadata.as_ref() else {
+                    return Err(Status::internal("update operation metadata missing"));
+                };
+                let operation_id = metadata.id.clone();
+                let resource_version = metadata.resource_version;
+                if state
+                    .store
+                    .repair_config_operation_projection(&record, resource_version)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "repair update operation projection failed: {error}"
+                        ))
+                    })?
+                {
+                    repaired = repaired.saturating_add(1);
+                    break;
+                }
+                let Some(current) = get_record(state, &operation_id).await? else {
+                    break;
+                };
+                record = current;
+            }
+        }
+        if page_len < OPERATION_SCAN_PAGE_SIZE as usize {
+            break;
+        }
+        offset = offset.saturating_add(OPERATION_SCAN_PAGE_SIZE);
+    }
+    if repaired > 0 {
+        info!(
+            repaired,
+            "configuration update operation projection repair complete"
+        );
+    }
+    Ok(())
+}
+
 pub fn public_operation(
     record: &StoredConfigUpdateOperation,
 ) -> Result<ConfigUpdateOperation, Status> {
@@ -249,8 +345,9 @@ async fn finish(
         let Some(operation) = record.operation.as_mut() else {
             return false;
         };
-        let current = ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
-        if terminal(current) {
+        if ConfigUpdateOperationState::try_from(operation.state)
+            != Ok(ConfigUpdateOperationState::Pending)
+        {
             return false;
         }
         operation.state = terminal_state.into();
@@ -261,6 +358,46 @@ async fn finish(
         true
     })
     .await?;
+    record_terminal_transition(state, transition, terminal_state);
+    Ok(())
+}
+
+async fn finish_if_target_matches(
+    state: &ServerState,
+    operation_id: &str,
+    requested_revision: &ConfigSnapshotRevision,
+    terminal_state: ConfigUpdateOperationState,
+    outcome: ConfigApplyOutcome,
+    error: &str,
+) -> Result<(), Status> {
+    let now = current_time_ms();
+    let transition = mutate_record(state, operation_id, |record| {
+        let Some(operation) = record.operation.as_mut() else {
+            return false;
+        };
+        if ConfigUpdateOperationState::try_from(operation.state)
+            != Ok(ConfigUpdateOperationState::Pending)
+            || operation.target_revision.as_ref() != Some(requested_revision)
+        {
+            return false;
+        }
+        operation.state = terminal_state.into();
+        operation.outcome = outcome.into();
+        operation.sanitized_error = sanitize_error(error);
+        operation.updated_at_ms = now;
+        operation.completed_at_ms = now;
+        true
+    })
+    .await?;
+    record_terminal_transition(state, transition, terminal_state);
+    Ok(())
+}
+
+fn record_terminal_transition(
+    state: &ServerState,
+    transition: Option<(StoredConfigUpdateOperation, bool)>,
+    terminal_state: ConfigUpdateOperationState,
+) {
     if let Some((record, true)) = transition {
         counter!(
             "openshell_config_update_operations_terminal_total",
@@ -268,10 +405,12 @@ async fn finish(
         )
         .increment(1);
         if let Some(operation) = record.operation.as_ref() {
+            state
+                .config_update_operation_watch_bus
+                .notify(&operation.operation_id);
             state.sandbox_watch_bus.notify(&operation.sandbox_id);
         }
     }
-    Ok(())
 }
 
 fn snapshot_revision(
@@ -393,7 +532,8 @@ async fn reconcile_records_for_sandbox(
             let Some(operation) = stored.operation.as_mut() else {
                 return false;
             };
-            if ConfigUpdateOperationState::try_from(operation.state).is_ok_and(terminal)
+            if ConfigUpdateOperationState::try_from(operation.state)
+                != Ok(ConfigUpdateOperationState::Pending)
                 || stored.next_attempt_at_ms > now
             {
                 return false;
@@ -414,15 +554,39 @@ async fn reconcile_records_for_sandbox(
         return Ok(());
     }
 
-    // Claim commits above keep slow snapshot construction and delivery out of
-    // the write transaction. Another gateway may inspect the same batch, but
-    // its CAS sees the advanced retry deadline and does no work.
-    let snapshot = crate::grpc::policy::build_sandbox_config_snapshot(state, &sandbox).await?;
-    let mut publish_provider_environment = false;
-    let mut claimed_any = false;
-    for record in claimed_records {
+    // Claims commit before admission to the bounded delivery queue. The queue
+    // builds the current snapshot once, records its exact revision on matching
+    // operations, then sends those same bytes. A failed admission remains
+    // recoverable when the claim's retry deadline expires.
+    let publish_provider_environment = claimed_records
+        .iter()
+        .any(|record| record.response_policy_version != 0);
+    let components = if publish_provider_environment {
+        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+    } else {
+        crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+    };
+    crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
+    Ok(())
+}
+
+/// Associate pending operations with the exact snapshot that the delivery
+/// worker is about to send. The caller must skip delivery if this fails.
+pub async fn associate_pending_with_snapshot(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    snapshot: &openshell_core::proto::SandboxConfigSnapshot,
+) -> Result<(), Status> {
+    let records = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list update operations failed: {error}")))?;
+    let target_revision = snapshot_revision(snapshot);
+    let now = current_time_ms();
+    for record in records {
         let operation = public_operation(&record)?;
-        match target_relation(&record, &snapshot) {
+        match target_relation(&record, snapshot) {
             std::cmp::Ordering::Greater => {
                 finish(
                     state,
@@ -440,15 +604,14 @@ async fn reconcile_records_for_sandbox(
                 );
             }
             std::cmp::Ordering::Equal => {
-                let target_revision = snapshot_revision(&snapshot);
                 let _ = mutate_record(state, &operation.operation_id, |stored| {
                     let Some(operation) = stored.operation.as_mut() else {
                         return false;
                     };
-                    if ConfigUpdateOperationState::try_from(operation.state).is_ok_and(terminal) {
-                        return false;
-                    }
-                    if operation.target_revision.as_ref() == Some(&target_revision) {
+                    if ConfigUpdateOperationState::try_from(operation.state)
+                        != Ok(ConfigUpdateOperationState::Pending)
+                        || operation.target_revision.as_ref() == Some(&target_revision)
+                    {
                         return false;
                     }
                     operation.target_revision = Some(target_revision);
@@ -456,18 +619,8 @@ async fn reconcile_records_for_sandbox(
                     true
                 })
                 .await?;
-                claimed_any = true;
-                publish_provider_environment |= record.response_policy_version != 0;
             }
         }
-    }
-    if claimed_any {
-        let components = if publish_provider_environment {
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
-        } else {
-            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
-        };
-        crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
     }
     Ok(())
 }
@@ -519,9 +672,10 @@ pub async fn complete_from_apply_results(
                 .failure
                 .as_ref()
                 .map_or("", |failure| failure.message.as_str());
-            finish(
+            finish_if_target_matches(
                 state,
                 &operation.operation_id,
+                requested,
                 terminal_state,
                 outcome,
                 failure,
@@ -553,11 +707,11 @@ pub async fn wait_for_terminal(
     };
     let started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
-    let initial = get_record(state, operation_id)
-        .await?
-        .ok_or_else(|| Status::not_found("update operation not found"))?;
-    let sandbox_id = public_operation(&initial)?.sandbox_id;
-    let mut wake = state.sandbox_watch_bus.subscribe(&sandbox_id);
+    // Subscribe first, then perform the authoritative read. A wakeup is only a
+    // hint; the fallback poll covers other replicas and process restarts.
+    let mut wake = state
+        .config_update_operation_watch_bus
+        .subscribe(operation_id);
     loop {
         let record = get_record(state, operation_id)
             .await?
@@ -666,7 +820,52 @@ pub fn spawn_reconciler(state: Arc<ServerState>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::SandboxConfigSnapshot;
+    use crate::grpc::test_support::test_server_state;
+    use openshell_core::proto::{SandboxConfigSnapshot, SandboxSpec};
+
+    async fn pending_test_operation() -> (Arc<ServerState>, StoredConfigUpdateOperation) {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "operation-test-sandbox".to_string(),
+                name: "operation-test-sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let record = new_record(
+            &sandbox,
+            "default",
+            "operation-test-request",
+            OperationTarget {
+                policy_version: 0,
+                settings_revision: 1,
+            },
+            CommittedResponse::default(),
+        );
+        state
+            .store
+            .put_if_with_operation(
+                crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+                "operation-test-settings",
+                "operation-test-sandbox",
+                "default",
+                br#"{"revision":1,"settings":{}}"#,
+                crate::persistence::WriteCondition::MustCreate,
+                &record,
+                None,
+            )
+            .await
+            .unwrap();
+        let operation_id = &record.operation.as_ref().unwrap().operation_id;
+        (
+            state.clone(),
+            get_record(&state, operation_id).await.unwrap().unwrap(),
+        )
+    }
 
     #[test]
     fn authoritative_phase_classification_is_explicit() {
@@ -741,5 +940,92 @@ mod tests {
         let sanitized = sanitize_error(&value);
         assert!(sanitized.len() <= MAX_SANITIZED_ERROR_BYTES);
         assert!(sanitized.is_char_boundary(sanitized.len()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_commit_once_and_noop_does_not_churn_version() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        let now = current_time_ms();
+        let claim = || async {
+            mutate_record(&state, &operation_id, |stored| {
+                if stored.next_attempt_at_ms > now {
+                    return false;
+                }
+                stored.attempt_count = stored.attempt_count.saturating_add(1);
+                stored.next_attempt_at_ms = now.saturating_add(1_000);
+                stored.operation.as_mut().unwrap().updated_at_ms = now;
+                true
+            })
+            .await
+            .unwrap()
+        };
+        let (first, second) = tokio::join!(claim(), claim());
+        let committed = usize::from(first.as_ref().is_some_and(|(_, changed)| *changed))
+            + usize::from(second.as_ref().is_some_and(|(_, changed)| *changed));
+        assert_eq!(committed, 1);
+
+        let claimed = get_record(&state, &operation_id).await.unwrap().unwrap();
+        assert_eq!(claimed.attempt_count, 1);
+        let version = claimed.metadata.as_ref().unwrap().resource_version;
+        let unchanged = mutate_record(&state, &operation_id, |_| false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unchanged.1);
+        assert_eq!(
+            get_record(&state, &operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .unwrap()
+                .resource_version,
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rechecks_exact_target_inside_cas_transition() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        let expected = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::SandboxConfig(
+                SandboxConfigRevision {
+                    config_revision: 1,
+                    policy_version: 1,
+                    settings_revision: 1,
+                    ..Default::default()
+                },
+            )),
+        };
+        mutate_record(&state, &operation_id, |stored| {
+            stored.operation.as_mut().unwrap().target_revision = Some(expected);
+            true
+        })
+        .await
+        .unwrap();
+        let before = get_record(&state, &operation_id).await.unwrap().unwrap();
+
+        finish_if_target_matches(
+            &state,
+            &operation_id,
+            &ConfigSnapshotRevision::default(),
+            ConfigUpdateOperationState::Applied,
+            ConfigApplyOutcome::Applied,
+            "",
+        )
+        .await
+        .unwrap();
+
+        let after = get_record(&state, &operation_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.metadata.as_ref().unwrap().resource_version,
+            before.metadata.as_ref().unwrap().resource_version
+        );
+        assert_eq!(
+            ConfigUpdateOperationState::try_from(after.operation.unwrap().state).unwrap(),
+            ConfigUpdateOperationState::Pending
+        );
     }
 }

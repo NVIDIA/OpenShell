@@ -550,12 +550,14 @@ after that commit; `WAIT_FOR_APPLY` durably waits for `applied`, `inactive`,
 mutation or cancel the operation, and the operation ID is returned in error
 metadata for later lookup. Stopped or completed sandboxes finish as `inactive`;
 session absence alone never does. A background reconciler reads pending
-operations in bounded due batches. It claims retry ownership before building a
-snapshot, groups claimed work by sandbox, and republishes each requested
-component at most once for that sandbox. Local sandbox-state notifications run
-the same scoped reconciliation path immediately. The periodic database query
-remains the recovery path when another gateway owns the waiter or a notification
-is missed.
+operations in bounded due batches. It claims retry ownership, groups work by
+sandbox, and admits each requested component to the existing bounded delivery
+queue at most once for that sandbox. The delivery worker builds the latest
+sandbox snapshot once, records its exact revision on every matching pending
+operation, then sends that same snapshot. It skips the send if revision
+association fails. Local sandbox-state notifications run the same scoped
+reconciliation path immediately. The periodic database query remains the
+recovery path when another gateway owns the waiter or a notification is missed.
 
 ## Policy Revision Acknowledgement
 

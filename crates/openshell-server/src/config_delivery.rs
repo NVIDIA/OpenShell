@@ -470,9 +470,16 @@ async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryK
             return Ok(None);
         };
         match key.component {
-            ConfigComponentKind::SandboxConfig => build_sandbox_config_snapshot(state, &sandbox)
-                .await
-                .map(|snapshot| SupervisorConfigMessage::SandboxConfig(Box::new(snapshot))),
+            ConfigComponentKind::SandboxConfig => {
+                let snapshot = build_sandbox_config_snapshot(state, &sandbox).await?;
+                crate::config_update_operation::associate_pending_with_snapshot(
+                    state,
+                    &key.sandbox_id,
+                    &snapshot,
+                )
+                .await?;
+                Ok(SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)))
+            }
             ConfigComponentKind::ProviderEnvironment => {
                 build_provider_environment_snapshot(state, &sandbox, true)
                     .await

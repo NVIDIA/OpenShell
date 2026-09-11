@@ -425,6 +425,18 @@ impl Store {
         Ok(KnownVersionUpdate::Changed(updated))
     }
 
+    /// Repair operation query columns from the authoritative protobuf payload
+    /// without changing the payload or resource version.
+    pub async fn repair_config_operation_projection(
+        &self,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(
+            self.repair_config_operation_projection(operation, expected_resource_version)
+        )
+    }
+
     /// Return pending operations for one sandbox. Terminal history is excluded
     /// by SQL before protobuf payloads are decoded.
     pub async fn list_pending_config_operations_for_scope(
