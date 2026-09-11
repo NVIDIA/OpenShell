@@ -1,14 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{ pkgs }:
+{
+  pkgs,
+  qemuPkgs ? pkgs,
+  firmwarePkgs ? pkgs,
+}:
 
 let
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   architecture = if isAarch64 then "aarch64" else "x86_64";
   ubuntuArchitecture = if isAarch64 then "arm64" else "amd64";
-  qemu = pkgs.qemu.override { hostCpuOnly = true; };
+  qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
   qemuBinary =
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
   machine = if isAarch64 then "virt" else "q35";
@@ -35,7 +39,7 @@ let
   ]
   ++ pkgs.lib.optionals isAarch64 [
     "-drive"
-    "if=pflash,format=raw,readonly=on,file=${pkgs.OVMF.firmware}"
+    "if=pflash,format=raw,readonly=on,file=${firmwarePkgs.OVMF.firmware}"
     "-drive"
     "if=pflash,format=raw,file=firmware-vars.fd"
   ]
@@ -72,7 +76,7 @@ let
           16G
 
         ${pkgs.lib.optionalString isAarch64 ''
-          cp ${pkgs.OVMF.variables} firmware-vars.fd
+          cp ${firmwarePkgs.OVMF.variables} firmware-vars.fd
           chmod 0600 firmware-vars.fd
         ''}
 
