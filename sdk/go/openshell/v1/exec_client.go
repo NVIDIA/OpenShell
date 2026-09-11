@@ -26,16 +26,15 @@ func (e *execClient) Run(ctx context.Context, workspace, sandboxName string, com
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	sb, err := e.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	var opt *ExecOptions
 	if len(opts) > 0 {
 		opt = &opts[0]
 	}
-	req := converter.ExecRequestToProto(sb.ID, command, opt)
+	req := converter.ExecRequestToProto(sandboxName, command, opt)
+	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	stream, err := e.client.ExecSandbox(ctx, req)
 	if err != nil {
@@ -61,16 +60,15 @@ func (e *execClient) Stream(ctx context.Context, workspace, sandboxName string, 
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	sb, err := e.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	var opt *ExecOptions
 	if len(opts) > 0 {
 		opt = &opts[0]
 	}
-	req := converter.ExecRequestToProto(sb.ID, command, opt)
+	req := converter.ExecRequestToProto(sandboxName, command, opt)
+	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := e.client.ExecSandbox(streamCtx, req)
@@ -86,11 +84,9 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	sb, err := e.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	var opt *ExecOptions
 	if len(opts) > 0 {
 		opt = &opts[0]
@@ -103,7 +99,8 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 		return nil, converter.FromGRPCError(err)
 	}
 
-	startReq := converter.ExecInteractiveRequestToProto(sb.ID, command, cols, rows, opt)
+	startReq := converter.ExecInteractiveRequestToProto(sandboxName, command, cols, rows, opt)
+	startReq.WorkspaceScope = namedWorkspaceScope(workspace)
 	if sendErr := stream.Send(&pb.ExecSandboxInput{
 		Payload: &pb.ExecSandboxInput_Start{Start: startReq},
 	}); sendErr != nil {

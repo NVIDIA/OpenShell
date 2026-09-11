@@ -21,11 +21,11 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 
 func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:        sandboxName,
+		SandboxName:    sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		Service:        serviceName,
 		TargetPort:     targetPort,
 		Domain:         domain,
-		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,9 +35,9 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
+		SandboxName:    sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		Service:        serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -62,7 +62,7 @@ func (s *serviceClient) List(workspace, sandboxName string, opts ...ListOptions)
 	}
 	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ServiceEndpoint], error) {
 		req := &pb.ListServicesRequest{
-			Sandbox: sandboxName, WorkspaceScope: workspaceScope, PageSize: pageSize,
+			SandboxName: sandboxName, WorkspaceScope: workspaceScope, PageSize: pageSize,
 			PageToken: pageToken,
 		}
 		resp, err := s.client.ListServices(ctx, req)
@@ -87,9 +87,9 @@ func (s *serviceClient) ListAll(ctx context.Context, workspace, sandboxName stri
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
 	_, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
-		Sandbox:        sandboxName,
-		Service:        serviceName,
+		SandboxName:    sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		Service:        serviceName,
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

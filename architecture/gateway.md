@@ -56,13 +56,18 @@ cross-origin or sibling-subdomain request.
 
 Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
 select one non-empty workspace explicitly; `default` is an ordinary explicit
-name, not an omitted-value fallback. Sandbox, sandbox template, provider, and
-service list RPCs also accept an all-workspaces marker after Platform Admin
-authorization. Single-workspace handlers reject that marker. Platform-global
-policy operations require the selector to be absent, while workspace policy
-operations require it. The gateway authorizes the selected scope before
-performing resource lookup so malformed, unsupported, and unauthorized scopes
-have consistent behavior across resource types.
+name, not an omitted-value fallback. Every public sandbox-scoped RPC identifies
+the sandbox with a string `sandbox_name` and carries its workspace selector as
+a separate request field. Canonical sandbox IDs remain internal metadata used
+at authentication, persistence, and compute-driver boundaries; public callers
+do not use them as sandbox references. The gateway resolves the name to the
+persisted sandbox record and authorizes that record's workspace. Missing and
+unauthorized references use the same response within each principal class so
+the resolver does not expose an object-existence oracle. Sandbox, sandbox
+template, provider, and service list RPCs also accept an all-workspaces marker
+after Platform Admin authorization. Single-workspace handlers reject that
+marker. Platform-global policy operations require `sandbox_name` and
+`workspace_scope` to be absent, while sandbox policy operations require both.
 
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway
@@ -329,7 +334,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`0f14943574349d02bdc61076c8c5a59a98b627325564ef1a6d21d7941825dc46`).
+(`822ee7b26d2e18a9081fd695b3c2ffadd0dd60ad51ce29b0081d3d1edd8937a8`).
 
 Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server

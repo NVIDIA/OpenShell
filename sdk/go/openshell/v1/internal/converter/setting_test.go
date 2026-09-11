@@ -429,7 +429,7 @@ func TestConfigUpdateToProto(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, req)
-	assert.Equal(t, "my-sandbox", req.Name)
+	assert.Equal(t, "my-sandbox", req.GetSandboxName())
 	assert.Equal(t, "timeout", req.SettingKey)
 	require.NotNil(t, req.SettingValue)
 	assert.Equal(t, int64(60), req.SettingValue.GetIntValue())
@@ -495,7 +495,7 @@ func TestConfigUpdateToProto_GlobalScope(t *testing.T) {
 
 	require.NotNil(t, req)
 	assert.True(t, req.Global)
-	assert.Empty(t, req.Name)
+	assert.Empty(t, req.GetSandboxName())
 }
 
 func TestConfigUpdateToProto_NilSettingValue(t *testing.T) {
@@ -779,7 +779,7 @@ func TestConfigUpdateToProto_WithMergeOperations(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, req)
-	assert.Equal(t, "my-sandbox", req.GetName())
+	assert.Equal(t, "my-sandbox", req.GetSandboxName())
 	require.Len(t, req.GetMergeOperations(), 3)
 
 	// First: RemoveRule

@@ -109,7 +109,7 @@ func TestFileUpload(t *testing.T) {
 	err := client.Upload(context.Background(), "default", "test-sandbox", localPath, "/remote/upload.txt")
 
 	require.NoError(t, err)
-	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "test-sandbox", mock.lastCreateReq.GetSandboxName())
 	assert.Equal(t, 1, mock.createCallCount)
 }
 
@@ -164,7 +164,7 @@ func TestFileDownload(t *testing.T) {
 	err := client.Download(context.Background(), "default", "test-sandbox", "/remote/file.txt", localPath)
 
 	require.NoError(t, err)
-	assert.Equal(t, "sb-test-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "test-sandbox", mock.lastCreateReq.GetSandboxName())
 	assert.Equal(t, 1, mock.createCallCount)
 }
 
@@ -242,7 +242,7 @@ func TestFileDownload_EmptyRemotePath(t *testing.T) {
 
 // --- Name-to-ID resolution tests ---
 
-func TestFileUpload_ResolvesNameToID(t *testing.T) {
+func TestFileUpload_UsesName(t *testing.T) {
 	mock := newMockFileServer()
 	mock.createResp = &pb.CreateSshSessionResponse{
 		SandboxId:   "sb-my-sandbox",
@@ -261,7 +261,7 @@ func TestFileUpload_ResolvesNameToID(t *testing.T) {
 	_ = client.Upload(context.Background(), "default", "my-sandbox", localPath, "/remote/file.txt")
 
 	// Verify the proto request contains the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastCreateReq.GetSandboxName())
 }
 
 func TestFileUpload_ResolutionError(t *testing.T) {
@@ -299,7 +299,7 @@ func TestFileUpload_ResolutionError(t *testing.T) {
 	assert.Equal(t, 0, mock.createCallCount)
 }
 
-func TestFileDownload_ResolvesNameToID(t *testing.T) {
+func TestFileDownload_UsesName(t *testing.T) {
 	mock := newMockFileServer()
 	client, cleanup := setupFileTest(t, mock)
 	defer cleanup()
@@ -307,7 +307,7 @@ func TestFileDownload_ResolvesNameToID(t *testing.T) {
 	localPath := filepath.Join(t.TempDir(), "downloaded.txt")
 	_ = client.Download(context.Background(), "default", "my-sandbox", "/remote/file.txt", localPath)
 
-	assert.Equal(t, "sb-my-sandbox", mock.lastCreateReq.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastCreateReq.GetSandboxName())
 }
 
 func TestFileDownload_ResolutionError(t *testing.T) {

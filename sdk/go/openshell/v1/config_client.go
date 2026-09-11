@@ -25,13 +25,12 @@ func (c *configClient) GetSandbox(ctx context.Context, workspace, sandboxName st
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	sb, err := c.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := c.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	resp, err := c.client.GetSandboxConfig(ctx, &sbv1.GetSandboxConfigRequest{
-		SandboxId: sb.ID,
+		SandboxName:    sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

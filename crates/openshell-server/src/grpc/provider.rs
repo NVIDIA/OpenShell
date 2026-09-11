@@ -6653,11 +6653,11 @@ mod tests {
             &state,
             authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "sandbox-custom".to_string(),
-                provider_name: "custom-provider".to_string(),
-                expected_resource_version: 0,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                provider_name: "custom-provider".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
