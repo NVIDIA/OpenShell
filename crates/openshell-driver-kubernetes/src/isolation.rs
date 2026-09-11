@@ -20,11 +20,11 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 
 /// Registered RFC 0012 backend name for the proxy-pod topology.
 pub const BACKEND_NAME: &str = "kubernetes-proxy-pod";
