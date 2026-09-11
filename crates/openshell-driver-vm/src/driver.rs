@@ -59,7 +59,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
-use openshell_isolation_interface::boundary_protocol::{
+use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
     SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,

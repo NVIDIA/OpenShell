@@ -4273,6 +4273,7 @@ dependencies = [
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
+ "openshell-sandbox-backend",
  "openshell-vfio",
  "opentelemetry",
  "opentelemetry_sdk",
