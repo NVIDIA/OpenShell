@@ -34,29 +34,29 @@ mod linux {
     use openshell_core::jwt::{
         SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
     };
-    #[cfg(test)]
-    use openshell_core::proto::isolation::v1::isolation_boundary_client::IsolationBoundaryClient;
-    use openshell_core::proto::isolation::v1::{
-        BoundaryChunk,
-        isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
-    };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
         BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
         CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
         SandboxConfirmEvidence,
     };
-    use openshell_isolation_interface::mediation::{
+    use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
-    use openshell_isolation_interface::sandbox_auth::{
+    #[cfg(test)]
+    use openshell_sandbox_backend::proto::isolation_boundary_client::IsolationBoundaryClient;
+    use openshell_sandbox_backend::proto::{
+        BoundaryChunk,
+        isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
+    };
+    use openshell_sandbox_backend::sandbox_auth::{
         SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
         SandboxProtocolPrincipal,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_stream::wrappers::ReceiverStream;
 
-    use openshell_isolation_interface::boundary_protocol::{
+    use openshell_sandbox_backend::boundary_protocol::{
         AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
         ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
@@ -261,7 +261,7 @@ mod linux {
     }
 
     fn tls_paths_are_absolute(
-        tls: &openshell_isolation_interface::boundary_protocol::SandboxTlsServerConfig,
+        tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> bool {
         tls.certificate_chain_path.is_absolute() && tls.private_key_path.is_absolute()
     }
@@ -673,7 +673,7 @@ mod linux {
     ) -> Result<(), String> {
         let request: RequestEnvelope = tokio::time::timeout(
             CONTROL_IO_TIMEOUT,
-            openshell_isolation_interface::boundary_protocol::read_frame_async(&mut stream),
+            openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut stream),
         )
         .await
         .map_err(|_| "mediation attach timed out".to_string())?
@@ -2752,7 +2752,7 @@ mod linux {
     }
 
     fn load_tls_server_config(
-        tls: &openshell_isolation_interface::boundary_protocol::SandboxTlsServerConfig,
+        tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> io::Result<rustls::ServerConfig> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
@@ -2991,7 +2991,7 @@ mod linux {
         use openshell_core::jwt::{
             CredentialEpoch, DEFAULT_SESSION_TOKEN_TTL, SandboxSessionIdentity, SessionJwtIssuer,
         };
-        use openshell_isolation_interface::boundary_protocol::{
+        use openshell_sandbox_backend::boundary_protocol::{
             GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
             generate_sandbox_tls_material,
         };
@@ -3443,11 +3443,9 @@ mod linux {
                 .expect("attach test connection");
             let (mut replacement, task) = request_test_mediation(runtime, principal).await;
             let ready: ResponseEnvelope =
-                openshell_isolation_interface::boundary_protocol::read_frame_async(
-                    &mut replacement,
-                )
-                .await
-                .unwrap();
+                openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut replacement)
+                    .await
+                    .unwrap();
             assert!(matches!(ready.response, Response::MediationReady));
             drop(replacement);
             task.await.unwrap().unwrap();
@@ -3486,14 +3484,14 @@ mod linux {
             let (mut first, first_task) =
                 request_test_mediation(runtime.clone(), principal.clone()).await;
             let ready: ResponseEnvelope =
-                openshell_isolation_interface::boundary_protocol::read_frame_async(&mut first)
+                openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut first)
                     .await
                     .unwrap();
             assert!(matches!(ready.response, Response::MediationReady));
             let (mut denied, denied_task) =
                 request_test_mediation(runtime.clone(), principal.clone()).await;
             let response: ResponseEnvelope =
-                openshell_isolation_interface::boundary_protocol::read_frame_async(&mut denied)
+                openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut denied)
                     .await
                     .unwrap();
             assert!(matches!(
@@ -3516,9 +3514,7 @@ mod linux {
             first_task.await.unwrap().unwrap();
             let ready: ResponseEnvelope = tokio::time::timeout(
                 Duration::from_secs(1),
-                openshell_isolation_interface::boundary_protocol::read_frame_async(
-                    &mut replacement,
-                ),
+                openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut replacement),
             )
             .await
             .unwrap()
@@ -3774,7 +3770,7 @@ mod linux {
                 frame.extend_from_slice(&chunk.data);
             }
             let response: ResponseEnvelope =
-                openshell_isolation_interface::boundary_protocol::decode_frame(&frame)
+                openshell_sandbox_backend::boundary_protocol::decode_frame(&frame)
                     .expect("decode logical response");
             assert!(matches!(response.response, Response::Attached { .. }));
             server.abort();
