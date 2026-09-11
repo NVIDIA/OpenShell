@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_yml::Value;
-use z3::ast::{Bool, Int, Regexp, String as Z3String};
+use z3::ast::{Ast, Bool, Int, Regexp, String as Z3String};
 use z3::{Context, Params, SatResult, Solver};
 
 const READ_ONLY_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
@@ -707,6 +707,9 @@ fn solve_network_mode(
         SatResult::Sat => solver
             .get_model()
             .and_then(|model| counterexample_from_model(&model, &action, binary_identity_required))
+            .filter(|counterexample| {
+                counterexample_satisfies_predicate(maximum, candidate, counterexample)
+            })
             .map_or_else(
                 || {
                     NetworkSolve::Incomplete(CheckResult::Inconclusive(ReasonEvidence {
@@ -1065,9 +1068,9 @@ fn counterexample_from_model(
     binary_identity_required: bool,
 ) -> Option<Counterexample> {
     let port = model.eval(&action.port, true)?.as_u64()?;
-    let layer = model.eval(&action.layer, true)?.as_string()?;
+    let layer = model_string_exact(model, &action.layer)?;
     let binary = if binary_identity_required {
-        let binary = model.eval(&action.binary, true)?.as_string()?;
+        let binary = model_string_exact(model, &action.binary)?;
         if !is_canonical_runtime_binary_path(&binary) {
             return None;
         }
@@ -1076,7 +1079,7 @@ fn counterexample_from_model(
         None
     };
     let ancestor_binary = if binary_identity_required {
-        let binary = model.eval(&action.ancestor_binary, true)?.as_string()?;
+        let binary = model_string_exact(model, &action.ancestor_binary)?;
         if !is_canonical_runtime_binary_path(&binary) {
             return None;
         }
@@ -1084,7 +1087,7 @@ fn counterexample_from_model(
     } else {
         None
     };
-    let host = model.eval(&action.host, true)?.as_string()?;
+    let host = model_string_exact(model, &action.host)?;
     if !is_canonical_dns_host(&host) {
         return None;
     }
@@ -1094,8 +1097,8 @@ fn counterexample_from_model(
         Protocol::Rest
     };
     let (method, path) = if protocol == Protocol::Rest {
-        let method = model.eval(&action.method, true)?.as_string()?;
-        let path = model.eval(&action.path, true)?.as_string()?;
+        let method = model_string_exact(model, &action.method)?;
+        let path = model_string_exact(model, &action.path)?;
         if !is_http_method(&method) || !is_canonical_rest_path(&path) {
             return None;
         }
@@ -1115,6 +1118,52 @@ fn counterexample_from_model(
     })
 }
 
+/// Decode a model string only when encoding it again produces the exact same
+/// solver value. `as_string` uses a lossy C-string boundary in the Rust Z3
+/// binding, so accepting its output alone could publish an altered witness.
+fn model_string_exact(model: &z3::Model, value: &Z3String) -> Option<String> {
+    let evaluated = model.eval(value, true)?;
+    let decoded = evaluated.as_string()?;
+    let reconstructed = Z3String::from_str(&decoded).ok()?;
+    (evaluated.eq(reconstructed).simplify().as_bool() == Some(true)).then_some(decoded)
+}
+
+fn counterexample_satisfies_predicate(
+    maximum: &ContainmentPolicy,
+    candidate: &ContainmentPolicy,
+    counterexample: &Counterexample,
+) -> bool {
+    let Counterexample::Network {
+        binary,
+        ancestor_binary,
+        binary_identity_required,
+        host,
+        port,
+        protocol,
+        method,
+        path,
+    } = counterexample
+    else {
+        return false;
+    };
+    let concrete = SymbolicAction {
+        binary: Z3String::from_str(binary.as_deref().unwrap_or("")).unwrap(),
+        ancestor_binary: Z3String::from_str(ancestor_binary.as_deref().unwrap_or("")).unwrap(),
+        host: Z3String::from_str(host).unwrap(),
+        port: Int::from_u64(u64::from(*port)),
+        layer: Z3String::from_str(protocol.as_str()).unwrap(),
+        method: Z3String::from_str(method.as_deref().unwrap_or("GET")).unwrap(),
+        path: Z3String::from_str(path.as_deref().unwrap_or("/")).unwrap(),
+    };
+    Bool::and(&[
+        policy_allows(candidate, &concrete, *binary_identity_required),
+        !policy_allows(maximum, &concrete, *binary_identity_required),
+    ])
+    .simplify()
+    .as_bool()
+        == Some(true)
+}
+
 fn is_canonical_runtime_binary_path(path: &str) -> bool {
     path.len() <= 4 * 1024 && is_canonical_pattern_path(path) && !path.chars().any(char::is_control)
 }
@@ -1125,17 +1174,13 @@ fn is_canonical_dns_host(host: &str) -> bool {
         && host.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+                && label.as_bytes().first().is_some_and(|byte| *byte != b'-')
+                && label.as_bytes().last().is_some_and(|byte| *byte != b'-')
         })
 }
 
@@ -1494,6 +1539,11 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
             return unsupported(format!("rule '{rule_name}' uses unsupported fields"));
         }
         for binary in &rule.binaries {
+            if !binary.path.is_ascii() {
+                return unsupported(format!(
+                    "rule '{rule_name}' binary path contains a non-ASCII literal"
+                ));
+            }
             if binary.path.is_empty()
                 || !is_canonical_pattern_path(&binary.path)
                 || !binary.extra.is_empty()
@@ -1504,14 +1554,28 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
         }
         for endpoint in &rule.endpoints {
             let context = format!("rule '{rule_name}'");
+            if !endpoint.host.is_ascii() {
+                return unsupported(format!(
+                    "{context} endpoint host contains a non-ASCII literal"
+                ));
+            }
+            if !endpoint.path.is_ascii() {
+                return unsupported(format!(
+                    "{context} endpoint path contains a non-ASCII literal"
+                ));
+            }
             if endpoint.host.is_empty()
                 || endpoint.effective_ports().is_empty()
                 || (endpoint.port != 0 && !endpoint.ports.is_empty())
             {
                 return unsupported(format!("{context} has no unambiguous host and port"));
             }
-            if unsupported_host_glob(&endpoint.host)
-                || unsupported_glob(&endpoint.path)
+            if unsupported_host_glob(&endpoint.host) {
+                return unsupported(format!(
+                    "{context} endpoint host uses an unsupported pattern"
+                ));
+            }
+            if unsupported_glob(&endpoint.path)
                 || (!endpoint.path.is_empty() && !is_canonical_pattern_path(&endpoint.path))
             {
                 return unsupported(format!("{context} uses an unsupported glob"));
@@ -1581,11 +1645,31 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
                 return unsupported(format!("{context} mixes REST controls into L4 authority"));
             }
             for rule in &endpoint.rules {
+                if !rule.allow.method.is_ascii() {
+                    return unsupported(format!(
+                        "{context} REST allow method contains a non-ASCII literal"
+                    ));
+                }
+                if !rule.allow.path.is_ascii() {
+                    return unsupported(format!(
+                        "{context} REST allow path contains a non-ASCII literal"
+                    ));
+                }
                 if !rule.extra.is_empty() || unsupported_allow(&rule.allow) {
                     return unsupported(format!("{context} uses an unsupported REST allow rule"));
                 }
             }
             for rule in &endpoint.deny_rules {
+                if !rule.method.is_ascii() {
+                    return unsupported(format!(
+                        "{context} REST deny method contains a non-ASCII literal"
+                    ));
+                }
+                if !rule.path.is_ascii() {
+                    return unsupported(format!(
+                        "{context} REST deny path contains a non-ASCII literal"
+                    ));
+                }
                 if unsupported_deny(rule) {
                     return unsupported(format!("{context} uses an unsupported REST deny rule"));
                 }
@@ -1746,10 +1830,26 @@ fn unsupported_host_glob(pattern: &str) -> bool {
     {
         return true;
     }
-    pattern.split('.').enumerate().any(|(index, label)| {
-        (label.contains("**") && label != "**")
-            || (index > 0 && label.contains('*') && label != "*" && label != "**")
-    })
+    let labels = pattern.split('.').collect::<Vec<_>>();
+    let minimum_name_len = labels
+        .iter()
+        .map(|label| label.bytes().filter(|byte| *byte != b'*').count().max(1))
+        .sum::<usize>()
+        + labels.len().saturating_sub(1);
+    minimum_name_len > 253
+        || labels.iter().enumerate().any(|(index, label)| {
+            let first = label.as_bytes().first().copied();
+            let last = label.as_bytes().last().copied();
+            let minimum_label_len = label.bytes().filter(|byte| *byte != b'*').count().max(1);
+            minimum_label_len > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'*'))
+                || first == Some(b'-')
+                || last == Some(b'-')
+                || (label.contains("**") && *label != "**")
+                || (index > 0 && label.contains('*') && *label != "*" && *label != "**")
+        })
 }
 
 fn bool_or(values: impl IntoIterator<Item = Bool>) -> Bool {
@@ -1850,19 +1950,31 @@ fn path_glob_regex(pattern: &str) -> Regexp {
 }
 
 fn non_separator_regex(separator: &str) -> Regexp {
-    match separator {
-        "/" => Regexp::union(&[&Regexp::range(&' ', &'.'), &Regexp::range(&'0', &'~')]),
-        "." => Regexp::union(&[&Regexp::range(&' ', &'-'), &Regexp::range(&'/', &'~')]),
-        _ => Regexp::full(),
-    }
+    // Runtime globs match Unicode values. Describe a non-empty separator-free
+    // sequence from Z3's full string language instead of limiting wildcards to
+    // character ranges. This works with both supported Z3 versions; callers'
+    // `star` and `plus` operations preserve the runtime wildcard languages.
+    let contains_separator = Regexp::concat(&[
+        &Regexp::full(),
+        &Regexp::literal(separator),
+        &Regexp::full(),
+    ]);
+    Regexp::intersect(&[
+        &contains_separator.complement(),
+        &Regexp::literal("").complement(),
+    ])
 }
 
 fn host_domain_regex() -> Regexp {
     let alphanumeric = Regexp::union(&[&Regexp::range(&'a', &'z'), &Regexp::range(&'0', &'9')]);
-    let label_character = Regexp::union(&[&alphanumeric, &Regexp::literal("-")]);
+    // Actions represent canonical resolver inputs, not every raw value the
+    // proxy parser or Rego glob builtin can compare. Supported endpoint globs
+    // are therefore modeled over this same resolver-oriented host domain.
+    let label_edge = Regexp::union(&[&alphanumeric, &Regexp::literal("_")]);
+    let label_character = Regexp::union(&[&label_edge, &Regexp::literal("-")]);
     let label = Regexp::union(&[
-        &alphanumeric,
-        &Regexp::concat(&[&alphanumeric, &label_character.star(), &alphanumeric]),
+        &label_edge,
+        &Regexp::concat(&[&label_edge, &label_character.r#loop(0, 61), &label_edge]),
     ]);
     Regexp::concat(&[
         &label,
@@ -1939,6 +2051,113 @@ mod tests {
                     }
                 )
         ));
+    }
+
+    #[test]
+    fn underscore_hosts_are_present_in_the_full_action_domain() {
+        let cases = [
+            ("api_internal.example.com", ""),
+            ("_service.example.com", "tcp"),
+            ("a_b.test", "rest"),
+        ];
+
+        for (host, protocol) in cases {
+            let endpoint = if protocol == "rest" {
+                format!(
+                    "{{ host: {host}, port: 443, protocol: rest, enforcement: enforce, access: read-only }}"
+                )
+            } else if protocol == "tcp" {
+                format!("{{ host: {host}, port: 443, protocol: tcp }}")
+            } else {
+                format!("{{ host: {host}, port: 443 }}")
+            };
+            let candidate = parse(&format!(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{endpoint}]\n    binaries: []\n"
+            ));
+            let result = check_within_maximum(&parse("version: 1\n"), &candidate, options());
+            assert!(
+                matches!(
+                    result,
+                    CheckResult::Exceeds(ref evidence)
+                        if matches!(
+                            evidence.counterexample(),
+                            Counterexample::Network { host: witness, .. } if witness == host
+                        )
+                ),
+                "protocol={protocol:?} host={host}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn underscore_hosts_preserve_exact_and_wildcard_containment() {
+        let maximum = parse(
+            "version: 1\nnetwork_policies:\n  maximum:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: []\n",
+        );
+        let candidate = parse(
+            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: api_internal.example.com, port: 443 }]\n    binaries: []\n",
+        );
+        assert!(matches!(
+            check_within_maximum(&maximum, &candidate, options()),
+            CheckResult::Within(_)
+        ));
+
+        let exact_maximum = parse(
+            "version: 1\nnetwork_policies:\n  maximum:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
+        );
+        let exact_candidate = parse(
+            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
+        );
+        assert!(matches!(
+            check_within_maximum(&exact_maximum, &exact_candidate, options()),
+            CheckResult::Within(_)
+        ));
+    }
+
+    #[test]
+    fn host_domain_enforces_modeled_label_and_name_boundaries() {
+        let maximum_length = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(maximum_length.len(), 253);
+        assert!(is_canonical_dns_host(&maximum_length));
+        assert!(!unsupported_host_glob(&maximum_length));
+        assert!(is_canonical_dns_host("_service.example.com"));
+        assert!(is_canonical_dns_host("api-internal.example.com"));
+
+        let oversized_label = format!("{}.example.com", "a".repeat(64));
+        assert!(!is_canonical_dns_host(&oversized_label));
+        assert!(unsupported_host_glob(&oversized_label));
+
+        let oversized_name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        assert_eq!(oversized_name.len(), 254);
+        assert!(!is_canonical_dns_host(&oversized_name));
+        assert!(unsupported_host_glob(&oversized_name));
+        assert!(unsupported_host_glob("api$.example.com"));
+        for unsupported in ["-api.example.com", "api-.example.com"] {
+            assert!(!is_canonical_dns_host(unsupported));
+            assert!(unsupported_host_glob(unsupported));
+
+            let candidate = parse(&format!(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{{ host: {unsupported}, port: 443 }}]\n    binaries: []\n"
+            ));
+            assert!(matches!(
+                check_within_maximum(&parse("version: 1\n"), &candidate, options()),
+                CheckResult::Unsupported(ref evidence)
+                    if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
+                        && evidence.reason().contains("endpoint host")
+            ));
+        }
     }
 
     #[test]
@@ -2405,6 +2624,9 @@ mod tests {
             ("**.example.com", "example.com"),
             ("api*.example.com", "api.example.com"),
             ("api*.example.com", "api-v2.example.com"),
+            ("api*.example.com", "api_internal.example.com"),
+            ("*.example.com", "_service.example.com"),
+            ("api-internal.example.com", "api-internal.example.com"),
         ];
         for (pattern, host) in cases {
             let runtime = HostPattern::new(pattern).unwrap().matches(host);
@@ -2498,6 +2720,10 @@ mod tests {
                 "/a/xb",
                 "/a/x/z/xb/y/b",
                 "/a/c",
+                "/a/é/b",
+                "/a/汉/b",
+                "/a/e\u{301}/b",
+                "/a/😀/b",
             ] {
                 let query = format!(
                     "glob.match({}, [\"/\"], {})",
@@ -2516,6 +2742,85 @@ mod tests {
                     solver.check() == SatResult::Sat,
                     expected,
                     "pattern={pattern} path={path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn z3_string_boundary_decodes_exactly_or_fails_closed() {
+        for (expected, exactly_decodable) in [
+            ("ascii", true),
+            (r"a\b", true),
+            ("é", false),
+            ("e\u{301}", false),
+            ("𐐷", false),
+            ("😀", false),
+        ] {
+            let solver = Solver::new();
+            let value = Z3String::fresh_const("round_trip");
+            solver.assert(value.eq(Z3String::from_str(expected).unwrap()));
+            assert_eq!(solver.check(), SatResult::Sat, "value={expected:?}");
+            let model = solver.get_model().unwrap();
+            let decoded = model_string_exact(&model, &value);
+            if exactly_decodable {
+                assert_eq!(decoded.as_deref(), Some(expected), "value={expected:?}");
+            } else if let Some(decoded) = decoded {
+                assert_eq!(decoded, expected, "value={expected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_network_literals_are_unsupported_in_both_inputs() {
+        let policies = [
+            (
+                "binary path",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/é*' }]\n",
+            ),
+            (
+                "endpoint host",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: 'é.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+            (
+                "endpoint path",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, path: '/é/**', access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+            (
+                "REST allow method",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: 'GÉT', path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+            (
+                "REST allow path",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/é/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+            (
+                "REST deny method",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: 'DÉLETE', path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+            (
+                "REST deny path",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: GET, path: '/é/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            ),
+        ];
+        let empty = parse("version: 1\n");
+        for (field, yaml) in policies {
+            let policy = parse(yaml);
+            for (maximum, candidate, label) in [
+                (&policy, &empty, "maximum"),
+                (&empty, &policy, "candidate"),
+                (&policy, &policy, "maximum"),
+            ] {
+                let result = check_within_maximum(maximum, candidate, options());
+                assert!(
+                    matches!(
+                        result,
+                        CheckResult::Unsupported(ref evidence)
+                            if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
+                                && evidence.reason().contains(label)
+                                && evidence.reason().contains(field)
+                    ),
+                    "field={field} input={label} result={result:?}"
                 );
             }
         }

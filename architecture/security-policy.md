@@ -348,8 +348,13 @@ authority, and enforced REST method and path authority, including explicit REST
 denies. Network containment covers runtime configurations both with and without
 binary identity enforcement. Strict checks match grants and denies against the
 executable and an ancestor identity, and the evidence identifies the identities
-for an exceeding witness. Recognized authority outside the reviewed model
-produces an unsupported result rather than being silently ignored.
+for an exceeding witness. Network binary selectors, endpoint host and path
+selectors, and REST allow and deny method and path selectors must use ASCII
+literals. This restriction applies to both inputs, including deny-only rules;
+other Unicode policy text and filesystem paths are unaffected. ASCII wildcard
+selectors still cover non-ASCII runtime values matched by the policy engine.
+Recognized authority outside the reviewed model produces an unsupported result
+rather than being silently ignored.
 Environment-dependent authority also remains unsupported when the result
 depends on context that is unavailable to the local command. This includes an
 unresolved workdir, filesystem or binary containment that depends on image-specific
@@ -362,6 +367,9 @@ are created. They support matching paths, grant removal, write-to-read reduction
 and a maximum root grant. Other comparisons between paths remain unsupported;
 lexical ancestry or distinctness alone cannot establish resolved ancestry or
 distinctness. Adding access when the maximum grants none produces a counterexample.
+If the solver produces a string that cannot be decoded and checked faithfully,
+the command returns an inconclusive `invalid_witness` result instead of publishing
+the value as counterexample evidence.
 
 This containment operation is separate from the proposal-risk queries below.
 See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)

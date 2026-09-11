@@ -130,6 +130,15 @@ The result object reports the domains used for each check. Policies that use
 recognized authority outside that model return `unsupported` rather than
 silently ignoring it.
 
+Network binary selectors, endpoint host and path selectors, and REST allow and
+deny method and path selectors must use ASCII literals in both the candidate and
+maximum. A non-ASCII literal in one of these fields returns `unsupported` with
+`reason_code: unsupported_policy_shape`, including when it appears only in a
+deny. This is a prover-model limitation, not a general policy validation rule:
+filesystem paths and unrelated policy text retain their existing Unicode
+behavior. ASCII wildcard selectors still cover non-ASCII runtime values matched
+by the policy engine.
+
 Containment means `Allowed(candidate)` is a subset of `Allowed(maximum)` under
 the reported model. It does not establish least privilege, automatic approval
 eligibility, semantic safety, or equivalence to a running sandbox's kernel
@@ -154,6 +163,9 @@ state. In particular:
   match the executable or an ancestor identity. Network counterexamples report
   the configuration and identities that expose the additional authority.
 - REST containment witnesses use canonical request methods and paths.
+- If a solver string cannot be decoded and validated faithfully, the command
+  returns `inconclusive` with `reason_code: invalid_witness` instead of emitting
+  a counterexample.
 - Both files are interpreted in the same sandbox filesystem namespace and
   mount model, with stable path resolution when enforcement rules are created.
   The CLI does not resolve sandbox paths against the host.
