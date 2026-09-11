@@ -18,7 +18,7 @@ publish = false
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
 openshell-sdk = { path = "../../crates/openshell-sdk", features = ["extension"] }
 tokio = { version = "1.43", features = ["fs", "macros", "rt-multi-thread"] }
-tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic = { version = "0.14", features = ["transport", "tls-aws-lc"] }
 
 [lints.rust]
 unsafe_code = "warn"

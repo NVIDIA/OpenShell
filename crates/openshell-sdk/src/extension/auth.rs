@@ -265,6 +265,12 @@ impl GatewayJwtAuthenticatorBuilder {
     }
 
     pub fn build(self) -> Result<GatewayJwtAuthenticator, VerificationError> {
+        // jsonwebtoken panics on first use when feature unification in the host
+        // binary enables more than one crypto backend and none was installed.
+        // Selecting one here keeps the verifier self-contained; a provider the
+        // host installed earlier wins and works equally for EdDSA.
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+
         if self.issuer.is_empty() || self.audience.is_empty() {
             return Err(VerificationError::EmptyExpectedIdentity);
         }
