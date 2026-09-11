@@ -18,6 +18,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt"] }
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
