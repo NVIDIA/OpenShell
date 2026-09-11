@@ -66,8 +66,21 @@ const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
 #[cfg(target_os = "linux")]
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
+fn build_connection_error_event(
+    peer_addr: SocketAddr,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .message(message)
+        .build()
+}
+
 fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -272,7 +285,7 @@ impl ProxyHandle {
             let mut consecutive_unknown_errors: u32 = 0;
             loop {
                 match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, peer_addr)) => {
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
                         set_tcp_nodelay_best_effort(&stream);
@@ -315,45 +328,24 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Proxy connection error: {err}"))
-                                    .build();
+                                let event = build_connection_error_event(
+                                    peer_addr,
+                                    format!("Proxy connection error: {err}"),
+                                );
                                 ocsf_emit!(event);
                             }
                         });
                     }
                     Err(err) => {
-                        match classify_accept_error(
+                        let action = classify_accept_error(
                             &err,
                             &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
-                        ) {
-                            AcceptAction::Terminal => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::High)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept loop exiting on terminal error: {err}",
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
-                                break;
-                            }
-                            AcceptAction::Retry { backoff, severity } => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(severity)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept error (retrying in {}ms): {err}",
-                                        backoff.as_millis(),
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
+                        );
+                        ocsf_emit!(build_accept_error_event(local_addr, &err, &action));
+                        match action {
+                            AcceptAction::Terminal => break,
+                            AcceptAction::Retry { backoff, .. } => {
                                 tokio::time::sleep(backoff).await;
                             }
                         }
@@ -434,7 +426,7 @@ impl TransparentTcpHandle {
                     );
                 }
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
+                    let Ok((stream, peer_addr)) = listener.accept().await else {
                         break;
                     };
                     set_tcp_nodelay_best_effort(&stream);
@@ -461,12 +453,7 @@ impl TransparentTcpHandle {
                         .await
                         {
                             ocsf_emit!(
-                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Transparent TCP connection error: {error}"))
-                                    .build()
+                                build_connection_error_event(peer_addr, format!("Transparent TCP connection error: {error}"))
                             );
                         }
                     });
@@ -905,6 +892,34 @@ enum AcceptAction {
     },
 }
 
+fn build_accept_error_event(
+    local_addr: SocketAddr,
+    err: &std::io::Error,
+    action: &AcceptAction,
+) -> openshell_ocsf::OcsfEvent {
+    let (severity, message) = match action {
+        AcceptAction::Terminal => (
+            SeverityId::High,
+            format!("Proxy accept loop exiting on terminal error: {err}"),
+        ),
+        AcceptAction::Retry { backoff, severity } => (
+            *severity,
+            format!(
+                "Proxy accept error (retrying in {}ms): {err}",
+                backoff.as_millis()
+            ),
+        ),
+    };
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
+        .severity(severity)
+        .status(StatusId::Failure)
+        .status_detail("proxy_accept_error")
+        .message(message)
+        .build()
+}
+
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
@@ -1322,12 +1337,57 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
-fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+fn build_forward_parse_error_ocsf_event(
+    peer_addr: SocketAddr,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!("FORWARD parse error for {path}"))
+        .build()
+}
+
+/// Build the rejection event for an absolute-form request whose scheme is not
+/// supported by the forward proxy. `path` must already be query-free and have
+/// credential-reference syntax redacted by [`forward_telemetry_path`].
+fn build_forward_unsupported_scheme_ocsf_event(
+    method: &str,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new(scheme, host, path, port),
+        ))
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Rejected)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "FORWARD rejected: unsupported scheme {scheme} for {host}:{port}"
+        ))
+        .build()
+}
+
+fn build_forward_graphql_inspection_failure_ocsf_event(
+    host: &str,
+    port: u16,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message("FORWARD_GRAPHQL_L7 request rejected during inspection")
+        .status_detail("graphql_request_inspection_failed")
         .build()
 }
 
@@ -3454,8 +3514,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
 
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
+                    let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                         .severity(SeverityId::Medium)
                         .message(format!(
                             "allowed_ips entry has a very broad CIDR {n} (/{}) < /{MIN_SAFE_PREFIX_LEN}; \
@@ -4097,12 +4156,16 @@ async fn handle_forward_proxy(
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
+    let workload_addr = client.peer_addr().into_diagnostic()?;
     let mut telemetry_path = forward_telemetry_path(target_uri);
     // 1. Parse the absolute-form URI. Every external forward target is
     // canonicalized below before credential binding, policy-path evaluation,
     // upstream bytes, or telemetry consume it.
     let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
-        ocsf_emit!(build_forward_parse_error_ocsf_event(&telemetry_path));
+        ocsf_emit!(build_forward_parse_error_ocsf_event(
+            workload_addr,
+            &telemetry_path
+        ));
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
@@ -4144,17 +4207,13 @@ async fn handle_forward_proxy(
     }
 
     if scheme != "http" {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Refuse)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Rejected)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .message(format!(
-                "FORWARD rejected: unsupported scheme {scheme} for {host_lc}:{port}"
-            ))
-            .build();
+        let event = build_forward_unsupported_scheme_ocsf_event(
+            method,
+            &scheme,
+            &host_lc,
+            port,
+            &telemetry_path,
+        );
         ocsf_emit!(event);
         if scheme == "https" {
             respond(
@@ -4182,7 +4241,6 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let workload_addr = client.peer_addr().into_diagnostic()?;
     let proxy_addr = client.local_addr().into_diagnostic()?;
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
@@ -4610,14 +4668,9 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
-                        .build();
-                    ocsf_emit!(event);
+                    ocsf_emit!(build_forward_graphql_inspection_failure_ocsf_event(
+                        &host_lc, port,
+                    ));
                     emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
@@ -6362,6 +6415,52 @@ network_policies:
     }
 
     #[test]
+    fn accept_errors_preserve_endpoint_and_diagnostics_in_shorthand() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+        let addr = "127.0.0.1:3128".parse().unwrap();
+        let error = std::io::Error::other("accept failed");
+        for (action, expected) in [
+            (
+                AcceptAction::Terminal,
+                "exiting on terminal error: accept failed",
+            ),
+            (
+                AcceptAction::Retry {
+                    backoff: std::time::Duration::from_millis(250),
+                    severity: SeverityId::Low,
+                },
+                "retrying in 250ms): accept failed",
+            ),
+        ] {
+            let event = build_accept_error_event(addr, &error, &action);
+            let json = event.to_json().unwrap();
+            validate_required_fields(&json, &load_class_schema("network_activity"));
+            assert_eq!(json["dst_endpoint"]["ip"], "127.0.0.1");
+            assert_eq!(json["dst_endpoint"]["port"], 3128);
+            let shorthand = event.format_shorthand();
+            assert!(shorthand.contains("127.0.0.1:3128"), "{shorthand}");
+            assert!(shorthand.contains(expected), "{shorthand}");
+        }
+    }
+
+    #[test]
+    fn connection_and_parse_errors_include_known_peer_for_ocsf18() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let schema = load_class_schema("network_activity");
+        for event in [
+            build_connection_error_event(peer, "Proxy connection error".to_string()),
+            build_forward_parse_error_ocsf_event(peer, "/[INVALID_REQUEST_TARGET]"),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 4001);
+            assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
+            assert_eq!(json["src_endpoint"]["port"], 54321);
+            validate_required_fields(&json, &schema);
+        }
+    }
+
+    #[test]
     fn middleware_failure_response_uses_platform_text_without_policy_guidance() {
         let response = build_middleware_failure_response("api-policy");
         let response = String::from_utf8(response).expect("UTF-8 error response");
@@ -6701,9 +6800,12 @@ network_policies:
         assert!(!serialized.contains("real-secret"), "{serialized}");
         assert!(!serialized.contains("?token="), "{serialized}");
 
-        let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
-            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
-        ))
+        let malformed = build_forward_parse_error_ocsf_event(
+            "127.0.0.1:12345".parse().unwrap(),
+            &forward_telemetry_path(
+                "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+            ),
+        )
         .to_json()
         .unwrap();
         assert_eq!(
@@ -9255,6 +9357,42 @@ network_policies:
         assert_eq!(malformed, "/[INVALID_REQUEST_TARGET]");
         assert!(!malformed.contains("API_TOKEN"));
         assert!(!malformed.contains("real-secret"));
+    }
+
+    #[test]
+    fn unsupported_forward_scheme_event_keeps_only_redacted_request_context() {
+        let target = "https://api.example.com/v1/openshell:resolve:env:API_TOKEN?token=real-secret";
+        let (_, host, port, _) = parse_proxy_uri(target).unwrap();
+        let event = build_forward_unsupported_scheme_ocsf_event(
+            "GET",
+            "https",
+            &host,
+            port,
+            &forward_telemetry_path(target),
+        );
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert_eq!(json["http_request"]["url"]["scheme"], "https");
+        assert_eq!(json["http_request"]["url"]["hostname"], "api.example.com");
+        assert_eq!(json["http_request"]["url"]["path"], "/v1/[CREDENTIAL]");
+        assert_eq!(json["http_request"]["url"]["port"], 443);
+
+        let rendered = format!("{json} {}", event.format_shorthand());
+        assert!(!rendered.contains("API_TOKEN"));
+        assert!(!rendered.contains("real-secret"));
+    }
+
+    #[test]
+    fn graphql_inspection_failure_event_has_no_parser_detail() {
+        let event = build_forward_graphql_inspection_failure_ocsf_event("api.example.com", 443);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(
+            json["message"],
+            "FORWARD_GRAPHQL_L7 request rejected during inspection"
+        );
+        assert_eq!(json["status_detail"], "graphql_request_inspection_failed");
     }
 
     #[test]

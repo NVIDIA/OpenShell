@@ -457,6 +457,16 @@ Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
 The OCSF device describes the sandbox environment, with type ID Other and type
 label `Sandbox`; its operating system is a separate attribute.
+Network Activity records identify at least one observed endpoint. HTTP Activity
+records contain a request or response; early rejections with only connection
+context use Network Activity. Configuration diagnostics use Config State Change,
+and monitor startup failures use Application Lifecycle. Unix socket relay and
+relay-control notifications use Base Event when no network endpoint is available.
+Producer regression tests check required fields and `at_least_one` constraints
+against the vendored OCSF 1.8 schemas.
+Shorthand logs retain diagnostic messages for network operational failures and
+failed application lifecycle events, including when endpoint or component fields
+are present.
 
 ## Policy Proposals
 

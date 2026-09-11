@@ -159,6 +159,17 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
     }
 }
 
+fn build_start_failure_event(message: impl Into<String>) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::AppLifecycleBuilder::new(openshell_ocsf::ctx::ctx())
+        .app_name("OpenShell Bypass Monitor")
+        .activity(ActivityId::Reset)
+        .status(openshell_ocsf::StatusId::Failure)
+        .status_detail("bypass_monitor_start_failure")
+        .severity(SeverityId::Low)
+        .message(message)
+        .build()
+}
+
 /// Spawn the bypass monitor as a background tokio task.
 ///
 /// Uses `dmesg --follow` to tail the kernel ring buffer for nftables log
@@ -189,14 +200,10 @@ pub fn spawn(
         .status();
 
     if !dmesg_check.is_ok_and(|s| s.success()) {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .severity(SeverityId::Low)
-            .message(
-                "dmesg not available; bypass detection monitor will not run. \
+        let event = build_start_failure_event(
+            "dmesg not available; bypass detection monitor will not run. \
                  Bypass REJECT rules still provide fast-fail behavior.",
-            )
-            .build();
+        );
         ocsf_emit!(event);
         return None;
     }
@@ -217,24 +224,18 @@ pub fn spawn(
         {
             Ok(c) => c,
             Err(e) => {
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .message(format!(
-                        "Failed to start dmesg --follow; bypass monitor will not run: {e}"
-                    ))
-                    .build();
+                let event = build_start_failure_event(format!(
+                    "Failed to start dmesg --follow; bypass monitor will not run: {e}"
+                ));
                 ocsf_emit!(event);
                 return;
             }
         };
 
         let Some(stdout) = child.stdout.take() else {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Other)
-                .severity(SeverityId::Low)
-                .message("dmesg --follow produced no stdout; bypass monitor will not run")
-                .build();
+            let event = build_start_failure_event(
+                "dmesg --follow produced no stdout; bypass monitor will not run",
+            );
             ocsf_emit!(event);
             return;
         };
@@ -381,6 +382,28 @@ fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_failures_preserve_component_and_cause_in_shorthand() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+        for message in [
+            "dmesg not available; bypass detection monitor will not run",
+            "Failed to start dmesg --follow; bypass monitor will not run: permission denied",
+            "dmesg --follow produced no stdout; bypass monitor will not run",
+        ] {
+            let event = build_start_failure_event(message);
+            let json = event.to_json().unwrap();
+            validate_required_fields(&json, &load_class_schema("application_lifecycle"));
+            assert_eq!(json["app"]["name"], "OpenShell Bypass Monitor");
+            assert_eq!(json["message"], message);
+            let shorthand = event.format_shorthand();
+            assert!(
+                shorthand.contains("OpenShell Bypass Monitor failure"),
+                "{shorthand}"
+            );
+            assert!(shorthand.contains(message), "{shorthand}");
+        }
+    }
 
     #[test]
     fn parse_kmsg_line_tcp_bypass() {

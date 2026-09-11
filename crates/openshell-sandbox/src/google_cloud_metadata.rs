@@ -83,7 +83,7 @@ fn route_request(
 ) -> MetadataResponse {
     if method != "GET" {
         emit_metadata_event(
-            ActivityId::Refuse,
+            405,
             SeverityId::Low,
             StatusId::Failure,
             &format!("metadata: unsupported method {method}"),
@@ -93,10 +93,13 @@ fn route_request(
 
     if let Err(resp) = validate_metadata_headers(headers) {
         emit_metadata_event(
-            ActivityId::Refuse,
+            resp.0,
             SeverityId::Medium,
             StatusId::Failure,
-            &format!("metadata: header validation failed for {path}"),
+            &format!(
+                "metadata: header validation failed for {}",
+                path.split('?').next().unwrap_or(path)
+            ),
         );
         return resp;
     }
@@ -133,7 +136,7 @@ fn route_request(
         "/computeMetadata/v1/instance" => (200, "text/plain", "service-accounts/\n".to_string()),
         _ => {
             emit_metadata_event(
-                ActivityId::Refuse,
+                404,
                 SeverityId::Low,
                 StatusId::Failure,
                 &format!("metadata: unknown path {route}"),
@@ -161,7 +164,7 @@ fn handle_token(ctx: &MetadataContext) -> MetadataResponse {
                 "credentials_unavailable",
             )
         };
-        emit_metadata_event(ActivityId::Fail, SeverityId::Medium, StatusId::Failure, msg);
+        emit_metadata_event(503, SeverityId::Medium, StatusId::Failure, msg);
         return (
             503,
             "application/json",
@@ -170,7 +173,7 @@ fn handle_token(ctx: &MetadataContext) -> MetadataResponse {
     };
 
     emit_metadata_event(
-        ActivityId::Open,
+        200,
         SeverityId::Informational,
         StatusId::Success,
         "metadata: token placeholder served",
@@ -212,7 +215,7 @@ fn handle_service_account_recursive(ctx: &MetadataContext) -> MetadataResponse {
 fn handle_env(ctx: &MetadataContext, env_key: &str) -> MetadataResponse {
     let Some(resolver) = ctx.credentials.resolver() else {
         emit_metadata_event(
-            ActivityId::Fail,
+            503,
             SeverityId::Medium,
             StatusId::Failure,
             &format!("metadata: {env_key} request but no credentials configured"),
@@ -224,7 +227,7 @@ fn handle_env(ctx: &MetadataContext, env_key: &str) -> MetadataResponse {
     resolver.resolve_placeholder(&placeholder).map_or_else(
         || {
             emit_metadata_event(
-                ActivityId::Fail,
+                404,
                 SeverityId::Low,
                 StatusId::Failure,
                 &format!("metadata: {env_key} not configured"),
@@ -304,19 +307,30 @@ where
     Ok(())
 }
 
-fn emit_metadata_event(
-    activity: ActivityId,
+fn emit_metadata_event(response_code: u16, severity: SeverityId, status: StatusId, message: &str) {
+    ocsf_emit!(build_metadata_event(
+        response_code,
+        severity,
+        status,
+        message
+    ));
+}
+
+fn build_metadata_event(
+    response_code: u16,
     severity: SeverityId,
     status: StatusId,
     message: &str,
-) {
-    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
-        .activity(activity)
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Other)
+        .http_response(openshell_ocsf::HttpResponse {
+            code: response_code,
+        })
         .severity(severity)
         .status(status)
         .message(message.to_string())
-        .build();
-    ocsf_emit!(event);
+        .build()
 }
 
 #[cfg(test)]
@@ -340,6 +354,46 @@ mod tests {
 
     fn flavor_headers() -> Vec<(String, String)> {
         vec![("Metadata-Flavor".to_string(), "Google".to_string())]
+    }
+
+    #[test]
+    fn metadata_events_include_response_for_ocsf18() {
+        use openshell_ocsf::tracing_layers::OcsfJsonlLayer;
+        use openshell_ocsf::validation::{
+            load_class_schema, validate_enum_value, validate_required_fields,
+        };
+        use tracing_subscriber::prelude::*;
+
+        let schema = load_class_schema("http_activity");
+        for (method, path, headers, expected_code) in [
+            ("GET", PATH_TOKEN, flavor_headers(), 200),
+            ("GET", "/?token=secret-query", Vec::new(), 403),
+            ("GET", "/unknown", flavor_headers(), 404),
+            ("POST", PATH_TOKEN, flavor_headers(), 405),
+            ("GET", PATH_TOKEN, flavor_headers(), 503),
+            ("GET", PATH_EMAIL, flavor_headers(), 404),
+        ] {
+            let env = if expected_code == 503 {
+                HashMap::new()
+            } else {
+                HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "test-token".to_string())])
+            };
+            let ctx = make_context(env);
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let subscriber =
+                tracing_subscriber::registry().with(OcsfJsonlLayer::new(log.reopen().unwrap()));
+            let response = tracing::subscriber::with_default(subscriber, || {
+                route_request(&ctx, method, path, &headers)
+            });
+            assert_eq!(response.0, expected_code);
+            let output = std::fs::read_to_string(log.path()).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(json["http_response"]["code"], response.0);
+            assert!(!output.contains("secret-query"), "{output}");
+            assert!(json.get("http_request").is_none());
+            validate_required_fields(&json, &schema);
+            validate_enum_value(&json, "activity_id", &schema);
+        }
     }
 
     #[test]

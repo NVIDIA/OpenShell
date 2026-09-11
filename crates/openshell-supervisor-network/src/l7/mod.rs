@@ -186,8 +186,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let tls = match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
         Some("terminate") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .message(
                     "'tls: terminate' is deprecated; TLS termination is now automatic. \
@@ -198,8 +197,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             TlsMode::Auto
         }
         Some("passthrough") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .message(
                     "'tls: passthrough' is deprecated; TLS termination is now automatic. \
@@ -248,8 +246,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         Some("sigv4:body") => CredentialSigning::SigV4Body,
         Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
         Some(other) if !other.is_empty() => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::High)
                 .message(format!(
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
@@ -265,8 +262,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let signing_region = get_object_str(val, "signing_region").unwrap_or_default();
 
     if credential_signing.is_sigv4() && signing_service.is_empty() {
-        let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(openshell_ocsf::ActivityId::Other)
+        let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::High)
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();

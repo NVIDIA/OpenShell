@@ -247,7 +247,10 @@ impl OcsfEvent {
                 // policy-DNS mapping in the human-readable audit log.
                 let show_correlation_message =
                     e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                let show_failure_message =
+                    e.base.status_detail.as_deref() == Some("proxy_accept_error");
                 let message_ctx = if show_correlation_message
+                    || show_failure_message
                     || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
                 {
                     message_tag(&e.base)
@@ -440,7 +443,13 @@ impl OcsfEvent {
                     .map(|s| s.label().to_lowercase())
                     .unwrap_or_default();
 
-                format!("LIFECYCLE:{activity} {sev} {app} {status}")
+                let message_ctx =
+                    if e.base.status_detail.as_deref() == Some("bypass_monitor_start_failure") {
+                        message_tag(&e.base)
+                    } else {
+                        String::new()
+                    };
+                format!("LIFECYCLE:{activity} {sev} {app} {status}{message_ctx}")
             }
 
             Self::DeviceConfigStateChange(e) => {

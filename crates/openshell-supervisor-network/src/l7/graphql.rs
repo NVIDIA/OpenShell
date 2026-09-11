@@ -498,7 +498,7 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
             .unwrap_or_default();
         let chunk_size = usize::from_str_radix(size_token, 16)
             .into_diagnostic()
-            .map_err(|_| miette!("Invalid GraphQL chunk size token: {size_token:?}"))?;
+            .map_err(|_| miette!("Invalid GraphQL chunk size token"))?;
         pos = size_line_end + 2;
 
         if decoded.len().saturating_add(chunk_size) > max_body_bytes {
@@ -732,6 +732,31 @@ mod tests {
         assert!(!forwarded.to_ascii_lowercase().contains("transfer-encoding"));
         assert!(!forwarded.to_ascii_lowercase().contains("trailer:"));
         assert!(req.raw_header.ends_with(body));
+    }
+
+    #[tokio::test]
+    async fn invalid_chunk_size_does_not_echo_request_data() {
+        let sentinel = "graphql-chunk-secret";
+        let mut req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "POST /graphql HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n{sentinel}\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::Chunked,
+        };
+        let error =
+            inspect_graphql_request(&mut tokio::io::empty(), &mut req, DEFAULT_MAX_BODY_BYTES)
+                .await
+                .expect_err("invalid chunk size must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid GraphQL chunk size token")
+        );
+        assert!(!error.to_string().contains(sentinel));
     }
 
     #[tokio::test]

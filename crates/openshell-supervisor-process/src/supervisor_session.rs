@@ -143,17 +143,23 @@ fn relay_open_event(
     open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
 ) -> OcsfEvent {
-    let mut builder = NetworkActivityBuilder::new(ctx)
+    // Unix socket relay operations have no network endpoint.
+    let Some(endpoint) = relay_target_endpoint(open) else {
+        return openshell_ocsf::BaseEventBuilder::new(ctx)
+            .activity_name("Relay open")
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(relay_target_message(open, "open", ssh_socket_path))
+            .build();
+    };
+    NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Open)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .message(relay_target_message(open, "open", ssh_socket_path));
-    if let Some(endpoint) = relay_target_endpoint(open) {
-        builder = builder
-            .dst_endpoint(endpoint)
-            .connection_info(ConnectionInfo::new("tcp"));
-    }
-    builder.build()
+        .message(relay_target_message(open, "open", ssh_socket_path))
+        .dst_endpoint(endpoint)
+        .connection_info(ConnectionInfo::new("tcp"))
+        .build()
 }
 
 fn relay_closed_event(
@@ -161,17 +167,23 @@ fn relay_closed_event(
     open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
 ) -> OcsfEvent {
-    let mut builder = NetworkActivityBuilder::new(ctx)
+    // Unix socket relay operations have no network endpoint.
+    let Some(endpoint) = relay_target_endpoint(open) else {
+        return openshell_ocsf::BaseEventBuilder::new(ctx)
+            .activity_name("Relay closed")
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(relay_target_message(open, "closed", ssh_socket_path))
+            .build();
+    };
+    NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Close)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .message(relay_target_message(open, "closed", ssh_socket_path));
-    if let Some(endpoint) = relay_target_endpoint(open) {
-        builder = builder
-            .dst_endpoint(endpoint)
-            .connection_info(ConnectionInfo::new("tcp"));
-    }
-    builder.build()
+        .message(relay_target_message(open, "closed", ssh_socket_path))
+        .dst_endpoint(endpoint)
+        .connection_info(ConnectionInfo::new("tcp"))
+        .build()
 }
 
 fn relay_failed_event(
@@ -180,25 +192,34 @@ fn relay_failed_event(
     ssh_socket_path: &std::path::Path,
     error: &str,
 ) -> OcsfEvent {
-    let mut builder = NetworkActivityBuilder::new(ctx)
+    // Unix socket relay operations have no network endpoint.
+    let Some(endpoint) = relay_target_endpoint(open) else {
+        return openshell_ocsf::BaseEventBuilder::new(ctx)
+            .activity_name("Relay failed")
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .message(format!(
+                "{}: {error}",
+                relay_target_message(open, "bridge failed", ssh_socket_path)
+            ))
+            .build();
+    };
+    NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Fail)
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!(
             "{}: {error}",
             relay_target_message(open, "bridge failed", ssh_socket_path)
-        ));
-    if let Some(endpoint) = relay_target_endpoint(open) {
-        builder = builder
-            .dst_endpoint(endpoint)
-            .connection_info(ConnectionInfo::new("tcp"));
-    }
-    builder.build()
+        ))
+        .dst_endpoint(endpoint)
+        .connection_info(ConnectionInfo::new("tcp"))
+        .build()
 }
 
 fn relay_close_from_gateway_event(ctx: &EventContext, channel_id: &str, reason: &str) -> OcsfEvent {
-    NetworkActivityBuilder::new(ctx)
-        .activity(ActivityId::Close)
+    openshell_ocsf::BaseEventBuilder::new(ctx)
+        .activity_name("Relay close from gateway")
         .severity(SeverityId::Informational)
         .message(format!(
             "relay close from gateway (channel_id={channel_id}, reason={reason})"
@@ -994,10 +1015,16 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn relay_open_emits_network_open_success() {
+    fn relay_open_emits_base_open_success() {
         let event = relay_open_event(&ctx(), &ssh_relay_open("ch-42"), ssh_socket_path());
-        let na = network_activity(&event);
-        assert_eq!(na.base.activity_id, ActivityId::Open.as_u8());
+        let OcsfEvent::Base(na) = &event else {
+            panic!("expected Base Event for relay control operation")
+        };
+        openshell_ocsf::validation::validate_required_fields(
+            &event.to_json().unwrap(),
+            &openshell_ocsf::validation::load_class_schema("base_event"),
+        );
+        assert_eq!(na.base.activity_name, "Relay open");
         assert_eq!(na.base.severity, SeverityId::Informational);
         let msg = na.base.message.as_deref().unwrap_or_default();
         assert!(msg.contains("ch-42"), "message: {msg}");
@@ -1030,23 +1057,35 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn relay_closed_emits_network_close_success() {
+    fn relay_closed_emits_base_close_success() {
         let event = relay_closed_event(&ctx(), &ssh_relay_open("ch-42"), ssh_socket_path());
-        let na = network_activity(&event);
-        assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
+        let OcsfEvent::Base(na) = &event else {
+            panic!("expected Base Event for relay control operation")
+        };
+        openshell_ocsf::validation::validate_required_fields(
+            &event.to_json().unwrap(),
+            &openshell_ocsf::validation::load_class_schema("base_event"),
+        );
+        assert_eq!(na.base.activity_name, "Relay closed");
         assert_eq!(na.base.status, Some(StatusId::Success));
     }
 
     #[test]
-    fn relay_failed_emits_network_fail_low() {
+    fn relay_failed_emits_base_fail_low() {
         let event = relay_failed_event(
             &ctx(),
             &ssh_relay_open("ch-42"),
             ssh_socket_path(),
             "write to ssh failed",
         );
-        let na = network_activity(&event);
-        assert_eq!(na.base.activity_id, ActivityId::Fail.as_u8());
+        let OcsfEvent::Base(na) = &event else {
+            panic!("expected Base Event for relay control operation")
+        };
+        openshell_ocsf::validation::validate_required_fields(
+            &event.to_json().unwrap(),
+            &openshell_ocsf::validation::load_class_schema("base_event"),
+        );
+        assert_eq!(na.base.activity_name, "Relay failed");
         assert_eq!(na.base.severity, SeverityId::Low);
         assert_eq!(na.base.status, Some(StatusId::Failure));
         let msg = na.base.message.as_deref().unwrap_or_default();
@@ -1055,10 +1094,16 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn relay_close_from_gateway_is_network_close_informational() {
+    fn relay_close_from_gateway_is_base_close_informational() {
         let event = relay_close_from_gateway_event(&ctx(), "ch-42", "sandbox deleted");
-        let na = network_activity(&event);
-        assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
+        let OcsfEvent::Base(na) = &event else {
+            panic!("expected Base Event for relay control operation")
+        };
+        openshell_ocsf::validation::validate_required_fields(
+            &event.to_json().unwrap(),
+            &openshell_ocsf::validation::load_class_schema("base_event"),
+        );
+        assert_eq!(na.base.activity_name, "Relay close from gateway");
         assert_eq!(na.base.severity, SeverityId::Informational);
         let msg = na.base.message.as_deref().unwrap_or_default();
         assert!(msg.contains("sandbox deleted"), "message: {msg}");

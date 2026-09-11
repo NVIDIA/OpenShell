@@ -379,6 +379,23 @@ mod tests {
     }
 
     #[test]
+    fn unclassified_network_failures_do_not_push_raw_messages() {
+        let sentinel = "raw-parser-secret";
+        let event = NetworkActivityBuilder::new(&ocsf_ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .message(format!("parser failed: {sentinel}"))
+            .build();
+
+        let lines = capture(16, || ocsf_emit!(event));
+
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].message.contains(sentinel), "{:?}", lines[0]);
+    }
+
+    #[test]
     fn non_ocsf_events_use_visitor_extraction() {
         let lines = capture(16, || {
             tracing::info!(target: "test_target", answer = 42, name = "widget", "hello");
