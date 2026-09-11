@@ -6099,6 +6099,15 @@ network_policies:
                 response
             });
             let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            #[cfg(target_os = "linux")]
+            let identity_mode = Arc::new(ProxyIdentityMode::procfs(
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let identity_mode = Arc::new(
+                ProxyIdentityMode::static_binary(executable.clone()).expect("hash test executable"),
+            );
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -6109,8 +6118,7 @@ network_policies:
                     request.len(),
                     &mut proxy_connection,
                     engine,
-                    Arc::new(BinaryIdentityCache::new()),
-                    Arc::new(AtomicU32::new(std::process::id())),
+                    identity_mode,
                     None,
                     AgentProposals::default(),
                     Arc::new(None),

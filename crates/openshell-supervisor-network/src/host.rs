@@ -46,7 +46,6 @@ pub struct HostProxyConfig {
     pub sandbox_id: Option<String>,
     pub sandbox_name: Option<String>,
     pub openshell_endpoint: Option<String>,
-    pub inference_routes: Option<String>,
     pub provider_credentials: Option<ProviderCredentialState>,
     /// Shared feature state for the policy.local agent proposal surface.
     pub agent_proposals: AgentProposals,
@@ -105,13 +104,6 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         config.agent_proposals,
         workspace_rx,
     ));
-    let inference_ctx = crate::inference_routes::build_inference_context(
-        config.sandbox_id.as_deref(),
-        config.openshell_endpoint.as_deref(),
-        config.inference_routes.as_deref(),
-    )
-    .await?;
-
     let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
     let proxy_policy = ProxyPolicy {
         http_addr: Some(config.bind_addr),
@@ -204,7 +196,6 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         engine,
         Arc::new(ProxyIdentityMode::static_binary(config.binary_path)?),
         tls_state,
-        inference_ctx,
         config.provider_credentials,
         Some(policy_local_ctx.clone()),
         config.denial_tx,
@@ -246,7 +237,6 @@ mod tests {
             sandbox_id: Some("sandbox-123".to_string()),
             sandbox_name: Some("agent-box".to_string()),
             openshell_endpoint: None,
-            inference_routes: None,
             provider_credentials: None,
             agent_proposals: AgentProposals::new(true),
             denial_tx: None,
@@ -304,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn starts_loopback_proxy_and_serves_policy_local() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let binary = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(binary.path(), b"agent").unwrap();
 

@@ -834,7 +834,6 @@ async fn run_lifecycle(
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),
                 openshell_endpoint: None,
-                inference_routes: None,
                 provider_credentials: None,
                 agent_proposals: openshell_core::proposals::AgentProposals::default(),
                 denial_tx: None,
