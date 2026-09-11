@@ -384,7 +384,6 @@ pub fn control_egress_policy(
             egress: Some(vec![NetworkPolicyEgressRule::default()]),
             ..Default::default()
         }),
-        status: None,
     }
 }
 
@@ -600,8 +599,8 @@ mod tests {
         assert_eq!(
             pod_spec.image_pull_secrets.as_ref().unwrap()[0]
                 .name
-                .as_deref(),
-            Some("registry-credentials")
+                .as_str(),
+            "registry-credentials"
         );
         let pod_security =
             serde_json::to_value(pod_spec.security_context.as_ref().unwrap()).unwrap();
