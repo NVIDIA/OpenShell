@@ -91,6 +91,25 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSandboxRuntimeRepository" -}}
+ghcr.io/nvidia/openshell/sandbox
+{{- end }}
+
+{{/* Whether Helm must propagate a sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/* Sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImage" -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default (include "openshell.defaultSandboxRuntimeRepository" .) -}}
+{{- $tag := .Values.sandboxRuntime.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
 {{/* Official supervisor repository used by the gateway's built-in default. */}}
 {{- define "openshell.defaultSupervisorRepository" -}}
 ghcr.io/nvidia/openshell/supervisor
