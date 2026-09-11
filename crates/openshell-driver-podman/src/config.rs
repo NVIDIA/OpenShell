@@ -60,9 +60,11 @@ pub struct PodmanComputeConfig {
     pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
-    /// OCI image containing the openshell-sandbox supervisor binary.
+    /// OCI image containing the statically linked `openshell-sandbox` binary.
     /// Mounted read-only into sandbox containers at /opt/openshell/bin
     /// using Podman's `type=image` mount.
+    pub sandbox_runtime_image: String,
+    /// OCI image containing the dynamically linked `openshell-supervisor` binary.
     pub supervisor_image: String,
     /// Host path to the CA certificate for sandbox mTLS.
     ///
@@ -469,6 +471,7 @@ impl Default for PodmanComputeConfig {
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
+            sandbox_runtime_image: openshell_core::config::default_sandbox_runtime_image(),
             supervisor_image: openshell_core::config::default_supervisor_image(),
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -503,6 +506,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("network_name", &self.network_name)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
+            .field("sandbox_runtime_image", &self.sandbox_runtime_image)
             .field("supervisor_image", &self.supervisor_image)
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)

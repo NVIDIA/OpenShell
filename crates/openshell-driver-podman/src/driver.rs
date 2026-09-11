@@ -13,7 +13,7 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    GatewayCallbackRoute, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    GatewayCallbackRoute, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
     gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
     validate_linux_elf_binary, write_cache_binary_atomic,
 };
@@ -798,10 +798,25 @@ impl PodmanComputeDriver {
         let (image, immutable_image_id, image_user, image_env) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                // The supervisor binary is shipped in a standalone OCI image and
-                // mounted into sandbox containers via Podman's type=image mount.
+                // The sandbox runtime is shipped in a standalone OCI image and
+                // mounted into workload containers via Podman's type=image mount.
+                let sandbox_runtime_pull_policy =
+                    runtime_image_pull_policy(&self.config.sandbox_runtime_image);
+                info!(
+                    image = %self.config.sandbox_runtime_image,
+                    policy = sandbox_runtime_pull_policy,
+                    "Ensuring sandbox runtime image"
+                );
+                self.client
+                    .pull_image(
+                        &self.config.sandbox_runtime_image,
+                        sandbox_runtime_pull_policy,
+                    )
+                    .await
+                    .map_err(ComputeDriverError::from)?;
+
                 let supervisor_pull_policy =
-                    supervisor_image_pull_policy(&self.config.supervisor_image);
+                    runtime_image_pull_policy(&self.config.supervisor_image);
                 info!(
                     image = %self.config.supervisor_image,
                     policy = supervisor_pull_policy,
@@ -880,6 +895,16 @@ impl PodmanComputeDriver {
             .await?;
         let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
         let mut runtime_config = self.config.clone();
+        runtime_config.sandbox_runtime_image = self
+            .client
+            .inspect_image(&self.config.sandbox_runtime_image)
+            .await?
+            .id;
+        if runtime_config.sandbox_runtime_image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "sandbox runtime image inspection returned no immutable image ID".into(),
+            ));
+        }
         runtime_config.supervisor_image = self
             .client
             .inspect_image(&self.config.supervisor_image)
@@ -963,7 +988,7 @@ impl PodmanComputeDriver {
                 };
                 let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref())
                 {
-                    match extract_supervisor_bin(&self.client, &runtime_config).await {
+                    match extract_sandbox_bin(&self.client, &runtime_config).await {
                         Ok(path) => Some(path),
                         Err(e) => {
                             cleanup_created().await;
@@ -1635,7 +1660,7 @@ fn validate_apparmor_support(
     Ok(())
 }
 
-fn supervisor_image_pull_policy(image: &str) -> &'static str {
+fn runtime_image_pull_policy(image: &str) -> &'static str {
     if supervisor_image_should_refresh(image) {
         "newer"
     } else {
@@ -1707,34 +1732,37 @@ fn validate_rootless_local_callback_helper(
     )))
 }
 
-// ── Supervisor binary extraction (userns fallback) ─────────────────────
+// ── Sandbox binary extraction (userns fallback) ────────────────────────
 
-async fn extract_supervisor_bin(
+async fn extract_sandbox_bin(
     client: &PodmanClient,
     config: &PodmanComputeConfig,
 ) -> Result<PathBuf, ComputeDriverError> {
     let mut inspect = client
-        .inspect_image(&config.supervisor_image)
+        .inspect_image(&config.sandbox_runtime_image)
         .await
         .map_err(ComputeDriverError::from)?;
 
-    if supervisor_image_should_refresh(&config.supervisor_image) {
+    if supervisor_image_should_refresh(&config.sandbox_runtime_image) {
         info!(
-            image = %config.supervisor_image,
-            "Refreshing mutable podman supervisor image"
+            image = %config.sandbox_runtime_image,
+            "Refreshing mutable Podman sandbox runtime image"
         );
-        match client.pull_image(&config.supervisor_image, "always").await {
+        match client
+            .pull_image(&config.sandbox_runtime_image, "always")
+            .await
+        {
             Ok(()) => {
                 inspect = client
-                    .inspect_image(&config.supervisor_image)
+                    .inspect_image(&config.sandbox_runtime_image)
                     .await
                     .map_err(ComputeDriverError::from)?;
             }
             Err(err) => {
                 warn!(
-                    image = %config.supervisor_image,
+                    image = %config.sandbox_runtime_image,
                     error = %err,
-                    "Failed to refresh mutable podman supervisor image; \
+                    "Failed to refresh mutable Podman sandbox runtime image; \
                      falling back to local image if present",
                 );
             }
@@ -1743,36 +1771,35 @@ async fn extract_supervisor_bin(
 
     let digest = if inspect.id.is_empty() {
         return Err(ComputeDriverError::Precondition(format!(
-            "supervisor image '{}' has no ID",
-            config.supervisor_image,
+            "sandbox runtime image '{}' has no ID",
+            config.sandbox_runtime_image,
         )));
     } else {
         &inspect.id
     };
 
-    let cache_path =
-        openshell_core::driver_utils::supervisor_cache_path("podman-supervisor", digest)
-            .map_err(ComputeDriverError::Precondition)?;
+    let cache_path = openshell_core::driver_utils::supervisor_cache_path("podman-sandbox", digest)
+        .map_err(ComputeDriverError::Precondition)?;
     if cache_path.is_file() {
         validate_linux_elf_binary(&cache_path).map_err(ComputeDriverError::Precondition)?;
         info!(
             cache_path = %cache_path.display(),
-            "Using cached supervisor binary"
+            "Using cached sandbox binary"
         );
         return Ok(cache_path);
     }
 
     info!(
-        image = %config.supervisor_image,
+        image = %config.sandbox_runtime_image,
         cache_path = %cache_path.display(),
-        "Extracting supervisor binary from image"
+        "Extracting sandbox binary from image"
     );
 
     let container_name = temp_extract_container_name();
     let spec = serde_json::json!({
-        "image": config.supervisor_image,
+        "image": config.sandbox_runtime_image,
         "name": container_name,
-        "entrypoint": [SUPERVISOR_IMAGE_BINARY_PATH],
+        "entrypoint": [SANDBOX_RUNTIME_IMAGE_BINARY_PATH],
         "command": [],
     });
     client
@@ -1786,7 +1813,7 @@ async fn extract_supervisor_bin(
         warn!(
             container = container_name,
             error = %err,
-            "Failed to remove supervisor extractor container"
+            "Failed to remove sandbox runtime extractor container"
         );
     }
 
@@ -1799,13 +1826,13 @@ async fn extract_binary_from_container(
     cache_path: &Path,
 ) -> Result<PathBuf, ComputeDriverError> {
     let tar_bytes = client
-        .copy_from_container(container_name, SUPERVISOR_IMAGE_BINARY_PATH)
+        .copy_from_container(container_name, SANDBOX_RUNTIME_IMAGE_BINARY_PATH)
         .await
         .map_err(ComputeDriverError::from)?;
 
     let binary_bytes = extract_first_tar_entry(&tar_bytes).map_err(|err| {
         ComputeDriverError::Precondition(format!(
-            "failed to extract supervisor binary from tar: {err}"
+            "failed to extract sandbox binary from tar: {err}"
         ))
     })?;
 
@@ -2179,8 +2206,13 @@ mod tests {
         let subscriber =
             tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
+        let mut sandbox = plain_sandbox("sandbox-trace", "demo");
+        sandbox.spec = Some(DriverSandboxSpec {
+            launch_authentication: encoded_launch_authentication(),
+            ..DriverSandboxSpec::default()
+        });
         test_driver(socket_path.clone())
-            .create_sandbox(&plain_sandbox("sandbox-trace", "demo"))
+            .create_sandbox(&sandbox)
             .with_subscriber(subscriber)
             .await
             .expect("create should succeed");
@@ -2948,25 +2980,25 @@ mod tests {
     #[test]
     fn supervisor_pull_policy_refreshes_mutable_tags_only() {
         assert_eq!(
-            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
+            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
             "newer"
         );
         assert_eq!(
-            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
+            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
             "newer"
         );
         assert_eq!(
-            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
+            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
             "newer"
         );
         assert_eq!(
-            supervisor_image_pull_policy(
+            runtime_image_pull_policy(
                 "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
             ),
             "missing"
         );
         assert_eq!(
-            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
+            runtime_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
             "missing"
         );
     }
@@ -3358,6 +3390,7 @@ mod tests {
 
     fn create_setup_responses(proxy_secret: bool) -> Vec<StubResponse> {
         let mut responses = vec![
+            StubResponse::new(StatusCode::OK, "{}"), // sandbox runtime pull
             StubResponse::new(StatusCode::OK, "{}"), // supervisor pull
             StubResponse::new(StatusCode::OK, "{}"), // workload pull
             image_response("sha256:sandbox"),
@@ -3366,6 +3399,7 @@ mod tests {
             StubResponse::new(StatusCode::NOT_FOUND, ""), // optional passwd
             StubResponse::new(StatusCode::NOT_FOUND, ""), // optional group
             StubResponse::new(StatusCode::NO_CONTENT, ""), // remove stopped reader
+            image_response("sha256:sandbox-runtime"),
             image_response("sha256:supervisor"),
             StubResponse::new(StatusCode::CREATED, "{}"), // workspace volume
         ];
@@ -3404,6 +3438,7 @@ mod tests {
         let (path, requests, handle) = spawn_podman_stub(
             "reserved-control-root",
             vec![
+                StubResponse::new(StatusCode::OK, "{}"),
                 StubResponse::new(StatusCode::OK, "{}"),
                 StubResponse::new(StatusCode::OK, "{}"),
                 image_response("sha256:image"),
@@ -3448,9 +3483,14 @@ mod tests {
                 .collect(),
         );
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+        let mut sandbox = plain_sandbox(sandbox_id, "demo");
+        sandbox.spec = Some(DriverSandboxSpec {
+            launch_authentication: encoded_launch_authentication(),
+            ..DriverSandboxSpec::default()
+        });
 
         driver
-            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .create_sandbox(&sandbox)
             .await
             .expect_err("container create should fail");
 
@@ -3489,9 +3529,14 @@ mod tests {
                 .collect(),
         );
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+        let mut sandbox = plain_sandbox(sandbox_id, "demo");
+        sandbox.spec = Some(DriverSandboxSpec {
+            launch_authentication: encoded_launch_authentication(),
+            ..DriverSandboxSpec::default()
+        });
 
         driver
-            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .create_sandbox(&sandbox)
             .await
             .expect_err("container start should fail");
 
