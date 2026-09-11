@@ -58,16 +58,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::Win32::Foundation::WIN32_ERROR;
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessTelemetryIdInformation};
+use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_HEADER, EVENT_HEADER_EXTENDED_DATA_ITEM,
-    EVENT_PROPERTY_INFO, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
-    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-    ProcessTrace, StartTraceW, TRACE_EVENT_INFO, TRACE_LEVEL_VERBOSE, TdhGetEventInformation,
-    WNODE_FLAG_TRACED_GUID,
+    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
+    ENABLE_TRACE_PARAMETERS_VERSION_2, EVENT_ENABLE_PROPERTY_PROCESS_START_KEY, EVENT_HEADER,
+    EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_PROPERTY_INFO,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_EVENT_INFO,
+    TRACE_LEVEL_VERBOSE, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
 };
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{GUID, PCWSTR, PWSTR};
 
 use openshell_ocsf::{
@@ -179,10 +180,9 @@ unsafe impl Send for RawEtwEvent {}
 /// [`DecodedEtwEvent::summary`] for sanitized diagnostic output.
 #[derive(Clone)]
 pub(crate) struct DecodedEtwEvent {
-    /// QPC timestamp recorded by ETW when the producer emitted the event. The
-    /// session uses `ClientContext = 1`, so this is on the same clock as process
-    /// registration and retirement. Callback delivery time is deliberately not
-    /// used: ETW may retain a record in a per-CPU buffer across PID reuse.
+    /// QPC timestamp recorded by ETW when the producer emitted the event.
+    /// Attribution deliberately does not use elapsed time as process-generation
+    /// evidence.
     pub timestamp_qpc: i64,
     /// Provider that emitted the event.
     pub provider: GUID,
@@ -194,6 +194,10 @@ pub(crate) struct DecodedEtwEvent {
     pub opcode: u8,
     /// Emitting process id.
     pub process_id: u32,
+    /// Kernel process-generation key appended by ETW. PID attribution is
+    /// accepted only when this exactly matches the key queried from the
+    /// driver-owned child handle.
+    pub process_start_key: Option<u64>,
     /// ETW activity id (event header) — the cross-process/cross-event correlator
     /// for payload-keyless events like `SandboxConfig`.
     pub activity_id: GUID,
@@ -595,6 +599,11 @@ fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String
         Value: session_handle,
     };
 
+    let enable_parameters = ENABLE_TRACE_PARAMETERS {
+        Version: ENABLE_TRACE_PARAMETERS_VERSION_2,
+        EnableProperty: EVENT_ENABLE_PROPERTY_PROCESS_START_KEY,
+        ..Default::default()
+    };
     let status = unsafe {
         EnableTraceEx2(
             h,
@@ -604,7 +613,7 @@ fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String
             0xFFFF_FFFF_FFFF_FFFF, // all keywords
             0,
             0,
-            None,
+            Some(&raw const enable_parameters),
         )
     };
 
@@ -880,6 +889,8 @@ unsafe fn copy_raw(event_record: *const EVENT_RECORD, queued_bytes: usize) -> Ra
 /// Runs on the consumer thread (off the real-time pump).
 #[allow(clippy::field_reassign_with_default)]
 fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
+    let process_start_key = process_start_key_from_extended_data(&raw.ext_items, &raw.ext_bufs);
+
     // Re-point each extended-data item at our owned copy (TraceLogging schema
     // lives here, so TDH must be able to read it).
     for (item, buf) in raw.ext_items.iter_mut().zip(raw.ext_bufs.iter()) {
@@ -905,7 +916,19 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
         raw.ext_items.as_mut_ptr()
     };
 
-    decode_event(std::ptr::addr_of_mut!(rec))
+    let mut decoded = decode_event(std::ptr::addr_of_mut!(rec))?;
+    decoded.process_start_key = process_start_key;
+    Some(decoded)
+}
+
+fn process_start_key_from_extended_data(
+    items: &[EVENT_HEADER_EXTENDED_DATA_ITEM],
+    buffers: &[Vec<u8>],
+) -> Option<u64> {
+    items.iter().zip(buffers).find_map(|(item, buf)| {
+        (u32::from(item.ExtType) == EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY && buf.len() >= 8)
+            .then(|| u64::from_ne_bytes(buf[..8].try_into().expect("checked length")))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +969,7 @@ fn decode_event(event_record: *mut EVENT_RECORD) -> Option<DecodedEtwEvent> {
         level: header.EventDescriptor.Level,
         opcode: header.EventDescriptor.Opcode,
         process_id: header.ProcessId,
+        process_start_key: None,
         activity_id: header.ActivityId,
         event_name,
         props,
@@ -1170,57 +1194,71 @@ const PENDING_MAX: usize = 4096;
 /// unattributable (e.g. an unrelated Sandboxing-provider consumer on the box).
 const PENDING_TTL: Duration = Duration::from_secs(5);
 
-/// Grace window for trusting a PID match for an event captured just before the
-/// driver's initial registration.
-/// The driver seeds `by_pid` within milliseconds of spawning `wxc-exec`, so a
-/// legitimate seed event's registration lands at (or just after) the moment the
-/// event was captured. A recycled PID, by contrast, requires the prior
-/// `wxc-exec` to exit and a new one to spawn — far longer than this window — so
-/// a registration that is newer than the captured event by more than this grace
-/// is treated as a *different* (recycled) owner and the PID match is refused.
-const PRE_REGISTRATION_PID_GRACE: Duration = Duration::from_secs(2);
-
 /// Keep already-established strong correlations briefly after `wxc-exec` exits
 /// so ETW records that were in flight can still be attributed. The consumer's
 /// periodic pending drain prunes them after the same horizon used for late event
 /// replay.
 const RETIRED_CORRELATION_TTL: Duration = PENDING_TTL;
 
-fn qpc_now() -> i64 {
-    let mut value = 0;
-    // QPC is available on every supported Windows version. If the call ever
-    // fails, zero fails closed for generation matching instead of borrowing a
-    // wall clock that is incompatible with ETW's configured timestamp source.
-    let _ = unsafe { QueryPerformanceCounter(&mut value) };
-    value
-}
+/// Query the kernel generation key for a spawned child while the driver still
+/// owns its process handle. This is the same value ETW appends under
+/// `EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY`.
+pub(crate) fn child_process_start_key(child: &tokio::process::Child) -> Result<u64, String> {
+    let raw_handle = child
+        .raw_handle()
+        .ok_or_else(|| "wxc-exec child handle is no longer available".to_string())?;
+    let expected_pid = child
+        .id()
+        .ok_or_else(|| "wxc-exec child PID is no longer available".to_string())?;
+    let handle = HANDLE(raw_handle);
 
-fn duration_qpc_ticks(duration: Duration) -> i64 {
-    let mut frequency = 0;
-    if unsafe { QueryPerformanceFrequency(&mut frequency) }.is_err() || frequency <= 0 {
-        return 0;
+    // The fixed telemetry header is followed by optional variable-length
+    // strings. Start with ample room and honor the kernel's requested size.
+    let mut buffer = vec![0_u8; 4096];
+    loop {
+        let mut returned = 0_u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessTelemetryIdInformation,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                &mut returned,
+            )
+        };
+        if status.is_ok() {
+            if buffer.len() < 16 {
+                return Err("process telemetry response was shorter than its fixed header".into());
+            }
+            let header_size = u32::from_ne_bytes(buffer[0..4].try_into().expect("fixed slice"));
+            let process_id = u32::from_ne_bytes(buffer[4..8].try_into().expect("fixed slice"));
+            let process_start_key =
+                u64::from_ne_bytes(buffer[8..16].try_into().expect("fixed slice"));
+            if header_size < 16 || process_id != expected_pid || process_start_key == 0 {
+                return Err(format!(
+                    "invalid process telemetry header (size={header_size}, pid={process_id}, expected_pid={expected_pid})"
+                ));
+            }
+            return Ok(process_start_key);
+        }
+
+        let required = usize::try_from(returned).unwrap_or(usize::MAX);
+        if required > buffer.len() && required <= 1024 * 1024 {
+            buffer.resize(required, 0);
+            continue;
+        }
+        return Err(format!(
+            "NtQueryInformationProcess(ProcessTelemetryIdInformation) failed: status 0x{:08x}",
+            status.0 as u32
+        ));
     }
-    let ticks = duration.as_nanos().saturating_mul(frequency as u128) / 1_000_000_000;
-    i64::try_from(ticks).unwrap_or(i64::MAX)
 }
 
-/// A `wxc-exec` PID registration: which sandbox owns the PID and *when* it was
-/// registered. The timestamp lets every resolution path reject a record that
-/// was captured under an older generation of a recycled PID.
+/// A live `wxc-exec` registration. The PID is only an index; the kernel-issued
+/// process start key proves which generation owns it.
 struct PidReg {
     sid: String,
-    started_qpc: i64,
-    /// Whether an event captured just before this registration may use the PID.
-    /// A recently retired or reassigned PID makes that race ambiguous, so only
-    /// its strong identity/activity/CV correlators remain eligible for
-    /// resolution.
-    allow_pre_registration_capture: bool,
-}
-
-struct RetiredPidReg {
-    registration: PidReg,
-    ended_qpc: i64,
-    retired_at: Instant,
+    process_start_key: u64,
 }
 
 #[derive(Default)]
@@ -1233,10 +1271,6 @@ pub(crate) struct AttributionIndex {
     /// correlations remain authoritative only until the recorded instant plus
     /// [`RETIRED_CORRELATION_TTL`].
     retired_sandboxes: HashMap<String, Instant>,
-    /// Recently retired PID generations. Their producer-time lifetime lets
-    /// records delivered after process exit resolve to the correct sandbox and
-    /// prevents those records from binding to a recycled PID's new owner.
-    retired_pids: HashMap<u32, VecDeque<RetiredPidReg>>,
     names: HashMap<String, String>,
     /// Sandboxes for which a lifecycle [6002] row has already been emitted, so
     /// the two redundant create events don't double-count.
@@ -1258,21 +1292,22 @@ impl AttributionIndex {
     /// only initial authority anchor and remains authoritative only while that
     /// process is alive. Events resolved through it establish the strong
     /// identity/activity/CV correlations used for the rest of the create burst.
-    pub fn register_launch(&mut self, sandbox_id: &str, sandbox_name: &str, wxc_pid: u32) {
+    pub fn register_launch(
+        &mut self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        wxc_pid: u32,
+        process_start_key: u64,
+    ) {
         let now = Instant::now();
-        let now_qpc = qpc_now();
         self.purge_expired_retirements(now);
         let previous = self.by_pid.remove(&wxc_pid);
-        let allow_pre_registration_capture =
-            previous.is_none() && !self.retired_pids.contains_key(&wxc_pid);
 
-        // PID-reuse guard: if this PID still maps to a *different* sandbox, the
+        // PID-reuse guard: if this PID still maps to a different sandbox, the
         // prior process exited without its monitor retiring the registration.
-        // Its actual end is unknown, so do not synthesize a retired lifetime at
-        // `now_qpc`: that would make a new process's pre-registration events look
-        // as though they belonged to the old sandbox. Established strong
-        // correlations remain available for the normal late-event horizon, but
-        // PID-only events across this ambiguous generation gap fail closed.
+        // Rebind only to the new driver-supplied generation key. Established
+        // strong correlations remain available for the normal late-event
+        // horizon.
         if let Some(previous) = previous {
             if previous.sid != sandbox_id {
                 tracing::warn!(
@@ -1285,7 +1320,7 @@ impl AttributionIndex {
                 self.retired_sandboxes
                     .entry(previous.sid.clone())
                     .or_insert(now);
-            } else {
+            } else if previous.process_start_key == process_start_key {
                 // Duplicate registration of the same live launch is idempotent.
                 self.by_pid.insert(wxc_pid, previous);
                 self.names
@@ -1297,8 +1332,7 @@ impl AttributionIndex {
             wxc_pid,
             PidReg {
                 sid: sandbox_id.to_string(),
-                started_qpc: now_qpc,
-                allow_pre_registration_capture,
+                process_start_key,
             },
         );
         self.retired_sandboxes.remove(sandbox_id);
@@ -1309,9 +1343,8 @@ impl AttributionIndex {
 
     /// Retire a driver-owned PID after its monitored child exits. The exact
     /// sandbox match prevents a delayed monitor from removing a recycled PID's
-    /// newer registration. Strong correlations and the bounded historical PID
-    /// lifetime remain for a short late-event window so records still buffered
-    /// inside ETW can be attributed after the process exits.
+    /// newer registration. After retirement, delayed records can resolve only
+    /// through strong correlations established while the child was live.
     pub fn retire_launch(&mut self, sandbox_id: &str, wxc_pid: u32) {
         let matches_owner = self
             .by_pid
@@ -1322,18 +1355,7 @@ impl AttributionIndex {
         }
 
         let now = Instant::now();
-        let registration = self
-            .by_pid
-            .remove(&wxc_pid)
-            .expect("owner match requires a live registration");
-        self.retired_pids
-            .entry(wxc_pid)
-            .or_default()
-            .push_back(RetiredPidReg {
-                registration,
-                ended_qpc: qpc_now(),
-                retired_at: now,
-            });
+        self.by_pid.remove(&wxc_pid);
         if !self
             .by_pid
             .values()
@@ -1352,24 +1374,8 @@ impl AttributionIndex {
 
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
-        let now = Instant::now();
-        let retired_pids = self
-            .by_pid
-            .iter()
-            .filter_map(|(pid, registration)| (registration.sid == sandbox_id).then_some(*pid))
-            .collect::<Vec<_>>();
-        for pid in retired_pids {
-            if let Some(registration) = self.by_pid.remove(&pid) {
-                self.retired_pids
-                    .entry(pid)
-                    .or_default()
-                    .push_back(RetiredPidReg {
-                        registration,
-                        ended_qpc: qpc_now(),
-                        retired_at: now,
-                    });
-            }
-        }
+        self.by_pid
+            .retain(|_, registration| registration.sid != sandbox_id);
         self.by_identity.retain(|_, v| v != sandbox_id);
         self.by_activity.retain(|_, v| v != sandbox_id);
         self.by_cv.retain(|_, v| v != sandbox_id);
@@ -1379,14 +1385,6 @@ impl AttributionIndex {
     }
 
     fn purge_expired_retirements(&mut self, now: Instant) {
-        self.retired_pids.retain(|_, generations| {
-            generations.retain(|generation| {
-                now.checked_duration_since(generation.retired_at)
-                    .is_none_or(|age| age < PENDING_TTL)
-            });
-            !generations.is_empty()
-        });
-
         let expired_sandboxes = self
             .retired_sandboxes
             .iter()
@@ -1427,14 +1425,10 @@ impl AttributionIndex {
     /// Resolve an event to a `sandbox_id` via any known key, then cross-link the
     /// other keys it carries so later keyless events attribute correctly.
     ///
-    /// Strong per-sandbox correlators take precedence over PID. A PID match uses
-    /// ETW's producer timestamp against current and recently-retired process
-    /// lifetimes. This rule applies before and after pending-buffer replay.
+    /// Strong per-sandbox correlators take precedence over PID. A PID match is
+    /// accepted only when ETW's process start key equals the key queried from
+    /// the live driver-owned child handle.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
-        self.resolve_at(ev, qpc_now())
-    }
-
-    fn resolve_at(&mut self, ev: &DecodedEtwEvent, now_qpc: i64) -> Option<String> {
         self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
         let cv = ev.cv_base();
@@ -1450,45 +1444,8 @@ impl AttributionIndex {
             })
             .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))
             .or_else(|| {
-                self.retired_pids
-                    .get(&ev.process_id)
-                    .and_then(|generations| {
-                        generations.iter().rev().find_map(|generation| {
-                            let start = if generation.registration.allow_pre_registration_capture {
-                                generation
-                                    .registration
-                                    .started_qpc
-                                    .saturating_sub(duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE))
-                            } else {
-                                generation.registration.started_qpc
-                            };
-                            (ev.timestamp_qpc >= start && ev.timestamp_qpc <= generation.ended_qpc)
-                                .then(|| generation.registration.sid.clone())
-                        })
-                    })
-            })
-            .or_else(|| {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
-                    // A PID is the only seed available before strong ETW keys
-                    // are learned. Hold PID-only events long enough for the
-                    // driver's registration to expose a reuse boundary; without
-                    // this delay an event from a newly reused PID could resolve
-                    // through the stale live owner before that owner is displaced.
-                    let grace_ticks = duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE);
-                    let pid_evidence_mature =
-                        grace_ticks > 0 && now_qpc.saturating_sub(ev.timestamp_qpc) >= grace_ticks;
-                    if !pid_evidence_mature {
-                        return None;
-                    }
-                    let captured_during_registration = ev.timestamp_qpc >= r.started_qpc;
-                    let captured_during_seed_race = r.allow_pre_registration_capture
-                        && r.started_qpc.saturating_sub(ev.timestamp_qpc)
-                            <= duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE);
-                    if captured_during_registration || captured_during_seed_race {
-                        Some(r.sid.clone())
-                    } else {
-                        None
-                    }
+                    (ev.process_start_key == Some(r.process_start_key)).then(|| r.sid.clone())
                 })
             })?;
 
@@ -1543,14 +1500,7 @@ impl AttributionIndex {
     /// aged past [`PENDING_TTL`] still unresolved. Callers emit the returned
     /// events *after* releasing the index lock.
     fn drain_resolved(&mut self) -> Vec<(String, String, DecodedEtwEvent)> {
-        self.drain_resolved_at(Instant::now(), qpc_now())
-    }
-
-    fn drain_resolved_at(
-        &mut self,
-        now: Instant,
-        now_qpc: i64,
-    ) -> Vec<(String, String, DecodedEtwEvent)> {
+        let now = Instant::now();
         self.purge_expired_retirements(now);
         if self.pending.is_empty() {
             return Vec::new();
@@ -1563,7 +1513,7 @@ impl AttributionIndex {
                 tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 continue;
             }
-            match self.resolve_at(&p.ev, now_qpc) {
+            match self.resolve(&p.ev) {
                 Some(sid) => {
                     let name = self.name_of(&sid);
                     ready.push((sid, name, p.ev));
@@ -2079,34 +2029,38 @@ mod tests {
 
     fn mk_event(pid: u32, name: &str) -> DecodedEtwEvent {
         DecodedEtwEvent {
-            timestamp_qpc: qpc_now(),
+            timestamp_qpc: 0,
             provider: GUID::from_u128(0),
             event_id: 1,
             level: 4,
             opcode: OPCODE_START,
             process_id: pid,
+            process_start_key: Some(u64::from(pid)),
             activity_id: GUID::from_u128(0),
             event_name: Some(name.to_string()),
             props: Vec::new(),
         }
     }
 
-    fn resolve_after_pid_grace(idx: &mut AttributionIndex, ev: &DecodedEtwEvent) -> Option<String> {
-        idx.resolve_at(
-            ev,
-            ev.timestamp_qpc
-                .saturating_add(duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE))
-                .saturating_add(1),
-        )
-    }
+    #[test]
+    fn extracts_process_start_key_from_etw_extended_data() {
+        let mut unrelated = EVENT_HEADER_EXTENDED_DATA_ITEM::default();
+        unrelated.ExtType = 1;
+        let mut process_key = EVENT_HEADER_EXTENDED_DATA_ITEM::default();
+        process_key.ExtType = EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY as u16;
+        let expected = 0x0123_4567_89ab_cdef_u64;
 
-    fn drain_after_pid_grace(idx: &mut AttributionIndex) -> Vec<(String, String, DecodedEtwEvent)> {
-        idx.drain_resolved_at(
-            Instant::now() + PRE_REGISTRATION_PID_GRACE,
-            qpc_now()
-                .saturating_add(duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE))
-                .saturating_add(1),
-        )
+        assert_eq!(
+            process_start_key_from_extended_data(
+                &[unrelated, process_key],
+                &[vec![0; 8], expected.to_ne_bytes().to_vec()],
+            ),
+            Some(expected)
+        );
+        assert_eq!(
+            process_start_key_from_extended_data(&[process_key], &[vec![0; 7]]),
+            None
+        );
     }
 
     #[test]
@@ -2173,10 +2127,10 @@ mod tests {
         );
 
         // Driver seeds attribution for the wxc-exec pid we spawned.
-        idx.register_launch("sbx-1", "my-sandbox", 1234);
+        idx.register_launch("sbx-1", "my-sandbox", 1234, 1234);
 
         // The buffered event now attributes and is returned for emit, in order.
-        let ready = drain_after_pid_grace(&mut idx);
+        let ready = idx.drain_resolved();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, "sbx-1");
         assert_eq!(ready[0].1, "my-sandbox");
@@ -2206,16 +2160,13 @@ mod tests {
     #[test]
     fn buffered_event_replays_via_crosslink() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-9", "s9", 4321);
+        idx.register_launch("sbx-9", "s9", 4321, 4321);
 
         // First event carries the pid + an activity id → resolves and cross-links
         // the activity id to sbx-9.
         let mut anchor = mk_event(4321, "CreateProcessInSandbox");
         anchor.activity_id = GUID::from_u128(0xABCD);
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &anchor).as_deref(),
-            Some("sbx-9")
-        );
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-9"));
 
         // A later payload-keyless event shares only the activity id (different
         // pid) — it must now resolve via the cross-link.
@@ -2230,71 +2181,68 @@ mod tests {
     #[test]
     fn pid_reuse_rebinds_to_new_sandbox() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-A", "A", 1000);
+        idx.register_launch("sbx-A", "A", 1000, 100);
         let ev_a = mk_event(1000, "CreateProcessInSandbox");
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &ev_a).as_deref(),
-            Some("sbx-A")
-        );
+        let mut ev_a = ev_a;
+        ev_a.process_start_key = Some(100);
+        assert_eq!(idx.resolve(&ev_a).as_deref(), Some("sbx-A"));
 
         // A leaks (delete never ran). PID 1000 is recycled for B.
-        idx.register_launch("sbx-B", "B", 1000);
+        idx.register_launch("sbx-B", "B", 1000, 200);
         idx.retire_launch("sbx-A", 1000);
         let ev_b = mk_event(1000, "CreateProcessInSandbox");
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &ev_b).as_deref(),
-            Some("sbx-B")
-        );
+        let mut ev_b = ev_b;
+        ev_b.process_start_key = Some(200);
+        assert_eq!(idx.resolve(&ev_b).as_deref(), Some("sbx-B"));
     }
 
     #[test]
     fn displaced_live_pid_does_not_claim_new_pre_registration_event() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-old", "old", 1000);
+        idx.register_launch("sbx-old", "old", 1000, 100);
 
         // Windows has reused PID 1000, but the new launch registration has not
         // reached the consumer yet. The stale live owner must not immediately
         // claim the event or learn its new generation's strong identity.
         let mut queued_new = mk_event(1000, "SandboxConfig");
+        queued_new.process_start_key = Some(200);
         queued_new
             .props
             .push(("identity".into(), "new-generation".into()));
         assert!(idx.resolve(&queued_new).is_none());
         idx.buffer_unresolved(queued_new.clone());
 
-        idx.register_launch("sbx-new", "new", 1000);
+        idx.register_launch("sbx-new", "new", 1000, 200);
 
-        assert!(drain_after_pid_grace(&mut idx).is_empty());
+        let ready = idx.drain_resolved();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "sbx-new");
         let mut same_identity = mk_event(0, "SandboxConfig");
         same_identity
             .props
             .push(("identity".into(), "new-generation".into()));
-        assert!(
-            idx.resolve(&same_identity).is_none(),
-            "an ambiguous pre-registration event must not seed old-sandbox strong keys"
-        );
+        assert_eq!(idx.resolve(&same_identity).as_deref(), Some("sbx-new"));
     }
 
     #[test]
     fn displaced_live_pid_does_not_reassign_delayed_old_event_to_new_owner() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-old", "old", 1000);
-        let queued_old = mk_event(1000, "SandboxConfig");
+        idx.register_launch("sbx-old", "old", 1000, 100);
+        let mut queued_old = mk_event(1000, "SandboxConfig");
+        queued_old.process_start_key = Some(100);
 
         // The old monitor has not recorded an exact retirement boundary before
         // Windows reuses the PID. Neither side may claim records from the
         // resulting ambiguous interval using PID evidence alone.
-        idx.register_launch("sbx-new", "new", 1000);
+        idx.register_launch("sbx-new", "new", 1000, 200);
         assert!(
-            resolve_after_pid_grace(&mut idx, &queued_old).is_none(),
+            idx.resolve(&queued_old).is_none(),
             "a delayed old-generation event must not bind to the new owner"
         );
 
-        let fresh_new = mk_event(1000, "SandboxConfig");
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &fresh_new).as_deref(),
-            Some("sbx-new")
-        );
+        let mut fresh_new = mk_event(1000, "SandboxConfig");
+        fresh_new.process_start_key = Some(200);
+        assert_eq!(idx.resolve(&fresh_new).as_deref(), Some("sbx-new"));
     }
 
     // Command text is user-controlled and may match unrelated host activity, so
@@ -2302,7 +2250,7 @@ mod tests {
     #[test]
     fn command_line_is_never_used_for_resolution() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11);
+        idx.register_launch("sbx-1", "s1", 11, 11);
 
         // An unrelated provider event carrying the exact workload command but no
         // driver-owned PID or strong correlator must remain unattributed.
@@ -2316,13 +2264,10 @@ mod tests {
     #[test]
     fn retired_pid_is_not_used_before_sandbox_deletion() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11);
+        idx.register_launch("sbx-1", "s1", 11, 11);
 
         let anchor = mk_event(11, "CreateProcessInSandbox");
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &anchor).as_deref(),
-            Some("sbx-1")
-        );
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
         idx.retire_launch("sbx-1", 11);
 
         let mut stale = mk_event(11, "SandboxConfig");
@@ -2338,14 +2283,11 @@ mod tests {
     #[test]
     fn retired_strong_correlations_expire_after_late_event_window() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11);
+        idx.register_launch("sbx-1", "s1", 11, 11);
 
         let mut anchor = mk_event(11, "CreateProcessInSandbox");
         anchor.activity_id = GUID::from_u128(0xABCD);
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &anchor).as_deref(),
-            Some("sbx-1")
-        );
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
         idx.retire_launch("sbx-1", 11);
 
         let mut late = mk_event(999, "SandboxConfig");
@@ -2366,72 +2308,72 @@ mod tests {
         );
     }
 
-    // A record whose only key is a PID must not bind to a registration that
-    // appeared well after capture. Refusing it beats misattributing it.
+    // A PID without matching kernel generation evidence cannot seed ownership.
     #[test]
-    fn pid_match_refused_when_capture_predates_registration_beyond_grace() {
+    fn pid_match_without_process_start_key_is_refused() {
         let mut idx = AttributionIndex::new();
         let mut ev = mk_event(1000, "CreateProcessInSandbox");
-        ev.timestamp_qpc = qpc_now() - duration_qpc_ticks(Duration::from_secs(3));
+        ev.process_start_key = None;
 
-        idx.register_launch("sbx-new", "new", 1000);
+        idx.register_launch("sbx-new", "new", 1000, 200);
 
         assert!(
             idx.resolve(&ev).is_none(),
-            "stale PID-only record must not bind to a newer registration"
+            "PID-only evidence must not confer ownership"
         );
     }
 
     #[test]
-    fn producer_timestamp_routes_delayed_record_to_original_pid_generation() {
+    fn retired_pid_generation_cannot_resolve_delayed_record() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-old", "old", 1000);
-        // The producer emits this record while the old PID generation is live,
-        // but ETW delays callback delivery until after process exit and reuse.
-        let queued_old = mk_event(1000, "CreateProcessInSandbox");
+        idx.register_launch("sbx-old", "old", 1000, 100);
+        let mut queued_old = mk_event(1000, "CreateProcessInSandbox");
+        queued_old.process_start_key = Some(100);
         idx.retire_launch("sbx-old", 1000);
-        idx.register_launch("sbx-new", "new", 1000);
 
-        assert_eq!(
-            idx.resolve(&queued_old).as_deref(),
-            Some("sbx-old"),
-            "a delayed record must resolve through its producer-time PID generation"
-        );
-
-        let fresh = mk_event(1000, "CreateProcessInSandbox");
-        assert_eq!(
-            resolve_after_pid_grace(&mut idx, &fresh).as_deref(),
-            Some("sbx-new"),
-            "a record captured during the new registration remains authoritative"
+        assert!(
+            idx.resolve(&queued_old).is_none(),
+            "retired PID evidence must not attribute delayed records"
         );
     }
 
     #[test]
-    fn short_lived_process_keeps_attribution_until_etw_flushes() {
+    fn mature_reused_pid_event_stays_unresolved_until_matching_registration() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-short", "short", 2000);
-        let emitted_before_exit = mk_event(2000, "SandboxConfig");
+        idx.register_launch("sbx-A", "A", 1000, 100);
+        let mut event_b = mk_event(1000, "SandboxConfig");
+        event_b.process_start_key = Some(200);
+        event_b.props.push(("identity".into(), "identity-B".into()));
 
-        // The process exits before ETW's one-second flush timer delivers the
-        // record to our callback.
-        idx.retire_launch("sbx-short", 2000);
-
-        assert_eq!(
-            idx.resolve(&emitted_before_exit).as_deref(),
-            Some("sbx-short"),
-            "process exit must not discard attribution for ETW-buffered records"
+        assert!(idx.resolve(&event_b).is_none());
+        idx.buffer_unresolved(event_b);
+        idx.pending.back_mut().expect("buffered event").at =
+            Instant::now() - Duration::from_secs(3);
+        assert!(
+            idx.drain_resolved().is_empty(),
+            "elapsed time must not make a mismatched PID generation authoritative"
         );
+        idx.register_launch("sbx-B", "B", 1000, 200);
+        let ready = idx.drain_resolved();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "sbx-B");
+
+        let mut identity_b = mk_event(0, "SandboxConfig");
+        identity_b.process_start_key = None;
+        identity_b
+            .props
+            .push(("identity".into(), "identity-B".into()));
+        assert_eq!(idx.resolve(&identity_b).as_deref(), Some("sbx-B"));
     }
 
-    // The legitimate seed race is preserved: an event captured immediately
-    // before the driver seeds attribution still resolves via its PID.
+    // The legitimate seed race is preserved by exact generation evidence.
     #[test]
-    fn pre_registration_pid_match_is_accepted_within_grace() {
+    fn pre_registration_pid_match_is_accepted_with_matching_generation() {
         let mut idx = AttributionIndex::new();
         let ev = mk_event(1000, "CreateProcessInSandbox");
-        idx.register_launch("sbx-1", "s1", 1000);
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
         assert_eq!(
-            resolve_after_pid_grace(&mut idx, &ev).as_deref(),
+            idx.resolve(&ev).as_deref(),
             Some("sbx-1"),
             "a seed event captured at registration time must still resolve"
         );
@@ -2441,7 +2383,7 @@ mod tests {
     #[test]
     fn command_line_is_not_used_for_pre_registration_resolution() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11);
+        idx.register_launch("sbx-1", "s1", 11, 11);
 
         let mut only_cmd = mk_event(999, "SandboxConfig");
         only_cmd

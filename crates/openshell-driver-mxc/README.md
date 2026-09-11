@@ -77,17 +77,14 @@ blocking the ETW pump or growing gateway memory. The gateway emits an immediate
 warning identifying the audit coverage gap and rate-limits follow-up warnings
 to once every 30 seconds while overload continues.
 
-Audit attribution bootstraps only from the driver-owned `wxc-exec` PID while
-that child is alive; command text is never an ownership key. The process monitor
-retires the live PID at exit. Its bounded process lifetime and any identity,
-activity, and correlation-vector links learned from it remain available for five
-seconds so already in-flight ETW records can arrive. PID resolution uses the
-event's ETW producer timestamp and holds PID-only records for two seconds so a
-new launch registration can expose PID reuse before attribution. A normal
-retirement provides an exact generation boundary for delayed delivery. If a new
-owner displaces a still-live registration, the boundary is unknowable and
-PID-only records in that gap remain unattributed; established strong correlations
-can still resolve legitimate late records.
+Audit attribution bootstraps only when the driver-owned `wxc-exec` PID and its
+kernel process start key both match the values attached to the ETW record;
+command text is never an ownership key. This generation key prevents a recycled
+PID from inheriting the previous process's attribution regardless of delivery
+delay. The process monitor retires the live PID at exit. Established identity,
+activity, and correlation-vector links remain available for five seconds so
+already in-flight ETW records can arrive, but retired PID evidence cannot resolve
+them. Records without matching generation evidence remain unattributed.
 
 ## Prerequisites (live runs)
 

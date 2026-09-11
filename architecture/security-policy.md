@@ -398,12 +398,10 @@ arguments from structured fields and messages. Raw ETW debug summaries replace
 the `commandLine` value with `[REDACTED]`, including pending-buffer eviction
 diagnostics.
 MXC ETW attribution never treats command text as ownership evidence. It uses the
-driver-owned `wxc-exec` PID as the initial anchor and retains bounded PID
-lifetime records plus established identity, activity, and correlation-vector
-links for a five-second late-event window. PID resolution compares the event's
-ETW producer timestamp with those lifetimes and delays PID-only attribution long
-enough for launch registration to expose reuse. A recorded process retirement
-provides an exact generation boundary. If a new owner displaces an unretired PID,
-PID-only events in the unknowable interval fail closed instead of being assigned
-to either sandbox; established strong correlations remain eligible during the
-late-event window.
+driver-owned `wxc-exec` PID plus its kernel process start key as the initial
+anchor. ETW attaches that generation key to each record, and the driver queries
+the same key from its child process handle. PID attribution requires both values
+to match, so reuse cannot transfer ownership between process generations.
+Retired PID evidence is discarded; established identity, activity, and
+correlation-vector links remain eligible during the five-second late-event
+window. Records without matching generation evidence fail closed.

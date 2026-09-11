@@ -799,9 +799,23 @@ async fn run_lifecycle(
         // anchor that ties the `Sandboxing` provider's events back to this
         // `sandbox_id` while the child is alive. Command text is never an
         // attribution key. No-op unless the ETW consumer is running.
-        if let Some(pid) = child.id() {
-            if let Ok(mut idx) = attribution.lock() {
-                idx.register_launch(&sandbox_id, &sandbox_name, pid);
+        if config.etw_audit
+            && let Some(pid) = child.id()
+        {
+            match crate::etw_consumer::child_process_start_key(&child) {
+                Ok(process_start_key) => {
+                    if let Ok(mut idx) = attribution.lock() {
+                        idx.register_launch(&sandbox_id, &sandbox_name, pid, process_start_key);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        sandbox = %sandbox_name,
+                        pid,
+                        error,
+                        "failed to obtain wxc-exec process generation key; PID-based ETW attribution disabled for this launch"
+                    );
+                }
             }
         }
 
