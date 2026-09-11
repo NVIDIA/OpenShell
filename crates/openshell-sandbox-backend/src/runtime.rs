@@ -16,19 +16,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::AgentSpec;
-use crate::contract::{
+use crate::proto::{BoundaryChunk, isolation_boundary_client::IsolationBoundaryClient};
+use async_trait::async_trait;
+use hyper_util::rt::TokioIo;
+use openshell_isolation_interface::AgentSpec;
+use openshell_isolation_interface::contract::{
     BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
     BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
     BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
     MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
     ReadyBoundary, RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial,
     VerifiedTopologyDescriptor,
-};
-use async_trait::async_trait;
-use hyper_util::rt::TokioIo;
-use openshell_core::proto::isolation::v1::{
-    BoundaryChunk, isolation_boundary_client::IsolationBoundaryClient,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -51,15 +49,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BOOTSTRAP_TOKEN_BYTES: usize = 32;
 
-/// Host-side remote boundary implementation registered with the supervisor.
+/// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
-pub struct RemoteIsolationBackend {
+pub struct OpenShellRuntimeBackend {
     backend_name: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
 }
 
-impl RemoteIsolationBackend {
+impl OpenShellRuntimeBackend {
     pub fn new(
         backend_name: impl Into<String>,
         ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
@@ -74,7 +72,7 @@ impl RemoteIsolationBackend {
 }
 
 #[async_trait]
-impl IsolationBackend for RemoteIsolationBackend {
+impl IsolationBackend for OpenShellRuntimeBackend {
     fn backend_name(&self) -> &str {
         &self.backend_name
     }
@@ -274,11 +272,11 @@ struct RemoteBound {
     host_gateway_ip: Option<std::net::IpAddr>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
-    identity: crate::contract::ResolvedWorkloadIdentity,
+    identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     generation: String,
     session_epoch: String,
     resource_claims: std::collections::BTreeMap<String, String>,
-    driver_fence: crate::contract::DriverFenceEvidence,
+    driver_fence: openshell_isolation_interface::contract::DriverFenceEvidence,
 }
 
 #[async_trait]
@@ -1460,16 +1458,16 @@ mod tests {
 
     use super::*;
     use crate::boundary_protocol::{ExitStatusWire, generate_boundary_mutual_tls_material};
-    use openshell_core::policy::{
-        FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
-    };
-    use openshell_core::proto::isolation::v1::{
+    use crate::proto::{
         BoundaryChunk,
         isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
     };
+    use openshell_core::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+    };
 
-    fn test_driver_fence() -> crate::contract::DriverFenceEvidence {
-        crate::contract::DriverFenceEvidence::Vm {
+    fn test_driver_fence() -> openshell_isolation_interface::contract::DriverFenceEvidence {
+        openshell_isolation_interface::contract::DriverFenceEvidence::Vm {
             generation: "test-generation".to_string(),
             network_device_count: 0,
         }
@@ -1691,7 +1689,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let query = DnsQueryWire {
                 request: vec![1, 2, 3],
-                transport: crate::contract::DnsTransport::Udp,
+                transport: openshell_isolation_interface::contract::DnsTransport::Udp,
                 identity: crate::boundary_protocol::BinaryIdentityWire::Resolved {
                     binary_path: PathBuf::from("/usr/bin/dig"),
                     binary_digest: Some("a".repeat(64).parse().unwrap()),
@@ -1839,7 +1837,7 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
             },
-            identity: crate::contract::ResolvedWorkloadIdentity::new(
+            identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
                 10_001,
                 10_001,
                 Vec::new(),
@@ -1850,11 +1848,12 @@ mod tests {
         }
     }
 
-    fn test_confirmation_evidence() -> crate::contract::SandboxConfirmEvidence {
-        crate::contract::SandboxConfirmEvidence {
+    fn test_confirmation_evidence()
+    -> openshell_isolation_interface::contract::SandboxConfirmEvidence {
+        openshell_isolation_interface::contract::SandboxConfirmEvidence {
             generation: "test-generation".to_string(),
             identity: sandbox().identity,
-            capabilities: crate::contract::CapabilityEvidence {
+            capabilities: openshell_isolation_interface::contract::CapabilityEvidence {
                 inheritable: 0,
                 permitted: 0,
                 effective: 0,
@@ -1867,7 +1866,7 @@ mod tests {
             core_limit_zero: true,
             native_architecture: std::env::consts::ARCH.to_string(),
             kernel_release: "test".to_string(),
-            seccomp: crate::contract::SeccompEvidence {
+            seccomp: openshell_isolation_interface::contract::SeccompEvidence {
                 new_listener: true,
                 notification_round_trip: true,
                 id_validation: true,
