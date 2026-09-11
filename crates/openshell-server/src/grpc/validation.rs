@@ -10,7 +10,7 @@
 
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxSpec, SandboxTemplate,
+    SandboxSpec, SandboxTemplate, UiClipboardAccess,
 };
 use prost::Message;
 use tonic::Status;
@@ -932,7 +932,7 @@ pub(super) fn validate_no_reserved_provider_policy_keys(
     Ok(())
 }
 
-/// Validate that static policy fields (filesystem, landlock, process) haven't changed
+/// Validate that static policy fields (filesystem, landlock, process, UI) haven't changed
 /// from the baseline (version 1) policy.
 pub(super) fn validate_static_fields_unchanged(
     baseline: &ProtoSandboxPolicy,
@@ -954,6 +954,18 @@ pub(super) fn validate_static_fields_unchanged(
     if baseline.process != new.process {
         return Err(Status::invalid_argument(
             "process policy cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
+    let mut baseline_ui = baseline.ui;
+    let mut new_ui = new.ui;
+    for ui in [&mut baseline_ui, &mut new_ui].into_iter().flatten() {
+        if ui.clipboard == UiClipboardAccess::Unspecified as i32 {
+            ui.clipboard = UiClipboardAccess::None as i32;
+        }
+    }
+    if baseline_ui != new_ui {
+        return Err(Status::invalid_argument(
+            "UI policy cannot be changed on a live sandbox (applied at startup)",
         ));
     }
     Ok(())
@@ -2221,6 +2233,33 @@ mod tests {
         let result = validate_static_fields_unchanged(&baseline, &changed);
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("include_workdir"));
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_ui_presence_or_value_change() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let absent = ProtoSandboxPolicy::default();
+        let deny = ProtoSandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let allow_clipboard = ProtoSandboxPolicy {
+            ui: Some(UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let presence_error = validate_static_fields_unchanged(&absent, &deny)
+            .expect_err("adding explicit UI policy must be static");
+        assert!(presence_error.message().contains("UI policy"));
+
+        let value_error = validate_static_fields_unchanged(&deny, &allow_clipboard)
+            .expect_err("changing UI policy must be static");
+        assert!(value_error.message().contains("UI policy"));
+        assert!(validate_static_fields_unchanged(&deny, &deny).is_ok());
     }
 
     // ---- Exec validation ----

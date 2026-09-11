@@ -18,7 +18,9 @@ inputs:
       - ../../proto/datamodel.proto
       - ../../proto/options.proto
 plugins:
-  - local: ./node_modules/.bin/protoc-gen-es
+  - local:
+      - node
+      - ./node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es
     out: src/gen
     opt:
       - target=ts

@@ -29,7 +29,7 @@ use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    SandboxPolicy, UiClipboardAccess, UiPolicy,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -63,6 +63,8 @@ struct PolicyFile {
     landlock: Option<LandlockDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process: Option<ProcessDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui: Option<UiDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -102,6 +104,53 @@ struct ProcessDef {
     run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     run_as_group: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UiDef {
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_graphical_ui: bool,
+    #[serde(default, skip_serializing_if = "UiClipboardAccessDef::is_none")]
+    clipboard: UiClipboardAccessDef,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_input_injection: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UiClipboardAccessDef {
+    #[default]
+    None,
+    Read,
+    Write,
+    All,
+}
+
+impl UiClipboardAccessDef {
+    // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    const fn to_proto(self) -> UiClipboardAccess {
+        match self {
+            Self::None => UiClipboardAccess::None,
+            Self::Read => UiClipboardAccess::Read,
+            Self::Write => UiClipboardAccess::Write,
+            Self::All => UiClipboardAccess::All,
+        }
+    }
+
+    fn from_proto(value: i32) -> Self {
+        match UiClipboardAccess::try_from(value).unwrap_or(UiClipboardAccess::Unspecified) {
+            UiClipboardAccess::Unspecified | UiClipboardAccess::None => Self::None,
+            UiClipboardAccess::Read => Self::Read,
+            UiClipboardAccess::Write => Self::Write,
+            UiClipboardAccess::All => Self::All,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +249,12 @@ struct NetworkCredentialBindingDef {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -935,6 +990,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             run_as_user: p.run_as_user,
             run_as_group: p.run_as_group,
         }),
+        ui: raw.ui.map(|ui| UiPolicy {
+            allow_graphical_ui: ui.allow_graphical_ui,
+            clipboard: ui.clipboard.to_proto() as i32,
+            allow_input_injection: ui.allow_input_injection,
+        }),
         network_policies,
         network_middlewares,
     })
@@ -976,6 +1036,12 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                 run_as_group: p.run_as_group.clone(),
             })
         }
+    });
+
+    let ui = policy.ui.as_ref().map(|ui| UiDef {
+        allow_graphical_ui: ui.allow_graphical_ui,
+        clipboard: UiClipboardAccessDef::from_proto(ui.clipboard),
+        allow_input_injection: ui.allow_input_injection,
     });
 
     let network_policies = policy
@@ -1094,6 +1160,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         filesystem_policy,
         landlock,
         process,
+        ui,
         network_policies,
         network_middlewares,
     })
@@ -1292,6 +1359,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             compatibility: "best_effort".into(),
         }),
         process: None,
+        ui: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
     }
@@ -1327,6 +1395,8 @@ const MAX_PATH_LENGTH: usize = 4096;
 pub enum PolicyViolation {
     /// An explicit `run_as_user` or `run_as_group` is unsafe.
     InvalidProcessIdentity { field: &'static str, value: String },
+    /// The protobuf carries a clipboard enum value unknown to this version.
+    InvalidUiClipboardAccess { value: i32 },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
     /// A filesystem path is not absolute (does not start with `/`).
@@ -1426,6 +1496,12 @@ impl fmt::Display for PolicyViolation {
                 write!(
                     f,
                     "{field} must be 'sandbox' or a numeric UID/GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}], got '{value}'"
+                )
+            }
+            Self::InvalidUiClipboardAccess { value } => {
+                write!(
+                    f,
+                    "ui clipboard access has unknown enum value {value}; expected unspecified, none, read, write, or all"
                 )
             }
             Self::PathTraversal { path } => {
@@ -1634,6 +1710,7 @@ impl fmt::Display for PolicyViolation {
 ///
 /// Checks performed:
 /// - Explicit `run_as_user` / `run_as_group` fields must be safe identities
+/// - UI clipboard access must use a recognized enum value
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
 /// - Read-write paths must not be overly broad (just `/`)
@@ -1680,6 +1757,14 @@ fn validate_sandbox_policy_with_mcp_presence(
                 value: process.run_as_group.clone(),
             });
         }
+    }
+
+    if let Some(ref ui) = policy.ui
+        && UiClipboardAccess::try_from(ui.clipboard).is_err()
+    {
+        violations.push(PolicyViolation::InvalidUiClipboardAccess {
+            value: ui.clipboard,
+        });
     }
 
     // Check landlock compatibility mode is a recognized value. Direct gRPC/SDK
@@ -2137,6 +2222,7 @@ fn validate_and_canonicalize_mcp_policy_schema(
         .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
+    canonicalize_ui_defaults(&mut policy);
     validate_mcp_policy_schema(&policy, McpVersionPresence::RequireMaterialized)
         .map_err(|violations| PolicyValidationError { violations })?;
     Ok(policy)
@@ -2159,11 +2245,26 @@ pub fn validate_and_canonicalize_sandbox_policy(
         .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
+    canonicalize_ui_defaults(&mut policy);
     debug_assert!(
         validate_sandbox_policy(&policy).is_ok(),
         "validated MCP canonicalization must preserve every policy invariant"
     );
     Ok(policy)
+}
+
+/// Materialize protobuf UI defaults that have a distinct canonical enum value.
+///
+/// Proto3 clients commonly leave `clipboard` at `Unspecified(0)`. `OpenShell`
+/// defines that value as deny, so canonical policy state stores the equivalent
+/// explicit `None(1)`. This keeps protobuf, YAML, hashes, and static-field
+/// comparisons stable across a serialize/parse round trip.
+fn canonicalize_ui_defaults(policy: &mut SandboxPolicy) {
+    if let Some(ui) = policy.ui.as_mut()
+        && ui.clipboard == UiClipboardAccess::Unspecified as i32
+    {
+        ui.clipboard = UiClipboardAccess::None as i32;
+    }
 }
 
 /// Replace absent protobuf MCP options and empty revision lists with the
@@ -2283,6 +2384,98 @@ network_policies:
         assert_eq!(json["version"], serde_json::json!(1));
         assert!(json.get("filesystem").is_none());
         assert!(json.get("network_policies").is_some());
+    }
+
+    #[test]
+    fn ui_absence_and_explicit_empty_remain_distinct() {
+        let absent = parse_sandbox_policy("version: 1\n").expect("absent UI parses");
+        assert!(absent.ui.is_none());
+        let absent_yaml = serialize_sandbox_policy(&absent).expect("absent UI serializes");
+        assert!(!absent_yaml.contains("\nui:"));
+
+        let explicit = parse_sandbox_policy("version: 1\nui: {}\n").expect("empty UI parses");
+        let ui = explicit.ui.as_ref().expect("UI presence preserved");
+        assert!(!ui.allow_graphical_ui);
+        assert_eq!(ui.clipboard, UiClipboardAccess::None as i32);
+        assert!(!ui.allow_input_injection);
+
+        let explicit_yaml = serialize_sandbox_policy(&explicit).expect("empty UI serializes");
+        assert!(explicit_yaml.contains("ui: {}"), "got:\n{explicit_yaml}");
+        let reparsed = parse_sandbox_policy(&explicit_yaml).expect("empty UI reparses");
+        assert!(reparsed.ui.is_some());
+    }
+
+    #[test]
+    fn ui_policy_round_trips_all_clipboard_directions() {
+        for (wire, expected) in [
+            ("none", UiClipboardAccess::None),
+            ("read", UiClipboardAccess::Read),
+            ("write", UiClipboardAccess::Write),
+            ("all", UiClipboardAccess::All),
+        ] {
+            let yaml = format!(
+                "version: 1\nui:\n  allow_graphical_ui: true\n  clipboard: {wire}\n  allow_input_injection: true\n"
+            );
+            let policy = parse_sandbox_policy(&yaml).expect("UI policy parses");
+            let ui = policy.ui.as_ref().expect("UI policy present");
+            assert!(ui.allow_graphical_ui);
+            assert_eq!(ui.clipboard, expected as i32);
+            assert!(ui.allow_input_injection);
+
+            let serialized = serialize_sandbox_policy(&policy).expect("UI policy serializes");
+            let reparsed = parse_sandbox_policy(&serialized).expect("UI policy reparses");
+            assert_eq!(reparsed, policy);
+        }
+    }
+
+    #[test]
+    fn ui_unspecified_clipboard_canonicalizes_to_none_across_yaml_round_trip() {
+        let raw = SandboxPolicy {
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: UiClipboardAccess::Unspecified as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let canonical = validate_and_canonicalize_sandbox_policy(raw)
+            .expect("unspecified clipboard must be a valid deny default");
+        assert_eq!(
+            canonical.ui.as_ref().expect("UI remains present").clipboard,
+            UiClipboardAccess::None as i32
+        );
+
+        let yaml = serialize_sandbox_policy(&canonical).expect("canonical UI serializes");
+        let reparsed = parse_sandbox_policy(&yaml).expect("canonical UI reparses");
+        assert_eq!(reparsed, canonical);
+    }
+
+    #[test]
+    fn ui_policy_rejects_unknown_yaml_clipboard_value() {
+        let error = parse_sandbox_policy("version: 1\nui:\n  clipboard: execute\n")
+            .expect_err("unknown clipboard value must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse sandbox policy YAML")
+        );
+    }
+
+    #[test]
+    fn ui_policy_validation_rejects_unknown_proto_clipboard_value() {
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy {
+                clipboard: 99,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let violations = validate_sandbox_policy(&policy).expect_err("unknown enum must fail");
+        assert_eq!(
+            violations,
+            vec![PolicyViolation::InvalidUiClipboardAccess { value: 99 }]
+        );
     }
 
     /// Verify that `allowed_ips` survives the round-trip.
@@ -3842,6 +4035,7 @@ network_policies:
             process: None,
             filesystem: None,
             landlock: None,
+            ui: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -4300,6 +4494,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ui: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -4316,6 +4511,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ui: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };
@@ -4388,6 +4584,7 @@ network_policies:
             }),
             filesystem: None,
             landlock: None,
+            ui: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
         };

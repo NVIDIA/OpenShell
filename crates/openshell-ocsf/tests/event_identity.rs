@@ -65,10 +65,15 @@ fn a_container_without_an_image_omits_the_image() {
 #[test]
 fn device_identifies_the_sandbox_environment() {
     let json = event(&sandbox_ctx("image:1")).to_json().unwrap();
+    let expected_os = if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
 
     assert_eq!(json["device"]["type_id"], 99);
     assert_eq!(json["device"]["type"], "Sandbox");
-    assert_eq!(json["device"]["os"]["name"], "Linux");
+    assert_eq!(json["device"]["os"]["name"], expected_os);
 }
 
 #[test]

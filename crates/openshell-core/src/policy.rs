@@ -113,6 +113,10 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
     type Error = miette::Report;
 
     fn try_from(proto: ProtoSandboxPolicy) -> Result<Self, Self::Error> {
+        // UI capabilities are intentionally absent from the portable supervisor
+        // runtime. Non-Windows compute paths do not expose them, so even a
+        // schema-level UI allowance cannot grant a UI surface there. The MXC
+        // driver consumes the typed proto directly on Windows.
         // In cluster mode we always run with proxy networking so all egress
         // can be evaluated by OPA.
         let network = NetworkPolicy {
@@ -192,6 +196,29 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{UiClipboardAccess, UiPolicy};
+
+    #[test]
+    fn portable_runtime_does_not_activate_ui_allowances() {
+        let converted = SandboxPolicy::try_from(ProtoSandboxPolicy {
+            version: 1,
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: UiClipboardAccess::All as i32,
+                allow_input_injection: true,
+            }),
+            ..Default::default()
+        })
+        .expect("portable policy conversion succeeds");
+
+        assert_eq!(converted.version, 1);
+        assert!(matches!(converted.network.mode, NetworkMode::Proxy));
+        assert!(converted.network.proxy.is_some());
+        assert!(converted.filesystem.read_only.is_empty());
+        assert!(converted.filesystem.read_write.is_empty());
+        assert!(converted.process.run_as_user.is_none());
+        assert!(converted.process.run_as_group.is_none());
+    }
 
     #[test]
     fn try_from_maps_known_compatibility_values() {

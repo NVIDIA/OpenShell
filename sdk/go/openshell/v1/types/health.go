@@ -29,9 +29,10 @@ type GatewayInfo struct {
 
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo struct {
-	Name          string
-	DriverName    string
-	DriverVersion string
+	Name             string
+	DriverName       string
+	DriverVersion    string
+	SupportsUIPolicy bool
 }
 
 // CurrentUser holds the authenticated caller's identity.

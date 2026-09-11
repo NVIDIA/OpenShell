@@ -1591,6 +1591,20 @@ async fn auto_approve_chunk(
     Ok(())
 }
 
+/// Preserve UI as the sandbox's startup contract when applying a global policy.
+///
+/// UI controls are enforced by the compute runtime before the workload starts,
+/// so a later global override cannot safely add, remove, or change them. Global
+/// policy writes reject their own UI section; this overlay also prevents a
+/// global dynamic policy from hiding the UI state that the runtime enforced.
+fn preserve_sandbox_startup_ui(policy: &mut ProtoSandboxPolicy, sandbox: &Sandbox) {
+    policy.ui = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.as_ref())
+        .and_then(|policy| policy.ui);
+}
+
 // TODO: share effective-policy lookup with `load_sandbox_policy` /
 // `GetSandboxConfig`. They re-implement very similar global-settings and
 // profile-composition logic; consolidating them is out of scope for the
@@ -1608,10 +1622,10 @@ async fn current_effective_policy_for_sandbox(
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
-        // A global policy is the complete effective policy. Dormant sandbox
-        // history and specs may predate the current schema, but they must not
-        // prevent the valid global policy from being served.
+    if let Some(mut global_policy) = decode_policy_from_global_settings(&global_settings)? {
+        // A global policy replaces dynamic policy, but startup-only UI remains
+        // anchored to the sandbox spec so reads cannot misrepresent enforcement.
+        preserve_sandbox_startup_ui(&mut global_policy, sandbox);
         return apply_effective_policy_context(
             state,
             catalog,
@@ -2398,9 +2412,10 @@ pub(super) async fn handle_get_sandbox_config(
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-    let (mut policy, version, mut policy_hash, policy_source) = if let Some(global_policy) =
+    let (mut policy, version, mut policy_hash, policy_source) = if let Some(mut global_policy) =
         global_policy
     {
+        preserve_sandbox_startup_ui(&mut global_policy, &sandbox);
         let version = latest
             .as_ref()
             .map(|record| u32::try_from(record.version).unwrap_or(0))
@@ -3325,6 +3340,11 @@ async fn handle_update_config_inner(
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
+            if new_policy.ui.is_some() {
+                return Err(Status::invalid_argument(
+                    "UI policy cannot be set globally because it is applied at sandbox startup; configure ui in each sandbox policy",
+                ));
+            }
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
@@ -3718,7 +3738,10 @@ async fn handle_update_config_inner(
     }
 
     let should_backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        let comparable_baseline = baseline_policy.clone();
+        let comparable_baseline = validate_and_canonicalize_stored_policy(
+            baseline_policy.clone(),
+            STORED_POLICY_SOURCE_SPEC,
+        )?;
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         false
     } else {
@@ -7873,6 +7896,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_policy_preserves_each_sandbox_startup_ui_contract() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        assert!(global_policy.ui.is_none());
+
+        let sandbox_id = "global-preserves-startup-ui";
+        let startup_ui = UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::Read as i32,
+            allow_input_injection: false,
+        };
+        let mut sandbox_policy = openshell_policy::restrictive_default_policy();
+        sandbox_policy.ui = Some(startup_ui);
+        let sandbox = test_sandbox(sandbox_id, sandbox_id, sandbox_policy, Vec::new());
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("global policy read must preserve startup UI")
+        .into_inner();
+        assert_eq!(
+            response
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.ui.as_ref()),
+            Some(&startup_ui)
+        );
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective policy lookup must preserve startup UI");
+        assert_eq!(effective.ui.as_ref(), Some(&startup_ui));
+    }
+
+    #[tokio::test]
     async fn canonical_mcp_version_order_produces_identical_policy_bytes_and_hashes() {
         let state = test_server_state().await;
         let forward = mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
@@ -7967,6 +8050,93 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_policy_ingress_rejects_startup_only_ui_before_persistence() {
+        use openshell_core::proto::UiPolicy;
+
+        let state = test_server_state().await;
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.ui = Some(UiPolicy::default());
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("global UI must be rejected before persistence");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("sandbox startup"));
+        assert!(
+            state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+                .expect("global policy lookup")
+                .is_none()
+        );
+        let settings = load_global_settings(state.store.as_ref())
+            .await
+            .expect("global settings lookup");
+        assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    #[tokio::test]
+    async fn sandbox_policy_update_accepts_semantically_unchanged_ui_default() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let state = test_server_state().await;
+        let sandbox_id = "ui-default-roundtrip";
+        let mut canonical = openshell_policy::restrictive_default_policy();
+        canonical.ui = Some(UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::None as i32,
+            ..Default::default()
+        });
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                canonical.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+
+        let mut protobuf_default = canonical;
+        protobuf_default.ui.as_mut().expect("UI policy").clipboard =
+            UiClipboardAccess::Unspecified as i32;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_id.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(protobuf_default),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("unspecified and none are the same static UI policy");
+
+        let stored = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("policy revision");
+        let persisted = ProtoSandboxPolicy::decode(stored.policy_payload.as_slice())
+            .expect("decode persisted policy");
+        assert_eq!(
+            persisted.ui.expect("persisted UI").clipboard,
+            UiClipboardAccess::None as i32
+        );
     }
 
     #[tokio::test]
@@ -18427,6 +18597,35 @@ mod tests {
             deterministic_policy_hash(&policy_a),
             deterministic_policy_hash(&policy_b),
             "middleware-only policy changes must produce a new policy hash"
+        );
+    }
+
+    #[test]
+    fn policy_hash_distinguishes_ui_absence_presence_and_values() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let absent = ProtoSandboxPolicy::default();
+        let explicit_deny = ProtoSandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let clipboard_read = ProtoSandboxPolicy {
+            ui: Some(UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            deterministic_policy_hash(&absent),
+            deterministic_policy_hash(&explicit_deny),
+            "an explicitly present deny-only UI block remains hash-significant"
+        );
+        assert_ne!(
+            deterministic_policy_hash(&explicit_deny),
+            deterministic_policy_hash(&clipboard_read),
+            "UI capability changes must produce a new policy hash"
         );
     }
 

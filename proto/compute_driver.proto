@@ -100,6 +100,10 @@ message GetCapabilitiesResponse {
   // Maximum rootfs tar file size in bytes accepted by the driver. Zero means
   // the driver does not support rootfs tar sources.
   uint64 rootfs_tar_max_bytes = 11;
+  // Whether this configured driver instance completely enforces the current
+  // portable SandboxPolicy.ui contract. Partial support must report false so
+  // the gateway rejects every explicit UI section before provisioning.
+  bool supports_ui_policy = 12;
 }
 
 message AuthenticateSandboxRequest {

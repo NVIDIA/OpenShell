@@ -794,6 +794,7 @@ impl VmDriver {
                     count_selection_supported: self.config.gpu_enabled,
                 }),
             }),
+            supports_ui_policy: false,
             rootfs_tar_staging_dir: self
                 .config
                 .rootfs_tar_staging_dir()

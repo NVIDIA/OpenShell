@@ -24,7 +24,7 @@
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy,
     MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint, NetworkMiddlewareConfig,
-    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    NetworkPolicyRule, ProcessPolicy, SandboxPolicy, UiClipboardAccess, UiPolicy,
 };
 use openshell_driver_mxc::{
     EmbeddedPolicyMapper, MapCtx, MapError, MxcMappingOptions, PolicyMapper, map_to_mxc,
@@ -82,6 +82,12 @@ fn pc_split_opts() -> MxcMappingOptions {
     }
 }
 
+fn pc_opts() -> MxcMappingOptions {
+    MxcMappingOptions {
+        containment: "processcontainer".to_owned(),
+        ..Default::default()
+    }
+}
 /// Build a minimal policy with one network rule whose endpoints carry a single
 /// endpoint set up by the caller.
 fn net_policy(key: &str, ep: NetworkEndpoint) -> SandboxPolicy {
@@ -934,6 +940,7 @@ fn b_seam_returns_unsupported_on_error_field() {
     let ctx = MapCtx {
         sandbox_id: "sb-test".into(),
         egress: None, // coarse path → isolation_session → network policy errors
+        containment: "isolation_session".into(),
     };
     let err = mapper.map(Some(&policy), &ctx).unwrap_err();
     assert!(
@@ -1039,6 +1046,131 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
     );
 }
 
+#[test]
+fn a_processcontainer_maps_ui_capabilities_exactly() {
+    for (clipboard, expected) in [
+        (UiClipboardAccess::Unspecified, "none"),
+        (UiClipboardAccess::None, "none"),
+        (UiClipboardAccess::Read, "read"),
+        (UiClipboardAccess::Write, "write"),
+        (UiClipboardAccess::All, "all"),
+    ] {
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: clipboard as i32,
+                allow_input_injection: true,
+            }),
+            ..Default::default()
+        };
+        let result = map_to_mxc(&policy, &pc_opts());
+        assert_eq!(result.config["ui"]["disable"], false);
+        assert_eq!(result.config["ui"]["clipboard"], expected);
+        assert_eq!(result.config["ui"]["injection"], true);
+        assert_eq!(result.config["ui"].as_object().unwrap().len(), 3);
+        assert!(result.loss.iter().all(|item| item.path != "ui"));
+    }
+}
+
+#[test]
+fn c_processcontainer_absent_or_empty_ui_is_default_deny() {
+    for policy in [
+        SandboxPolicy::default(),
+        SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        },
+    ] {
+        let result = map_to_mxc(&policy, &pc_opts());
+        assert_eq!(result.config["ui"]["disable"], true);
+        assert_eq!(result.config["ui"]["clipboard"], "none");
+        assert_eq!(result.config["ui"]["injection"], false);
+    }
+}
+
+#[test]
+fn b_processcontainer_rejects_clipboard_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            clipboard: UiClipboardAccess::Read as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["clipboard"], "none");
+    assert_single_loss(
+        &result.loss,
+        "ui.clipboard",
+        "error",
+        "clipboard grant suppressed by ui.disable",
+    );
+}
+
+#[test]
+fn b_processcontainer_rejects_input_injection_without_graphical_ui() {
+    let policy = SandboxPolicy {
+        ui: Some(UiPolicy {
+            allow_input_injection: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = map_to_mxc(&policy, &pc_opts());
+    assert_eq!(result.config["ui"]["disable"], true);
+    assert_eq!(result.config["ui"]["injection"], false);
+    assert_single_loss(
+        &result.loss,
+        "ui.allow_input_injection",
+        "error",
+        "input-injection grant suppressed by ui.disable",
+    );
+}
+
+#[test]
+fn b_isolation_session_omits_absent_ui_and_rejects_explicit_ui() {
+    let opts = MxcMappingOptions {
+        containment: "isolation_session".into(),
+        ..Default::default()
+    };
+    let absent = map_to_mxc(&SandboxPolicy::default(), &opts);
+    assert!(absent.config.get("ui").is_none());
+
+    let explicit = map_to_mxc(
+        &SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        },
+        &opts,
+    );
+    assert!(explicit.config.get("ui").is_none());
+    assert_single_loss(
+        &explicit.loss,
+        "ui",
+        "error",
+        "isolation_session explicit UI",
+    );
+}
+
+#[test]
+fn a_split_maps_ui_to_mxc_and_omits_it_from_proxy_policy() {
+    let policy = SandboxPolicy {
+        version: 1,
+        ui: Some(UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::Write as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let result = split_policy(&policy, &pc_split_opts()).expect("split");
+    assert_eq!(result.mxc_config["ui"]["disable"], false);
+    assert_eq!(result.mxc_config["ui"]["clipboard"], "write");
+    assert_eq!(result.mxc_config["ui"]["injection"], false);
+    assert!(result.proxy_policy.ui.is_none());
+}
+
 // ─── DRIFT GUARD ─────────────────────────────────────────────────────────────
 //
 // Serialize policies via openshell_policy::serialize_sandbox_policy, collect
@@ -1053,11 +1185,14 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
 /// "landlock"             — loss item emitted in add_static_policy_loss
 /// "process"              — loss items for run_as_user / run_as_group
 /// "network_policies"     — mapped via map_network / delegated in split
+/// "network_middlewares"  — error loss in coarse map / delegated in split
+/// "ui"                    — exact processContainer map / explicit unsupported loss
 const HANDLED_TOPLEVEL: &[&str] = &[
     "version",
     "filesystem_policy",
     "landlock",
     "process",
+    "ui",
     "network_policies",
     "network_middlewares",
 ];
@@ -1128,6 +1263,7 @@ fn handled_fields_inventory() {
             run_as_user: "sandbox".into(),
             run_as_group: "sandbox".into(),
         }),
+        ui: Some(UiPolicy::default()),
         network_policies: {
             let mut m = std::collections::HashMap::new();
             m.insert(
