@@ -283,8 +283,8 @@ cargo build --release -p openshell-gateway --no-default-features --features tele
 # Docker and VM only, with telemetry compiled out.
 cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
 
-# Windows MXC only, with telemetry support and bundled Z3.
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
+# Windows MXC only, with telemetry support and prebuilt Z3.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,openshell-server/prebuilt-z3
 ```
 
 Regular builds retain their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC; the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
