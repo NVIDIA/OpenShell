@@ -354,7 +354,11 @@ chart fullname when it is unset. The managed ConfigMap must have
 `openshell.ai/managed-by=openshell` and the matching
 `openshell.ai/gateway-id` label. The chart grants `get`/`patch` only on this
 exact name and separate unrestricted `create` (Kubernetes cannot restrict a
-create with `resourceNames`). Check both the object and authorization:
+create with `resourceNames`). Enabling this gives the gateway/driver service
+account namespace-wide ConfigMap-create authority. In managed/operator modes,
+the chart's ClusterRoleBinding makes that permission cluster-wide for the bound
+service account; prefer a dedicated service account and scoped bindings when
+that boundary matters. Check both the object and authorization:
 
 ```bash
 kubectl -n <sandbox-namespace> get configmap \
