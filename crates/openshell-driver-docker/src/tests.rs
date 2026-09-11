@@ -7,6 +7,10 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE,
 };
+use openshell_core::jwt::{
+    CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
+    SupervisorAuthBundle,
+};
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
@@ -21,6 +25,25 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tempfile::TempDir;
+
+fn test_launch_authentication() -> Vec<u8> {
+    serde_json::to_vec(&SandboxLaunchAuthentication {
+        supervisor: SupervisorAuthBundle {
+            session_id: openshell_core::SandboxSessionId::new(),
+            gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
+            gateway_expires_at: i64::MAX,
+            sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
+            sandbox_expires_at: i64::MAX,
+            credential_epoch: CredentialEpoch::new(1).unwrap(),
+        },
+        gateway_id: "gateway-test".to_string(),
+        verification_keys: vec![SessionVerificationKey {
+            key_id: "test-key".to_string(),
+            public_key_pem: b"public-key".to_vec(),
+        }],
+    })
+    .unwrap()
+}
 
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
@@ -47,7 +70,7 @@ fn test_sandbox() -> DriverSandbox {
             tty: false,
             await_main_process_attachment: false,
             workload_identity: None,
-            launch_authentication: Vec::new(),
+            launch_authentication: test_launch_authentication(),
         }),
         status: None,
         workspace: String::new(),
@@ -606,7 +629,7 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
-    Box::pin(DockerComputeDriver::start_sandbox(&driver, "", "").with_subscriber(subscriber))
+    Box::pin(DockerComputeDriver::start_sandbox(&driver, "", "", &[]).with_subscriber(subscriber))
         .await
         .expect_err("missing identifier should fail");
     provider.force_flush().unwrap();
@@ -1443,7 +1466,6 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
         DockerSandboxTls {
             certificate: b"server-cert",
             private_key: b"server-key",
-            client_ca: b"client-ca",
         },
         &identity,
         driver_mounts::DEFAULT_WORKSPACE_ROOT,
@@ -1473,7 +1495,6 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
         DockerSandboxTls {
             certificate: b"server-cert",
             private_key: b"server-key",
-            client_ca: b"client-ca",
         },
         &identity,
         "/workspace/project",
@@ -1490,7 +1511,7 @@ fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
 }
 
 #[test]
-fn sandbox_bundle_stages_private_mutual_tls_material() {
+fn sandbox_bundle_stages_private_tls_server_material() {
     let identity = test_workload_identity();
     let archive = docker_sandbox_bundle_archive(
         b"sandbox-binary",
@@ -1498,7 +1519,6 @@ fn sandbox_bundle_stages_private_mutual_tls_material() {
         DockerSandboxTls {
             certificate: b"server-cert",
             private_key: b"server-key",
-            client_ca: b"client-ca",
         },
         &identity,
         driver_mounts::DEFAULT_WORKSPACE_ROOT,
@@ -1524,7 +1544,6 @@ fn sandbox_bundle_stages_private_mutual_tls_material() {
     for path in [
         ".openshell/channel/sandbox/server.crt",
         ".openshell/channel/sandbox/server.key",
-        ".openshell/channel/sandbox/client-ca.crt",
     ] {
         assert_eq!(
             entries.get(Path::new(path)),
@@ -2511,24 +2530,22 @@ fn validate_sandbox_rejects_template_errors_before_device_config() {
 }
 
 #[test]
-fn validate_sandbox_auth_requires_gateway_token() {
+fn validate_sandbox_auth_requires_launch_authentication() {
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().sandbox_token.clear();
+    sandbox.spec.as_mut().unwrap().launch_authentication.clear();
 
     let err = DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         err.message(),
-        "docker sandboxes require gateway JWT auth; configure [openshell.gateway.gateway_jwt]"
+        "docker sandboxes require launch-scoped gateway authentication"
     );
 }
 
 #[test]
-fn validate_sandbox_auth_accepts_gateway_token() {
-    let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
-
+fn validate_sandbox_auth_accepts_launch_authentication() {
+    let sandbox = test_sandbox();
     DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
 }
 
