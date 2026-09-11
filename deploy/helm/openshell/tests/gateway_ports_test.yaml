@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway listener port validation
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+
+tests:
+  - it: rejects primary gateway port 0
+    template: templates/statefulset.yaml
+    set:
+      service.port: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be between 1 and 65535"
+
+  - it: rejects a primary gateway listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.port: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be between 1 and 65535"
+
+  - it: rejects a disabled health listener because probes require it
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+
+  - it: rejects a health listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+
+  - it: rejects a health listener that collides with the primary listener
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 8080
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port and service.healthPort must be different"
+
+  - it: rejects a metrics listener that collides with the primary listener
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 8080
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+
+  - it: rejects a metrics listener that collides with the health listener
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 8081
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+
+  - it: rejects a negative metrics listener port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: -1
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+
+  - it: rejects a boolean primary port
+    template: templates/statefulset.yaml
+    set:
+      service.port: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be an integer"
+
+  - it: rejects a boolean health port
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be an integer"
+
+  - it: rejects a boolean metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be an integer"
+
+  - it: rejects a fractional metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 9090.5
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be an integer"
+
+  - it: rejects a metrics listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+
+  - it: accepts boundary ports with metrics disabled
+    template: templates/gateway-config.yaml
+    set:
+      service.port: 1
+      service.healthPort: 65535
+      service.metricsPort: 0
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address\s*=\s*"0\.0\.0\.0:1"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address\s*=\s*"0\.0\.0\.0:65535"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address\s*='
