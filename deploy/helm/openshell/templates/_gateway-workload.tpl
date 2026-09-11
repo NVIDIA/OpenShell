@@ -5,12 +5,14 @@
 Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 */}}
 {{- define "openshell.gatewayPodTemplate" -}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
     # gateway only reads /etc/openshell/gateway.toml at startup, so without
     # this annotation a `helm upgrade` that only mutates the ConfigMap would
-    # leave pods running with stale config.
+    # leave pods running with stale config. The operator-owned additional-CA
+    # ConfigMap is not checksummed; restart the gateway after changing its data.
     checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
     {{- with .Values.podAnnotations }}
     {{- toYaml . | nindent 4 }}
@@ -146,6 +148,12 @@ spec:
         - name: gateway-peer-token
           mountPath: /var/run/secrets/openshell-peer
           readOnly: true
+        {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+        - name: network-additional-ca-source
+          mountPath: /etc/openshell-tls/network-additional-ca-source/ca.crt
+          subPath: ca.crt
+          readOnly: true
+        {{- end }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
@@ -232,6 +240,14 @@ spec:
               path: token
               audience: openshell-gateway-peer
               expirationSeconds: 3600
+    {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
+    - name: network-additional-ca-source
+      configMap:
+        name: {{ get $supervisorNetwork "additionalCaConfigMapName" | quote }}
+        items:
+          - key: ca.crt
+            path: ca.crt
+    {{- end }}
     {{- if not .Values.server.disableTls }}
     - name: tls-cert
       secret:

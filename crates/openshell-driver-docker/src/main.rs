@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
-    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config, None)
         .await
         .into_diagnostic()?;
 
