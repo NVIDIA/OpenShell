@@ -53,6 +53,7 @@ pub mod contract;
 pub mod mediation;
 /// Reusable control-side implementation for a remote boundary endpoint.
 pub mod remote;
+pub mod sandbox_auth;
 
 /// Linux-only primitives shared by capability-free sandbox implementations.
 #[cfg(target_os = "linux")]

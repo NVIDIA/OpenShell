@@ -107,6 +107,7 @@ base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.3"
 aws-lc-rs = "1.16"
 spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-rust-crypto", "tracing"] }
