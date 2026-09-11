@@ -28,6 +28,7 @@ use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use prost::Message;
+use prost_types::FileDescriptorSet;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -200,6 +201,39 @@ macro_rules! request_id_middleware {
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
+const REFLECTED_PROTO_ROOTS: &[&str] = &["openshell.proto"];
+
+/// Restrict reflection to the public gateway APIs and their imported types.
+fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::DecodeError> {
+    let mut descriptor_set = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)?;
+    let mut included: std::collections::BTreeSet<String> = REFLECTED_PROTO_ROOTS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+
+    loop {
+        let before = included.len();
+        for file in &descriptor_set.file {
+            if file
+                .name
+                .as_ref()
+                .is_some_and(|name| included.contains(name))
+            {
+                included.extend(file.dependency.iter().cloned());
+            }
+        }
+        if included.len() == before {
+            break;
+        }
+    }
+
+    descriptor_set.file.retain(|file| {
+        file.name
+            .as_ref()
+            .is_some_and(|name| included.contains(name))
+    });
+    Ok(descriptor_set)
+}
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -273,6 +307,10 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_file_descriptor_set(gateway_reflection_descriptor_set()?)
+            .with_service_name("openshell.v1.OpenShell")
+            .build_v1()?;
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -280,7 +318,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            openshell,
+            GrpcRouter::new(openshell, reflection),
             authenticator_chain,
             authz_policy,
             self.state
@@ -911,6 +949,56 @@ where
         }
         let future = self.inner.call(req);
         Box::pin(future)
+    }
+}
+
+/// Combined gRPC service that routes between `OpenShell` and reflection.
+#[derive(Clone)]
+pub struct GrpcRouter<N, R> {
+    openshell: N,
+    reflection: R,
+}
+
+impl<N, R> GrpcRouter<N, R> {
+    fn new(openshell: N, reflection: R) -> Self {
+        Self {
+            openshell,
+            reflection,
+        }
+    }
+}
+
+pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
+
+impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+where
+    N: tower::Service<Request<B>> + Clone + Send + 'static,
+    N::Response: Send,
+    N::Future: Send,
+    N::Error: Send,
+    R: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    R::Future: Send,
+    B: Send + 'static,
+{
+    type Response = N::Response;
+    type Error = N::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
+            let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else {
+            let mut svc = self.openshell.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        }
     }
 }
 
@@ -2520,6 +2608,151 @@ mod tests {
         assert_eq!(grpc_method_from_path(""), "");
     }
 
+    #[tokio::test]
+    async fn grpc_router_dispatches_gateway_and_reflection_paths() {
+        #[derive(Clone)]
+        struct RouteRecorder {
+            name: &'static str,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for RouteRecorder {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                self.calls.lock().unwrap().push(self.name);
+                Box::pin(async { Ok(Response::new(tonic::body::Body::empty())) })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = |name| RouteRecorder {
+            name,
+            calls: calls.clone(),
+        };
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+
+        for path in [
+            "/openshell.v1.OpenShell/Health",
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+        ] {
+            router
+                .call(
+                    Request::builder()
+                        .uri(path)
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+    }
+
+    #[tokio::test]
+    async fn running_primary_gateway_reflection_advertises_only_public_services() {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_file_descriptor_set(gateway_reflection_descriptor_set().unwrap())
+            .with_service_name("openshell.v1.OpenShell")
+            .build_v1()
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let rejecting_oidc = Arc::new(MockAuthenticator::returning(Err(
+            tonic::Status::unauthenticated("OIDC credentials required"),
+        )));
+        let grpc = AuthGrpcRouter::with_peer_identity(
+            GrpcRouter::new(unrouted, reflection),
+            Some(AuthenticatorChain::new(vec![rejecting_oidc])),
+            None,
+            None,
+            true,
+            false,
+        );
+        let service = GatewayListenerContextService::new(
+            MultiplexedService::new(grpc, unrouted),
+            GatewayListenerScope::Primary,
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let response = client
+            .server_reflection_info(tokio_stream::iter([request]))
+            .await
+            .unwrap()
+            .into_inner()
+            .message()
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(MessageResponse::ListServicesResponse(response)) = response.message_response
+        else {
+            panic!("expected a reflection list-services response");
+        };
+        let mut names: Vec<_> = response
+            .service
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+        server.abort();
+    }
+
+    #[test]
+    fn reflection_descriptor_excludes_internal_service_protos() {
+        let descriptors = gateway_reflection_descriptor_set().unwrap();
+        let names: std::collections::BTreeSet<_> = descriptors
+            .file
+            .iter()
+            .filter_map(|file| file.name.as_deref())
+            .collect();
+
+        assert!(names.contains("openshell.proto"));
+        assert!(names.contains("sandbox.proto"));
+        assert!(!names.contains("compute_driver.proto"));
+        assert!(!names.contains("credential_driver.proto"));
+        assert!(!names.contains("gateway_interceptor.proto"));
+        assert!(!names.contains("supervisor_middleware.proto"));
+    }
+
     #[test]
     fn normalize_ws_tunnel() {
         assert_eq!(normalize_http_path("/_ws_tunnel"), "/_ws_tunnel");
@@ -2732,6 +2965,31 @@ mod tests {
 
             assert!(seen.lock().unwrap().is_none());
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn reflection_bypasses_oidc_and_mtls_user_authentication() {
+            let oidc = Arc::new(MockAuthenticator::returning(Err(
+                tonic::Status::unauthenticated("OIDC credentials required"),
+            )));
+            let chain = AuthenticatorChain::new(vec![oidc]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, true, false);
+
+            let res = router
+                .call(empty_request(
+                    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert_eq!(grpc_status(&res), None);
+            assert!(
+                seen.lock().unwrap().is_none(),
+                "reflection must not receive an authenticated user principal"
+            );
         }
 
         #[tokio::test]
