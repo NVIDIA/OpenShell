@@ -535,15 +535,14 @@ fn apply_guest_tls(
     )
 ))]
 mod local_driver_tests {
-    use super::{
-        apply_guest_tls, install_default_compute_drivers, validate_local_driver_guest_tls,
-    };
+    use super::{apply_guest_tls, validate_local_driver_guest_tls};
     use std::path::{Path, PathBuf};
 
     #[test]
+    #[cfg(feature = "in-tree-compute-drivers")]
     fn linux_builtin_compute_driver_registry_has_expected_names() {
         assert_eq!(
-            install_default_compute_drivers()
+            super::install_default_compute_drivers()
                 .installed_driver_names()
                 .collect::<Vec<_>>(),
             ["docker", "kubernetes", "podman", "vm"]
