@@ -578,18 +578,37 @@ fn build_env(
     // hostname could otherwise present a certificate for a name they control
     // and intercept the sandbox JWT.
     env.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
-    env.insert(
-        openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
-        oci_user.to_string(),
-    );
-    env.insert(
-        openshell_core::sandbox_env::SANDBOX_UID.into(),
-        String::new(),
-    );
-    env.insert(
-        openshell_core::sandbox_env::SANDBOX_GID.into(),
-        String::new(),
-    );
+    if oci_user.is_empty() {
+        // The image declares no OCI USER (e.g. a plain Alpine base). Assign a
+        // numeric non-root identity like the Kubernetes and VM drivers so the
+        // supervisor synthesizes the account instead of rejecting the image.
+        env.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            String::new(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.into(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID.to_string(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.into(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID.to_string(),
+        );
+    } else {
+        // The image declares a USER; preserve the OCI resolution path.
+        env.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            oci_user.to_string(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.into(),
+            String::new(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.into(),
+            String::new(),
+        );
+    }
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.

@@ -2896,18 +2896,37 @@ fn build_environment_for_oci_user(
     // hostname could otherwise present a certificate for a name they control
     // and intercept the sandbox JWT.
     environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
-    environment.insert(
-        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
-        oci_user.to_string(),
-    );
-    environment.insert(
-        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
-        String::new(),
-    );
-    environment.insert(
-        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
-        String::new(),
-    );
+    if oci_user.is_empty() {
+        // The image declares no OCI USER (e.g. a plain Alpine base). Assign a
+        // numeric non-root identity like the Kubernetes and VM drivers so the
+        // supervisor synthesizes the account instead of rejecting the image.
+        environment.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+            String::new(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID.to_string(),
+        );
+    } else {
+        // The image declares a USER; preserve the OCI resolution path.
+        environment.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+            oci_user.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+            String::new(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+            String::new(),
+        );
+    }
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
