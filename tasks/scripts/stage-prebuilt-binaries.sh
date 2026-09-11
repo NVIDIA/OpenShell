@@ -149,7 +149,9 @@ patch_workspace_version() {
   cargo_toml_backup="$(mktemp)"
   cp "$cargo_toml" "$cargo_toml_backup"
   restore_cargo_toml=1
-  sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' "$cargo_toml"
+  sed -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' \
+    "$cargo_toml" >"${cargo_toml}.updated"
+  mv "${cargo_toml}.updated" "$cargo_toml"
 }
 
 restore_workspace_version() {

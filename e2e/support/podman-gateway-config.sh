@@ -128,9 +128,12 @@ e2e_write_podman_gateway_config() {
         # A remote UDS driver owns all runtime options. Keep the selected
         # gateway table transport-only so no in-tree setting can be mistaken
         # for executed external-driver configuration.
-        sed -i '/^health_check_interval_secs = /d' "${output}"
+        sed '/^health_check_interval_secs = /d' "${output}" >"${output}.updated"
+        mv "${output}.updated" "${output}"
       elif [ "${option_profile}" = "podman-options" ]; then
-        sed -i 's/^health_check_interval_secs = .*/health_check_interval_secs = 7/' "${output}"
+        sed 's/^health_check_interval_secs = .*/health_check_interval_secs = 7/' \
+          "${output}" >"${output}.updated"
+        mv "${output}.updated" "${output}"
       fi
       # The v2 template opens the Podman table. Insert gateway-owned TLS
       # before it rather than reopening [openshell.gateway] later.
