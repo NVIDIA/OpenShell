@@ -976,6 +976,7 @@ fn make_sandbox_with_condition(
             sandbox_fd: String::new(),
             conditions: vec![condition.clone()],
             deleting,
+            ..Default::default()
         }),
     }
 }
