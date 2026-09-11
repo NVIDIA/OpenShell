@@ -53,6 +53,26 @@
       ansible.builtin.debug:
         var: conformance_result.stdout_lines
 
+    - name: Read OpenShell gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - openshell-gateway.service
+          - --no-pager
+          - --lines
+          - "500"
+      register: openshell_gateway_logs
+      changed_when: false
+      failed_when: false
+      when: conformance_result.rc != 0
+
+    - name: Show OpenShell gateway logs
+      ansible.builtin.debug:
+        var: openshell_gateway_logs.stdout_lines
+      when: conformance_result.rc != 0
+
     - name: Require OpenShell smoke conformance success
       ansible.builtin.assert:
         that:

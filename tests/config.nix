@@ -99,7 +99,7 @@ let
     name = "tmachine";
     runtimeInputs = [
       pkgs.qemu
-      pkgs.python3Packages.ansible-core
+      pkgs.ansible
       pkgs.sshpass
     ];
     text = ''

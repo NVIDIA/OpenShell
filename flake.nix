@@ -70,7 +70,7 @@
             zstd
           ]
           ++ [
-            pkgs.python3Packages.ansible-core
+            pkgs.ansible
             pkgs.sshpass
             testMachines.package
           ];
@@ -122,16 +122,28 @@
           firmwarePkgs = testGuestPkgs;
         };
         testMachines = import ./tests/config.nix { inherit pkgs toolchains; };
-        tmachineArtifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
       in
       {
         apps = {
+          build-artifacts = {
+            type = "app";
+            program = "${artifacts.all}/bin/build-artifacts";
+          };
+          build-artifacts-binaries = {
+            type = "app";
+            program = "${artifacts.binaries}/bin/build-artifacts-binaries";
+          };
+          build-artifacts-helm = {
+            type = "app";
+            program = "${artifacts.helm}/bin/build-artifacts-helm";
+          };
+          build-artifacts-images = {
+            type = "app";
+            program = "${artifacts.images}/bin/build-artifacts-images";
+          };
           test-guest = testGuest.app;
           test-guest-cache = testGuest.cacheApp;
-          tmachine-artifacts = {
-            type = "app";
-            program = "${tmachineArtifacts}/bin/tmachine-artifacts";
-          };
         };
 
         packages = {
