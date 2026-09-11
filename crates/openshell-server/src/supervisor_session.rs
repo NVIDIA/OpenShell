@@ -15,6 +15,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+use openshell_core::proto::ConfigBootstrapResult;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigComponent, ConfigComponentApplyResult,
     ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicySource,
@@ -248,6 +250,16 @@ fn validate_component_apply_result(
         ));
     }
     Ok(outcome)
+}
+
+fn outcome_acknowledges_revision(outcome: ConfigApplyOutcome) -> bool {
+    matches!(
+        outcome,
+        ConfigApplyOutcome::Applied
+            | ConfigApplyOutcome::IgnoredDuplicate
+            | ConfigApplyOutcome::RetainedLocalOverride
+            | ConfigApplyOutcome::Degraded
+    )
 }
 
 impl SupervisorSessionRegistry {
@@ -487,13 +499,7 @@ impl SupervisorSessionRegistry {
             ));
         }
         let outcome = validate_component_apply_result(component_result, &in_flight.revision)?;
-        if matches!(
-            outcome,
-            ConfigApplyOutcome::Applied
-                | ConfigApplyOutcome::IgnoredDuplicate
-                | ConfigApplyOutcome::RetainedLocalOverride
-                | ConfigApplyOutcome::Degraded
-        ) {
+        if outcome_acknowledges_revision(outcome) {
             delivery_state.last_acknowledged_revision = Some(in_flight.revision);
         }
         delivery_state.in_flight = None;
@@ -512,6 +518,48 @@ impl SupervisorSessionRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Record a successfully persisted bootstrap result in the live session's
+    /// delivery state so reconciliation does not immediately redeliver it.
+    ///
+    /// A streamed update may be delivered while the bootstrap result is being
+    /// persisted. In that case, or if this session has already acknowledged a
+    /// revision, leave the newer delivery state untouched.
+    fn acknowledge_bootstrap_component(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        result: &ConfigComponentApplyResult,
+    ) -> bool {
+        let component = ConfigComponent::try_from(result.component).unwrap_or_default();
+        let outcome = ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default();
+        if !outcome_acknowledges_revision(outcome) {
+            return false;
+        }
+        let Some(revision) = result.requested_revision.as_ref() else {
+            return false;
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
+            return false;
+        };
+        let delivery_state = match component {
+            ConfigComponent::SandboxConfig => &mut session.config_sequences.sandbox_config,
+            ConfigComponent::ProviderEnvironment => {
+                &mut session.config_sequences.provider_environment
+            }
+            ConfigComponent::Unspecified => return false,
+        };
+        if delivery_state.in_flight.is_some() || delivery_state.last_acknowledged_revision.is_some()
+        {
+            return false;
+        }
+        delivery_state.last_acknowledged_revision = Some(*revision);
+        true
     }
 
     fn retry_config_update_after_persistence_failure(
@@ -1500,16 +1548,21 @@ async fn handle_supervisor_message(
                 return;
             }
             for component in &result.results {
-                if let Err(error) =
-                    record_component_apply_result(state, sandbox_id, component).await
-                {
-                    warn!(
-                        sandbox_id,
-                        session_id,
-                        component = component.component,
-                        error = %error,
-                        "failed to persist supervisor bootstrap result"
-                    );
+                match record_component_apply_result(state, sandbox_id, component).await {
+                    Ok(()) => {
+                        state
+                            .supervisor_sessions
+                            .acknowledge_bootstrap_component(sandbox_id, session_id, component);
+                    }
+                    Err(error) => {
+                        warn!(
+                            sandbox_id,
+                            session_id,
+                            component = component.component,
+                            error = %error,
+                            "failed to persist supervisor bootstrap result"
+                        );
+                    }
                 }
             }
         }
@@ -1583,13 +1636,7 @@ fn validate_bootstrap_result(
         };
         let outcome = validate_component_apply_result(result, revision)?;
         seen.push(component);
-        all_succeeded &= matches!(
-            outcome,
-            ConfigApplyOutcome::Applied
-                | ConfigApplyOutcome::IgnoredDuplicate
-                | ConfigApplyOutcome::RetainedLocalOverride
-                | ConfigApplyOutcome::Degraded
-        );
+        all_succeeded &= outcome_acknowledges_revision(outcome);
     }
     Ok(all_succeeded)
 }
@@ -1892,6 +1939,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_bootstrap_result_suppresses_unchanged_reconciliation() {
+        let state = state_with_sandbox("sb-bootstrap-ack").await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "sb-bootstrap-ack".into(),
+            "session-1".into(),
+            tx,
+            shutdown_tx,
+        );
+        let snapshot = ProviderEnvironmentSnapshot {
+            provider_env_revision: 11,
+            ..Default::default()
+        };
+        let revision = config_message_revision(&SupervisorConfigMessage::ProviderEnvironment(
+            snapshot.clone(),
+        ));
+        let result = ConfigComponentApplyResult {
+            component: ConfigComponent::ProviderEnvironment.into(),
+            requested_revision: Some(revision),
+            applied_revision: Some(revision),
+            outcome: ConfigApplyOutcome::Applied.into(),
+            ..Default::default()
+        };
+
+        handle_supervisor_message(
+            &state,
+            "sb-bootstrap-ack",
+            "session-1",
+            true,
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigBootstrapResult(
+                    ConfigBootstrapResult {
+                        results: vec![result],
+                    },
+                )),
+            },
+        )
+        .await;
+
+        let observation = state
+            .store
+            .get_message::<StoredConfigComponentObservation>(
+                "sb-bootstrap-ack:provider_environment",
+            )
+            .await
+            .unwrap()
+            .expect("bootstrap observation");
+        assert_eq!(observation.requested_revision, Some(revision));
+        assert_eq!(
+            state.supervisor_sessions.deliver_config(
+                "sb-bootstrap-ack",
+                SupervisorConfigMessage::ProviderEnvironment(snapshot),
+            ),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn component_apply_result_persists_compact_observed_state() {
         let state = state_with_sandbox("sb-observed").await;
         let requested_revision = ConfigSnapshotRevision {
@@ -2039,6 +2146,128 @@ mod tests {
                 .await,
             DeliveryDisposition::NoActiveSession
         );
+    }
+
+    #[test]
+    fn bootstrap_acknowledgement_suppresses_unchanged_reconciliation() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let snapshot = SandboxConfigSnapshot {
+            config_revision: 7,
+            version: 11,
+            ..Default::default()
+        };
+        let revision = config_message_revision(&SupervisorConfigMessage::SandboxConfig(Box::new(
+            snapshot.clone(),
+        )));
+
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision),
+                applied_revision: None,
+                outcome: ConfigApplyOutcome::FailedClosed.into(),
+                ..Default::default()
+            },
+        ));
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision),
+                applied_revision: Some(revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
+            ),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn bootstrap_acknowledgement_does_not_replace_newer_delivery_state() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        let bootstrap_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(7)),
+        };
+
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                    provider_env_revision: 8,
+                    ..Default::default()
+                }),
+            ),
+            DeliveryDisposition::Enqueued
+        );
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(bootstrap_revision),
+                applied_revision: Some(bootstrap_revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+        ));
+
+        let message = rx.try_recv().expect("newer update");
+        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+            panic!("expected config update");
+        };
+        assert_eq!(update.component_sequence, 1);
+        let in_flight_revision = registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get("sb-1")
+            .unwrap()
+            .config_sequences
+            .provider_environment
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .revision;
+        assert_eq!(
+            in_flight_revision.component,
+            Some(config_snapshot_revision::Component::ProviderEnvironment(8))
+        );
+
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let (replacement_shutdown_tx, _replacement_shutdown_rx) = oneshot::channel();
+        registry.register(
+            "sb-1".into(),
+            "session-2".into(),
+            replacement_tx,
+            replacement_shutdown_tx,
+        );
+        assert!(!registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(bootstrap_revision),
+                applied_revision: Some(bootstrap_revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            },
+        ));
     }
 
     #[tokio::test]
