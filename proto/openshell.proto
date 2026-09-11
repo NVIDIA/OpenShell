@@ -1300,7 +1300,9 @@ message ListSandboxesRequest {
   string label_selector = 3;
 }
 
-// List providers attached to a sandbox request.
+// List providers attached to a sandbox request. A sandbox can have at most 32
+// attached providers, so this bounded list intentionally has no pagination
+// fields.
 message ListSandboxProvidersRequest {
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
@@ -1389,6 +1391,7 @@ message ListSandboxesResponse {
 
 // List providers attached to a sandbox response.
 message ListSandboxProvidersResponse {
+  // The complete bounded set of providers attached to the sandbox.
   repeated openshell.datamodel.v1.Provider providers = 1;
 }
 
