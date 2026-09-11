@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::boundary_protocol::{BinaryIdentityWire, MediationTimingWire};
-use crate::contract::DnsTransport;
+use openshell_isolation_interface::contract::DnsTransport;
 
 const HEADER_BYTES: usize = 13;
 const MAX_METADATA_BYTES: usize = 256 * 1024;

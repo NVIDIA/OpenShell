@@ -14,16 +14,16 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use crate::AgentSpec;
-use crate::contract::Sha256Digest;
-use crate::contract::{
-    BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal, DriverFenceEvidence,
-    ExecSpec, ResolveError, SandboxConfirmEvidence, TopologyDescriptor,
-};
 use openshell_core::SandboxSessionId;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkMode, NetworkPolicy,
     ProcessPolicy, ProxyPolicy, SandboxPolicy,
+};
+use openshell_isolation_interface::AgentSpec;
+use openshell_isolation_interface::contract::Sha256Digest;
+use openshell_isolation_interface::contract::{
+    BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal, DriverFenceEvidence,
+    ExecSpec, ResolveError, SandboxConfirmEvidence, TopologyDescriptor,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -313,7 +313,7 @@ pub struct BoundaryTopology {
     /// Fresh session epoch shared with the sandbox bootstrap.
     pub session_epoch: String,
     /// Immutable numeric identity already applied to the sandbox workload.
-    pub workload_identity: crate::contract::ResolvedWorkloadIdentity,
+    pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Driver-provisioned control endpoint.
     pub transport: BoundaryTransport,
     /// Trusted dial target for well-known host-gateway aliases, when the
@@ -390,7 +390,7 @@ pub struct BoundaryConfig {
     #[serde(default)]
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
     /// Exact identity already applied by the runtime to the sandbox process.
-    pub workload_identity: crate::contract::ResolvedWorkloadIdentity,
+    pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Concrete outer-fence evidence validated by the driver.
     pub driver_fence: DriverFenceEvidence,
     /// Driver-resolved environment exposed only to workload processes.
@@ -762,7 +762,7 @@ pub enum Response {
     NetworkConnected {
         identity: BinaryIdentityWire,
         destination: std::net::SocketAddr,
-        socket: crate::contract::NetworkSocketMetadata,
+        socket: openshell_isolation_interface::contract::NetworkSocketMetadata,
         policy_generation: u64,
         timing: MediationTimingWire,
     },
