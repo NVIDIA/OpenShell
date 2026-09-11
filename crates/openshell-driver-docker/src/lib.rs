@@ -4105,10 +4105,7 @@ async fn prepare_docker_boundary_files(
             Status::failed_precondition("Docker sandbox launch authentication is required")
         })
         .and_then(|spec| decode_docker_launch_authentication(&spec.launch_authentication))?;
-    let host_gateway_ip = Some(match config.gateway_route {
-        DockerGatewayRoute::Bridge { bind_address, .. } => bind_address.ip(),
-        DockerGatewayRoute::HostGateway => IpAddr::V4(Ipv4Addr::LOCALHOST),
-    });
+    let host_gateway_ip = docker_boundary_host_gateway_ip(&config.gateway_route);
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
@@ -5300,6 +5297,16 @@ fn docker_supervisor_host_alias(route: &DockerGatewayRoute) -> String {
     match route {
         DockerGatewayRoute::Bridge { bind_address } => bind_address.ip().to_string(),
         DockerGatewayRoute::HostGateway => "host-gateway".to_string(),
+    }
+}
+
+fn docker_boundary_host_gateway_ip(route: &DockerGatewayRoute) -> Option<IpAddr> {
+    match route {
+        DockerGatewayRoute::Bridge { bind_address } => Some(bind_address.ip()),
+        // Docker resolves this special alias inside the supervisor container.
+        // Pinning it to loopback would target the daemon VM rather than the
+        // desktop host on Docker Desktop and compatible runtimes.
+        DockerGatewayRoute::HostGateway => None,
     }
 }
 

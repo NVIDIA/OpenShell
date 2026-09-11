@@ -1215,6 +1215,20 @@ fn docker_supervisor_alias_matches_the_trusted_gateway_route() {
 }
 
 #[test]
+fn docker_boundary_pins_only_concrete_host_gateway_addresses() {
+    assert_eq!(
+        docker_boundary_host_gateway_ip(&DockerGatewayRoute::Bridge {
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
+        }),
+        Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)))
+    );
+    assert_eq!(
+        docker_boundary_host_gateway_ip(&DockerGatewayRoute::HostGateway),
+        None
+    );
+}
+
+#[test]
 fn parse_optional_host_gateway_ip_rejects_invalid_values() {
     assert_eq!(parse_optional_host_gateway_ip("").unwrap(), None);
     assert_eq!(
