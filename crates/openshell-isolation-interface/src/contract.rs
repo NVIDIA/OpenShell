@@ -917,7 +917,7 @@ pub struct NetworkSocketMetadata {
 }
 
 /// Typed supervisor decision for one pending TCP open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TcpOpenDecision {
     /// L4 authorization and a bounded relay handler are ready. L7 policy still
     /// applies to bytes after the local connection commits.
@@ -927,7 +927,7 @@ pub enum TcpOpenDecision {
 }
 
 /// Placement-neutral reason why a staged TCP open was not committed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TcpOpenDenial {
     /// The admitted network policy rejected the request.
     PolicyDenied,
