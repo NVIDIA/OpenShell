@@ -145,16 +145,9 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         let binaries: Vec<NetworkBinary> = if binary.is_empty() {
             vec![]
         } else {
-            let mut proposal_binary = NetworkBinary {
+            let proposal_binary = NetworkBinary {
                 path: binary.clone(),
-                ..Default::default()
             };
-            // The deprecated harness bit is ignored by policy YAML, but OPA
-            // maps it to advisor_proposed to preserve the SSRF two-step flow.
-            #[allow(deprecated)]
-            {
-                proposal_binary.harness = true;
-            }
             vec![proposal_binary]
         };
 
@@ -535,11 +528,6 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
-        #[allow(deprecated)]
-        {
-            assert!(rule.binaries[0].harness);
-        }
-
         // No L7 fields when no samples provided.
         assert!(rule.endpoints[0].protocol.is_empty());
         assert!(rule.endpoints[0].rules.is_empty());

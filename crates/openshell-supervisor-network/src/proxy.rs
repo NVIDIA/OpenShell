@@ -559,31 +559,77 @@ async fn preauthorize_transparent_open(
             return None;
         }
     };
-    if host != INFERENCE_LOCAL_HOST || destination.port() != INFERENCE_LOCAL_PORT {
-        let mut decision = authorize_supplied_identity(
-            opa_engine,
-            EgressIntent::connect(host.clone(), destination.port()),
+    let mut decision = authorize_supplied_identity(
+        opa_engine,
+        EgressIntent::connect(host.clone(), destination.port()),
+        &binary_identity,
+    );
+    if let NetworkAction::Deny { reason } = &decision.action {
+        warn!(%destination, %reason, "Denied staged transparent connection");
+        emit_staged_transparent_denial(
+            destination,
             &binary_identity,
+            reason,
+            "transparent_tcp_policy_denied",
         );
-        if let NetworkAction::Deny { reason } = &decision.action {
-            warn!(%destination, %reason, "Denied staged transparent connection");
+        let denial = if binary_identity.is_err() {
+            TcpOpenDenial::IdentityUnavailable
+        } else {
+            TcpOpenDenial::PolicyDenied
+        };
+        let _ = completion.send(TcpOpenDecision::Denied(denial));
+        return None;
+    }
+    if let Err(denial) =
+        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
+    {
+        warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+        emit_staged_transparent_denial(
+            destination,
+            &binary_identity,
+            &denial.reason,
+            "transparent_tcp_destination_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+        return None;
+    }
+    if let Some(mapping) = policy_dns_store.and_then(|store| {
+        store
+            .lookup(
+                destination.ip(),
+                destination.port(),
+                opa_engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .ok()
+    }) {
+        let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
             emit_staged_transparent_denial(
                 destination,
                 &binary_identity,
-                reason,
-                "transparent_tcp_policy_denied",
+                "policy DNS produced an invalid pinned destination",
+                "transparent_tcp_destination_denied",
             );
-            let denial = if binary_identity.is_err() {
-                TcpOpenDenial::IdentityUnavailable
-            } else {
-                TcpOpenDenial::PolicyDenied
-            };
-            let _ = completion.send(TcpOpenDecision::Denied(denial));
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
-        }
-        if let Err(denial) =
-            hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
-        {
+        };
+        decision.endpoint.destination = Some(plan);
+    }
+    let plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
+    let connector = match validate_destination(DestinationRequest {
+        host: &host,
+        port: destination.port(),
+        sandbox_entrypoint_pid: 0,
+        plan,
+    })
+    .await
+    {
+        Ok(connector) => connector,
+        Err(denial) => {
             warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
             emit_staged_transparent_denial(
                 destination,
@@ -594,67 +640,7 @@ async fn preauthorize_transparent_open(
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
         }
-        if let Some(mapping) = policy_dns_store.and_then(|store| {
-            store
-                .lookup(
-                    destination.ip(),
-                    destination.port(),
-                    opa_engine.current_generation(),
-                    std::time::Instant::now(),
-                )
-                .ok()
-        }) {
-            let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
-                emit_staged_transparent_denial(
-                    destination,
-                    &binary_identity,
-                    "policy DNS produced an invalid pinned destination",
-                    "transparent_tcp_destination_denied",
-                );
-                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
-                return None;
-            };
-            decision.endpoint.destination = Some(plan);
-        }
-        let plan = decision
-            .endpoint
-            .destination
-            .as_ref()
-            .expect("destination plan hydrated");
-        let connector = match validate_destination(DestinationRequest {
-            host: &host,
-            port: destination.port(),
-            sandbox_entrypoint_pid: 0,
-            plan,
-        })
-        .await
-        {
-            Ok(connector) => connector,
-            Err(denial) => {
-                warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
-                emit_staged_transparent_denial(
-                    destination,
-                    &binary_identity,
-                    &denial.reason,
-                    "transparent_tcp_destination_denied",
-                );
-                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
-                return None;
-            }
-        };
-        if completion.send(TcpOpenDecision::RelayReady).is_err() {
-            return None;
-        }
-        return Some((
-            stream,
-            Some(binary_identity),
-            None,
-            Some(TransparentOpen {
-                destination,
-                authorization: Some((decision, connector)),
-            }),
-        ));
-    }
+    };
     if completion.send(TcpOpenDecision::RelayReady).is_err() {
         return None;
     }
@@ -664,7 +650,7 @@ async fn preauthorize_transparent_open(
         None,
         Some(TransparentOpen {
             destination,
-            authorization: None,
+            authorization: Some((decision, connector)),
         }),
     ))
 }
@@ -1949,7 +1935,6 @@ async fn handle_tcp_connection(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
-    inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     backend_host_gateway: Arc<Option<IpAddr>>,
@@ -1979,7 +1964,6 @@ async fn handle_tcp_connection(
         identity_cache,
         entrypoint_pid,
         tls_state,
-        inference_ctx,
         policy_local_ctx,
         agent_proposals,
         backend_host_gateway,
@@ -2151,10 +2135,10 @@ async fn handle_mediated_connection(
     let (raw_host, port) = parse_target(target)?;
     let host = normalize_host(&raw_host);
     let (host_lc, raw_host_lc) = (host.to_ascii_lowercase(), raw_host.to_ascii_lowercase());
-
-    let workload_addr = client.peer_addr().into_diagnostic()?;
-    let proxy_addr = client.local_addr().into_diagnostic()?;
-    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+    let workload_addr = socket_addrs.map_or_else(
+        || SocketAddr::from(([0, 0, 0, 0], 0)),
+        |(workload, _)| workload,
+    );
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -6646,7 +6630,6 @@ network_policies: {}
             None,
             None,
             None,
-            None,
             ready_rx,
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
@@ -6789,28 +6772,37 @@ network_policies:
                 socket.read_to_end(&mut response).await.unwrap();
                 response
             });
-            let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            let socket_addrs = proxy_connection
+                .peer_addr()
+                .ok()
+                .zip(proxy_connection.local_addr().ok());
+            let mut proxy_connection: ProxyClient =
+                tokio::io::BufReader::new(Box::new(proxy_connection));
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                handle_forward_proxy(
+                Box::pin(handle_forward_proxy(
                     "POST",
                     &target,
                     request.as_bytes(),
                     request.len(),
                     &mut proxy_connection,
+                    None,
+                    socket_addrs,
                     engine,
                     Arc::new(BinaryIdentityCache::new()),
                     Arc::new(AtomicU32::new(std::process::id())),
                     None,
                     AgentProposals::default(),
                     Arc::new(None),
+                    Arc::new(None),
                     None,
                     None,
                     None,
                     None,
                     None,
-                ),
+                )),
             )
             .await
             .expect("MCP forwarding should complete")
@@ -6913,7 +6905,7 @@ network_policies:
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -6933,7 +6925,7 @@ network_policies:
                 None,
                 None,
                 None,
-            ),
+            )),
         )
         .await
         .expect("denied preflight must complete without an upstream response")

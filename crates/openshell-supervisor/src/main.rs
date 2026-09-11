@@ -64,9 +64,6 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_INFERENCE_ROUTES")]
-    inference_routes: Option<String>,
-
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
@@ -157,7 +154,7 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -191,7 +188,7 @@ fn main() -> Result<()> {
         .into_diagnostic()?;
 
     let exit_code = runtime.block_on(async move {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
             (&args.sandbox_id, &args.openshell_endpoint)
         {
@@ -298,7 +295,6 @@ fn main() -> Result<()> {
             args.policy_data,
             args.ssh_socket_path,
             args.health_socket_path,
-            args.inference_routes,
             ocsf_enabled,
             upstream_proxy_args,
             topology,
@@ -320,13 +316,17 @@ mod tests {
     fn role_specific_cli_has_no_mode_switch() {
         let directory = tempfile::tempdir().expect("temporary topology directory");
         let topology_path = directory.path().join("topology.json");
+        let auth_bundle_path = directory.path().join("auth-bundle.json");
         std::fs::write(&topology_path, [0]).expect("write topology payload");
+        std::fs::write(&auth_bundle_path, [0]).expect("write auth bundle payload");
         let args = Args::try_parse_from([
             "openshell-supervisor",
             "--topology-backend-name",
             "test",
             "--topology-payload-file",
             topology_path.to_str().expect("UTF-8 topology path"),
+            "--auth-bundle-file",
+            auth_bundle_path.to_str().expect("UTF-8 auth bundle path"),
         ])
         .expect("supervisor arguments");
         assert_eq!(topology(&args).expect("topology").payload, vec![0]);

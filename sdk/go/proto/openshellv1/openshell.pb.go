@@ -665,8 +665,16 @@ type RefreshSandboxTokenResponse struct {
 	// Fresh credentials for the requested, policy-authorized extension
 	// services. These remain in supervisor memory and are never persisted.
 	ExtensionCredentials []*ExtensionServiceCredential `protobuf:"bytes,3,rep,name=extension_credentials,json=extensionCredentials,proto3" json:"extension_credentials,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Fresh Sandbox Protocol bearer token from the same atomic refresh.
+	SandboxToken string `protobuf:"bytes,4,opt,name=sandbox_token,json=sandboxToken,proto3" json:"sandbox_token,omitempty"`
+	// Absolute Sandbox Protocol token expiry, milliseconds since the epoch.
+	SandboxExpiresAtMs int64 `protobuf:"varint,5,opt,name=sandbox_expires_at_ms,json=sandboxExpiresAtMs,proto3" json:"sandbox_expires_at_ms,omitempty"`
+	// Launch generation to which both refreshed credentials are bound.
+	SessionId string `protobuf:"bytes,6,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// Monotonic Sandbox Protocol connection replacement order.
+	CredentialEpoch uint64 `protobuf:"varint,7,opt,name=credential_epoch,json=credentialEpoch,proto3" json:"credential_epoch,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RefreshSandboxTokenResponse) Reset() {
@@ -718,6 +726,34 @@ func (x *RefreshSandboxTokenResponse) GetExtensionCredentials() []*ExtensionServ
 		return x.ExtensionCredentials
 	}
 	return nil
+}
+
+func (x *RefreshSandboxTokenResponse) GetSandboxToken() string {
+	if x != nil {
+		return x.SandboxToken
+	}
+	return ""
+}
+
+func (x *RefreshSandboxTokenResponse) GetSandboxExpiresAtMs() int64 {
+	if x != nil {
+		return x.SandboxExpiresAtMs
+	}
+	return 0
+}
+
+func (x *RefreshSandboxTokenResponse) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *RefreshSandboxTokenResponse) GetCredentialEpoch() uint64 {
+	if x != nil {
+		return x.CredentialEpoch
+	}
+	return 0
 }
 
 // Health check request.
@@ -14322,11 +14358,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12\"\n" +
 	"\rexpires_at_ms\x18\x02 \x01(\x03R\vexpiresAtMs\"T\n" +
 	"\x1aRefreshSandboxTokenRequest\x126\n" +
-	"\x17extension_service_names\x18\x01 \x03(\tR\x15extensionServiceNames\"\xbc\x01\n" +
+	"\x17extension_service_names\x18\x01 \x03(\tR\x15extensionServiceNames\"\xe4\x02\n" +
 	"\x1bRefreshSandboxTokenResponse\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12\"\n" +
 	"\rexpires_at_ms\x18\x02 \x01(\x03R\vexpiresAtMs\x12]\n" +
-	"\x15extension_credentials\x18\x03 \x03(\v2(.openshell.v1.ExtensionServiceCredentialR\x14extensionCredentials\"\x0f\n" +
+	"\x15extension_credentials\x18\x03 \x03(\v2(.openshell.v1.ExtensionServiceCredentialR\x14extensionCredentials\x12)\n" +
+	"\rsandbox_token\x18\x04 \x01(\tB\x04\x88\xb5\x18\x01R\fsandboxToken\x121\n" +
+	"\x15sandbox_expires_at_ms\x18\x05 \x01(\x03R\x12sandboxExpiresAtMs\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x06 \x01(\tR\tsessionId\x12)\n" +
+	"\x10credential_epoch\x18\a \x01(\x04R\x0fcredentialEpoch\"\x0f\n" +
 	"\rHealthRequest\"_\n" +
 	"\x0eHealthResponse\x123\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1b.openshell.v1.ServiceStatusR\x06status\x12\x18\n" +

@@ -13,7 +13,7 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
-fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
+fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
     openshell_ocsf::ctx::ctx()
 }
 

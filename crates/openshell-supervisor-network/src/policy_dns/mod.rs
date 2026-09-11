@@ -34,7 +34,7 @@ pub(crate) use store::{
 
 use crate::opa::OpaEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
-use crate::proxy::{INFERENCE_LOCAL_HOST, INFERENCE_LOCAL_PORT, is_host_gateway_alias};
+use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint,
@@ -122,16 +122,11 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             .policy
             .policy_dns_eligibility_snapshot()
             .map_err(|error| PolicyDnsError::Policy(error.to_string()))?;
-        let system_inference = normalized_name.as_str() == INFERENCE_LOCAL_HOST;
-        let eligible = if system_inference {
-            vec![system_inference_endpoint(family)?]
-        } else {
-            eligible_endpoints(
-                &snapshot.endpoints,
-                &normalized_name,
-                self.trusted_host_gateway,
-            )?
-        };
+        let eligible = eligible_endpoints(
+            &snapshot.endpoints,
+            &normalized_name,
+            self.trusted_host_gateway,
+        )?;
         if eligible.is_empty() {
             emit_dns_denial(
                 &normalized_name,
@@ -144,12 +139,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         // The trusted resolver is invoked only after the immutable snapshot
         // proved policy eligibility. It never consults sandbox resolver state.
         let endpoint_context = eligible_endpoint_context(&eligible);
-        let trusted_answer = if system_inference {
-            TrustedAnswer {
-                addresses: vec![family_loopback(family)],
-                ttl: MAX_MAPPING_TTL,
-            }
-        } else if is_host_gateway_alias(normalized_name.as_str()) {
+        let trusted_answer = if is_host_gateway_alias(normalized_name.as_str()) {
             let address = self
                 .trusted_host_gateway
                 .filter(|address| family.accepts(*address))
@@ -272,28 +262,6 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn store(&self) -> &Arc<ResolvedEndpointStore> {
         &self.store
     }
-}
-
-fn family_loopback(family: AddressFamily) -> std::net::IpAddr {
-    match family {
-        AddressFamily::Ipv4 => std::net::Ipv4Addr::LOCALHOST.into(),
-        AddressFamily::Ipv6 => std::net::Ipv6Addr::LOCALHOST.into(),
-    }
-}
-
-fn system_inference_endpoint(family: AddressFamily) -> Result<EligibleEndpoint, PolicyDnsError> {
-    let address = family_loopback(family);
-    let destination_plan = crate::proxy::destination::build_pinned_validation_plan(vec![address])
-        .map_err(|error| PolicyDnsError::Policy(error.reason))?;
-    Ok(EligibleEndpoint {
-        endpoint_id: PolicyEndpointId {
-            policy_name: "openshell-system-inference".to_string(),
-            endpoint_index: 0,
-        },
-        ports: vec![INFERENCE_LOCAL_PORT],
-        destination_plan,
-        contract_fingerprint: "openshell-system-inference-local".to_string(),
-    })
 }
 
 struct EligibleEndpoint {
@@ -654,36 +622,6 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await;
         assert!(matches!(result, Err(PolicyDnsError::Ineligible)));
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn publishes_system_inference_without_upstream_resolution_or_user_policy() {
-        let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
-        let now = Instant::now();
-
-        let answer = service
-            .answer_query(INFERENCE_LOCAL_HOST, AddressFamily::Ipv4, now)
-            .await
-            .unwrap();
-
-        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
-        let mapping = service
-            .store
-            .lookup(
-                answer.address,
-                INFERENCE_LOCAL_PORT,
-                answer.policy_generation,
-                now,
-            )
-            .unwrap();
-        assert_eq!(
-            mapping.record.normalized_name.as_str(),
-            INFERENCE_LOCAL_HOST
-        );
-        assert_eq!(
-            mapping.pinned_addresses(),
-            [IpAddr::V4(Ipv4Addr::LOCALHOST)]
-        );
     }
 
     #[tokio::test]
