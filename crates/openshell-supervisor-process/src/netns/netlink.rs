@@ -135,9 +135,32 @@ pub fn destroy_netns(name: &str, fd: RawFd) -> Result<()> {
     unmount_and_remove(&ns_path)
 }
 
+/// Run `work` on a fresh, short-lived OS thread and wait for its result.
+///
+/// `create()` is invoked from within a tokio runtime on some drivers, so the
+/// local `current_thread` runtime in [`block_on_netlink`] must never be built
+/// on the caller's thread (that panics with "Cannot start a runtime from
+/// within a runtime"). Running on a dedicated thread also gives the setns path
+/// a thread whose namespace state is discarded on exit.
+fn on_thread<T, W>(work: W) -> Result<T>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv()
+        .map_err(|_| miette!("netlink worker thread panicked"))?
+}
+
 /// Build a local current-thread runtime, open a route-netlink connection
 /// scoped to the current thread's network namespace, run `f`, then tear the
 /// connection task down.
+///
+/// Must be called on a dedicated thread (see [`on_thread`]) — never directly
+/// on a thread already driving a tokio runtime.
 fn block_on_netlink<T, F>(f: impl FnOnce(rtnetlink::Handle) -> F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -177,42 +200,44 @@ pub fn setup_host_side(
 ) -> Result<()> {
     let veth_host = veth_host.to_string();
     let veth_sandbox = veth_sandbox.to_string();
-    block_on_netlink(move |handle| async move {
-        // Create veth pair.
-        handle
-            .link()
-            .add()
-            .veth(veth_host.clone(), veth_sandbox.clone())
-            .execute()
-            .await
-            .into_diagnostic()?;
+    on_thread(move || {
+        block_on_netlink(move |handle| async move {
+            // Create veth pair.
+            handle
+                .link()
+                .add()
+                .veth(veth_host.clone(), veth_sandbox.clone())
+                .execute()
+                .await
+                .into_diagnostic()?;
 
-        // Move the sandbox peer into the target namespace by fd.
-        let sandbox_idx = link_index_by_name(&handle, &veth_sandbox).await?;
-        handle
-            .link()
-            .set(sandbox_idx)
-            .setns_by_fd(ns_fd)
-            .execute()
-            .await
-            .into_diagnostic()?;
+            // Move the sandbox peer into the target namespace by fd.
+            let sandbox_idx = link_index_by_name(&handle, &veth_sandbox).await?;
+            handle
+                .link()
+                .set(sandbox_idx)
+                .setns_by_fd(ns_fd)
+                .execute()
+                .await
+                .into_diagnostic()?;
 
-        // Configure the host end: address + up.
-        let host_idx = link_index_by_name(&handle, &veth_host).await?;
-        handle
-            .address()
-            .add(host_idx, host_ip, prefix)
-            .execute()
-            .await
-            .into_diagnostic()?;
-        handle
-            .link()
-            .set(host_idx)
-            .up()
-            .execute()
-            .await
-            .into_diagnostic()?;
-        Ok(())
+            // Configure the host end: address + up.
+            let host_idx = link_index_by_name(&handle, &veth_host).await?;
+            handle
+                .address()
+                .add(host_idx, host_ip, prefix)
+                .execute()
+                .await
+                .into_diagnostic()?;
+            handle
+                .link()
+                .set(host_idx)
+                .up()
+                .execute()
+                .await
+                .into_diagnostic()?;
+            Ok(())
+        })
     })
 }
 
@@ -226,20 +251,14 @@ where
     T: Send + 'static,
     W: FnOnce() -> Result<T> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel::<Result<T>>();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<T> {
-            // SAFETY: setns on a dedicated, short-lived thread.
-            #[allow(unsafe_code)]
-            if unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) } != 0 {
-                return Err(miette!("setns failed: {}", std::io::Error::last_os_error()));
-            }
-            work()
-        })();
-        let _ = tx.send(result);
-    });
-    rx.recv()
-        .map_err(|_| miette!("netns worker thread panicked"))?
+    on_thread(move || {
+        // SAFETY: setns on a dedicated, short-lived thread.
+        #[allow(unsafe_code)]
+        if unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) } != 0 {
+            return Err(miette!("setns failed: {}", std::io::Error::last_os_error()));
+        }
+        work()
+    })
 }
 
 /// Configure the sandbox end inside the namespace: address, link up, loopback
@@ -293,10 +312,12 @@ pub fn setup_sandbox_side(
 /// veth end removes its peer too.
 pub fn delete_link(name: &str) -> Result<()> {
     let name = name.to_string();
-    block_on_netlink(move |handle| async move {
-        let idx = link_index_by_name(&handle, &name).await?;
-        handle.link().del(idx).execute().await.into_diagnostic()?;
-        Ok(())
+    on_thread(move || {
+        block_on_netlink(move |handle| async move {
+            let idx = link_index_by_name(&handle, &name).await?;
+            handle.link().del(idx).execute().await.into_diagnostic()?;
+            Ok(())
+        })
     })
 }
 
