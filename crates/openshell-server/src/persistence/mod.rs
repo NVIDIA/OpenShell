@@ -271,6 +271,14 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Maximum number of pooled database connections for this backend.
+    pub fn max_connections(&self) -> u32 {
+        match self {
+            Self::Postgres(store) => store.max_connections(),
+            Self::Sqlite(store) => store.max_connections(),
+        }
+    }
+
     /// Connect to a persistence store based on the database URL.
     pub async fn connect(url: &str) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {

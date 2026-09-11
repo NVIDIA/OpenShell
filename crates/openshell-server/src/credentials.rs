@@ -93,6 +93,16 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
     fn fail_next_delete(&self) {}
 
     #[cfg(test)]
+    fn gate_next_resolve(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        None
+    }
+
+    #[cfg(test)]
     fn gate_next_store(
         &self,
     ) -> Option<(
@@ -266,6 +276,19 @@ impl CredentialRuntime {
             .get(&self.registry.storage_owner_name())
             .and_then(|driver| driver.gate_next_store())
             .expect("test credential driver supports store gating")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_resolve(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.drivers
+            .get(&self.registry.storage_owner_name())
+            .and_then(|driver| driver.gate_next_resolve())
+            .expect("test credential driver supports resolve gating")
     }
 
     pub async fn store_provider_credentials(
@@ -1711,6 +1734,13 @@ struct TestStaticCredentialDriver {
     fail_next_store: std::sync::atomic::AtomicBool,
     fail_next_delete: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    resolve_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     store_gate: std::sync::Mutex<
         Option<(
             tokio::sync::oneshot::Sender<()>,
@@ -1728,6 +1758,8 @@ impl TestStaticCredentialDriver {
             values: std::sync::Mutex::new(HashMap::new()),
             fail_next_store: std::sync::atomic::AtomicBool::new(false),
             fail_next_delete: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            resolve_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             store_gate: std::sync::Mutex::new(None),
         }
@@ -1806,6 +1838,17 @@ impl CredentialDriver for TestStaticCredentialDriver {
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
         let mut responses = Vec::with_capacity(requests.len());
+        #[cfg(test)]
+        let gate = self
+            .resolve_gate
+            .lock()
+            .ok()
+            .and_then(|mut gate| gate.take());
+        #[cfg(test)]
+        if let Some((hit, release)) = gate {
+            let _ = hit.send(());
+            let _ = release.await;
+        }
         for request in requests {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
             let value = self
@@ -1834,6 +1877,19 @@ impl CredentialDriver for TestStaticCredentialDriver {
     fn fail_next_store(&self) {
         self.fail_next_store
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn gate_next_resolve(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.resolve_gate.lock().ok()? = Some((hit_tx, release_rx));
+        Some((hit_rx, release_tx))
     }
 
     #[cfg(test)]

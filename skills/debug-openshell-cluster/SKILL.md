@@ -19,6 +19,8 @@ The target deployment flow is:
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
+If supervisor sessions fail with a protocol revision mismatch, check that custom supervisor images match the gateway release. Gateway and supervisor require the same internal protocol revision; authentication success does not make mismatched versions compatible. Supervisors that predate the handshake still connect for one release. The gateway logs a warning for each such session and counts them in the `openshell_supervisor_protocol_legacy_sessions_total` metric, so recreate those sandboxes before the next gateway upgrade. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md).
+
 The `openshell-gateway` composition crate explicitly installs its compiled
 Docker, Podman, Kubernetes, and VM registrations at startup; `openshell-server`
 does not link compute-driver crates. Custom gateway binaries may include a

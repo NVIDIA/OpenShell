@@ -23,6 +23,7 @@ use openshell_core::proto::{
     RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
     SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
+use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder, OcsfEvent,
     SeverityId, StatusId, ocsf_emit,
@@ -354,6 +355,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
+            protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
         })),
     })
     .await
@@ -381,6 +383,7 @@ async fn run_single_session(
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
+    validate_gateway_protocol_revision(accepted.protocol_revision)?;
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         &config.endpoint,
@@ -388,6 +391,15 @@ async fn run_single_session(
         heartbeat_secs,
     );
     ocsf_emit!(event);
+
+    if accepted.bootstrap.is_some() {
+        debug!(
+            sandbox_id = %config.sandbox_id,
+            session_id = %accepted.session_id,
+            "supervisor session: ignoring configuration bootstrap while polling remains active"
+        );
+    }
+
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
@@ -429,6 +441,24 @@ async fn run_single_session(
                 }
             }
         }
+    }
+}
+
+fn validate_gateway_protocol_revision(
+    gateway_revision: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match gateway_revision {
+        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
+        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
+            warn!(
+                "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
+            );
+            Ok(())
+        }
+        other => Err(format!(
+            "supervisor protocol revision mismatch: supervisor requires {SUPERVISOR_PROTOCOL_REVISION}, gateway offered {other}"
+        )
+        .into()),
     }
 }
 
@@ -486,6 +516,15 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
+        }
+        Some(gateway_message::Payload::ConfigUpdate(update)) => {
+            // Stage 1 accepts pushed configuration but leaves polling as the
+            // only path that changes runtime state.
+            debug!(
+                sandbox_id = %context.sandbox_id,
+                component_sequence = update.component_sequence,
+                "supervisor session: ignoring configuration update while polling remains active"
+            );
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
@@ -827,6 +866,19 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 #[cfg(test)]
 mod target_tests {
     use super::*;
+
+    #[test]
+    fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
+        assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+    }
+
+    #[test]
+    fn gateway_protocol_revision_rejects_unknown_peers() {
+        let error = validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION + 1)
+            .expect_err("version skew must be rejected");
+        assert!(error.to_string().contains("revision mismatch"));
+    }
 
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
         TcpRelayTarget {
