@@ -504,7 +504,7 @@ pub async fn run_sandbox(
     let admitted_backend_name = admitted_isolation_backend.ok_or_else(|| {
         miette::miette!("protected topology supplied without an admitted isolation backend")
     })?;
-    let topology: openshell_isolation_interface::boundary_protocol::BoundaryTopology =
+    let topology: openshell_sandbox_backend::boundary_protocol::BoundaryTopology =
         serde_json::from_slice(&topology_descriptor.payload)
             .map_err(|error| miette::miette!("decode boundary topology: {error}"))?;
     if auth_bundle.session_id != topology.session_id {
@@ -515,14 +515,13 @@ pub async fn run_sandbox(
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
     let session_id = topology.session_id;
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let backend: Arc<dyn openshell_isolation_interface::contract::IsolationBackend> = Arc::new(
-        openshell_isolation_interface::remote::RemoteIsolationBackend::new(
+    let backend: Arc<dyn openshell_isolation_interface::contract::IsolationBackend> =
+        Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
             admitted_backend_name.clone(),
             ca_file_paths.clone(),
             provider_credentials.clone(),
             sandbox_bearer,
-        ),
-    );
+        ));
     let mut registry = openshell_isolation_interface::contract::BackendRegistry::new();
     registry
         .register(backend)
