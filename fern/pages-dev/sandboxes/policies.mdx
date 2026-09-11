@@ -253,9 +253,11 @@ The following steps outline the hot-reload policy update workflow.
    ```
 
    Add `--output json` or `--output yaml` for automation. Structured policy
-   history contains the scope, sandbox name when applicable, version, full
+   history is an envelope with `revisions` and `next_page_token` fields. Each
+   revision contains the scope, sandbox name when applicable, version, full
    hash, status, and available revision timestamps, load error, and provenance.
-   Use `openshell policy list --global --output json` for global history.
+   Pass the returned token to `--page-token` to continue. Use
+   `openshell policy list --global --output json` for global history.
 
 ### Validation failures
 
