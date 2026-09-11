@@ -38,6 +38,9 @@ const MAX_ACTIVE_FANOUT_WORKERS: usize = 64;
 /// pool busy without stacking every waiter on the acquire timeout.
 const SNAPSHOT_BUILDS_PER_DB_CONNECTION: usize = 2;
 const MIN_CONCURRENT_SNAPSHOT_BUILDS: usize = 4;
+/// Admit scoped bursts independently of the database build bound. Workers
+/// waiting to build still count toward this limit.
+const MIN_CONCURRENT_DELIVERY_WORKERS: usize = 64;
 
 /// One complete configuration component awaiting delivery to a supervisor.
 #[derive(Clone)]
@@ -210,11 +213,15 @@ impl Default for ConfigDeliveryQueue {
 impl ConfigDeliveryQueue {
     #[must_use]
     pub fn new(max_concurrent_builds: usize) -> Self {
+        Self::with_limits(max_concurrent_builds, max_concurrent_builds)
+    }
+
+    fn with_limits(max_concurrent_builds: usize, max_delivery_workers: usize) -> Self {
         let max_concurrent_builds = max_concurrent_builds.max(1);
         Self {
             pending: Mutex::default(),
             fanout_pending: Mutex::default(),
-            delivery_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            delivery_permits: Arc::new(Semaphore::new(max_delivery_workers.max(1))),
             build_permits: Semaphore::new(max_concurrent_builds),
         }
     }
@@ -223,11 +230,10 @@ impl ConfigDeliveryQueue {
     #[must_use]
     pub fn for_db_connections(max_connections: u32) -> Self {
         let max_connections = usize::try_from(max_connections).unwrap_or(usize::MAX);
-        Self::new(
-            max_connections
-                .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
-                .max(MIN_CONCURRENT_SNAPSHOT_BUILDS),
-        )
+        let builds = max_connections
+            .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
+            .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
+        Self::with_limits(builds, builds.max(MIN_CONCURRENT_DELIVERY_WORKERS))
     }
 
     #[cfg(test)]
@@ -672,6 +678,9 @@ mod tests {
 
     #[test]
     fn build_bound_is_sized_from_the_database_pool() {
+        let local = ConfigDeliveryQueue::for_db_connections(5);
+        assert_eq!(local.max_concurrent_builds(), 10);
+        assert_eq!(local.delivery_permits.available_permits(), 64);
         assert_eq!(
             ConfigDeliveryQueue::for_db_connections(10).max_concurrent_builds(),
             20

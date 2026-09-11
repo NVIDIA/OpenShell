@@ -680,7 +680,10 @@ refresh bootstrap material; sandboxes receive minted access tokens instead.
 Committed configuration mutations publish component and scope identifiers,
 never configuration payloads, to a bounded coalescing scheduler. The scheduler
 admits a fixed number of delivery workers and builds the latest full snapshot
-for each affected active sandbox. Fleet fanout waits for worker capacity before
+for each affected active sandbox. Delivery admission allows at least 64 workers,
+while snapshot build concurrency remains tied to database pool capacity. This
+absorbs scoped bursts without increasing concurrent database-backed builds.
+Fleet fanout waits for worker capacity before
 admitting another recipient. An async router owns session lookup, message
 sizing, sequence allocation, and enqueue. Its local implementation uses the
 process-local supervisor registry. A future HA implementation can resolve the
