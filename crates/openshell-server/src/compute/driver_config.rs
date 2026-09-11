@@ -9,7 +9,7 @@
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{Error, Result};
+use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -109,6 +109,7 @@ impl GuestTlsPaths {
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
     pub guest_tls: Option<&'a GuestTlsPaths>,
+    pub network_trust: Option<&'a NetworkSupervisorTrustBundle>,
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
@@ -229,6 +230,7 @@ mod tests {
         DriverStartupContext {
             file,
             guest_tls: None,
+            network_trust: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             gateway_tls_enabled: false,
             endpoint_overrides,
