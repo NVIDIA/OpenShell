@@ -11023,7 +11023,10 @@ network_policies:
             response.starts_with("HTTP/1.1 403 Forbidden"),
             "internal forward destination must get the SSRF 403; got: {response:?}"
         );
-        assert!(response.contains("ssrf_denied"));
+        assert!(
+            response.contains("ssrf_denied"),
+            "expected the SSRF-specific denial body; got: {response:?}"
+        );
         assert!(
             response.contains("GET 127.0.0.1:80 blocked: declared endpoint check failed"),
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
