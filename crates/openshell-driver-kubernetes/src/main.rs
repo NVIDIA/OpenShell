@@ -109,6 +109,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    sandbox_runtime_image: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
+    sandbox_runtime_image_pull_policy: Option<String>,
+
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
 
@@ -239,6 +245,12 @@ async fn main() -> Result<()> {
                 gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
                 gateway_pod_selector: managed_ssh_gateway_pod_selector,
             },
+            sandbox_runtime_image: args
+                .sandbox_runtime_image
+                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+            sandbox_runtime_image_pull_policy: args
+                .sandbox_runtime_image_pull_policy
+                .unwrap_or_default(),
             supervisor_image: args
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),

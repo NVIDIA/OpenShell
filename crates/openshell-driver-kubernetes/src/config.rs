@@ -144,8 +144,12 @@ pub struct KubernetesComputeConfig {
     /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
     /// only from gateway pods matching this peer.
     pub managed_ssh_ingress: ManagedSshIngressConfig,
-    /// Image that provides the trusted `openshell-sandbox` bootstrap binary
-    /// and the separate `openshell-supervisor` control binary.
+    /// Image that provides the trusted `openshell-sandbox` bootstrap binary.
+    pub sandbox_runtime_image: String,
+    /// Kubernetes `imagePullPolicy` for the sandbox runtime image.
+    /// Empty string delegates to the Kubernetes default.
+    pub sandbox_runtime_image_pull_policy: String,
+    /// Image that provides the trusted `openshell-supervisor` control binary.
     pub supervisor_image: String,
     /// Kubernetes `imagePullPolicy` for the supervisor image.
     /// Empty string delegates to the Kubernetes default.
@@ -261,6 +265,8 @@ impl Default for KubernetesComputeConfig {
             image_pull_policy: String::new(),
             image_pull_secrets: Vec::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
+            sandbox_runtime_image: config::default_sandbox_runtime_image(),
+            sandbox_runtime_image_pull_policy: String::new(),
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
             proxy_pod: KubernetesProxyPodConfig::default(),
