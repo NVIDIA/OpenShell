@@ -445,16 +445,28 @@ func (c *fakeSandboxClient) Get(_ context.Context, workspace, name string) (*typ
 	return c.store.Get(workspace, name)
 }
 
-// List returns all sandboxes. ListOptions are accepted for interface
-// compatibility but filtering is not implemented.
-func (c *fakeSandboxClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+// List returns a lazy pager over sandboxes. Filtering is not implemented.
+func (c *fakeSandboxClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.Sandbox], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
 	}
-	return c.store.List(workspace), nil
+	items := c.store.List(workspace)
+	if len(opts) > 0 && opts[0].AllWorkspaces {
+		items = c.store.ListAll()
+	}
+	return newSlicePager(items, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // Stop transitions a sandbox to the Stopped phase.

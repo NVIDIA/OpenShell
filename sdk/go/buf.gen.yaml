@@ -10,7 +10,6 @@ version: v2
 
 inputs:
   - proto_file: proto/openshell.proto
-  - proto_file: proto/inference.proto
 
 plugins:
   - local: protoc-gen-go
@@ -22,7 +21,6 @@ plugins:
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
-      - Minference.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/inferencev1
   - local: protoc-gen-go-grpc
     out: sdk/go
     include_imports: true
@@ -32,4 +30,3 @@ plugins:
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
-      - Minference.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/inferencev1

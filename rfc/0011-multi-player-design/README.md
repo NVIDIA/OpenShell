@@ -312,8 +312,8 @@ Within a workspace, access varies by resource type:
   boundary — within a workspace, all members share the same trust domain and
   the same provider credentials, so there is no security benefit to restricting
   sandbox access by owner. Platform Admins can list across workspaces using
-  `all_workspaces = true` on list RPCs (see Cross-Workspace List Operations
-  below).
+  the `all_workspaces` `WorkspaceSelector` variant on list RPCs (see
+  Cross-Workspace List Operations below).
 
 - **Providers.** Users can list and reference providers by name within their
   workspace but cannot create, update, or delete them, and cannot see raw
@@ -507,7 +507,8 @@ resolves it, and the runtime consumes it directly.
 that depends on a request field. Handlers may strengthen, but never weaken,
 the declared baseline for these cases:
 
-- `all_workspaces: true` requires Platform Admin on cross-workspace list RPCs.
+- The `all_workspaces` selector requires Platform Admin on cross-workspace list
+  RPCs.
 - `global: true` requires Platform Admin for global configuration and policy
   reads or writes.
 - An empty provider-profile workspace selects platform scope and requires
@@ -861,16 +862,16 @@ analogous to `kubectl get pods --all-namespaces`. This is an explicit opt-in
 on list RPCs, not the default behavior.
 
 **RPC mechanism.** Workspace-scoped list RPCs (`ListSandboxes`,
-`ListProviders`, `ListServices`) gain an `all_workspaces` boolean field. When
-`all_workspaces = true`, the handler bypasses workspace scoping and returns
-results from all workspaces. The caller must have the Platform Admin global role;
-workspace-scoped roles cannot set `all_workspaces`. Results include the
-`workspace` field in each resource's `ObjectMeta` so the caller can distinguish
-provenance.
+`ListSandboxTemplates`, `ListProviders`, `ListServices`) use a
+`WorkspaceSelector` oneof with either a non-empty named workspace or an
+`all_workspaces` marker. The all-workspaces variant bypasses workspace scoping
+and returns results from all workspaces. The caller must have the Platform
+Admin global role; workspace-scoped roles cannot select all workspaces. Results
+include the `workspace` field in each resource's `ObjectMeta` so the caller can
+distinguish provenance.
 
-This is distinct from passing an empty workspace string. Empty workspace is
-resolved to `"default"` by the gateway's `resolve_workspace()` logic for
-backwards compatibility — it does not mean "all workspaces."
+An omitted selector, an unset selector, and an empty named workspace are
+invalid. The default workspace is selected explicitly with the name `default`.
 
 **Store query.** The `all_workspaces` handler path uses the same
 `list_by_type(object_type, limit, offset)` store method as the internal
@@ -1081,8 +1082,8 @@ etc.). Unlike the CLI, the SDK does not default to `"default"` — programmatic
 callers must always specify the target workspace. This is a deliberate design
 choice: agents and automation scripts should be explicit about which workspace
 they operate on, and a silent default could mask workspace-routing bugs.
-Passing `workspace=None` to `list()` uses `all_workspaces=True` for
-cross-workspace queries.
+Cross-workspace queries use the separate `list_for_all_workspaces()` method so
+named and all-workspaces scopes cannot conflict.
 
 ## Implementation plan
 
@@ -1149,8 +1150,9 @@ foundations. The work can be phased to deliver value incrementally:
   workspace through `StoredProviderCredentialRefreshState` so the provider
   refresh worker can unambiguously resolve workspace-scoped providers — with
   multiple workspaces, `provider_name` alone is insufficient because different
-  workspaces can have same-named providers. Add `all_workspaces` field to
-  workspace-scoped list RPCs for Platform Admin cross-workspace visibility.
+  workspaces can have same-named providers. Add the typed `WorkspaceSelector`
+  to workspace-scoped request RPCs and its `all_workspaces` variant to list
+  RPCs for Platform Admin cross-workspace visibility.
   Add `ObjectWorkspace::requires_workspace()` trait method and validation in
   store write helpers (`put_message`, `put_scoped_message`) that returns an
   error when a workspace-scoped resource is persisted with an empty workspace.
@@ -1270,10 +1272,10 @@ depend only on Phase 1.
 - **Cross-workspace store query authorization.** The `list_by_type` store method
   has no access-control gate — it is a persistence-layer primitive. Authorization
   for cross-workspace queries is enforced at the gRPC handler level (Platform
-  Admin check for `all_workspaces` on list RPCs) and by code-level access
-  control for internal operations (only the reconciler, start, and refresh
-  worker call it). This relies on internal code discipline rather than an
-  enforced store-level boundary. A future extension could add a store-level
+  Admin check for the `all_workspaces` selector on list RPCs) and by code-level
+  access control for internal operations (only the reconciler, start, and
+  refresh worker call it). This relies on internal code discipline rather than
+  an enforced store-level boundary. A future extension could add a store-level
   caller identity parameter if defense-in-depth is desired.
 
 - **Remote compute driver channel security.** The `RemoteComputeDriver` gRPC

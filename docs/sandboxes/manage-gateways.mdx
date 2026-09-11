@@ -15,7 +15,7 @@ The gateway is responsible for:
 - Provisioning and managing sandboxes, including creation, deletion, and status monitoring.
 - Storing provider credentials and delivering them to sandboxes at startup.
 - Delivering network and filesystem policies to sandboxes. Policy enforcement itself happens inside each sandbox through the proxy, OPA, Landlock, and seccomp.
-- Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
+- Resolving endpoint-bound provider environments for the providers attached to each sandbox.
 - Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
 
 OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.

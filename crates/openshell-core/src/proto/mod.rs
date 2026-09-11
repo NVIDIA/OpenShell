@@ -59,12 +59,13 @@ pub mod test {
     pub use super::generated::openshell::test::v1::*;
 }
 
-pub mod inference {
-    pub use super::generated::openshell::inference::v1;
-}
-
 pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
+}
+
+#[doc(hidden)]
+pub mod pagination {
+    pub use super::generated::openshell::internal::pagination::v1;
 }
 
 pub mod gateway_interceptor {
@@ -73,8 +74,23 @@ pub mod gateway_interceptor {
 
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
-pub use inference::v1::*;
 pub use middleware::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
+
+/// Build a selector for one explicitly named workspace.
+pub fn workspace_selector(workspace: impl Into<String>) -> WorkspaceSelector {
+    WorkspaceSelector {
+        selection: Some(workspace_selector::Selection::Workspace(workspace.into())),
+    }
+}
+
+/// Build a selector for every workspace supported by a cross-workspace request.
+pub fn all_workspaces_selector() -> WorkspaceSelector {
+    WorkspaceSelector {
+        selection: Some(workspace_selector::Selection::AllWorkspaces(
+            AllWorkspaces {},
+        )),
+    }
+}

@@ -69,9 +69,43 @@
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        z3-static = pkgs.callPackage ./nix/pkgs/z3-static.nix { };
-        aws-lc-static = pkgs.callPackage ./nix/pkgs/aws-lc-static.nix { };
+        rustToolchain =
+          ((pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+            targets = map (toolchain: toolchain.target) (builtins.attrValues toolchains);
+          }).overrideAttrs
+            {
+              propagatedBuildInputs = [ ];
+              depsHostHostPropagated = [ ];
+              depsTargetTargetPropagated = [ ];
+            };
+        buildInputs = { pkgs, stdenv }: [
+          (pkgs.callPackage ./nix/pkgs/z3.nix { inherit stdenv; })
+          (pkgs.callPackage ./nix/pkgs/aws-lc.nix { inherit stdenv; })
+        ];
+        inherit (import ./nix/toolchain) mkToolchain;
+        toolchains = {
+          x86_64-gnu = mkToolchain {
+            pkgs = pkgs.pkgsCross.gnu64;
+            inherit buildInputs;
+          };
+          x86_64-musl = mkToolchain {
+            pkgs = pkgs.pkgsCross.musl64;
+            inherit buildInputs;
+          };
+          aarch64-gnu = mkToolchain {
+            pkgs = pkgs.pkgsCross.aarch64-multiplatform;
+            inherit buildInputs;
+          };
+          aarch64-musl = mkToolchain {
+            pkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
+            inherit buildInputs;
+          };
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          aarch64-darwin = mkToolchain {
+            inherit pkgs buildInputs;
+          };
+        };
         vmRuntime = pkgs.callPackage ./nix/pkgs/vm-runtime.nix { };
         testGuest = import ./nix/test-guest {
           inherit pkgs;
@@ -85,31 +119,10 @@
 
         packages.vm-runtime = vmRuntime;
 
-        devShells = {
-          default =
-            (pkgs.mkShell.override {
-              stdenv =
-                if pkgs.stdenv.hostPlatform.isLinux then
-                  pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv
-                else
-                  pkgs.stdenv;
-            })
-              {
-                packages = [
-                  rustToolchain
-                  z3-static
-                  aws-lc-static
-                ]
-                ++ commonDevShellPackages;
-              };
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
-            inherit pkgs rust-overlay commonDevShellPackages;
-          };
-          musl = import ./nix/devShells/musl.nix {
-            inherit pkgs rust-overlay commonDevShellPackages;
-          };
+        devShells.default = pkgs.mkShellNoCC {
+          packages = [ rustToolchain ] ++ commonDevShellPackages;
+
+          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
         };
 
         formatter = treefmtEval.config.build.wrapper;

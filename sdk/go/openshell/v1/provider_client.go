@@ -35,8 +35,8 @@ func (p *providerClient) Refresh() RefreshInterface {
 
 func (p *providerClient) Create(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	resp, err := p.client.CreateProvider(ctx, &pb.CreateProviderRequest{
-		Provider:  converter.ProviderToProto(provider),
-		Workspace: workspace,
+		Provider:       converter.ProviderToProto(provider),
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -46,8 +46,8 @@ func (p *providerClient) Create(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Provider, error) {
 	resp, err := p.client.GetProvider(ctx, &pb.GetProviderRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -55,39 +55,48 @@ func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Prov
 	return converter.ProviderFromProto(resp.GetProvider()), nil
 }
 
-func (p *providerClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error) {
-	req := &pb.ListProvidersRequest{
-		Workspace: workspace,
-	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-		req.AllWorkspaces = opts[0].AllWorkspaces
-	}
-
-	resp, err := p.client.ListProviders(ctx, req)
+func (p *providerClient) List(workspace string, opts ...ListOptions) (*Pager[*Provider], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken string
+	var allWorkspaces bool
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+		allWorkspaces = opts[0].AllWorkspaces
+	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Provider], error) {
+		req := &pb.ListProvidersRequest{WorkspaceScope: workspaceScope, PageSize: pageSize, PageToken: pageToken}
+		resp, err := p.client.ListProviders(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		providers := make([]*Provider, 0, len(resp.GetProviders()))
+		for _, proto := range resp.GetProviders() {
+			providers = append(providers, converter.ProviderFromProto(proto))
+		}
+		return &Page[*Provider]{Items: providers, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	providers := make([]*Provider, 0, len(resp.GetProviders()))
-	for _, proto := range resp.GetProviders() {
-		providers = append(providers, converter.ProviderFromProto(proto))
+func (p *providerClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return providers, nil
+	return pager.All(ctx)
 }
 
 func (p *providerClient) Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	proto := converter.ProviderToProto(provider)
 	req := &pb.UpdateProviderRequest{
-		Provider:  proto,
-		Workspace: workspace,
+		Provider:       proto,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if proto != nil {
 		req.CredentialExpiresAtMs = proto.CredentialExpiresAtMs
@@ -102,8 +111,8 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Delete(ctx context.Context, workspace, name string) error {
 	_, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

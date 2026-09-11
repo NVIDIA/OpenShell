@@ -38,11 +38,19 @@ func (c *fakeServiceClient) Get(_ context.Context, _, _, _ string) (*types.Servi
 }
 
 // List returns Unimplemented.
-func (c *fakeServiceClient) List(_ context.Context, _, _ string, _ ...v1.ListOptions) ([]*types.ServiceEndpoint, error) {
+func (c *fakeServiceClient) List(_, _ string, _ ...v1.ListOptions) (*v1.Pager[*types.ServiceEndpoint], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "List is not supported by the fake client"}
+}
+
+// ListAll returns Unimplemented.
+func (c *fakeServiceClient) ListAll(_ context.Context, _, _ string, _ ...v1.ListOptions) ([]*types.ServiceEndpoint, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "ListAll is not supported by the fake client"}
 }
 
 // Delete returns Unimplemented.

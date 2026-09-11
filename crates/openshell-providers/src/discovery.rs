@@ -67,7 +67,7 @@ pub fn discover_from_profile(
     }
 
     if profile.id == "google-vertex-ai" {
-        for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
+        for key in crate::VERTEX_AI_CONFIG_KEY_NAMES {
             if let Some(value) = context.env_var(key)
                 && !value.trim().is_empty()
             {

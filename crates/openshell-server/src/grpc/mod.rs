@@ -68,24 +68,6 @@ use tonic::{Request, Response, Status};
 
 use crate::ServerState;
 
-// ---------------------------------------------------------------------------
-// Public re-exports
-// ---------------------------------------------------------------------------
-
-/// Maximum number of records a single list RPC may return.
-///
-/// Client-provided `limit` values are clamped to this ceiling to prevent
-/// unbounded memory allocation from an excessively large page request.
-pub const MAX_PAGE_SIZE: u32 = 1000;
-
-/// Clamp a client-provided page `limit`.
-///
-/// Returns `default` when `raw` is 0 (the protobuf zero-value convention),
-/// otherwise returns the smaller of `raw` and `max`.
-pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
-    if raw == 0 { default } else { raw.min(max) }
-}
-
 /// Map a `PersistenceError` to an appropriate gRPC `Status`.
 ///
 /// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
@@ -190,19 +172,6 @@ enum StoredSettingValue {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
-
-/// Validate that object metadata is present and contains required fields.
-///
-/// This is a crate-level helper that wraps the validation module's implementation.
-/// Use this from modules outside of `grpc` that need to validate metadata.
-// `tonic::Status` is large but is the API surface of gRPC handlers.
-#[allow(clippy::result_large_err)]
-pub fn validate_object_metadata(
-    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
-    resource_type: &str,
-) -> Result<(), Status> {
-    validation::validate_object_metadata(metadata, resource_type)
-}
 
 // ---------------------------------------------------------------------------
 // Service struct
@@ -944,31 +913,6 @@ mod tests {
         MemoryResourceCapabilities as DriverMemoryResourceCapabilities,
         ResourceCapabilities as DriverResourceCapabilities,
     };
-
-    #[test]
-    fn clamp_limit_zero_returns_default() {
-        assert_eq!(clamp_limit(0, 100, MAX_PAGE_SIZE), 100);
-        assert_eq!(clamp_limit(0, 50, MAX_PAGE_SIZE), 50);
-    }
-
-    #[test]
-    fn clamp_limit_within_range_passes_through() {
-        assert_eq!(clamp_limit(1, 100, MAX_PAGE_SIZE), 1);
-        assert_eq!(clamp_limit(500, 100, MAX_PAGE_SIZE), 500);
-        assert_eq!(
-            clamp_limit(MAX_PAGE_SIZE, 100, MAX_PAGE_SIZE),
-            MAX_PAGE_SIZE
-        );
-    }
-
-    #[test]
-    fn clamp_limit_exceeding_max_is_capped() {
-        assert_eq!(
-            clamp_limit(MAX_PAGE_SIZE + 1, 100, MAX_PAGE_SIZE),
-            MAX_PAGE_SIZE
-        );
-        assert_eq!(clamp_limit(u32::MAX, 100, MAX_PAGE_SIZE), MAX_PAGE_SIZE);
-    }
 
     #[test]
     fn public_resource_capabilities_preserves_reported_fields() {

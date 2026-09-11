@@ -69,7 +69,13 @@ def test_create_sandbox_rejects_root_user(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "root" in exc_info.value.details().lower()
@@ -93,7 +99,13 @@ def test_create_sandbox_rejects_path_traversal(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "traversal" in exc_info.value.details().lower()
@@ -117,7 +129,13 @@ def test_create_sandbox_rejects_overly_broad_paths(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "broad" in exc_info.value.details().lower()
@@ -153,7 +171,7 @@ def test_create_sandbox_materializes_default_mcp_version(
         stored = sandbox_client._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
                 name=created.name,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         stored_endpoint = stored.sandbox.spec.policy.network_policies[
@@ -210,6 +228,9 @@ def test_update_policy_rejects_immutable_fields(
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateConfig(
                 openshell_pb2.UpdateConfigRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     name=sandbox_name,
                     policy=unsafe_policy,
                 )

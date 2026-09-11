@@ -115,10 +115,8 @@ jobs:
         include:
           - triple: x86_64-unknown-linux-musl
             runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.musl
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.musl
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-conformance-cli
@@ -126,7 +124,6 @@ jobs:
       artifact-name: openshell-conformance-${{ matrix.triple }}
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
@@ -158,12 +155,8 @@ jobs:
         include:
           - triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.glibc-2-28
-            interpreter: /lib64/ld-linux-x86-64.so.2
           - triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.glibc-2-28
-            interpreter: /lib/ld-linux-aarch64.so.1
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-gateway
@@ -171,10 +164,8 @@ jobs:
       artifact-name: openshell-gateway-plain-${{ matrix.triple }}
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       extra-cargo-flags: --no-default-features
-      interpreter: ${{ matrix.interpreter }}
     secrets: inherit
 
   build-driver-docker:
@@ -188,9 +179,7 @@ jobs:
       binary: openshell-driver-docker
       triple: aarch64-unknown-linux-gnu
       runner: linux-arm64-cpu8
-      dev-shell: .#devShells.aarch64-linux.glibc-2-28
       cargo-version: ${{ needs.version.outputs.cargo }}
-      interpreter: /lib/ld-linux-aarch64.so.1
     secrets: inherit
 
   build-driver-podman:
@@ -204,9 +193,7 @@ jobs:
       binary: openshell-driver-podman
       triple: x86_64-unknown-linux-gnu
       runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.glibc-2-28
       cargo-version: ${{ needs.version.outputs.cargo }}
-      interpreter: /lib64/ld-linux-x86-64.so.2
     secrets: inherit
 
   build-driver-kubernetes:
@@ -220,9 +207,7 @@ jobs:
       binary: openshell-driver-kubernetes
       triple: x86_64-unknown-linux-gnu
       runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.glibc-2-28
       cargo-version: ${{ needs.version.outputs.cargo }}
-      interpreter: /lib64/ld-linux-x86-64.so.2
     secrets: inherit
 
   build-vm-driver:

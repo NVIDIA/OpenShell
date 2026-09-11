@@ -15,7 +15,7 @@ For the field-by-field YAML reference, use
 | Filesystem | Landlock restricts read-only and read-write paths. |
 | Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
 | Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
-| Inference | `inference.local` is configured through gateway inference settings, not OPA network policy. |
+| Provider access | Attached provider profiles contribute endpoint and binary rules; credentials remain bound to profile-authorized endpoints. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
 Filesystem and process policy are startup-time controls. Network policy is
@@ -144,13 +144,25 @@ requires removing the endpoint or replacing the policy.
 
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
-placeholders require rewrite. REST bodies can continue streaming when body
-rewrite is disabled, but the relay withholds enough trailing bytes to detect a
-placeholder split across reads before forwarding its marker. Explicitly opted-in
+placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
+complete placeholder candidates until a request-scoped metadata snapshot can
+classify them. Authoritatively unknown keys and valid credentials with a current
+binding pass unchanged, including references bound to the destination itself.
+Revoked or invalid identities and unavailable classification state
+fail closed. Classification never substitutes secret values and shares the request's
+credential revision; stale credential or policy generations terminate forwarding.
+Header rewriting scans only headers. Body bytes received in the initial proxy
+read follow the same body classifier or explicit rewriter as later reads.
+Candidates are limited to 4096 wire bytes, including percent encoding. Malformed
+or oversized candidates fail closed; HTTP trailers retain prefix-based rejection. Explicitly opted-in
 endpoints retain raw passthrough behavior.
 
+Body denials return `credential_placeholder_in_request_body` in a local HTTP 403
+response and discard any partially written upstream request. Safe preceding bytes
+may already have reached upstream.
+
 Denials emit both the relevant network activity and a detection finding. Events
-identify only the destination, policy, and traffic surface; they never include
+identify only the destination, policy, traffic surface, and controlled denial reason; they never include
 credential names, placeholders, body content, or secret values.
 
 Credential provenance is gateway-derived and deliberately absent from the policy

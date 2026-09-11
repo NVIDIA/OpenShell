@@ -480,7 +480,10 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -493,7 +496,10 @@ impl OpenShell for TestOpenShell {
             .collect::<Vec<_>>();
         profiles.extend(self.state.profiles.lock().await.values().cloned());
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse { profiles },
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
         ))
     }
 
@@ -1357,7 +1363,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "table",
         "default",
@@ -1428,7 +1434,7 @@ async fn provider_list_json_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -1471,7 +1477,7 @@ async fn provider_list_yaml_output() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "yaml",
         "default",
@@ -1499,7 +1505,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
-        0,
+        "",
         false,
         "json",
         "default",
@@ -2920,7 +2926,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         })
         .await
         .expect("get provider should succeed")

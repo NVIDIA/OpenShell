@@ -711,7 +711,7 @@ where
         client.write_all(&head).await.into_diagnostic()?;
         if matches!(framing, ResponseFraming::Chunked) {
             for unit in &finish.body_units {
-                write_chunk(client, unit).await?;
+                write_downstream_response_chunk(client, unit).await?;
             }
             write_response_trailers(client, &finish.trailers).await?;
         } else {
@@ -722,7 +722,7 @@ where
     } else {
         for unit in &finish.body_units {
             if chunked_output {
-                write_chunk(client, unit).await?;
+                write_downstream_response_chunk(client, unit).await?;
             } else {
                 client.write_all(unit).await.into_diagnostic()?;
             }

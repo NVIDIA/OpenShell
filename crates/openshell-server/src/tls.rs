@@ -15,7 +15,7 @@ use notify::event::EventKind;
 use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs::sign;
@@ -473,8 +473,8 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
-fn tls_ocsf_ctx() -> SandboxContext {
-    SandboxContext {
+fn tls_ocsf_ctx() -> EventContext {
+    EventContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
         container_image: "openshell/gateway".to_string(),

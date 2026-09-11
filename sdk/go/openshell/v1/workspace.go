@@ -39,9 +39,11 @@ const (
 type WorkspaceInterface interface {
 	Create(ctx context.Context, name string, labels map[string]string) (*Workspace, error)
 	Get(ctx context.Context, name string) (*Workspace, error)
-	List(ctx context.Context, opts ...ListOptions) ([]*Workspace, error)
+	List(opts ...ListOptions) (*Pager[*Workspace], error)
+	ListAll(ctx context.Context, opts ...ListOptions) ([]*Workspace, error)
 	Delete(ctx context.Context, name string) error
 	AddMember(ctx context.Context, workspace, principalSubject string, role WorkspaceRole) (*WorkspaceMember, error)
 	RemoveMember(ctx context.Context, workspace, principalSubject string) error
-	ListMembers(ctx context.Context, workspace string, opts ...ListOptions) ([]*WorkspaceMember, error)
+	ListMembers(workspace string, opts ...ListOptions) (*Pager[*WorkspaceMember], error)
+	ListAllMembers(ctx context.Context, workspace string, opts ...ListOptions) ([]*WorkspaceMember, error)
 }

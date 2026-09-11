@@ -291,7 +291,7 @@ mod tests {
 
     use openshell_core::proto::{
         CreateProviderRequest, CreateSandboxRequest, GpuResourceRequirements, Provider,
-        SandboxSpec, UpdateConfigRequest,
+        SandboxSpec, UpdateConfigRequest, workspace_selector,
     };
     use prost::Message as _;
     use prost_types::{
@@ -315,7 +315,7 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
             annotations: HashMap::new(),
-            workspace: String::new(),
+            workspace_scope: Some(workspace_selector("default")),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
         };
@@ -345,7 +345,7 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "us-west".to_string())]),
                 ..Provider::default()
             }),
-            workspace: String::new(),
+            workspace_scope: Some(workspace_selector("default")),
         };
         let encoded = request.encode_to_vec();
 
@@ -369,7 +369,6 @@ mod tests {
         let codec = ProtoJsonCodec::openshell().unwrap();
         for (message_name, field_name) in [
             ("openshell.datamodel.v1.Provider", "credentials"),
-            ("openshell.inference.v1.ResolvedRoute", "api_key"),
             ("openshell.compute.v1.DriverSandboxSpec", "sandbox_token"),
             ("openshell.v1.IssueSandboxTokenResponse", "token"),
             ("openshell.v1.RefreshSandboxTokenResponse", "token"),
@@ -378,10 +377,6 @@ mod tests {
             ("openshell.v1.RevokeSshSessionRequest", "token"),
             ("openshell.v1.TcpForwardInit", "authorization_token"),
             ("openshell.v1.SshSession", "token"),
-            (
-                "openshell.v1.StoredProviderCredentialRefreshState",
-                "material",
-            ),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
             (
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",
@@ -405,6 +400,7 @@ mod tests {
                 environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
                 ..SandboxSpec::default()
             }),
+            workspace_scope: Some(workspace_selector("default")),
             ..CreateSandboxRequest::default()
         };
 
@@ -459,6 +455,7 @@ mod tests {
                 "openshell.nvidia.com/policy-signature".to_string(),
                 "signed".to_string(),
             )]),
+            workspace_scope: Some(workspace_selector("default")),
             ..Default::default()
         };
         let bytes = request.encode_to_vec();
