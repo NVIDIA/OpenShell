@@ -3214,7 +3214,9 @@ func (x *ListSandboxesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelecto
 	return nil
 }
 
-// List providers attached to a sandbox request.
+// List providers attached to a sandbox request. A sandbox can have at most 32
+// attached providers, so this bounded list intentionally has no pagination
+// fields.
 type ListSandboxProvidersRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox name (canonical lookup key).
@@ -3687,7 +3689,8 @@ func (x *ListSandboxesResponse) GetNextPageToken() string {
 
 // List providers attached to a sandbox response.
 type ListSandboxProvidersResponse struct {
-	state         protoimpl.MessageState  `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The complete bounded set of providers attached to the sandbox.
 	Providers     []*datamodelv1.Provider `protobuf:"bytes,1,rep,name=providers,proto3" json:"providers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
