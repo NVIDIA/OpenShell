@@ -21,6 +21,13 @@ The target deployment flow is:
 
 If supervisor sessions fail with a protocol revision mismatch, check that custom supervisor images match the gateway release. The gateway accepts its current internal protocol revision, the immediately previous revision through polling compatibility, and supervisors that predate the handshake for one release. Authentication success does not make other revisions compatible. The gateway logs compatibility sessions and counts them in `openshell_supervisor_protocol_previous_sessions_total` or `openshell_supervisor_protocol_legacy_sessions_total`; recreate those sandboxes before compatibility is removed. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md).
 
+Current supervisors must receive their complete desired-state bootstrap before
+gateway-owned policy, provider state, networking, or the workload is initialized.
+If startup stalls or fails, inspect gateway snapshot-build and bootstrap-result
+logs together with the supervisor session logs. Current supervisors do not use
+settings or provider fetch polling; polling messages indicate a revision 1 or
+revision 0 compatibility session.
+
 The `openshell-gateway` composition crate explicitly installs its compiled
 Docker, Podman, Kubernetes, and VM registrations at startup; `openshell-server`
 does not link compute-driver crates. Custom gateway binaries may include a
@@ -542,9 +549,10 @@ restart it with a fresh listener. If the process supervisor fails before
 launching the workload,
 inspect both containers for control-socket bind, connect, bootstrap, or update
 errors. If new SSH/exec sessions do not pick up refreshed provider environment,
-inspect the network sidecar settings-poll logs and the process container logs
-for provider environment update handling; the process container should consume
-newer provider-env revisions without receiving gateway credentials.
+inspect the network sidecar configuration-delivery logs and the process
+container logs for provider environment update handling; the process container
+should consume newer provider-env revisions without receiving gateway
+credentials.
 
 The process container reports the workload entrypoint PID over the same control
 socket, and the network sidecar uses that PID for binary-scoped policy

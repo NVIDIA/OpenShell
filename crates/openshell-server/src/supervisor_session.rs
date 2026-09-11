@@ -27,6 +27,7 @@ use openshell_core::proto::{
     SUPERVISOR_PROTOCOL_REVISION,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
+use openshell_core::{ObjectId, ObjectWorkspace};
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
@@ -35,6 +36,8 @@ use crate::config_delivery::{
 };
 #[cfg(test)]
 use crate::config_delivery::{LocalSupervisorConfigRouter, SupervisorConfigRouter};
+use crate::persistence::{CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, ObjectType, current_time_ms};
+use crate::storage_proto::StoredConfigComponentObservation;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,6 +55,12 @@ const MAX_PENDING_RELAYS: usize = 256;
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
+
+impl ObjectType for StoredConfigComponentObservation {
+    fn object_type() -> &'static str {
+        CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -1628,6 +1637,7 @@ async fn record_component_apply_result(
         "outcome" => outcome.as_str_name(),
     )
     .increment(1);
+    record_config_component_observation(state, sandbox_id, component, outcome, result).await?;
     if component != ConfigComponent::SandboxConfig {
         return Ok(());
     }
@@ -1668,6 +1678,68 @@ async fn record_component_apply_result(
         "stream",
     )
     .await
+}
+
+async fn record_config_component_observation(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    component: ConfigComponent,
+    outcome: ConfigApplyOutcome,
+    result: &ConfigComponentApplyResult,
+) -> Result<(), Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("fetch sandbox for observation failed: {error}"))
+        })?
+        .ok_or_else(|| Status::not_found("sandbox not found while recording observation"))?;
+    let component_name = match component {
+        ConfigComponent::SandboxConfig => "sandbox_config",
+        ConfigComponent::ProviderEnvironment => "provider_environment",
+        ConfigComponent::Unspecified => "unspecified",
+    };
+    let observation_id = format!("{sandbox_id}:{component_name}");
+    let now_ms = current_time_ms();
+    let sanitized_error = result
+        .failure
+        .as_ref()
+        .map(|failure| failure.message.chars().take(1024).collect())
+        .unwrap_or_default();
+    let observation = StoredConfigComponentObservation {
+        metadata: Some(openshell_core::proto::ObjectMeta {
+            id: observation_id.clone(),
+            name: observation_id,
+            workspace: sandbox.object_workspace().to_string(),
+            created_at_ms: now_ms,
+            ..Default::default()
+        }),
+        sandbox_id: sandbox.object_id().to_string(),
+        component: component.into(),
+        requested_revision: result.requested_revision,
+        applied_revision: result.applied_revision,
+        outcome: outcome.into(),
+        effective_source: match outcome {
+            ConfigApplyOutcome::RetainedLocalOverride => "local_override",
+            ConfigApplyOutcome::FailedRetainedLastKnownGood => "last_known_good",
+            ConfigApplyOutcome::FailedClosed => "fail_closed",
+            ConfigApplyOutcome::Degraded => "gateway_degraded",
+            ConfigApplyOutcome::Unspecified
+            | ConfigApplyOutcome::Applied
+            | ConfigApplyOutcome::IgnoredDuplicate
+            | ConfigApplyOutcome::IgnoredStale
+            | ConfigApplyOutcome::Unsupported => "gateway",
+        }
+        .to_string(),
+        observed_at_ms: now_ms,
+        sanitized_error,
+    };
+    state
+        .store
+        .put_scoped_message(&observation, sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("persist component observation failed: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1817,6 +1889,52 @@ mod tests {
             .await
             .unwrap();
         state
+    }
+
+    #[tokio::test]
+    async fn component_apply_result_persists_compact_observed_state() {
+        let state = state_with_sandbox("sb-observed").await;
+        let requested_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(11)),
+        };
+        let applied_revision = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
+        };
+        record_component_apply_result(
+            &state,
+            "sb-observed",
+            &ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(requested_revision),
+                applied_revision: Some(applied_revision),
+                outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood.into(),
+                failure: Some(openshell_core::proto::ConfigApplyFailure {
+                    message: "x".repeat(2_000),
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let observation = state
+            .store
+            .get_message::<StoredConfigComponentObservation>("sb-observed:provider_environment")
+            .await
+            .unwrap()
+            .expect("component observation");
+        assert_eq!(observation.sandbox_id, "sb-observed");
+        assert_eq!(
+            observation.component,
+            ConfigComponent::ProviderEnvironment as i32
+        );
+        assert_eq!(
+            observation.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood as i32
+        );
+        assert_eq!(observation.effective_source, "last_known_good");
+        assert_eq!(observation.sanitized_error.len(), 1_024);
+        assert!(observation.observed_at_ms > 0);
     }
 
     async fn first_gateway_message(

@@ -46,6 +46,7 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_mins(1);
+const SESSION_PREPARE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// A stream-delivered desired-state payload awaiting application by the
 /// sandbox runtime. The response travels back over `ConnectSupervisor`.
@@ -58,6 +59,33 @@ pub enum ConfigApplyRequest {
         update: ConfigUpdate,
         response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
     },
+}
+
+/// A revision-2 supervisor session that has received its required bootstrap.
+///
+/// It has not yet reported runtime initialization. Holding the stream open
+/// across sandbox construction makes the bootstrap the source of initial
+/// gateway-owned state rather than a later reconciliation input.
+pub struct PreparedSupervisorSession {
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+    channel: grpc_client::AuthedChannel,
+    tx: mpsc::Sender<SupervisorMessage>,
+    inbound: tonic::Streaming<GatewayMessage>,
+    heartbeat_secs: u32,
+    protocol_revision: u32,
+    bootstrap: Option<ConfigBootstrap>,
+}
+
+impl PreparedSupervisorSession {
+    pub fn take_bootstrap(&mut self) -> Option<ConfigBootstrap> {
+        self.bootstrap.take()
+    }
+
+    pub fn uses_stream_configuration(&self) -> bool {
+        self.protocol_revision == SUPERVISOR_PROTOCOL_REVISION
+    }
 }
 
 #[derive(Default)]
@@ -367,7 +395,51 @@ pub fn spawn(
         instance_id,
         config_apply_tx,
     };
-    tokio::spawn(run_session_loop(config))
+    tokio::spawn(run_session_loop(config, None))
+}
+
+/// Establish the revision-2 control stream and receive its required bootstrap
+/// before gateway-owned runtime initialization begins.
+pub async fn prepare(
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
+    let prepared = tokio::time::timeout(
+        SESSION_PREPARE_TIMEOUT,
+        open_session(endpoint, sandbox_id, instance_id),
+    )
+    .await
+    .map_err(|_| "timed out waiting for supervisor session bootstrap")??;
+    if prepared.protocol_revision == SUPERVISOR_PROTOCOL_REVISION && prepared.bootstrap.is_none() {
+        return Err("revision-2 gateway omitted required configuration bootstrap".into());
+    }
+    Ok(prepared)
+}
+
+/// Resume a prepared startup session after the sandbox has installed the
+/// bootstrap and made its runtime endpoints ready.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_prepared(
+    prepared: PreparedSupervisorSession,
+    bootstrap_result: Option<ConfigBootstrapResult>,
+    ssh_socket_path: std::path::PathBuf,
+    netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
+    config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
+) -> tokio::task::JoinHandle<()> {
+    let config = SessionConfig {
+        endpoint: prepared.endpoint.clone(),
+        sandbox_id: prepared.sandbox_id.clone(),
+        ssh_socket_path,
+        netns_fd,
+        expected_ssh_peer_pid,
+        terminating,
+        instance_id: prepared.instance_id.clone(),
+        config_apply_tx: Some(config_apply_tx),
+    };
+    tokio::spawn(run_session_loop(config, Some((prepared, bootstrap_result))))
 }
 
 struct SessionConfig {
@@ -381,14 +453,22 @@ struct SessionConfig {
     config_apply_tx: Option<mpsc::Sender<ConfigApplyRequest>>,
 }
 
-async fn run_session_loop(config: SessionConfig) {
+async fn run_session_loop(
+    config: SessionConfig,
+    mut prepared: Option<(PreparedSupervisorSession, Option<ConfigBootstrapResult>)>,
+) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        match run_single_session(&config).await {
+        let result = if let Some((session, bootstrap_result)) = prepared.take() {
+            run_prepared_session(&config, session, bootstrap_result).await
+        } else {
+            run_single_session(&config).await
+        };
+        match result {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -416,11 +496,23 @@ async fn run_session_loop(config: SessionConfig) {
 async fn run_single_session(
     config: &SessionConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to the gateway. The same `Channel` is used for both the
-    // long-lived control stream and all data-plane `RelayStream` calls, so
-    // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
-    // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let prepared = open_session(
+        config.endpoint.clone(),
+        config.sandbox_id.clone(),
+        config.instance_id.clone(),
+    )
+    .await?;
+    run_prepared_session(config, prepared, None).await
+}
+
+async fn open_session(
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
+    // The same authenticated channel carries the long-lived control stream
+    // and all data-plane RelayStream calls.
+    let channel = grpc_client::connect_channel_pub(&endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -432,8 +524,8 @@ async fn run_single_session(
     // Send hello as the first message.
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: config.sandbox_id.clone(),
-            instance_id: config.instance_id.clone(),
+            sandbox_id: sandbox_id.clone(),
+            instance_id: instance_id.clone(),
             protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
         })),
     })
@@ -465,13 +557,45 @@ async fn run_single_session(
     validate_gateway_protocol_revision(accepted.protocol_revision)?;
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        &config.endpoint,
+        &endpoint,
         &accepted.session_id,
         heartbeat_secs,
     );
     ocsf_emit!(event);
 
-    if let Some(bootstrap) = accepted.bootstrap {
+    let protocol_revision = accepted.protocol_revision;
+    Ok(PreparedSupervisorSession {
+        endpoint,
+        sandbox_id,
+        instance_id,
+        channel,
+        tx,
+        inbound,
+        heartbeat_secs,
+        protocol_revision,
+        bootstrap: (protocol_revision == SUPERVISOR_PROTOCOL_REVISION)
+            .then_some(accepted.bootstrap)
+            .flatten(),
+    })
+}
+
+async fn run_prepared_session(
+    config: &SessionConfig,
+    mut prepared: PreparedSupervisorSession,
+    startup_result: Option<ConfigBootstrapResult>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let heartbeat_secs = prepared.heartbeat_secs;
+    let channel = prepared.channel;
+    let tx = prepared.tx;
+    let mut inbound = prepared.inbound;
+
+    if let Some(result) = startup_result {
+        tx.send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
+        })
+        .await
+        .map_err(|_| "failed to queue configuration bootstrap result")?;
+    } else if let Some(bootstrap) = prepared.bootstrap.take() {
         let result = apply_bootstrap(config, bootstrap).await;
         tx.send(SupervisorMessage {
             payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),

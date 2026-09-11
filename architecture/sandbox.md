@@ -23,17 +23,21 @@ only when the set is already empty; any other outcome fails the spawn.
 
 ## Startup Flow
 
-1. The compute runtime starts the workload with sandbox identity, callback
+1. The compute runtime starts the supervisor with sandbox identity, callback
    endpoint, TLS or secret material, image metadata, and initial command.
-2. The supervisor loads policy and runtime settings from local files or the
-   gateway, depending on mode.
-3. It prepares filesystem access, process restrictions, network namespace
+2. In gateway-backed mode, the supervisor opens `ConnectSupervisor` and
+   receives the complete desired-state bootstrap. Standalone mode reads its
+   explicit local files without opening a gateway session.
+3. It installs policy, settings, middleware, and provider state from that
+   authoritative source.
+4. It prepares filesystem access, process restrictions, network namespace
    routing, trust stores, and provider credential resolution.
-4. It launches the persisted canonical main-process argv and retains its PTY
+5. It starts the policy proxy and local SSH server, then launches the persisted
+   canonical main-process argv and retains its PTY
    or pipes in the main-session multiplexer.
-5. It starts the policy proxy and local SSH server.
-6. It opens a supervisor session back to the gateway for connect, exec, file
-   sync, config polling, and log push.
+6. After runtime endpoints are ready, it reports bootstrap application and
+   keeps the session open for desired-state delivery, connect, exec, file sync,
+   and log push.
 
 ## Isolation Layers
 
@@ -201,10 +205,9 @@ the registry. Public custom-CA PEM travels with the stable registration.
 
 The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
 gateway connection the supervisor opens, so the registry's clients and the
-polling loop that rotates them observe the same credentials. Configuration
-polling runs far more frequently than credentials expire, so the loop rotates
-only when a credential is missing or has passed four fifths of its lifetime,
-and bounds its sleep by the soonest rotation deadline.
+configuration loop that rotates them observe the same credentials. The loop
+rotates only when a credential is missing or has passed four fifths of its
+lifetime, and bounds its sleep by the soonest rotation deadline.
 
 Middleware cannot observe injected credentials, introduce credential
 placeholders, or mutate supervisor-owned credential, routing, or framing
@@ -487,6 +490,10 @@ Revision 2 supervisors require a complete bootstrap. The gateway uses the same
 bounded 45-second construction window as other snapshot builds and rejects the
 connection when construction fails. Revision 1 compatibility sessions retain
 the optional one-second bootstrap budget and use polling when it expires.
+The revision 2 supervisor opens the stream and consumes the bootstrap before it
+constructs gateway-owned policy, provider state, networking, or the workload.
+It reports bootstrap results after those components, the workload, and relay
+endpoints are ready.
 These payloads describe the latest effective state rather than
 the mutation that produced it. The gateway assigns ordering sequences within
 each session and component, while each snapshot retains its own content
@@ -496,7 +503,8 @@ Bootstrap components are independent read projections, not one atomic database
 snapshot. The sandbox configuration carries the provider-environment revision
 it was built against. The gateway retries bootstrap construction when that
 revision does not match the provider snapshot. Later component updates and
-polling repair changes committed while the other projections were being built.
+owner reconciliation repair changes committed while the other projections
+were being built.
 
 Configuration delivery goes through a gateway-owned routing boundary rather
 than exposing local supervisor channels to mutation handlers. The current
@@ -506,12 +514,15 @@ without changing publishers. Provider payloads can contain
 credentials, so the gateway does not persist or render complete stream
 messages in logs.
 
-The supervisor applies stream-delivered configuration through the same runtime
-primitives used by the compatibility poller. It reports the requested and
+The supervisor applies bootstrap and live stream snapshots through shared
+component runtime primitives. It reports the requested and
 active revisions plus a component-specific outcome on `ConnectSupervisor`.
 Sandbox-scoped policy results update only the matching policy-history row, so a
 late result cannot mark a newer revision loaded. Explicit local policy remains
-authoritative and produces a retained-local-override result.
+authoritative and produces a retained-local-override result. Other component
+results persist only compact observed state: requested and active revisions,
+outcome, effective source, observation time, and a bounded sanitized error.
+Delivered snapshots, including provider credentials, are never persisted.
 
 The gateway keeps one update in flight per session and component. It replaces
 the pending snapshot when newer desired state arrives, validates the update ID,
@@ -522,10 +533,11 @@ revisions suppress unchanged delivery, while failed or timed-out delivery is
 retried from current database state. Reconnect discards session delivery state
 and starts with a fresh bootstrap.
 
-Polling remains available during the mixed-version rollout. The gateway
-serializes construction per sandbox and component, and coalesces repeated
-mutations into the latest full snapshot. An enqueue result means only that the
-local stream queue accepted the message. A bounded scope fanout scheduler
+Revision 2 does not poll configuration fetch APIs. Polling remains available
+only to revision 1 and revision 0 supervisors during the mixed-version rollout.
+The gateway serializes construction per sandbox and component, and coalesces
+repeated mutations into the latest full snapshot. An enqueue result means only
+that the local stream queue accepted the message. A bounded scope fanout scheduler
 coalesces repeated workspace and global changes,
 and semaphores sized from the database pool bound delivery workers and snapshot
 builds. Fanout waits for worker capacity before admitting each recipient, so a
@@ -546,12 +558,11 @@ If policy construction fails, it reports the captured revision as `FAILED` with
 the original construction error. It never infers revision identity by comparing
 policy structure.
 
-This holds even when the initial policy is enriched with baseline paths during
-startup: the enriched revision the supervisor synced back to the gateway is the
-revision it acknowledges, so a successfully constructed initial policy never
-remains `Pending`. If the first poll returns a different revision, the supervisor
-processes it through the normal reload path instead of treating it as already
-loaded.
+Image-specific policy discovery and baseline enrichment can require one initial
+gateway synchronization. The supervisor commits that repair before runtime
+initialization, discards the mutation response, and reconnects so it installs
+only the fresh authoritative stream bootstrap. Compatibility supervisors retain
+the earlier enrichment and first-poll reconciliation path.
 
 A newer sandbox-scoped revision can carry the same non-empty effective policy
 hash as the currently loaded revision, for example when provenance changes
@@ -562,23 +573,23 @@ reconciliation succeeds. Global policies, local overrides, equal or older
 versions, and different hashes do not use this shortcut. Success telemetry is
 emitted only after the gateway accepts the resulting loaded-status report.
 
-Policy status delivery uses a FIFO background worker. Retryable delivery
-failures retain the ordered update and retry with capped exponential backoff;
-terminal errors are logged and discarded. The outbox is nonblocking and does
-not discard updates because of a fixed queue capacity, so status endpoint
-outages cannot block policy polling, enforcement, settings, or provider
-refreshes and cannot permanently lose the initial acknowledgement.
+Revision 2 policy status is recorded from the correlated stream result. The
+retained reporting RPC uses the same domain helper for compatibility
+supervisors. Retryable legacy status delivery uses a FIFO background worker so
+status endpoint outages do not block enforcement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
 not use the sandbox revision API and produce no acknowledgement. When explicit
 local Rego and data files are configured, the supervisor continues polling the
-gateway for settings and provider refreshes but never replaces the local OPA
-engine with a gateway policy revision.
+gateway for settings and provider refreshes only on the compatibility path; a
+revision 2 supervisor receives those components on the stream and never
+replaces the local OPA engine with a gateway policy revision.
 
 ## Failure Behavior
 
-- If gateway config polling fails, the sandbox keeps its last-known-good policy.
+- If a compatibility configuration poll fails, the sandbox keeps its
+  last-known-good policy.
 - If a live policy or middleware-registry update is invalid, the supervisor
   rejects the combined update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`

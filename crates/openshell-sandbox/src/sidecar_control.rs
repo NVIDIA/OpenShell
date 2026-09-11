@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct BootstrapData {
+    pub main_process_instance_id: String,
     pub policy_proto: openshell_core::proto::SandboxPolicy,
     pub provider_env_revision: u64,
     pub provider_env_generation: u64,
@@ -184,6 +185,7 @@ enum WireClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireServerMessage {
     BootstrapResponse {
+        main_process_instance_id: String,
         policy_proto: Vec<u8>,
         provider_env_revision: u64,
         provider_env_generation: u64,
@@ -215,6 +217,7 @@ impl BootstrapData {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn to_wire(&self) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
+            main_process_instance_id: self.main_process_instance_id.clone(),
             policy_proto: self.policy_proto.encode_to_vec(),
             provider_env_revision: self.provider_env_revision,
             provider_env_generation: self.provider_env_generation,
@@ -237,6 +240,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
 
     fn try_from(message: WireServerMessage) -> Result<Self> {
         let WireServerMessage::BootstrapResponse {
+            main_process_instance_id,
             policy_proto,
             provider_env_revision,
             provider_env_generation,
@@ -260,6 +264,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         )?;
 
         Ok(Self {
+            main_process_instance_id,
             policy_proto,
             provider_env_revision,
             provider_env_generation,
@@ -752,6 +757,7 @@ mod tests {
 
     fn bootstrap_message(policy: &SandboxPolicy) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
+            main_process_instance_id: "instance-1".to_string(),
             policy_proto: policy.encode_to_vec(),
             provider_env_revision: 0,
             provider_env_generation: 0,
@@ -826,6 +832,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("GITHUB_TOKEN".to_string(), "secret".to_string());
         let bootstrap = BootstrapData {
+            main_process_instance_id: "instance-1".to_string(),
             policy_proto: SandboxPolicy {
                 version: 7,
                 ..SandboxPolicy::default()
@@ -843,6 +850,7 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(received.main_process_instance_id, "instance-1");
         assert_eq!(received.policy_proto.version, 7);
         assert_eq!(received.provider_env_revision, 3);
         assert_eq!(received.provider_env_generation, 0);
@@ -865,6 +873,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: u64::MAX,
                 provider_env_generation: 7,
@@ -949,6 +958,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,
@@ -990,6 +1000,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,
@@ -1071,6 +1082,7 @@ mod tests {
         let _server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,
@@ -1106,6 +1118,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,
@@ -1136,6 +1149,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,
@@ -1167,6 +1181,7 @@ mod tests {
         let server = spawn_server(
             &socket,
             BootstrapData {
+                main_process_instance_id: "instance-1".to_string(),
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_env_generation: 0,

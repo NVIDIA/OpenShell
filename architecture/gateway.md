@@ -668,7 +668,9 @@ process-local supervisor registry. A future HA implementation can resolve the
 gateway that owns a session and forward the same typed message without changing
 mutation handlers.
 
-Current supervisors apply stream snapshots directly. Previous-revision
+Current supervisors establish the stream before gateway-owned runtime
+initialization, apply bootstrap and live snapshots directly, and persist only
+compact component observations from their results. Previous-revision
 supervisors retain polling as a rollout fallback, and owner reconciliation
 repairs missed or failed delivery from current database state. Snapshot build,
 fanout, or enqueue failure cannot fail a mutation that already committed.
