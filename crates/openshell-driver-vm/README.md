@@ -163,6 +163,17 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor through a protected per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
+Additional destination roots use the global
+`[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
+VM driver key. The gateway passes its normalized artifact to the managed driver
+through an internal option. Before each fresh or preserved-overlay launch, the
+driver validates the artifact, writes it read-only at
+`/etc/openshell-tls/network-additional-ca.crt`, and adds
+`--network-additional-ca-bundle` to the protected supervisor argument file.
+Restarting without the global setting removes stale material from the overlay.
+This trust augments destination roots and remains separate from callback mTLS
+and `proxy_ca_bundle`.
+
 For gateway-managed VM drivers, configure `guest_tls_ca`, `guest_tls_cert`, and
 `guest_tls_key` together under `[openshell.gateway]`; the gateway validates and
 injects that bundle into only the selected local driver. The standalone

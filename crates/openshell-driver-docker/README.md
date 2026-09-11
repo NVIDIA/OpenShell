@@ -187,6 +187,15 @@ mounted into the container and exposed with:
 
 HTTP endpoints reject TLS material because the supervisor would not use it.
 
+Additional sandbox destination roots use the global
+`[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
+Docker driver key. The gateway normalizes certificate-only PEM at startup. The
+in-process driver bind-mounts the gateway-owned artifact read-only at
+`/etc/openshell-tls/network-additional-ca.crt` and passes the operator-controlled
+`--network-additional-ca-bundle` argument. This trust augments default
+destination roots and remains separate from callback mTLS and corporate-proxy
+CA configuration.
+
 ## Corporate proxy, SPIFFE, and AppArmor
 
 `https_proxy`, `no_proxy`, and `proxy_auth_file` in

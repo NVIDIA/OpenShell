@@ -55,6 +55,11 @@ DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+if [ "${E2E_TEST_OVERRIDE}" = "additional_ca" ]; then
+  ADDITIONAL_CA_MODE=1
+  E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm,e2e-additional-ca}"
+fi
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -178,6 +183,10 @@ GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
 DRIVER_PID=""
 DRIVER_LOG="${RUN_STATE_DIR}/vm-driver.log"
 DRIVER_SOCKET="${RUN_STATE_DIR}/compute-driver.sock"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${RUN_STATE_DIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${RUN_STATE_DIR}/additional-ca"
+ADDITIONAL_CA_PORT=""
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
 
@@ -202,6 +211,7 @@ cleanup() {
     wait "${gateway_pid}" 2>/dev/null || true
   fi
   e2e_stop_process "${DRIVER_PID}" "external VM compute driver"
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
 
   # On failure, keep the VM console log for debugging. We deliberately
   # print it instead of leaving it on disk because the state dir gets
@@ -236,6 +246,19 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Launch the gateway + VM driver ───────────────────────────────────
+
+start_additional_ca_fixture() {
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the gateway-managed VM driver." >&2
+    exit 2
+  fi
+  start_additional_ca_fixture
+fi
 
 echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
@@ -281,6 +304,15 @@ gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
 
+EOF
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  cat >>"${GATEWAY_CONFIG}" <<EOF
+[openshell.supervisor.network]
+additional_ca_cert_paths = ["${ADDITIONAL_CA_DIR}/ca.crt"]
+
+EOF
+fi
+cat >>"${GATEWAY_CONFIG}" <<EOF
 [openshell.drivers.vm]
 EOF
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
@@ -374,6 +406,10 @@ fi
 
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  export OPENSHELL_E2E_GATEWAY_CONFIG="${GATEWAY_CONFIG}"
+fi
 e2e_export_gateway_restart_metadata \
   "${GATEWAY_BIN}" \
   "${GATEWAY_ARGS_FILE}" \

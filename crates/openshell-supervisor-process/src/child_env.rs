@@ -87,5 +87,15 @@ mod tests {
         assert!(stdout.contains("REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("GIT_SSL_CAINFO=/etc/openshell-tls/ca-bundle.pem"));
+
+        let keys = tls_env_vars(ca_cert_path, combined_bundle_path).map(|(key, _)| key);
+        assert!(
+            !keys.contains(&openshell_core::sandbox_env::TLS_CA),
+            "destination/child trust must not overwrite gateway mTLS trust"
+        );
+        assert_ne!(
+            ca_cert_path,
+            Path::new(openshell_core::container_paths::TLS_CA_MOUNT_PATH)
+        );
     }
 }

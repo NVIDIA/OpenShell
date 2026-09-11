@@ -62,6 +62,30 @@ maps an accepted proxy connection back to the workload socket by matching the
 complete local-to-remote TCP tuple before resolving every process that owns the
 socket inode.
 
+### Additional Destination Trust
+
+`[openshell.supervisor.network].additional_ca_cert_paths` adds operator-owned
+certificate authorities to sandbox destination TLS trust. Gateway startup reads
+and strictly normalizes the certificate-only PEM files into one bundle. An
+invalid source or staging failure aborts startup or sandbox provisioning rather
+than falling back to public roots. The bundle augments bundled, system, or
+native roots and preserves normal hostname verification.
+
+Drivers deliver the normalized material at their runtime boundary. Docker and
+Podman bind-mount a gateway-owned artifact. Kubernetes server-side-applies one
+gateway-scoped ConfigMap per target namespace; combined topology mounts it only
+in the agent container that runs the supervisor, while sidecar topology mounts
+it only in `openshell-network`. VM writes it into the per-sandbox overlay. All
+paths converge on `/etc/openshell-tls/network-additional-ca.crt` and the
+operator-controlled `--network-additional-ca-bundle` argument. The supervisor
+also includes these roots in its child-process trust files.
+
+Destination trust remains separate from corporate-proxy CA material, gateway
+listener TLS, OIDC trust, and sandbox-to-gateway mTLS through
+`OPENSHELL_TLS_CA`. Configuration is startup-only. Source changes require a
+gateway restart, and running sandboxes retain their initialized trust until
+recreated or restarted.
+
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
 the shared authorization result carries the process evidence and endpoint

@@ -121,6 +121,11 @@ DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_PORT=""
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
   echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
@@ -140,6 +145,7 @@ cleanup() {
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
   e2e_stop_process "${DRIVER_PID}" "external Docker compute driver"
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -192,6 +198,11 @@ cleanup() {
     echo "=== external Docker compute driver log ==="
     cat "${DRIVER_LOG}" || true
     echo "=== end external Docker compute driver log ==="
+  fi
+  if [ "${exit_code}" -ne 0 ] && [ -f "${ADDITIONAL_CA_SERVER_LOG}" ]; then
+    echo "=== additional CA HTTPS fixture log ==="
+    cat "${ADDITIONAL_CA_SERVER_LOG}" || true
+    echo "=== end additional CA HTTPS fixture log ==="
   fi
 
   rm -rf "${WORKDIR}" 2>/dev/null || true
@@ -263,6 +274,10 @@ connect_current_container_to_docker_network() {
 }
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the wrapper-managed Docker gateway." >&2
+    exit 2
+  fi
   case "${OPENSHELL_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
@@ -460,6 +475,19 @@ PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
+start_additional_ca_fixture() {
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+}
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: additional CA e2e requires the in-process Docker driver." >&2
+    exit 2
+  fi
+  start_additional_ca_fixture
+fi
+
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
@@ -476,6 +504,10 @@ export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  export OPENSHELL_E2E_GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+fi
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else
@@ -512,6 +544,11 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
       e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
     fi
+  fi
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    printf '[openshell.supervisor.network]\n'
+    printf 'additional_ca_cert_paths = [%s]\n\n' \
+      "$(toml_string "${ADDITIONAL_CA_DIR}/ca.crt")"
   fi
   printf '[openshell.drivers.docker]\n'
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then

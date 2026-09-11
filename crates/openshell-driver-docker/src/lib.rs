@@ -80,6 +80,8 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
@@ -267,6 +269,7 @@ struct DockerDriverRuntimeConfig {
     log_level: String,
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
+    network_trust_artifact: Option<PathBuf>,
     daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
@@ -542,6 +545,7 @@ impl DockerComputeDriver {
         gateway_bind_address: SocketAddr,
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
+        network_trust_artifact: Option<&Path>,
     ) -> CoreResult<Self> {
         docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
@@ -618,6 +622,7 @@ impl DockerComputeDriver {
                 log_level: gateway_log_level.to_string(),
                 supervisor_bin,
                 guest_tls,
+                network_trust_artifact: network_trust_artifact.map(Path::to_path_buf),
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
@@ -2780,6 +2785,36 @@ fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
     args
 }
 
+fn docker_network_trust_cli_args(network_trust_artifact: Option<&Path>) -> Vec<String> {
+    network_trust_artifact.map_or_else(Vec::new, |_| {
+        vec![
+            "--network-additional-ca-bundle".to_string(),
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+        ]
+    })
+}
+
+fn docker_network_trust_bind(path: &Path) -> Result<String, Status> {
+    let source = path.to_str().ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "network additional CA artifact path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    driver_mounts::validate_absolute_mount_source(source, "network additional CA artifact")
+        .map_err(Status::failed_precondition)?;
+    if !path.is_file() {
+        return Err(Status::failed_precondition(format!(
+            "failed to stage network additional CA artifact: '{}' does not exist or is not a file",
+            path.display()
+        )));
+    }
+    Ok(format!(
+        "{}:{NETWORK_ADDITIONAL_CA_BUNDLE_PATH}:ro,z",
+        path.display()
+    ))
+}
+
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -2789,6 +2824,9 @@ fn build_binds(
         config.supervisor_bin.display(),
         SUPERVISOR_MOUNT_PATH
     )];
+    if let Some(network_trust_artifact) = config.network_trust_artifact.as_deref() {
+        binds.push(docker_network_trust_bind(network_trust_artifact)?);
+    }
     if let Some(tls) = &config.guest_tls {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
         binds.push(format!(
@@ -3230,6 +3268,9 @@ fn build_container_create_body_for_image(
         cmd: {
             let mut args = vec!["--workdir".to_string(), workspace_root];
             args.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+            args.extend(docker_network_trust_cli_args(
+                config.network_trust_artifact.as_deref(),
+            ));
             Some(args)
         },
         labels: Some(labels),

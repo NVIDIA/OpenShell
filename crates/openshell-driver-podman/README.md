@@ -202,6 +202,16 @@ The supervisor reads these env vars and uses them to establish an mTLS
 connection back to the gateway. On SELinux systems, the bind mounts include
 Podman's shared relabel option so the container process can read the files.
 
+Destination trust uses a separate global gateway setting:
+`[openshell.supervisor.network].additional_ca_cert_paths`. The gateway
+normalizes that material once, and the in-process Podman driver mounts the
+gateway-owned artifact read-only at
+`/etc/openshell-tls/network-additional-ca.crt` and passes
+`--network-additional-ca-bundle` to the supervisor. This setting does not
+configure a corporate proxy and does not alter the gateway callback mTLS CA.
+The Podman-specific `proxy_ca_bundle` setting remains paired with
+`https_proxy` and retains its existing proxy validation and mount path.
+
 The RPM packaging auto-generates a self-signed PKI on first start via
 `openshell-gateway generate-certs`. Client certs are placed in the CLI
 auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so
@@ -402,7 +412,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set with an `http://` proxy; not required for `https://` proxies (the credential travels inside the verified TLS session) but tolerated if set. Rejected when no auth file is configured. |
 | `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
 | `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
-| `OPENSHELL_SANDBOX_PROXY_CA_BUNDLE` | `--sandbox-proxy-ca-bundle` | unset | Path (on the gateway host) to a PEM CA bundle trusted for the corporate proxy. Bind-mounted read-only into the sandbox (a CA certificate is not secret). Trusted for the `https://` proxy TLS handshake and, because TLS-intercepting proxies re-sign tunneled certificates, folded into the sandbox trust bundle and upstream verification. Requires a proxy URL; the file must exist and hold at least one certificate. |
+| `OPENSHELL_SANDBOX_PROXY_CA_BUNDLE` | `--sandbox-proxy-ca-bundle` | unset | Path (on the gateway host) to a PEM CA bundle trusted for the corporate proxy. Bind-mounted read-only into the sandbox (a CA certificate is not secret). Trusted for the `https://` proxy TLS handshake and, because TLS-intercepting proxies re-sign tunneled certificates, folded into the sandbox trust bundle and upstream verification. Requires a proxy URL; this is not the global destination CA setting. The file must exist and hold at least one certificate. |
 
 Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
 `proxy_auth_file`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname`,

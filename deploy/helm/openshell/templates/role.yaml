@@ -1,5 +1,8 @@
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
+{{- $workspaceResourcesEnabled := include "openshell.workspaceResourcesEnabled" . -}}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict -}}
+{{- $additionalCaEnabled := ne (get $supervisorNetwork "additionalCaConfigMapName" | default "") "" -}}
+{{- if and (eq $workspaceMode "shared") (or $workspaceResourcesEnabled $additionalCaEnabled) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -10,6 +13,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if $workspaceResourcesEnabled }}
   - apiGroups:
       - agents.x-k8s.io
     resources:
@@ -43,4 +47,17 @@ rules:
       - pods
     verbs:
       - get
+  {{- end }}
+  {{- if $additionalCaEnabled }}
+  # The Kubernetes driver server-side-applies one normalized destination CA
+  # ConfigMap in the shared sandbox namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - create
+      - patch
+  {{- end }}
 {{- end }}

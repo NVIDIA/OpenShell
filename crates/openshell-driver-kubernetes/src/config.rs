@@ -23,6 +23,23 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Prefix for the gateway-managed destination trust `ConfigMap`.
+pub const NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-network-additional-ca-";
+
+/// Key containing normalized destination CA certificates in the managed `ConfigMap`.
+pub const NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY: &str = "ca.crt";
+
+/// Derive the stable gateway-owned destination trust `ConfigMap` name.
+pub fn network_additional_ca_config_map_name(gateway_id: &str) -> Result<String, String> {
+    let name = format!("{NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX}{gateway_id}");
+    if !is_dns1123_subdomain(&name) {
+        return Err(format!(
+            "gateway_id '{gateway_id}' cannot be used for the network additional CA ConfigMap name"
+        ));
+    }
+    Ok(name)
+}
+
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
@@ -876,6 +893,25 @@ mod tests {
             cfg.workspace_default_storage_size,
             DEFAULT_WORKSPACE_STORAGE_SIZE
         );
+    }
+
+    #[test]
+    fn additional_ca_config_map_name_is_stable_and_gateway_scoped() {
+        assert_eq!(
+            network_additional_ca_config_map_name("gateway-a").unwrap(),
+            "openshell-network-additional-ca-gateway-a"
+        );
+        assert_ne!(
+            network_additional_ca_config_map_name("gateway-a").unwrap(),
+            network_additional_ca_config_map_name("gateway-b").unwrap()
+        );
+    }
+
+    #[test]
+    fn additional_ca_config_map_name_rejects_unusable_gateway_identity() {
+        let error = network_additional_ca_config_map_name(&"x".repeat(240)).unwrap_err();
+        assert!(error.contains("gateway_id"));
+        assert!(error.contains("ConfigMap"));
     }
 
     #[test]

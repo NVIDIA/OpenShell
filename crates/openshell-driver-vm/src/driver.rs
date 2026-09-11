@@ -10,10 +10,12 @@ use crate::lifecycle::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, remove_rootfs_image_file,
+    sandbox_guest_init_path, sandbox_guest_user_ids_from_image,
+    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
+#[cfg(test)]
+use crate::rootfs::{read_rootfs_image_file, stat_rootfs_image_file};
 use crate::runtime::VmBackend;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -163,6 +165,8 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
 const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+const GUEST_NETWORK_ADDITIONAL_CA_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
@@ -262,6 +266,10 @@ pub struct VmDriverConfig {
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
+    /// Gateway-owned normalized destination trust artifact. This internal
+    /// launch input is not part of the VM driver TOML contract.
+    #[serde(skip)]
+    pub network_additional_ca_bundle: Option<PathBuf>,
     /// Corporate forward proxy settings delivered to the guest init script.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
@@ -315,6 +323,10 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field(
+                "network_additional_ca_bundle_configured",
+                &self.network_additional_ca_bundle.is_some(),
+            )
             .field("gpu_enabled", &self.gpu_enabled)
             .field("gpu_mem_mib", &self.gpu_mem_mib)
             .field("gpu_vcpus", &self.gpu_vcpus)
@@ -378,6 +390,7 @@ impl Default for VmDriverConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            network_additional_ca_bundle: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
@@ -406,6 +419,13 @@ impl VmDriverConfig {
 
     pub fn validate_runtime_security_config(&self) -> Result<(), String> {
         self.upstream_proxy.validate()?;
+        if self
+            .network_additional_ca_bundle
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("network_additional_ca_bundle must not be empty when set".to_string());
+        }
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err("proxy_ca_bundle must not be empty when set".to_string());
@@ -1229,7 +1249,7 @@ impl VmDriver {
 
         // Staged on every launch, including a restart onto a preserved
         // overlay, so the driver's copy always shadows the image layer.
-        if let Err(err) = inject_guest_upstream_proxy(&overlay_disk, &self.config).await {
+        if let Err(err) = inject_guest_supervisor_configuration(&overlay_disk, &self.config).await {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
@@ -6208,7 +6228,7 @@ fn inject_guest_init_dropins(
 /// which sandbox spec/template environment and image `ENV` cannot influence.
 /// Credentials are never on argv — only the root-only guest path is passed;
 /// the supervisor reads the credential from that file.
-fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
+fn supervisor_cli_args(config: &VmDriverConfig) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = &config.upstream_proxy.https_proxy {
         args.push("--upstream-proxy".to_string());
@@ -6238,6 +6258,10 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
         args.push("--upstream-proxy-ca-bundle".to_string());
         // The guest path, never the gateway-host path the operator configured.
         args.push(GUEST_PROXY_CA_PATH.to_string());
+    }
+    if config.network_additional_ca_bundle.is_some() {
+        args.push("--network-additional-ca-bundle".to_string());
+        args.push(GUEST_NETWORK_ADDITIONAL_CA_PATH.to_string());
     }
     args
 }
@@ -6320,17 +6344,47 @@ async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
     })
 }
 
-/// Stage the corporate upstream-proxy configuration into the guest overlay.
+/// Read and validate the gateway-owned normalized destination trust artifact.
 ///
-/// Writes three files into the overlay upperdir the driver owns:
+/// This check happens for every sandbox preparation, including preserved
+/// overlays, so a missing, replaced, non-regular, oversized, or unusable
+/// artifact fails before VM launch. Certificate contents never appear in the
+/// returned diagnostic.
+async fn read_sandbox_network_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
+    let path_owned = path.to_path_buf();
+    let display_path = path.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        let path = path_owned
+            .to_str()
+            .ok_or_else(|| "network additional CA artifact path is not valid UTF-8".to_string())?;
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            path,
+            "network additional CA artifact",
+        )
+        .map(String::into_bytes)
+    })
+    .await
+    .map_err(|err| Status::internal(format!("network additional CA read task failed: {err}")))?
+    .map_err(|err| {
+        Status::failed_precondition(format!(
+            "network additional CA artifact '{display_path}' could not be staged: {err}"
+        ))
+    })
+}
+
+/// Stage operator-owned supervisor configuration into the guest overlay.
+///
+/// Writes the proxy files, destination trust bundle, and driver-owned
+/// supervisor argument list into the overlay upperdir:
 ///
 /// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
 /// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
 ///   is not secret);
+/// * the destination CA at [`GUEST_NETWORK_ADDITIONAL_CA_PATH`], mode `0444`;
 /// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
 ///   `0644`.
 ///
-/// Both are written on every launch, empty when the corresponding
+/// The proxy files and argument marker are written on every launch, empty when the corresponding
 /// setting is absent. Writing rather than skipping is what makes the channel
 /// unforgeable: the upperdir copy always shadows the read-only image layer, so
 /// a sandbox image cannot supply its own arguments or credential by baking a
@@ -6343,7 +6397,7 @@ async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
 /// delivery the per-sandbox gateway JWT already uses. It is removed with the
 /// sandbox when the state directory is deleted.
 #[allow(clippy::result_large_err)]
-async fn inject_guest_upstream_proxy(
+async fn inject_guest_supervisor_configuration(
     overlay_disk: &Path,
     config: &VmDriverConfig,
 ) -> Result<(), Status> {
@@ -6371,7 +6425,28 @@ async fn inject_guest_upstream_proxy(
     set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
         .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
 
-    let args = upstream_proxy_cli_args(config);
+    let network_ca_path = overlay_upper_path(GUEST_NETWORK_ADDITIONAL_CA_PATH);
+    if let Some(path) = config.network_additional_ca_bundle.as_deref() {
+        let network_ca = read_sandbox_network_ca_bundle(path).await?;
+        write_rootfs_image_file(overlay_disk, &network_ca_path, &network_ca).map_err(|err| {
+            Status::internal(format!(
+                "write VM guest network additional CA bundle: {err}"
+            ))
+        })?;
+        set_rootfs_image_file_mode(overlay_disk, &network_ca_path, 0o444).map_err(|err| {
+            Status::internal(format!(
+                "set VM guest network additional CA bundle mode: {err}"
+            ))
+        })?;
+    } else {
+        remove_rootfs_image_file(overlay_disk, &network_ca_path).map_err(|err| {
+            Status::internal(format!(
+                "remove VM guest network additional CA bundle: {err}"
+            ))
+        })?;
+    }
+
+    let args = supervisor_cli_args(config);
     validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
     let guest_path = overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH);
     write_rootfs_image_file(
@@ -10621,7 +10696,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_material_is_staged_inside_the_per_sandbox_overlay() {
+    fn operator_material_is_staged_inside_the_per_sandbox_overlay() {
         // Everything the driver stages lands in the overlay upperdir, which
         // lives in the sandbox's own state directory. That is what makes the
         // credential removable with the sandbox (remove_sandbox_state_dir
@@ -10630,11 +10705,14 @@ mod tests {
         for guest_path in [
             GUEST_UPSTREAM_PROXY_AUTH_PATH,
             GUEST_PROXY_CA_PATH,
+            GUEST_NETWORK_ADDITIONAL_CA_PATH,
             GUEST_SUPERVISOR_ARGS_PATH,
         ] {
             assert!(
-                guest_path.starts_with("/opt/openshell/"),
-                "{guest_path} must be under the reserved guest control root"
+                openshell_core::container_paths::CONTROL_ROOTS
+                    .iter()
+                    .any(|root| Path::new(guest_path).starts_with(root)),
+                "{guest_path} must be under a reserved guest control root"
             );
             assert_eq!(
                 overlay_upper_path(guest_path),
@@ -10646,7 +10724,7 @@ mod tests {
 
     #[test]
     fn upstream_proxy_args_are_empty_without_a_configured_proxy() {
-        assert!(upstream_proxy_cli_args(&VmDriverConfig::default()).is_empty());
+        assert!(supervisor_cli_args(&VmDriverConfig::default()).is_empty());
         // The file is still written, empty, so the guest cannot fall back to
         // an image-baked argument list.
         assert!(render_guest_supervisor_args(&[]).is_empty());
@@ -10659,7 +10737,7 @@ mod tests {
             Some("/etc/openshell/secrets/proxy-auth"),
         );
         config.proxy_ca_bundle = Some(PathBuf::from("/etc/openshell/tls/corp-ca.pem"));
-        let args = upstream_proxy_cli_args(&config);
+        let args = supervisor_cli_args(&config);
 
         // The credential and CA live at fixed guest paths; the gateway-host
         // paths the operator configured must never reach the guest argv.
@@ -10685,7 +10763,7 @@ mod tests {
     fn upstream_proxy_args_pass_only_explicit_opt_ins() {
         let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None);
         config.upstream_proxy.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
-        let args = upstream_proxy_cli_args(&config);
+        let args = supervisor_cli_args(&config);
         assert_eq!(
             args,
             vec![
@@ -10700,15 +10778,139 @@ mod tests {
         // supervisor side.
         config.upstream_proxy.proxy_connect_by_hostname = Some(false);
         assert!(
-            !upstream_proxy_cli_args(&config)
+            !supervisor_cli_args(&config)
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
         );
         config.upstream_proxy.proxy_connect_by_hostname = Some(true);
         assert!(
-            upstream_proxy_cli_args(&config)
+            supervisor_cli_args(&config)
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+    }
+
+    #[test]
+    fn network_trust_args_use_only_the_fixed_guest_path() {
+        let config = VmDriverConfig {
+            network_additional_ca_bundle: Some(PathBuf::from(
+                "/var/lib/openshell/network/additional-ca.crt",
+            )),
+            ..Default::default()
+        };
+        let args = supervisor_cli_args(&config);
+        assert_eq!(
+            args,
+            [
+                "--network-additional-ca-bundle",
+                GUEST_NETWORK_ADDITIONAL_CA_PATH
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("/var/lib/openshell")));
+        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+    }
+
+    #[tokio::test]
+    async fn network_trust_is_replaced_and_cleared_in_preserved_overlay() {
+        let base = unique_temp_dir();
+        let source = base.join("overlay-source");
+        let overlay = base.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).unwrap();
+        fs::create_dir_all(source.join("work")).unwrap();
+        fs::create_dir_all(source.join("config")).unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 32 * 1024 * 1024).unwrap();
+
+        let first = rcgen::generate_simple_self_signed(vec!["first.example".to_string()])
+            .unwrap()
+            .cert
+            .pem();
+        let second = rcgen::generate_simple_self_signed(vec!["second.example".to_string()])
+            .unwrap()
+            .cert
+            .pem();
+        let artifact = base.join("additional-ca.crt");
+        fs::write(&artifact, &first).unwrap();
+        let mut config = VmDriverConfig {
+            network_additional_ca_bundle: Some(artifact.clone()),
+            ..Default::default()
+        };
+
+        inject_guest_supervisor_configuration(&overlay, &config)
+            .await
+            .expect("stage first destination CA");
+        let guest_path = overlay_upper_path(GUEST_NETWORK_ADDITIONAL_CA_PATH);
+        assert_eq!(
+            read_rootfs_image_file(&overlay, &guest_path).unwrap(),
+            first.as_bytes()
+        );
+        assert!(
+            stat_rootfs_image_file(&overlay, &guest_path)
+                .unwrap()
+                .contains("Mode:  0444")
+        );
+        let args =
+            read_rootfs_image_file(&overlay, &overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH))
+                .unwrap();
+        assert_eq!(
+            args,
+            render_guest_supervisor_args(&[
+                "--network-additional-ca-bundle".to_string(),
+                GUEST_NETWORK_ADDITIONAL_CA_PATH.to_string(),
+            ])
+        );
+
+        fs::write(&artifact, &second).unwrap();
+        inject_guest_supervisor_configuration(&overlay, &config)
+            .await
+            .expect("replace destination CA on preserved overlay");
+        assert_eq!(
+            read_rootfs_image_file(&overlay, &guest_path).unwrap(),
+            second.as_bytes()
+        );
+
+        config.network_additional_ca_bundle = None;
+        inject_guest_supervisor_configuration(&overlay, &config)
+            .await
+            .expect("clear destination CA on preserved overlay");
+        assert!(
+            read_rootfs_image_file(&overlay, &guest_path)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            read_rootfs_image_file(&overlay, &overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH),)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn missing_network_trust_artifact_fails_without_material_leakage() {
+        let error = read_sandbox_network_ca_bundle(Path::new("/missing/additional-ca.crt"))
+            .await
+            .expect_err("missing gateway artifact must fail before VM launch");
+        assert!(error.message().contains("additional-ca.crt"));
+        assert!(!error.message().contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn guest_init_uses_driver_authored_args_for_both_backends() {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        assert!(script.contains("args_file=\"$(root_path /opt/openshell/supervisor-args)\""));
+        assert!(script.contains("SUPERVISOR_EXTRA_ARGS+=(\"$arg\")"));
+        assert!(script.contains("set -- --workdir /sandbox"));
+
+        for backend in [VmBackend::Libkrun, VmBackend::Qemu] {
+            assert!(
+                matches!(backend, VmBackend::Libkrun | VmBackend::Qemu),
+                "both supported launch backends use the common guest init path"
+            );
+        }
+        assert_eq!(
+            sandbox_guest_init_path(),
+            "/srv/openshell-vm-sandbox-init.sh"
         );
     }
 

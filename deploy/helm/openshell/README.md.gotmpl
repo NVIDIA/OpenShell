@@ -77,6 +77,40 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
+### Additional destination CAs
+
+Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
+TLS destinations signed by a private CA:
+
+```shell
+kubectl create configmap private-destination-ca -n openshell \
+  --from-file=ca.crt=/path/to/ca.crt
+```
+
+Then set the source ConfigMap name:
+
+```yaml
+supervisor:
+  network:
+    additionalCaConfigMapName: private-destination-ca
+```
+
+The chart mounts the source into the gateway and renders
+`[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
+and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
+separate managed ConfigMap in each target sandbox namespace and mounts it only
+into the container that runs network supervision. The configured roots augment
+default destination trust. They do not configure the corporate proxy, OIDC, or
+gateway callback mTLS trust.
+
+Changing only the source ConfigMap does not roll or reload the gateway. Restart
+the gateway, then recreate or restart affected sandboxes to use the new roots.
+If you render the TOML setting outside this Helm value, provide equivalent
+`get`, `create`, and `patch` ConfigMap permissions in sandbox namespaces.
+
+A configured CA can authenticate every policy-permitted TLS endpoint with a
+matching certificate chain and hostname. Scope private CAs accordingly.
+
 ### Database backend
 
 By default, OpenShell uses SQLite and runs the gateway as a StatefulSet so the

@@ -570,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_driver_specific_destination_ca_setting() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "additional_ca_cert_paths": ["/operator/ca.crt"]
+        }))
+        .expect_err("destination trust is global, not a Podman driver setting");
+        assert!(error.to_string().contains("additional_ca_cert_paths"));
+    }
+
+    #[test]
     fn default_config_disables_health_checks() {
         assert_eq!(
             PodmanComputeConfig::default().health_check_interval_secs,
