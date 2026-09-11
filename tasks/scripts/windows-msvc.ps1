@@ -53,11 +53,12 @@ $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindo
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-supervisor-process --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
-$PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
-$PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
-$PrebuiltZ3Version = "4.16.0"
-$Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
-$Z3ServerFeatures = $PrebuiltZ3ServerFeatures
+$BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
+$BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
+$BundledZ3GatewayFeatures = "--features openshell-gateway/bundled-z3"
+$Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
+$Z3ServerFeatures = $BundledZ3ServerFeatures
+$Z3GatewayFeatures = $BundledZ3GatewayFeatures
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -353,12 +354,11 @@ function Resolve-Z3HeaderPath([string] $HeaderPath) {
 
 function Configure-Z3 {
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
-        Write-Host "==> Z3: prebuilt release"
-        $env:Z3_SYS_Z3_VERSION = $PrebuiltZ3Version
-        Write-Host "    Z3_SYS_Z3_VERSION=$env:Z3_SYS_Z3_VERSION"
+        Write-Host "==> Z3: bundled"
         return [pscustomobject]@{
-            WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
-            ServerFeatures = $PrebuiltZ3ServerFeatures
+            WorkspaceFeatures = $BundledZ3WorkspaceFeatures
+            ServerFeatures = $BundledZ3ServerFeatures
+            GatewayFeatures = $BundledZ3GatewayFeatures
         }
     }
 
@@ -386,6 +386,7 @@ function Configure-Z3 {
     return [pscustomobject]@{
         WorkspaceFeatures = ""
         ServerFeatures = ""
+        GatewayFeatures = ""
     }
 }
 
@@ -512,7 +513,7 @@ function Invoke-Lint([string] $RustTarget) {
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-release.log"
 }
 
@@ -610,6 +611,7 @@ if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsu
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
+    $Z3GatewayFeatures = $z3Features.GatewayFeatures
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"

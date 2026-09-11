@@ -115,7 +115,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses an architecture-specific prebuilt release. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for bundled Z3 and other native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses MSVC's Visual Studio generator. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -135,8 +135,6 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
-| `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
 | `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
@@ -205,7 +203,8 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and downloads the official prebuilt ARM64 Z3 static library.
+`clang-cl`, and builds bundled Z3 with native MSVC `cl.exe` and the Visual
+Studio generator.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -312,13 +311,12 @@ Useful log files:
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
 
-The first check downloads the pinned official Z3 archive for the target
-architecture through `z3-sys`. GitHub Actions authenticates the lookup with its
-read-only workflow token; local users can set `READ_ONLY_GITHUB_TOKEN` if an
-unauthenticated lookup is rate-limited. Cargo stores the extracted library in
-its target tree, so the Windows target cache reuses it. The artifact report
-computes SHA256 through .NET directly and does not rely on the `Get-FileHash`
-module being available inside the mise-launched Windows PowerShell process.
+The first check builds bundled Z3 from source through `z3-sys`. Cargo stores the
+native build output in its target tree, so the Windows target cache reuses it.
+The resulting release executables do not require `libz3.dll`. The artifact
+report computes SHA256 through .NET directly and does not rely on the
+`Get-FileHash` module being available inside the mise-launched Windows
+PowerShell process.
 
 ## Common Fix Patterns
 

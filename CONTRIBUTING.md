@@ -340,19 +340,14 @@ cargo build -p openshell-prover --features bundled-z3
 
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
-- Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
-  pinned Z3 4.16.0 GitHub release for the target architecture on the first
-  build. Cargo reuses the extracted archive from its target directory. Windows
-  CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
-  preserves the archive in the architecture-specific Cargo target cache. For
-  cold local builds, you may set `READ_ONLY_GITHUB_TOKEN` to avoid anonymous
-  GitHub API rate limits.
+- Bundled Z3 (the default for `windows:*` tasks): `z3-sys` builds Z3 from
+  source and links it into the OpenShell binaries. This keeps the release
+  executables independent of `libz3.dll` when they are copied to another host.
 - System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
-  target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
-  The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
-  is set.
-- Bundled Z3: for direct Cargo builds, pass `--features bundled-z3` so `z3-sys`
-  builds Z3 from source.
+  target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to
+  `z3.h`. The `windows:*` tasks use this path automatically when
+  `Z3_LIBRARY_PATH_OVERRIDE` is set. Deploy the matching `libz3.dll` with any
+  binaries built against a dynamic system Z3.
 
 `openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
 just this crate does not require `LIBCLANG_PATH`:
@@ -365,17 +360,17 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundl
 
 To build the full set of Windows binaries, including `openshell-gateway.exe`
 and `openshell.exe`, use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
-full build also compiles crates that use `bindgen` (e.g. the MXC driver on
-Windows), so it requires `libclang.dll`; if LLVM is not on the default search
-path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
+single-crate `cargo build`. It builds Z3 from source (bundled) by default. A full
+build also compiles crates that use `bindgen` (e.g. the MXC driver on Windows),
+so it requires `libclang.dll`; if LLVM is not on the default search path, set
+`LIBCLANG_PATH` to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 mise run --skip-tools windows:build:x64
 ```
 
-To use a local x64 Z3 release instead of the prebuilt download, set
+To use a local x64 Z3 release instead of the bundled build, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
