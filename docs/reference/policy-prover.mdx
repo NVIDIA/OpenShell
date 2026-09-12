@@ -134,10 +134,11 @@ Network binary selectors, endpoint host and path selectors, and REST allow and
 deny method and path selectors must use ASCII literals in both the candidate and
 maximum. A non-ASCII literal in one of these fields returns `unsupported` with
 `reason_code: unsupported_policy_shape`, including when it appears only in a
-deny. This is a prover-model limitation, not a general policy validation rule:
-filesystem paths and unrelated policy text retain their existing Unicode
-behavior. ASCII wildcard selectors still cover non-ASCII runtime values matched
-by the policy engine.
+deny. Embedded NUL bytes in these fields are also unsupported. This is a
+prover-model limitation, not a general policy validation rule: filesystem paths
+and unrelated policy text retain their existing Unicode behavior. ASCII
+wildcard selectors still cover non-ASCII runtime values matched by the policy
+engine.
 
 Containment means `Allowed(candidate)` is a subset of `Allowed(maximum)` under
 the reported model. It does not establish least privilege, automatic approval
