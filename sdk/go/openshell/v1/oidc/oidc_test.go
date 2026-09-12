@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,143 @@ func TestLogin_KeyboardFlow(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, diskTok)
 	assert.Equal(t, "login-access-token", diskTok.AccessToken)
+}
+
+// Login authenticates a user, so the authorization URL must carry "openid"
+// even when the caller supplied its own scopes. An explicitly-empty scope
+// list must never produce a bare "scope=" parameter.
+func TestLogin_AlwaysRequestsOpenIDScope(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []LoginOption
+		want string
+	}{
+		{
+			name: "unset scopes send the defaults",
+			opts: nil,
+			want: "openid profile email",
+		},
+		{
+			name: "explicit empty still sends openid",
+			opts: []LoginOption{WithScopes()},
+			want: "openid",
+		},
+		{
+			name: "application scopes gain openid",
+			opts: []LoginOption{WithScopes("sandbox:read")},
+			want: "openid sandbox:read",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDiscoveryCache()
+
+			provider := setupMockProvider(t)
+			var prompt strings.Builder
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			opts := append([]LoginOption{
+				WithIssuer(provider.URL),
+				WithClientID("test-client"),
+				WithInMemory(),
+				WithKeyboardFlow(),
+				withInput(strings.NewReader("keyboard-auth-code\n")),
+				withOutput(&prompt),
+			}, tt.opts...)
+
+			_, err := Login(ctx, "", opts...)
+			require.NoError(t, err)
+
+			// The keyboard flow prints the authorization URL it would open.
+			authURL := extractAuthURL(t, prompt.String())
+			assert.Equal(t, tt.want, authURL.Query().Get("scope"))
+		})
+	}
+}
+
+// Login must honor the gateway's configured oidc_scopes the way the Rust CLI
+// does (see commands/gateway.rs, which passes metadata.oidc_scopes into the
+// interactive flow), while an explicit WithScopes still wins.
+func TestLogin_GatewayScopes(t *testing.T) {
+	tests := []struct {
+		name         string
+		gatewayScope string
+		opts         []LoginOption
+		want         string
+	}{
+		{
+			name:         "gateway scopes are used when the caller sets none",
+			gatewayScope: "openid sandbox:read sandbox:write",
+			want:         "openid sandbox:read sandbox:write",
+		},
+		{
+			name:         "gateway scopes gain openid",
+			gatewayScope: "sandbox:read",
+			want:         "openid sandbox:read",
+		},
+		{
+			name:         "explicit scopes win over gateway scopes",
+			gatewayScope: "sandbox:read",
+			opts:         []LoginOption{WithScopes("sandbox:admin")},
+			want:         "openid sandbox:admin",
+		},
+		{
+			name:         "empty gateway scopes fall back to the defaults",
+			gatewayScope: "",
+			want:         "openid profile email",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDiscoveryCache()
+
+			provider := setupMockProvider(t)
+			var prompt strings.Builder
+
+			fakeConfig := &gateway.Config{
+				Name:         "login-gw",
+				Endpoint:     "gateway.example.com:443",
+				Dir:          t.TempDir(),
+				OIDCIssuer:   provider.URL,
+				OIDCClientID: "gw-login-client",
+				OIDCScopes:   tt.gatewayScope,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			opts := append([]LoginOption{
+				WithInMemory(),
+				WithKeyboardFlow(),
+				withInput(strings.NewReader("keyboard-auth-code\n")),
+				withOutput(&prompt),
+				withGatewayResolver(func(string) (*gateway.Config, error) {
+					return fakeConfig, nil
+				}),
+			}, tt.opts...)
+
+			_, err := Login(ctx, "login-gw", opts...)
+			require.NoError(t, err)
+
+			authURL := extractAuthURL(t, prompt.String())
+			assert.Equal(t, tt.want, authURL.Query().Get("scope"))
+		})
+	}
+}
+
+// extractAuthURL pulls the authorization URL out of the keyboard-flow prompt.
+func extractAuthURL(t *testing.T, prompt string) *url.URL {
+	t.Helper()
+	start := strings.Index(prompt, "http")
+	require.GreaterOrEqual(t, start, 0, "no authorization URL in prompt: %q", prompt)
+	raw := strings.Fields(prompt[start:])[0]
+	parsed, err := url.Parse(raw)
+	require.NoError(t, err)
+	return parsed
 }
 
 // TestLogin_InMemorySkipsPersistence verifies that WithInMemory()
