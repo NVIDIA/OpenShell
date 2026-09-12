@@ -82,8 +82,8 @@ already satisfies Linux distribution trust-store policy.
 
 The workspace uses `z3` versions whose `z3-sys` dependency keeps downloader
 HTTP/TLS support behind explicit build features, so default system-Z3 builds do
-not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
-continue to opt in with `bundled-z3`.
+not reintroduce bundled Mozilla roots. Windows builds can explicitly select the
+prebuilt Z3 release path.
 
 ## Linux Runtime Environments
 
@@ -92,9 +92,9 @@ The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
 runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
 `openshell-gateway` and `openshell-driver-vm` are built with a glibc 2.28 floor.
-The gateway bundles z3 into the release binary so Linux packages, standalone
-tarballs, and gateway images do not depend on distro-specific z3 shared-library
-SONAMEs.
+The gateway statically links the target-specific Z3 library supplied by the Nix
+toolchain so Linux packages, standalone tarballs, and gateway images do not
+depend on distro-specific Z3 shared-library SONAMEs.
 
 The supervisor is the one binary whose libc is selectable, because it is the one
 binary executed inside a userland OpenShell does not control. `SUPERVISOR_LIBC`
@@ -138,12 +138,12 @@ otherwise fail with `ProcessFdQuotaExceeded` under macOS's default soft limit of
 256. The guard is a no-op on Linux and when `cargo-zigbuild` is absent. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
-packages share the same host portability floor. The gateway build enables
-`bundled-z3`. Linux VM driver release artifacts use the same glibc floor so
-package-managed VM support does not raise the package runtime requirement.
-Gateway staging and release workflows set up the Zig C/C++ wrapper before
-bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
-before publishing or copying artifacts.
+packages share the same host portability floor. The gateway build links the
+target-specific static Z3 library from the Nix toolchain. Linux VM driver
+release artifacts use the same glibc floor so package-managed VM support does
+not raise the package runtime requirement. Gateway staging and release
+workflows use the target-specific C/C++ toolchain and verify the maximum
+referenced `GLIBC_*` symbol version before publishing or copying artifacts.
 Supervisor binaries are static in every configuration. The default `musl`
 variant uses `cargo zigbuild` when available, including native CPU
 architectures, so C dependencies are compiled for the musl target instead of the
@@ -217,10 +217,8 @@ Runtime layout:
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
   `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
   gateway binaries must not reference `GLIBC_*` symbols newer than
-  `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
-  gateway bundles z3, so the image does not need a distro-provided z3 runtime.
-  The base is pinned to a multi-architecture digest; distro security updates
-  require refreshing that digest and rebuilding the gateway image.
+  `GLIBC_2.28`; release workflows verify this before publishing artifacts. Z3
+  is statically linked, so the image does not need a distro-provided Z3 runtime.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
