@@ -1387,9 +1387,9 @@ fn container_creation_uses_inspected_immutable_image() {
     assert_eq!(
         body.labels
             .as_ref()
-            .and_then(|labels| labels.get(LABEL_ISOLATION_TOPOLOGY))
+            .and_then(|labels| labels.get(LABEL_ISOLATION_BACKEND))
             .map(String::as_str),
-        Some(LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE)
+        Some(LABEL_ISOLATION_BACKEND_OPEN_SHELL)
     );
     assert_eq!(
         body.labels
