@@ -60,10 +60,10 @@ esac
 
 SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
-GUEST_SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-supervisor"
+VM_INIT_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-vm-init"
+VM_INIT_OUTPUT="${OUTPUT_DIR}/openshell-vm-init.zst"
 HOST_SUPERVISOR_BIN="${ROOT}/target/release/openshell-supervisor"
 HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-supervisor.zst"
-SUPERVISOR_RUNTIME_OUTPUT="${OUTPUT_DIR}/openshell-runtime.tar.zst"
 
 echo "==> Building openshell-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"
@@ -84,11 +84,15 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox -p openshell-supervisor --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox -p openshell-supervisor --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
     ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
@@ -123,8 +127,8 @@ else
     fi
 fi
 
-if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${GUEST_SUPERVISOR_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
-    echo "ERROR: sandbox or supervisor binary not found after build" >&2
+if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${VM_INIT_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
+    echo "ERROR: sandbox, VM init, or supervisor binary not found after build" >&2
     exit 1
 fi
 
@@ -132,57 +136,16 @@ if readelf -l "${SUPERVISOR_BIN}" 2>/dev/null | grep -q 'Requesting program inte
     echo "ERROR: VM guest openshell-sandbox must be statically linked" >&2
     exit 1
 fi
-
-zstd -19 -T0 -f "${SUPERVISOR_BIN}" -o "${SUPERVISOR_OUTPUT}"
-zstd -19 -T0 -f "${HOST_SUPERVISOR_BIN}" -o "${HOST_SUPERVISOR_OUTPUT}"
-
-case "${GUEST_ARCH}" in
-    aarch64|arm64) DOCKER_ARCH="arm64" ;;
-    x86_64|amd64) DOCKER_ARCH="amd64" ;;
-esac
-
-echo "==> Building trusted supervisor helper runtime"
-STAGED_SUPERVISOR="${ROOT}/deploy/docker/.build/prebuilt-binaries/${DOCKER_ARCH}/openshell-sandbox"
-STAGED_CONTROL="${ROOT}/deploy/docker/.build/prebuilt-binaries/${DOCKER_ARCH}/openshell-supervisor"
-RUNTIME_IMAGE="openshell-vm-helper-runtime:${DOCKER_ARCH}-$$"
-mkdir -p "$(dirname "${STAGED_SUPERVISOR}")"
-cp "${SUPERVISOR_BIN}" "${STAGED_SUPERVISOR}"
-cp "${GUEST_SUPERVISOR_BIN}" "${STAGED_CONTROL}"
-
-case "$(uname -m)" in
-    aarch64|arm64) HOST_DOCKER_ARCH="arm64" ;;
-    x86_64|amd64) HOST_DOCKER_ARCH="amd64" ;;
-    *) HOST_DOCKER_ARCH="" ;;
-esac
-
-if [ "${HOST_DOCKER_ARCH}" = "${DOCKER_ARCH}" ]; then
-    docker build \
-        --build-arg "TARGETARCH=${DOCKER_ARCH}" \
-        --file "${ROOT}/deploy/docker/Dockerfile.supervisor" \
-        --tag "${RUNTIME_IMAGE}" \
-        "${ROOT}"
-else
-    docker buildx build \
-        --load \
-        --platform "linux/${DOCKER_ARCH}" \
-        --build-arg "TARGETARCH=${DOCKER_ARCH}" \
-        --file "${ROOT}/deploy/docker/Dockerfile.supervisor" \
-        --tag "${RUNTIME_IMAGE}" \
-        "${ROOT}"
+if readelf -l "${VM_INIT_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+    echo "ERROR: openshell-vm-init must be statically linked" >&2
+    exit 1
 fi
 
-RUNTIME_CONTAINER="$(docker create "${RUNTIME_IMAGE}")"
-cleanup_runtime_image() {
-    docker rm -f "${RUNTIME_CONTAINER}" >/dev/null 2>&1 || true
-    docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1 || true
-}
-trap cleanup_runtime_image EXIT
-docker cp "${RUNTIME_CONTAINER}:/openshell-runtime" - \
-    | zstd -19 -T0 -f -o "${SUPERVISOR_RUNTIME_OUTPUT}"
-cleanup_runtime_image
-trap - EXIT
+zstd -19 -T0 -f "${SUPERVISOR_BIN}" -o "${SUPERVISOR_OUTPUT}"
+zstd -19 -T0 -f "${VM_INIT_BIN}" -o "${VM_INIT_OUTPUT}"
+zstd -19 -T0 -f "${HOST_SUPERVISOR_BIN}" -o "${HOST_SUPERVISOR_OUTPUT}"
 
 echo "==> Bundled supervisor ready"
 echo "    Binary: $(du -sh "${SUPERVISOR_BIN}" | cut -f1)"
 echo "    Compressed: $(du -sh "${SUPERVISOR_OUTPUT}" | cut -f1)"
-echo "    Helper runtime: $(du -sh "${SUPERVISOR_RUNTIME_OUTPUT}" | cut -f1)"
+echo "    VM init: $(du -sh "${VM_INIT_OUTPUT}" | cut -f1)"
