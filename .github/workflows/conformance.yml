@@ -97,8 +97,22 @@ jobs:
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
+  build-prover:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-prover-cli
+      binary: openshell-prover
+      triple: x86_64-unknown-linux-musl
+      runner: linux-amd64-cpu8
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
   build-rpm:
-    needs: [version, build-cli, build-gateway]
+    needs: [version, build-cli, build-gateway, build-prover]
     permissions:
       contents: read
     uses: ./.github/workflows/build-rpm.yml
@@ -108,6 +122,7 @@ jobs:
       runner: linux-amd64-cpu8
       cli-target: x86_64-unknown-linux-musl
       gateway-target: x86_64-unknown-linux-gnu
+      prover-target: x86_64-unknown-linux-musl
       cargo-version: ${{ needs.version.outputs.cargo }}
       rpm-version: ${{ needs.version.outputs.rpm_version }}
       rpm-release: ${{ needs.version.outputs.rpm_release }}

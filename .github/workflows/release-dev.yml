@@ -253,7 +253,7 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-cli, build-prover, build-gateway, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -273,7 +273,7 @@ jobs:
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-cli, build-gateway]
+    needs: [compute-versions, build-cli, build-prover, build-gateway]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ github.sha }}
@@ -335,6 +335,7 @@ jobs:
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends ./package-input/*.deb
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
           /usr/libexec/openshell/openshell-driver-vm --version
 
@@ -349,7 +350,11 @@ jobs:
         if: matrix.kind == 'rpm'
         run: |
           set -euo pipefail
-          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
+          dnf install -y \
+            ./package-input/openshell-[0-9]*.rpm \
+            ./package-input/openshell-gateway-*.rpm \
+            ./package-input/openshell-prover-*.rpm
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
 
       - name: Download Python wheel artifact
@@ -481,6 +486,8 @@ jobs:
           move_one openshell-dev-aarch64.rpm release/openshell-[0-9]*.aarch64.rpm
           move_one openshell-gateway-dev-x86_64.rpm release/openshell-gateway-[0-9]*.x86_64.rpm
           move_one openshell-gateway-dev-aarch64.rpm release/openshell-gateway-[0-9]*.aarch64.rpm
+          move_one openshell-prover-dev-x86_64.rpm release/openshell-prover-[0-9]*.x86_64.rpm
+          move_one openshell-prover-dev-aarch64.rpm release/openshell-prover-[0-9]*.aarch64.rpm
 
           ls -la release/
 
