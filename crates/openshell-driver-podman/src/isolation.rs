@@ -11,7 +11,7 @@ use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
@@ -20,7 +20,7 @@ pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
 pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
-pub const TOPOLOGY_PATH: &str = "/.openshell/supervisor/topology.payload";
+pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_BUNDLE_PATH: &str = "/.openshell/supervisor/sandbox-bundle.tar";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
@@ -186,7 +186,7 @@ pub fn bootstrap_archives(
         driver_fence: driver_fence.clone(),
         child_env,
     };
-    let topology = BoundaryTopology {
+    let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),
         generation,
         session_id,
@@ -221,8 +221,8 @@ pub fn bootstrap_archives(
     supervisor.directory(".openshell", 0o755, false)?;
     supervisor.directory(".openshell/supervisor", 0o700, true)?;
     supervisor.file(
-        TOPOLOGY_PATH,
-        &serde_json::to_vec(&topology).map_err(invalid)?,
+        RUNTIME_DESCRIPTOR_PATH,
+        &serde_json::to_vec(&runtime_descriptor).map_err(invalid)?,
     )?;
     supervisor.file(
         AUTH_BUNDLE_PATH,
@@ -414,20 +414,19 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let topology: BoundaryTopology = serde_json::from_slice(
+        let runtime_descriptor: SandboxRuntimeDescriptor = serde_json::from_slice(
             supervisor
-                .get(&PathBuf::from(TOPOLOGY_PATH.trim_start_matches('/')))
+                .get(&PathBuf::from(
+                    RUNTIME_DESCRIPTOR_PATH.trim_start_matches('/'),
+                ))
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(config.boundary_id, topology.boundary_id);
-        assert_eq!(config.session_id, topology.session_id);
-        assert_eq!(config.driver_fence, topology.driver_fence);
+        assert_eq!(config.boundary_id, runtime_descriptor.boundary_id);
+        assert_eq!(config.session_id, runtime_descriptor.session_id);
+        assert_eq!(config.driver_fence, runtime_descriptor.driver_fence);
         assert_eq!(config.workload_identity, identity);
-        topology
-            .driver_fence
-            .validate_for_backend("podman")
-            .unwrap();
+        runtime_descriptor.driver_fence.validate().unwrap();
         assert_eq!(
             supervisor
                 .get(&PathBuf::from(RESTART_BUNDLE_PATH.trim_start_matches('/')))
