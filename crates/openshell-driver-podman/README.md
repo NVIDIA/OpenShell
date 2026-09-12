@@ -57,7 +57,7 @@ namespace so the sandbox's loopback DNS relay can bind port 53 without a
 capability. No nftables or nested network namespace setup runs in the sandbox.
 
 The channel contains the sandbox bootstrap and sandbox-side TLS identity only.
-Supervisor private keys and topology stay in the companion's private filesystem.
+Supervisor private keys and the runtime descriptor stay in the supervisor's private filesystem.
 Landlock denies agent access to the top-level `/.openshell` control hierarchy.
 The driver verifies Podman's reported `network=none` fence before launch and
 restart. `host.containers.internal` and callback networking apply to the
@@ -115,7 +115,7 @@ See [gateway configuration](../../docs/reference/gateway-config.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for callback networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
 `health_check_interval_secs=0` uses a one-second check rather than disabling
-the readiness check required by this topology.
+the readiness check required by this architecture.
 
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.

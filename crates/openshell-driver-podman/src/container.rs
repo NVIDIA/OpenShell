@@ -1464,17 +1464,16 @@ pub fn build_isolation_specs(
     supervisor.image.clone_from(&input.config.supervisor_image);
     supervisor.entrypoint = vec!["/openshell-supervisor".into()];
     supervisor.command.extend([
-        "--topology-backend-name=podman".into(),
         format!(
-            "--topology-payload-file={}",
-            crate::isolation::TOPOLOGY_PATH
+            "--backend-descriptor-file={}",
+            crate::isolation::RUNTIME_DESCRIPTOR_PATH
         ),
         format!("--auth-bundle-file={}", crate::isolation::AUTH_BUNDLE_PATH),
         "--health-socket-path=/run/openshell/supervisor-health.sock".into(),
     ]);
     supervisor.env.insert(
         openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
-        "podman".into(),
+        openshell_sandbox_backend::BACKEND_NAME.into(),
     );
     supervisor.user = user;
     supervisor.groups = input
