@@ -26,9 +26,9 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
-    GatewayCallbackRoute, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, GatewayCallbackRoute, LABEL_MANAGED_BY,
+    LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_WORKSPACE, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
     gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
 };
 use openshell_core::gpu::{
@@ -60,7 +60,7 @@ use openshell_core::proto_struct::{
 use openshell_core::{Error, Result as CoreResult};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryTopology, GatewayVerificationKey, SandboxTlsClientConfig,
+    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use opentelemetry::trace::TraceContextExt as _;
@@ -106,16 +106,16 @@ const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/sandbox/control.so
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/channel/supervisor";
-const DRIVER_ADMITTED_BACKEND: &str = "docker";
-const LABEL_ISOLATION_TOPOLOGY: &str = "openshell.ai/isolation-topology";
-const LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE: &str = "capability-free";
+const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
+const LABEL_ISOLATION_BACKEND: &str = "openshell.ai/isolation-backend";
+const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACKEND_NAME;
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
 const SUPERVISOR_NETWORK_MODE: &str = "host";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
-const TOPOLOGY_PAYLOAD_FILE: &str = "topology.payload";
+const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const MAIN_PROCESS_SPEC_FILE: &str = "main-process.json";
 const WORKSPACE_ROOT_FILE: &str = "workspace-root";
 const BOUNDARY_CONFIG_FILE: &str = "boundary-bootstrap.json";
@@ -1542,7 +1542,7 @@ impl DockerComputeDriver {
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
 
-        let topology = match prepare_docker_boundary_files(
+        match prepare_docker_boundary_files(
             &self.docker,
             sandbox,
             &self.config,
@@ -1552,7 +1552,7 @@ impl DockerComputeDriver {
         )
         .await
         {
-            Ok(topology) => topology,
+            Ok(()) => {}
             Err(status) => {
                 let _ = self
                     .docker
@@ -1569,7 +1569,7 @@ impl DockerComputeDriver {
                     status.message(),
                 ));
             }
-        };
+        }
 
         let start_result = async {
             openshell_otel::record_error_result(
@@ -1614,7 +1614,6 @@ impl DockerComputeDriver {
             &self.docker,
             sandbox,
             &self.config,
-            &topology,
             failure_context,
         )
         .await
@@ -1845,7 +1844,7 @@ impl DockerComputeDriver {
                 "{LABEL_SANDBOX_NAMESPACE}={}",
                 self.config.sandbox_namespace
             ),
-            format!("{LABEL_ISOLATION_TOPOLOGY}={LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE}"),
+            format!("{LABEL_ISOLATION_BACKEND}={LABEL_ISOLATION_BACKEND_OPEN_SHELL}"),
         ]);
         let volumes = self
             .docker
@@ -1915,12 +1914,15 @@ impl DockerComputeDriver {
         if let Some(stale) = stale {
             stop_docker_control_process(stale).await;
         }
-        let Some(topology) = read_docker_boundary_topology(&sandbox.id, &self.config).await? else {
+        if read_docker_runtime_descriptor(&sandbox.id, &self.config)
+            .await?
+            .is_none()
+        {
             let container_id = summary_container_target(container)
                 .ok_or_else(|| Status::internal("managed Docker container has no id or name"))?;
             let failure_context = self.control_failure_context(sandbox.clone(), container_id);
             let status = Status::failed_precondition(
-                "Docker sandbox topology is missing; refusing to leave the workload running without its supervisor",
+                "Docker sandbox runtime descriptor is missing; refusing to leave the workload running without its supervisor",
             );
             handle_docker_runtime_failure(
                 failure_context,
@@ -1929,7 +1931,7 @@ impl DockerComputeDriver {
             )
             .await;
             return Err(status);
-        };
+        }
         let container_id = summary_container_target(container)
             .ok_or_else(|| Status::internal("managed Docker container has no id or name"))?;
         self.clear_runtime_failure(&sandbox.id).await;
@@ -1938,7 +1940,6 @@ impl DockerComputeDriver {
             &self.docker,
             &sandbox,
             &self.config,
-            &topology,
             failure_context.clone(),
         )
         .await
@@ -2223,11 +2224,11 @@ impl DockerComputeDriver {
             launch_authentication,
         )
         .await?;
-        let Some(topology) =
-            read_docker_boundary_topology(resolved_sandbox_id, &self.config).await?
+        let Some(runtime_descriptor) =
+            read_docker_runtime_descriptor(resolved_sandbox_id, &self.config).await?
         else {
             return Err(Status::failed_precondition(
-                "Docker sandbox topology is missing; refusing to start the workload without its supervisor",
+                "Docker sandbox runtime descriptor is missing; refusing to start the workload without its supervisor",
             ));
         };
         let boundary_config = tokio::fs::read(
@@ -2272,7 +2273,7 @@ impl DockerComputeDriver {
             &self.docker,
             &target,
             &self.config,
-            &topology.workload_identity,
+            &runtime_descriptor.workload_identity,
             &boundary_config,
             DockerSandboxTls {
                 certificate: &boundary_certificate,
@@ -3787,8 +3788,8 @@ async fn create_docker_channel_volume(
             config.sandbox_namespace.clone(),
         ),
         (
-            LABEL_ISOLATION_TOPOLOGY.to_string(),
-            LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE.to_string(),
+            LABEL_ISOLATION_BACKEND.to_string(),
+            LABEL_ISOLATION_BACKEND_OPEN_SHELL.to_string(),
         ),
     ]);
     docker
@@ -4122,7 +4123,7 @@ async fn prepare_docker_boundary_files(
     container_id: &str,
     image: &DockerImageMetadata,
     workload_identity: &ResolvedWorkloadIdentity,
-) -> Result<BoundaryTopology, Status> {
+) -> Result<(), Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
@@ -4191,10 +4192,14 @@ async fn prepare_docker_boundary_files(
     )
     .await?;
     let descriptor = provisioning
-        .topology
-        .descriptor(DRIVER_ADMITTED_BACKEND)
+        .runtime_descriptor
+        .backend_descriptor()
         .map_err(|error| Status::internal(error.to_string()))?;
-    write_docker_boundary_file(&directory.join(TOPOLOGY_PAYLOAD_FILE), &descriptor.payload).await?;
+    write_docker_boundary_file(
+        &directory.join(RUNTIME_DESCRIPTOR_FILE),
+        &descriptor.payload,
+    )
+    .await?;
     let supervisor_auth = serde_json::to_vec(&launch_authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
     write_docker_boundary_file(
@@ -4216,7 +4221,7 @@ async fn prepare_docker_boundary_files(
         workspace_root.as_bytes(),
     )
     .await?;
-    Ok(provisioning.topology)
+    Ok(())
 }
 
 async fn docker_supervisor_bundle_archive(
@@ -4224,9 +4229,9 @@ async fn docker_supervisor_bundle_archive(
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Vec<u8>, Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
-    let topology = tokio::fs::read(directory.join(TOPOLOGY_PAYLOAD_FILE))
+    let runtime_descriptor = tokio::fs::read(directory.join(RUNTIME_DESCRIPTOR_FILE))
         .await
-        .map_err(|error| Status::internal(format!("read Docker topology payload: {error}")))?;
+        .map_err(|error| Status::internal(format!("read Docker runtime descriptor: {error}")))?;
     let auth_bundle = tokio::fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE))
         .await
         .map_err(|error| {
@@ -4247,11 +4252,11 @@ async fn docker_supervisor_bundle_archive(
     )?;
     append_docker_archive_file(
         &mut archive,
-        ".openshell/channel/supervisor/topology.payload",
+        ".openshell/channel/supervisor/runtime-descriptor.json",
         0o600,
         SUPERVISOR_UID,
         SUPERVISOR_GID,
-        &topology,
+        &runtime_descriptor,
     )?;
     append_docker_archive_file(
         &mut archive,
@@ -4316,9 +4321,10 @@ async fn refresh_docker_boundary_authentication(
             "decode Docker sandbox bootstrap for authentication rotation: {error}"
         ))
     })?;
-    let Some(mut topology) = read_docker_boundary_topology(sandbox_id, config).await? else {
+    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
+    else {
         return Err(Status::failed_precondition(
-            "Docker sandbox topology is missing during authentication rotation",
+            "Docker sandbox runtime descriptor is missing during authentication rotation",
         ));
     };
     let session_id = authentication.supervisor.session_id;
@@ -4328,16 +4334,16 @@ async fn refresh_docker_boundary_authentication(
     boundary_config.gateway_id = authentication.gateway_id;
     boundary_config.verification_keys =
         gateway_verification_keys(&authentication.verification_keys)?;
-    topology.session_id = session_id;
-    topology.tls = SandboxTlsClientConfig {
+    runtime_descriptor.session_id = session_id;
+    runtime_descriptor.tls = SandboxTlsClientConfig {
         server_name: tls.server_name,
         trust_anchor_pem: tls.trust_anchor_pem,
     };
     let encoded_boundary_config = boundary_config
         .encode()
         .map_err(|error| Status::internal(error.to_string()))?;
-    let descriptor = topology
-        .descriptor(DRIVER_ADMITTED_BACKEND)
+    let descriptor = runtime_descriptor
+        .backend_descriptor()
         .map_err(|error| Status::internal(error.to_string()))?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
@@ -4356,7 +4362,11 @@ async fn refresh_docker_boundary_authentication(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
-    write_docker_boundary_file(&directory.join(TOPOLOGY_PAYLOAD_FILE), &descriptor.payload).await?;
+    write_docker_boundary_file(
+        &directory.join(RUNTIME_DESCRIPTOR_FILE),
+        &descriptor.payload,
+    )
+    .await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,
@@ -4364,24 +4374,24 @@ async fn refresh_docker_boundary_authentication(
     .await
 }
 
-async fn read_docker_boundary_topology(
+async fn read_docker_runtime_descriptor(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-) -> Result<Option<BoundaryTopology>, Status> {
-    let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(TOPOLOGY_PAYLOAD_FILE);
+) -> Result<Option<SandboxRuntimeDescriptor>, Status> {
+    let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(RUNTIME_DESCRIPTOR_FILE);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(Status::internal(format!(
-                "read Docker boundary topology {}: {error}",
+                "read Docker runtime descriptor {}: {error}",
                 path.display()
             )));
         }
     };
     serde_json::from_slice(&bytes).map(Some).map_err(|error| {
         Status::internal(format!(
-            "decode Docker boundary topology {}: {error}",
+            "decode Docker runtime descriptor {}: {error}",
             path.display()
         ))
     })
@@ -4492,13 +4502,9 @@ async fn spawn_docker_control_process(
     docker: &Docker,
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-    topology: &BoundaryTopology,
     failure_context: DockerRuntimeFailureContext,
 ) -> Result<DockerControlProcess, Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
-    let descriptor = topology
-        .descriptor(DRIVER_ADMITTED_BACKEND)
-        .map_err(|error| Status::internal(error.to_string()))?;
     let main_process_spec = tokio::fs::read_to_string(directory.join(MAIN_PROCESS_SPEC_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker main process spec: {error}")))?;
@@ -4512,7 +4518,7 @@ async fn spawn_docker_control_process(
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await;
-    let topology_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/topology.payload");
+    let runtime_descriptor_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/runtime-descriptor.json");
     let auth_bundle_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/auth.json");
     let mut environment = vec![
         format!(
@@ -4596,9 +4602,8 @@ async fn spawn_docker_control_process(
         user: Some(format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")),
         entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
         cmd: Some(vec![
-            format!("--topology-backend-name={}", descriptor.backend_name),
-            "--topology-payload-file".to_string(),
-            topology_path.clone(),
+            "--backend-descriptor-file".to_string(),
+            runtime_descriptor_path,
             "--auth-bundle-file".to_string(),
             auth_bundle_path,
             "--workdir".to_string(),
@@ -5214,8 +5219,8 @@ fn build_container_create_body_for_image(
         config.sandbox_namespace.clone(),
     );
     labels.insert(
-        LABEL_ISOLATION_TOPOLOGY.to_string(),
-        LABEL_ISOLATION_TOPOLOGY_CAPABILITY_FREE.to_string(),
+        LABEL_ISOLATION_BACKEND.to_string(),
+        LABEL_ISOLATION_BACKEND_OPEN_SHELL.to_string(),
     );
     labels.insert(
         LABEL_ISOLATION_ROLE.to_string(),
