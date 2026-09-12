@@ -1,29 +1,35 @@
-# Broad ownership — core team reviews everything
+## Broad ownership — core team reviews everything
 * @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
-# Vouch list — maintainers only (bot commits bypass, but manual edits need review)
+## Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
 
-# Merge enforcement — these paths decide who can merge, so they keep an explicit
-# owner independent of any broad ownership rule above.
-#
-# A workflow triggered by pull_request_review runs the pull request's copy of
-# the workflow file, not the one on main, so a contributor can rewrite the
-# approval gate in the same pull request the gate is meant to block. Requiring
-# a code owner here is what closes that: the tampered job still runs and still
-# reports green, but the pull request cannot merge without an approval GitHub
-# enforces natively.
+## Merge enforcement — these paths decide who can merge, so they notify the full
+# list of maintainers to raise scrutiny on changes here.
+# 
+# PR checks run local to the branch, so unless the check specifically avoids
+# using branch-local files, a PR could change its own gates and appear to pass
+# them. Covering the required checks here closes that gap.
 #
 # The whole workflows directory is covered, not just the approval gate, because
 # any workflow can claim a required check context or ask for a broader token.
 #
-# The three logins are named alongside the team because they are outside
-# collaborators and cannot join it. Owning these paths by team alone would mean
-# no Red Hat maintainer could approve a change to the merge gate.
+# Normally, we'd use a GitHub team to cover all maintainers, but org-level
+# policies prevent outside collaborators from being on a GH team at this time
+# so we spell them out explicitly.
+
+# Core check mechanisms
 /.github/workflows/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /.github/actions/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /.github/CODEOWNERS @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /.github/zizmor.yml @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# `MAINTAINERS.md` maintainer approval checks
 /MAINTAINERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/check_maintainer_approval.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 /tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_maintainer_approval_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/alert_maintainer_change_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# Auditable SBOM check
+/tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
