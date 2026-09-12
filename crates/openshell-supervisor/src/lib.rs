@@ -309,7 +309,7 @@ pub async fn run_sandbox(
     health_socket_path: Option<std::path::PathBuf>,
     ocsf_enabled: Arc<AtomicBool>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    topology_descriptor: openshell_isolation_interface::contract::TopologyDescriptor,
+    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
@@ -497,26 +497,25 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    // A separated topology uses the shared authenticated boundary protocol.
+    // The sandbox runtime uses the shared authenticated boundary protocol.
     // The admitted backend name is resolved independently of the protected
     // descriptor, and generic supervisor code never imports a driver crate.
     let admitted_backend_name = admitted_isolation_backend.ok_or_else(|| {
-        miette::miette!("protected topology supplied without an admitted isolation backend")
+        miette::miette!("runtime descriptor supplied without an admitted isolation backend")
     })?;
-    let topology: openshell_sandbox_backend::boundary_protocol::BoundaryTopology =
-        serde_json::from_slice(&topology_descriptor.payload)
-            .map_err(|error| miette::miette!("decode boundary topology: {error}"))?;
-    if auth_bundle.session_id != topology.session_id {
+    let runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+        serde_json::from_slice(&backend_descriptor.payload)
+            .map_err(|error| miette::miette!("decode sandbox runtime descriptor: {error}"))?;
+    if auth_bundle.session_id != runtime_descriptor.session_id {
         return Err(miette::miette!(
-            "supervisor authentication bundle does not match topology session"
+            "supervisor authentication bundle does not match runtime session"
         ));
     }
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
-    let session_id = topology.session_id;
+    let session_id = runtime_descriptor.session_id;
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
     let backend: Arc<dyn openshell_isolation_interface::contract::IsolationBackend> =
         Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-            admitted_backend_name.clone(),
             ca_file_paths.clone(),
             provider_credentials.clone(),
             sandbox_bearer,
@@ -526,7 +525,7 @@ pub async fn run_sandbox(
         .register(backend)
         .map_err(|error| miette::miette!(error.to_string()))?;
     let (backend, verified) = registry
-        .resolve(topology_descriptor, &admitted_backend_name)
+        .resolve(backend_descriptor, &admitted_backend_name)
         .map_err(|error| miette::miette!(error.to_string()))?;
     let context = openshell_isolation_interface::contract::SandboxContext {
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
@@ -539,7 +538,7 @@ pub async fn run_sandbox(
             timeout_secs,
             interactive,
         },
-        identity: topology.workload_identity,
+        identity: runtime_descriptor.workload_identity,
     };
     let bound = backend
         .attach(verified, context)

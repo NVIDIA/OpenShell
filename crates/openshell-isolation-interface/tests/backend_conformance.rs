@@ -297,7 +297,7 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
     }
     async fn attach(
         &self,
-        descriptor: VerifiedTopologyDescriptor,
+        descriptor: VerifiedBackendDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError> {
         assert_eq!(descriptor.backend_name(), K::BACKEND_ID);
@@ -326,8 +326,8 @@ fn registry() -> BackendRegistry {
     reg
 }
 
-fn descriptor(backend_name: &str) -> TopologyDescriptor {
-    TopologyDescriptor {
+fn descriptor(backend_name: &str) -> BackendDescriptor {
+    BackendDescriptor {
         backend_name: backend_name.to_string(),
         payload: vec![],
     }
@@ -432,28 +432,23 @@ fn driver_fence_evidence_is_backend_specific_and_fail_closed() {
         network_device_count: 0,
     };
 
-    assert!(docker.validate_for_backend("docker").is_ok());
-    assert!(
-        kubernetes
-            .validate_for_backend("kubernetes-proxy-pod")
-            .is_ok()
-    );
-    assert!(vm.validate_for_backend("vm").is_ok());
-    assert!(docker.validate_for_backend("vm").is_err());
+    assert!(docker.validate().is_ok());
+    assert!(kubernetes.validate().is_ok());
+    assert!(vm.validate().is_ok());
 
     let drifted = DriverFenceEvidence::Docker {
         container_id: "sha256:container".to_string(),
         network_mode: "bridge".to_string(),
         unexpected_networks: vec!["bridge".to_string()],
     };
-    assert!(drifted.validate_for_backend("docker").is_err());
+    assert!(drifted.validate().is_err());
 }
 
 /// The backend-independent supervisor sequence. Identical for every backend:
 /// this is the proof that adding a backend needs no supervisor lifecycle change.
 async fn drive(
     reg: &BackendRegistry,
-    descriptor: TopologyDescriptor,
+    descriptor: BackendDescriptor,
     admitted: &str,
 ) -> Result<Box<dyn RunningBoundary>, BackendError> {
     let (backend, verified) = reg.resolve(descriptor, admitted)?;

@@ -13,7 +13,7 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    GatewayCallbackTopology, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    GatewayCallbackRoute, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
     gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
     validate_linux_elf_binary, write_cache_binary_atomic,
 };
@@ -440,7 +440,7 @@ impl PodmanComputeDriver {
         // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
             config.grpc_endpoint = gateway_callback_endpoint(
-                GatewayCallbackTopology::Podman,
+                GatewayCallbackRoute::Podman,
                 config.gateway_port,
                 config.tls_enabled(),
             );
