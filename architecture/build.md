@@ -88,11 +88,10 @@ continue to opt in with `bundled-z3`.
 
 Release workflows build the standalone `openshell-prover` executable for Linux
 musl x86_64 and aarch64 and macOS Apple Silicon. The standard Debian, RPM, and
-Homebrew installations include it, following the same package-managed pattern
-as `openshell-gateway`. Releases also publish one standalone archive per target
-plus a dedicated SHA-256 manifest. Before publication, target-native jobs
-extract each archive, reject host Z3 or Nix store linkage, and run a real local
-containment check. The standalone artifact therefore requires neither an
+Homebrew installations include it. Releases also publish one standalone archive
+per target plus a dedicated SHA-256 manifest. Before publication, target-native
+jobs extract each archive, reject host Z3 or Nix store linkage, and run a real
+local containment check. The standalone artifact therefore requires neither an
 OpenShell installation nor a separately installed Z3 runtime.
 
 ## Linux Runtime Environments
