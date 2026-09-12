@@ -94,7 +94,7 @@ future version. To migrate an existing file:
    omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
    of 2048, and omit Podman `health_check_interval_secs` to disable health
    checks. Explicit zero values are invalid.
-7. Remove local Docker, Podman, or VM `grpc_endpoint` when the topology-derived
+7. Remove local Docker, Podman, or VM `grpc_endpoint` when the driver-derived
    callback is correct, or retain it as an explicit override. Kubernetes raw
    TOML requires an explicit endpoint; Helm derives one from the release's
    gateway Service. New VM root filesystems use an image-provided `sandbox`
@@ -546,7 +546,7 @@ image_pull_secrets             = ["regcred"]
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
-[openshell.drivers.kubernetes.proxy_pod]
+[openshell.drivers.kubernetes.sandbox_runtime]
 # Set this only after verifying that the cluster CNI enforces both ingress and
 # egress NetworkPolicy in every sandbox namespace.
 network_policy_enforced       = true
@@ -619,7 +619,7 @@ enabled = true
 gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
-[openshell.drivers.kubernetes.proxy_pod]
+[openshell.drivers.kubernetes.sandbox_runtime]
 # Required acknowledgement that the cluster CNI enforces NetworkPolicy and the
 # sandbox namespaces prevent untrusted policy, pod, label, and Secret changes.
 network_policy_enforced = true
@@ -699,7 +699,7 @@ image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
 # Optional override. When omitted, the gateway derives
-# https://host.openshell.internal:<gateway-port> for this topology.
+# https://host.openshell.internal:<gateway-port> for this driver.
 grpc_endpoint      = "https://host.openshell.internal:17670"
 # Contains both /openshell-sandbox and /openshell-supervisor. Defaults to the
 # gateway version; override to pin a specific build.
@@ -905,7 +905,7 @@ state_dir        = "/var/lib/openshell/vm"
 driver_dir       = "/usr/local/libexec/openshell"
 default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Optional override. When omitted, the gateway derives
-# https://host.openshell.internal:<gateway-port> for the VM topology.
+# https://host.openshell.internal:<gateway-port> for the VM driver.
 grpc_endpoint    = "https://host.openshell.internal:17670"
 # Empty falls back to default_image.
 bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

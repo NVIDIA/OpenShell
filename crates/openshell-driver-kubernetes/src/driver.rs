@@ -8,11 +8,14 @@ use crate::config::{
     KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, is_dns_1123_label,
     managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
 };
-use crate::isolation::{BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesProxyPodBoundarySpec};
-use crate::proxy_pod::{
-    BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ProxyPodNames,
-    boundary_service, control_deployment, control_egress_policy, generate_proxy_ca_material,
-    sandbox_bootstrap_secret, sandbox_owner_reference as proxy_pod_sandbox_owner_reference,
+use crate::isolation::{
+    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
+};
+use crate::sandbox_runtime::{
+    BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH,
+    SandboxRuntimeNames, boundary_service, control_deployment, control_egress_policy,
+    generate_proxy_ca_material, sandbox_bootstrap_secret,
+    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, workload_fence,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -80,17 +83,18 @@ pub type WatchStream =
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
 const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
-const ANNOTATION_PROXY_POD_BOOTSTRAPPING: &str = "openshell.ai/proxy-pod-bootstrapping";
-const ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: &str =
-    "openshell.ai/proxy-pod-bootstrap-started-at-ms";
-const ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: &str = "openshell.ai/proxy-pod-bootstrap-operation";
-const ANNOTATION_PROXY_POD_GENERATION: &str = "openshell.ai/proxy-pod-generation";
-const ANNOTATION_PROXY_POD_READINESS: &str = "openshell.ai/proxy-pod-readiness";
-const ANNOTATION_PROXY_POD_WORKLOAD_UID: &str = "openshell.ai/proxy-pod-workload-uid";
+const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: &str = "openshell.ai/sandbox-runtime-bootstrapping";
+const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: &str =
+    "openshell.ai/sandbox-runtime-bootstrap-started-at-ms";
+const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: &str =
+    "openshell.ai/sandbox-runtime-bootstrap-operation";
+const ANNOTATION_SANDBOX_RUNTIME_GENERATION: &str = "openshell.ai/sandbox-runtime-generation";
+const ANNOTATION_SANDBOX_RUNTIME_READINESS: &str = "openshell.ai/sandbox-runtime-readiness";
+const ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: &str = "openshell.ai/sandbox-runtime-workload-uid";
 
 fn boundary_service_authority(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     boundary_port: u16,
 ) -> String {
     format!(
@@ -182,15 +186,15 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
-const PROXY_POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-const PROXY_POD_FENCE_QUIESCE_WINDOW: Duration = Duration::from_secs(6);
-const PROXY_POD_FENCE_QUIESCE_INTERVAL: Duration = Duration::from_secs(2);
+const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const SANDBOX_RUNTIME_FENCE_QUIESCE_WINDOW: Duration = Duration::from_secs(6);
+const SANDBOX_RUNTIME_FENCE_QUIESCE_INTERVAL: Duration = Duration::from_secs(2);
 /// A pre-created fence may legitimately have no Sandbox CR while create is in flight.
-const PROXY_POD_ORPHAN_FENCE_MIN_AGE: Duration = Duration::from_mins(5);
+const SANDBOX_RUNTIME_ORPHAN_FENCE_MIN_AGE: Duration = Duration::from_mins(5);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
-const PROXY_POD_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
+const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
-fn random_proxy_pod_token() -> String {
+fn random_sandbox_runtime_token() -> String {
     use std::fmt::Write as _;
 
     let mut bytes = [0_u8; 32];
@@ -799,7 +803,7 @@ impl KubernetesComputeDriver {
             return Ok((owner.clone(), false));
         }
         validate_proxy_control_labels(pod, sandbox_id)?;
-        let names = ProxyPodNames::new(sandbox_id);
+        let names = SandboxRuntimeNames::new(sandbox_id);
         let replica_set_owner = controller_owner_reference(
             pod.metadata.owner_references.as_deref().unwrap_or_default(),
         )
@@ -825,7 +829,7 @@ impl KubernetesComputeDriver {
         })?;
         if deployment_owner.name != names.control_deployment {
             return Err(tonic::Status::permission_denied(
-                "control pod is not owned by the expected proxy-pod Deployment",
+                "control pod is not owned by the expected sandbox-runtime Deployment",
             ));
         }
         let deployment = Api::<Deployment>::namespaced(self.client.clone(), namespace)
@@ -1549,7 +1553,7 @@ impl KubernetesComputeDriver {
                     .clone()
                     .unwrap_or_else(|| self.config.namespace.clone());
                 Ok(
-                    sandbox_from_object_with_proxy_pod_readiness(&self.client, &ns, obj)
+                    sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
                         .await
                         .ok()
                         .map(|(_, sandbox)| sandbox),
@@ -1604,7 +1608,8 @@ impl KubernetesComputeDriver {
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.config.namespace.clone());
-                    match sandbox_from_object_with_proxy_pod_readiness(&self.client, &ns, obj).await
+                    match sandbox_from_object_with_sandbox_runtime_readiness(&self.client, &ns, obj)
+                        .await
                     {
                         Ok((_, sandbox)) => sandboxes.push(sandbox),
                         Err(err) => {
@@ -1716,8 +1721,8 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
-        let generation = random_proxy_pod_token();
-        let proxy_names = ProxyPodNames::for_generation(&sandbox.id, &generation);
+        let generation = random_sandbox_runtime_token();
+        let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
@@ -1732,13 +1737,13 @@ impl KubernetesComputeDriver {
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
-            boundary_port: self.config.proxy_pod.boundary_port,
+            boundary_port: self.config.sandbox_runtime.boundary_port,
             sandbox_secret_name: &proxy_names.sandbox_secret,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        self.create_proxy_pod_fence(&target_namespace, &proxy_names, sandbox, &kube_name)
+        self.create_sandbox_runtime_fence(&target_namespace, &proxy_names, sandbox, &kube_name)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
         // depth, but the CR is also created suspended so the controller
@@ -1752,19 +1757,19 @@ impl KubernetesComputeDriver {
         let mut annotations = sandbox_annotations(sandbox);
         add_trace_context_annotation(&mut annotations);
         annotations.insert(
-            ANNOTATION_PROXY_POD_BOOTSTRAPPING.to_string(),
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
             "true".to_string(),
         );
         annotations.insert(
-            ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT.to_string(),
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT.to_string(),
             openshell_core::time::now_ms().to_string(),
         );
         annotations.insert(
-            ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION.to_string(),
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
             "create".to_string(),
         );
         annotations.insert(
-            ANNOTATION_PROXY_POD_GENERATION.to_string(),
+            ANNOTATION_SANDBOX_RUNTIME_GENERATION.to_string(),
             generation.clone(),
         );
         for key in [
@@ -1821,7 +1826,7 @@ impl KubernetesComputeDriver {
             }
         };
         if let Err(error) = self
-            .create_proxy_pod_companions(
+            .create_sandbox_runtime_companions(
                 sandbox,
                 &target_namespace,
                 &kube_name,
@@ -1834,7 +1839,7 @@ impl KubernetesComputeDriver {
             )
             .await
         {
-            warn!(sandbox_id = %sandbox.id, %error, "proxy-pod provisioning failed; rolling back Sandbox CR");
+            warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
             let _ = agent_sandbox_api
                 .api
                 .delete(&kube_name, &DeleteParams::default())
@@ -1844,10 +1849,10 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    async fn create_proxy_pod_fence(
+    async fn create_sandbox_runtime_fence(
         &self,
         namespace: &str,
-        names: &ProxyPodNames,
+        names: &SandboxRuntimeNames,
         sandbox: &Sandbox,
         workload_pod_name: &str,
     ) -> Result<(), KubernetesDriverError> {
@@ -1855,7 +1860,7 @@ impl KubernetesComputeDriver {
             namespace,
             names,
             &sandbox.id,
-            self.config.proxy_pod.boundary_port,
+            self.config.sandbox_runtime.boundary_port,
         )
         .workload_policy;
         let labels = policy.metadata.labels.get_or_insert_default();
@@ -1874,7 +1879,7 @@ impl KubernetesComputeDriver {
             workload_pod_name.to_string(),
         );
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        create_or_validate_proxy_pod_fence(&policies, &policy).await
+        create_or_validate_sandbox_runtime_fence(&policies, &policy).await
     }
 
     async fn wait_for_bootstrap_workload_pod(
@@ -1954,7 +1959,7 @@ impl KubernetesComputeDriver {
             .labels
             .as_ref()
             .ok_or_else(|| fail("missing labels"))?;
-        let expected_pair = crate::proxy_pod::pair_label_value(sandbox_id);
+        let expected_pair = crate::sandbox_runtime::pair_label_value(sandbox_id);
         if labels.get(BOUNDARY_ROLE_LABEL).map(String::as_str) != Some("workload")
             || labels.get(BOUNDARY_PAIR_LABEL).map(String::as_str) != Some(expected_pair.as_str())
         {
@@ -2126,14 +2131,14 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
-    async fn create_proxy_pod_companions(
+    async fn create_sandbox_runtime_companions(
         &self,
         sandbox: &Sandbox,
         namespace: &str,
         cr_name: &str,
         sandbox_api: &AgentSandboxApi,
         sandbox_cr: &DynamicObject,
-        names: &ProxyPodNames,
+        names: &SandboxRuntimeNames,
         generation: &str,
         agent_uid: u32,
         agent_gid: u32,
@@ -2150,13 +2155,13 @@ impl KubernetesComputeDriver {
             .ok_or_else(|| {
                 KubernetesDriverError::Message("sandbox namespace has no UID".to_string())
             })?;
-        let dependent_owner = proxy_pod_sandbox_owner_reference(
+        let dependent_owner = sandbox_runtime_sandbox_owner_reference(
             cr_name,
             cr_uid,
             &sandbox_api.resource.api_version,
             false,
         );
-        let controller_owner = proxy_pod_sandbox_owner_reference(
+        let controller_owner = sandbox_runtime_sandbox_owner_reference(
             cr_name,
             cr_uid,
             &sandbox_api.resource.api_version,
@@ -2171,7 +2176,7 @@ impl KubernetesComputeDriver {
                     namespace,
                     names,
                     &sandbox.id,
-                    self.config.proxy_pod.boundary_port,
+                    self.config.sandbox_runtime.boundary_port,
                     dependent_owner.clone(),
                 ),
             )
@@ -2295,7 +2300,7 @@ impl KubernetesComputeDriver {
                 "metadata": {
                     "resourceVersion": version,
                     "annotations": {
-                        ANNOTATION_PROXY_POD_WORKLOAD_UID: workload_pod_uid.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                     }
                 }
             })
@@ -2338,7 +2343,7 @@ impl KubernetesComputeDriver {
             format!("sandbox:{cr_uid}"),
         )
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let provisioned = KubernetesProxyPodBoundarySpec {
+        let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox.id.clone(),
             generation: generation.to_string(),
             session_id,
@@ -2357,16 +2362,16 @@ impl KubernetesComputeDriver {
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
                 },
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             control_authority: boundary_service_authority(
                 namespace,
                 names,
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             control_address: std::net::SocketAddr::new(
                 service_ip,
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
@@ -2382,8 +2387,8 @@ impl KubernetesComputeDriver {
         }
         .provision();
         let descriptor = provisioned
-            .topology
-            .descriptor(crate::isolation::BACKEND_NAME)
+            .runtime_descriptor
+            .backend_descriptor()
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
@@ -2448,7 +2453,7 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?;
-        spawn_proxy_pod_bootstrap_completion(
+        spawn_sandbox_runtime_bootstrap_completion(
             deployments.clone(),
             sandbox_api.api.clone(),
             names.control_deployment.clone(),
@@ -2465,14 +2470,14 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
-    async fn install_proxy_pod_generation(
+    async fn install_sandbox_runtime_generation(
         &self,
         namespace: &str,
         cr_name: &str,
         sandbox_api: &AgentSandboxApi,
         sandbox_id: &str,
         cr_uid: &str,
-        names: &ProxyPodNames,
+        names: &SandboxRuntimeNames,
         generation: &str,
         deployment_uid: &str,
         agent_uid: u32,
@@ -2544,7 +2549,7 @@ impl KubernetesComputeDriver {
                 "metadata": {
                     "resourceVersion": version,
                     "annotations": {
-                        ANNOTATION_PROXY_POD_WORKLOAD_UID: workload_pod_uid.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                     }
                 }
             })
@@ -2565,7 +2570,7 @@ impl KubernetesComputeDriver {
             format!("sandbox:{cr_uid}"),
         )
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let provisioned = KubernetesProxyPodBoundarySpec {
+        let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox_id.to_string(),
             generation: generation.to_string(),
             session_id,
@@ -2584,16 +2589,16 @@ impl KubernetesComputeDriver {
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
                 },
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             control_authority: boundary_service_authority(
                 namespace,
                 names,
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             control_address: std::net::SocketAddr::new(
                 service_ip,
-                self.config.proxy_pod.boundary_port,
+                self.config.sandbox_runtime.boundary_port,
             ),
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_PATH),
@@ -2609,8 +2614,8 @@ impl KubernetesComputeDriver {
         }
         .provision();
         let descriptor = provisioned
-            .topology
-            .descriptor(crate::isolation::BACKEND_NAME)
+            .runtime_descriptor
+            .backend_descriptor()
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
@@ -2676,7 +2681,7 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?;
-        spawn_proxy_pod_bootstrap_completion(
+        spawn_sandbox_runtime_bootstrap_completion(
             deployments,
             sandbox_api.api.clone(),
             names.control_deployment.clone(),
@@ -2743,13 +2748,13 @@ impl KubernetesComputeDriver {
             );
             if stop_is_complete {
                 if let Err(error) = self
-                    .scale_proxy_pod_control(sandbox_id, &namespace, 0)
+                    .scale_sandbox_runtime_control(sandbox_id, &namespace, 0)
                     .await
                 {
                     // The workload is already stopped. Treat a stranded
                     // control replica as resource drift and let periodic
                     // reconciliation retry rather than failing the stop.
-                    warn!(sandbox_id, %error, "failed to scale stopped proxy-pod control Deployment to zero");
+                    warn!(sandbox_id, %error, "failed to scale stopped sandbox-runtime control Deployment to zero");
                 }
                 return Ok(());
             }
@@ -2781,12 +2786,13 @@ impl KubernetesComputeDriver {
     ) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let result =
-            Box::pin(self.start_proxy_pod_generation(sandbox_id, launch_authentication)).await;
+            Box::pin(self.start_sandbox_runtime_generation(sandbox_id, launch_authentication))
+                .await;
         span_status.finish(result)
     }
 
     #[allow(clippy::similar_names)]
-    async fn start_proxy_pod_generation(
+    async fn start_sandbox_runtime_generation(
         &self,
         sandbox_id: &str,
         encoded_authentication: &[u8],
@@ -2804,7 +2810,7 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::from_kube)?
             .items;
         let object = objects.pop().ok_or(KubernetesDriverError::NotFound)?;
-        if proxy_pod_bootstrap_in_progress(&object) {
+        if sandbox_runtime_bootstrap_in_progress(&object) {
             return Err(KubernetesDriverError::Precondition(
                 "sandbox bootstrap has not completed; wait for reconciliation or recreate the sandbox"
                     .to_string(),
@@ -2838,9 +2844,9 @@ impl KubernetesComputeDriver {
             ));
         }
 
-        let generation = random_proxy_pod_token();
-        let names = ProxyPodNames::for_generation(sandbox_id, &generation);
-        self.create_proxy_pod_fence(
+        let generation = random_sandbox_runtime_token();
+        let names = SandboxRuntimeNames::for_generation(sandbox_id, &generation);
+        self.create_sandbox_runtime_fence(
             &namespace,
             &names,
             &Sandbox {
@@ -2958,10 +2964,10 @@ impl KubernetesComputeDriver {
             let mut running_patch =
                 sandbox_operating_state_patch(&sandbox_api.resource.version, version, true);
             running_patch["metadata"]["annotations"] = serde_json::json!({
-                ANNOTATION_PROXY_POD_BOOTSTRAPPING: "true",
-                ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
-                ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: "restart",
-                ANNOTATION_PROXY_POD_GENERATION: generation,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
+                ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation,
             });
             running_patch["spec"]["podTemplate"]["spec"]["volumes"] =
                 serde_json::Value::Array(volumes.clone());
@@ -2972,7 +2978,7 @@ impl KubernetesComputeDriver {
         let (agent_uid, agent_gid, _) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
         let child_env = child_environment_from_sandbox_object(&object);
-        self.install_proxy_pod_generation(
+        self.install_sandbox_runtime_generation(
             &namespace,
             cr_name,
             &sandbox_api,
@@ -3040,13 +3046,13 @@ impl KubernetesComputeDriver {
             .cloned()
             .unwrap_or_else(|| kube_name.clone());
         if running {
-            if proxy_pod_bootstrap_in_progress(&object) {
+            if sandbox_runtime_bootstrap_in_progress(&object) {
                 return Err(KubernetesDriverError::Precondition(
-                    "proxy-pod bootstrap has not completed; wait for reconciliation or recreate the sandbox"
+                    "sandbox-runtime bootstrap has not completed; wait for reconciliation or recreate the sandbox"
                         .to_string(),
                 ));
             }
-            self.scale_proxy_pod_control(sandbox_id, &namespace, 1)
+            self.scale_sandbox_runtime_control(sandbox_id, &namespace, 1)
                 .await?;
         }
         patch_dynamic_object_with_resource_version_retry(
@@ -3073,13 +3079,13 @@ impl KubernetesComputeDriver {
         ))
     }
 
-    async fn scale_proxy_pod_control(
+    async fn scale_sandbox_runtime_control(
         &self,
         sandbox_id: &str,
         namespace: &str,
         replicas: i32,
     ) -> Result<(), KubernetesDriverError> {
-        let names = ProxyPodNames::new(sandbox_id);
+        let names = SandboxRuntimeNames::new(sandbox_id);
         Api::<Deployment>::namespaced(self.client.clone(), namespace)
             .patch(
                 &names.control_deployment,
@@ -3199,7 +3205,7 @@ impl KubernetesComputeDriver {
                             Ok(false) | Err(_) => {
                                 warn!(
                                     sandbox_id,
-                                    "retaining proxy-pod workload fence because workload Pod deletion was not confirmed"
+                                    "retaining sandbox-runtime workload fence because workload Pod deletion was not confirmed"
                                 );
                                 return Ok(true);
                             }
@@ -3218,14 +3224,14 @@ impl KubernetesComputeDriver {
                     ) {
                         warn!(
                             sandbox_id,
-                            "retaining proxy-pod workload fence because Sandbox CR deletion was not confirmed"
+                            "retaining sandbox-runtime workload fence because Sandbox CR deletion was not confirmed"
                         );
                         return Ok(true);
                     }
                     let quiesce_deadline =
-                        tokio::time::Instant::now() + PROXY_POD_FENCE_QUIESCE_WINDOW;
+                        tokio::time::Instant::now() + SANDBOX_RUNTIME_FENCE_QUIESCE_WINDOW;
                     while tokio::time::Instant::now() < quiesce_deadline {
-                        tokio::time::sleep(PROXY_POD_FENCE_QUIESCE_INTERVAL).await;
+                        tokio::time::sleep(SANDBOX_RUNTIME_FENCE_QUIESCE_INTERVAL).await;
                         let cr_is_gone = matches!(
                             tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
                                 .await,
@@ -3244,12 +3250,12 @@ impl KubernetesComputeDriver {
                         if !cr_is_gone || !pod_is_gone {
                             warn!(
                                 sandbox_id,
-                                "retaining proxy-pod workload fence because deletion did not remain quiescent"
+                                "retaining sandbox-runtime workload fence because deletion did not remain quiescent"
                             );
                             return Ok(true);
                         }
                     }
-                    let names = ProxyPodNames::new(sandbox_id);
+                    let names = SandboxRuntimeNames::new(sandbox_id);
                     let policies: Api<NetworkPolicy> =
                         Api::namespaced(self.client.clone(), &obj_namespace);
                     match policies
@@ -3259,7 +3265,7 @@ impl KubernetesComputeDriver {
                         Ok(_)
                         | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
                         Err(error) => {
-                            warn!(sandbox_id, %error, "failed to delete proxy-pod workload fence; reconciliation will retry");
+                            warn!(sandbox_id, %error, "failed to delete sandbox-runtime workload fence; reconciliation will retry");
                         }
                     }
                 }
@@ -3311,14 +3317,14 @@ impl KubernetesComputeDriver {
     /// gateway's sandbox watch is alive. Bootstrap material is immutable and
     /// intentionally not read by the gateway, so this pass only repairs state
     /// that can be proven from the Sandbox CR and named companion objects.
-    async fn reconcile_proxy_pod_resources(&self) {
+    async fn reconcile_sandbox_runtime_resources(&self) {
         let lookup_api = match self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
         {
             Ok(api) => api,
             Err(error) => {
-                warn!(%error, "skipping proxy-pod reconciliation: Sandbox API unavailable");
+                warn!(%error, "skipping sandbox-runtime reconciliation: Sandbox API unavailable");
                 return;
             }
         };
@@ -3332,11 +3338,11 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(list)) => list,
             Ok(Err(error)) => {
-                warn!(%error, "skipping proxy-pod reconciliation: Sandbox list failed");
+                warn!(%error, "skipping sandbox-runtime reconciliation: Sandbox list failed");
                 return;
             }
             Err(_) => {
-                warn!("skipping proxy-pod reconciliation: Sandbox list timed out");
+                warn!("skipping sandbox-runtime reconciliation: Sandbox list timed out");
                 return;
             }
         };
@@ -3353,7 +3359,7 @@ impl KubernetesComputeDriver {
                 .as_deref()
                 .unwrap_or(&self.config.namespace);
             let cr_name = object.metadata.name.as_deref().unwrap_or_default();
-            let names = ProxyPodNames::new(&sandbox_id);
+            let names = SandboxRuntimeNames::new(&sandbox_id);
             let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
             let fence_was_missing = matches!(
                 tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(&names.workload_policy))
@@ -3365,18 +3371,18 @@ impl KubernetesComputeDriver {
                 ..Default::default()
             };
             match self
-                .create_proxy_pod_fence(namespace, &names, &sandbox, cr_name)
+                .create_sandbox_runtime_fence(namespace, &names, &sandbox, cr_name)
                 .await
             {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
-                    warn!(sandbox_id, %error, "proxy-pod workload fence is altered; suspending workload");
-                    self.suspend_proxy_pod_after_dependency_failure(&lookup_api, &object)
+                    warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
+                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
                         .await;
                     continue;
                 }
                 Err(error) => {
-                    warn!(sandbox_id, %error, "could not verify proxy-pod workload fence; reconciliation will retry");
+                    warn!(sandbox_id, %error, "could not verify sandbox-runtime workload fence; reconciliation will retry");
                     continue;
                 }
             }
@@ -3387,28 +3393,28 @@ impl KubernetesComputeDriver {
                 // re-confirmed after a control restart.
                 warn!(
                     sandbox_id,
-                    "recreated missing proxy-pod workload fence; suspending stale boundary"
+                    "recreated missing sandbox-runtime workload fence; suspending stale boundary"
                 );
-                self.suspend_proxy_pod_after_dependency_failure(&lookup_api, &object)
+                self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
                     .await;
                 continue;
             }
-            if proxy_pod_bootstrap_in_progress(&object) {
-                if proxy_pod_control_availability(&self.client, namespace, &sandbox_id).await
-                    == ProxyPodControlAvailability::Available
-                    && proxy_pod_runtime_is_ready(&object)
+            if sandbox_runtime_bootstrap_in_progress(&object) {
+                if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
+                    == SandboxRuntimeControlAvailability::Available
+                    && sandbox_runtime_runtime_is_ready(&object)
                 {
-                    self.complete_proxy_pod_bootstrap(&lookup_api, &object)
+                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
                 } else {
-                    self.reap_stale_proxy_pod_bootstrap(&lookup_api, &object)
+                    self.reap_stale_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
                 }
                 continue;
             }
-            let desired = desired_proxy_pod_control_replicas(&object);
+            let desired = desired_sandbox_runtime_control_replicas(&object);
             if desired > 0 {
-                match proxy_pod_workload_generation_matches(
+                match sandbox_runtime_workload_generation_matches(
                     &self.client,
                     namespace,
                     cr_name,
@@ -3416,64 +3422,64 @@ impl KubernetesComputeDriver {
                 )
                 .await
                 {
-                    ProxyPodControlAvailability::Available => {}
-                    ProxyPodControlAvailability::Unavailable => {
+                    SandboxRuntimeControlAvailability::Available => {}
+                    SandboxRuntimeControlAvailability::Unavailable => {
                         warn!(
                             sandbox_id,
-                            "proxy-pod workload generation changed; suspending stale boundary"
+                            "sandbox-runtime workload generation changed; suspending stale boundary"
                         );
-                        self.suspend_proxy_pod_after_dependency_failure(&lookup_api, &object)
+                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
                             .await;
                         continue;
                     }
-                    ProxyPodControlAvailability::Unknown => {
+                    SandboxRuntimeControlAvailability::Unknown => {
                         warn!(
                             sandbox_id,
-                            "could not verify proxy-pod workload generation; reconciliation will retry"
+                            "could not verify sandbox-runtime workload generation; reconciliation will retry"
                         );
                         continue;
                     }
                 }
             }
             match self
-                .reconcile_proxy_pod_control_replicas(&sandbox_id, namespace, desired)
+                .reconcile_sandbox_runtime_control_replicas(&sandbox_id, namespace, desired)
                 .await
             {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
-                    warn!(sandbox_id, %error, "proxy-pod companion is missing; suspending workload");
-                    self.suspend_proxy_pod_after_dependency_failure(&lookup_api, &object)
+                    warn!(sandbox_id, %error, "sandbox-runtime companion is missing; suspending workload");
+                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
                         .await;
                 }
                 Err(error) => {
-                    warn!(sandbox_id, %error, "failed to reconcile proxy-pod control Deployment");
+                    warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime control Deployment");
                 }
             }
             let availability =
-                proxy_pod_control_availability(&self.client, namespace, &sandbox_id).await;
-            self.publish_proxy_pod_readiness_transition(&lookup_api, &object, availability)
+                sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await;
+            self.publish_sandbox_runtime_readiness_transition(&lookup_api, &object, availability)
                 .await;
         }
 
-        self.reap_orphaned_proxy_pod_fences(&live_ids).await;
+        self.reap_orphaned_sandbox_runtime_fences(&live_ids).await;
     }
 
-    async fn publish_proxy_pod_readiness_transition(
+    async fn publish_sandbox_runtime_readiness_transition(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
-        availability: ProxyPodControlAvailability,
+        availability: SandboxRuntimeControlAvailability,
     ) {
         let state = match availability {
-            ProxyPodControlAvailability::Available => "ready",
-            ProxyPodControlAvailability::Unavailable => "unavailable",
-            ProxyPodControlAvailability::Unknown => return,
+            SandboxRuntimeControlAvailability::Available => "ready",
+            SandboxRuntimeControlAvailability::Unavailable => "unavailable",
+            SandboxRuntimeControlAvailability::Unknown => return,
         };
         if object
             .metadata
             .annotations
             .as_ref()
-            .and_then(|annotations| annotations.get(ANNOTATION_PROXY_POD_READINESS))
+            .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_READINESS))
             .is_some_and(|current| current == state)
         {
             return;
@@ -3491,7 +3497,7 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = proxy_pod_readiness_transition_patch(resource_version, state);
+        let patch = sandbox_runtime_readiness_transition_patch(resource_version, state);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.api
@@ -3501,18 +3507,18 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                debug!(sandbox = name, %error, "proxy-pod readiness transition publication raced; reconciliation will retry");
+                debug!(sandbox = name, %error, "sandbox-runtime readiness transition publication raced; reconciliation will retry");
             }
             Err(_) => {
                 warn!(
                     sandbox = name,
-                    "timed out publishing proxy-pod readiness transition"
+                    "timed out publishing sandbox-runtime readiness transition"
                 );
             }
         }
     }
 
-    async fn suspend_proxy_pod_after_dependency_failure(
+    async fn suspend_sandbox_runtime_after_dependency_failure(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
@@ -3545,28 +3551,32 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                warn!(sandbox = name, %error, "failed to suspend proxy-pod after fence failure");
+                warn!(sandbox = name, %error, "failed to suspend sandbox-runtime after fence failure");
             }
             Err(error) => {
-                warn!(sandbox = name, %error, "timed out suspending proxy-pod after fence failure");
+                warn!(sandbox = name, %error, "timed out suspending sandbox-runtime after fence failure");
             }
         }
     }
 
-    async fn reap_stale_proxy_pod_bootstrap(
+    async fn reap_stale_sandbox_runtime_bootstrap(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
-        if !proxy_pod_bootstrap_is_stale(object, SystemTime::now(), PROXY_POD_BOOTSTRAP_GRACE) {
+        if !sandbox_runtime_bootstrap_is_stale(
+            object,
+            SystemTime::now(),
+            SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+        ) {
             return;
         }
-        if proxy_pod_bootstrap_operation(object) != Some("create") {
+        if sandbox_runtime_bootstrap_operation(object) != Some("create") {
             warn!(
                 sandbox = object.metadata.name.as_deref().unwrap_or("<unknown>"),
-                "suspending stale proxy-pod restart bootstrap"
+                "suspending stale sandbox-runtime restart bootstrap"
             );
-            self.suspend_proxy_pod_after_dependency_failure(lookup_api, object)
+            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, object)
                 .await;
             return;
         }
@@ -3591,22 +3601,22 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.delete(name, &params)).await {
             Ok(Ok(_)) => warn!(
                 sandbox = name,
-                "rolled back stale fail-closed proxy-pod bootstrap"
+                "rolled back stale fail-closed sandbox-runtime bootstrap"
             ),
             Ok(Err(KubeError::Api(error))) if error.code == 404 || error.code == 409 => {}
             Ok(Err(error)) => {
-                warn!(sandbox = name, %error, "failed to roll back stale proxy-pod bootstrap");
+                warn!(sandbox = name, %error, "failed to roll back stale sandbox-runtime bootstrap");
             }
             Err(_) => {
                 warn!(
                     sandbox = name,
-                    "timed out rolling back stale proxy-pod bootstrap"
+                    "timed out rolling back stale sandbox-runtime bootstrap"
                 );
             }
         }
     }
 
-    async fn complete_proxy_pod_bootstrap(
+    async fn complete_sandbox_runtime_bootstrap(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
@@ -3624,7 +3634,7 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = proxy_pod_bootstrap_completion_patch(resource_version);
+        let patch = sandbox_runtime_bootstrap_completion_patch(resource_version);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.api
@@ -3634,33 +3644,36 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                debug!(sandbox = name, %error, "proxy-pod bootstrap completion raced; reconciliation will retry");
+                debug!(sandbox = name, %error, "sandbox-runtime bootstrap completion raced; reconciliation will retry");
             }
-            Err(_) => warn!(sandbox = name, "timed out completing proxy-pod bootstrap"),
+            Err(_) => warn!(
+                sandbox = name,
+                "timed out completing sandbox-runtime bootstrap"
+            ),
         }
     }
 
-    async fn reconcile_proxy_pod_control_replicas(
+    async fn reconcile_sandbox_runtime_control_replicas(
         &self,
         sandbox_id: &str,
         namespace: &str,
         desired: i32,
     ) -> Result<(), KubernetesDriverError> {
-        let names = ProxyPodNames::new(sandbox_id);
+        let names = SandboxRuntimeNames::new(sandbox_id);
         let services = Api::<Service>::namespaced(self.client.clone(), namespace);
         let service_exists =
             tokio::time::timeout(KUBE_API_TIMEOUT, services.get_opt(&names.boundary_service))
                 .await
                 .map_err(|_| {
                     KubernetesDriverError::Message(
-                        "timed out reading proxy-pod boundary Service".to_string(),
+                        "timed out reading sandbox-runtime boundary Service".to_string(),
                     )
                 })?
                 .map_err(KubernetesDriverError::from_kube)?
                 .is_some();
         if !service_exists {
             return Err(KubernetesDriverError::Precondition(format!(
-                "proxy-pod boundary Service {} is missing and its allocated address cannot be safely reconstructed",
+                "sandbox-runtime boundary Service {} is missing and its allocated address cannot be safely reconstructed",
                 names.boundary_service
             )));
         }
@@ -3672,24 +3685,24 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(
-                "timed out reading proxy-pod control Deployment".to_string(),
+                "timed out reading sandbox-runtime control Deployment".to_string(),
             )
         })?
         .map_err(KubernetesDriverError::from_kube)?
         .ok_or_else(|| {
             KubernetesDriverError::Precondition(format!(
-                "proxy-pod control Deployment {} is missing and cannot be safely reconstructed from the Sandbox CR",
+                "sandbox-runtime control Deployment {} is missing and cannot be safely reconstructed from the Sandbox CR",
                 names.control_deployment
             ))
         })?;
         if deployment.spec.as_ref().and_then(|spec| spec.replicas) == Some(desired) {
             return Ok(());
         }
-        self.scale_proxy_pod_control(sandbox_id, namespace, desired)
+        self.scale_sandbox_runtime_control(sandbox_id, namespace, desired)
             .await
     }
 
-    async fn reap_orphaned_proxy_pod_fences(&self, live_ids: &HashSet<String>) {
+    async fn reap_orphaned_sandbox_runtime_fences(&self, live_ids: &HashSet<String>) {
         let policies: Api<NetworkPolicy> = if self.config.is_multi_namespace() {
             Api::all(self.client.clone())
         } else {
@@ -3707,11 +3720,11 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(list)) => list,
             Ok(Err(error)) => {
-                warn!(%error, "failed to list proxy-pod workload fences for orphan cleanup");
+                warn!(%error, "failed to list sandbox-runtime workload fences for orphan cleanup");
                 return;
             }
             Err(_) => {
-                warn!("timed out listing proxy-pod workload fences for orphan cleanup");
+                warn!("timed out listing sandbox-runtime workload fences for orphan cleanup");
                 return;
             }
         };
@@ -3726,10 +3739,10 @@ impl KubernetesComputeDriver {
             if sandbox_id.is_empty() || live_ids.contains(&sandbox_id) {
                 continue;
             }
-            if !proxy_pod_fence_is_old_enough(&policy, SystemTime::now()) {
+            if !sandbox_runtime_fence_is_old_enough(&policy, SystemTime::now()) {
                 debug!(
                     sandbox_id,
-                    "retaining young proxy-pod fence while Sandbox creation may be in flight"
+                    "retaining young sandbox-runtime fence while Sandbox creation may be in flight"
                 );
                 continue;
             }
@@ -3749,7 +3762,7 @@ impl KubernetesComputeDriver {
             else {
                 warn!(
                     sandbox_id,
-                    "retaining orphaned proxy-pod fence without workload Pod annotation"
+                    "retaining orphaned sandbox-runtime fence without workload Pod annotation"
                 );
                 continue;
             };
@@ -3760,14 +3773,16 @@ impl KubernetesComputeDriver {
             ) {
                 debug!(
                     sandbox_id,
-                    pod_name, "retaining proxy-pod fence until workload Pod absence is confirmed"
+                    pod_name,
+                    "retaining sandbox-runtime fence until workload Pod absence is confirmed"
                 );
                 continue;
             }
-            let quiesce_deadline = tokio::time::Instant::now() + PROXY_POD_FENCE_QUIESCE_WINDOW;
+            let quiesce_deadline =
+                tokio::time::Instant::now() + SANDBOX_RUNTIME_FENCE_QUIESCE_WINDOW;
             let mut quiescent = true;
             while tokio::time::Instant::now() < quiesce_deadline {
-                tokio::time::sleep(PROXY_POD_FENCE_QUIESCE_INTERVAL).await;
+                tokio::time::sleep(SANDBOX_RUNTIME_FENCE_QUIESCE_INTERVAL).await;
                 if self.sandbox_exists(&sandbox_id).await != Ok(false)
                     || !matches!(
                         tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name)).await,
@@ -3781,7 +3796,7 @@ impl KubernetesComputeDriver {
             if !quiescent {
                 debug!(
                     sandbox_id,
-                    pod_name, "retaining orphaned proxy-pod fence after quiescence recheck"
+                    pod_name, "retaining orphaned sandbox-runtime fence after quiescence recheck"
                 );
                 continue;
             }
@@ -3799,34 +3814,34 @@ impl KubernetesComputeDriver {
                     info!(
                         sandbox_id,
                         policy = name,
-                        "reaped orphaned proxy-pod workload fence"
+                        "reaped orphaned sandbox-runtime workload fence"
                     );
                 }
                 Ok(Err(error)) => {
-                    warn!(sandbox_id, policy = name, %error, "failed to reap orphaned proxy-pod workload fence");
+                    warn!(sandbox_id, policy = name, %error, "failed to reap orphaned sandbox-runtime workload fence");
                 }
                 Err(_) => warn!(
                     sandbox_id,
                     policy = name,
-                    "timed out reaping orphaned proxy-pod workload fence"
+                    "timed out reaping orphaned sandbox-runtime workload fence"
                 ),
             }
         }
     }
 
-    fn spawn_proxy_pod_periodic_reconcile(
+    fn spawn_sandbox_runtime_periodic_reconcile(
         &self,
         tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
     ) {
         let driver = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(PROXY_POD_RECONCILE_INTERVAL);
+            let mut interval = tokio::time::interval(SANDBOX_RUNTIME_RECONCILE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        driver.reconcile_proxy_pod_resources().await;
+                        driver.reconcile_sandbox_runtime_resources().await;
                         if let Ok(sandboxes) = driver.list_sandboxes().await {
                             for sandbox in sandboxes {
                                 if tx.send(Ok(WatchSandboxesEvent {
@@ -3848,7 +3863,7 @@ impl KubernetesComputeDriver {
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
-        self.reconcile_proxy_pod_resources().await;
+        self.reconcile_sandbox_runtime_resources().await;
         if self.config.is_multi_namespace() {
             self.watch_sandboxes_cluster_wide().await
         } else {
@@ -3874,7 +3889,7 @@ impl KubernetesComputeDriver {
         )
         .boxed();
         let (tx, rx) = mpsc::channel(256);
-        self.spawn_proxy_pod_periodic_reconcile(tx.clone());
+        self.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
         let readiness_client = self.watch_client.clone();
 
         tokio::spawn(async move {
@@ -3885,7 +3900,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
                         Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &namespace, obj).await {
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &namespace, obj).await {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -3979,21 +3994,21 @@ impl KubernetesComputeDriver {
     }
 }
 
-fn proxy_pod_bootstrap_completion_patch(resource_version: &str) -> serde_json::Value {
+fn sandbox_runtime_bootstrap_completion_patch(resource_version: &str) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
             "resourceVersion": resource_version,
             "annotations": {
-                ANNOTATION_PROXY_POD_BOOTSTRAPPING: serde_json::Value::Null,
-                ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
-                ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: serde_json::Value::Null,
-                ANNOTATION_PROXY_POD_READINESS: "ready",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_READINESS: "ready",
             }
         }
     })
 }
 
-fn spawn_proxy_pod_bootstrap_completion(
+fn spawn_sandbox_runtime_bootstrap_completion(
     deployments: Api<Deployment>,
     sandboxes: Api<DynamicObject>,
     deployment_name: String,
@@ -4001,11 +4016,11 @@ fn spawn_proxy_pod_bootstrap_completion(
     expected_sandbox_uid: Option<String>,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + PROXY_POD_BOOTSTRAP_GRACE;
+        let deadline = tokio::time::Instant::now() + SANDBOX_RUNTIME_BOOTSTRAP_GRACE;
         let available = |deployment: Option<&Deployment>| {
             deployment.is_some_and(|deployment| {
-                proxy_pod_control_availability_from_deployment(deployment)
-                    == ProxyPodControlAvailability::Available
+                sandbox_runtime_control_availability_from_deployment(deployment)
+                    == SandboxRuntimeControlAvailability::Available
             })
         };
         match tokio::time::timeout_at(
@@ -4017,7 +4032,7 @@ fn spawn_proxy_pod_bootstrap_completion(
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) | Err(_) => return,
             Ok(Err(error)) => {
-                debug!(%error, sandbox = sandbox_name, "proxy-pod bootstrap availability watch failed; reconciliation will retry");
+                debug!(%error, sandbox = sandbox_name, "sandbox-runtime bootstrap availability watch failed; reconciliation will retry");
                 return;
             }
         }
@@ -4031,8 +4046,8 @@ fn spawn_proxy_pod_bootstrap_completion(
         let runtime_ready = |object: Option<&DynamicObject>| {
             object.is_some_and(|object| {
                 object.metadata.uid == expected_sandbox_uid
-                    && proxy_pod_bootstrap_in_progress(object)
-                    && proxy_pod_runtime_is_ready(object)
+                    && sandbox_runtime_bootstrap_in_progress(object)
+                    && sandbox_runtime_runtime_is_ready(object)
             })
         };
         let object = match tokio::time::timeout_at(
@@ -4044,14 +4059,14 @@ fn spawn_proxy_pod_bootstrap_completion(
             Ok(Ok(Some(object))) => object,
             Ok(Ok(None)) | Err(_) => return,
             Ok(Err(error)) => {
-                debug!(%error, sandbox = sandbox_name, "proxy-pod runtime readiness watch failed; reconciliation will retry");
+                debug!(%error, sandbox = sandbox_name, "sandbox-runtime runtime readiness watch failed; reconciliation will retry");
                 return;
             }
         };
         let Some(resource_version) = object.metadata.resource_version.as_deref() else {
             return;
         };
-        let patch = proxy_pod_bootstrap_completion_patch(resource_version);
+        let patch = sandbox_runtime_bootstrap_completion_patch(resource_version);
         if let Err(error) = sandboxes
             .patch(
                 &sandbox_name,
@@ -4060,12 +4075,12 @@ fn spawn_proxy_pod_bootstrap_completion(
             )
             .await
         {
-            debug!(%error, sandbox = sandbox_name, "proxy-pod bootstrap completion raced; reconciliation will retry");
+            debug!(%error, sandbox = sandbox_name, "sandbox-runtime bootstrap completion raced; reconciliation will retry");
         }
     });
 }
 
-fn proxy_pod_runtime_is_ready(object: &DynamicObject) -> bool {
+fn sandbox_runtime_runtime_is_ready(object: &DynamicObject) -> bool {
     let Some(generation) = object.metadata.generation else {
         return false;
     };
@@ -4096,29 +4111,29 @@ fn proxy_pod_runtime_is_ready(object: &DynamicObject) -> bool {
     ready && !suspended
 }
 
-fn proxy_pod_fence_is_old_enough(policy: &NetworkPolicy, now: SystemTime) -> bool {
-    metadata_is_older_than(&policy.metadata, now, PROXY_POD_ORPHAN_FENCE_MIN_AGE)
+fn sandbox_runtime_fence_is_old_enough(policy: &NetworkPolicy, now: SystemTime) -> bool {
+    metadata_is_older_than(&policy.metadata, now, SANDBOX_RUNTIME_ORPHAN_FENCE_MIN_AGE)
 }
 
-fn proxy_pod_bootstrap_in_progress(object: &DynamicObject) -> bool {
+fn sandbox_runtime_bootstrap_in_progress(object: &DynamicObject) -> bool {
     object
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_PROXY_POD_BOOTSTRAPPING))
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING))
         .is_some_and(|value| value == "true")
 }
 
-fn proxy_pod_bootstrap_operation(object: &DynamicObject) -> Option<&str> {
+fn sandbox_runtime_bootstrap_operation(object: &DynamicObject) -> Option<&str> {
     object
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION))
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION))
         .map(String::as_str)
 }
 
-fn proxy_pod_bootstrap_is_stale(
+fn sandbox_runtime_bootstrap_is_stale(
     object: &DynamicObject,
     now: SystemTime,
     minimum_age: Duration,
@@ -4127,7 +4142,7 @@ fn proxy_pod_bootstrap_is_stale(
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT))
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT))
         .and_then(|value| value.parse::<u64>().ok())
     else {
         return true;
@@ -4136,11 +4151,14 @@ fn proxy_pod_bootstrap_is_stale(
         .is_ok_and(|age| age >= minimum_age)
 }
 
-fn proxy_pod_readiness_transition_patch(resource_version: &str, state: &str) -> serde_json::Value {
+fn sandbox_runtime_readiness_transition_patch(
+    resource_version: &str,
+    state: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
             "resourceVersion": resource_version,
-            "annotations": { ANNOTATION_PROXY_POD_READINESS: state },
+            "annotations": { ANNOTATION_SANDBOX_RUNTIME_READINESS: state },
         }
     })
 }
@@ -4166,7 +4184,7 @@ where
     S: Stream<Item = Event<DynamicObject>> + Send + Unpin + 'static,
 {
     let (tx, rx) = mpsc::channel(256);
-    driver.spawn_proxy_pod_periodic_reconcile(tx.clone());
+    driver.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
 
     tokio::spawn(async move {
         loop {
@@ -4175,7 +4193,7 @@ where
                     Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
-                        if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_proxy_pod_readiness(&readiness_client, &ns, obj).await {
+                        if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_sandbox_runtime_readiness(&readiness_client, &ns, obj).await {
                             let event = WatchSandboxesEvent {
                                 payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                     WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -4547,9 +4565,9 @@ fn validate_proxy_control_labels_from_metadata(
     sandbox_id: &str,
 ) -> Result<(), tonic::Status> {
     let labels = metadata.labels.as_ref().ok_or_else(|| {
-        tonic::Status::permission_denied("control workload has no proxy-pod labels")
+        tonic::Status::permission_denied("control workload has no sandbox-runtime labels")
     })?;
-    let expected_pair = crate::proxy_pod::pair_label_value(sandbox_id);
+    let expected_pair = crate::sandbox_runtime::pair_label_value(sandbox_id);
     let matches = labels
         .get(BOUNDARY_ROLE_LABEL)
         .is_some_and(|role| role == "supervisor")
@@ -4563,7 +4581,7 @@ fn validate_proxy_control_labels_from_metadata(
         Ok(())
     } else {
         Err(tonic::Status::permission_denied(
-            "control workload proxy-pod labels do not match the sandbox identity",
+            "control workload sandbox-runtime labels do not match the sandbox identity",
         ))
     }
 }
@@ -4713,15 +4731,15 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProxyPodControlAvailability {
+enum SandboxRuntimeControlAvailability {
     Available,
     Unavailable,
     Unknown,
 }
 
-fn proxy_pod_control_availability_from_deployment(
+fn sandbox_runtime_control_availability_from_deployment(
     deployment: &Deployment,
-) -> ProxyPodControlAvailability {
+) -> SandboxRuntimeControlAvailability {
     if deployment
         .status
         .as_ref()
@@ -4729,18 +4747,18 @@ fn proxy_pod_control_availability_from_deployment(
         .unwrap_or_default()
         > 0
     {
-        ProxyPodControlAvailability::Available
+        SandboxRuntimeControlAvailability::Available
     } else {
-        ProxyPodControlAvailability::Unavailable
+        SandboxRuntimeControlAvailability::Unavailable
     }
 }
 
-async fn proxy_pod_control_availability(
+async fn sandbox_runtime_control_availability(
     client: &Client,
     namespace: &str,
     sandbox_id: &str,
-) -> ProxyPodControlAvailability {
-    let names = ProxyPodNames::new(sandbox_id);
+) -> SandboxRuntimeControlAvailability {
+    let names = SandboxRuntimeNames::new(sandbox_id);
     let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
     let services = Api::<Service>::namespaced(client.clone(), namespace);
     let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
@@ -4758,33 +4776,35 @@ async fn proxy_pod_control_availability(
     ));
     let (deployment, service, fence) = tokio::join!(deployment, service, fence);
     let control = match deployment {
-        Ok(Ok(Some(deployment))) => proxy_pod_control_availability_from_deployment(&deployment),
-        Ok(Ok(None)) => ProxyPodControlAvailability::Unavailable,
+        Ok(Ok(Some(deployment))) => {
+            sandbox_runtime_control_availability_from_deployment(&deployment)
+        }
+        Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
-            warn!(sandbox_id, %error, "could not determine proxy-pod control availability");
-            ProxyPodControlAvailability::Unknown
+            warn!(sandbox_id, %error, "could not determine sandbox-runtime control availability");
+            SandboxRuntimeControlAvailability::Unknown
         }
         Err(_) => {
             warn!(
                 sandbox_id,
-                "timed out checking proxy-pod control availability"
+                "timed out checking sandbox-runtime control availability"
             );
-            ProxyPodControlAvailability::Unknown
+            SandboxRuntimeControlAvailability::Unknown
         }
     };
     let service = match service {
-        Ok(Ok(Some(_))) => ProxyPodControlAvailability::Available,
-        Ok(Ok(None)) => ProxyPodControlAvailability::Unavailable,
+        Ok(Ok(Some(_))) => SandboxRuntimeControlAvailability::Available,
+        Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
-            warn!(sandbox_id, %error, "could not determine proxy-pod boundary Service availability");
-            ProxyPodControlAvailability::Unknown
+            warn!(sandbox_id, %error, "could not determine sandbox-runtime boundary Service availability");
+            SandboxRuntimeControlAvailability::Unknown
         }
         Err(_) => {
             warn!(
                 sandbox_id,
-                "timed out checking proxy-pod boundary Service availability"
+                "timed out checking sandbox-runtime boundary Service availability"
             );
-            ProxyPodControlAvailability::Unknown
+            SandboxRuntimeControlAvailability::Unknown
         }
     };
 
@@ -4792,69 +4812,69 @@ async fn proxy_pod_control_availability(
     // unowned fence would otherwise leave a live boundary with direct pod
     // egress while the driver continued to publish Ready.
     let fence = match fence {
-        Ok(Ok(Some(_))) => ProxyPodControlAvailability::Available,
-        Ok(Ok(None)) => ProxyPodControlAvailability::Unavailable,
+        Ok(Ok(Some(_))) => SandboxRuntimeControlAvailability::Available,
+        Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
-            warn!(sandbox_id, %error, "could not determine proxy-pod workload fence availability");
-            ProxyPodControlAvailability::Unknown
+            warn!(sandbox_id, %error, "could not determine sandbox-runtime workload fence availability");
+            SandboxRuntimeControlAvailability::Unknown
         }
         Err(_) => {
             warn!(
                 sandbox_id,
-                "timed out checking proxy-pod workload fence availability"
+                "timed out checking sandbox-runtime workload fence availability"
             );
-            ProxyPodControlAvailability::Unknown
+            SandboxRuntimeControlAvailability::Unknown
         }
     };
-    if [control, service, fence].contains(&ProxyPodControlAvailability::Unavailable) {
-        ProxyPodControlAvailability::Unavailable
-    } else if [control, service, fence].contains(&ProxyPodControlAvailability::Unknown) {
-        ProxyPodControlAvailability::Unknown
+    if [control, service, fence].contains(&SandboxRuntimeControlAvailability::Unavailable) {
+        SandboxRuntimeControlAvailability::Unavailable
+    } else if [control, service, fence].contains(&SandboxRuntimeControlAvailability::Unknown) {
+        SandboxRuntimeControlAvailability::Unknown
     } else {
-        ProxyPodControlAvailability::Available
+        SandboxRuntimeControlAvailability::Available
     }
 }
 
-async fn proxy_pod_workload_generation_matches(
+async fn sandbox_runtime_workload_generation_matches(
     client: &Client,
     namespace: &str,
     pod_name: &str,
     sandbox: &DynamicObject,
-) -> ProxyPodControlAvailability {
+) -> SandboxRuntimeControlAvailability {
     let Some(expected_uid) = sandbox
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_PROXY_POD_WORKLOAD_UID))
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID))
     else {
-        return ProxyPodControlAvailability::Unavailable;
+        return SandboxRuntimeControlAvailability::Unavailable;
     };
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name)).await {
         Ok(Ok(Some(pod))) if pod.metadata.uid.as_deref() == Some(expected_uid.as_str()) => {
-            ProxyPodControlAvailability::Available
+            SandboxRuntimeControlAvailability::Available
         }
-        Ok(Ok(_)) => ProxyPodControlAvailability::Unavailable,
+        Ok(Ok(_)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
-            warn!(pod = pod_name, %error, "could not verify proxy-pod workload generation");
-            ProxyPodControlAvailability::Unknown
+            warn!(pod = pod_name, %error, "could not verify sandbox-runtime workload generation");
+            SandboxRuntimeControlAvailability::Unknown
         }
         Err(_) => {
             warn!(
                 pod = pod_name,
-                "timed out checking proxy-pod workload generation"
+                "timed out checking sandbox-runtime workload generation"
             );
-            ProxyPodControlAvailability::Unknown
+            SandboxRuntimeControlAvailability::Unknown
         }
     }
 }
 
-async fn sandbox_from_object_with_proxy_pod_readiness(
+async fn sandbox_from_object_with_sandbox_runtime_readiness(
     client: &Client,
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
-    let bootstrapping = proxy_pod_bootstrap_in_progress(&obj);
+    let bootstrapping = sandbox_runtime_bootstrap_in_progress(&obj);
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
         .metadata
@@ -4863,31 +4883,31 @@ async fn sandbox_from_object_with_proxy_pod_readiness(
         .unwrap_or_else(|| namespace.to_string());
     let (name, mut sandbox) = sandbox_from_object(namespace, obj.clone())?;
     if bootstrapping {
-        mark_proxy_pod_bootstrapping(&mut sandbox);
+        mark_sandbox_runtime_bootstrapping(&mut sandbox);
     }
     if !sandbox_id.is_empty() {
-        let dependencies = Box::pin(proxy_pod_control_availability(
+        let dependencies = Box::pin(sandbox_runtime_control_availability(
             client,
             &object_namespace,
             &sandbox_id,
         ));
-        let workload_generation = Box::pin(proxy_pod_workload_generation_matches(
+        let workload_generation = Box::pin(sandbox_runtime_workload_generation_matches(
             client,
             &object_namespace,
             &name,
             &obj,
         ));
         let (dependencies, workload_generation) = tokio::join!(dependencies, workload_generation);
-        if dependencies != ProxyPodControlAvailability::Available
-            || workload_generation != ProxyPodControlAvailability::Available
+        if dependencies != SandboxRuntimeControlAvailability::Available
+            || workload_generation != SandboxRuntimeControlAvailability::Available
         {
-            mark_proxy_pod_control_unavailable(&mut sandbox);
+            mark_sandbox_runtime_control_unavailable(&mut sandbox);
         }
     }
     Ok((name, sandbox))
 }
 
-fn mark_proxy_pod_bootstrapping(sandbox: &mut Sandbox) {
+fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
     if let Some(status) = sandbox.status.as_mut() {
         status.conditions.retain(|condition| {
             condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
@@ -4895,17 +4915,17 @@ fn mark_proxy_pod_bootstrapping(sandbox: &mut Sandbox) {
         status.conditions.push(SandboxCondition {
             r#type: "Bootstrapping".to_string(),
             status: "True".to_string(),
-            reason: "ProxyPodGenerationStarting".to_string(),
-            message: "replacement proxy-pod generation is starting".to_string(),
+            reason: "SandboxRuntimeGenerationStarting".to_string(),
+            message: "replacement sandbox-runtime generation is starting".to_string(),
             last_transition_time: String::new(),
         });
     }
-    mark_proxy_pod_control_unavailable(sandbox);
+    mark_sandbox_runtime_control_unavailable(sandbox);
 }
 
-fn mark_proxy_pod_control_unavailable(sandbox: &mut Sandbox) {
+fn mark_sandbox_runtime_control_unavailable(sandbox: &mut Sandbox) {
     const REASON: &str = "DependenciesNotReady";
-    const MESSAGE: &str = "proxy-pod enforcement dependencies are not ready";
+    const MESSAGE: &str = "sandbox-runtime enforcement dependencies are not ready";
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
@@ -4928,7 +4948,7 @@ fn mark_proxy_pod_control_unavailable(sandbox: &mut Sandbox) {
     }
 }
 
-fn desired_proxy_pod_control_replicas(obj: &DynamicObject) -> i32 {
+fn desired_sandbox_runtime_control_replicas(obj: &DynamicObject) -> i32 {
     if let Some(mode) = obj
         .data
         .get("spec")
@@ -5085,12 +5105,12 @@ const SANDBOX_PROXY_CA_VOLUME_NAME: &str = "openshell-run";
 const SANDBOX_PROXY_CA_MOUNT_PATH: &str = "/run";
 const SANDBOX_BOOTSTRAP_SCHEDULING_GATE: &str = "openshell.ai/bootstrap";
 
-/// Render the workload pod half of the RFC 0012 proxy-pod topology.
+/// Render the workload Pod that runs the `OpenShell` sandbox runtime.
 ///
 /// The pod receives no gateway credential or endpoint. Its non-root sandbox
 /// owns the workload process and seccomp listener; only the paired supervisor
 /// Deployment can reach its TLS listener through `NetworkPolicy`.
-fn apply_supervisor_proxy_pod_boundary(
+fn apply_supervisor_sandbox_runtime_boundary(
     pod_template: &mut serde_json::Value,
     params: &SandboxPodParams<'_>,
 ) {
@@ -5109,7 +5129,7 @@ fn apply_supervisor_proxy_pod_boundary(
         .expect("pod labels must be an object");
     labels.insert(
         BOUNDARY_PAIR_LABEL.to_string(),
-        serde_json::json!(crate::proxy_pod::pair_label_value(params.sandbox_id)),
+        serde_json::json!(crate::sandbox_runtime::pair_label_value(params.sandbox_id)),
     );
     labels.insert(
         BOUNDARY_ROLE_LABEL.to_string(),
@@ -5216,7 +5236,7 @@ fn apply_supervisor_proxy_pod_boundary(
             "capabilities": {"drop": ["ALL"]}
         },
         "volumeMounts": [
-            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::proxy_pod::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
+            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
             {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH},
             {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
         ]
@@ -5833,7 +5853,7 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    apply_supervisor_proxy_pod_boundary(&mut result, params);
+    apply_supervisor_sandbox_runtime_boundary(&mut result, params);
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling. Skipped when the user
@@ -6145,20 +6165,20 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
-async fn create_or_validate_proxy_pod_fence(
+async fn create_or_validate_sandbox_runtime_fence(
     policies: &Api<NetworkPolicy>,
     expected: &NetworkPolicy,
 ) -> Result<(), KubernetesDriverError> {
     let name = expected.metadata.name.as_deref().unwrap_or_default();
     match tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(name)).await {
         Ok(Ok(Some(existing))) => {
-            return validate_proxy_pod_fence(&existing, expected);
+            return validate_sandbox_runtime_fence(&existing, expected);
         }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
         Err(_) => {
             return Err(KubernetesDriverError::Message(
-                "timed out reading proxy-pod workload fence".to_string(),
+                "timed out reading sandbox-runtime workload fence".to_string(),
             ));
         }
     }
@@ -6175,34 +6195,34 @@ async fn create_or_validate_proxy_pod_fence(
                 .await
                 .map_err(|_| {
                     KubernetesDriverError::Message(
-                        "timed out validating existing proxy-pod workload fence".to_string(),
+                        "timed out validating existing sandbox-runtime workload fence".to_string(),
                     )
                 })?
                 .map_err(KubernetesDriverError::from_kube)?;
-            validate_proxy_pod_fence(&existing, expected)
+            validate_sandbox_runtime_fence(&existing, expected)
         }
         Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
         Err(_) => Err(KubernetesDriverError::Message(
-            "timed out creating proxy-pod workload fence".to_string(),
+            "timed out creating sandbox-runtime workload fence".to_string(),
         )),
     }
 }
 
-fn validate_proxy_pod_fence(
+fn validate_sandbox_runtime_fence(
     existing: &NetworkPolicy,
     expected: &NetworkPolicy,
 ) -> Result<(), KubernetesDriverError> {
-    if proxy_pod_fence_matches(existing, expected) {
+    if sandbox_runtime_fence_matches(existing, expected) {
         Ok(())
     } else {
         let name = expected.metadata.name.as_deref().unwrap_or_default();
         Err(KubernetesDriverError::Precondition(format!(
-            "proxy-pod workload fence {name} exists but does not match the intended enforcement"
+            "sandbox-runtime workload fence {name} exists but does not match the intended enforcement"
         )))
     }
 }
 
-fn proxy_pod_fence_matches(existing: &NetworkPolicy, expected: &NetworkPolicy) -> bool {
+fn sandbox_runtime_fence_matches(existing: &NetworkPolicy, expected: &NetworkPolicy) -> bool {
     fn normalized_spec(mut spec: Option<NetworkPolicySpec>) -> Option<NetworkPolicySpec> {
         if let Some(spec) = spec.as_mut() {
             // The Kubernetes API server omits explicitly empty rule arrays when it
@@ -6355,10 +6375,10 @@ fn sandbox_operating_state_patch(
                 "metadata": {
                     "resourceVersion": resource_version,
                     "annotations": {
-                        ANNOTATION_PROXY_POD_BOOTSTRAPPING: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_WORKLOAD_UID: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
                     },
                 },
                 "spec": {"operatingMode": "Suspended"}
@@ -6375,10 +6395,10 @@ fn sandbox_operating_state_patch(
                 "metadata": {
                     "resourceVersion": resource_version,
                     "annotations": {
-                        ANNOTATION_PROXY_POD_BOOTSTRAPPING: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: serde_json::Value::Null,
-                        ANNOTATION_PROXY_POD_WORKLOAD_UID: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
+                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
                     },
                 },
                 "spec": {"replicas": 0}
@@ -6668,7 +6688,7 @@ mod tests {
 
     #[test]
     fn boundary_authority_uses_stable_service_dns_name() {
-        let names = ProxyPodNames::new("sandbox-1");
+        let names = SandboxRuntimeNames::new("sandbox-1");
 
         assert_eq!(
             boundary_service_authority("workspace-a", &names, 5500),
@@ -7075,7 +7095,7 @@ mod tests {
                     (LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string()),
                     (
                         BOUNDARY_PAIR_LABEL.to_string(),
-                        crate::proxy_pod::pair_label_value(sandbox_id),
+                        crate::sandbox_runtime::pair_label_value(sandbox_id),
                     ),
                     (BOUNDARY_ROLE_LABEL.to_string(), "supervisor".to_string()),
                 ])),
@@ -7119,23 +7139,23 @@ mod tests {
         }))
         .unwrap();
         let created = SystemTime::UNIX_EPOCH + Duration::from_hours(490_896);
-        assert!(!proxy_pod_fence_is_old_enough(
+        assert!(!sandbox_runtime_fence_is_old_enough(
             &policy,
-            created + PROXY_POD_ORPHAN_FENCE_MIN_AGE - Duration::from_secs(1)
+            created + SANDBOX_RUNTIME_ORPHAN_FENCE_MIN_AGE - Duration::from_secs(1)
         ));
-        assert!(proxy_pod_fence_is_old_enough(
+        assert!(sandbox_runtime_fence_is_old_enough(
             &policy,
-            created + PROXY_POD_ORPHAN_FENCE_MIN_AGE
+            created + SANDBOX_RUNTIME_ORPHAN_FENCE_MIN_AGE
         ));
-        assert!(!proxy_pod_fence_is_old_enough(
+        assert!(!sandbox_runtime_fence_is_old_enough(
             &NetworkPolicy::default(),
-            created + PROXY_POD_ORPHAN_FENCE_MIN_AGE
+            created + SANDBOX_RUNTIME_ORPHAN_FENCE_MIN_AGE
         ));
     }
 
     #[test]
-    fn proxy_pod_fence_validation_accepts_api_normalization_and_injected_metadata() {
-        let names = ProxyPodNames::new("sandbox-id-a");
+    fn sandbox_runtime_fence_validation_accepts_api_normalization_and_injected_metadata() {
+        let names = SandboxRuntimeNames::new("sandbox-id-a");
         let mut expected =
             workload_fence("namespace-a", &names, "sandbox-id-a", 5000).workload_policy;
         expected.metadata.labels = Some(BTreeMap::from([(
@@ -7155,19 +7175,19 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert("admission.example/injected".to_string(), "true".to_string());
-        assert!(proxy_pod_fence_matches(&persisted, &expected));
-        assert!(validate_proxy_pod_fence(&persisted, &expected).is_ok());
+        assert!(sandbox_runtime_fence_matches(&persisted, &expected));
+        assert!(validate_sandbox_runtime_fence(&persisted, &expected).is_ok());
 
         persisted.spec.as_mut().unwrap().policy_types = Some(vec!["Ingress".to_string()]);
-        assert!(!proxy_pod_fence_matches(&persisted, &expected));
+        assert!(!sandbox_runtime_fence_matches(&persisted, &expected));
         assert!(matches!(
-            validate_proxy_pod_fence(&persisted, &expected),
+            validate_sandbox_runtime_fence(&persisted, &expected),
             Err(KubernetesDriverError::Precondition(_))
         ));
     }
 
     #[test]
-    fn proxy_pod_bootstrap_marker_and_age_gate_rollback() {
+    fn sandbox_runtime_bootstrap_marker_and_age_gate_rollback() {
         let started = Duration::from_hours(490_896);
         let mut object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
@@ -7176,44 +7196,47 @@ mod tests {
                 "name": "sandbox-a",
                 "creationTimestamp": "2020-01-01T00:00:00Z",
                 "annotations": {
-                    ANNOTATION_PROXY_POD_BOOTSTRAPPING: "true",
-                    ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT: started.as_millis().to_string(),
-                    ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION: "restart",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: started.as_millis().to_string(),
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
                 }
             }
         }))
         .unwrap();
-        assert!(proxy_pod_bootstrap_in_progress(&object));
-        assert_eq!(proxy_pod_bootstrap_operation(&object), Some("restart"));
+        assert!(sandbox_runtime_bootstrap_in_progress(&object));
+        assert_eq!(
+            sandbox_runtime_bootstrap_operation(&object),
+            Some("restart")
+        );
         let started_at = SystemTime::UNIX_EPOCH + started;
-        assert!(!proxy_pod_bootstrap_is_stale(
+        assert!(!sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + PROXY_POD_BOOTSTRAP_GRACE - Duration::from_secs(1),
-            PROXY_POD_BOOTSTRAP_GRACE
+            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE - Duration::from_secs(1),
+            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
         ));
-        assert!(proxy_pod_bootstrap_is_stale(
+        assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
-            started_at + PROXY_POD_BOOTSTRAP_GRACE,
-            PROXY_POD_BOOTSTRAP_GRACE
+            started_at + SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
+            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
         ));
         object
             .metadata
             .annotations
             .as_mut()
             .unwrap()
-            .remove(ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT);
-        assert!(proxy_pod_bootstrap_is_stale(
+            .remove(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT);
+        assert!(sandbox_runtime_bootstrap_is_stale(
             &object,
             started_at,
-            PROXY_POD_BOOTSTRAP_GRACE
+            SANDBOX_RUNTIME_BOOTSTRAP_GRACE
         ));
         object
             .metadata
             .annotations
             .as_mut()
             .unwrap()
-            .remove(ANNOTATION_PROXY_POD_BOOTSTRAPPING);
-        assert!(!proxy_pod_bootstrap_in_progress(&object));
+            .remove(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING);
+        assert!(!sandbox_runtime_bootstrap_in_progress(&object));
     }
 
     #[test]
@@ -7248,7 +7271,7 @@ mod tests {
         let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
         assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
         assert_eq!(
-            beta_stop["metadata"]["annotations"][ANNOTATION_PROXY_POD_BOOTSTRAPPING],
+            beta_stop["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
             serde_json::Value::Null
         );
         assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
@@ -8068,7 +8091,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_topology_renders_credential_free_boundary_workload() {
+    fn sandbox_runtime_renders_credential_free_boundary_workload() {
         let params = SandboxPodParams {
             sandbox_runtime_image: "sandbox-runtime-image:latest",
             sandbox_id: "sandbox-123",
@@ -9720,65 +9743,65 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_control_availability_requires_an_available_replica() {
+    fn sandbox_runtime_control_availability_requires_an_available_replica() {
         let mut deployment = Deployment::default();
         assert_eq!(
-            proxy_pod_control_availability_from_deployment(&deployment),
-            ProxyPodControlAvailability::Unavailable
+            sandbox_runtime_control_availability_from_deployment(&deployment),
+            SandboxRuntimeControlAvailability::Unavailable
         );
         deployment.status = Some(k8s_openapi::api::apps::v1::DeploymentStatus {
             available_replicas: Some(1),
             ..Default::default()
         });
         assert_eq!(
-            proxy_pod_control_availability_from_deployment(&deployment),
-            ProxyPodControlAvailability::Available
+            sandbox_runtime_control_availability_from_deployment(&deployment),
+            SandboxRuntimeControlAvailability::Available
         );
     }
 
     #[test]
-    fn proxy_pod_readiness_transitions_bump_the_watched_cr() {
-        let unavailable = proxy_pod_readiness_transition_patch("42", "unavailable");
-        let ready = proxy_pod_readiness_transition_patch("42", "ready");
+    fn sandbox_runtime_readiness_transitions_bump_the_watched_cr() {
+        let unavailable = sandbox_runtime_readiness_transition_patch("42", "unavailable");
+        let ready = sandbox_runtime_readiness_transition_patch("42", "ready");
 
         assert_eq!(unavailable["metadata"]["resourceVersion"], "42");
         assert_eq!(ready["metadata"]["resourceVersion"], "42");
         assert_eq!(
-            unavailable["metadata"]["annotations"][ANNOTATION_PROXY_POD_READINESS],
+            unavailable["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_READINESS],
             "unavailable"
         );
         assert_eq!(
-            ready["metadata"]["annotations"][ANNOTATION_PROXY_POD_READINESS],
+            ready["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_READINESS],
             "ready"
         );
         assert_ne!(unavailable, ready);
     }
 
     #[test]
-    fn proxy_pod_bootstrap_completion_is_resource_version_guarded_and_publishes_ready() {
-        let patch = proxy_pod_bootstrap_completion_patch("42");
+    fn sandbox_runtime_bootstrap_completion_is_resource_version_guarded_and_publishes_ready() {
+        let patch = sandbox_runtime_bootstrap_completion_patch("42");
 
         assert_eq!(patch["metadata"]["resourceVersion"], "42");
         assert_eq!(
-            patch["metadata"]["annotations"][ANNOTATION_PROXY_POD_BOOTSTRAPPING],
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
             serde_json::Value::Null
         );
         assert_eq!(
-            patch["metadata"]["annotations"][ANNOTATION_PROXY_POD_BOOTSTRAP_STARTED_AT],
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT],
             serde_json::Value::Null
         );
         assert_eq!(
-            patch["metadata"]["annotations"][ANNOTATION_PROXY_POD_BOOTSTRAP_OPERATION],
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION],
             serde_json::Value::Null
         );
         assert_eq!(
-            patch["metadata"]["annotations"][ANNOTATION_PROXY_POD_READINESS],
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_READINESS],
             "ready"
         );
     }
 
     #[test]
-    fn proxy_pod_bootstrap_completion_waits_for_runtime_ready() {
+    fn sandbox_runtime_bootstrap_completion_waits_for_runtime_ready() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1BETA1,
@@ -9791,29 +9814,29 @@ mod tests {
                 "conditions": [{"type": "Suspended", "status": "True", "observedGeneration": 7}]
             }
         });
-        assert!(!proxy_pod_runtime_is_ready(&sandbox));
+        assert!(!sandbox_runtime_runtime_is_ready(&sandbox));
 
         sandbox.data["status"]["conditions"] = serde_json::json!([
             {"type": "Suspended", "status": "False", "observedGeneration": 6},
             {"type": "Ready", "status": "True", "observedGeneration": 6}
         ]);
-        assert!(!proxy_pod_runtime_is_ready(&sandbox));
+        assert!(!sandbox_runtime_runtime_is_ready(&sandbox));
 
         sandbox.data["status"]["conditions"] = serde_json::json!([
             {"type": "Suspended", "status": "False", "observedGeneration": 7},
             {"type": "Ready", "status": "True", "observedGeneration": 7}
         ]);
-        assert!(proxy_pod_runtime_is_ready(&sandbox));
+        assert!(sandbox_runtime_runtime_is_ready(&sandbox));
 
         sandbox.data["status"]["conditions"] = serde_json::json!([
             {"type": "Suspended", "status": "True", "observedGeneration": 7},
             {"type": "Ready", "status": "True", "observedGeneration": 7}
         ]);
-        assert!(!proxy_pod_runtime_is_ready(&sandbox));
+        assert!(!sandbox_runtime_runtime_is_ready(&sandbox));
     }
 
     #[test]
-    fn proxy_pod_readiness_is_downgraded_with_a_transient_reason() {
+    fn sandbox_runtime_readiness_is_downgraded_with_a_transient_reason() {
         let mut sandbox = Sandbox {
             status: Some(SandboxStatus {
                 conditions: vec![SandboxCondition {
@@ -9825,14 +9848,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        mark_proxy_pod_control_unavailable(&mut sandbox);
+        mark_sandbox_runtime_control_unavailable(&mut sandbox);
         let ready = &sandbox.status.unwrap().conditions[0];
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
     }
 
     #[test]
-    fn proxy_pod_bootstrap_does_not_publish_a_terminal_suspension() {
+    fn sandbox_runtime_bootstrap_does_not_publish_a_terminal_suspension() {
         let mut sandbox = Sandbox {
             status: Some(SandboxStatus {
                 conditions: vec![SandboxCondition {
@@ -9846,7 +9869,7 @@ mod tests {
             ..Default::default()
         };
 
-        mark_proxy_pod_bootstrapping(&mut sandbox);
+        mark_sandbox_runtime_bootstrapping(&mut sandbox);
 
         let conditions = &sandbox.status.unwrap().conditions;
         assert!(
@@ -9862,12 +9885,12 @@ mod tests {
         assert!(conditions.iter().any(|condition| {
             condition.r#type == "Bootstrapping"
                 && condition.status == "True"
-                && condition.reason == "ProxyPodGenerationStarting"
+                && condition.reason == "SandboxRuntimeGenerationStarting"
         }));
     }
 
     #[test]
-    fn completed_proxy_pod_bootstrap_preserves_real_suspension() {
+    fn completed_sandbox_runtime_bootstrap_preserves_real_suspension() {
         let sandbox = Sandbox {
             status: Some(SandboxStatus {
                 conditions: vec![SandboxCondition {
@@ -9887,7 +9910,7 @@ mod tests {
     }
 
     #[test]
-    fn desired_proxy_pod_control_replicas_tracks_both_sandbox_apis() {
+    fn desired_sandbox_runtime_control_replicas_tracks_both_sandbox_apis() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1BETA1,
@@ -9895,14 +9918,14 @@ mod tests {
         ));
         let mut beta = DynamicObject::new("beta", &resource);
         beta.data = serde_json::json!({"spec": {"operatingMode": "Suspended"}});
-        assert_eq!(desired_proxy_pod_control_replicas(&beta), 0);
+        assert_eq!(desired_sandbox_runtime_control_replicas(&beta), 0);
         beta.data = serde_json::json!({"spec": {"operatingMode": "Running"}});
-        assert_eq!(desired_proxy_pod_control_replicas(&beta), 1);
+        assert_eq!(desired_sandbox_runtime_control_replicas(&beta), 1);
 
         let mut alpha = DynamicObject::new("alpha", &resource);
         alpha.data = serde_json::json!({"spec": {"replicas": 0}});
-        assert_eq!(desired_proxy_pod_control_replicas(&alpha), 0);
+        assert_eq!(desired_sandbox_runtime_control_replicas(&alpha), 0);
         alpha.data = serde_json::json!({"spec": {"replicas": 1}});
-        assert_eq!(desired_proxy_pod_control_replicas(&alpha), 1);
+        assert_eq!(desired_sandbox_runtime_control_replicas(&alpha), 1);
     }
 }

@@ -299,8 +299,8 @@ discovery endpoint or its TLS CA.
 | supervisor.image.pullPolicy | string | `nil` | Sandbox supervisor pull policy. Leave unset to use the Kubernetes image default. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
 | supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
-| supervisor.proxyPod.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
-| supervisor.proxyPod.networkPolicyEnforced | bool | `false` | Required operator acknowledgement that the cluster CNI enforces NetworkPolicy. |
+| supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
+| supervisor.sandboxRuntime.networkPolicyEnforced | bool | `false` | Required operator acknowledgement that the cluster CNI enforces NetworkPolicy. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
 | upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |

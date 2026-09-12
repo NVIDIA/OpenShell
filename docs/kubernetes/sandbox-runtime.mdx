@@ -1,9 +1,9 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Kubernetes Sandbox Topology"
-sidebar-title: "Topology"
-description: "Understand the capability-free sandbox and supervisor topology used for Kubernetes workloads."
+title: "Kubernetes Sandbox Runtime"
+sidebar-title: "Sandbox runtime"
+description: "Understand how Kubernetes places and protects the sandbox runtime and supervisor."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Network Policy, Seccomp, Landlock"
 position: 2
 ---
@@ -14,7 +14,7 @@ policy decisions, and upstream connections.
 
 ## Understand the Components
 
-The Kubernetes driver always uses this topology:
+The Kubernetes driver always uses this placement:
 
 ```mermaid
 flowchart LR
@@ -76,7 +76,7 @@ policy-approved upstream destinations.
 Kubernetes policies are additive. Keep sandbox namespaces under administrative
 control so another principal cannot add permissive policies, create Pods with
 OpenShell labels, or read bootstrap Secrets. Set
-`supervisor.proxyPod.networkPolicyEnforced: true` only after you verify that the
+`supervisor.sandboxRuntime.networkPolicyEnforced: true` only after you verify that the
 cluster CNI enforces both ingress and egress policies for these namespaces.
 
 ## Bootstrap a Sandbox
@@ -105,7 +105,7 @@ egress fence until Kubernetes confirms that the workload Pod is gone.
 
 ## Check Cluster Requirements
 
-The topology requires the following cluster behavior:
+This architecture requires the following cluster behavior:
 
 - Linux nodes and a container runtime that permits an unprivileged process to
   install a nested seccomp user-notification filter under `RuntimeDefault`.

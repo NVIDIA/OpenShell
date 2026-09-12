@@ -133,9 +133,9 @@ pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
 /// The isolation backend admitted by the deployment configuration (RFC 0012).
 ///
-/// Delivered on a channel separate from the topology descriptor so descriptor
+/// Delivered on a channel separate from the backend descriptor so descriptor
 /// verification against the admitted backend is not self-referential. Required
-/// whenever a topology descriptor is supplied.
+/// whenever a backend descriptor is supplied.
 pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
 
 /// Comma-separated runtime networking capabilities supplied by the compute

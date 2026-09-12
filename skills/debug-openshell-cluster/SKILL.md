@@ -550,7 +550,8 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
-Kubernetes always uses the proxy-pod topology. Helm must render
+The Kubernetes driver creates a sandbox workload Pod and a separate supervisor
+Deployment. Helm must render
 `network_policy_enforced = true`. This is an explicit operator assertion that
 the cluster CNI enforces Kubernetes NetworkPolicy; the Kubernetes API cannot
 attest enforcement. Run sandboxes only in a trusted namespace
@@ -569,7 +570,7 @@ the sandbox over per-sandbox TLS with server-certificate verification plus
 bootstrap-token client authentication, and owns gateway policy, provider
 credentials, DNS, and mediated upstream connections.
 
-Inspect the complete companion set when a proxy-pod sandbox remains Starting
+Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:
 
 ```bash

@@ -263,10 +263,10 @@ cleanup() {
       echo "=== gateway sandbox records ==="
       "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
         sandbox list --all-workspaces --output json 2>&1 || true
-      echo "=== proxy-pod supervisor Deployments ==="
+      echo "=== sandbox-runtime supervisor Deployments ==="
       kctl -n "${NAMESPACE}" get deployments \
         -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
-      echo "=== proxy-pod supervisor logs (last 200 lines each) ==="
+      echo "=== sandbox-runtime supervisor logs (last 200 lines each) ==="
       while IFS= read -r supervisor_pod; do
         [ -n "${supervisor_pod}" ] || continue
         echo "--- ${supervisor_pod} ---"
@@ -284,7 +284,7 @@ cleanup() {
       kctl -n "${NAMESPACE}" logs "$(kube_workload_ref "${RELEASE_NAME}")" \
         --since=20m \
         --all-containers --prefix 2>&1 \
-        | grep -Ei "sandbox phase changed|start_sandbox|stop_sandbox|supervisor session|proxy-pod|bootstrap" \
+        | grep -Ei "sandbox phase changed|start_sandbox|stop_sandbox|supervisor session|sandbox-runtime|bootstrap" \
         || true
       echo "=== gateway logs (last 200 lines) ==="
       kctl -n "${NAMESPACE}" logs \

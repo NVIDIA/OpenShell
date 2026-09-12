@@ -36,7 +36,7 @@ oc create ns openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.proxyPod.networkPolicyEnforced=true
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and
