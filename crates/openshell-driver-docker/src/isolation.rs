@@ -3,7 +3,7 @@
 
 //! Docker provisioning for the shared authenticated boundary protocol.
 //!
-//! Docker owns only the container/socket topology and immutable OCI resource
+//! Docker owns only container placement, the protected socket, and immutable OCI resource
 //! claims. Lifecycle, process, network, identity, and wire behavior live in
 //! `openshell-isolation-interface` and `openshell-sandbox`.
 
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 
@@ -38,7 +38,7 @@ pub struct DockerBoundarySpec {
 /// Protected container config and matching host descriptor.
 pub struct DockerBoundaryProvisioning {
     pub boundary_config: BoundaryConfig,
-    pub topology: BoundaryTopology,
+    pub runtime_descriptor: SandboxRuntimeDescriptor,
 }
 
 impl DockerBoundarySpec {
@@ -72,7 +72,7 @@ impl DockerBoundarySpec {
                 driver_fence: driver_fence.clone(),
                 child_env: self.child_env,
             },
-            topology: BoundaryTopology {
+            runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
                 generation: self.generation,
                 session_id: self.session_id,
@@ -135,21 +135,21 @@ mod tests {
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
-            provisioned.topology.resource_claims
+            provisioned.runtime_descriptor.resource_claims
         );
         assert_eq!(
-            provisioned.topology.resource_claims["docker.container_id"],
+            provisioned.runtime_descriptor.resource_claims["docker.container_id"],
             "sha256:container"
         );
         assert_eq!(
             provisioned.boundary_config.driver_fence,
-            provisioned.topology.driver_fence
+            provisioned.runtime_descriptor.driver_fence
         );
         assert!(
             provisioned
-                .topology
+                .runtime_descriptor
                 .driver_fence
-                .validate_for_backend("docker")
+                .validate()
                 .is_ok()
         );
     }
