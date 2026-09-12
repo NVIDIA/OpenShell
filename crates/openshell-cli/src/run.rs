@@ -762,6 +762,7 @@ pub async fn sandbox_create(
             log_since_ms: 0,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: 0,
         })
         .await
         .into_diagnostic()?
@@ -3213,6 +3214,7 @@ async fn wait_for_lifecycle_phase(
             log_since_ms: 0,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: 0,
         })
         .await
         .into_diagnostic()?
@@ -5418,6 +5420,7 @@ pub async fn sandbox_logs(
                 log_since_ms: since_ms,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: 0,
             })
             .await
             .into_diagnostic()?

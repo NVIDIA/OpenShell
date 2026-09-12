@@ -2862,6 +2862,8 @@ impl ComputeRuntime {
                                     public_platform_event_from_driver(&event),
                                 ),
                             ),
+                            // Placeholder: platform_event_bus.publish() stamps the cursor.
+                            cursor: 0,
                         },
                     );
                 }
@@ -3541,8 +3543,9 @@ impl ComputeRuntime {
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
+        // `tracing_log_bus.remove` also clears the platform event bus and resets
+        // the shared cursor allocator last (see its docs).
         self.tracing_log_bus.remove(sandbox_id);
-        self.tracing_log_bus.platform_event_bus.remove(sandbox_id);
         self.sandbox_watch_bus.remove(sandbox_id);
     }
 

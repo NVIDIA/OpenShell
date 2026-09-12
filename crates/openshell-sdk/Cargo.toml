@@ -28,6 +28,7 @@ tokio-tungstenite = { workspace = true }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tower = { workspace = true }
 tracing = { workspace = true }
+async-stream = "0.3.6"
 
 [dev-dependencies]
 serde_json = { workspace = true }
