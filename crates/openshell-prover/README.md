@@ -63,8 +63,8 @@ pub struct ExfilPath {
 }
 ```
 
-The gateway's `finding_delta` keys paths by `(category, binary,
-host:port, category, method)` so that adding a new method on an
+The gateway's `finding_delta` keys paths by `(finding query, binary,
+host:port, path category, method)` so that adding a new method on an
 already-reached host surfaces as exactly one new path (not the whole
 re-emission of the existing method set).
 
