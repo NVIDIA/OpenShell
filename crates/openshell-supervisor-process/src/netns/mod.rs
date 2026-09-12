@@ -7,6 +7,7 @@
 //! the sandbox to the host. This ensures the sandboxed process can only
 //! communicate through the proxy running on the host side of the veth.
 
+mod netlink;
 mod nft_ruleset;
 
 use miette::{IntoDiagnostic, Result};
@@ -26,7 +27,6 @@ const SANDBOX_IP_SUFFIX: u8 = 2;
 /// this listener before the bypass fence runs.
 pub const POLICY_DNS_PORT: u16 = 15_053;
 pub const TRANSPARENT_TCP_PORT: u16 = 15_001;
-const IP_SEARCH_PATHS: &[&str] = &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
 const NSENTER_SEARCH_PATHS: &[&str] = &[
     "/usr/bin/nsenter",
     "/bin/nsenter",
@@ -88,88 +88,25 @@ impl NetworkNamespace {
                 .build()
         );
 
-        // Create the namespace
-        run_ip(&["netns", "add", &name])?;
+        // Create the FD-owned namespace, bind-mounted at netns_path via
+        // `mount(2)` (not `ip netns add`) so the nsenter-based nft path still
+        // reaches it. Returns a persistent fd for the setns paths.
+        let ns_fd = netlink::create_netns_fd(&name)?;
 
-        // Create veth pair
-        if let Err(e) = run_ip(&[
-            "link",
-            "add",
-            &veth_host,
-            "type",
-            "veth",
-            "peer",
-            "name",
-            &veth_sandbox,
-        ]) {
-            // Cleanup namespace on failure
-            let _ = run_ip(&["netns", "delete", &name]);
+        // Host side: veth pair, move peer into the namespace, host addr + up.
+        if let Err(e) = netlink::setup_host_side(&veth_host, &veth_sandbox, host_ip, 24, ns_fd) {
+            let _ = netlink::destroy_netns(&name, ns_fd);
             return Err(e);
         }
 
-        // Move sandbox veth into namespace
-        if let Err(e) = run_ip(&["link", "set", &veth_sandbox, "netns", &name]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
+        // Sandbox side: addr on veth-s, veth-s up, lo up, default route.
+        if let Err(e) = netlink::setup_sandbox_side(ns_fd, &veth_sandbox, sandbox_ip, 24, host_ip) {
+            let _ = netlink::delete_link(&veth_host);
+            let _ = netlink::destroy_netns(&name, ns_fd);
             return Err(e);
         }
 
-        // Configure host side
-        let host_cidr = format!("{host_ip}/24");
-        if let Err(e) = run_ip(&["addr", "add", &host_cidr, "dev", &veth_host]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        if let Err(e) = run_ip(&["link", "set", &veth_host, "up"]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        // Configure sandbox side (inside namespace)
-        let sandbox_cidr = format!("{sandbox_ip}/24");
-        if let Err(e) = run_ip_netns(&name, &["addr", "add", &sandbox_cidr, "dev", &veth_sandbox]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        if let Err(e) = run_ip_netns(&name, &["link", "set", &veth_sandbox, "up"]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        // Bring up loopback in namespace
-        if let Err(e) = run_ip_netns(&name, &["link", "set", "lo", "up"]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        // Add default route via host
-        let host_ip_str = host_ip.to_string();
-        if let Err(e) = run_ip_netns(&name, &["route", "add", "default", "via", &host_ip_str]) {
-            let _ = run_ip(&["link", "delete", &veth_host]);
-            let _ = run_ip(&["netns", "delete", &name]);
-            return Err(e);
-        }
-
-        // Open the namespace file descriptor for later use with setns
-        let ns_path = openshell_core::container_paths::netns_path(&name);
-        let ns_fd = match nix::fcntl::open(
-            ns_path.as_path(),
-            nix::fcntl::OFlag::O_RDONLY,
-            nix::sys::stat::Mode::empty(),
-        ) {
-            Ok(fd) => Some(fd),
-            Err(e) => {
-                warn!(error = %e, "Failed to open namespace fd, will use nsenter fallback");
-                None
-            }
-        };
+        let ns_fd = Some(ns_fd);
 
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
@@ -337,10 +274,11 @@ impl NetworkNamespace {
         // default route. Install only the active synthetic IPv6 epoch so the
         // kernel reaches the nft OUTPUT hook; REDIRECT then reroutes it to
         // the local transparent listener.
-        run_ip_netns(
-            &self.name,
-            &["-6", "route", "replace", synthetic_ipv6_cidr, "dev", "lo"],
-        )?;
+        let ns_fd = self
+            .ns_fd
+            .ok_or_else(|| miette::miette!("no namespace fd available for route setup"))?;
+        let v6_cidr: ipnet::IpNet = synthetic_ipv6_cidr.parse().into_diagnostic()?;
+        netlink::replace_route_dev_lo_in_netns(ns_fd, v6_cidr)?;
         let nft_path = find_nft().ok_or_else(|| {
             miette::miette!(
                 "trusted nft helper not found; policy DNS and transparent TCP require nftables"
@@ -385,9 +323,11 @@ impl NetworkNamespace {
                 .parse::<ipnet::IpNet>()
                 .into_diagnostic()?,
         ];
-        for family in ["-4", "-6"] {
-            let routes =
-                run_ip_netns_output(&self.name, &[family, "route", "show", "table", "all"])?;
+        let ns_fd = self
+            .ns_fd
+            .ok_or_else(|| miette::miette!("no namespace fd available for route validation"))?;
+        for v6 in [false, true] {
+            let routes = netlink::dump_route_prefixes_in_netns(ns_fd, v6)?;
             if let Some((route, pool)) = first_route_overlap(&routes, &reserved) {
                 return Err(miette::miette!(
                     "synthetic address pool {pool} overlaps workload route {route}; refusing to enable policy DNS"
@@ -552,13 +492,9 @@ impl Drop for NetworkNamespace {
     fn drop(&mut self) {
         debug!(namespace = %self.name, "Cleaning up network namespace");
 
-        // Close the fd if we have one
-        if let Some(fd) = self.ns_fd.take() {
-            let _ = nix::unistd::close(fd);
-        }
-
-        // Delete the host-side veth (this also removes the peer)
-        if let Err(e) = run_ip(&["link", "delete", &self.veth_host]) {
+        // Delete the host-side veth (this also removes the sandbox peer).
+        // Do this before freeing the namespace so ordering stays explicit.
+        if let Err(e) = netlink::delete_link(&self.veth_host) {
             warn!(
                 error = %e,
                 veth = %self.veth_host,
@@ -566,13 +502,16 @@ impl Drop for NetworkNamespace {
             );
         }
 
-        // Delete the namespace
-        if let Err(e) = run_ip(&["netns", "delete", &self.name]) {
-            warn!(
-                error = %e,
-                namespace = %self.name,
-                "Failed to delete network namespace"
-            );
+        // Free the namespace: close the fd, unmount the bind mount, remove the
+        // target file (no `ip netns delete`).
+        if let Some(fd) = self.ns_fd.take() {
+            if let Err(e) = netlink::destroy_netns(&self.name, fd) {
+                warn!(
+                    error = %e,
+                    namespace = %self.name,
+                    "Failed to remove network namespace mount"
+                );
+            }
         }
 
         openshell_ocsf::ocsf_emit!(
@@ -596,9 +535,9 @@ impl Drop for NetworkNamespace {
 /// # Errors
 ///
 /// Returns an error if proxy mode is requested but the namespace cannot be
-/// created (e.g., missing `CAP_NET_ADMIN` / `CAP_SYS_ADMIN` or `iproute2`).
-/// Failure to install nftables bypass-detection rules is non-fatal and is
-/// reported via OCSF instead.
+/// created (e.g., missing `CAP_NET_ADMIN` / `CAP_SYS_ADMIN`). Failure to
+/// install nftables bypass-detection rules is non-fatal and is reported via
+/// OCSF instead.
 pub fn create_netns_for_proxy(
     policy: &openshell_core::policy::SandboxPolicy,
 ) -> Result<Option<NetworkNamespace>> {
@@ -632,7 +571,7 @@ pub fn create_netns_for_proxy(
         }
         Err(e) => Err(miette::miette!(
             "Network namespace creation failed and proxy mode requires isolation. \
-             Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+             Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available. \
              Error: {e}"
         )),
     }
@@ -825,29 +764,6 @@ fn cleanup_sidecar_iptables_legacy_rule_families(ipv4_cmd: &str, ipv6_cmd: Optio
     }
 }
 
-/// Run an `ip` command on the host.
-fn run_ip(args: &[&str]) -> Result<()> {
-    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
-
-    debug!(command = %format!("{ip_path} {}", args.join(" ")), "Running ip command");
-
-    let output = Command::new(ip_path)
-        .args(args)
-        .output()
-        .into_diagnostic()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "{ip_path} {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        ));
-    }
-
-    Ok(())
-}
-
 fn run_iptables_legacy_current_namespace(iptables_cmd: &str, args: &[&str]) -> Result<()> {
     debug!(
         command = %format!("{iptables_cmd} {}", args.join(" ")),
@@ -910,73 +826,25 @@ fn run_nft_commands_current_namespace(
     Ok(())
 }
 
-/// Run an `ip` command inside a network namespace via `nsenter --net=`.
-///
-/// We use `nsenter` instead of `ip netns exec` because `ip netns exec`
-/// remounts `/sys` to reflect the target namespace's sysfs entries. That
-/// sysfs remount requires real `CAP_SYS_ADMIN` in the host user namespace,
-/// which is unavailable in rootless container runtimes (e.g. rootless
-/// Podman). `nsenter --net=` enters only the network namespace without
-/// changing the mount namespace, avoiding the sysfs remount entirely.
-/// The supervisor's operations (addr add, link set, route add) are all
-/// netlink-based and do not need sysfs access.
-fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
-    run_ip_netns_output(netns, args).map(|_| ())
-}
-
-fn run_ip_netns_output(netns: &str, args: &[&str]) -> Result<String> {
-    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
-    let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
-    let ns_path = openshell_core::container_paths::netns_path(netns);
-    let net_flag = format!("--net={}", ns_path.display());
-
-    let mut full_args = vec![net_flag.as_str(), "--", ip_path];
-    full_args.extend(args);
-
-    debug!(
-        command = %format!("{nsenter_path} {}", full_args.join(" ")),
-        "Running ip in namespace via nsenter"
-    );
-
-    let output = Command::new(nsenter_path)
-        .args(&full_args)
-        .output()
-        .into_diagnostic()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "{nsenter_path} --net={} {ip_path} {} failed: {}",
-            ns_path.display(),
-            args.join(" "),
-            stderr.trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 fn first_route_overlap(
-    routes: &str,
+    routes: &[ipnet::IpNet],
     reserved: &[ipnet::IpNet],
 ) -> Option<(ipnet::IpNet, ipnet::IpNet)> {
-    routes.lines().find_map(|line| {
-        line.split_whitespace().find_map(|token| {
-            let route = token
-                .parse::<ipnet::IpNet>()
-                .ok()
-                .or_else(|| token.parse::<IpAddr>().ok().map(ipnet::IpNet::from))?;
-            reserved
-                .iter()
-                .copied()
-                .find(|pool| {
-                    let same_family = route.addr().is_ipv4() == pool.addr().is_ipv4();
-                    let overlaps =
-                        route.contains(&pool.network()) || pool.contains(&route.network());
-                    same_family && overlaps
-                })
-                .map(|pool| (route, pool))
-        })
+    routes.iter().find_map(|route| {
+        // A default route (0.0.0.0/0 or ::/0) covers everything but never
+        // shadows a specific synthetic pool, so it is not a real overlap.
+        if route.prefix_len() == 0 {
+            return None;
+        }
+        reserved
+            .iter()
+            .copied()
+            .find(|pool| {
+                let same_family = route.addr().is_ipv4() == pool.addr().is_ipv4();
+                let overlaps = route.contains(&pool.network()) || pool.contains(&route.network());
+                same_family && overlaps
+            })
+            .map(|pool| (*route, pool))
     })
 }
 
@@ -1111,6 +979,19 @@ mod tests {
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
 
+    /// Root-only: create() builds a working namespace with host veth, sandbox
+    /// address, and default route — with no external `ip`/`nsenter` process.
+    #[test]
+    #[ignore = "requires root / CAP_NET_ADMIN"]
+    fn create_builds_namespace_via_netlink() {
+        let ns = NetworkNamespace::create().expect("create netns");
+        assert_eq!(ns.host_ip().to_string(), "10.200.0.1");
+        assert_eq!(ns.sandbox_ip().to_string(), "10.200.0.2");
+        assert!(ns.name().starts_with("sandbox-"));
+        assert!(ns.ns_fd().is_some(), "namespace must be FD-owned");
+        // Dropping ns tears everything down via netlink + fd close.
+    }
+
     #[test]
     fn find_trusted_binary_uses_absolute_existing_file() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -1191,8 +1072,11 @@ fe800000000000000000000000000001 02 40 20 80 eth0
             "198.18.1.0/25".parse().unwrap(),
             "fd23:6f70:656e:1::/120".parse().unwrap(),
         ];
-        let routes = "default via 10.200.0.1 dev veth\n198.18.0.0/15 dev eth1\n";
-        let (route, pool) = first_route_overlap(routes, &reserved).expect("collision");
+        let routes: Vec<ipnet::IpNet> = ["0.0.0.0/0", "198.18.0.0/15"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let (route, pool) = first_route_overlap(&routes, &reserved).expect("collision");
         assert_eq!(route.to_string(), "198.18.0.0/15");
         assert_eq!(pool.to_string(), "198.18.1.0/25");
     }
@@ -1203,8 +1087,11 @@ fe800000000000000000000000000001 02 40 20 80 eth0
             "198.18.1.0/25".parse().unwrap(),
             "fd23:6f70:656e:1::/120".parse().unwrap(),
         ];
-        let routes = "default via 10.200.0.1 dev veth\n10.200.0.0/24 dev veth\n";
-        assert_eq!(first_route_overlap(routes, &reserved), None);
+        let routes: Vec<ipnet::IpNet> = ["0.0.0.0/0", "10.200.0.0/24"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(first_route_overlap(&routes, &reserved), None);
     }
 
     #[test]
