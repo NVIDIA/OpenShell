@@ -9070,6 +9070,94 @@ network_policies:
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn exact_deny_symlink_expands_but_glob_deny_does_not() {
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let link_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("python3");
+        let link = link_dir.path().join("python");
+        std::fs::write(&target, b"python binary").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let target_path = target.to_string_lossy();
+        let exact_link = link.to_string_lossy();
+        let candidate_glob = format!("{}/*", link_dir.path().to_string_lossy());
+        let policy = |deny_binary: &str| {
+            format!(
+                r#"
+version: 1
+network_policies:
+  grant:
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules: [{{ allow: {{ method: GET, path: "/**" }} }}]
+    binaries: [{{ path: "{target_path}" }}]
+  deny:
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules: [{{ allow: {{ method: GET, path: "/**" }} }}]
+        deny_rules: [{{ method: "*", path: "/**" }}]
+    binaries: [{{ path: "{deny_binary}" }}]
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#
+            )
+        };
+
+        let maximum = openshell_policy::parse_sandbox_policy(&policy(&exact_link))
+            .expect("maximum policy should parse");
+        let candidate = openshell_policy::parse_sandbox_policy(&policy(&candidate_glob))
+            .expect("candidate policy should parse");
+        let pid = std::process::id();
+        let maximum_engine =
+            OpaEngine::from_proto_with_pid(&maximum, pid).expect("maximum engine should load");
+        let candidate_engine =
+            OpaEngine::from_proto_with_pid(&candidate, pid).expect("candidate engine should load");
+        let input = serde_json::json!({
+            "network": { "host": "example.com", "port": 443 },
+            "exec": {
+                "path": target_path,
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/",
+                "query_params": {}
+            }
+        });
+
+        assert!(
+            eval_l7(&candidate_engine, &input),
+            "the candidate glob must not be resolved through the exact symlink"
+        );
+        assert!(
+            !eval_l7(&maximum_engine, &input),
+            "the maximum exact deny must expand to the resolved target"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
         use std::os::unix::fs::symlink;
 

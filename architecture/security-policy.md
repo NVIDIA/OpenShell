@@ -335,7 +335,25 @@ may store such a draft, but existing merge validation rejects it when an
 approval attempts to add it to policy; runtime SSRF protections remain the
 final enforcement boundary.
 
-## What the prover decides
+## Standalone maximum-boundary checks
+
+The standalone `openshell-prover check` command compares a fully composed local
+candidate policy with an operator-supplied local maximum. It establishes
+`Allowed(candidate) ⊆ Allowed(maximum)` for the model scope reported in its
+result. It does not fetch gateway state, compose provider rules, apply policy,
+or decide whether an in-boundary change is eligible for automatic approval.
+
+The initial model covers filesystem paths, L4 network authority, and enforced
+REST method and path authority. It returns explicit unsupported or inconclusive
+results when a sound decision depends on authority or runtime context outside
+the model. The result records the model version and covered domains so callers
+can bind a successful check to those semantics.
+
+This containment operation is separate from the proposal-risk queries below.
+See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+for installation, command behavior, model limitations, evidence, and exit codes.
+
+## What the proposal prover decides
 
 The prover answers four formal questions about each proposed policy
 change. Each "yes" answer becomes its own categorical finding — there is

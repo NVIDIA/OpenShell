@@ -40,10 +40,12 @@ jobs:
             runner: linux-amd64-cpu8
             cli_target: x86_64-unknown-linux-musl
             gateway_target: x86_64-unknown-linux-gnu
+            prover_target: x86_64-unknown-linux-musl
           - arch: aarch64
             runner: linux-arm64-cpu8
             cli_target: aarch64-unknown-linux-musl
             gateway_target: aarch64-unknown-linux-gnu
+            prover_target: aarch64-unknown-linux-musl
     uses: ./.github/workflows/build-rpm.yml
     with:
       checkout-ref: ${{ inputs.checkout-ref }}
@@ -51,6 +53,7 @@ jobs:
       runner: ${{ matrix.runner }}
       cli-target: ${{ matrix.cli_target }}
       gateway-target: ${{ matrix.gateway_target }}
+      prover-target: ${{ matrix.prover_target }}
       rpm-version: ${{ inputs.rpm-version }}
       rpm-release: ${{ inputs.rpm-release }}
       cargo-version: ${{ inputs.cargo-version }}

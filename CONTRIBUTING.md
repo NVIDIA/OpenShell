@@ -313,11 +313,12 @@ Project requirements:
 
 ### Z3 installation
 
-The `openshell-prover` crate links directly against Z3. The `openshell-server`
-crate depends on the prover, and the `openshell-gateway` binary crate depends
-on `openshell-server` in turn; both forward a `bundled-z3` feature down to
-`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on
-Z3. On macOS and Linux, install the system Z3 development package; `z3-sys`
+The `openshell-prover` crate and standalone `openshell-prover-cli` binary link
+directly against Z3. The `openshell-server` crate depends on the prover, and
+the `openshell-gateway` binary crate depends on `openshell-server` in turn.
+These packages forward a `bundled-z3` feature to
+`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on Z3.
+On macOS and Linux, install the system Z3 development package; `z3-sys`
 discovers it through `pkg-config`.
 
 ```bash
@@ -336,6 +337,7 @@ compiles Z3 from source during the Rust build and requires CMake 3.16+:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
+cargo build -p openshell-prover-cli --features bundled-z3
 ```
 
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
@@ -458,6 +460,7 @@ These are the primary `mise` tasks for day-to-day development:
 | Path            | Purpose                                       |
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
+| `crates/openshell-prover-cli/` | Standalone local policy maximum checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |

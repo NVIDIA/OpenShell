@@ -58,6 +58,14 @@ lifecycle management. This package installs Podman-oriented defaults in
 gateway TOML while leaving compute driver selection to gateway auto-detection
 or explicit operator configuration.
 
+# --- Standalone policy prover sub-package ---
+%package prover
+Summary:        Standalone OpenShell policy boundary prover
+
+%description prover
+OpenShell policy prover for checking whether a local candidate policy stays
+within an operator-supplied maximum without connecting to a gateway.
+
 # --- Python SDK sub-package ---
 %package -n python3-%{name}
 Summary:        OpenShell Python SDK for agent execution and management
@@ -87,6 +95,7 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 %build
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-prover"
 
 # Generate vendored crate manifest and license metadata.
 # cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
@@ -102,6 +111,9 @@ pandoc -s -t man deploy/man/openshell-gateway.8.md -o openshell-gateway.8
 %install
 # --- CLI binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}" %{buildroot}%{_bindir}/%{name}
+
+# --- Standalone policy prover ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-prover" %{buildroot}%{_bindir}/%{name}-prover
 
 # --- Gateway binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
@@ -209,6 +221,9 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # Smoke-test the CLI binary
 %{buildroot}%{_bindir}/%{name} --version
 
+# Smoke-test the standalone policy prover
+%{buildroot}%{_bindir}/%{name}-prover --version
+
 # Smoke-test the gateway binary
 %{buildroot}%{_bindir}/%{name}-gateway --version
 
@@ -245,6 +260,12 @@ grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.se
 %doc README.md
 %{_bindir}/%{name}
 %{_mandir}/man1/openshell.1*
+
+%files prover
+%license LICENSE
+%license LICENSE.dependencies
+%license cargo-vendor.txt
+%{_bindir}/%{name}-prover
 
 %files gateway
 %license LICENSE

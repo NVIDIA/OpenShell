@@ -118,6 +118,16 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-prover:
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-prover-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   build-gateway:
     needs: compute-versions
     permissions:
@@ -152,11 +162,13 @@ jobs:
     secrets: inherit
 
   package-binaries:
-    needs: [build-cli, build-gateway, build-sandbox, build-vm-driver]
+    needs: [build-cli, build-prover, build-gateway, build-sandbox, build-vm-driver]
     permissions:
       actions: read
       contents: read
     uses: ./.github/workflows/package-release-binaries.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.ref }}
 
   build-gateway-image:
     needs: [compute-versions, build-gateway]
@@ -294,7 +306,7 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-cli, build-prover, build-gateway, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -315,7 +327,7 @@ jobs:
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-cli, build-gateway]
+    needs: [compute-versions, build-cli, build-prover, build-gateway]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
@@ -420,6 +432,7 @@ jobs:
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends ./package-input/*.deb
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
           /usr/libexec/openshell/openshell-driver-vm --version
 
@@ -434,7 +447,11 @@ jobs:
         if: matrix.kind == 'rpm'
         run: |
           set -euo pipefail
-          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
+          dnf install -y \
+            ./package-input/openshell-[0-9]*.rpm \
+            ./package-input/openshell-gateway-*.rpm \
+            ./package-input/openshell-prover-*.rpm
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
 
       - name: Download Python wheel artifact
@@ -505,6 +522,19 @@ jobs:
           pattern: driver-vm-*
           path: release/
           merge-multiple: true
+
+      - name: Download prover binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: prover-binary-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download prover checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prover-checksums
+          path: release/
 
       - name: Download wheel artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -645,11 +675,15 @@ jobs:
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
             release/*.whl
             release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
 
       - name: Upload pre-release artifacts
         if: needs.compute-versions.outputs.is_prerelease == 'true'
