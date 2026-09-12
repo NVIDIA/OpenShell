@@ -61,7 +61,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
@@ -161,11 +161,10 @@ const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_IN
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
 const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
-const HOST_TOPOLOGY_PAYLOAD_FILE: &str = "topology.payload";
-/// The backend this driver's deployment admits, delivered to the supervisor on
-/// a channel separate from the topology descriptor so descriptor verification
-/// is not self-referential.
-const DRIVER_ADMITTED_BACKEND: &str = "vm";
+const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
+/// The backend this driver admits. VM-specific placement remains inside the
+/// opaque runtime descriptor.
+const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
 const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-supervisor";
 const VM_CONTROL_SOCKET: &str = "control.sock";
 const VM_CONTROL_PORT: u32 = 5500;
@@ -808,7 +807,7 @@ impl VmDriver {
         sandbox: &Sandbox,
         state_dir: &Path,
         tls_paths: Option<&VmDriverTlsPaths>,
-        topology: &BoundaryTopology,
+        runtime_descriptor: &SandboxRuntimeDescriptor,
         auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
     ) -> Result<Child, Status> {
         let supervisor_binary = self.host_supervisor_binary().await?;
@@ -828,21 +827,21 @@ impl VmDriver {
                 Status::internal(format!("restrict supervisor auth bundle: {error}"))
             })?;
 
-        let descriptor = topology
-            .descriptor(DRIVER_ADMITTED_BACKEND)
+        let descriptor = runtime_descriptor
+            .backend_descriptor()
             .map_err(|error| Status::internal(error.to_string()))?;
         // The payload carries the boundary bootstrap token, so it must not
         // appear in the world-readable process cmdline; deliver it through a
         // driver-owned 0600 file like the gateway token.
-        let payload_path = state_dir.join(HOST_TOPOLOGY_PAYLOAD_FILE);
+        let payload_path = state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE);
         tokio::fs::write(&payload_path, &descriptor.payload)
             .await
-            .map_err(|error| Status::internal(format!("write host topology payload: {error}")))?;
+            .map_err(|error| Status::internal(format!("write host runtime descriptor: {error}")))?;
         #[cfg(unix)]
         tokio::fs::set_permissions(&payload_path, fs::Permissions::from_mode(0o600))
             .await
             .map_err(|error| {
-                Status::internal(format!("restrict host topology payload: {error}"))
+                Status::internal(format!("restrict host runtime descriptor: {error}"))
             })?;
         let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
             sandbox.spec.as_ref(),
@@ -866,11 +865,7 @@ impl VmDriver {
                     Status::internal(format!("create supervisor error log: {error}"))
                 })?,
             ))
-            .arg(format!(
-                "--topology-backend-name={}",
-                descriptor.backend_name
-            ))
-            .arg("--topology-payload-file")
+            .arg("--backend-descriptor-file")
             .arg(&payload_path)
             .arg("--auth-bundle-file")
             .arg(&auth_bundle_path)
@@ -1461,7 +1456,7 @@ impl VmDriver {
             &channel_tls,
         )
         .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
-        let topology = provisioning.topology;
+        let runtime_descriptor = provisioning.runtime_descriptor;
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
@@ -1556,7 +1551,7 @@ impl VmDriver {
                 &sandbox,
                 &state_dir,
                 tls_paths.as_ref(),
-                &topology,
+                &runtime_descriptor,
                 &launch_authentication.supervisor,
             )
             .await
@@ -10352,7 +10347,7 @@ mod tests {
 
     #[test]
     fn sandbox_driver_config_cannot_carry_proxy_settings() {
-        // The upstream proxy is host network topology, not a per-sandbox
+        // The upstream proxy is host network infrastructure, not a per-sandbox
         // setting: the caller-supplied envelope must reject it outright
         // rather than silently ignoring it.
         for key in [

@@ -12,7 +12,7 @@ use openshell_isolation_interface::contract::{
     BackendError, DriverFenceEvidence, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -37,7 +37,7 @@ pub struct VmBoundarySpec {
 /// The protected guest config and matching host descriptor for one VM.
 pub struct VmBoundaryProvisioning {
     pub boundary_config: BoundaryConfig,
-    pub topology: BoundaryTopology,
+    pub runtime_descriptor: SandboxRuntimeDescriptor,
 }
 
 impl VmBoundarySpec {
@@ -76,7 +76,7 @@ impl VmBoundarySpec {
                 driver_fence: driver_fence.clone(),
                 child_env: self.child_env,
             },
-            topology: BoundaryTopology {
+            runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
                 generation: self.generation,
                 session_id: self.session_id,
@@ -138,25 +138,25 @@ mod tests {
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
-            provisioned.topology.resource_claims
+            provisioned.runtime_descriptor.resource_claims
         );
         assert_eq!(
-            provisioned.topology.resource_claims["vm.generation"],
+            provisioned.runtime_descriptor.resource_claims["vm.generation"],
             "generation-1"
         );
         assert_eq!(
-            provisioned.topology.host_gateway_ip,
+            provisioned.runtime_descriptor.host_gateway_ip,
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
         assert_eq!(
             provisioned.boundary_config.driver_fence,
-            provisioned.topology.driver_fence
+            provisioned.runtime_descriptor.driver_fence
         );
         assert!(
             provisioned
-                .topology
+                .runtime_descriptor
                 .driver_fence
-                .validate_for_backend("vm")
+                .validate()
                 .is_ok()
         );
     }
