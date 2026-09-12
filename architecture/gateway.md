@@ -343,7 +343,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`8ac68c71d93e6a5e56406b8df1882ee40c6066270969e03eb99803f0e6396fc1`).
+(`c6b4e1ae4d09e5d7de3831601953aa36901e51a24913a86f00559c53511fedde`).
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
