@@ -22,8 +22,8 @@ use openshell_core::policy::{
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
-    BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal, DriverFenceEvidence,
-    ExecSpec, ResolveError, SandboxConfirmEvidence, TopologyDescriptor,
+    BackendDescriptor, BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal,
+    DriverFenceEvidence, ExecSpec, ResolveError, SandboxConfirmEvidence,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -185,10 +185,10 @@ pub struct GatewayVerificationKey {
     pub public_key_pem: String,
 }
 
-/// Protected descriptor consumed by `openshell-supervisor`.
+/// Protected runtime descriptor consumed by `openshell-supervisor`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BoundaryTopology {
+pub struct SandboxRuntimeDescriptor {
     /// Stable identity of the boundary, normally the sandbox ID.
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
@@ -213,10 +213,10 @@ pub struct BoundaryTopology {
     pub driver_fence: DriverFenceEvidence,
 }
 
-impl fmt::Debug for BoundaryTopology {
+impl fmt::Debug for SandboxRuntimeDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("BoundaryTopology")
+            .debug_struct("SandboxRuntimeDescriptor")
             .field("boundary_id", &self.boundary_id)
             .field("generation", &self.generation)
             .field("session_id", &self.session_id)
@@ -229,17 +229,14 @@ impl fmt::Debug for BoundaryTopology {
     }
 }
 
-impl BoundaryTopology {
-    /// Encode this topology as the shared RFC 0012 descriptor admitted for
-    /// `backend_name`.
-    pub fn descriptor(
-        &self,
-        backend_name: impl Into<String>,
-    ) -> Result<TopologyDescriptor, BackendError> {
-        let payload = serde_json::to_vec(self)
-            .map_err(|error| BackendError::Descriptor(format!("encode topology: {error}")))?;
-        Ok(TopologyDescriptor {
-            backend_name: backend_name.into(),
+impl SandboxRuntimeDescriptor {
+    /// Encode this runtime configuration for the `openshell-sandbox` backend.
+    pub fn backend_descriptor(&self) -> Result<BackendDescriptor, BackendError> {
+        let payload = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode runtime descriptor: {error}"))
+        })?;
+        Ok(BackendDescriptor {
+            backend_name: crate::BACKEND_NAME.to_string(),
             payload,
         })
     }
@@ -262,7 +259,7 @@ pub struct BoundaryConfig {
     /// Driver-provisioned listener.
     pub listener: BoundaryListener,
     /// Immutable coordinates the boundary requires from the control-side
-    /// topology descriptor before accepting attachment.
+    /// runtime descriptor before accepting attachment.
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Driver-provisioned, read-only runtime evidence for resource claims.

@@ -10,7 +10,7 @@
 //! chain of boxed states:
 //!
 //! ```text
-//! attach topology + sandbox context -> Bound -> confirm -> Ready
+//! attach backend descriptor + sandbox context -> Bound -> confirm -> Ready
 //!     -> start_agent -> Running
 //! ```
 //!
@@ -27,8 +27,8 @@
 //! [`PendingTcpOpen`], resolved for that exact socket and process
 //! generation; an unresolved identity denies the open.
 //!
-//! The contract is transport-neutral. Concrete topology implementations keep
-//! their placement and coordination details behind these interfaces.
+//! The contract is transport-neutral. Compute drivers keep runtime placement
+//! and coordination details behind these interfaces.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -154,14 +154,14 @@ impl std::error::Error for ResolveError {}
 // Descriptor and registry
 // ============================================================================
 
-/// The common topology descriptor envelope.
+/// The common isolation backend descriptor envelope.
 ///
-/// The compute driver supplies one for every admitted topology. The opaque
+/// The compute driver supplies one for the selected isolation backend. The opaque
 /// payload identifies an existing resource or carries the trusted prepared
 /// inputs the backend needs to establish one during `attach`; its protection
-/// and resource lifecycle remain topology-specific.
+/// and resource lifecycle remain owned by the compute driver.
 #[derive(Debug, Clone)]
-pub struct TopologyDescriptor {
+pub struct BackendDescriptor {
     /// The backend the supervisor must instantiate.
     pub backend_name: String,
     /// Backend-specific attachment data.
@@ -174,11 +174,11 @@ pub struct TopologyDescriptor {
 /// unverified descriptor cannot reach a backend. The type does not imply that
 /// the opaque payload has been validated: the backend validates the payload and
 /// atomically binds it to the sandbox context during `attach`.
-pub struct VerifiedTopologyDescriptor {
-    descriptor: TopologyDescriptor,
+pub struct VerifiedBackendDescriptor {
+    descriptor: BackendDescriptor,
 }
 
-impl VerifiedTopologyDescriptor {
+impl VerifiedBackendDescriptor {
     /// The verified backend name.
     #[must_use]
     pub fn backend_name(&self) -> &str {
@@ -309,9 +309,9 @@ impl BackendRegistry {
     /// registered for the admitted name.
     pub fn resolve(
         &self,
-        descriptor: TopologyDescriptor,
+        descriptor: BackendDescriptor,
         admitted_backend_name: &str,
-    ) -> Result<(Arc<dyn IsolationBackend>, VerifiedTopologyDescriptor), BackendError> {
+    ) -> Result<(Arc<dyn IsolationBackend>, VerifiedBackendDescriptor), BackendError> {
         if descriptor.backend_name != admitted_backend_name {
             return Err(BackendError::Descriptor(format!(
                 "descriptor backend {:?} does not match admitted backend {admitted_backend_name:?}",
@@ -330,7 +330,7 @@ impl BackendRegistry {
                 descriptor.backend_name
             )));
         }
-        Ok((backend, VerifiedTopologyDescriptor { descriptor }))
+        Ok((backend, VerifiedBackendDescriptor { descriptor }))
     }
 }
 
@@ -349,7 +349,7 @@ pub trait IsolationBackend: Send + Sync {
     /// external orchestrator that supplied the descriptor.
     async fn attach(
         &self,
-        descriptor: VerifiedTopologyDescriptor,
+        descriptor: VerifiedBackendDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError>;
 }
@@ -358,7 +358,7 @@ pub trait IsolationBackend: Send + Sync {
 // Lifecycle states
 // ============================================================================
 
-/// Bound: the topology descriptor and trusted sandbox context are bound to the
+/// Bound: the backend descriptor and trusted sandbox context are bound to the
 /// same resource, and the mediation source is available. No untrusted workload
 /// code is running.
 #[async_trait]
@@ -459,38 +459,29 @@ pub enum DriverFenceEvidence {
 
 impl DriverFenceEvidence {
     #[must_use]
-    pub const fn backend_name(&self) -> &'static str {
+    pub const fn driver_name(&self) -> &'static str {
         match self {
             Self::Docker { .. } => "docker",
             Self::Podman { .. } => "podman",
-            Self::Kubernetes { .. } => "kubernetes-proxy-pod",
+            Self::Kubernetes { .. } => "kubernetes",
             Self::Vm { .. } => "vm",
         }
     }
 
-    /// Validate the concrete fence properties and bind them to the selected
-    /// isolation backend.
-    pub fn validate_for_backend(&self, backend_name: &str) -> Result<(), BackendError> {
+    /// Validate the concrete outer-fence properties reported by the compute driver.
+    pub fn validate(&self) -> Result<(), BackendError> {
         let valid = match self {
             Self::Docker {
                 container_id,
                 network_mode,
                 unexpected_networks,
-            } => {
-                backend_name == "docker"
-                    && !container_id.is_empty()
-                    && network_mode == "none"
-                    && unexpected_networks.is_empty()
             }
-            Self::Podman {
+            | Self::Podman {
                 container_id,
                 network_mode,
                 unexpected_networks,
             } => {
-                backend_name == "podman"
-                    && !container_id.is_empty()
-                    && network_mode == "none"
-                    && unexpected_networks.is_empty()
+                !container_id.is_empty() && network_mode == "none" && unexpected_networks.is_empty()
             }
             Self::Kubernetes {
                 network_policy_uid,
@@ -499,8 +490,7 @@ impl DriverFenceEvidence {
                 egress_isolated,
                 egress_rule_count,
             } => {
-                backend_name == "kubernetes-proxy-pod"
-                    && !network_policy_uid.is_empty()
+                !network_policy_uid.is_empty()
                     && !network_policy_resource_version.is_empty()
                     && *ingress_isolated
                     && *egress_isolated
@@ -509,13 +499,14 @@ impl DriverFenceEvidence {
             Self::Vm {
                 generation,
                 network_device_count,
-            } => backend_name == "vm" && !generation.is_empty() && *network_device_count == 0,
+            } => !generation.is_empty() && *network_device_count == 0,
         };
         if valid {
             Ok(())
         } else {
             Err(BackendError::Confirm(format!(
-                "driver fence evidence is incomplete or does not match backend {backend_name:?}"
+                "{} driver fence evidence is incomplete",
+                self.driver_name()
             )))
         }
     }
@@ -556,8 +547,7 @@ pub struct SandboxConfirmEvidence {
 impl SandboxConfirmEvidence {
     /// Validate the security-critical evidence required before launch.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
-        self.driver_fence
-            .validate_for_backend(self.driver_fence.backend_name())?;
+        self.driver_fence.validate()?;
         let complete = &self.identity == expected
             && self.capabilities.is_empty()
             && self.no_new_privileges

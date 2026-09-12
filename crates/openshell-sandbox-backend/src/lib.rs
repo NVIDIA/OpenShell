@@ -15,6 +15,9 @@ pub mod sandbox_auth;
 
 pub use runtime::OpenShellRuntimeBackend;
 
+/// Stable isolation backend name implemented by `openshell-sandbox`.
+pub const BACKEND_NAME: &str = "openshell-sandbox";
+
 /// Generated gRPC transport envelope for the OpenShell Sandbox Protocol.
 #[allow(
     clippy::all,
