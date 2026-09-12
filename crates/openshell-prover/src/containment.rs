@@ -87,7 +87,7 @@ pub struct ManagedPolicyMetadata {
     extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct FilesystemPolicy {
     #[serde(default)]
     include_workdir: bool,
@@ -97,6 +97,20 @@ struct FilesystemPolicy {
     read_write: Vec<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+impl Default for FilesystemPolicy {
+    fn default() -> Self {
+        Self {
+            // Match the runtime default when `filesystem_policy` is absent.
+            // Serde still uses `false` for an omitted `include_workdir` field
+            // inside an explicitly present filesystem policy.
+            include_workdir: true,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            extra: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -882,8 +896,9 @@ fn assert_action_domain(solver: &Solver, action: &SymbolicAction, binary_identit
         );
         solver.assert(action.ancestor_binary.length().le(4_096));
     }
-    solver.assert(action.host.regex_matches(&host_domain_regex()));
-    solver.assert(action.host.length().le(253));
+    // Keep `action.host` unconstrained: the runtime applies host globs to raw
+    // proxy input before DNS validation, so DNS structure and resolver length
+    // limits are not properties of the action domain.
     solver.assert(Int::from_u64(1).le(&action.port));
     solver.assert(action.port.le(65_535));
     solver.assert(str_eq_any(&action.layer, &[LAYER_L4, LAYER_REST]));
@@ -1546,10 +1561,8 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
             return unsupported(format!("rule '{rule_name}' uses unsupported fields"));
         }
         for binary in &rule.binaries {
-            if !binary.path.is_ascii() {
-                return unsupported(format!(
-                    "rule '{rule_name}' binary path contains a non-ASCII literal"
-                ));
+            if let Some(reason) = unsupported_network_literal(&binary.path) {
+                return unsupported(format!("rule '{rule_name}' binary path {reason}"));
             }
             if binary.path.is_empty()
                 || !is_canonical_pattern_path(&binary.path)
@@ -1561,15 +1574,11 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
         }
         for endpoint in &rule.endpoints {
             let context = format!("rule '{rule_name}'");
-            if !endpoint.host.is_ascii() {
-                return unsupported(format!(
-                    "{context} endpoint host contains a non-ASCII literal"
-                ));
+            if let Some(reason) = unsupported_network_literal(&endpoint.host) {
+                return unsupported(format!("{context} endpoint host {reason}"));
             }
-            if !endpoint.path.is_ascii() {
-                return unsupported(format!(
-                    "{context} endpoint path contains a non-ASCII literal"
-                ));
+            if let Some(reason) = unsupported_network_literal(&endpoint.path) {
+                return unsupported(format!("{context} endpoint path {reason}"));
             }
             if endpoint.host.is_empty()
                 || endpoint.effective_ports().is_empty()
@@ -1652,30 +1661,22 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
                 return unsupported(format!("{context} mixes REST controls into L4 authority"));
             }
             for rule in &endpoint.rules {
-                if !rule.allow.method.is_ascii() {
-                    return unsupported(format!(
-                        "{context} REST allow method contains a non-ASCII literal"
-                    ));
+                if let Some(reason) = unsupported_network_literal(&rule.allow.method) {
+                    return unsupported(format!("{context} REST allow method {reason}"));
                 }
-                if !rule.allow.path.is_ascii() {
-                    return unsupported(format!(
-                        "{context} REST allow path contains a non-ASCII literal"
-                    ));
+                if let Some(reason) = unsupported_network_literal(&rule.allow.path) {
+                    return unsupported(format!("{context} REST allow path {reason}"));
                 }
                 if !rule.extra.is_empty() || unsupported_allow(&rule.allow) {
                     return unsupported(format!("{context} uses an unsupported REST allow rule"));
                 }
             }
             for rule in &endpoint.deny_rules {
-                if !rule.method.is_ascii() {
-                    return unsupported(format!(
-                        "{context} REST deny method contains a non-ASCII literal"
-                    ));
+                if let Some(reason) = unsupported_network_literal(&rule.method) {
+                    return unsupported(format!("{context} REST deny method {reason}"));
                 }
-                if !rule.path.is_ascii() {
-                    return unsupported(format!(
-                        "{context} REST deny path contains a non-ASCII literal"
-                    ));
+                if let Some(reason) = unsupported_network_literal(&rule.path) {
+                    return unsupported(format!("{context} REST deny path {reason}"));
                 }
                 if unsupported_deny(rule) {
                     return unsupported(format!("{context} uses an unsupported REST deny rule"));
@@ -1700,6 +1701,16 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
         );
     }
     None
+}
+
+fn unsupported_network_literal(value: &str) -> Option<&'static str> {
+    if !value.is_ascii() {
+        Some("contains a non-ASCII literal")
+    } else if value.contains('\0') {
+        Some("contains an embedded NUL byte")
+    } else {
+        None
+    }
 }
 
 fn resource_limit_reason(
@@ -1892,15 +1903,7 @@ fn glob_regex(pattern: &str, separator: &str) -> Regexp {
     while let Some(character) = chars.next() {
         if character == '*' && chars.peek() == Some(&'*') {
             chars.next();
-            if separator == "." {
-                let label = non_separator_regex(separator).plus();
-                parts.push(Regexp::concat(&[
-                    &label,
-                    &Regexp::concat(&[&Regexp::literal("."), &label]).star(),
-                ]));
-            } else {
-                parts.push(Regexp::full());
-            }
+            parts.push(Regexp::full());
         } else if character == '*' {
             let wildcard = non_separator_regex(separator);
             parts.push(wildcard.star());
@@ -1972,27 +1975,9 @@ fn non_separator_regex(separator: &str) -> Regexp {
     ])
 }
 
-fn host_domain_regex() -> Regexp {
-    let alphanumeric = Regexp::union(&[&Regexp::range(&'a', &'z'), &Regexp::range(&'0', &'9')]);
-    // Actions represent canonical resolver inputs, not every raw value the
-    // proxy parser or Rego glob builtin can compare. Supported endpoint globs
-    // are therefore modeled over this same resolver-oriented host domain.
-    let label_edge = Regexp::union(&[&alphanumeric, &Regexp::literal("_")]);
-    let label_character = Regexp::union(&[&label_edge, &Regexp::literal("-")]);
-    let label = Regexp::union(&[
-        &label_edge,
-        &Regexp::concat(&[&label_edge, &label_character.r#loop(0, 61), &label_edge]),
-    ]);
-    Regexp::concat(&[
-        &label,
-        &Regexp::concat(&[&Regexp::literal("."), &label]).star(),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::host_pattern::HostPattern;
     use std::fmt::Write as _;
 
     fn parse(value: &str) -> ContainmentPolicy {
@@ -2016,8 +2001,27 @@ mod tests {
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&parse("version: 1\n"), &exceeds, options()),
+            check_within_maximum(
+                &parse("version: 1\nfilesystem_policy: {}\n"),
+                &exceeds,
+                options()
+            ),
             CheckResult::Exceeds(_)
+        ));
+    }
+
+    #[test]
+    fn absent_filesystem_policy_uses_the_runtime_workdir_default() {
+        let omitted = parse("version: 1\n");
+        assert!(omitted.filesystem_policy.include_workdir);
+
+        let explicit = parse("version: 1\nfilesystem_policy: {}\n");
+        assert!(!explicit.filesystem_policy.include_workdir);
+
+        assert!(matches!(
+            check_within_maximum(&explicit, &omitted, options()),
+            CheckResult::Unsupported(ref evidence)
+                if evidence.reason_code() == ReasonCode::UnresolvedWorkdir
         ));
     }
 
@@ -2122,7 +2126,30 @@ mod tests {
     }
 
     #[test]
-    fn host_domain_enforces_modeled_label_and_name_boundaries() {
+    fn host_action_domain_covers_noncanonical_wildcard_matches() {
+        for (pattern, host) in [
+            ("*.example.com", ".example.com".to_owned()),
+            ("**.example.com", "api..example.com".to_owned()),
+            ("*.example.com", "é.example.com".to_owned()),
+            ("*.example.com", "$service.example.com".to_owned()),
+            ("*.example.com", "-api.example.com".to_owned()),
+            ("*.example.com", format!("{}.example.com", "a".repeat(242))),
+        ] {
+            let solver = Solver::new();
+            let action = symbolic_action("host_superset");
+            assert_action_domain(&solver, &action, false);
+            solver.assert(action.host.eq(Z3String::from_str(&host).unwrap()));
+            solver.assert(action.host.regex_matches(&glob_regex(pattern, ".")));
+            assert_eq!(
+                solver.check(),
+                SatResult::Sat,
+                "pattern={pattern:?} host={host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_literals_enforce_modeled_label_and_name_boundaries() {
         let maximum_length = format!(
             "{}.{}.{}.{}",
             "a".repeat(63),
@@ -2357,7 +2384,7 @@ mod tests {
             CheckResult::Unsupported(_)
         ));
         let workdir = parse("version: 1\nfilesystem_policy: { include_workdir: true }\n");
-        let empty = parse("version: 1\n");
+        let empty = parse("version: 1\nfilesystem_policy: {}\n");
         assert!(matches!(
             check_within_maximum(&empty, &workdir, options()),
             CheckResult::Unsupported(_)
@@ -2633,17 +2660,29 @@ mod tests {
             ("api*.example.com", "api-v2.example.com"),
             ("api*.example.com", "api_internal.example.com"),
             ("*.example.com", "_service.example.com"),
+            ("*.example.com", ".example.com"),
+            ("**.example.com", "api..example.com"),
+            ("*.example.com", "é.example.com"),
+            ("*.example.com", "$service.example.com"),
+            ("*.example.com", "-api.example.com"),
             ("api-internal.example.com", "api-internal.example.com"),
         ];
+        let mut runtime = regorus::Engine::new();
         for (pattern, host) in cases {
-            let runtime = HostPattern::new(pattern).unwrap().matches(host);
+            let query = format!(
+                "glob.match({}, [\".\"], {})",
+                serde_json::to_string(pattern).unwrap(),
+                serde_json::to_string(host).unwrap()
+            );
+            let actual = runtime.eval_query(query, false).unwrap();
+            let expected = actual.result[0].expressions[0].value == regorus::Value::from(true);
             let solver = Solver::new();
             let modeled = Z3String::from_str(host)
                 .unwrap()
                 .regex_matches(&glob_regex(pattern, "."));
             solver.assert(!modeled);
             let prover = solver.check() == SatResult::Unsat;
-            assert_eq!(prover, runtime, "pattern={pattern} host={host}");
+            assert_eq!(prover, expected, "pattern={pattern} host={host}");
         }
     }
 
@@ -2830,6 +2869,42 @@ mod tests {
                     "field={field} input={label} result={result:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn embedded_nul_network_literal_is_unsupported_before_solving() {
+        assert_eq!(unsupported_network_literal("ascii"), None);
+        assert_eq!(
+            unsupported_network_literal("é"),
+            Some("contains a non-ASCII literal")
+        );
+        assert_eq!(
+            unsupported_network_literal("G\0ET"),
+            Some("contains an embedded NUL byte")
+        );
+
+        let policy = parse(
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+        );
+        let empty = parse("version: 1\n");
+        for (maximum, candidate, label) in [
+            (&policy, &empty, "maximum"),
+            (&empty, &policy, "candidate"),
+            (&policy, &policy, "maximum"),
+        ] {
+            let result = check_within_maximum(maximum, candidate, options());
+            assert!(
+                matches!(
+                    result,
+                    CheckResult::Unsupported(ref evidence)
+                        if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
+                            && evidence.reason().contains(label)
+                            && evidence.reason().contains("REST allow method")
+                            && evidence.reason().contains("NUL")
+                ),
+                "input={label} result={result:?}"
+            );
         }
     }
 }

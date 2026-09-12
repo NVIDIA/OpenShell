@@ -18,7 +18,8 @@ The containment model accepts ASCII literals in network binary selectors,
 endpoint host and path selectors, and REST allow and deny method and path
 selectors. It returns `unsupported_policy_shape` when either policy uses a
 non-ASCII literal in one of those fields. This boundary does not apply to
-filesystem paths or unrelated policy text. ASCII wildcards are modeled over the
+filesystem paths or unrelated policy text. Embedded NUL bytes in network
+selector fields are also unsupported. ASCII wildcards are modeled over the
 runtime match language and can therefore match non-ASCII runtime values. A
 solver string that cannot be decoded and validated exactly produces
 `invalid_witness` rather than counterexample evidence.

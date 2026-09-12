@@ -351,8 +351,9 @@ executable and an ancestor identity, and the evidence identifies the identities
 for an exceeding witness. Network binary selectors, endpoint host and path
 selectors, and REST allow and deny method and path selectors must use ASCII
 literals. This restriction applies to both inputs, including deny-only rules;
-other Unicode policy text and filesystem paths are unaffected. ASCII wildcard
-selectors still cover non-ASCII runtime values matched by the policy engine.
+embedded NUL bytes in those fields are also unsupported. Other Unicode policy
+text and filesystem paths are unaffected. ASCII wildcard selectors still cover
+non-ASCII runtime values matched by the policy engine.
 Recognized authority outside the reviewed model produces an unsupported result
 rather than being silently ignored.
 Environment-dependent authority also remains unsupported when the result
