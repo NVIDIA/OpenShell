@@ -221,7 +221,7 @@ mod linux {
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
             .driver_fence
-            .validate_for_backend(config.driver_fence.backend_name())
+            .validate()
             .map_err(|error| error.to_string())?;
         for (claim, path) in &config.resource_claim_files {
             if !config.resource_claims.contains_key(claim) {
@@ -1653,7 +1653,7 @@ mod linux {
                     } else {
                         guest_error(
                             BoundaryErrorKind::Denied,
-                            "topology resource claims do not match the boundary configuration",
+                            "backend resource claims do not match the boundary configuration",
                         )
                     }
                 }

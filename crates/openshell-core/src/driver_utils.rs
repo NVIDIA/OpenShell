@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::proto::compute::v1::DriverSandbox;
 
-/// Built-in sandbox network topologies used to derive a callback endpoint
+/// Built-in sandbox network callback routes used to derive a callback endpoint
 /// when an operator does not configure a per-driver `grpc_endpoint` override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayCallbackTopology {
+pub enum GatewayCallbackRoute {
     /// A Docker container reaches the host through Docker's gateway alias.
     Docker,
     /// A Podman container reaches the host through Podman's gateway alias.
@@ -19,41 +19,41 @@ pub enum GatewayCallbackTopology {
     Vm,
 }
 
-/// Build the endpoint a sandbox uses to call its gateway for a known topology.
+/// Build the endpoint a sandbox uses to call its gateway for a known route.
 ///
 /// The result is deliberately derived by the gateway rather than baked into
 /// individual driver defaults. A configured `grpc_endpoint` remains an
 /// operator override for remote or non-standard deployments.
 #[must_use]
 pub fn gateway_callback_endpoint(
-    topology: GatewayCallbackTopology,
+    route: GatewayCallbackRoute,
     gateway_port: u16,
     gateway_tls_enabled: bool,
 ) -> String {
     let scheme = if gateway_tls_enabled { "https" } else { "http" };
-    let host = match topology {
-        GatewayCallbackTopology::Docker | GatewayCallbackTopology::Vm => "host.openshell.internal",
-        GatewayCallbackTopology::Podman => "host.containers.internal",
+    let host = match route {
+        GatewayCallbackRoute::Docker | GatewayCallbackRoute::Vm => "host.openshell.internal",
+        GatewayCallbackRoute::Podman => "host.containers.internal",
     };
     format!("{scheme}://{host}:{gateway_port}")
 }
 
 #[cfg(test)]
 mod callback_endpoint_tests {
-    use super::{GatewayCallbackTopology, gateway_callback_endpoint};
+    use super::{GatewayCallbackRoute, gateway_callback_endpoint};
 
     #[test]
-    fn derives_endpoint_for_each_builtin_topology() {
+    fn derives_endpoint_for_each_builtin_route() {
         assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Docker, 17670, false),
+            gateway_callback_endpoint(GatewayCallbackRoute::Docker, 17670, false),
             "http://host.openshell.internal:17670"
         );
         assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Podman, 17670, true),
+            gateway_callback_endpoint(GatewayCallbackRoute::Podman, 17670, true),
             "https://host.containers.internal:17670"
         );
         assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Vm, 17670, true),
+            gateway_callback_endpoint(GatewayCallbackRoute::Vm, 17670, true),
             "https://host.openshell.internal:17670"
         );
     }
