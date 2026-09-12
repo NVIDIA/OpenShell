@@ -42,7 +42,7 @@ VM-specific RFC 0012 code under `src/isolation/` only chooses the vsock transpor
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/umoci and `mise run vm:supervisor` builds the portable Linux guest sandbox plus its trusted helper runtime. The development task also builds the native host supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/umoci and `mise run vm:supervisor` builds the portable Linux guest sandbox plus its small static guest-init helper. The development task also builds the native host supervisor. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
@@ -105,7 +105,7 @@ If you want to drive the launch yourself instead of using `mise run gateway:vm` 
 ```shell
 # 1. Stage runtime artifacts + guest sandbox into target/vm-runtime-compressed/
 mise run vm:setup
-mise run vm:supervisor          # builds the Linux guest sandbox and trusted helper runtime
+mise run vm:supervisor          # builds the Linux guest sandbox and static guest-init helper
 
 # 2. Build gateway, native host supervisor, and driver
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \

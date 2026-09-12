@@ -25,6 +25,7 @@ fn main() {
             "libkrunfw.5.dylib.zst",
             "openshell-sandbox.zst",
             "openshell-supervisor.zst",
+            "openshell-vm-init.zst",
             "umoci.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
@@ -47,7 +48,7 @@ fn main() {
                     "libkrunfw",
                     "openshell-sandbox.zst",
                     "openshell-supervisor.zst",
-                    "openshell-runtime.tar.zst",
+                    "openshell-vm-init.zst",
                     "umoci.zst",
                 ],
             );
@@ -67,7 +68,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "openshell-sandbox.zst",
                 "openshell-supervisor.zst",
-                "openshell-runtime.tar.zst",
+                "openshell-vm-init.zst",
                 "umoci.zst",
             ],
         );
@@ -95,8 +96,8 @@ fn main() {
             "openshell-supervisor.zst".to_string(),
         ),
         (
-            "openshell-runtime.tar.zst".to_string(),
-            "openshell-runtime.tar.zst".to_string(),
+            "openshell-vm-init.zst".to_string(),
+            "openshell-vm-init.zst".to_string(),
         ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];

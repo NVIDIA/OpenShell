@@ -39,7 +39,7 @@ supervisor runs on the host.
 # Download the current pre-built runtime and stage compressed artifacts
 mise run vm:setup
 
-# Build the portable Linux guest sandbox and trusted helper runtime (requires Docker Buildx)
+# Build the portable Linux guest sandbox and static guest-init helper
 mise run vm:supervisor
 
 # Build the gateway, native host supervisor, and VM driver
