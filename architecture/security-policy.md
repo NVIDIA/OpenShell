@@ -343,38 +343,15 @@ candidate policy with an operator-supplied local maximum. It establishes
 result. It does not fetch gateway state, compose provider rules, apply policy,
 or decide whether an in-boundary change is eligible for automatic approval.
 
-The initial maximum-boundary model covers filesystem paths, L4 network
-authority, and enforced REST method and path authority, including explicit REST
-denies. Network containment covers runtime configurations both with and without
-binary identity enforcement. Strict checks match grants and denies against the
-executable and an ancestor identity, and the evidence identifies the identities
-for an exceeding witness. Network binary selectors, endpoint host and path
-selectors, and REST allow and deny method and path selectors must use ASCII
-literals. This restriction applies to both inputs, including deny-only rules;
-embedded NUL bytes in those fields are also unsupported. Other Unicode policy
-text and filesystem paths are unaffected. ASCII wildcard selectors still cover
-non-ASCII runtime values matched by the policy engine.
-Recognized authority outside the reviewed model produces an unsupported result
-rather than being silently ignored.
-Environment-dependent authority also remains unsupported when the result
-depends on context that is unavailable to the local command. This includes an
-unresolved workdir, filesystem or binary containment that depends on image-specific
-path resolution, and overlapping L4 and REST endpoints whose inspection selection
-depends on the complete runtime endpoint set. Candidate and maximum paths use
-the same sandbox namespace and mount interpretation; the checker does not
-resolve them against the CLI host or verify kernel enforcement in a running
-sandbox. Filesystem checks assume stable path resolution when enforcement rules
-are created. They support matching paths, grant removal, write-to-read reduction,
-and a maximum root grant. Other comparisons between paths remain unsupported;
-lexical ancestry or distinctness alone cannot establish resolved ancestry or
-distinctness. Adding access when the maximum grants none produces a counterexample.
-If the solver produces a string that cannot be decoded and checked faithfully,
-the command returns an inconclusive `invalid_witness` result instead of publishing
-the value as counterexample evidence.
+The initial model covers filesystem paths, L4 network authority, and enforced
+REST method and path authority. It returns explicit unsupported or inconclusive
+results when a sound decision depends on authority or runtime context outside
+the model. The result records the model version and covered domains so callers
+can bind a successful check to those semantics.
 
 This containment operation is separate from the proposal-risk queries below.
 See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
-for installation, command behavior, evidence, and exit codes.
+for installation, command behavior, model limitations, evidence, and exit codes.
 
 ## What the proposal prover decides
 
