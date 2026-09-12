@@ -15,6 +15,7 @@ const LOOPBACK_NAME: &[u8] = b"lo";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     PrepareNetwork,
+    Version,
 }
 
 #[cfg(target_os = "linux")]
@@ -46,6 +47,10 @@ fn main() -> ExitCode {
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), InitError> {
     match parse_command(args)? {
         Command::PrepareNetwork => prepare_network(),
+        Command::Version => {
+            println!("openshell-vm-init {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 
@@ -55,17 +60,15 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, In
         .next()
         .ok_or_else(|| InitError("expected the prepare-network command".to_string()))?;
     if args.next().is_some() {
-        return Err(InitError(
-            "prepare-network does not accept arguments".to_string(),
-        ));
+        return Err(InitError("command does not accept arguments".to_string()));
     }
-    if command == "prepare-network" {
-        Ok(Command::PrepareNetwork)
-    } else {
-        Err(InitError(format!(
-            "unknown command '{}'; expected prepare-network",
+    match command.to_str() {
+        Some("prepare-network") => Ok(Command::PrepareNetwork),
+        Some("--version") => Ok(Command::Version),
+        _ => Err(InitError(format!(
+            "unknown command '{}'; expected prepare-network or --version",
             command.to_string_lossy()
-        )))
+        ))),
     }
 }
 
@@ -217,6 +220,10 @@ mod tests {
         assert_eq!(
             parse_command([OsString::from("prepare-network")]).expect("valid command"),
             Command::PrepareNetwork
+        );
+        assert_eq!(
+            parse_command([OsString::from("--version")]).expect("valid version command"),
+            Command::Version
         );
         assert!(parse_command(Vec::<OsString>::new()).is_err());
         assert!(parse_command([OsString::from("other")]).is_err());
