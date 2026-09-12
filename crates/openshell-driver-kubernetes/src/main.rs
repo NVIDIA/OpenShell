@@ -12,7 +12,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesProxyPodConfig,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesSandboxRuntimeConfig,
     ManagedSshIngressConfig, WorkspaceMode,
 };
 
@@ -123,17 +123,17 @@ struct Args {
 
     #[arg(
         long,
-        env = "OPENSHELL_K8S_PROXY_POD_NETWORK_POLICY_ENFORCED",
+        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_NETWORK_POLICY_ENFORCED",
         default_value_t = false
     )]
-    proxy_pod_network_policy_enforced: bool,
+    sandbox_runtime_network_policy_enforced: bool,
 
     #[arg(
         long,
-        env = "OPENSHELL_K8S_PROXY_POD_BOUNDARY_PORT",
+        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_BOUNDARY_PORT",
         default_value_t = 5500
     )]
-    proxy_pod_boundary_port: u16,
+    sandbox_runtime_boundary_port: u16,
 
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
@@ -255,9 +255,9 @@ async fn main() -> Result<()> {
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
-            proxy_pod: KubernetesProxyPodConfig {
-                network_policy_enforced: args.proxy_pod_network_policy_enforced,
-                boundary_port: args.proxy_pod_boundary_port,
+            sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                network_policy_enforced: args.sandbox_runtime_network_policy_enforced,
+                boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
