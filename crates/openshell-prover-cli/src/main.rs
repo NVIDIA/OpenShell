@@ -106,9 +106,14 @@ enum CounterexampleJson<'a> {
 fn main() -> ExitCode {
     let cancelled = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
-    if let Err(error) =
+    if let Err(error) = signal_hook::flag::register_conditional_shutdown(
+        signal_hook::consts::signal::SIGINT,
+        130,
+        Arc::clone(&cancelled),
+    )
+    .and_then(|_| {
         signal_hook::flag::register(signal_hook::consts::signal::SIGINT, Arc::clone(&cancelled))
-    {
+    }) {
         let _ = writeln!(
             io::stderr().lock(),
             "openshell-prover: cannot install Ctrl-C handler: {error}"
