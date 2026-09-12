@@ -576,7 +576,7 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
-Each Kubernetes sandbox uses a workload Pod and a separate supervisor Pod.
+The Kubernetes driver creates a workload Pod and a separate supervisor Pod.
 The workload Pod runs `openshell-sandbox`, which owns the agent process tree,
 identifies binaries, and intercepts mediated requests. The supervisor Pod runs
 `openshell-supervisor`, owns gateway authentication and external egress, and

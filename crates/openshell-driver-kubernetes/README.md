@@ -67,7 +67,7 @@ The driver creates an empty-egress `NetworkPolicy` before it releases the
 workload Pod. A second rule permits only the paired supervisor Pod to reach the
 sandbox TLS port. The supervisor has normal egress for gateway, DNS, and
 policy-approved upstream connections. Set
-`proxy_pod.network_policy_enforced = true` only after verifying that the cluster
+`sandbox_runtime.network_policy_enforced = true` only after verifying that the cluster
 CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
 
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init

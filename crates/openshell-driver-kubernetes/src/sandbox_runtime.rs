@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kubernetes resources owned by the RFC 0012 proxy-pod topology.
+//! Kubernetes resources that place and protect the `OpenShell` sandbox runtime.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,14 +15,14 @@ use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesProxyPodNetworkFence,
-    KubernetesProxyPodNetworkFenceSpec,
+    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
+    KubernetesSandboxRuntimeNetworkFenceSpec,
 };
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
 pub const SUPERVISOR_SECRET_COMPONENT: &str = "supervisor-bootstrap";
 pub const BOUNDARY_CONFIG_KEY: &str = "boundary.json";
-pub const TOPOLOGY_PAYLOAD_KEY: &str = "topology.json";
+pub const BACKEND_DESCRIPTOR_KEY: &str = "runtime-descriptor.json";
 pub const BOUNDARY_CERTIFICATE_KEY: &str = "tls.crt";
 pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
 pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
@@ -32,7 +32,7 @@ pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
 pub const BOUNDARY_PRIVATE_KEY_PATH: &str = "/.openshell/state/bootstrap/tls.key";
-pub const TOPOLOGY_PAYLOAD_PATH: &str = "/.openshell/supervisor/topology.json";
+pub const BACKEND_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
 pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
@@ -64,7 +64,7 @@ pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProxyPodNames {
+pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
@@ -73,7 +73,7 @@ pub struct ProxyPodNames {
     pub control_policy: String,
 }
 
-impl ProxyPodNames {
+impl SandboxRuntimeNames {
     #[must_use]
     pub fn new(sandbox_id: &str) -> Self {
         let suffix = sandbox_id.to_ascii_lowercase();
@@ -112,11 +112,11 @@ pub fn pair_label_value(sandbox_id: &str) -> String {
 #[must_use]
 pub fn workload_fence(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_port: u16,
-) -> KubernetesProxyPodNetworkFence {
-    KubernetesProxyPodNetworkFenceSpec {
+) -> KubernetesSandboxRuntimeNetworkFence {
+    KubernetesSandboxRuntimeNetworkFenceSpec {
         namespace: namespace.to_string(),
         policy_name: names.workload_policy.clone(),
         pair_label_value: pair_label_value(sandbox_id),
@@ -128,7 +128,7 @@ pub fn workload_fence(
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_port: u16,
     owner: OwnerReference,
@@ -154,7 +154,7 @@ pub fn boundary_service(
 #[must_use]
 pub fn control_deployment(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
     sandbox_name: &str,
     gateway_id: &str,
@@ -241,10 +241,8 @@ pub fn control_deployment(
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
-        "--topology-backend-name".to_string(),
-        crate::isolation::BACKEND_NAME.to_string(),
-        "--topology-payload-file".to_string(),
-        TOPOLOGY_PAYLOAD_PATH.to_string(),
+        "--backend-descriptor-file".to_string(),
+        BACKEND_DESCRIPTOR_PATH.to_string(),
         "--auth-bundle-file".to_string(),
         SUPERVISOR_AUTH_BUNDLE_PATH.to_string(),
         "--workdir".to_string(),
@@ -361,7 +359,7 @@ pub fn control_deployment(
 #[must_use]
 pub fn control_egress_policy(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
     owner: OwnerReference,
 ) -> NetworkPolicy {
@@ -391,7 +389,7 @@ pub fn control_egress_policy(
 #[must_use]
 pub fn sandbox_bootstrap_secret(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_config: Vec<u8>,
     boundary_certificate: Vec<u8>,
@@ -427,9 +425,9 @@ pub fn sandbox_bootstrap_secret(
 #[allow(clippy::too_many_arguments)]
 pub fn supervisor_bootstrap_secret(
     namespace: &str,
-    names: &ProxyPodNames,
+    names: &SandboxRuntimeNames,
     sandbox_id: &str,
-    topology_payload: Vec<u8>,
+    backend_descriptor: Vec<u8>,
     supervisor_auth_bundle: Vec<u8>,
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
@@ -445,8 +443,8 @@ pub fn supervisor_bootstrap_secret(
         },
         data: Some(BTreeMap::from([
             (
-                TOPOLOGY_PAYLOAD_KEY.to_string(),
-                ByteString(topology_payload),
+                BACKEND_DESCRIPTOR_KEY.to_string(),
+                ByteString(backend_descriptor),
             ),
             (
                 SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
@@ -536,7 +534,7 @@ mod tests {
 
     #[test]
     fn service_selects_only_the_workload_boundary() {
-        let names = ProxyPodNames::new("4b67c0d0-1111-2222-3333-444444444444");
+        let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
         let service = boundary_service("sandbox", &names, "pair", 5500, owner());
         assert_eq!(
             service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
@@ -551,7 +549,7 @@ mod tests {
 
     #[test]
     fn control_policy_explicitly_allows_control_egress() {
-        let names = ProxyPodNames::new("pair");
+        let names = SandboxRuntimeNames::new("pair");
         let policy = control_egress_policy("sandbox", &names, "pair", owner());
         let spec = policy.spec.unwrap();
         assert_eq!(spec.policy_types.unwrap(), ["Egress"]);
@@ -560,7 +558,7 @@ mod tests {
 
     #[test]
     fn control_deployment_is_singleton_ready_and_unprivileged() {
-        let names = ProxyPodNames::new("pair");
+        let names = SandboxRuntimeNames::new("pair");
         let deployment = control_deployment(
             "sandbox",
             &names,
@@ -665,7 +663,7 @@ mod tests {
 
     #[test]
     fn bootstrap_secrets_are_immutable_and_split_by_trust_domain() {
-        let names = ProxyPodNames::new("pair");
+        let names = SandboxRuntimeNames::new("pair");
         let sandbox = sandbox_bootstrap_secret(
             "sandbox",
             &names,
@@ -720,7 +718,7 @@ mod tests {
                 PROXY_CA_CERTIFICATE_KEY.to_string(),
                 PROXY_CA_PRIVATE_KEY.to_string(),
                 SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
-                TOPOLOGY_PAYLOAD_KEY.to_string(),
+                BACKEND_DESCRIPTOR_KEY.to_string(),
             ])
         );
     }

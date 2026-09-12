@@ -423,8 +423,8 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the trusted runtime image that provides the `openshell-sandbox` and `openshell-supervisor` binaries. The default repository with an empty tag uses the version pinned into the gateway. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
-| `proxy_pod.network_policy_enforced` | `supervisor.proxyPod.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
-| `proxy_pod.boundary_port` | `supervisor.proxyPod.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
+| `sandbox_runtime.network_policy_enforced` | `supervisor.sandboxRuntime.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
+| `sandbox_runtime.boundary_port` | `supervisor.sandboxRuntime.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Set destinations that bypass only the corporate proxy. OpenShell policy evaluation still applies. |
 | `proxy_auth_secret_name` | `upstreamProxy.authSecret.name` | Set the existing Secret name in the sandbox namespace that contains the proxy credential. The Secret mounts only in the supervisor Pod. |
@@ -442,7 +442,8 @@ remain limited to the explicitly configured TLS and image-pull Secret names.
 The driver creates copies only in gateway-owned managed namespaces. Do not
 reuse the gateway ServiceAccount for unrelated workloads.
 
-The Kubernetes driver always uses a capability-free proxy-pod topology. The
+The Kubernetes driver always places the sandbox runtime in the workload Pod and
+the supervisor in a separate Deployment. The
 workload Pod runs `openshell-sandbox` as the same non-root UID/GID as the agent
 and requests no added Linux capabilities. A separate Deployment runs
 `openshell-supervisor`, authenticates to the gateway with a sandbox JWT, and

@@ -26,7 +26,7 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: preserves proxy-pod fence permissions when gateway isolation is disabled
+  - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
       networkPolicy.enabled: false
@@ -141,7 +141,7 @@ tests:
             resources: ["secrets"]
           any: true
 
-  - it: grants managed proxy-pod companion permissions
+  - it: grants managed sandbox-runtime companion permissions
     set:
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
@@ -158,7 +158,7 @@ tests:
             resources: ["secrets"]
             verbs: ["create"]
 
-  - it: grants operator proxy-pod companion permissions
+  - it: grants operator sandbox-runtime companion permissions
     set:
       server.drivers.kubernetes.workspaceMode: operator
     asserts:
