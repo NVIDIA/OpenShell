@@ -225,6 +225,35 @@ Envoy Gateway is already installed by Skaffold (the `envoy-gateway` Helm release
 service for the proxy; klipper-lb binds it to hostPort 80, reachable via the
 `8080:80` load balancer port mapping.
 
+### BackendTLSPolicy (end-to-end TLS)
+
+To enable end-to-end TLS between the Gateway proxy and the gateway pod, add
+BackendTLSPolicy values to the Helm install:
+
+```bash
+helm upgrade --install openshell deploy/helm/openshell \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.backendTLSPolicy.enabled=true \
+  --set server.tls.enableMtls=false \
+  ...
+```
+
+This requires `server.tls.enableMtls=false` because ingress proxies cannot
+present client certificates to the backend. The certgen hook creates a backend
+CA ConfigMap from the server Secret's `ca.crt` key. With cert-manager, a
+separate post-install Job polls for the cert-manager-issued certificate (up to
+`pkiInitJob.timeoutSeconds`); with built-in PKI the ConfigMap is created in the
+same pre-install hook. The ConfigMap is reconciled on every upgrade so CA
+rotations propagate automatically.
+
+Key Helm values:
+- `grpcRoute.backendTLSPolicy.enabled`: create the BackendTLSPolicy resource
+- `grpcRoute.backendTLSPolicy.caCertificateConfigMapName`: override ConfigMap name
+- `grpcRoute.backendTLSPolicy.hostname`: override backend validation hostname
+- `server.tls.enableMtls`: must be `false` for BackendTLSPolicy
+- `pkiInitJob.timeoutSeconds`: polling duration for cert-manager mode
+- `pkiInitJob.failOnTimeout`: fail install if cert-manager times out
+
 ### Keycloak OIDC
 
 One-time setup — only needed once per cluster lifetime:
