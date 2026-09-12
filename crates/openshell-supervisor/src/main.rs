@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use openshell_isolation_interface::contract::TopologyDescriptor;
+use openshell_isolation_interface::contract::BackendDescriptor;
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -94,10 +94,7 @@ struct Args {
     upstream_proxy_ca_bundle: Option<String>,
 
     #[arg(long)]
-    topology_backend_name: String,
-
-    #[arg(long)]
-    topology_payload_file: PathBuf,
+    backend_descriptor_file: PathBuf,
 
     /// Protected gateway-issued credentials for this exact sandbox launch.
     #[arg(long)]
@@ -107,15 +104,15 @@ struct Args {
     main_exit_marker: Option<PathBuf>,
 }
 
-fn topology(args: &Args) -> Result<TopologyDescriptor> {
-    let payload = std::fs::read(&args.topology_payload_file).map_err(|error| {
+fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
+    let payload = std::fs::read(&args.backend_descriptor_file).map_err(|error| {
         miette::miette!(
-            "read topology payload {}: {error}",
-            args.topology_payload_file.display()
+            "read backend descriptor {}: {error}",
+            args.backend_descriptor_file.display()
         )
     })?;
-    Ok(TopologyDescriptor {
-        backend_name: args.topology_backend_name.clone(),
+    Ok(BackendDescriptor {
+        backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
         payload,
     })
 }
@@ -166,7 +163,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
-    let topology = topology(&args)?;
+    let backend_descriptor = backend_descriptor(&args)?;
     let auth_bundle = auth_bundle(&args)?;
 
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -297,7 +294,7 @@ fn main() -> Result<()> {
             args.health_socket_path,
             ocsf_enabled,
             upstream_proxy_args,
-            topology,
+            backend_descriptor,
             auth_bundle,
             admitted_isolation_backend,
             args.main_exit_marker,
@@ -314,30 +311,32 @@ mod tests {
 
     #[test]
     fn role_specific_cli_has_no_mode_switch() {
-        let directory = tempfile::tempdir().expect("temporary topology directory");
-        let topology_path = directory.path().join("topology.json");
+        let directory = tempfile::tempdir().expect("temporary runtime descriptor directory");
+        let descriptor_path = directory.path().join("runtime-descriptor.json");
         let auth_bundle_path = directory.path().join("auth-bundle.json");
-        std::fs::write(&topology_path, [0]).expect("write topology payload");
+        std::fs::write(&descriptor_path, [0]).expect("write runtime descriptor payload");
         std::fs::write(&auth_bundle_path, [0]).expect("write auth bundle payload");
         let args = Args::try_parse_from([
             "openshell-supervisor",
-            "--topology-backend-name",
-            "test",
-            "--topology-payload-file",
-            topology_path.to_str().expect("UTF-8 topology path"),
+            "--backend-descriptor-file",
+            descriptor_path
+                .to_str()
+                .expect("UTF-8 runtime descriptor path"),
             "--auth-bundle-file",
             auth_bundle_path.to_str().expect("UTF-8 auth bundle path"),
         ])
         .expect("supervisor arguments");
-        assert_eq!(topology(&args).expect("topology").payload, vec![0]);
+        assert_eq!(
+            backend_descriptor(&args)
+                .expect("runtime descriptor")
+                .payload,
+            vec![0]
+        );
     }
 
     #[test]
-    fn topology_payload_is_mandatory() {
-        assert!(
-            Args::try_parse_from(["openshell-supervisor", "--topology-backend-name", "test"])
-                .is_err()
-        );
+    fn backend_descriptor_is_mandatory() {
+        assert!(Args::try_parse_from(["openshell-supervisor"]).is_err());
     }
 
     #[test]

@@ -359,9 +359,9 @@ and explicit `/sandbox` values select `/sandbox`; other paths must already
 exist without symlink or reserved-mount collisions and must be usable by the
 resolved identity. Kubernetes and VM use `/sandbox`.
 
-Kubernetes uses only the proxy-pod topology. The driver creates the empty-egress
-workload fence before a suspended Sandbox CR, then provisions split immutable
-bootstrap Secrets, the boundary Service, and the supervisor Deployment. A
+The Kubernetes driver creates the empty-egress workload fence before a
+suspended Sandbox CR, then provisions split immutable bootstrap Secrets, the
+private runtime Service, and the supervisor Deployment. A
 non-root init container stages `openshell-sandbox` and one-use bootstrap files
 into memory volumes. The workload Pod never mounts supervisor or gateway
 credentials. The driver removes its scheduling gate only after the companions

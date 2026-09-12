@@ -25,7 +25,7 @@ use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
-    GatewayCallbackTopology, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
+    GatewayCallbackRoute, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
     LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
     SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_IMAGE_BINARY_PATH,
     extract_first_tar_entry, gateway_callback_endpoint, supervisor_image_should_refresh,
@@ -589,7 +589,7 @@ impl DockerComputeDriver {
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             docker_config.grpc_endpoint = gateway_callback_endpoint(
-                GatewayCallbackTopology::Docker,
+                GatewayCallbackRoute::Docker,
                 gateway_port,
                 docker_guest_tls_configured(&docker_config),
             );

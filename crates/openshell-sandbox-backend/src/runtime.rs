@@ -26,7 +26,7 @@ use openshell_isolation_interface::contract::{
     BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
     MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
     ReadyBoundary, RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial,
-    VerifiedTopologyDescriptor,
+    VerifiedBackendDescriptor,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -34,11 +34,11 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, BoundaryTopology, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES,
-    Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
-    STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxTlsClientConfig,
-    SandboxTransport, SignalWire, decode_frame, encode_frame, read_stream_frame,
-    validate_resource_claims, write_stream_frame,
+    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request,
+    RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
+    STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
+    SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
+    read_stream_frame, validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
@@ -51,7 +51,6 @@ const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
-    backend_name: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -59,13 +58,11 @@ pub struct OpenShellRuntimeBackend {
 
 impl OpenShellRuntimeBackend {
     pub fn new(
-        backend_name: impl Into<String>,
         ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
         provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
-            backend_name: backend_name.into(),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
@@ -76,23 +73,28 @@ impl OpenShellRuntimeBackend {
 #[async_trait]
 impl IsolationBackend for OpenShellRuntimeBackend {
     fn backend_name(&self) -> &str {
-        &self.backend_name
+        crate::BACKEND_NAME
     }
 
     async fn attach(
         &self,
-        descriptor: VerifiedTopologyDescriptor,
+        descriptor: VerifiedBackendDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError> {
-        let topology: BoundaryTopology = serde_json::from_slice(descriptor.payload())
-            .map_err(|error| BackendError::Descriptor(format!("decode topology: {error}")))?;
-        validate_topology(&topology, &sandbox, &self.backend_name)?;
-        let host_gateway_ip = topology.host_gateway_ip;
-        let resource_claims = topology.resource_claims.clone();
-        let generation = topology.generation.clone();
-        let session_id = topology.session_id;
-        let driver_fence = topology.driver_fence.clone();
-        let client = Arc::new(BoundaryClient::new(topology, self.sandbox_bearer.clone()));
+        let runtime_descriptor: SandboxRuntimeDescriptor =
+            serde_json::from_slice(descriptor.payload()).map_err(|error| {
+                BackendError::Descriptor(format!("decode runtime descriptor: {error}"))
+            })?;
+        validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
+        let host_gateway_ip = runtime_descriptor.host_gateway_ip;
+        let resource_claims = runtime_descriptor.resource_claims.clone();
+        let generation = runtime_descriptor.generation.clone();
+        let session_id = runtime_descriptor.session_id;
+        let driver_fence = runtime_descriptor.driver_fence.clone();
+        let client = Arc::new(BoundaryClient::new(
+            runtime_descriptor,
+            self.sandbox_bearer.clone(),
+        ));
         let response = client
             .call_idempotent(Request::Attach {
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
@@ -104,7 +106,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         };
         if snapshot.generation != generation {
             return Err(BackendError::Confirm(
-                "sandbox session snapshot generation does not match topology".to_string(),
+                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
             ));
         }
         Ok(Box::new(RemoteBound {
@@ -125,35 +127,35 @@ impl IsolationBackend for OpenShellRuntimeBackend {
     }
 }
 
-fn validate_topology(
-    topology: &BoundaryTopology,
+fn validate_runtime_descriptor(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
     sandbox: &SandboxContext,
-    backend_name: &str,
 ) -> Result<(), BackendError> {
-    if topology.boundary_id != sandbox.sandbox_id {
+    if runtime_descriptor.boundary_id != sandbox.sandbox_id {
         return Err(BackendError::Descriptor(format!(
             "boundary {:?} does not match sandbox {:?}",
-            topology.boundary_id, sandbox.sandbox_id
+            runtime_descriptor.boundary_id, sandbox.sandbox_id
         )));
     }
-    if topology.generation.is_empty() {
+    if runtime_descriptor.generation.is_empty() {
         return Err(BackendError::Descriptor(
             "boundary generation must not be empty".to_string(),
         ));
     }
-    if topology.session_id != sandbox.session_id {
+    if runtime_descriptor.session_id != sandbox.session_id {
         return Err(BackendError::Descriptor(
-            "topology session ID does not match admitted sandbox session".to_string(),
+            "runtime descriptor session ID does not match admitted sandbox session".to_string(),
         ));
     }
-    if topology.workload_identity != sandbox.identity {
+    if runtime_descriptor.workload_identity != sandbox.identity {
         return Err(BackendError::Descriptor(
-            "topology workload identity does not match admitted sandbox identity".to_string(),
+            "runtime descriptor workload identity does not match admitted sandbox identity"
+                .to_string(),
         ));
     }
-    validate_resource_claims(&topology.resource_claims)?;
-    topology.driver_fence.validate_for_backend(backend_name)?;
-    match &topology.transport {
+    validate_resource_claims(&runtime_descriptor.resource_claims)?;
+    runtime_descriptor.driver_fence.validate()?;
+    match &runtime_descriptor.transport {
         SandboxTransport::Unix { socket_path } => {
             validate_socket_path(socket_path)?;
         }
@@ -180,7 +182,7 @@ fn validate_topology(
             validate_control_port(*port)?;
         }
     }
-    validate_client_tls(&topology.tls)?;
+    validate_client_tls(&runtime_descriptor.tls)?;
     Ok(())
 }
 
@@ -287,7 +289,7 @@ impl BoundBoundary for RemoteBound {
             || evidence.driver_fence != self.driver_fence
         {
             return Err(BackendError::Confirm(
-                "sandbox confirmation generation, session, resource claims, or driver fence do not match topology"
+                "sandbox confirmation generation, session, resource claims, or driver fence do not match runtime descriptor"
                     .to_string(),
             ));
         }
@@ -945,7 +947,7 @@ async fn dispatch_client_mediation_frame(
 }
 
 struct BoundaryClient {
-    topology: BoundaryTopology,
+    runtime_descriptor: SandboxRuntimeDescriptor,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
@@ -965,11 +967,11 @@ struct CachedGrpcChannel {
 
 impl BoundaryClient {
     fn new(
-        topology: BoundaryTopology,
+        runtime_descriptor: SandboxRuntimeDescriptor,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
-            topology,
+            runtime_descriptor,
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
@@ -1419,7 +1421,7 @@ impl BoundaryClient {
     }
 
     async fn build_grpc_channel(&self) -> Result<tonic::transport::Channel, BackendError> {
-        let topology = self.topology.clone();
+        let runtime_descriptor = self.runtime_descriptor.clone();
         let endpoint =
             tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
                 .initial_stream_window_size(16 * 1024 * 1024)
@@ -1428,9 +1430,9 @@ impl BoundaryClient {
                 .keep_alive_while_idle(true);
         let channel = endpoint
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
-                let topology = topology.clone();
+                let runtime_descriptor = runtime_descriptor.clone();
                 async move {
-                    connect_boundary_with_retry(&topology)
+                    connect_boundary_with_retry(&runtime_descriptor)
                         .await
                         .map(TokioIo::new)
                         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -1445,16 +1447,16 @@ impl BoundaryClient {
 
     #[cfg(test)]
     async fn connect_boundary_once(&self) -> Result<BoundaryDuplexStream, BackendError> {
-        connect_boundary_once(&self.topology).await
+        connect_boundary_once(&self.runtime_descriptor).await
     }
 }
 
 async fn connect_boundary_with_retry(
-    topology: &BoundaryTopology,
+    runtime_descriptor: &SandboxRuntimeDescriptor,
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
     loop {
-        match connect_boundary_once(topology).await {
+        match connect_boundary_once(runtime_descriptor).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
@@ -1463,9 +1465,9 @@ async fn connect_boundary_with_retry(
 }
 
 async fn connect_boundary_once(
-    topology: &BoundaryTopology,
+    runtime_descriptor: &SandboxRuntimeDescriptor,
 ) -> Result<BoundaryDuplexStream, BackendError> {
-    let stream: BoundaryDuplexStream = match &topology.transport {
+    let stream: BoundaryDuplexStream = match &runtime_descriptor.transport {
         #[cfg(unix)]
         SandboxTransport::Unix { socket_path } => {
             let stream = UnixStream::connect(socket_path).await.map_err(|error| {
@@ -1498,7 +1500,7 @@ async fn connect_boundary_once(
         }
         SandboxTransport::Vsock { guest_cid, port } => connect_host_vsock(*guest_cid, *port)?,
     };
-    let tls = &topology.tls;
+    let tls = &runtime_descriptor.tls;
     let server_name =
         rustls::pki_types::ServerName::try_from(tls.server_name.clone()).map_err(|error| {
             BackendError::Descriptor(format!(
@@ -1918,7 +1920,7 @@ mod tests {
             .await
             .unwrap();
         let client = BoundaryClient::new(
-            tls_topology(address, test_certificate().client_tls),
+            tls_runtime_descriptor(address, test_certificate().client_tls),
             test_bearer(&"a".repeat(32)),
         );
         *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
@@ -1974,7 +1976,7 @@ mod tests {
             }
         });
         let client = BoundaryClient::new(
-            tls_topology(address, certificate.client_tls),
+            tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         );
         let attach = Request::Attach {
@@ -2119,11 +2121,11 @@ mod tests {
         }
     }
 
-    fn tls_topology(
+    fn tls_runtime_descriptor(
         address: std::net::SocketAddr,
         tls: SandboxTlsClientConfig,
-    ) -> BoundaryTopology {
-        BoundaryTopology {
+    ) -> SandboxRuntimeDescriptor {
+        SandboxRuntimeDescriptor {
             boundary_id: "sandbox-1".to_string(),
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
@@ -2261,9 +2263,9 @@ mod tests {
     }
 
     #[test]
-    fn topology_debug_redacts_trust_anchor() {
+    fn runtime_descriptor_debug_redacts_trust_anchor() {
         let certificate = test_certificate();
-        let topology = BoundaryTopology {
+        let runtime_descriptor = SandboxRuntimeDescriptor {
             boundary_id: "sandbox-1".to_string(),
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
@@ -2276,14 +2278,14 @@ mod tests {
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
         };
-        let debug = format!("{topology:?}");
+        let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains(&certificate.client_tls.trust_anchor_pem));
     }
 
     #[test]
-    fn topology_must_match_sandbox() {
-        let topology = BoundaryTopology {
+    fn runtime_descriptor_must_match_sandbox() {
+        let runtime_descriptor = SandboxRuntimeDescriptor {
             boundary_id: "other".to_string(),
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
@@ -2297,14 +2299,14 @@ mod tests {
             driver_fence: test_driver_fence(),
         };
         assert!(matches!(
-            validate_topology(&topology, &sandbox(), "vm"),
+            validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
             Err(BackendError::Descriptor(_))
         ));
     }
 
     #[test]
-    fn topology_rejects_an_unspecified_tcp_target() {
-        let topology = BoundaryTopology {
+    fn runtime_descriptor_rejects_an_unspecified_tcp_target() {
+        let runtime_descriptor = SandboxRuntimeDescriptor {
             boundary_id: "sandbox-1".to_string(),
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
@@ -2319,14 +2321,14 @@ mod tests {
             driver_fence: test_driver_fence(),
         };
         assert!(matches!(
-            validate_topology(&topology, &sandbox(), "vm"),
+            validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
             Err(BackendError::Descriptor(_))
         ));
     }
 
     #[test]
-    fn topology_accepts_a_concrete_tcp_target() {
-        let topology = BoundaryTopology {
+    fn runtime_descriptor_accepts_a_concrete_tcp_target() {
+        let runtime_descriptor = SandboxRuntimeDescriptor {
             boundary_id: "sandbox-1".to_string(),
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
@@ -2340,12 +2342,13 @@ mod tests {
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
         };
-        validate_topology(&topology, &sandbox(), "vm").expect("TCP topology should be valid");
+        validate_runtime_descriptor(&runtime_descriptor, &sandbox())
+            .expect("TCP runtime descriptor should be valid");
     }
 
     #[test]
-    fn topology_rejects_invalid_tls_configuration() {
-        let topology = tls_topology(
+    fn runtime_descriptor_rejects_invalid_tls_configuration() {
+        let runtime_descriptor = tls_runtime_descriptor(
             "127.0.0.1:5500".parse().expect("valid address"),
             SandboxTlsClientConfig {
                 server_name: "not a dns name!".to_string(),
@@ -2353,7 +2356,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            validate_topology(&topology, &sandbox(), "vm"),
+            validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
             Err(BackendError::Descriptor(_))
         ));
     }
@@ -2363,7 +2366,7 @@ mod tests {
         let certificate = test_certificate();
         let (address, server) = spawn_tls_boundary(certificate.server_config, "a".repeat(32)).await;
         let client = BoundaryClient::new(
-            tls_topology(address, certificate.client_tls),
+            tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         );
 
@@ -2405,7 +2408,7 @@ mod tests {
         let certificate = test_certificate();
         let (address, server) = spawn_tls_boundary(certificate.server_config, "a".repeat(32)).await;
         let client = Arc::new(BoundaryClient::new(
-            tls_topology(address, certificate.client_tls),
+            tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         ));
         let session = open_exec_session(
@@ -2516,7 +2519,7 @@ mod tests {
             }
         });
         let client = Arc::new(BoundaryClient::new(
-            BoundaryTopology {
+            SandboxRuntimeDescriptor {
                 boundary_id: "sandbox-1".to_string(),
                 generation: "test-generation".to_string(),
                 session_id: test_session_id(),
@@ -2557,7 +2560,7 @@ mod tests {
         let certificate = test_certificate();
         let (address, server) = spawn_tls_boundary(certificate.server_config, "a".repeat(32)).await;
         let client = BoundaryClient::new(
-            tls_topology(address, certificate.client_tls),
+            tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         );
         let context = sandbox();
@@ -2604,7 +2607,7 @@ mod tests {
         });
         let context = sandbox();
         let client = BoundaryClient::new(
-            BoundaryTopology {
+            SandboxRuntimeDescriptor {
                 boundary_id: "sandbox-1".to_string(),
                 generation: "test-generation".to_string(),
                 session_id: test_session_id(),
@@ -2651,7 +2654,7 @@ mod tests {
         )
         .await;
         let client = BoundaryClient::new(
-            tls_topology(address, certificate.client_tls),
+            tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer("incorrect-token-incorrect-token"),
         );
 
@@ -2668,7 +2671,7 @@ mod tests {
         let trusted = test_certificate();
         let (address, server) = spawn_tls_boundary(presented.server_config, "a".repeat(32)).await;
         let client = BoundaryClient::new(
-            tls_topology(address, trusted.client_tls),
+            tls_runtime_descriptor(address, trusted.client_tls),
             test_bearer(&"a".repeat(32)),
         );
 

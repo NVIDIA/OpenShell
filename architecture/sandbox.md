@@ -126,7 +126,7 @@ The sandbox reserves `SIGUSR2` with a non-restarting no-op handler for these
 broker threads; startup rejects a conflicting handler. This signal disposition
 is process-global kernel state, while registrations and cancellation state are
 owned by the broker. Workload exec resets the caught handler to its default.
-This topology requires Linux 6.2 or newer for Landlock ABI v3 and treats
+This sandbox runtime requires Linux 6.2 or newer for Landlock ABI v3 and treats
 `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` as mandatory so cancelled
 notifications cannot race task-memory writes.
 

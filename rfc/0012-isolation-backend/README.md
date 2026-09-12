@@ -19,7 +19,7 @@ links:
 
 Today the supervisor both builds the workload's isolation boundary and applies its network policy. Because the supervisor runs inside the agent container, the privilege needed to build that boundary sits beside the code it confines. This RFC moves boundary construction and process operations behind a pluggable **Isolation Backend**. The supervisor continues to apply approved network policy through network mediation.
 
-The compute driver provisions the workload and trusted components. The logical supervisor is the trusted bridge between the gateway and the workload: it maintains the gateway connection, handles authorized requests, and drives the backend. The backend establishes the isolation controls, manages workload processes, and routes egress to network mediation. The same lifecycle supports today's in-pod implementation and future delegated implementations without topology-specific supervisor paths.
+The compute driver orchestrates the workload, supervisor, sandbox runtime, protected channel, and outer network fence. The supervisor is the trusted bridge between the gateway and the workload: it maintains the gateway connection, handles authorized requests, and drives the backend. The backend establishes the isolation controls, manages workload processes, and routes egress to network mediation. The same lifecycle supports different compute drivers and backend implementations without driver-specific supervisor paths.
 
 ## Motivation
 
@@ -33,7 +33,7 @@ All three come from coupling boundary construction to boundary operation. A comm
 
 ## Non-goals
 
-- **Implementing a delegated backend.** Each topology requires its own design and implementation.
+- **Implementing a delegated backend.** Each backend implementation and compute-driver placement requires its own design and implementation.
 - **Changing authorization.** [RFC 0001](../0001-core-architecture/README.md) owns control-plane and sandbox identity. A delegated backend must still authenticate callers and scope them to one boundary.
 - **Standardizing backend-internal component coordination.** A backend may coordinate helper, sidecar, or interception processes behind one lifecycle; how those components cooperate is backend-specific, not contract surface.
 - **Changing gateway lifecycle or public status.** This RFC adds no gateway activation operation, public phase, or status API, and it does not define how a boundary's effective isolation model is surfaced to operators.
@@ -42,23 +42,23 @@ All three come from coupling boundary construction to boundary operation. A comm
 
 The mental model has three roles:
 
-- The **compute driver** provisions the sandbox instance according to the selected placement of the workload and trusted isolation components. That placement is the **topology**.
-- The **Isolation Backend** establishes and operates the topology-specific controls around the workload. It also routes workload egress to network mediation and provides process operations.
+- The **compute driver** orchestrates the sandbox instance: it places the workload, supervisor, and sandbox runtime; creates their protected channel; and applies the outer network fence.
+- The **Isolation Backend** establishes and operates the controls around the workload. It also routes workload egress to network mediation and provides process operations.
 - The **logical supervisor** is the trusted control-plane bridge between the gateway and the workload. It drives the backend, handles authorized gateway requests, and applies approved network policy through network mediation.
 
 Together, network policy, filesystem isolation, syscall filtering, and sandbox identity form the workload's isolation boundary. The roles above enforce that boundary and may run in one process or across several trusted components. Their placement does not change the contract.
 
-Each active boundary has at most one logical supervisor, which may span multiple coupled processes. The backend routes all workload egress through a per-boundary source, and the supervisor consumes that source. Internal delegation and transport remain topology-private.
+Each active boundary has at most one logical supervisor, which may span multiple coupled processes. The backend routes all workload egress through a per-boundary source, and the supervisor consumes that source. Internal delegation and transport remain backend-private.
 
 [RFC 0001](../0001-core-architecture/README.md) continues to own sandbox authentication and authorization. In this contract, sandbox identity means binding the authenticated sandbox context to the isolation boundary.
 
-Admission selects the sandbox's topology and determines its trusted context. The compute driver sets up the topology and gives the logical supervisor a `TopologyDescriptor` describing what it provisioned. The supervisor uses the descriptor to attach the matching Isolation Backend. The backend prepares the required controls before the agent starts.
+Admission selects the sandbox's Isolation Backend and determines its trusted context. The compute driver orchestrates the required resources and gives the supervisor a `BackendDescriptor` describing the selected backend and provisioned runtime. The supervisor uses the descriptor to attach the matching Isolation Backend. The backend prepares the required controls before the agent starts.
 
 ```mermaid
 flowchart TB
     Gateway["Gateway"] -->|"create sandbox"| Driver["Compute driver"]
 
-    subgraph Topology["Driver-provisioned topology (placement varies)"]
+    subgraph Runtime["Driver-orchestrated sandbox"]
         Supervisor["Supervisor"]
         Backend["Isolation Backend (may coordinate components)"]
         subgraph Boundary["Isolation boundary"]
@@ -76,13 +76,13 @@ flowchart TB
         Workload ==>|"only egress"| Mediator
     end
 
-    Driver -->|"resources + TopologyDescriptor"| Supervisor
+    Driver -->|"resources + BackendDescriptor"| Supervisor
     Mediator -->|"allowed egress"| Egress["Egress"]
 ```
 
-In the in-pod topology, the supervisor drives a backend implemented in the same process. Other topologies may delegate backend operations without changing the supervisor lifecycle.
+The initial implementation is `OpenShellRuntimeBackend`: a supervisor-side client that delegates operations over the authenticated OpenShell Sandbox Protocol to `openshell-sandbox` beside the workload. A future runtime-native backend could implement the same interface without using that protocol or binary.
 
-A boundary is active from successful `attach` until normal backend cleanup releases the binding or the topology's trusted cleanup path invalidates it. A backend may coordinate multiple trusted helper or interception processes for that boundary. The backend owns the active-boundary binding; the compute driver owns the sandbox instance and topology lifecycle.
+A boundary is active from successful `attach` until normal backend cleanup releases the binding or the compute driver's trusted cleanup path invalidates it. A backend may coordinate multiple trusted helper or interception processes for that boundary. The backend owns the active-boundary binding; the compute driver owns the sandbox instance and infrastructure lifecycle.
 
 ### Contract invariants
 
@@ -99,52 +99,52 @@ Each backend states its termination bound in its implementation documentation. L
 
 ### Provisioning
 
-Provisioning runs on the control plane, and three rules hold in every topology:
+Provisioning runs on the control plane, and three rules hold for every sandbox:
 
-1. **Admission selects the topology** from trusted deployment configuration, not `SandboxPolicy`, and records its required backend. The `TopologyDescriptor` supplied by the compute driver must name that backend, and resolution never falls back to another backend.
-2. **The compute driver provisions the topology** and anything the selected backend needs.
+1. **Admission selects the Isolation Backend** from trusted deployment configuration, not `SandboxPolicy`. The `BackendDescriptor` supplied by the compute driver must name that backend, and resolution never falls back to another backend.
+2. **The compute driver orchestrates the sandbox** and anything the selected backend needs.
 3. **The backend establishes standing enforcement before untrusted code runs**, during provisioning or `attach`, depending on the backend.
 
-If a topology depends on cluster-scoped coverage or registration, admission verifies that the prerequisite covers the boundary's placement before untrusted code runs.
+If a driver depends on cluster-scoped coverage or registration, admission verifies that the prerequisite covers the boundary's placement before untrusted code runs.
 
-Every topology provides a trusted cleanup path that does not depend on logical-supervisor availability.
+Every compute driver provides a trusted cleanup path that does not depend on supervisor availability.
 
-A compute driver may provision a resource and `TopologyDescriptor` before the control plane assigns it to a sandbox. No untrusted workload runs while the resource is unassigned. After claim or assignment produces a trusted `SandboxContext`, the supervisor calls `attach`; the backend either binds that context to the prepared resource and returns `Bound`, or rejects it as incompatible. Pool creation, claim, reset, release, and recycling remain outside this contract.
+A compute driver may provision a resource and `BackendDescriptor` before the control plane assigns it to a sandbox. No untrusted workload runs while the resource is unassigned. After claim or assignment produces a trusted `SandboxContext`, the supervisor calls `attach`; the backend either binds that context to the prepared resource and returns `Bound`, or rejects it as incompatible. Pool creation, claim, reset, release, and recycling remain outside this contract.
 
 Every create or start-from-stopped operation receives a fresh `SandboxSessionId`. Retries of the same durable launch transition reuse that identity, while a later launch receives a new one even when the compute platform reuses its outer resource. The backend binds `attach` to that exact session and rejects descriptors or runtime sessions left over from an earlier launch.
 
-### The topology descriptor
+### The backend descriptor
 
-The driver supplies a descriptor for every provisioned topology, including in-pod and resources prepared before assignment. The common envelope names the backend and carries an opaque payload.
+The driver supplies a descriptor for every provisioned sandbox, including resources prepared before assignment. The common envelope names the backend and carries an opaque payload.
 
 ```rust
-struct TopologyDescriptor {
+struct BackendDescriptor {
     backend_name: String,
     version: u32,
     payload: Vec<u8>,
 }
 ```
 
-`version` is the Isolation Backend interface version. Backend name and version match exactly; this contract does not negotiate compatibility ranges. The descriptor is transport-neutral. Provisioning supplies it to the supervisor before `attach`; how it is transported is topology-specific and outside this contract, and every transport preserves one property: workload-controlled input cannot select or modify the descriptor.
+`version` is the Isolation Backend interface version. Backend name and version match exactly; this contract does not negotiate compatibility ranges. The descriptor is transport-neutral. Provisioning supplies it to the supervisor before `attach`; how it is transported is compute-driver-specific and outside this contract, and every transport preserves one property: workload-controlled input cannot select or modify the descriptor.
 
-The opaque payload identifies, or gives the backend enough information to resolve, the exact driver-provisioned resource. It may also carry topology-specific endpoint or helper-role information; there are no common topology or role fields.
+The opaque payload identifies, or gives the backend enough information to resolve, the exact driver-provisioned resource. It may also carry backend-specific endpoint or helper-role information; there are no common placement or role fields.
 
 Common verification requires:
 
-- the descriptor's `backend_name` matches the backend required by the admitted topology;
+- the descriptor's `backend_name` matches the backend selected during admission;
 - the descriptor's version is one the supervisor supports, and the resolved backend reports that same version; and
 - `SandboxContext` is constructed after the control plane assigns the resource to the admitted sandbox, using authenticated control-plane and trusted supervisor state.
 
-The supervisor validates the descriptor's common fields and produces a `VerifiedTopologyDescriptor`, then resolves its `backend_name` and version without fallback. Verification does not imply that the opaque payload is valid; the selected backend validates it and atomically binds the provisioned resource to the trusted `SandboxContext` during `attach`. Any failure rejects the sandbox.
+The supervisor validates the descriptor's common fields and produces a `VerifiedBackendDescriptor`, then resolves its `backend_name` and version without fallback. Verification does not imply that the opaque payload is valid; the selected backend validates it and atomically binds the provisioned resource to the trusted `SandboxContext` during `attach`. Any failure rejects the sandbox.
 
 ### The lifecycle
 
 The contract does not prescribe enforcement mechanisms; it standardizes how the supervisor drives whichever backend a deployment admits.
 
-A backend registers under a `backend_name` and version. The supervisor attaches to the admitted topology and drives the boundary through a fixed sequence of states. Each transition consumes the prior state, so the supervisor cannot skip a stage or invoke a later transition through an earlier handle. The Rust names are illustrative; the states and their semantics are normative.
+A backend registers under a `backend_name` and version. The supervisor attaches to the admitted sandbox and drives the boundary through a fixed sequence of states. Each transition consumes the prior state, so the supervisor cannot skip a stage or invoke a later transition through an earlier handle. The Rust names are illustrative; the states and their semantics are normative.
 
 ```text
-attach topology + sandbox context -> Bound -> confirm -> Ready -> start_agent -> Running
+attach backend descriptor + sandbox context -> Bound -> confirm -> Ready -> start_agent -> Running
 ```
 
 ```rust
@@ -155,7 +155,7 @@ trait IsolationBackend: Send + Sync {
 
     async fn attach(
         &self,
-        descriptor: VerifiedTopologyDescriptor,
+        descriptor: VerifiedBackendDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError>;
 }
@@ -197,7 +197,7 @@ trait RunningBoundary: Send + Sync {
 
 The states have normative meanings:
 
-- **Bound:** the topology descriptor and trusted sandbox context are bound to the same resource, and the network-mediation source is available. No untrusted workload code is running.
+- **Bound:** the backend descriptor and trusted sandbox context are bound to the same resource, and the network-mediation source is available. No untrusted workload code is running.
 - **Ready:** the backend has confirmed standing enforcement for this concrete boundary and is prepared to apply the admitted launch-time controls before untrusted execution.
 - **Running:** `start_agent` has made the admitted agent runnable and returned `RunningBoundary`. Every applicable launch-time control was in force before the first untrusted instruction. Whether the backend creates the agent process or releases a held, driver-provisioned execution object is backend-specific; the contract fixes the ordering, not the mechanism.
 
@@ -277,7 +277,7 @@ struct PendingDnsQuery {
 
 `NetworkMediationSource` supplies typed TCP opens and DNS queries from one boundary to supervisor-owned network mediation. The two accepts are independent so the supervisor can consume them concurrently without coupling their ordering or backpressure. The backend routes all workload egress through these sources and authoritatively associates each request with the boundary without relying solely on workload-provided data. Capture, transport, framing, placement, and coordination are backend-private. General UDP mediation is outside this contract.
 
-Every topology may use the same supervisor-owned mediation libraries or services; the source does not require a backend-specific policy engine.
+Every backend may use the same supervisor-owned mediation libraries or services; the source does not require a backend-specific policy engine.
 
 Shared implementations isolate each boundary's state and enforcement. Failure or teardown of one boundary cannot weaken another. Network-mediation unavailability never enables direct egress.
 
@@ -308,14 +308,14 @@ The logical supervisor resolves `backend_name` and version through a trusted imp
 
 The supervisor runs the same sequence for every backend:
 
-1. Obtain the `TopologyDescriptor` and trusted `SandboxContext`.
+1. Obtain the `BackendDescriptor` and trusted `SandboxContext`.
 2. Verify the descriptor and resolve its `backend_name` and version without fallback.
 3. Call `attach` to obtain `Bound`.
 4. Connect the boundary's `NetworkMediationSource` to network mediation.
 5. Call `confirm` to obtain `Ready`, then `start_agent` to obtain `Running`.
 6. Use the returned runtime handles for agent wait, `exec`, and port forwarding while network mediation consumes outbound connections.
 
-This RFC supersedes RFC 0001's fixed in-sandbox supervisor placement and its assignment of topology-specific isolation controls to that process, generalizing the supervisor into a logical role. RFC 0001's authentication, sandbox-identity, outbound-connection, session, and reconnection requirements continue to apply. The component hosting the logical supervisor holds the required outbound gateway connection. A driver-hosted or shared supervisor routes gateway `exec`, SSH, and forwarding requests through the backend; the gateway does not initiate a connection to the boundary.
+This RFC supersedes RFC 0001's fixed in-sandbox supervisor placement and its assignment of driver-specific isolation controls to that process, generalizing the supervisor into a logical role. RFC 0001's authentication, sandbox-identity, outbound-connection, session, and reconnection requirements continue to apply. The component hosting the logical supervisor holds the required outbound gateway connection. A driver-hosted or shared supervisor routes gateway `exec`, SSH, and forwarding requests through the backend; the gateway does not initiate a connection to the boundary.
 
 ### Failure semantics
 
@@ -327,65 +327,65 @@ enum BackendErrorKind { Invalid, Denied, Unavailable, Unsupported, Failed, Termi
 
 `Invalid` covers descriptor, version, and backend mismatches; `Denied` covers authenticated attachment rejection; `Unavailable` covers transient inability to serve an operation; `Unsupported` identifies an optional operation the selected backend does not implement; `Failed` covers other backend faults; and `Terminated` reports boundary or workload termination, or an operation against an inactive boundary. An error never advances the lifecycle or authorizes an operation, and backend selection never falls back.
 
-A backend may retry backend-private work within one `attach` call. The supervisor calls `attach` at most once per provisioned topology. If it does not return `Bound`, the topology is reclaimed rather than reused.
+A backend may retry backend-private work within one `attach` call. The supervisor calls `attach` at most once per provisioned sandbox. If it does not return `Bound`, the sandbox is reclaimed rather than reused.
 
 Failures resolve as follows:
 
-- an `attach` or `confirm` failure, or network-mediation initialization failure while `Bound`, prevents untrusted workload execution and causes the driver to reclaim the topology;
-- if `start_agent` does not return `Running`, no untrusted process from that attempt remains, and the driver reclaims the topology;
+- an `attach` or `confirm` failure, or network-mediation initialization failure while `Bound`, prevents untrusted workload execution and causes the driver to reclaim the sandbox;
+- if `start_agent` does not return `Running`, no untrusted process from that attempt remains, and the driver reclaims the sandbox;
 - if `exec` or loopback `connect` fails, the backend terminates any process or closes any connection created by that attempt while the boundary otherwise remains active;
 - after `Running`, supervisor or enforcement loss follows invariant 6; when enforcement loss ends the agent, `BoundaryProcess::wait` fails with `BackendErrorKind::Terminated` where process-exit observation survives;
 - network-mediation errors yield no authorized connection and do not by themselves end `Running`; and
 - retained runtime handles and the network-mediation source reject new operations whenever the boundary ends, except `BoundaryProcess::wait` where the backend can still return its stable result.
 
-Whenever a boundary ends, the backend terminates remaining workload processes and releases the active-boundary binding before the compute driver reclaims or deprovisions the topology. If normal backend cleanup is unavailable, the compute driver uses the topology's trusted cleanup path to terminate the execution environment and invalidate the binding before reclaim or reuse. On normal agent exit, `BoundaryProcess::wait` returns the stable exit status. A retained `wait` result may outlive teardown.
+Whenever a boundary ends, the backend terminates remaining workload processes and releases the active-boundary binding before the compute driver reclaims or deprovisions the sandbox. If normal backend cleanup is unavailable, the compute driver uses its trusted cleanup path to terminate the execution environment and invalidate the binding before reclaim or reuse. On normal agent exit, `BoundaryProcess::wait` returns the stable exit status. A retained `wait` result may outlive teardown.
 
-### Topologies
+### Compute-driver placement
 
-The contract fixes the roles; a topology fixes their placement. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [topology matrix](./topology-matrix.md) catalogs representative placements.
+The contract fixes the roles; each compute driver decides where they run. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [driver placement guide](./driver-placement.md) describes the supported mappings.
 
 ## Conformance
 
-Every admitted backend and topology must pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics.
+Every admitted backend and compute driver must pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics.
 
-The conformance suite exercises each backend in its deployed topology, including delegated components and their transport. It verifies observable contract behavior while transport details remain backend-private.
+The conformance suite exercises each backend in its driver-orchestrated placement, including delegated components and their transport. It verifies observable contract behavior while transport details remain backend-private.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| The Isolation Backend could duplicate compute-driver responsibilities or allow topology-specific behavior to leak back into the supervisor. | Keep the responsibility boundary explicit: the compute driver owns, provisions, and deprovisions the topology; the backend binds and operates the active boundary. The same component may implement both roles. |
-| Contract conformance could be mistaken for equivalent isolation across topologies. | Treat conformance as behavioral, not as a security-strength rating. Document and validate each topology's actual containment and reject policy it cannot enforce. |
+| The Isolation Backend could duplicate compute-driver responsibilities or allow driver-specific behavior to leak back into the supervisor. | Keep the responsibility boundary explicit: the compute driver orchestrates and deprovisions the sandbox infrastructure; the backend binds and operates the active boundary. The same component may implement both roles. |
+| Contract conformance could be mistaken for equivalent isolation across compute drivers. | Treat conformance as behavioral, not as a security-strength rating. Document and validate each driver's actual containment and reject policy it cannot enforce. |
 | Shared backend or network-mediation components concentrate privilege and failure impact. | Isolate state, connection attribution, enforcement, and control authority per boundary. Failure of one boundary must not weaken another or enable direct egress. |
 | The mandatory contract may exclude otherwise useful but incomplete backends. | Keep the network-mediation source, binary identity, process control, `exec`, and port forwarding mandatory. An incomplete backend does not claim conformance or silently degrade. |
-| A future topology may not fit the lifecycle or interfaces. | Keep placement and coordination backend-private. Add versioned contract surface only when a concrete implementation requires new common semantics. |
+| A future runtime may not fit the lifecycle or interfaces. | Keep placement and coordination backend-private. Add versioned contract surface only when a concrete implementation requires new common semantics. |
 | A component restart may interrupt boundary operation. | Keep the last confirmed enforcement state in force and deny supervisor-dependent operations. |
 
 ## Alternatives
 
 ### Keep isolation embedded in the supervisor
 
-OpenShell could keep the current in-pod design and add topology-specific supervisor and compute-driver paths as new requirements arise.
+OpenShell could keep the current in-pod design and add driver-specific supervisor paths as new requirements arise.
 
-Doing nothing avoids a new interface, but retains privileged boundary construction beside the workload. Implementing each delegated topology as a one-off supervisor change moves that privilege for one placement but accretes topology-specific supervisor behavior. The proposed contract instead keeps one supervisor lifecycle while allowing the topology to change.
+Doing nothing avoids a new interface, but retains privileged boundary construction beside the workload. Implementing each runtime placement as a one-off supervisor change moves that privilege for one driver but adds driver-specific supervisor behavior. The proposed contract instead keeps one supervisor lifecycle while allowing runtime implementations and placements to change.
 
 ### Extend the compute-driver contract
 
 The compute driver could own both provisioning and active-boundary operation.
 
-This is natural for topologies such as MXC, and the same component may implement both responsibilities. The interfaces remain distinct because they serve different callers and lifecycles: the gateway uses the compute driver to provision and deprovision resources, while the supervisor uses the Isolation Backend to operate an active boundary. Combining them would couple runtime policy, identity, network mediation, and process operations to the gateway-facing driver API.
+This is natural for drivers such as MXC, and the same component may implement both responsibilities. The interfaces remain distinct because they serve different callers and lifecycles: the gateway uses the compute driver to provision and deprovision resources, while the supervisor uses the Isolation Backend to operate an active boundary. Combining them would couple runtime policy, identity, network mediation, and process operations to the gateway-facing driver API.
 
 ### Start with a remote backend service
 
 The contract could be expressed as a gRPC service or plugin ABI rather than an in-process Rust contract. [RFC 0001](../0001-core-architecture/README.md) chose gRPC for its gateway-facing drivers, so the question applies here.
 
-The callers differ. A gateway driver is a control-plane peer with its own release cycle, while the Isolation Backend is driven by the supervisor that operates the boundary, and the co-located topology needs no transport at all. Starting in-process serves that case directly and lets delegated implementations carry their own transport behind the same interface. A transport-bearing surface is not precluded: it is versioned contract surface, added when a concrete delegated backend requires it.
+The callers differ. A gateway driver is a control-plane peer with its own release cycle, while the Isolation Backend is driven by the supervisor that operates the boundary, and a co-located implementation needs no transport at all. Starting in-process serves that case directly and lets delegated implementations carry their own transport behind the same interface. A transport-bearing surface is not precluded: it is versioned contract surface, added when a concrete delegated backend requires it.
 
-### Standardize topology and capabilities
+### Standardize placement and capabilities
 
-The contract could expose common topology roles, placement fields, capability flags, and recovery behavior so the supervisor can compose backend components.
+The contract could expose common placement roles, capability flags, and recovery behavior so the supervisor can compose backend components.
 
-That would make known deployments explicit, but it would also encode current topology assumptions and introduce capability-dependent supervisor paths. The proposal keeps placement and coordination in the opaque descriptor, requires one baseline contract, and uses the non-normative topology matrix to document representative arrangements.
+That would make known deployments explicit, but it would also encode current placement assumptions and introduce capability-dependent supervisor paths. The proposal keeps placement and coordination in the opaque descriptor, requires one baseline contract, and uses the non-normative driver placement guide to document supported arrangements.
 
 ## Prior art
 
