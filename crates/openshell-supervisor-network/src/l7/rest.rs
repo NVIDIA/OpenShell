@@ -7,12 +7,28 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
+mod http_response;
+
+pub(crate) use http_response::{
+    DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT, HttpResponseMiddlewareRelay,
+};
+use http_response::{RelayResponseOptions, relay_response};
+#[cfg(test)]
+use http_response::{
+    http_response_middleware_fail_open_finding_event, http_response_middleware_invocation_events,
+    parse_connection_close, parse_status_code, response_is_event_stream,
+    strip_response_integrity_headers,
+};
+
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
-use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
+use openshell_core::proto::{
+    ExistingHeaderAction, HeaderMutation, HttpHeader, HttpRequestTarget, RequestContext,
+    header_mutation,
+};
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, contains_reserved_credential_marker_bytes,
     rewrite_http_header_block,
@@ -20,7 +36,7 @@ use openshell_core::secrets::{
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -49,6 +65,7 @@ async fn max_middleware_body_bytes() -> usize {
     chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
+const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
     b"HEAD ",
@@ -804,6 +821,20 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_http_request_with_response_middleware_guarded(req, client, upstream, options, None).await
+}
+
+pub(crate) async fn relay_http_request_with_response_middleware_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -1154,6 +1185,7 @@ where
             websocket: websocket_response,
             client_requested_upgrade,
         },
+        response_middleware,
     )
     .await?;
 
@@ -3109,230 +3141,6 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-#[derive(Clone)]
-struct RelayResponseOptions {
-    websocket_extensions: WebSocketExtensionMode,
-    client_requested_upgrade: bool,
-    websocket: Option<WebSocketResponseValidation>,
-}
-
-impl Default for RelayResponseOptions {
-    fn default() -> Self {
-        Self {
-            websocket_extensions: WebSocketExtensionMode::Preserve,
-            client_requested_upgrade: true,
-            websocket: None,
-        }
-    }
-}
-
-async fn relay_response<U, C>(
-    request_method: &str,
-    upstream: &mut U,
-    client: &mut C,
-    options: RelayResponseOptions,
-) -> Result<RelayOutcome>
-where
-    U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    let started_at = std::time::Instant::now();
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1024];
-
-    // Read response headers
-    loop {
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(miette!("HTTP response headers exceed limit"));
-        }
-
-        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
-        if n == 0 {
-            // Upstream closed — forward whatever we have
-            if !buf.is_empty() {
-                client.write_all(&buf).await.into_diagnostic()?;
-            }
-            return Ok(RelayOutcome::Consumed);
-        }
-        buf.extend_from_slice(&tmp[..n]);
-
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
-
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-
-    // Parse response framing
-    let header_str = String::from_utf8_lossy(&buf[..header_end]);
-    let status_code = parse_status_code(&header_str).unwrap_or(200);
-    let server_wants_close = parse_connection_close(&header_str);
-    let event_stream = response_is_event_stream(&header_str);
-    let body_length = parse_body_length(&header_str)?;
-
-    debug!(
-        status_code,
-        ?body_length,
-        server_wants_close,
-        request_method,
-        overflow_bytes = buf.len() - header_end,
-        "relay_response framing"
-    );
-
-    // 101 Switching Protocols: the connection has been upgraded (e.g. to
-    // WebSocket).  Forward the 101 headers to the client and signal the
-    // caller to switch to raw bidirectional TCP relay.  Any bytes read
-    // from upstream beyond the headers are overflow that belong to the
-    // upgraded protocol and must be forwarded before switching.
-    if status_code == 101 {
-        if !options.client_requested_upgrade {
-            return Ok(RelayOutcome::Consumed);
-        }
-        let (websocket_permessage_deflate, websocket_subprotocol) = validate_websocket_response(
-            &header_str,
-            options.websocket_extensions,
-            options.websocket.as_ref(),
-        )?;
-        client
-            .write_all(&buf[..header_end])
-            .await
-            .into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
-        let overflow = buf[header_end..].to_vec();
-        debug!(
-            request_method,
-            overflow_bytes = overflow.len(),
-            "101 Switching Protocols — signaling protocol upgrade"
-        );
-        return Ok(RelayOutcome::Upgraded {
-            overflow,
-            websocket_permessage_deflate,
-            websocket_subprotocol,
-        });
-    }
-
-    // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
-    if is_bodiless_response(request_method, status_code) {
-        client
-            .write_all(&buf[..header_end])
-            .await
-            .into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
-        return if server_wants_close {
-            Ok(RelayOutcome::Consumed)
-        } else {
-            Ok(RelayOutcome::Reusable)
-        };
-    }
-
-    // No explicit framing (no Content-Length, no Transfer-Encoding).
-    // Per RFC 7230 §3.3.3 the body is delimited by connection close.
-    if matches!(body_length, BodyLength::None) {
-        if server_wants_close || event_stream {
-            // Server indicated it will close, or this is a streaming response
-            // such as SSE where the body is intentionally delimited by EOF.
-            let before_end = &buf[..header_end - 2];
-            client.write_all(before_end).await.into_diagnostic()?;
-            if server_wants_close {
-                client
-                    .write_all(b"Connection: close\r\n\r\n")
-                    .await
-                    .into_diagnostic()?;
-            } else {
-                client.write_all(b"\r\n").await.into_diagnostic()?;
-            }
-            let overflow = &buf[header_end..];
-            if !overflow.is_empty() {
-                client.write_all(overflow).await.into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
-            }
-            if event_stream {
-                relay_until_eof_without_idle_timeout(upstream, client).await?;
-            } else {
-                relay_until_eof(upstream, client).await?;
-            }
-            client.flush().await.into_diagnostic()?;
-            return Ok(RelayOutcome::Consumed);
-        }
-        // No Connection: close — an HTTP/1.1 keep-alive server that omits
-        // framing headers has an empty body.  Forward headers and continue
-        // the relay loop instead of blocking on relay_until_eof.
-        debug!("BodyLength::None without Connection: close — treating body as empty");
-        client
-            .write_all(&buf[..header_end])
-            .await
-            .into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
-        return Ok(RelayOutcome::Reusable);
-    }
-
-    // Forward response headers + any overflow body bytes
-    client.write_all(&buf).await.into_diagnostic()?;
-    let overflow_len = (buf.len() - header_end) as u64;
-
-    // Forward remaining response body
-    match body_length {
-        BodyLength::ContentLength(len) => {
-            let remaining = len.saturating_sub(overflow_len);
-            if remaining > 0 {
-                relay_fixed(upstream, client, remaining, None).await?;
-            }
-        }
-        BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..], None).await?;
-        }
-        BodyLength::None => unreachable!(),
-    }
-    client.flush().await.into_diagnostic()?;
-    debug!(
-        request_method,
-        elapsed_ms = started_at.elapsed().as_millis(),
-        "relay_response complete (explicit framing)"
-    );
-
-    // When body framing is explicit (Content-Length / Chunked), always report
-    // the connection as reusable so the relay loop continues.  If the server
-    // sent `Connection: close`, the *next* upstream write will fail and the
-    // loop will exit via the normal error path.  Exiting early here would
-    // tear down the CONNECT tunnel before the client can detect the close,
-    // causing ~30 s retry delays in clients like `gh`.
-    Ok(RelayOutcome::Reusable)
-}
-
-/// Parse the HTTP status code from a response status line.
-///
-/// Expects the first line to look like `HTTP/1.1 200 OK`.
-fn parse_status_code(headers: &str) -> Option<u16> {
-    let status_line = headers.lines().next()?;
-    let code_str = status_line.split_whitespace().nth(1)?;
-    code_str.parse().ok()
-}
-
-/// Check if the response headers contain `Connection: close`.
-fn parse_connection_close(headers: &str) -> bool {
-    for line in headers.lines().skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("connection:") {
-            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            return val.contains("close");
-        }
-    }
-    false
-}
-
-fn response_is_event_stream(headers: &str) -> bool {
-    headers.lines().skip(1).any(|line| {
-        let lower = line.to_ascii_lowercase();
-        let Some(value) = lower.strip_prefix("content-type:") else {
-            return false;
-        };
-        value
-            .split(';')
-            .next()
-            .is_some_and(|mime| mime.trim() == "text/event-stream")
-    })
-}
-
 fn validate_websocket_response(
     headers: &str,
     mode: WebSocketExtensionMode,
@@ -3630,16 +3438,286 @@ mod tests {
     use crate::opa::OpaEngine;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use openshell_core::proposals::AgentProposals;
+    use openshell_core::proto::{
+        Decision, HttpRequestResult, HttpResponseBlockDelivery, HttpResponseBodyMode,
+        HttpResponseBodyResult, HttpResponseBodyTransform, HttpResponseEvent,
+        HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
+        HttpResponseTrailersResult, MiddlewareBinding, MiddlewareManifest,
+        SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, http_response_body_result,
+        http_response_body_transform, http_response_body_unit, http_response_event,
+        http_response_event_result, http_response_preflight_result,
+    };
     use openshell_core::secrets::SecretResolver;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
     const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
+
+    #[derive(Clone, Copy)]
+    enum ResponseRelayScript {
+        HeadersOnly,
+        WholeBody,
+        WholeBodyWithTrailer,
+        Stream,
+        BlockPreflight,
+        BlockWholeBody,
+        BlockStream,
+        SlowWholeBody,
+        SlowStream,
+        InvalidBodySequence,
+        InvalidWholeBodySequence,
+    }
+
+    struct ResponseRelayService {
+        script: ResponseRelayScript,
+        request_only: bool,
+        body_gate: Option<ResponseBodyGate>,
+        captured_preflight_headers: Option<Arc<std::sync::Mutex<Vec<HttpHeader>>>>,
+    }
+
+    #[derive(Clone)]
+    struct ResponseBodyGate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_supervisor_middleware::InProcessMiddleware for ResponseRelayService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/response-relay".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: if self.request_only {
+                        SupervisorMiddlewareOperation::HttpRequest
+                    } else {
+                        SupervisorMiddlewareOperation::HttpResponse
+                    } as i32,
+                    phase: if self.request_only {
+                        SupervisorMiddlewarePhase::PreCredentials
+                    } else {
+                        SupervisorMiddlewarePhase::PreReturn
+                    } as i32,
+                    max_payload_bytes: 4096,
+                    timeout: String::new(),
+                }],
+                expected_audience: String::new(),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_supervisor_middleware::HttpRequestView<'_>,
+        ) -> Result<HttpRequestResult> {
+            Ok(HttpRequestResult {
+                decision: Decision::Allow as i32,
+                ..Default::default()
+            })
+        }
+
+        async fn open_http_response_pre_return(
+            &self,
+            mut requests: mpsc::Receiver<HttpResponseEvent>,
+        ) -> std::result::Result<
+            openshell_supervisor_middleware::HttpResponseResultStream,
+            tonic::Status,
+        > {
+            assert!(
+                !self.request_only,
+                "request-only service received a response"
+            );
+            let mut script = self.script;
+            let body_gate = self.body_gate.clone();
+            let captured_preflight_headers = self.captured_preflight_headers.clone();
+            let (sender, receiver) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Some(event) = requests.recv().await {
+                    let Some(event) = event.event else {
+                        break;
+                    };
+                    let result = match event {
+                        http_response_event::Event::Preflight(preflight) => {
+                            if let Some(captured) = &captured_preflight_headers {
+                                *captured.lock().expect("preflight capture lock") =
+                                    preflight.headers.clone();
+                            }
+                            if preflight
+                                .config
+                                .as_ref()
+                                .is_some_and(|config| config.fields.contains_key("whole_body"))
+                            {
+                                script = ResponseRelayScript::WholeBody;
+                            }
+                            if matches!(script, ResponseRelayScript::BlockPreflight) {
+                                HttpResponseEventResult {
+                                    result: Some(
+                                        http_response_event_result::Result::PreflightResult(
+                                            HttpResponsePreflightResult {
+                                                action: Some(
+                                                    http_response_preflight_result::Action::BlockDelivery(
+                                                        HttpResponseBlockDelivery {},
+                                                    ),
+                                                ),
+                                                reason_code: "content_match".into(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                }
+                            } else {
+                                let (body_mode, header_mutations) = match script {
+                                    ResponseRelayScript::HeadersOnly => (
+                                        HttpResponseBodyMode::HeadersOnly,
+                                        vec![write_header(
+                                            "cache-control",
+                                            "private",
+                                            ExistingHeaderAction::Overwrite,
+                                        )],
+                                    ),
+                                    ResponseRelayScript::WholeBody
+                                    | ResponseRelayScript::BlockWholeBody
+                                    | ResponseRelayScript::SlowWholeBody
+                                    | ResponseRelayScript::InvalidWholeBodySequence
+                                    | ResponseRelayScript::WholeBodyWithTrailer => {
+                                        (HttpResponseBodyMode::WholeBodyBytes, Vec::new())
+                                    }
+                                    ResponseRelayScript::Stream
+                                    | ResponseRelayScript::SlowStream
+                                    | ResponseRelayScript::BlockStream
+                                    | ResponseRelayScript::InvalidBodySequence => {
+                                        (HttpResponseBodyMode::StreamBytes, Vec::new())
+                                    }
+                                    ResponseRelayScript::BlockPreflight => unreachable!(),
+                                };
+                                HttpResponseEventResult {
+                                    result: Some(
+                                        http_response_event_result::Result::PreflightResult(
+                                            HttpResponsePreflightResult {
+                                                action: Some(
+                                                    http_response_preflight_result::Action::Inspect(
+                                                        HttpResponsePreflightInspect {
+                                                            body_mode: body_mode as i32,
+                                                            header_mutations,
+                                                        },
+                                                    ),
+                                                ),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                }
+                            }
+                        }
+                        http_response_event::Event::Body(body) => {
+                            if let Some(gate) = &body_gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
+                            let Some(http_response_body_unit::Payload::Data(data)) = body.payload
+                            else {
+                                break;
+                            };
+                            let replacement = match script {
+                                ResponseRelayScript::WholeBody
+                                | ResponseRelayScript::BlockWholeBody
+                                | ResponseRelayScript::SlowWholeBody
+                                | ResponseRelayScript::WholeBodyWithTrailer
+                                | ResponseRelayScript::InvalidWholeBodySequence => {
+                                    [b"whole:".as_slice(), &data].concat()
+                                }
+                                ResponseRelayScript::Stream
+                                | ResponseRelayScript::SlowStream
+                                | ResponseRelayScript::BlockStream
+                                | ResponseRelayScript::InvalidBodySequence => {
+                                    data.to_ascii_uppercase()
+                                }
+                                ResponseRelayScript::HeadersOnly
+                                | ResponseRelayScript::BlockPreflight => break,
+                            };
+                            if matches!(
+                                script,
+                                ResponseRelayScript::SlowWholeBody
+                                    | ResponseRelayScript::SlowStream
+                            ) {
+                                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                            }
+                            HttpResponseEventResult {
+                                result: Some(http_response_event_result::Result::BodyResult(
+                                    HttpResponseBodyResult {
+                                        sequence: if matches!(
+                                            script,
+                                            ResponseRelayScript::InvalidBodySequence
+                                                | ResponseRelayScript::InvalidWholeBodySequence
+                                        ) {
+                                            body.sequence + 1
+                                        } else {
+                                            body.sequence
+                                        },
+                                        action: Some(
+                                            if matches!(
+                                                script,
+                                                ResponseRelayScript::BlockWholeBody
+                                                    | ResponseRelayScript::BlockStream
+                                            ) {
+                                                http_response_body_result::Action::BlockDelivery(
+                                                    HttpResponseBlockDelivery {},
+                                                )
+                                            } else {
+                                                http_response_body_result::Action::Transform(
+                                                HttpResponseBodyTransform {
+                                                    replacement: Some(
+                                                        http_response_body_transform::Replacement::Data(
+                                                            replacement,
+                                                        ),
+                                                    ),
+                                                },
+                                            )
+                                            },
+                                        ),
+                                        reason_code: if matches!(
+                                            script,
+                                            ResponseRelayScript::BlockWholeBody
+                                                | ResponseRelayScript::BlockStream
+                                        ) {
+                                            "content_match".into()
+                                        } else {
+                                            String::new()
+                                        },
+                                        ..Default::default()
+                                    },
+                                )),
+                            }
+                        }
+                        http_response_event::Event::Trailers(_) => HttpResponseEventResult {
+                            result: Some(http_response_event_result::Result::TrailersResult(
+                                HttpResponseTrailersResult::default(),
+                            )),
+                        },
+                        http_response_event::Event::SessionEnd(_) => break,
+                    };
+                    if sender.send(Ok(result)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(ReceiverStream::new(receiver)))
+        }
+    }
 
     struct CountingReader {
         bytes: Vec<u8>,
@@ -5511,6 +5589,1208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_middleware_unbound_chains_preserve_ordinary_headers() {
+        let mut many_headers = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+        for _ in 0..129 {
+            many_headers.extend_from_slice(b"Set-Cookie: a=b\r\n");
+        }
+        many_headers.extend_from_slice(b"\r\n");
+        let opaque_headers =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Opaque: \xff\xfe\r\n\r\nabc".to_vec();
+        let (_, chain) = response_middleware_fixture(ResponseRelayScript::HeadersOnly);
+        let request_only_runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script: ResponseRelayScript::HeadersOnly,
+                request_only: true,
+                body_gate: None,
+                captured_preflight_headers: None,
+            }));
+        let empty_runner = openshell_supervisor_middleware::ChainRunner::default();
+        for response in [many_headers, opaque_headers] {
+            assert!(response.len() < MAX_HEADER_BYTES);
+            for context in [
+                None,
+                Some(response_middleware_context(&empty_runner, &[], "GET")),
+                Some(response_middleware_context(
+                    &request_only_runner,
+                    &chain,
+                    "GET",
+                )),
+            ] {
+                let mut upstream = response.as_slice();
+                let mut delivered = Vec::new();
+                let outcome = relay_response(
+                    "GET",
+                    &mut upstream,
+                    &mut delivered,
+                    RelayResponseOptions::default(),
+                    context,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(outcome, RelayOutcome::Reusable));
+                assert_eq!(delivered, response);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_selected_hook_enforces_header_limits() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+        for _ in 0..129 {
+            response.extend_from_slice(b"X-Ordinary: value\r\n");
+        }
+        response.extend_from_slice(b"\r\n");
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::HeadersOnly);
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        assert!(delivered.starts_with(b"HTTP/1.1 502 "));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_omits_credentials_and_preserves_downstream_fields() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script: ResponseRelayScript::HeadersOnly,
+                request_only: false,
+                body_gate: None,
+                captured_preflight_headers: Some(Arc::clone(&captured)),
+            }));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/response-relay".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 5\r\n\
+            Cache-Control: public\r\n\
+            Set-Cookie:  session=secret; HttpOnly\r\n\
+            WWW-Authenticate: Bearer realm=private\r\n\
+            Authentication-Info: nextnonce=secret\r\n\
+            Proxy-Authenticate: Basic realm=proxy\r\n\
+            Proxy-Authentication-Info: nextnonce=proxy-secret\r\n\
+            Proxy-Authorization: Basic proxy-secret\r\n\
+            X-OpenShell-Credential-Token: injected-secret\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await
+        .expect("response relay");
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+        let observed = captured.lock().expect("preflight capture lock");
+        assert_eq!(
+            observed
+                .iter()
+                .map(|header| header.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["content-length", "cache-control"]
+        );
+        drop(observed);
+
+        let delivered = String::from_utf8(delivered).expect("UTF-8 response");
+        for credential_field in [
+            "Set-Cookie:  session=secret; HttpOnly\r\n",
+            "WWW-Authenticate: Bearer realm=private\r\n",
+            "Authentication-Info: nextnonce=secret\r\n",
+            "Proxy-Authenticate: Basic realm=proxy\r\n",
+            "Proxy-Authentication-Info: nextnonce=proxy-secret\r\n",
+            "Proxy-Authorization: Basic proxy-secret\r\n",
+            "X-OpenShell-Credential-Token: injected-secret\r\n",
+        ] {
+            assert!(delivered.contains(credential_field), "{delivered}");
+        }
+        assert!(delivered.contains("cache-control: private\r\n"));
+        assert!(delivered.ends_with("\r\n\r\nhello"));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_flushes_partial_framed_payload_promptly() {
+        for chunked in [false, true] {
+            let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+            let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
+            // Small capacity forces the relay to complete partial downstream writes.
+            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let head = if chunked {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n1000\r\nabc".as_slice()
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nContent-Type: text/event-stream\r\n\r\nabc".as_slice()
+            };
+            upstream_write.write_all(head).await.unwrap();
+            let task = tokio::spawn(async move {
+                relay_response(
+                    "GET",
+                    &mut upstream_read,
+                    &mut client_write,
+                    RelayResponseOptions::default(),
+                    Some(response_middleware_context(&runner, &chain, "GET")),
+                )
+                .await
+            });
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(client_read.read_u8().await.unwrap());
+                }
+                let mut first = [0; 8];
+                client_read.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first, b"3\r\nABC\r\n");
+                // Complete the same framed payload only after its first transformed
+                // bytes have reached the consumer.
+                upstream_write.write_all(&vec![b'd'; 4093]).await.unwrap();
+                if chunked {
+                    for fragment in [b"\r".as_slice(), b"\n0\r", b"\n\r", b"\n"] {
+                        upstream_write.write_all(fragment).await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                }
+                drop(upstream_write);
+                let mut rest = Vec::new();
+                client_read.read_to_end(&mut rest).await.unwrap();
+                assert!(rest.ends_with(b"0\r\n\r\n"));
+                let body = collect_chunked_body(&mut tokio::io::empty(), &rest, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(body, vec![b'D'; 4093]);
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+            }
+            let relay = task.await;
+            assert!(result.is_ok(), "partial payload stalled, chunked={chunked}");
+            assert!(relay.unwrap().is_ok());
+        }
+    }
+
+    fn response_middleware_fixture(
+        script: ResponseRelayScript,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
+        response_middleware_fixture_with_error(
+            script,
+            openshell_supervisor_middleware::OnError::FailClosed,
+        )
+    }
+
+    fn response_middleware_fixture_with_error(
+        script: ResponseRelayScript,
+        on_error: openshell_supervisor_middleware::OnError,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
+        let runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script,
+                request_only: false,
+                body_gate: None,
+                captured_preflight_headers: None,
+            }));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/response-relay".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error,
+        }];
+        (runner, chain)
+    }
+
+    fn response_middleware_context<'a>(
+        runner: &'a openshell_supervisor_middleware::ChainRunner,
+        chain: &'a [openshell_supervisor_middleware::ChainEntry],
+        method: &str,
+    ) -> HttpResponseMiddlewareRelay<'a> {
+        HttpResponseMiddlewareRelay {
+            chain,
+            runner,
+            request_context: RequestContext {
+                request_id: "request-1".into(),
+                sandbox_id: "sandbox-1".into(),
+                ..Default::default()
+            },
+            target: HttpRequestTarget {
+                scheme: "https".into(),
+                host: "example.test".into(),
+                port: 443,
+                method: method.into(),
+                path: "/data".into(),
+                query: String::new(),
+            },
+            policy_name: "test-policy",
+            generation_guard: None,
+            whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+        }
+    }
+
+    async fn run_response_middleware_relay(
+        response: &[u8],
+        method: &str,
+        script: ResponseRelayScript,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        run_response_middleware_relay_with_error(
+            response,
+            method,
+            script,
+            openshell_supervisor_middleware::OnError::FailClosed,
+        )
+        .await
+    }
+
+    async fn run_response_middleware_relay_with_error(
+        response: &[u8],
+        method: &str,
+        script: ResponseRelayScript,
+        on_error: openshell_supervisor_middleware::OnError,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        run_response_middleware_relay_with_timeout(
+            response,
+            method,
+            script,
+            on_error,
+            std::time::Duration::from_mins(2),
+        )
+        .await
+    }
+
+    async fn run_response_middleware_relay_with_timeout(
+        response: &[u8],
+        method: &str,
+        script: ResponseRelayScript,
+        on_error: openshell_supervisor_middleware::OnError,
+        whole_body_timeout: std::time::Duration,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        let (runner, chain) = response_middleware_fixture_with_error(script, on_error);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        let response = response.to_vec();
+        tokio::spawn(async move {
+            upstream_write.write_all(&response).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
+        });
+        let mut middleware = response_middleware_context(&runner, &chain, method);
+        middleware.whole_body_timeout = whole_body_timeout;
+        let outcome = relay_response(
+            method,
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(middleware),
+        )
+        .await;
+        drop(client_write);
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+        (outcome, delivered)
+    }
+
+    #[tokio::test]
+    async fn response_middleware_headers_only_mutates_head_and_preserves_framing() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nCache-Control: public\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.contains("cache-control: private\r\n"),
+            "{delivered}"
+        );
+        assert!(delivered.contains("Content-Length: 5\r\n"), "{delivered}");
+        assert!(
+            !delivered.to_ascii_lowercase().contains("transfer-encoding"),
+            "{delivered}"
+        );
+        assert!(delivered.ends_with("\r\n\r\nhello"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_headers_only_preserves_chunked_and_close_delimited_bodies() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;ext=yes\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.contains("Transfer-Encoding: chunked\r\n"),
+            "{delivered}"
+        );
+        assert!(
+            delivered.ends_with("2;ext=yes\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n"),
+            "{delivered}"
+        );
+
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(
+            String::from_utf8(delivered)
+                .unwrap()
+                .ends_with("\r\n\r\nhello")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_middleware_whole_body_delays_commit_and_sets_length() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: stale\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::WholeBody,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.contains("Content-Length: 11\r\n"), "{delivered}");
+        assert!(
+            !delivered.to_ascii_lowercase().contains("etag:"),
+            "{delivered}"
+        );
+        assert!(delivered.ends_with("\r\n\r\nwhole:hello"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_preflight_block_returns_canonical_403() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::BlockPreflight,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{delivered}"
+        );
+        assert!(
+            delivered.contains("\"error\":\"middleware_denied\""),
+            "{delivered}"
+        );
+        assert!(
+            delivered.contains("\"reason_code\":\"content_match\""),
+            "{delivered}"
+        );
+        assert!(delivered.contains("Connection: close\r\n"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_head_block_reports_length_without_body() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HEAD",
+            ResponseRelayScript::BlockPreflight,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let header_end = delivered
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let head = String::from_utf8(delivered[..header_end].to_vec()).unwrap();
+        assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{head}");
+        assert!(head.contains("Content-Length: "), "{head}");
+        assert_eq!(delivered.len(), header_end);
+    }
+
+    #[tokio::test]
+    async fn response_middleware_whole_body_block_returns_403_before_commit() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::BlockWholeBody,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{delivered}"
+        );
+        assert!(!delivered.contains("HTTP/1.1 200 OK"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_stream_block_aborts_after_commit_without_error_bytes() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::BlockStream,
+        )
+        .await;
+        assert!(outcome.is_err());
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
+        assert!(!delivered.contains("middleware_denied"), "{delivered}");
+        assert!(
+            !delivered.contains("response_delivery_failed"),
+            "{delivered}"
+        );
+    }
+
+    async fn run_response_relay_across_policy_reload(
+        script: ResponseRelayScript,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script,
+                request_only: false,
+                body_gate: Some(ResponseBodyGate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                captured_preflight_headers: None,
+            }));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/response-relay".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("initial generation guard");
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.generation_guard = Some(&guard);
+        let mut upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice();
+        let mut delivered = Vec::new();
+        let relay = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(middleware),
+        );
+        let reload = async {
+            entered.notified().await;
+            engine
+                .reload(TEST_POLICY, "network_policies: {}\n")
+                .expect("policy reload");
+            release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(relay, reload);
+        (outcome, delivered)
+    }
+
+    #[tokio::test]
+    async fn response_middleware_rechecks_generation_after_stream_exchange() {
+        let (outcome, delivered) =
+            run_response_relay_across_policy_reload(ResponseRelayScript::Stream).await;
+
+        let error = outcome.expect_err("stale stream output must not be delivered");
+        assert!(error.to_string().contains("policy generation is stale"));
+        assert!(delivered.ends_with(b"\r\n\r\n"));
+        assert!(!delivered.windows(5).any(|window| window == b"HELLO"));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_rechecks_generation_after_whole_body_finish() {
+        let (outcome, delivered) =
+            run_response_relay_across_policy_reload(ResponseRelayScript::WholeBody).await;
+
+        let error = outcome.expect_err("stale whole-body output must not be delivered");
+        assert!(error.to_string().contains("policy generation is stale"));
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_middleware_whole_body_timeout_obeys_failure_policy() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let (outcome, delivered) = run_response_middleware_relay_with_timeout(
+            response,
+            "GET",
+            ResponseRelayScript::SlowWholeBody,
+            openshell_supervisor_middleware::OnError::FailOpen,
+            std::time::Duration::from_millis(15),
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert!(
+            String::from_utf8(delivered)
+                .unwrap()
+                .ends_with("\r\n\r\nhello")
+        );
+
+        let (outcome, delivered) = run_response_middleware_relay_with_timeout(
+            response,
+            "GET",
+            ResponseRelayScript::SlowWholeBody,
+            openshell_supervisor_middleware::OnError::FailClosed,
+            std::time::Duration::from_millis(15),
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        assert!(
+            String::from_utf8(delivered)
+                .unwrap()
+                .contains("response_delivery_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_middleware_whole_body_timeout_does_not_reset_for_trickle_input() {
+        let (runner, chain) = response_middleware_fixture_with_error(
+            ResponseRelayScript::WholeBody,
+            openshell_supervisor_middleware::OnError::FailOpen,
+        );
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(async move {
+            upstream_write
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nh")
+                .await
+                .unwrap();
+            for byte in b"ello" {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                upstream_write.write_all(&[*byte]).await.unwrap();
+            }
+            upstream_write.shutdown().await.unwrap();
+        });
+        let mut middleware = response_middleware_context(&runner, &chain, "GET");
+        middleware.whole_body_timeout = std::time::Duration::from_millis(20);
+        let outcome = relay_response(
+            "GET",
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(middleware),
+        )
+        .await;
+        drop(client_write);
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        let (_, body) = delivered.split_once("\r\n\r\n").unwrap();
+        let decoded = collect_chunked_body(&mut tokio::io::empty(), body.as_bytes(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(decoded, b"hello");
+        assert!(!delivered.contains("whole:hello"), "{delivered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_middleware_expiry_preserves_bytes_through_slow_stream_and_client() {
+        for chunked in [true, false] {
+            let (runner, mut chain) = response_middleware_fixture_with_error(
+                ResponseRelayScript::SlowStream,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            );
+            let mut whole_body = chain[0].clone();
+            whole_body.name = "whole-body".into();
+            whole_body
+                .config
+                .fields
+                .insert("whole_body".into(), prost_types::Value::default());
+            chain[0].order = 1;
+            chain.insert(0, whole_body);
+            let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
+            // Force write_all to make partial progress before each wait.
+            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let producer = async move {
+                let head = if chunked {
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice()
+                };
+                upstream_write.write_all(head).await.unwrap();
+                upstream_write.write_all(&vec![b'a'; 2048]).await.unwrap();
+                if chunked {
+                    upstream_write.write_all(b"\r\n").await.unwrap();
+                }
+                // The first coalesced unit belongs to the whole-body stage. A new
+                // partial unit starts coalescing just before its deadline.
+                tokio::time::sleep(std::time::Duration::from_millis(9)).await;
+                upstream_write
+                    .write_all(if chunked { b"1\r\nb\r\n" } else { b"b" })
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if chunked {
+                    upstream_write.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                upstream_write.shutdown().await.unwrap();
+            };
+            let relay = async {
+                let mut context = response_middleware_context(&runner, &chain, "GET");
+                context.whole_body_timeout = std::time::Duration::from_millis(10);
+                let outcome = relay_response(
+                    "GET",
+                    &mut upstream_read,
+                    &mut client_write,
+                    RelayResponseOptions::default(),
+                    Some(context),
+                )
+                .await;
+                drop(client_write);
+                outcome
+            };
+            let consumer = async move {
+                let mut delivered = Vec::new();
+                let mut bytes = [0; 7];
+                loop {
+                    let count = client_read.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    delivered.extend_from_slice(&bytes[..count]);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                delivered
+            };
+            let ((), outcome, delivered) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                Box::pin(async { tokio::join!(producer, relay, consumer) }),
+            )
+            .await
+            .expect("response relay stalled");
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let head_end = delivered
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let mut wire = &delivered[head_end..];
+            let mut body = Vec::new();
+            loop {
+                let end = wire.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
+                let size =
+                    usize::from_str_radix(std::str::from_utf8(&wire[..end]).unwrap(), 16).unwrap();
+                wire = &wire[end + 2..];
+                if size == 0 {
+                    assert_eq!(wire, b"\r\n");
+                    break;
+                }
+                body.extend_from_slice(&wire[..size]);
+                assert_eq!(&wire[size..size + 2], b"\r\n");
+                wire = &wire[size + 2..];
+            }
+            let mut expected = vec![b'A'; 2048];
+            expected.push(b'B');
+            assert_eq!(body, expected, "chunked={chunked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_streams_normalized_chunks_and_preserves_trailers() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-upstream\r\n\r\n2;ext=yes\r\nhe\r\n3\r\nllo\r\n0\r\nX-Upstream: kept\r\n\r\n",
+            "GET",
+            ResponseRelayScript::Stream,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.contains("Trailer: x-upstream\r\n"), "{delivered}");
+        assert!(delivered.contains("5\r\nHELLO\r\n"), "{delivered}");
+        assert!(delivered.contains("x-upstream: kept\r\n"), "{delivered}");
+        assert!(!delivered.contains("digest:"), "{delivered}");
+        assert!(!delivered.contains("ext=yes"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_rejects_malformed_response_fields_before_commit() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTrailer: content-length\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nConnection: x-private\r\nTrailer: x-private\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay(
+                response,
+                "GET",
+                ResponseRelayScript::WholeBody,
+            )
+            .await;
+            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{delivered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_rejects_malformed_or_protected_upstream_trailers_atomically() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nBad Name: value\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Length: 7\r\n\r\n".as_slice(),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay(
+                response,
+                "GET",
+                ResponseRelayScript::WholeBody,
+            )
+            .await;
+            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{delivered}"
+            );
+            assert!(!delivered.contains("whole:hello"), "{delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_never_uses_chunked_framing_for_http_10() {
+        for (script, expected_body) in [
+            (ResponseRelayScript::HeadersOnly, "hello"),
+            (ResponseRelayScript::Stream, "HELLO"),
+            (ResponseRelayScript::WholeBodyWithTrailer, "whole:hello"),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay(
+                b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                "GET",
+                script,
+            )
+            .await;
+            assert!(outcome.is_ok());
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(delivered.starts_with("HTTP/1.0 200 OK\r\n"), "{delivered}");
+            assert!(
+                !delivered.to_ascii_lowercase().contains("transfer-encoding"),
+                "{delivered}"
+            );
+            assert!(
+                !delivered.to_ascii_lowercase().contains("trailer:"),
+                "{delivered}"
+            );
+            assert!(delivered.ends_with(expected_body), "{delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_preserves_baseline_connection_outcomes() {
+        let (outcome, _) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert!(String::from_utf8(delivered).unwrap().ends_with("\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_forwards_interim_head_before_final_preflight() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 100 Continue\r\nX-Interim: yes\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            "GET",
+            ResponseRelayScript::WholeBody,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.starts_with("HTTP/1.1 100 Continue\r\nX-Interim: yes\r\n\r\n"));
+        assert!(delivered.ends_with("whole:ok"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_handles_bodyless_responses_without_body_events() {
+        for response in [
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n".as_slice(),
+        ] {
+            let (outcome, delivered) =
+                run_response_middleware_relay(response, "GET", ResponseRelayScript::HeadersOnly)
+                    .await;
+            assert!(outcome.is_ok());
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.contains("cache-control: private\r\n"),
+                "{delivered}"
+            );
+            assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
+        }
+
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HEAD",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(outcome.is_ok());
+        let split = delivered
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&delivered[split..], b"");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_bypasses_protocol_upgrades() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x02ok",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(
+            outcome.unwrap(),
+            RelayOutcome::Upgraded { ref overflow, .. } if overflow == b"\x81\x02ok"
+        ));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(!delivered.contains("cache-control: private"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_fail_closed_before_commit_returns_canonical_502() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::InvalidWholeBodySequence,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{delivered}"
+        );
+        assert!(delivered.contains("\"error\":\"response_delivery_failed\""));
+        assert!(delivered.contains(
+            "The upstream request may have completed, but OpenShell could not deliver its response. Retrying may repeat upstream side effects."
+        ));
+        assert!(!delivered.contains("invalid_body_sequence"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_head_failure_reports_body_length_without_body() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HEAD",
+            ResponseRelayScript::WholeBody,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let split = delivered
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let head = String::from_utf8(delivered[..split].to_vec()).unwrap();
+        assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");
+        assert!(head.contains("Content-Length: "), "{head}");
+        assert_eq!(&delivered[split..], b"");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_fail_closed_after_commit_aborts_without_replacement() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::InvalidBodySequence,
+        )
+        .await;
+        assert!(outcome.is_err());
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
+        assert!(!delivered.contains("502 Bad Gateway"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_unrepresentable_input_obeys_failure_policy() {
+        let mut many_headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".to_vec();
+        for _ in 0..=openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
+            many_headers.extend_from_slice(b"X-Extra: value\r\n");
+        }
+        many_headers.extend_from_slice(b"\r\nok");
+        for response in [
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            many_headers.as_slice(),
+        ] {
+            for on_error in [
+                openshell_supervisor_middleware::OnError::FailOpen,
+                openshell_supervisor_middleware::OnError::FailClosed,
+            ] {
+                let (outcome, delivered) = run_response_middleware_relay_with_error(
+                    response,
+                    "GET",
+                    ResponseRelayScript::HeadersOnly,
+                    on_error,
+                )
+                .await;
+                if on_error == openshell_supervisor_middleware::OnError::FailOpen {
+                    assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+                    assert_eq!(delivered, response);
+                } else {
+                    assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                    assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                    assert!(
+                        String::from_utf8(delivered)
+                            .unwrap()
+                            .contains("response_delivery_failed")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_obs_text_does_not_bypass_unsafe_headers() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\x00\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay_with_error(
+                response, "GET", ResponseRelayScript::HeadersOnly,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            ).await;
+            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_fail_open_preserves_input_before_and_after_commit() {
+        for (script, expected_framing) in [
+            (
+                ResponseRelayScript::InvalidWholeBodySequence,
+                "Content-Length: 5\r\n",
+            ),
+            (
+                ResponseRelayScript::InvalidBodySequence,
+                "Transfer-Encoding: chunked\r\n",
+            ),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay_with_error(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                "GET",
+                script,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            )
+            .await;
+            assert!(outcome.is_ok());
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(delivered.contains(expected_framing), "{delivered}");
+            assert!(delivered.contains("hello"), "{delivered}");
+            assert!(!delivered.contains("502 Bad Gateway"), "{delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_stale_policy_generation_aborts_before_preflight() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        upstream_write
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+        upstream_write.shutdown().await.unwrap();
+        let mut context = response_middleware_context(&runner, &chain, "GET");
+        context.generation_guard = Some(&guard);
+        let outcome = relay_response(
+            "GET",
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await;
+        assert!(outcome.is_err());
+        drop(client_write);
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_middleware_client_disconnect_aborts_stream_delivery() {
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (client_read, mut client_write) = tokio::io::duplex(4096);
+        drop(client_read);
+        upstream_write
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+        upstream_write.shutdown().await.unwrap();
+        let outcome = relay_response(
+            "GET",
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await;
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_middleware_streams_close_delimited_body_with_owned_framing() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello",
+            "GET",
+            ResponseRelayScript::Stream,
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(
+            delivered.contains("Transfer-Encoding: chunked\r\n"),
+            "{delivered}"
+        );
+        assert!(delivered.contains("5\r\nHELLO\r\n"), "{delivered}");
+    }
+
+    #[test]
+    fn response_middleware_ocsf_events_omit_content_headers_and_free_form_reasons() {
+        let target = HttpRequestTarget {
+            scheme: "https".into(),
+            host: "example.test".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/safe".into(),
+            query: String::new(),
+        };
+        let events = http_response_middleware_invocation_events(
+            "policy",
+            &target,
+            200,
+            &[openshell_supervisor_middleware::HttpResponseInvocation {
+                config_name: "scan".into(),
+                implementation: "example/scan".into(),
+                outcome: openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailOpen,
+                sequence: Some(1),
+                input_size: 19,
+                output_size: None,
+                failed: true,
+                stage_disabled: true,
+                reason_code: Some("stable_reason".into()),
+                failure_category: Some("timeout".into()),
+            }],
+        );
+        let json = events[0].to_json().unwrap().to_string();
+        for forbidden in [
+            "secret-response-body",
+            "authorization",
+            "content-length",
+            "middleware said secret",
+            "stable_reason",
+        ] {
+            assert!(!json.contains(forbidden), "{json}");
+        }
+        assert!(
+            json.to_ascii_lowercase()
+                .contains("http_response_middleware"),
+            "{json}"
+        );
+        assert!(json.contains("example/scan"), "{json}");
+    }
+
+    #[test]
+    fn response_middleware_fail_open_dual_emits_sanitized_findings() {
+        let target = HttpRequestTarget {
+            scheme: "https".into(),
+            host: "example.test".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/safe".into(),
+            query: String::new(),
+        };
+        for category in [
+            "invalid_result",
+            "timeout",
+            "payload_capacity",
+            "session_capacity",
+        ] {
+            let invocation = openshell_supervisor_middleware::HttpResponseInvocation {
+                config_name: "scan".into(),
+                implementation: "example/scan".into(),
+                outcome: openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailOpen,
+                sequence: Some(1),
+                input_size: 19,
+                output_size: None,
+                failed: true,
+                stage_disabled: true,
+                reason_code: None,
+                failure_category: Some(category.into()),
+            };
+            assert_eq!(
+                http_response_middleware_invocation_events(
+                    "policy",
+                    &target,
+                    200,
+                    std::slice::from_ref(&invocation),
+                )
+                .len(),
+                1
+            );
+            let finding =
+                http_response_middleware_fail_open_finding_event("policy", &target, &invocation)
+                    .expect("fail-open failure must create a detection finding")
+                    .to_json()
+                    .unwrap()
+                    .to_string();
+            for expected in [
+                "openshell.middleware.http_response_fail_open",
+                "example.test",
+                "pre_return",
+                category,
+            ] {
+                assert!(finding.contains(expected), "{finding}");
+            }
+            assert!(!finding.contains("stable_reason"), "{finding}");
+        }
+    }
+
+    #[tokio::test]
     async fn relay_response_no_framing_with_connection_close_reads_until_eof() {
         // Response with Connection: close but no Content-Length/TE: body is
         // delimited by connection close — relay_until_eof should forward it.
@@ -5531,6 +6811,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5576,6 +6857,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5626,6 +6908,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5670,6 +6953,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5711,6 +6995,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5749,6 +7034,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5789,6 +7075,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5833,6 +7120,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5876,6 +7164,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5912,6 +7201,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -5958,6 +7248,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -6005,6 +7296,7 @@ mod tests {
                 &mut upstream_read,
                 &mut client_write,
                 RelayResponseOptions::default(),
+                None,
             ),
         )
         .await
@@ -8089,6 +9381,37 @@ mod tests {
         assert_eq!(
             detect_payload_mode(headers).unwrap(),
             SigV4PayloadMode::UnsignedPayload
+        );
+    }
+
+    #[test]
+    fn response_body_transform_strips_stale_integrity_headers() {
+        let mut headers = [
+            "accept-ranges",
+            "etag",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "signature",
+            "signature-input",
+            "content-type",
+        ]
+        .into_iter()
+        .map(|name| HttpHeader {
+            name: name.to_string(),
+            value: "value".to_string(),
+        })
+        .collect();
+
+        strip_response_integrity_headers(&mut headers);
+
+        assert_eq!(
+            headers,
+            vec![HttpHeader {
+                name: "content-type".to_string(),
+                value: "value".to_string(),
+            }]
         );
     }
 }

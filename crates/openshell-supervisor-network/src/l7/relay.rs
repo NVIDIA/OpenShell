@@ -8,7 +8,7 @@
 //! and either forwards or denies the request.
 
 use crate::l7::middleware::{
-    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain,
+    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain_with_request_id,
     emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
 };
 #[cfg(test)]
@@ -398,13 +398,20 @@ async fn relay_http_request_with_credential_rejection<C, U>(
     upstream: &mut U,
     options: crate::l7::rest::RelayRequestOptions<'_>,
     ctx: &L7EvalContext,
+    response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
 ) -> Result<Option<RelayOutcome>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    match crate::l7::rest::relay_http_request_with_options_guarded(
-        request, client, upstream, options,
+    match Box::pin(
+        crate::l7::rest::relay_http_request_with_response_middleware_guarded(
+            request,
+            client,
+            upstream,
+            options,
+            response_middleware,
+        ),
     )
     .await
     {
@@ -421,6 +428,90 @@ where
             } else {
                 Err(report)
             }
+        }
+    }
+}
+
+pub(crate) fn http_response_middleware_relay<'a>(
+    request: &crate::l7::provider::L7Request,
+    ctx: &'a L7EvalContext,
+    scheme: &str,
+    request_id: &str,
+    chain: &'a [openshell_supervisor_middleware::ChainEntry],
+    runner: &'a openshell_supervisor_middleware::ChainRunner,
+    generation_guard: Option<&'a PolicyGenerationGuard>,
+) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
+    let sandbox = openshell_ocsf::ctx::ctx();
+    crate::l7::rest::HttpResponseMiddlewareRelay {
+        chain,
+        runner,
+        request_context: openshell_core::proto::RequestContext {
+            request_id: request_id.to_string(),
+            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox_name: sandbox.sandbox_name.clone(),
+            workspace: ctx.workspace.clone(),
+            originating_process: None,
+        },
+        target: openshell_core::proto::HttpRequestTarget {
+            scheme: scheme.to_string(),
+            host: ctx.host.clone(),
+            port: u32::from(ctx.port),
+            method: request.action.clone(),
+            path: request.target.clone(),
+            query: policy_safe_response_query(&request.query_params),
+        },
+        policy_name: &ctx.policy_name,
+        generation_guard,
+        whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+    }
+}
+
+pub(super) fn policy_safe_response_query(
+    query_params: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let mut parameters: Vec<_> = query_params.iter().collect();
+    parameters.sort_by_key(|(name, _)| *name);
+    let mut output = String::new();
+    for (name, values) in parameters {
+        let empty_value = String::new();
+        let values = if values.is_empty() {
+            std::slice::from_ref(&empty_value)
+        } else {
+            values.as_slice()
+        };
+        for value in values {
+            if !output.is_empty() {
+                output.push('&');
+            }
+            let name = if secrets::contains_reserved_credential_marker(name) {
+                "[REDACTED]"
+            } else {
+                name
+            };
+            let value = if secrets::contains_reserved_credential_marker(value) {
+                "[REDACTED]"
+            } else {
+                value
+            };
+            push_form_component(&mut output, name);
+            output.push('=');
+            push_form_component(&mut output, value);
+        }
+    }
+    output
+}
+
+fn push_form_component(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(char::from(byte));
+        } else if byte == b' ' {
+            output.push('+');
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
 }
@@ -857,13 +948,15 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
             // stage (a no-op for REST and websocket, whose policy inputs the
             // chain cannot mutate).
             let validate = transformed_body_validator(config, &engine, ctx, &request_info);
-            let middleware_result = apply_middleware_chain(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -871,6 +964,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await;
             let req = match middleware_result? {
@@ -975,6 +1069,15 @@ where
                     port: ctx.port,
                 },
                 ctx,
+                Some(http_response_middleware_relay(
+                    &req,
+                    ctx,
+                    "https",
+                    &request_id,
+                    &response_chain,
+                    engine.middleware_runner(),
+                    Some(engine.generation_guard()),
+                )),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -1588,11 +1691,13 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
             // per-stage body re-check is needed.
-            let middleware_result = apply_middleware_chain(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -1600,6 +1705,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                &request_id,
             )
             .await;
             let req = match middleware_result? {
@@ -1715,6 +1821,15 @@ where
                     port: ctx.port,
                 },
                 ctx,
+                Some(http_response_middleware_relay(
+                    &req_with_auth,
+                    ctx,
+                    "https",
+                    &request_id,
+                    &response_chain,
+                    engine.middleware_runner(),
+                    Some(engine.generation_guard()),
+                )),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -2005,12 +2120,14 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain(
+            let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2018,6 +2135,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await?
             {
@@ -2082,6 +2200,15 @@ where
                     ..Default::default()
                 },
                 ctx,
+                Some(http_response_middleware_relay(
+                    &req,
+                    ctx,
+                    "https",
+                    &request_id,
+                    &response_chain,
+                    engine.middleware_runner(),
+                    Some(engine.generation_guard()),
+                )),
             )
             .await?
             else {
@@ -2251,12 +2378,14 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain(
+            let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2264,6 +2393,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await?
             {
@@ -2318,6 +2448,15 @@ where
                     ..Default::default()
                 },
                 ctx,
+                Some(http_response_middleware_relay(
+                    &req,
+                    ctx,
+                    "https",
+                    &request_id,
+                    &response_chain,
+                    engine.middleware_runner(),
+                    Some(engine.generation_guard()),
+                )),
             )
             .await?
             else {
@@ -2870,6 +3009,8 @@ where
             ocsf_emit!(event);
         }
 
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
@@ -2877,19 +3018,24 @@ where
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;
+            let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+                request_id.clone(),
+                chain,
+                runner,
+                generation_guard.clone(),
+            );
             // The passthrough path enforces no L7 policy, so there is no
             // body-aware decision to re-check after a transformation.
-            match apply_middleware_chain(
-                req,
-                client,
-                ctx,
-                chain,
-                &runner,
-                generation_guard,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-            )
-            .await?
-            {
+            let result = exchange
+                .apply_request(
+                    req,
+                    client,
+                    ctx,
+                    "http",
+                    openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                )
+                .await?;
+            let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
@@ -2926,7 +3072,9 @@ where
                     .await?;
                     return Ok(());
                 }
-            }
+            };
+            response_selection = Some(exchange);
+            request
         } else {
             req
         };
@@ -2948,6 +3096,9 @@ where
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
+        let response_middleware = response_selection
+            .as_ref()
+            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
@@ -2963,6 +3114,7 @@ where
                 ..Default::default()
             },
             ctx,
+            response_middleware,
         )
         .await?
         else {
@@ -3034,6 +3186,7 @@ mod tests {
                 ..Default::default()
             },
             &L7EvalContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -3307,6 +3460,7 @@ mod tests {
                 ..options
             },
             &ctx,
+            None,
         )
         .await
         .expect("typed credential denial");
@@ -6230,7 +6384,7 @@ network_policies:
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         app.write_all(&body).await.unwrap();
 
-        let result = crate::l7::middleware::apply_middleware_chain_for_scheme(
+        let result = crate::l7::middleware::apply_middleware_chain_for_scheme_with_request_id(
             req,
             &mut relay_client,
             &ctx,
@@ -6239,6 +6393,7 @@ network_policies:
             &runner,
             tunnel_engine.generation_guard(),
             openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            "test-request-id",
         )
         .await
         .expect("apply middleware chain");
@@ -6364,6 +6519,50 @@ network_policies:
         );
 
         assert_eq!(input.scheme, "http");
+    }
+
+    #[test]
+    fn response_middleware_context_reuses_exchange_request_id() {
+        let req = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/data".into(),
+            query_params: std::collections::HashMap::from([
+                ("cursor".into(), vec!["next page".into()]),
+                (
+                    "token".into(),
+                    vec!["openshell:resolve:env:API_TOKEN".into()],
+                ),
+            ]),
+            raw_header: b"GET /v1/data?cursor=next+page&token=sk-live-secret HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            workspace: "workspace-1".into(),
+            policy_name: "api".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let chain = Vec::new();
+        let response = http_response_middleware_relay(
+            &req,
+            &ctx,
+            "https",
+            "exchange-123",
+            &chain,
+            &runner,
+            None,
+        );
+
+        assert_eq!(response.request_context.request_id, "exchange-123");
+        assert_eq!(
+            response.target.query,
+            "cursor=next+page&token=%5BREDACTED%5D"
+        );
+        assert!(!response.target.query.contains("sk-live-secret"));
+        assert!(!response.target.query.contains("API_TOKEN"));
+        assert_eq!(response.target.scheme, "https");
     }
 
     #[test]

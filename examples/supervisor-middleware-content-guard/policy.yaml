@@ -18,6 +18,7 @@ network_middlewares:
     endpoints:
       include:
         - httpbin.org
+        - host.openshell.internal
 
 network_policies:
   httpbin:
@@ -42,5 +43,20 @@ network_policies:
           - allow:
               method: POST
               path: /anything
+    binaries:
+      - path: /usr/bin/curl
+  guard-responses:
+    name: Guard responses
+    endpoints:
+      - host: host.openshell.internal
+        port: 18081
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /clean
+          - allow:
+              method: GET
+              path: /sensitive
     binaries:
       - path: /usr/bin/curl

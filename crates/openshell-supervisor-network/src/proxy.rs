@@ -1155,8 +1155,7 @@ struct ForwardL7Reevaluation<'a> {
 struct ForwardMiddlewarePipeline<'a> {
     ctx: &'a crate::l7::relay::L7EvalContext,
     scheme: &'a str,
-    runner: &'a openshell_supervisor_middleware::ChainRunner,
-    generation_guard: &'a PolicyGenerationGuard,
+    exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
     l7_reevaluation: Option<ForwardL7Reevaluation<'a>>,
 }
 
@@ -1169,7 +1168,6 @@ impl ForwardMiddlewarePipeline<'_> {
         &self,
         request: crate::l7::provider::L7Request,
         client: &mut C,
-        chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     ) -> Result<crate::l7::middleware::MiddlewareApplyResult>
     where
         C: TokioAsyncRead + TokioAsyncWrite + Unpin + Send,
@@ -1188,17 +1186,15 @@ impl ForwardMiddlewarePipeline<'_> {
             None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         };
 
-        crate::l7::middleware::apply_middleware_chain_for_scheme(
-            request,
-            client,
-            self.ctx,
-            self.scheme,
-            chain,
-            self.runner,
-            self.generation_guard,
-            transformed_body_policy,
-        )
-        .await
+        self.exchange
+            .apply_request(
+                request,
+                client,
+                self.ctx,
+                self.scheme,
+                transformed_body_policy,
+            )
+            .await
     }
 }
 
@@ -1648,7 +1644,7 @@ async fn handle_tcp_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        return handle_forward_proxy(
+        return Box::pin(handle_forward_proxy(
             method,
             target,
             &buf[..],
@@ -1665,7 +1661,7 @@ async fn handle_tcp_connection(
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
-        )
+        ))
         .await;
     }
 
@@ -3986,6 +3982,13 @@ struct ForwardRelayOptions<'a> {
     signing_region: &'a str,
     host: &'a str,
     port: u16,
+    response_middleware: Option<ForwardResponseMiddleware<'a>>,
+}
+
+struct ForwardResponseMiddleware<'a> {
+    ctx: &'a crate::l7::relay::L7EvalContext,
+    scheme: &'a str,
+    exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -4006,16 +4009,22 @@ where
         .map_or(rewritten.len(), |p| p + 4);
     let header_str = String::from_utf8_lossy(&rewritten[..header_end]);
     let body_length = crate::l7::rest::parse_body_length(&header_str)?;
-    let (_, query_params) = crate::l7::rest::parse_target_query(path)?;
+    let (request_path, query_params) = crate::l7::rest::parse_target_query(path)?;
     let req = crate::l7::provider::L7Request {
         action: method.to_string(),
-        target: path.to_string(),
+        target: request_path,
         query_params,
         raw_header: rewritten,
         body_length,
     };
 
-    crate::l7::rest::relay_http_request_with_options_guarded(
+    let response_middleware = options.response_middleware.map(|middleware| {
+        middleware
+            .exchange
+            .response_relay(&req, middleware.ctx, middleware.scheme)
+    });
+
+    crate::l7::rest::relay_http_request_with_response_middleware_guarded(
         &req,
         client,
         upstream,
@@ -4033,6 +4042,7 @@ where
             host: options.host,
             port: options.port,
         },
+        response_middleware,
     )
     .await
 }
@@ -4974,8 +4984,11 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
+    let request_id = uuid::Uuid::new_v4().to_string();
     let websocket_chain = forward_websocket_request.then(|| chain.clone());
-    if !chain.is_empty() {
+    let response_selection = if chain.is_empty() {
+        None
+    } else {
         let middleware_runner = opa_engine.middleware_runner()?;
         let request = crate::l7::rest::request_from_buffered_http(
             method,
@@ -4991,14 +5004,19 @@ async fn handle_forward_proxy(
             }),
             _ => None,
         };
+        let middleware_exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            request_id.clone(),
+            chain,
+            middleware_runner,
+            forward_generation_guard.clone(),
+        );
         let pipeline = ForwardMiddlewarePipeline {
             ctx: &l7_ctx,
             scheme: &scheme,
-            runner: &middleware_runner,
-            generation_guard: &forward_generation_guard,
+            exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client, chain).await? {
+        forward_request_bytes = match pipeline.apply(request, client).await? {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
@@ -5016,7 +5034,8 @@ async fn handle_forward_proxy(
                 return Ok(());
             }
         };
-    }
+        Some(middleware_exchange)
+    };
     let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
         let request = crate::l7::rest::request_from_buffered_http(
             method,
@@ -5338,6 +5357,13 @@ async fn handle_forward_proxy(
             signing_region,
             host: &host_lc,
             port,
+            response_middleware: response_selection.as_ref().map(|exchange| {
+                ForwardResponseMiddleware {
+                    ctx: &l7_ctx,
+                    scheme: &scheme,
+                    exchange,
+                }
+            }),
         },
     )
     .await;
@@ -5766,6 +5792,118 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
+    struct ForwardResponseHeadersMiddleware {
+        expected_path: String,
+        forbidden_path_fragment: String,
+        block: bool,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for ForwardResponseHeadersMiddleware {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/forward-response".into(),
+                service_version: "test".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpResponse
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 8192,
+                    timeout: String::new(),
+                }],
+                expected_audience: String::new(),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            })
+        }
+
+        async fn open_http_response_pre_return(
+            &self,
+            mut requests: mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+        ) -> std::result::Result<openshell_core::middleware::HttpResponseResultStream, tonic::Status>
+        {
+            let (sender, receiver) = mpsc::channel(2);
+            let expected_path = self.expected_path.clone();
+            let forbidden_path_fragment = self.forbidden_path_fragment.clone();
+            let block = self.block;
+            tokio::spawn(async move {
+                while let Some(event) = requests.recv().await {
+                    match event.event {
+                        Some(openshell_core::proto::http_response_event::Event::Preflight(
+                            preflight,
+                        )) => {
+                            let target = preflight.target.expect("response target");
+                            assert_eq!(target.path, expected_path);
+                            assert!(!target.path.contains(&forbidden_path_fragment));
+                            let action = if block {
+                                openshell_core::proto::http_response_preflight_result::Action::BlockDelivery(
+                                    openshell_core::proto::HttpResponseBlockDelivery {},
+                                )
+                            } else {
+                                openshell_core::proto::http_response_preflight_result::Action::Inspect(
+                                    openshell_core::proto::HttpResponsePreflightInspect {
+                                        body_mode: openshell_core::proto::HttpResponseBodyMode::HeadersOnly as i32,
+                                        header_mutations: vec![openshell_core::proto::HeaderMutation {
+                                            operation: Some(
+                                                openshell_core::proto::header_mutation::Operation::Write(
+                                                    openshell_core::proto::WriteHeader {
+                                                        name: "x-forward-response-test".into(),
+                                                        value: "selected".into(),
+                                                        on_existing: openshell_core::proto::ExistingHeaderAction::Overwrite as i32,
+                                                    },
+                                                ),
+                                            ),
+                                        }],
+                                    },
+                                )
+                            };
+                            let result = openshell_core::proto::HttpResponseEventResult {
+                                result: Some(
+                                    openshell_core::proto::http_response_event_result::Result::PreflightResult(
+                                        openshell_core::proto::HttpResponsePreflightResult {
+                                            action: Some(action),
+                                            reason_code: if block {
+                                                "query_guard".into()
+                                            } else {
+                                                String::new()
+                                            },
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            };
+                            if sender.send(Ok(result)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(openshell_core::proto::http_response_event::Event::SessionEnd(_))
+                        | None => break,
+                        Some(_) => panic!("headers-only response received an unexpected event"),
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+        }
+    }
+
     #[tonic::async_trait]
     impl openshell_core::middleware::InProcessMiddleware for BlockingForwardMiddleware {
         async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
@@ -5981,7 +6119,7 @@ network_policies:
             });
             let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
-            tokio::time::timeout(
+            Box::pin(tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 handle_forward_proxy(
                     "POST",
@@ -6001,7 +6139,7 @@ network_policies:
                     None,
                     None,
                 ),
-            )
+            ))
             .await
             .expect("MCP forwarding should complete")
             .expect("handle valid MCP request");
@@ -6097,7 +6235,7 @@ network_policies:
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -6114,7 +6252,7 @@ network_policies:
                 None,
                 None,
                 None,
-            ),
+            )),
         )
         .await
         .expect("denied preflight must complete without an upstream response")
@@ -6230,7 +6368,7 @@ network_policies:
         let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
         let handler = tokio::spawn(async move {
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -6247,7 +6385,7 @@ network_policies:
                 None,
                 None,
                 None,
-            )
+            ))
             .await
         });
         let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
@@ -7131,17 +7269,6 @@ network_policies:
                 .next()
                 .expect("built-in middleware service"),
         );
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: tunnel_engine.generation_guard(),
-            l7_reevaluation: Some(ForwardL7Reevaluation {
-                config: &config,
-                engine: &tunnel_engine,
-                request_info: &request_info,
-            }),
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
@@ -7149,10 +7276,26 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            tunnel_engine.generation_guard().clone(),
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: Some(ForwardL7Reevaluation {
+                config: &config,
+                engine: &tunnel_engine,
+                request_info: &request_info,
+            }),
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
 
         let outcome = pipeline
-            .apply(request, &mut client, chain)
+            .apply(request, &mut client)
             .await
             .expect("forward middleware pipeline");
 
@@ -7229,13 +7372,6 @@ network_policies:
             canonicalize_forward_host_header(raw, "api.example.test").unwrap(),
         )
         .unwrap();
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: &guard,
-            l7_reevaluation: None,
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "blocker".into(),
             implementation: "test/blocking-forward".into(),
@@ -7243,13 +7379,25 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: None,
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
         let revoke = async {
             entered.notified().await;
             state.revoke_static_provider_environment(2);
             release.notify_one();
         };
-        let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client, chain), revoke);
+        let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client), revoke);
         let request = match outcome.expect("middleware pipeline") {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
             crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
@@ -7362,6 +7510,181 @@ network_policies:
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn plaintext_forward_relay_applies_response_middleware() {
+        let guard = forward_test_guard();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "forward".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            ForwardResponseHeadersMiddleware {
+                expected_path: "/demo".into(),
+                forbidden_path_fragment: "not-present".into(),
+                block: false,
+            },
+        ));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/forward-response".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "correlated-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let request = b"GET /demo HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let upstream_task = tokio::spawn(async move {
+            let mut request = vec![0; 1024];
+            let size = upstream.read(&mut request).await.unwrap();
+            assert!(request[..size].ends_with(b"\r\n\r\n"));
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let outcome = relay_rewritten_forward_request(
+            "GET",
+            "/demo",
+            request,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                body_classifier: None,
+                generation_guard: &guard,
+                credential_generation: None,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "api.example.test",
+                port: 80,
+                response_middleware: Some(ForwardResponseMiddleware {
+                    ctx: &ctx,
+                    scheme: "http",
+                    exchange: &exchange,
+                }),
+            },
+        )
+        .await
+        .expect("plaintext forward relay");
+        assert!(matches!(
+            outcome,
+            crate::l7::provider::RelayOutcome::Reusable
+        ));
+        upstream_task.await.unwrap();
+        drop(proxy_to_client);
+        let mut response = Vec::new();
+        app.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("x-forward-response-test: selected\r\n"));
+        assert!(response.ends_with("\r\n\r\nok"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_forward_response_denial_never_echoes_query_secret() {
+        const SECRET: &str = "sk-forward-query-secret";
+        let guard = forward_test_guard();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "forward".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            ForwardResponseHeadersMiddleware {
+                expected_path: "/demo".into(),
+                forbidden_path_fragment: SECRET.into(),
+                block: true,
+            },
+        ));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/forward-response".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "correlated-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let target = format!("/demo?access_token={SECRET}");
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n").into_bytes();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let upstream_task = tokio::spawn(async move {
+            let mut request = vec![0; 1024];
+            let size = upstream.read(&mut request).await.unwrap();
+            assert!(request[..size].ends_with(b"\r\n\r\n"));
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let outcome = relay_rewritten_forward_request(
+            "GET",
+            &target,
+            request,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                body_classifier: None,
+                generation_guard: &guard,
+                credential_generation: None,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "api.example.test",
+                port: 80,
+                response_middleware: Some(ForwardResponseMiddleware {
+                    ctx: &ctx,
+                    scheme: "http",
+                    exchange: &exchange,
+                }),
+            },
+        )
+        .await
+        .expect("plaintext forward response denial");
+        assert!(matches!(
+            outcome,
+            crate::l7::provider::RelayOutcome::Consumed
+        ));
+        upstream_task.await.unwrap();
+        drop(proxy_to_client);
+        let mut response = Vec::new();
+        app.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(response.contains("\"path\":\"/demo\""));
+        assert!(!response.contains(SECRET));
+        assert!(!response.contains("access_token"));
+    }
+
     async fn relay_forward_request_and_capture(
         method: &str,
         path: &str,
@@ -7459,6 +7782,7 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
             },
         )
         .await?;
@@ -7724,6 +8048,7 @@ network_policies:
                     signing_region: "",
                     host: "",
                     port: 0,
+                    response_middleware: None,
                 },
             )
             .await?;
@@ -9844,13 +10169,6 @@ network_policies:
                 .expect("built-in middleware service"),
         );
         let guard = forward_test_guard();
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: &guard,
-            l7_reevaluation: None,
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
@@ -9858,10 +10176,22 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            guard,
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: None,
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
 
         let allowed = pipeline
-            .apply(request, &mut client, chain)
+            .apply(request, &mut client)
             .await
             .expect("middleware pipeline");
         let crate::l7::middleware::MiddlewareApplyResult::Allowed(request) = allowed else {
@@ -10231,6 +10561,7 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
             },
         )
         .await
@@ -10313,6 +10644,7 @@ network_policies:
                 signing_region: "us-west-2",
                 host: "api.example.com",
                 port: 80,
+                response_middleware: None,
             },
         )
         .await
@@ -10402,6 +10734,7 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
             },
         )
         .await;
@@ -10453,6 +10786,7 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
             },
         )
         .await;
