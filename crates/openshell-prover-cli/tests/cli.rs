@@ -182,6 +182,35 @@ fn non_ascii_network_literals_are_unsupported_in_both_inputs() {
 }
 
 #[test]
+fn embedded_nul_network_literal_is_unsupported_without_panicking() {
+    let path = std::env::temp_dir().join(format!(
+        "openshell-prover-nul-selector-{}.yaml",
+        std::process::id()
+    ));
+    fs::write(
+        &path,
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+    )
+    .expect("write NUL selector policy");
+    let output = run(&[
+        "check",
+        path.to_str().expect("UTF-8 temporary path"),
+        "--maximum",
+        fixture("maximum-empty.yaml").to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    fs::remove_file(path).expect("remove NUL selector policy");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+    assert_eq!(value["result"], "unsupported");
+    assert_eq!(value["reason_code"], "unsupported_policy_shape");
+    assert!(value["reason"].as_str().unwrap().contains("NUL"));
+}
+
+#[test]
 fn resource_exhaustion_is_inconclusive_and_returns_three() {
     let path = std::env::temp_dir().join(format!(
         "openshell-prover-resource-limit-{}.yaml",
@@ -394,13 +423,13 @@ fn sigint_interrupts_the_check_with_exit_130() {
         .expect("send SIGINT");
     assert!(signal.success());
     let output = child.wait_with_output().expect("wait for cancelled prover");
-    fs::remove_dir_all(directory).expect("remove cancellation policies");
     assert_eq!(output.status.code(), Some(130));
     let value: Value =
         serde_json::from_slice(&output.stdout).expect("structured cancellation JSON");
     assert_eq!(value["result"], "inconclusive");
     assert_eq!(value["reason_code"], "cancelled");
     assert_eq!(value["exit_code"], 130);
+    fs::remove_dir_all(directory).expect("remove cancellation policies");
 }
 
 #[cfg(unix)]
