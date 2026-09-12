@@ -86,7 +86,7 @@ and creates a new supervisor companion. A durably stopped sandbox stays stopped
 across gateway restarts.
 
 Delete force-removes both containers, the driver-owned channel volume, and the
-host-private topology record. Missing or altered topology and channel resources
+host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
 
 ## Driver Config Mounts
