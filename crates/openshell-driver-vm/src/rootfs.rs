@@ -1456,7 +1456,7 @@ mod tests {
                 .contains("chown \"${_sandbox_uid}:${_sandbox_gid}\" \"$_sandbox_state_dir\"")
         );
         assert!(init_script.contains("chmod 0700 \"$_sandbox_state_dir\""));
-        assert!(!init_script.contains("--topology-backend-name=in-pod"));
+        assert!(!init_script.contains("--backend-name=in-pod"));
         assert!(!init_script.contains("@ISOLATION_INTERFACE_VERSION@"));
         assert!(!init_script.contains("8.8.8.8"));
         assert!(!init_script.contains("VM_NET_"));
