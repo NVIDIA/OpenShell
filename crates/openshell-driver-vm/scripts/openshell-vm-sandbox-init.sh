@@ -116,9 +116,9 @@ ensure_target_runtime() {
         cp /opt/openshell/bin/openshell-sandbox "$image_root/opt/openshell/bin/openshell-sandbox"
         chmod 0755 "$image_root/opt/openshell/bin/openshell-sandbox"
     fi
-    if [ -d /opt/openshell/bin/openshell-runtime ]; then
-        rm -rf "$image_root/opt/openshell/bin/openshell-runtime"
-        cp -a /opt/openshell/bin/openshell-runtime "$image_root/opt/openshell/bin/openshell-runtime"
+    if [ -x /opt/openshell/bin/openshell-vm-init ]; then
+        cp /opt/openshell/bin/openshell-vm-init "$image_root/opt/openshell/bin/openshell-vm-init"
+        chmod 0755 "$image_root/opt/openshell/bin/openshell-vm-init"
     fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
@@ -566,7 +566,7 @@ run_post_overlay_setup() {
     setup_sandbox_workdir
 
     configure_hostname
-    if ! ip link set lo up; then
+    if ! /opt/openshell/bin/openshell-vm-init prepare-network; then
         ts "FATAL: failed to bring up the loopback interface"
         exit 1
     fi
