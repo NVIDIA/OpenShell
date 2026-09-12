@@ -4,7 +4,7 @@
 //! Kubernetes provisioning for the shared authenticated boundary protocol.
 //!
 //! This module deliberately contains no lifecycle, process, network, identity,
-//! or wire implementation. The driver chooses the proxy-pod placement, binds
+//! or wire implementation. The driver places the sandbox runtime, binds
 //! immutable Kubernetes resource identities, and provisions TCP coordinates;
 //! `openshell-isolation-interface` and `openshell-sandbox` provide the common
 //! control and boundary behavior.
@@ -22,12 +22,12 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 
-/// Registered RFC 0012 backend name for the proxy-pod topology.
-pub const BACKEND_NAME: &str = "kubernetes-proxy-pod";
+/// Isolation backend implemented by the `OpenShell` sandbox runtime.
+pub const BACKEND_NAME: &str = openshell_sandbox_backend::BACKEND_NAME;
 
 /// Label that binds the workload and control pods in one unique pair.
 pub const BOUNDARY_PAIR_LABEL: &str = "openshell.ai/boundary-pair";
@@ -40,11 +40,11 @@ const SUPERVISOR_ROLE: &str = "supervisor";
 
 /// Driver-owned inputs for the workload pod's Kubernetes network fence.
 ///
-/// This is the first phase of proxy-pod provisioning. The driver applies the
+/// This is the first phase of sandbox-runtime provisioning. The driver applies the
 /// returned labels to the respective pods and creates the returned policy. It
 /// then observes the policy UID and resourceVersion and supplies both to
-/// `KubernetesProxyPodBoundarySpec`.
-pub struct KubernetesProxyPodNetworkFenceSpec {
+/// `KubernetesSandboxRuntimeBoundarySpec`.
+pub struct KubernetesSandboxRuntimeNetworkFenceSpec {
     pub namespace: String,
     pub policy_name: String,
     /// A unique, Kubernetes-label-safe value generated for this pod pair.
@@ -53,13 +53,13 @@ pub struct KubernetesProxyPodNetworkFenceSpec {
 }
 
 /// Labels and policy needed to remove direct workload-pod egress.
-pub struct KubernetesProxyPodNetworkFence {
+pub struct KubernetesSandboxRuntimeNetworkFence {
     pub workload_labels: BTreeMap<String, String>,
     pub control_labels: BTreeMap<String, String>,
     pub workload_policy: NetworkPolicy,
 }
 
-impl KubernetesProxyPodNetworkFenceSpec {
+impl KubernetesSandboxRuntimeNetworkFenceSpec {
     /// Render a default-deny workload fence with one control-to-boundary path.
     ///
     /// Kubernetes `NetworkPolicy` is connection-aware: traffic returning over
@@ -67,7 +67,7 @@ impl KubernetesProxyPodNetworkFenceSpec {
     /// workload pod has no egress rules. The control pod remains responsible
     /// for opening policy-approved upstream connections.
     #[must_use]
-    pub fn provision(self) -> KubernetesProxyPodNetworkFence {
+    pub fn provision(self) -> KubernetesSandboxRuntimeNetworkFence {
         let workload_labels = boundary_pair_labels(&self.pair_label_value, WORKLOAD_ROLE);
         let control_labels = boundary_pair_labels(&self.pair_label_value, SUPERVISOR_ROLE);
 
@@ -107,7 +107,7 @@ impl KubernetesProxyPodNetworkFenceSpec {
             }),
         };
 
-        KubernetesProxyPodNetworkFence {
+        KubernetesSandboxRuntimeNetworkFence {
             workload_labels,
             control_labels,
             workload_policy,
@@ -126,9 +126,9 @@ fn boundary_pair_labels(pair: &str, role: &str) -> BTreeMap<String, String> {
 ///
 /// The driver constructs this only after Kubernetes has assigned every UID and
 /// after it has observed the exact egress policy resource version. The workload
-/// stays held until the matching boundary config and control topology have been
+/// stays held until the matching boundary config and supervisor resources have been
 /// installed.
-pub struct KubernetesProxyPodBoundarySpec {
+pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub boundary_id: String,
     pub generation: String,
     pub session_id: openshell_core::SandboxSessionId,
@@ -151,17 +151,17 @@ pub struct KubernetesProxyPodBoundarySpec {
     pub child_env: HashMap<String, String>,
 }
 
-/// Protected workload-pod config and matching proxy-pod descriptor.
-pub struct KubernetesProxyPodBoundaryProvisioning {
+/// Protected workload-pod config and matching sandbox-runtime descriptor.
+pub struct KubernetesSandboxRuntimeBoundaryProvisioning {
     pub boundary_config: BoundaryConfig,
-    pub topology: BoundaryTopology,
+    pub runtime_descriptor: SandboxRuntimeDescriptor,
 }
 
-impl KubernetesProxyPodBoundarySpec {
+impl KubernetesSandboxRuntimeBoundarySpec {
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
     #[must_use]
-    pub fn provision(self) -> KubernetesProxyPodBoundaryProvisioning {
+    pub fn provision(self) -> KubernetesSandboxRuntimeBoundaryProvisioning {
         let resource_claims = BTreeMap::from([
             ("kubernetes.namespace_uid".to_string(), self.namespace_uid),
             (
@@ -193,7 +193,7 @@ impl KubernetesProxyPodBoundarySpec {
             egress_isolated: true,
             egress_rule_count: 0,
         };
-        KubernetesProxyPodBoundaryProvisioning {
+        KubernetesSandboxRuntimeBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
                 generation: self.generation.clone(),
@@ -213,7 +213,7 @@ impl KubernetesProxyPodBoundarySpec {
                 driver_fence: driver_fence.clone(),
                 child_env: self.child_env,
             },
-            topology: BoundaryTopology {
+            runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
                 generation: self.generation,
                 session_id: self.session_id,
@@ -235,8 +235,8 @@ impl KubernetesProxyPodBoundarySpec {
 mod tests {
     use super::*;
 
-    fn spec() -> KubernetesProxyPodBoundarySpec {
-        KubernetesProxyPodBoundarySpec {
+    fn spec() -> KubernetesSandboxRuntimeBoundarySpec {
+        KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),
             session_id: openshell_core::SandboxSessionId::new(),
@@ -282,25 +282,25 @@ mod tests {
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
-            provisioned.topology.resource_claims
+            provisioned.runtime_descriptor.resource_claims
         );
         assert_eq!(
-            provisioned.topology.resource_claims["kubernetes.sandbox_resource_uid"],
+            provisioned.runtime_descriptor.resource_claims["kubernetes.sandbox_resource_uid"],
             "sandbox-resource-uid"
         );
         assert_eq!(
-            provisioned.topology.resource_claims["kubernetes.egress_policy_resource_version"],
+            provisioned.runtime_descriptor.resource_claims["kubernetes.egress_policy_resource_version"],
             "1945"
         );
         assert_eq!(
             provisioned.boundary_config.driver_fence,
-            provisioned.topology.driver_fence
+            provisioned.runtime_descriptor.driver_fence
         );
         assert!(
             provisioned
-                .topology
+                .runtime_descriptor
                 .driver_fence
-                .validate_for_backend(BACKEND_NAME)
+                .validate()
                 .is_ok()
         );
     }
@@ -320,14 +320,14 @@ mod tests {
             }
         );
         assert_eq!(
-            provisioned.topology.transport,
+            provisioned.runtime_descriptor.transport,
             SandboxTransport::Tcp {
                 authority: "os-boundary-sandbox.default.svc:5500".to_string(),
                 addresses: vec!["10.42.0.7:5500".parse().expect("valid target")],
             }
         );
         assert_eq!(
-            provisioned.topology.tls,
+            provisioned.runtime_descriptor.tls,
             SandboxTlsClientConfig {
                 server_name: "boundary.sandbox.openshell".to_string(),
                 trust_anchor_pem: "test-ca".to_string(),
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn network_fence_denies_all_workload_initiated_egress() {
-        let fence = KubernetesProxyPodNetworkFenceSpec {
+        let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
             pair_label_value: "pair-1".to_string(),
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn network_fence_allows_only_paired_control_to_boundary_port() {
-        let fence = KubernetesProxyPodNetworkFenceSpec {
+        let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
             pair_label_value: "pair-1".to_string(),

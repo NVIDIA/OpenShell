@@ -22,10 +22,10 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Driver-owned requirements for the cross-pod RFC 0012 topology.
+/// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct KubernetesProxyPodConfig {
+pub struct KubernetesSandboxRuntimeConfig {
     /// Explicit operator assertion that the cluster CNI enforces
     /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
     pub network_policy_enforced: bool,
@@ -33,7 +33,7 @@ pub struct KubernetesProxyPodConfig {
     pub boundary_port: u16,
 }
 
-impl Default for KubernetesProxyPodConfig {
+impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             network_policy_enforced: false,
@@ -42,16 +42,16 @@ impl Default for KubernetesProxyPodConfig {
     }
 }
 
-impl KubernetesProxyPodConfig {
+impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.network_policy_enforced {
             return Err(
-                "proxy-pod topology requires proxy_pod.network_policy_enforced = true after the operator has verified CNI NetworkPolicy enforcement"
+                "sandbox_runtime.network_policy_enforced must be true after the operator has verified CNI NetworkPolicy enforcement"
                     .to_string(),
             );
         }
         if self.boundary_port < 1024 {
-            return Err("proxy_pod.boundary_port must be at least 1024".to_string());
+            return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
         Ok(())
     }
@@ -132,7 +132,7 @@ pub struct KubernetesComputeConfig {
     /// operator mode. Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
-    /// Kubernetes `ServiceAccount` assigned to both topology Pods. Automatic
+    /// Kubernetes `ServiceAccount` assigned to the workload and supervisor Pods. Automatic
     /// token mounting is disabled; only the supervisor receives an explicit
     /// audience-bound projected token accepted by the bootstrap authenticator.
     pub service_account_name: String,
@@ -155,7 +155,7 @@ pub struct KubernetesComputeConfig {
     /// Empty string delegates to the Kubernetes default.
     pub supervisor_image_pull_policy: String,
     /// Cross-pod sandbox/supervisor settings.
-    pub proxy_pod: KubernetesProxyPodConfig,
+    pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -269,7 +269,7 @@ impl Default for KubernetesComputeConfig {
             sandbox_runtime_image_pull_policy: String::new(),
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
-            proxy_pod: KubernetesProxyPodConfig::default(),
+            sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -330,7 +330,7 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.proxy_pod.validate()
+        self.sandbox_runtime.validate()
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_requires_network_policy_enforcement_acknowledgement() {
+    fn sandbox_runtime_requires_network_policy_enforcement_acknowledgement() {
         let mut cfg = KubernetesComputeConfig::default();
         assert!(
             cfg.validate_proxy_uid()
@@ -739,7 +739,7 @@ mod tests {
                 .contains("network_policy_enforced")
         );
 
-        cfg.proxy_pod.network_policy_enforced = true;
+        cfg.sandbox_runtime.network_policy_enforced = true;
         cfg.validate_proxy_uid().unwrap();
     }
 
@@ -751,19 +751,6 @@ mod tests {
             }
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn serde_rejects_removed_topology_alias_field() {
-        let mut json = serde_json::Map::new();
-        json.insert(
-            ["supervisor", "topology"].join("_"),
-            serde_json::json!("sidecar"),
-        );
-        let err =
-            serde_json::from_value::<KubernetesComputeConfig>(serde_json::Value::Object(json))
-                .unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 
