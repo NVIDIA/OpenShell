@@ -12,9 +12,12 @@
 #   $env:GITHUB_TOKEN = "github_pat_..."
 #   mise run --skip-tools windows:build:x64
 #
-# Run from a demo-package folder containing openshell-gateway.exe, openshell.exe,
-# the PowerShell probe, and the three configuration fixtures beside this script,
-# or pass explicit gateway and CLI paths:
+# Run from a local demo-package folder containing openshell-gateway.exe,
+# openshell.exe, the PowerShell probe, and the three configuration fixtures
+# beside this script, or pass explicit local gateway and CLI paths. When the
+# script is copied to a network share, keep the executables on a local volume;
+# Windows Application Control commonly rejects unsigned development binaries
+# launched from UNC or mapped network paths.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass `
 #     -File .\run-provider-credential-test.ps1 `
@@ -45,7 +48,10 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $resultDir = Join-Path $here "results-provider-credential-$stamp"
 New-Item -ItemType Directory -Force $resultDir | Out-Null
 
-function Step([string]$message) { Write-Host "`n=== $message ===" -ForegroundColor Cyan }
+function Step([string]$message) {
+    $script:failureStage = $message
+    Write-Host "`n=== $message ===" -ForegroundColor Cyan
+}
 function Info([string]$message) { Write-Host "    $message" }
 function Ok([string]$message) { Write-Host "[OK]   $message" -ForegroundColor Green }
 function Bad([string]$message) { Write-Host "[FAIL] $message" -ForegroundColor Red }
@@ -59,25 +65,95 @@ function Resolve-Artifact([string]$explicit, [string]$leaf) {
 
 function Escape-Toml([string]$value) { return $value.Replace('\', '\\') }
 
-function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $lines = & $cli @CommandArgs 2>&1
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    # Windows PowerShell wraps native stderr lines in ErrorRecord objects and
-    # Out-String adds a misleading "At ... NativeCommandError" block even when
-    # the command succeeds. Preserve the message without that decoration.
-    $text = (($lines | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $_.Exception.Message
-        } else {
-            $_.ToString()
+function Test-NetworkPath([string]$value) {
+    if ($value.StartsWith('\\')) { return $true }
+    if ($value -notmatch '^([A-Za-z]):[\\/]') { return $false }
+
+    $drive = Get-PSDrive -Name $Matches[1] -PSProvider FileSystem -ErrorAction SilentlyContinue
+    return $null -ne $drive -and
+        -not [string]::IsNullOrWhiteSpace($drive.DisplayRoot) -and
+        $drive.DisplayRoot.StartsWith('\\')
+}
+
+function Assert-LocalExecutable([string]$label, [string]$path) {
+    if (-not (Test-NetworkPath $path)) { return }
+
+    throw "$label executable resolves to network path '$path'. Windows Application Control can block unsigned development binaries launched from network locations. Pass -GatewayPath and -CliPath pointing to local build outputs (for example, the repository's target\x86_64-pc-windows-msvc\release directory); the script and result artifacts may remain on the network share."
+}
+
+function Get-LaunchFailureMessage([string]$label, [string]$path, [System.Exception]$exception) {
+    $messages = New-Object System.Collections.Generic.List[string]
+    $currentException = $exception
+    while ($null -ne $currentException) {
+        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) {
+            [void]$messages.Add($currentException.Message)
         }
-    }) -join [Environment]::NewLine).Trim()
+        $currentException = $currentException.InnerException
+    }
+    $message = ($messages -join ' | ')
+
+    if ($message -match '(?i)Application Control policy has blocked this file') {
+        $sha256 = try { (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash } catch { "unavailable" }
+        $signature = try { (Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop).Status } catch { "unavailable" }
+        return "Application Control blocked $label launch '$path' (SHA256=$sha256; Authenticode=$signature). Use a local, policy-approved binary and review the applicable App Control event log if the local launch is also blocked. Original error: $message"
+    }
+
+    return "failed to launch $label '$path': $message"
+}
+
+# Build one CreateProcess-compatible command-line argument. Windows PowerShell
+# 5.1 removes embedded quotes from JSON passed to native commands through the
+# call operator, which corrupts --driver-config-json before the CLI parses it.
+function Quote-NativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($ch -eq '"') {
+            [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+            [void]$quoted.Append('"')
+        } else {
+            if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
+            [void]$quoted.Append($ch)
+        }
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $cli
+    $startInfo.Arguments = (($CommandArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "failed to start $cli" }
+    } catch {
+        throw (Get-LaunchFailureMessage "CLI" $cli $_.Exception)
+    }
+
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $text = (@($stdout.Result, $stderr.Result) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    }) -join [Environment]::NewLine
+    $text = $text.Trim()
     if (-not $AllowFailure -and $exitCode -ne 0) {
         throw "openshell $($CommandArgs -join ' ') failed (exit $exitCode): $text"
     }
@@ -133,6 +209,8 @@ $providerName = "mxc-github-e2e"
 $passed = $false
 $rawTokenLeak = $false
 $artifactScanFailed = $false
+$failureReason = ""
+$failureStage = "initialization"
 $githubToken = $env:GITHUB_TOKEN
 
 try {
@@ -144,6 +222,8 @@ try {
         if (-not (Test-Path $file)) { throw "missing artifact: $file" }
         Info "found $file"
     }
+    Assert-LocalExecutable "gateway" $gateway
+    Assert-LocalExecutable "CLI" $cli
     if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
         throw "gateway port $Port is already in use"
     }
@@ -222,10 +302,14 @@ try {
     # a successful test cannot be attributed to gateway environment inheritance.
     Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
     try {
-        $gw = Start-Process -FilePath $gateway `
-            -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info") `
-            -WorkingDirectory $here -PassThru -NoNewWindow `
-            -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
+        try {
+            $gw = Start-Process -FilePath $gateway `
+                -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info") `
+                -WorkingDirectory $here -PassThru -NoNewWindow `
+                -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
+        } catch {
+            throw (Get-LaunchFailureMessage "gateway" $gateway $_.Exception)
+        }
     } finally {
         $env:GITHUB_TOKEN = $githubToken
     }
@@ -242,7 +326,12 @@ try {
 
     Step "Configure provider and effective policy"
     $env:OPENSHELL_GATEWAY = ""
-    Invoke-Cli @("gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName) | Out-Null
+    $gatewayAdd = Invoke-Cli @(
+        "gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName
+    ) -AllowFailure
+    if ($gatewayAdd.ExitCode -ne 0 -and $gatewayAdd.Text -notmatch '(?i)already exists') {
+        throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
+    }
     Invoke-Cli @("gateway", "select", $GatewayName) | Out-Null
     Invoke-Cli @("provider", "profile", "lint", "--file", $profileUsed) | Out-Null
     Invoke-Cli @("provider", "profile", "import", "--file", $profileUsed) | Out-Null
@@ -294,7 +383,11 @@ try {
     Ok "placeholder isolation, authorized rewrite, and endpoint mismatch all passed"
 }
 catch {
-    Bad $_.Exception.Message
+    $failureReason = ($_.Exception.Message -replace '\r?\n', ' | ').Trim()
+    if (-not [string]::IsNullOrWhiteSpace($githubToken)) {
+        $failureReason = $failureReason.Replace($githubToken, "***REDACTED***")
+    }
+    Bad $failureReason
 }
 finally {
     if ($cli -and $sandboxName -and $gw -and -not $gw.HasExited) {
@@ -342,6 +435,8 @@ sandbox    : $sandboxName
 backend    : process_container
 provider   : $providerName
 share_path : $ShareDir
+stage      : $failureStage
+failure    : $(if ([string]::IsNullOrWhiteSpace($failureReason)) { "none" } else { $failureReason })
 
 PASS proves:
   - MXC received a revision-scoped GITHUB_TOKEN placeholder, not the token.
