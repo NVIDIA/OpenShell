@@ -455,7 +455,7 @@ impl PodmanComputeDriver {
         }
 
         // Auto-detect the gRPC callback endpoint before deciding whether this
-        // topology needs the Podman bridge gateway address.
+        // callback route needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
             config.grpc_endpoint = gateway_callback_endpoint(
                 GatewayCallbackRoute::Podman,
@@ -470,7 +470,7 @@ impl PodmanComputeDriver {
         }
 
         // Ensure the bridge network exists. Inspect its gateway only when the
-        // selected Linux callback topology will bind that exact address.
+        // selected Linux callback route will bind that exact address.
         client.ensure_network(&config.network_name).await?;
         let uses_local_callback_alias = Url::parse(&config.grpc_endpoint)
             .ok()
@@ -3314,7 +3314,7 @@ mod tests {
             ),
             StubResponse::new(StatusCode::OK, archive.into_inner().unwrap()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
-            StubResponse::new(StatusCode::OK, ""), // refreshed supervisor auth and topology
+            StubResponse::new(StatusCode::OK, ""), // refreshed supervisor auth and runtime descriptor
             fence_response(),
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
