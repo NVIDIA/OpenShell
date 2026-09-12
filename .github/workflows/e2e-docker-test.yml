@@ -33,7 +33,7 @@ on:
         required: false
         type: string
         default: >-
-          [{"suite":"python","cmd":"mise run --no-deps --skip-deps e2e:python","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-python","cmd":"mise run --no-deps --skip-deps e2e:oidc-python:docker","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-pkce-docker","cmd":"mise run --no-deps --skip-deps e2e:oidc-pkce:docker","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker","cmd":"mise run --no-deps --skip-deps e2e:rust","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"mcp","cmd":"mise run --no-deps --skip-deps e2e:mcp","apt_packages":"","python_proto":false,"mcp":true}]
+          [{"suite":"python","cmd":"mise run --no-deps --skip-deps e2e:python","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-python","cmd":"mise run --no-deps --skip-deps e2e:oidc-python:docker","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-pkce-docker","cmd":"mise run --no-deps --skip-deps e2e:oidc-pkce:docker","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker","cmd":"mise run --no-deps --skip-deps e2e:rust","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"supervisor-middleware","cmd":"mise run --no-deps --skip-deps e2e:supervisor-middleware","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"mcp","cmd":"mise run --no-deps --skip-deps e2e:mcp","apt_packages":"","python_proto":false,"mcp":true}]
 
 permissions:
   actions: read
