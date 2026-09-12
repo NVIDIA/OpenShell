@@ -29,6 +29,10 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "d" * 64 + "  openshell-gateway-aarch64-apple-darwin.tar.gz\n",
         encoding="utf-8",
     )
+    (release_dir / "openshell-prover-checksums-sha256.txt").write_text(
+        "e" * 64 + "  openshell-prover-aarch64-apple-darwin.tar.gz\n",
+        encoding="utf-8",
+    )
 
     repo_root = Path(__file__).resolve().parents[2]
     output = tmp_path / "openshell.rb"
@@ -53,6 +57,14 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
+    assert (
+        "https://github.com/NVIDIA/OpenShell/releases/download/"
+        "v0.0.10/openshell-prover-aarch64-apple-darwin.tar.gz"
+    ) in formula
+    assert 'sha256 "' + "e" * 64 + '"' in formula
+    assert 'resource("openshell-prover").stage' in formula
+    assert 'bin.install "openshell-prover"' in formula
+    assert "#{bin}/openshell-prover --version" in formula
     assert "OPENSHELL_COMPUTE_DRIVER: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
