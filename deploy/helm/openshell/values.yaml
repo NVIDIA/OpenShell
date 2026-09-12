@@ -47,7 +47,7 @@ supervisor:
     pullPolicy: null
     # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
-  proxyPod:
+  sandboxRuntime:
     # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
     networkPolicyEnforced: false
     # -- Workload boundary TLS listener port.
