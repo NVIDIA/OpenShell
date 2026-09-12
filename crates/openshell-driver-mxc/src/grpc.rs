@@ -122,10 +122,15 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let req = request.into_inner();
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
         if req.sandbox_name.is_empty() {
             return Err(Status::invalid_argument("sandbox_name is required"));
         }
-        self.backend.stop_sandbox(&req.sandbox_name).await?;
+        self.backend
+            .stop_sandbox(&req.sandbox_id, &req.sandbox_name)
+            .await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -229,5 +234,33 @@ mod tests {
             .delete_workspace(Request::new(DeleteWorkspaceRequest::default()))
             .await
             .expect("MXC workspace deletion must remain idempotent");
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_requires_both_identifiers() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        // sandbox_id is the authoritative identity. Without it the driver would
+        // have to resolve by name, which is only unique within a workspace.
+        let missing_id = service
+            .stop_sandbox(Request::new(StopSandboxRequest {
+                sandbox_name: "demo".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a stop request without sandbox_id must be rejected");
+        assert_eq!(missing_id.code(), tonic::Code::InvalidArgument);
+        assert!(missing_id.message().contains("sandbox_id is required"));
+
+        let missing_name = service
+            .stop_sandbox(Request::new(StopSandboxRequest {
+                sandbox_id: "sb-alpha".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a stop request without sandbox_name must be rejected");
+        assert_eq!(missing_name.code(), tonic::Code::InvalidArgument);
+        assert!(missing_name.message().contains("sandbox_name is required"));
     }
 }
