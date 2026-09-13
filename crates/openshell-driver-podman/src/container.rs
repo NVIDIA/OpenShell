@@ -1451,6 +1451,20 @@ pub fn build_isolation_specs(
     workload
         .mounts
         .retain(|mount| !trusted_mount(&mount.destination));
+    workload.mounts.push(Mount {
+        kind: "tmpfs".into(),
+        source: "tmpfs".into(),
+        destination: openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.into(),
+        options: vec![
+            "rw".into(),
+            "nosuid".into(),
+            "nodev".into(),
+            format!("uid={}", input.identity.uid),
+            format!("gid={}", input.identity.gid),
+            "mode=0755".into(),
+            "size=1m".into(),
+        ],
+    });
     workload.volumes.push(NamedVolume {
         name: channel.clone(),
         dest: crate::isolation::CHANNEL_ROOT.into(),
@@ -1711,6 +1725,32 @@ mod tests {
                 .mounts
                 .iter()
                 .all(|mount| !trusted_mount(&mount.destination))
+        );
+        let supervisor_ca_mount = specs
+            .workload
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR)
+            .expect("workload supervisor CA mount");
+        assert_eq!(supervisor_ca_mount.kind, "tmpfs");
+        assert_eq!(supervisor_ca_mount.source, "tmpfs");
+        for option in [
+            "rw",
+            "nosuid",
+            "nodev",
+            "uid=1000",
+            "gid=1001",
+            "mode=0755",
+            "size=1m",
+        ] {
+            assert!(supervisor_ca_mount.options.contains(&option.to_string()));
+        }
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| mount.destination != "/run")
         );
         assert_eq!(specs.supervisor.secrets.len(), 1);
         assert_eq!(specs.supervisor.secrets[0].source, "jwt");
