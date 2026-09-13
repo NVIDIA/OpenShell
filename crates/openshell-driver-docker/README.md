@@ -74,7 +74,7 @@ LSM decisions remain authoritative.
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Set `sandbox_pids_limit = 0` to use the runtime default. |
 | Private named volume | Carries a per-generation mutual-TLS sandbox/supervisor channel without sharing daemon-host paths. The sandbox consumes its server key at startup; only the supervisor receives the client key. |
-| In-memory `/run` tmpfs | Supplies writable runtime state without changing the workload image root filesystem. |
+| In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
 ## Stop, Start, and Delete
