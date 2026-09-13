@@ -5271,9 +5271,9 @@ fn build_container_create_body_for_image(
             network_mode: Some("none".to_string()),
             dns: Some(vec!["127.0.0.53".to_string()]),
             tmpfs: Some(HashMap::from([(
-                "/run".to_string(),
+                openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
                 format!(
-                    "rw,noexec,nosuid,size=64m,uid={},gid={},mode=0755",
+                    "rw,noexec,nosuid,nodev,size=1m,uid={},gid={},mode=0755",
                     workload_identity.uid, workload_identity.gid
                 ),
             )])),
