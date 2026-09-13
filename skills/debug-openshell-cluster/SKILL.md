@@ -223,7 +223,8 @@ Common findings:
   callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
   upgrade.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
-- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the Docker or Podman driver supplied the `policy-dns-transparent-tcp` runtime capability and inspect supervisor logs for missing `nft`, synthetic-route overlap, or namespace-local DNS/TCP listener bind failures. Kubernetes, VM, sidecar, and out-of-tree drivers must reject this policy until they provide the complete substrate; use omitted protocol with an explicit proxy on those runtimes.
+- Supervisor runtime validation fails: verify `supervisor_image` contains a static `/openshell-supervisor` executable from the same release as the sandbox runtime.
+- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
@@ -426,7 +427,7 @@ If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
-and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; sandbox pods must
+and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
 receive the matching Workload API socket from the Kubernetes driver config.
 The gateway verifies supervisor JWT-SVIDs from JWT bundles fetched through this
 Workload API socket, not from the SPIRE OIDC discovery endpoint.
@@ -549,58 +550,49 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
-If `topology = "sidecar"` is rendered under `[openshell.drivers.kubernetes]`,
-sandbox pods should have an `openshell-network-init` init container running
-`--mode=network-init`, an `agent` container running
-`openshell-sandbox --mode=process`, and an `openshell-supervisor-network`
-container running `--mode=network`. The init container owns nftables setup and
-should be the only sidecar topology container with `NET_ADMIN`. It also needs
-`CHOWN`/`FOWNER` to hand shared emptyDir state to the effective sidecar UID. The
-default binary-aware network sidecar runs as UID 0 with primary GID
-`sandbox_gid` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH`. When
-`process_binary_aware_network_policy = false`, it runs as the configured
-non-root `proxy_uid` without those inspection capabilities. That dedicated
-proxy UID must remain at least `1000` and must not match the workload UID
-because the pod egress fence exempts its traffic. The pod `fsGroup` is set to
-`sandbox_gid` in both modes.
+The Kubernetes driver creates a sandbox workload Pod and a separate, directly
+managed supervisor Pod. Helm must render
+`network_policy_enforced = true`. This is an explicit operator assertion that
+the cluster CNI enforces Kubernetes NetworkPolicy; the Kubernetes API cannot
+attest enforcement. Run sandboxes only in a trusted namespace
+where tenants cannot create Pods, copy OpenShell role labels, or read the
+bootstrap Secret.
 
-In sidecar topology only the network sidecar should mount the gateway bootstrap
-credentials (`openshell-sa-token` and `openshell-client-tls`). The process
-container should not receive `OPENSHELL_ENDPOINT`, gateway TLS env vars, the
-sandbox token file, or those credential mounts. Instead, the network sidecar
-serves policy and provider environment state over the Unix control socket from
-`OPENSHELL_SIDECAR_CONTROL_SOCKET` (`/run/openshell-sidecar/control.sock` by
-default). The process supervisor must be the first and only client. After
-validating its peer UID, GID, and PID, the sidecar unlinks the listener. If the
-connection later closes, the network sidecar exits non-zero so Kubernetes can
-restart it with a fresh listener. If the process supervisor fails before
-launching the workload,
-inspect both containers for control-socket bind, connect, bootstrap, or update
-errors. If new SSH/exec sessions do not pick up refreshed provider environment,
-inspect the network sidecar settings-poll logs and the process container logs
-for provider environment update handling; the process container should consume
-newer provider-env revisions without receiving gateway credentials.
+The workload Pod runs `/openshell-sandbox`. It has no gateway credentials and
+no direct egress. One namespace-wide workload NetworkPolicy is created before
+the suspended Sandbox resource. It denies all workload egress and allows
+supervisor Pods to reach sandbox TLS listeners. The driver then creates a
+per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
+Pod before releasing either Pod. The supervisor Pod runs
+`/openshell-supervisor`. Both Pods use the
+same resolved non-root identity, request no capabilities, drop `ALL`, disable
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
+the sandbox over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication, and owns gateway policy, provider
+credentials, DNS, and mediated upstream connections.
 
-The process container reports the workload entrypoint PID over the same control
-socket, and the network sidecar uses that PID for binary-scoped policy
-decisions through `/proc`. If rules with `policy.binaries` are unexpectedly
-denied, inspect the sidecar control logs and confirm the pod has
-`shareProcessNamespace: true`.
-The shared state directory should preserve `sandbox_gid` inheritance
-(`02775`). Sidecar SSH uses the Linux abstract socket
-`@openshell-sidecar-ssh`; the network sidecar verifies its peer PID before
-bridging gateway relay requests. No `ssh.sock` file should appear in the shared
-state directory.
-Inspect all three when sandbox registration or egress enforcement fails:
+Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
+or loses readiness:
 
 ```bash
-kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='
-kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
-kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
-kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
-kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
-kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
+kubectl -n <sandbox-namespace> get sandbox,pod,service,secret -l openshell.ai/sandbox-id=<sandbox-id>
+kubectl -n <sandbox-namespace> get networkpolicy openshell-sandbox-workloads -o yaml
+kubectl -n <sandbox-namespace> describe pod -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=supervisor
+kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200
+kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload -o yaml
+kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
+
+Creation and recovery fail closed. A missing Secret leaves both pods inert; a
+missing or unobserved workload fence must prevent the driver from releasing the
+Sandbox; and readiness requires both Agent Sandbox readiness and an Available
+supervisor Pod. Its exec readiness check succeeds only after the
+supervisor has attached, confirmed enforcement, started or resumed the
+workload, and registered the gateway access plane. Use both Pod logs for
+bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked
+a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
+capabilities, gateway egress, or credentials to the workload Pod as a
+workaround.
 
 #### Corporate upstream proxy
 
@@ -617,26 +609,21 @@ helm -n openshell get values openshell | grep -A8 upstreamProxy
 ```
 
 Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
-plain-HTTP egress are out of scope and rejected. Proxy credentials require
-`topology = "sidecar"` — combined topology shares the credential mount with the
-workload, so the gateway rejects credentials there. The credential Secret named
-by `proxy_auth_secret_name` must exist in the sandbox namespace with the key
-named by `proxy_auth_secret_key`, and Kubernetes will not create keys longer
-than 253 bytes or named `.`/`..`.
+plain-HTTP egress are out of scope and rejected. The credential Secret named by
+`proxy_auth_secret_name` must exist in the sandbox namespace with the key named
+by `proxy_auth_secret_key`, and Kubernetes will not create keys longer than 253
+bytes or named `.`/`..`.
 
-The proxy arguments and credential mount are injected only into the container
-that runs network supervision (the `agent` container in combined topology, the
-`openshell-supervisor-network` sidecar in sidecar topology). The one-shot
-`openshell-network-init` container and the process `agent` container in sidecar
-topology must never receive them. The credential is projected read-only as the
+The proxy arguments and credential mount are injected only into the supervisor
+Pod. The sandbox Pod must never receive them. The credential is projected read-only as the
 `openshell-upstream-proxy-auth` volume at `/run/openshell/upstream-proxy-auth`
 and passed as `--upstream-proxy-auth-file`; it must never appear in env,
 annotations, or command arguments.
 
 ```bash
 kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
-kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}' | grep -- '--upstream-'
-kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{": "}{range .volumeMounts[*]}{.name}{" "}{end}{"\n"}{end}' | grep upstream-proxy-auth
+kubectl -n <sandbox-namespace> get deployment <supervisor-deployment> -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}' | grep -- '--upstream-'
+kubectl -n <sandbox-namespace> get deployment <supervisor-deployment> -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{": "}{range .volumeMounts[*]}{.name}{" "}{end}{"\n"}{end}' | grep upstream-proxy-auth
 kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
 ```
 
@@ -649,7 +636,7 @@ destination that should be direct is missing from `no_proxy`. Inspect the
 network supervisor logs for CONNECT and upstream-proxy decisions:
 
 ```bash
-kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200 | grep -Ei 'upstream|connect|proxy'
+kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
 ### Step 7: Check VM-Backed Gateways
