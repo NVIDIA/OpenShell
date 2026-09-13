@@ -3,10 +3,9 @@
 
 """Python SDK policy integration tests.
 
-Transparent network interception is exercised by the Rust E2E suites, which
-cover TCP, DNS, L7, SSRF, policy reload, and credential rewriting without a
-workload-visible forward-proxy endpoint. This module keeps the SDK-level
-policy checks that do not depend on the retired ``10.200.0.1:3128`` contract.
+The Rust E2E suites cover the complete transparent mediation pipeline. These
+SDK-level checks retain the most important policy denials through normal
+workload sockets, without relying on a workload-visible proxy endpoint.
 """
 
 from __future__ import annotations
@@ -30,9 +29,7 @@ _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
-_BASE_PROCESS = sandbox_pb2.ProcessPolicy(
-    run_as_user="sandbox", run_as_group="sandbox"
-)
+_BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 
 
 def _base_policy(
@@ -44,6 +41,39 @@ def _base_policy(
         landlock=_BASE_LANDLOCK,
         process=_BASE_PROCESS,
         network_policies=network_policies or {},
+    )
+
+
+def _tcp_connect_errno():
+    def connect(host: str, port: int) -> int:
+        import socket
+
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return 0
+        except OSError as error:
+            return error.errno or -1
+
+    return connect
+
+
+def _network_rule(
+    host: str,
+    port: int,
+    *,
+    binary: str = "/**",
+    allowed_ips: list[str] | None = None,
+) -> sandbox_pb2.NetworkPolicyRule:
+    return sandbox_pb2.NetworkPolicyRule(
+        name="test_rule",
+        endpoints=[
+            sandbox_pb2.NetworkEndpoint(
+                host=host,
+                port=port,
+                allowed_ips=allowed_ips or [],
+            )
+        ],
+        binaries=[sandbox_pb2.NetworkBinary(path=binary)],
     )
 
 
@@ -72,6 +102,56 @@ def test_policy_applies_to_exec_commands(
         file_result = policy_sandbox.exec_python(write_allowed_files)
         assert file_result.exit_code == 0, file_result.stderr
         assert file_result.stdout.strip() == "ok"
+
+
+@pytest.mark.parametrize(
+    ("policy", "host", "port"),
+    [
+        (_base_policy(), "example.com", 443),
+        (
+            _base_policy(
+                {"test_rule": _network_rule("example.com", 80)},
+            ),
+            "example.com",
+            443,
+        ),
+        (
+            _base_policy(
+                {"test_rule": _network_rule("example.com", 443, binary="/bin/false")},
+            ),
+            "example.com",
+            443,
+        ),
+        (
+            _base_policy(
+                {
+                    "test_rule": _network_rule(
+                        "127.0.0.1",
+                        9,
+                        allowed_ips=["127.0.0.1/32"],
+                    )
+                },
+            ),
+            "127.0.0.1",
+            9,
+        ),
+    ],
+    ids=["no-policy", "wrong-port", "wrong-binary", "loopback-ssrf"],
+)
+def test_transparent_tcp_policy_denies_unauthorized_connections(
+    sandbox: Callable[..., Sandbox],
+    policy: sandbox_pb2.SandboxPolicy,
+    host: str,
+    port: int,
+) -> None:
+    import errno
+
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as policy_sandbox:
+        result = policy_sandbox.exec_python(_tcp_connect_errno(), host, port)
+
+    assert result.exit_code == 0, result.stderr
+    assert int(result.stdout.strip()) in {errno.EACCES, errno.EPERM}
 
 
 def test_conflicting_destination_metadata_is_rejected(
