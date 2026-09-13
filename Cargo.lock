@@ -4220,14 +4220,17 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
+ "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "tar",
  "temp-env",
  "thiserror 2.0.18",
  "tokio",
@@ -4238,6 +4241,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

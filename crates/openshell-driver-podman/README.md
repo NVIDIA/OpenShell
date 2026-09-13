@@ -1,489 +1,121 @@
 # openshell-driver-podman
 
-The Podman compute driver manages sandbox containers via the Podman REST API
-over a Unix socket. It targets single-machine and developer environments where
-rootless container isolation is preferred over a full Kubernetes cluster. The
-driver runs in-process within the gateway server and delegates all sandbox
-isolation enforcement to the `openshell-sandbox` supervisor binary, which is
-sideloaded into each container via an OCI image volume mount.
+The Podman compute driver runs inside the gateway and uses the native libpod
+REST API over a Unix socket. Each sandbox has two independent containers:
 
-When the gateway configures `[openshell.gateway.otlp]`, Podman compute-driver
-spans export to the same OTLP/gRPC collector with the service name
-`openshell-driver-podman`. The driver preserves the gateway trace context and
-uses the same compute-driver RPC span names in its in-process and standalone
-forms.
+- `openshell-sandbox` owns the agent process in the workload container.
+- `openshell-supervisor` evaluates policy, holds gateway credentials, and
+  proxies approved egress in a separate companion container.
 
-`mise run gateway:podman` enables this export only when a local collector is
-listening on `127.0.0.1:4317`. Otherwise, it omits the gateway OTLP configuration
-so the development gateway does not repeatedly report export failures.
+The driver provisions placement, identity, credentials, transport, and lifecycle.
+The shared isolation interface supplies exec, attach, signal, terminate, binary
+identity, DNS, TCP, and loopback-forwarding semantics.
 
-Before creating the container, the driver inspects the final sandbox image and
-captures its immutable image ID and raw OCI `Config.User`. Container creation
-uses that image ID with pulling disabled, preventing a mutable tag from changing
-between inspection and launch. The supervisor runs as root, resolves omitted
-policy identity fields from the image declaration, and drops only agent
-children to the completed identity. Named OCI components remain names after
-validation; a missing group is filled with the user's numeric primary GID. Explicit
-`process.run_as_user` and `process.run_as_group` values take precedence
-independently.
+## Runtime posture
 
-For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
-
-## Stop and Start
-
-Stop stops the managed container without deleting it. The per-sandbox named
-workspace volume, token and proxy-auth secrets, labels, and container metadata
-remain intact. Start starts the same container and reuses the same named
-volume. Stopped managed containers remain visible through list and watch
-reconciliation. Delete remains responsible for removing the container,
-driver-owned secrets, and workspace volume.
-
-The stop call waits until Podman reports the container as stopped or exited.
-This keeps an immediate start from racing a rootless Podman stop that is still
-finishing after its API request returns.
-
-Graceful gateway shutdown sends `StopSandbox` for each sandbox whose persisted
-phase requires running compute without changing that persisted intent. On
-startup, the gateway sends an idempotent `StartSandbox` request for the same
-sandboxes, restarting their retained containers. Explicitly stopped sandboxes
-remain excluded.
-
-## Architecture
-
-The Podman driver communicates with the Podman daemon over a Unix socket and
-delegates sandbox isolation to the supervisor binary running inside each
-container.
-
-```mermaid
-graph TB
-    CLI["openshell CLI"] -->|gRPC| GW["Gateway Server<br/>(openshell-server)"]
-    GW -->|in-process| PD["PodmanComputeDriver"]
-    PD -->|HTTP/1.1<br/>Unix socket| PA["Podman API"]
-    PA -->|OCI runtime<br/>crun/runc| C["Sandbox Container"]
-    C -->|image volume<br/>read-only| SV["Supervisor Binary<br/>/opt/openshell/bin/openshell-sandbox"]
-    SV -->|creates| NS["Nested Network Namespace<br/>veth pair + proxy"]
-    SV -->|enforces| LL["Landlock + seccomp"]
-    SV -->|gRPC callback| GW
-```
-
-## Isolation Model
-
-The Podman driver provides the same protection layers as the other compute
-drivers. The driver itself does not implement isolation primitives directly. It
-configures the container so that the `openshell-sandbox` supervisor can enforce
-them at runtime.
-
-### Container Security Configuration
-
-The container spec in `container.rs` sets these security-critical fields:
-
-| Setting | Value | Rationale |
+| Property | Workload | Supervisor |
 |---|---|---|
-| `user` | `0:0` | The supervisor needs root inside the container for namespace creation, proxy setup, Landlock, seccomp, and filesystem preparation. |
-| `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
-| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP`, `KILL` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, child bounding-set cleanup, and forwarding shutdown signals to a workload that runs as the sandbox user. Policy DNS binds an unprivileged supervisor port and does not require `NET_BIND_SERVICE`. |
-| `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
-| `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
-| `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
-| CDI GPU devices | Opaque `driver_config.cdi_devices` values when set, otherwise the requested count of NVIDIA CDI GPUs selected in round-robin order. Local `/dev/dxg` permits `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. | Exposes requested GPUs to GPU-enabled sandbox containers. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
+| UID/GID | Pinned non-root workload identity | Same mapped identity |
+| Capabilities | Drop all; add none | Drop all; add none |
+| Seccomp | Runtime default plus sandbox-installed filters | Runtime default |
+| Network | `none`; loopback only | Podman host network |
+| Gateway JWT and upstream credentials | Never mounted | Podman secrets |
+| User volumes and CDI devices | Workload only | Never mounted |
+| Channel | Private named volume, writable | Same volume, read-only |
 
-The restricted agent child does not retain these supervisor privileges.
+Podman creates the namespaces and volume ownership before the workload runs.
+Rootless operation uses the operator's Podman service and subordinate-ID
+configuration; it does not require adding capabilities to either container.
+The supervisor joins the workload's **user namespace only** to preserve UID/GID
+mapping for shared-volume access. PID, mount, and network namespaces remain
+separate. The channel volume uses shared SELinux relabeling (`:z`).
 
-## Driver Config Mounts
+Before starting either container, the driver uploads volume-relative archives
+directly to the channel and workspace volume destinations. A rootfs upload on a
+stopped Podman container does not populate nested named volumes. Restart restores
+only the channel bootstrap into the existing channel volume, preserving the
+workspace. The workload starts before the supervisor so its user namespace exists
+when the supervisor joins it; a stopped supervisor resolves that namespace again
+on its next start.
 
-The gateway forwards the `podman` block from `--driver-config-json` to this
-driver. The driver accepts user-supplied `mounts` entries with these Podman
-mount types:
+The runtime must pass the sandbox's unprivileged enforcement probe, including
+nested seccomp notification and Landlock. Unsupported runtime defaults fail
+closed; do not switch to an unconfined profile or add capabilities.
 
-- `bind`: mounts an absolute host path when `[openshell.drivers.podman]`
-  has `enable_bind_mounts = true`.
-- `volume`: mounts an existing Podman named volume. The driver validates that
-  the volume exists before provisioning and never creates or removes it. Podman
-  local-driver volumes created with bind options are treated as host bind
-  mounts and require `enable_bind_mounts = true`.
-- `tmpfs`: mounts an in-memory filesystem with optional `options`,
-  `size_bytes`, and `mode`.
-- `image`: mounts an OCI image through Podman's image-volume API. The driver
-  pulls the image during provisioning using the sandbox image pull policy.
+## Protected channel and network enforcement
 
-Host bind mounts are disabled by default because they expose gateway host paths
-to sandbox requests. The driver still uses internal bind mounts for configured
-TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
-
-Podman `bind` mounts accept `source`, `target`, optional `read_only`, and an
-optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
-`:Z`) for SELinux-enforcing hosts. User-supplied bind and volume mounts are
-read-only by default; set `read_only: false` to make them writable. Podman
-image and volume mounts do not support `subpath` in OpenShell driver config.
-Mount `source` and `target` values must not contain surrounding whitespace.
-Mount targets must be absolute container paths and must not replace
-the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
-`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
-
-Example named-volume usage:
-
-```shell
-podman volume create openshell-work
-
-openshell sandbox create \
-  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work"}]}}' \
-  -- claude
+```text
+agent -> openshell-sandbox === authenticated gRPC / private UDS === supervisor -> network
+         network=none           TCP, DNS, control streams         policy + gateway JWT
 ```
 
-### Capability Breakdown
+The workload has no external interface or published port. Seccomp socket
+mediation carries TCP and DNS through one authenticated gRPC connection.
+DNS remains supervisor-mediated; general UDP is unsupported. The driver sets
+`net.ipv4.ip_unprivileged_port_start=0` in the isolated workload network
+namespace so the sandbox's loopback DNS relay can bind port 53 without a
+capability. No nftables or nested network namespace setup runs in the sandbox.
 
-| Capability | Purpose |
-|---|---|
-| `SYS_ADMIN` | seccomp filter installation, namespace creation, and Landlock setup. |
-| `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and nftables. |
-| `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
-| `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
-| `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |
-| `SETPCAP` | Clearing the restricted child process capability bounding set before exec. |
+The channel contains the sandbox bootstrap and sandbox-side TLS identity only.
+Supervisor private keys and the runtime descriptor stay in the supervisor's private filesystem.
+Landlock denies agent access to the top-level `/.openshell` control hierarchy.
+The driver verifies Podman's reported `network=none` fence before launch and
+restart. `host.containers.internal` and callback networking apply to the
+supervisor, not the agent.
 
-The driver intentionally keeps Podman's default `SETUID`, `SETGID`, `CHOWN`,
-and `FOWNER` capabilities because the supervisor needs them to drop privileges
-and prepare writable sandbox directories. It also keeps `SETPCAP` until child
-setup so `drop_privileges()` can clear the child capability bounding set before
-exec. It drops unneeded defaults such as
-`DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_RAW`, `SETFCAP`,
-and `SYS_CHROOT`.
+Gateway callbacks use the existing sandbox JWT and optional configured mTLS
+bundle. The sandbox/supervisor channel always uses its separate, per-sandbox
+mutual TLS material. These are distinct authentication relationships.
 
-## Supervisor Sideloading
+## Identity and trusted binaries
 
-The supervisor binary is delivered to sandbox containers via Podman's OCI image
-volume mechanism, distinct from both the Kubernetes pod-volume approach and the
-VM's embedded guest bundle.
+Both workload and supervisor images are pinned by immutable image ID. The
+driver reads account files from a stopped workload-image container; it never
+executes the image to resolve an account. Policy identity fields override OCI
+`USER` independently. Named users/groups resolve against that image, including
+supplementary groups. Root and unresolved identities fail before provisioning.
+Images must not prepopulate the reserved `/.openshell` hierarchy; this prevents
+image-controlled symlinks from aliasing private control state into user mounts.
 
-```mermaid
-sequenceDiagram
-    participant D as PodmanComputeDriver
-    participant P as Podman API
-    participant C as Sandbox Container
+`sandbox_runtime_image` supplies the statically linked musl
+`/openshell-sandbox` binary. Podman's read-only image volume delivers it to the
+workload; user-namespace modes that cannot use image volumes retain the trusted
+binary extraction path. `supervisor_image` supplies the dynamically linked
+glibc `/openshell-supervisor` binary outside the workload. Image and request
+environment belong to agent children, never the supervisor process.
 
-    D->>P: pull_image(supervisor, "missing")
-    D->>P: create_container(spec with image_volumes)
-    Note over P: Podman resolves image_volumes at<br/>libpod layer before OCI spec generation
-    P->>C: Mount supervisor image at /opt/openshell/bin (read-only)
-    D->>P: start_container
-    C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
-```
+## Lifecycle and readiness
 
-The supervisor image from `deploy/docker/Dockerfile.supervisor` provides the
-static `openshell-sandbox` binary at `/openshell-sandbox`.
-Mounting that image at `/opt/openshell/bin` makes the binary available as
-`/opt/openshell/bin/openshell-sandbox`.
+Create builds both stopped containers and stages the private archives before
+starting either container. The sandbox does not execute the agent until the
+supervisor authenticates and confirms the common boundary contract. Failed
+creation removes only containers created by that attempt, then cleans up
+driver-owned volumes and secrets.
 
-The container spec sets that binary as the entrypoint. This avoids relying on
-the sandbox image entrypoint or command, which might otherwise append the
-supervisor path as an argument to an image-provided shell.
+Stop retains both containers, workspace, channel, and secrets. Start restores
+the consumed sandbox bootstrap from a copy in the supervisor's private
+filesystem, verifies the fence, and starts the same pair. A failed supervisor
+start stops the workload. Delete removes the companion first, then the workload,
+channel, workspace, and driver-owned secrets. User-owned volumes are retained.
 
-## TLS
+Only workload containers appear in sandbox list/watch results. Readiness uses
+the supervisor's private health socket; there is no shell, legacy marker, or
+TCP-listener shortcut. Watch reconciliation and supervisor exit/removal events
+stop a running workload whose companion is unavailable. The gateway also
+requires the authenticated supervisor session before publishing Ready.
 
-When all three Podman TLS paths are set, the driver treats sandbox callbacks as
-mTLS callbacks:
+## Mounts, GPUs, and configuration
 
-- `OPENSHELL_PODMAN_TLS_CA`
-- `OPENSHELL_PODMAN_TLS_CERT`
-- `OPENSHELL_PODMAN_TLS_KEY`
+User `bind`, `volume`, `tmpfs`, and `image` mounts and CDI GPU selection remain
+native Podman features and apply only to the workload. Bind mounts require the
+operator's `enable_bind_mounts` opt-in. Reserved control paths and the workspace
+root cannot be replaced. User-owned volumes are never created or deleted.
 
-The driver validates that the TLS paths are provided as a complete set. Partial
-configuration fails early instead of silently falling back to plaintext.
+See [gateway configuration](../../docs/reference/gateway-config.mdx) for
+operator settings and [NETWORKING.md](NETWORKING.md) for callback networking.
+The supervisor uses Podman's host network and owns the upstream proxy settings.
+`health_check_interval_secs=0` uses a one-second check rather than disabling
+the readiness check required by this architecture.
 
-When enabled, the driver:
-
-1. Switches the auto-detected endpoint scheme from `http://` to `https://`.
-2. Bind-mounts the client cert files read-only into the container at
-   `/etc/openshell/tls/client/`.
-3. Sets `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT`, and `OPENSHELL_TLS_KEY` to
-   the container-side paths.
-
-The supervisor reads these env vars and uses them to establish an mTLS
-connection back to the gateway. On SELinux systems, the bind mounts include
-Podman's shared relabel option so the container process can read the files.
-
-The RPM packaging auto-generates a self-signed PKI on first start via
-`openshell-gateway generate-certs`. Client certs are placed in the CLI
-auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so
-the CLI connects with mTLS without manual configuration. See
-`deploy/rpm/CONFIGURATION.md` for the full RPM configuration reference.
-
-## Network Model
-
-Sandbox network isolation uses a two-layer approach: a Podman bridge network
-for container-to-host communication, and a nested network namespace created by
-the supervisor for sandbox process isolation.
-
-```mermaid
-graph TB
-    subgraph Host
-        GW["Gateway Server<br/>127.0.0.1:17670"]
-        PS["Podman Socket"]
-    end
-
-    subgraph Bridge["Podman Bridge Network (10.89.x.x)"]
-        subgraph Container["Sandbox Container"]
-            SV["Supervisor<br/>(root in user ns)"]
-            subgraph NestedNS["Nested Network Namespace"]
-                SP["Sandbox Process<br/>(resolved non-root identity)"]
-                VE2["veth1: 10.200.0.2"]
-            end
-            VE1["veth0: 10.200.0.1<br/>(CONNECT proxy)"]
-            SV --- VE1
-            VE1 ---|veth pair| VE2
-        end
-    end
-
-    GW -.->|SSH via supervisor relay<br/>gRPC session| SV
-    SV -->|gRPC callback via<br/>host.containers.internal| GW
-    SP -->|all egress via proxy| VE1
-```
-
-Key points:
-
-- Bridge network: created by `client.ensure_network()` with DNS enabled.
-  Containers on the bridge can see each other at L3, but sandbox processes
-  cannot because they are isolated inside the nested netns.
-- Nested netns: the supervisor creates a private `NetworkNamespace` with a veth
-  pair. Sandbox processes enter this netns via `setns(fd, CLONE_NEWNET)` in the
-  `pre_exec` hook, forcing ordinary traffic through the CONNECT proxy.
-- Policy DNS and transparent TCP: the driver advertises the complete
-  `policy-dns-transparent-tcp` substrate. For explicit `protocol: tcp`
-  endpoints, the supervisor installs namespace-local DNS listeners, synthetic
-  routes, and TCP redirect rules before starting the workload. The container
-  disables Podman's implicit DNS search suffix so policy DNS evaluates the
-  exact endpoint name requested by the workload, and asks libc to use the
-  policy DNS TCP listener to avoid rootless Podman's nested UDP NAT return
-  path.
-- Port publishing: the container spec still requests `host_port: 0` for the
-  configured SSH port. The gateway SSH tunnel uses the supervisor relay rather
-  than connecting directly to the published port.
-- Host gateway: `host.containers.internal` and `host.openshell.internal` are
-  injected into `/etc/hosts` so containers can reach services on the gateway
-  host. Linux defaults to Podman's `host-gateway` resolver. macOS Podman
-  machine defaults to gvproxy's host-loopback IP, `192.168.127.254`, because
-  stale Podman machines may fail to resolve `host-gateway`.
-- nsenter: the supervisor uses `nsenter --net=` instead of `ip netns exec` for
-  namespace operations, avoiding the sysfs remount path that fails in rootless
-  containers.
-
-See [NETWORKING.md](NETWORKING.md) for the rootless Podman networking deep dive.
-
-## Supervisor Relay
-
-Podman follows the same end-to-end contract as the Kubernetes and VM drivers
-for the in-container SSH relay: gateway config to `PodmanComputeConfig` to
-sandbox environment to supervisor session registration on that path.
-
-1. `[openshell.drivers.podman].ssh_socket_path` is deserialized into
-   `PodmanComputeConfig::ssh_socket_path` when the gateway builds the in-process
-   driver. The field defaults to `/run/openshell/ssh.sock` when omitted.
-2. `build_env()` in `container.rs` sets `OPENSHELL_SSH_SOCKET_PATH` to that
-   value, alongside required vars such as `OPENSHELL_ENDPOINT` and
-   `OPENSHELL_SANDBOX_ID`. These driver-controlled entries overwrite template
-   environment variables to prevent spoofing.
-3. The supervisor reads `OPENSHELL_SSH_SOCKET_PATH` and uses it for the Unix
-   socket the gateway's SSH stack bridges to.
-
-The standalone `openshell-driver-podman` binary sets the same struct field from
-`OPENSHELL_SANDBOX_SSH_SOCKET_PATH`.
-
-## Credential Injection
-
-Sandboxes authenticate to the gateway via mTLS using client materials bind-
-mounted into the container from a Podman secret. No shared per-request secret
-is injected as an environment variable.
-
-| Credential | Mechanism | Visible in `inspect`? | Visible in `/proc/<pid>/environ`? |
-|---|---|---|---|
-| mTLS client cert/key | Bind-mounted file paths (`OPENSHELL_TLS_*` env vars point at them) | Yes (paths only) | Yes (paths only) |
-| Sandbox identity | Plaintext env var | Yes | Yes |
-| gRPC endpoint | Plaintext env var, override-protected | Yes | Yes |
-| Supervisor relay socket path | Plaintext env var, override-protected | Yes | Yes |
-
-The `build_env()` function inserts user-supplied variables first, then
-unconditionally overwrites all security-critical variables to prevent spoofing
-via sandbox templates:
-
-- `OPENSHELL_SANDBOX`
-- `OPENSHELL_SANDBOX_ID`
-- `OPENSHELL_ENDPOINT`
-- `OPENSHELL_SSH_SOCKET_PATH`
-- `OPENSHELL_CONTAINER_IMAGE`
-- `OPENSHELL_MAIN_PROCESS_SPEC`
-
-## Sandbox Lifecycle
-
-### Creation Flow
-
-```mermaid
-sequenceDiagram
-    participant GW as Gateway
-    participant D as PodmanComputeDriver
-    participant P as Podman API
-
-    GW->>D: create_sandbox(DriverSandbox)
-    D->>D: validate name + id
-    D->>D: validated_container_name()
-
-    D->>P: pull_image(supervisor, "missing")
-    D->>P: pull_image(sandbox_image, policy)
-
-    D->>P: create_volume(workspace)
-    Note over D: On failure below, rollback volume
-
-    D->>P: create_container(spec)
-    alt Conflict (409)
-        D->>P: remove_volume
-        D-->>GW: AlreadyExists
-    end
-    Note over D: On failure below, rollback container + volume
-
-    D->>P: start_container
-    D-->>GW: Ok
-```
-
-Each step rolls back previously-created resources on failure. The Conflict path
-cleans up the volume because it is keyed by the new sandbox's ID, not the
-conflicting container's ID.
-
-### Readiness and Health
-
-The container `healthconfig` marks the sandbox healthy when any of these
-signals succeeds:
-
-- Legacy marker file `/var/run/openshell-ssh-ready`.
-- `test -S` on the configured supervisor Unix socket path.
-- The prior TCP check for a listener on the in-container SSH port.
-
-The Unix socket check allows relay-only backend readiness when the supervisor
-exposes the socket without the old marker or published-port signal. Omitting
-`health_check_interval_secs` disables these Podman/conmon probes, but it does
-not bypass public readiness gating: the gateway keeps a backend-ready sandbox
-in `Provisioning` with `SupervisorNotConnected` until its supervisor control
-session is connected.
-
-### Deletion Flow
-
-1. Validate `sandbox_name` and stable `sandbox_id` from `DeleteSandboxRequest`.
-2. Best-effort inspect cross-checks the container label when present, but
-   cleanup remains keyed by the request `sandbox_id`.
-3. Best-effort stop, ignoring the stop result.
-4. Force-remove the container.
-5. Remove workspace volume derived from the request `sandbox_id`, warning on
-   failure and continuing.
-
-If the container is already gone during inspect or remove, the driver still
-performs idempotent volume cleanup using the request `sandbox_id` and
-returns `Ok(false)` for the container-delete result. This prevents leaked
-Podman resources after out-of-band container removal or label drift.
-
-## Configuration
-
-| Environment Variable | CLI Flag | Default | Description |
-|---|---|---|---|
-| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | Probes known local Podman API sockets and uses the first responsive socket, then falls back to asking the `podman` CLI for the host-side socket. Fails to start if neither finds one. | Podman API Unix socket path. |
-| `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
-| `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `if_not_present` | Pull policy: `always`, `if_not_present`, `never`, or `newer`. |
-| `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
-| `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `17670` | Gateway port used for endpoint auto-detection by the standalone binary. |
-| `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
-| `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
-| `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
-| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
-| `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Omission uses OpenShell's `2048` default; explicit `0` is invalid. |
-| `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
-| `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
-| `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
-| `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
-| `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Credential-free `http://host:port` and `https://host:port` URLs are supported (scheme and port required). For an `https://` proxy the supervisor TLS-wraps the proxy connection, verifying the proxy certificate against the built-in and system roots plus `--sandbox-proxy-ca-bundle`. Plain-HTTP requests always dial directly. |
-| `OPENSHELL_SANDBOX_NO_PROXY` | `--sandbox-no-proxy` | unset | Comma-separated `NO_PROXY` list (hostnames, domain suffixes, IPs, CIDRs, each with an optional `:port` qualifier) dialed directly instead of through the corporate proxy. IP/CIDR entries also match hostnames through their validated DNS resolution. |
-| `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
-| `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set with an `http://` proxy; not required for `https://` proxies (the credential travels inside the verified TLS session) but tolerated if set. Rejected when no auth file is configured. |
-| `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
-| `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
-| `OPENSHELL_SANDBOX_PROXY_CA_BUNDLE` | `--sandbox-proxy-ca-bundle` | unset | Path (on the gateway host) to a PEM CA bundle trusted for the corporate proxy. Bind-mounted read-only into the sandbox (a CA certificate is not secret). Trusted for the `https://` proxy TLS handshake and, because TLS-intercepting proxies re-sign tunneled certificates, folded into the sandbox trust bundle and upstream verification. Requires a proxy URL; the file must exist and hold at least one certificate. |
-
-Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
-`proxy_auth_file`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname`,
-and `proxy_ca_bundle` keys under `[openshell.drivers.podman]`; see
-`docs/reference/gateway-config.mdx`.
-
-`provider_spiffe_workload_api_socket` accepts either an absolute host UNIX
-Workload API socket, projected through a dedicated read-only mount, or an
-explicit container-reachable `tcp:IP:port` endpoint. The driver sets the
-supervisor's `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET` accordingly.
-`app_armor_profile` shares the canonical
-`RuntimeDefault`, `Unconfined`, or `Localhost/<profile>` model with Docker and
-Kubernetes. When omitted, the driver sends no override and preserves Podman's
-runtime-selected profile. Set `Unconfined` explicitly only when the deployment
-requires the supervisor's mount setup to bypass that profile. Explicit confined
-choices fail early when Podman reports AppArmor unavailable.
-
-This is an operator-owned egress boundary: the driver passes the settings on
-the supervisor's command line, so sandbox and template environment — and any
-`ENV` baked into the sandbox image — cannot override them, and the
-conventional `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` variables a sandbox
-controls do not steer it. Credentials must be supplied through
-`proxy_auth_file`; an inline `user:pass@` in the URL is rejected at startup.
-
-Basic auth over an `http://` proxy is cleartext on the wire: anyone on the
-network path between the sandbox host and the proxy can recover the
-credential. Setting `proxy_auth_file` therefore requires
-`proxy_auth_allow_insecure = true`; both the driver and the in-container
-supervisor reject credentials without that explicit acknowledgement.
-
-CONNECT requests target a validated resolved IP by default, so the proxy
-performs no DNS resolution and the tunnel stays bound to the address that
-passed the sandbox's SSRF and `allowed_ips` checks; the hostname still
-travels inside the tunnel (TLS SNI, application `Host`). In split-horizon
-networks, point the gateway host at the corporate resolver. Set
-`proxy_connect_by_hostname = true` only when the proxy's ACLs filter on
-hostnames and reject IP CONNECT targets — it re-opens proxy-side DNS
-resolution, making the proxy's ACLs the effective egress control.
-
-## Rootless-Specific Adaptations
-
-The Podman driver is designed for rootless operation. The following adaptations
-matter compared to cluster or rootful runtimes:
-
-1. subuid/subgid preflight check: on non-macOS hosts, `check_subuid_range()` in
-   `driver.rs` warns operators if `/etc/subuid` or `/etc/subgid` entries are
-   missing for the current user. This is not a hard error because some systems
-   use LDAP or other mechanisms. macOS skips the check because `podman machine`
-   runs the Podman service inside a Linux VM.
-2. cgroups v2 requirement: the driver refuses to start if cgroups v1 is
-   detected. Rootless Podman requires the unified cgroup hierarchy.
-3. `nsenter` for namespace operations: `openshell-sandbox` uses
-   `nsenter --net=` instead of `ip netns exec` to avoid the sysfs remount path
-   that requires real `CAP_SYS_ADMIN` in the host user namespace.
-4. `DAC_READ_SEARCH` capability: required for the proxy to read
-   `/proc/<pid>/fd/` across UIDs within the user namespace.
-5. `SETUID` and `SETGID` capabilities: kept from Podman's default capability
-   set so `drop_privileges()` can call `setuid()` and `setgid()`.
-6. `host.containers.internal`: used instead of Docker's `host.docker.internal`
-   for container-to-host communication. The driver also injects the
-   OpenShell-owned `host.openshell.internal` alias.
-7. Ephemeral port publishing: the SSH compatibility port uses `host_port: 0`
-   because the bridge network IP is not reliably routable from the host in
-   rootless mode.
-8. tmpfs at `/run/netns`: a private tmpfs lets the supervisor create named
-   network namespaces via `ip netns add`.
-
-## Implementation References
-
-- Gateway integration: `crates/openshell-gateway/src/lib.rs` registers the
-  driver factory and constructs `PodmanComputeConfig` from the generic server
-  build context.
-- Server configuration: `crates/openshell-server/src/lib.rs` exposes the
-  backend-agnostic registry and factory context.
-- Gateway relay path: `openshell-core` `Config::sandbox_ssh_socket_path` in
-  `crates/openshell-core/src/config.rs`.
-- SSRF mitigation: `crates/openshell-core/src/net.rs`,
-  `crates/openshell-sandbox/src/proxy.rs`, and
-  `crates/openshell-server/src/grpc/policy.rs`.
-- Sandbox supervisor: `crates/openshell-sandbox/src/` for Landlock, seccomp,
-  netns, proxy, and relay behavior shared by all drivers.
-- Container engine abstraction: `tasks/scripts/container-engine.sh` for
-  build/deploy support across Docker and Podman.
-- Supervisor image build: `deploy/docker/Dockerfile.supervisor`.
+Gateway OTLP configuration continues to export compute-driver spans under the
+`openshell-driver-podman` service, preserving gateway trace context.

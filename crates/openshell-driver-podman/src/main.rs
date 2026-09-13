@@ -101,7 +101,11 @@ struct Args {
     )]
     health_check_interval_secs: Option<NonZeroU64>,
 
-    /// OCI image containing the openshell-sandbox supervisor binary.
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
 
@@ -207,6 +211,9 @@ async fn main() -> Result<()> {
         ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
+        sandbox_runtime_image: args
+            .sandbox_runtime_image
+            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(openshell_core::config::default_supervisor_image),
