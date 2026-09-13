@@ -30,6 +30,7 @@ use openshell_core::proto::compute::v1::{
     GpuResourceCapabilities, GpuResourceRequirements, MemoryResourceCapabilities,
     ResourceCapabilities, gateway_listener_requirement::Selector,
 };
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -1044,14 +1045,7 @@ impl PodmanComputeDriver {
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
-                    let child_env = image_env
-                        .iter()
-                        .filter_map(|entry| {
-                            entry
-                                .split_once('=')
-                                .map(|(key, value)| (key.into(), value.into()))
-                        })
-                        .collect();
+                    let child_env = podman_child_environment(sandbox, &image_env);
                     let launch_authentication = sandbox
                         .spec
                         .as_ref()
@@ -1376,16 +1370,16 @@ impl PodmanComputeDriver {
                 .await?;
             let archive = self
                 .client
-                .copy_from_container(&supervisor, crate::isolation::RESTART_BUNDLE_PATH)
+                .copy_from_container(&supervisor, crate::isolation::RESTART_METADATA_PATH)
                 .await?;
             let bundle =
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
-            let previous_config = crate::isolation::boundary_config_from_channel_archive(&bundle)?;
+            let restart_metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
             let archives = crate::isolation::bootstrap_archives(
                 sandbox_id,
                 &container_id,
-                &previous_config.workload_identity,
-                previous_config.child_env,
+                &restart_metadata.workload_identity,
+                restart_metadata.child_env,
                 &launch_authentication,
             )?;
             self.client
@@ -1847,6 +1841,28 @@ fn userns_needs_extraction(userns: Option<&str>) -> bool {
         let base = mode.split(':').next().unwrap_or(mode);
         !base.eq_ignore_ascii_case("host")
     })
+}
+
+fn podman_child_environment(
+    sandbox: &DriverSandbox,
+    image_env: &[String],
+) -> HashMap<String, String> {
+    let mut environment = image_env
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    if let Some(spec) = sandbox.spec.as_ref() {
+        if let Some(template) = spec.template.as_ref() {
+            environment.extend(template.environment.clone());
+        }
+        environment.extend(spec.environment.clone());
+    }
+    environment.retain(|key, _| !key.starts_with("OPENSHELL_"));
+    environment
 }
 
 /// Returns `true` when userns remaps all UIDs, making host-owned bind mounts
@@ -3269,6 +3285,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_environment_preserves_precedence_and_strips_control_keys() {
+        let mut sandbox = plain_sandbox("sandbox", "agent");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                environment: HashMap::from([
+                    ("TEMPLATE_ONLY".to_string(), "template".to_string()),
+                    ("OVERRIDE".to_string(), "template".to_string()),
+                ]),
+                ..Default::default()
+            }),
+            environment: HashMap::from([
+                ("REQUEST_ONLY".to_string(), "request".to_string()),
+                ("OVERRIDE".to_string(), "request".to_string()),
+                ("OPENSHELL_SANDBOX_TOKEN".to_string(), "spoofed".to_string()),
+            ]),
+            ..Default::default()
+        });
+        let image_env = vec![
+            "IMAGE_ONLY=image".to_string(),
+            "OVERRIDE=image".to_string(),
+            "OPENSHELL_ENDPOINT=spoofed".to_string(),
+        ];
+
+        let environment = podman_child_environment(&sandbox, &image_env);
+
+        assert_eq!(
+            environment.get("IMAGE_ONLY").map(String::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            environment.get("TEMPLATE_ONLY").map(String::as_str),
+            Some("template")
+        );
+        assert_eq!(
+            environment.get("REQUEST_ONLY").map(String::as_str),
+            Some("request")
+        );
+        assert_eq!(
+            environment.get("OVERRIDE").map(String::as_str),
+            Some("request")
+        );
+        assert!(!environment.keys().any(|key| key.starts_with("OPENSHELL_")));
+    }
+
     fn secret_delete_request(sandbox_id: &str) -> String {
         format!(
             "DELETE {}",
@@ -3289,22 +3350,17 @@ mod tests {
             "sha256:image".into(),
         )
         .unwrap();
-        let authentication = launch_authentication();
-        let bundle = crate::isolation::bootstrap_archives(
-            "sandbox-1",
-            "ctr-1",
-            &identity,
-            HashMap::new(),
-            &authentication,
-        )
-        .unwrap()
-        .channel;
+        let bundle = serde_json::to_vec(&crate::isolation::RestartMetadata {
+            workload_identity: identity,
+            child_env: HashMap::new(),
+        })
+        .unwrap();
         let mut header = tar::Header::new_gnu();
         header.set_size(bundle.len() as u64);
         header.set_mode(0o600);
         header.set_cksum();
         archive
-            .append_data(&mut header, "sandbox-bundle.tar", bundle.as_slice())
+            .append_data(&mut header, "restart-metadata.json", bundle.as_slice())
             .unwrap();
         vec![
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor stop
