@@ -97,6 +97,11 @@ Six invariants hold for every boundary:
 
 Each backend states its termination bound in its implementation documentation. Loss of the logical supervisor means loss of the components holding the backend lifecycle, not loss of the gateway connection; gateway disconnection follows RFC 0001's reconnection semantics.
 
+Transport recovery is scoped to the same logical supervisor process. A backend
+may reconnect that process and re-confirm its binding, but a replacement
+supervisor process cannot resume an existing runtime generation with launch
+credentials. Planned upgrades stop the sandbox and start a fresh generation.
+
 ### Provisioning
 
 Provisioning runs on the control plane, and three rules hold for every sandbox:

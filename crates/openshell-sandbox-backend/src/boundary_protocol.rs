@@ -13,6 +13,7 @@ use std::fmt;
 use std::io;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use openshell_core::SandboxSessionId;
 use openshell_core::policy::{
@@ -40,6 +41,82 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+/// Ephemeral identity of the supervisor process that owns one sandbox runtime.
+///
+/// The supervisor generates this value in memory and presents it on every
+/// attach, including transport reconnects. The sandbox pins the first value it
+/// accepts for its process lifetime, so a replacement supervisor cannot reuse
+/// launch credentials to take over an existing runtime generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SupervisorInstanceId(uuid::Uuid);
+
+impl SupervisorInstanceId {
+    /// Generate a fresh supervisor-process identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for SupervisorInstanceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SupervisorInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.hyphenated().fmt(formatter)
+    }
+}
+
+impl fmt::Debug for SupervisorInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SupervisorInstanceId([REDACTED])")
+    }
+}
+
+impl FromStr for SupervisorInstanceId {
+    type Err = SupervisorInstanceIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parsed = uuid::Uuid::parse_str(value).map_err(|_| SupervisorInstanceIdError)?;
+        if parsed.is_nil() || parsed.hyphenated().to_string() != value {
+            return Err(SupervisorInstanceIdError);
+        }
+        Ok(Self(parsed))
+    }
+}
+
+impl Serialize for SupervisorInstanceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SupervisorInstanceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(|_| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&value),
+                &"a non-nil canonical lowercase UUID",
+            )
+        })
+    }
+}
+
+/// A supervisor instance ID was not a canonical non-nil UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
+pub struct SupervisorInstanceIdError;
 
 /// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
 /// Authentication is configured separately and is identical for every variant.
@@ -438,6 +515,7 @@ impl fmt::Debug for RequestEnvelope {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
     Attach {
+        supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
         resource_claims: std::collections::BTreeMap<String, String>,
     },
@@ -519,6 +597,7 @@ impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Attach {
+                supervisor_instance_id: _,
                 policy: _,
                 resource_claims,
             } => formatter
@@ -1137,6 +1216,25 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn supervisor_instance_id_round_trips_canonically_and_stays_redacted() {
+        let instance_id = SupervisorInstanceId::new();
+        let encoded = serde_json::to_string(&instance_id).expect("encode supervisor instance ID");
+        let decoded = serde_json::from_str::<SupervisorInstanceId>(&encoded)
+            .expect("decode supervisor instance ID");
+        assert_eq!(decoded, instance_id);
+        assert_eq!(
+            format!("{instance_id:?}"),
+            "SupervisorInstanceId([REDACTED])"
+        );
+        assert!(
+            serde_json::from_str::<SupervisorInstanceId>(
+                r#""00000000-0000-0000-0000-000000000000""#
+            )
+            .is_err()
+        );
     }
 
     #[test]
