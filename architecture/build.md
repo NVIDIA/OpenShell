@@ -176,7 +176,7 @@ Runtime layout:
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
 - **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
-  musl `/openshell-sandbox` binary and its guest bootstrap helper runtime.
+  musl `/openshell-sandbox` binary and its static VM guest-init helper.
   Drivers stage this binary into the workload trust domain.
 - **Supervisor**: Debian-based `openshell/supervisor` image containing only the
   dynamically linked GNU `/openshell-supervisor` binary. GNU supervisor builds

@@ -108,9 +108,6 @@ pub enum BackendFeature {
     /// QEMU-only and currently rejected for non-GPU sandboxes pending the
     /// non-GPU QEMU launch path landing.
     PciPassthrough,
-    /// Extension needs a host TAP device wired into the guest. Currently
-    /// QEMU-only (libkrun does not expose a TAP transport).
-    TapNetworking,
 }
 
 impl BackendFeature {
@@ -120,7 +117,6 @@ impl BackendFeature {
             Self::ExternalKernelImage => "external-kernel-image",
             Self::GuestInitDropins => "guest-init-dropins",
             Self::PciPassthrough => "pci-passthrough",
-            Self::TapNetworking => "tap-networking",
         }
     }
 
@@ -130,10 +126,7 @@ impl BackendFeature {
     /// exists.
     #[must_use]
     pub fn requires_qemu(self) -> bool {
-        matches!(
-            self,
-            Self::ExternalKernelImage | Self::PciPassthrough | Self::TapNetworking
-        )
+        matches!(self, Self::ExternalKernelImage | Self::PciPassthrough)
     }
 }
 
@@ -226,12 +219,7 @@ pub struct LaunchPlan {
     pub kernel_profile: Option<String>,
     pub kernel_image: Option<PathBuf>,
     pub gpu_bdf: Option<String>,
-    pub tap_device: Option<String>,
-    pub guest_ip: Option<String>,
-    pub host_ip: Option<String>,
     pub vsock_cid: Option<u32>,
-    pub guest_mac: Option<String>,
-    pub gateway_port: Option<u16>,
     pub guest_init_dropins: Vec<GuestInitDropin>,
     pub env: Vec<String>,
 }
@@ -296,7 +284,7 @@ pub enum ExtensionActivation {
 ///    (kernel profile, guest init drop-ins, etc.). Called before the driver
 ///    has resolved the final backend.
 /// 2. Driver resolves [`LaunchPlan::backend`] from declared requirements
-///    and allocates backend-specific host resources (subnet, tap, vsock).
+///    and allocates backend-specific host resources such as a vsock CID.
 /// 3. [`before_launch`](Self::before_launch) — perform host-side
 ///    side effects with the resolved plan in hand, optionally append
 ///    additional guest env via [`LaunchPlan::env`].
@@ -353,7 +341,7 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     /// At this point [`LaunchPlan::backend`],
     /// [`LaunchPlan::required_backends`], and
     /// [`LaunchPlan::required_backend_features`] are finalized and any
-    /// backend-specific host resources (subnet, tap, vsock) have been
+    /// backend-specific host resources have been
     /// allocated. This hook is the right place to bind PCI devices, set
     /// up filesystem state, or otherwise prepare the host.
     ///
@@ -953,12 +941,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf: None,
-            tap_device: None,
-            guest_ip: None,
-            host_ip: None,
             vsock_cid: None,
-            guest_mac: None,
-            gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         }

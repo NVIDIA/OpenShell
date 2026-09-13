@@ -165,6 +165,10 @@ fn main() -> Result<()> {
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let backend_descriptor = backend_descriptor(&args)?;
     let auth_bundle = auth_bundle(&args)?;
+    // Install the driver-provisioned session before starting log push or any
+    // other gateway client. `run_sandbox` obtains the same Sandbox Protocol
+    // bearer slot after it validates the runtime descriptor binding.
+    let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
 
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
