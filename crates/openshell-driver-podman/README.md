@@ -114,8 +114,9 @@ root cannot be replaced. User-owned volumes are never created or deleted.
 See [gateway configuration](../../docs/reference/gateway-config.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for callback networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
-`health_check_interval_secs=0` uses a one-second check rather than disabling
-the readiness check required by this architecture.
+Omit `health_check_interval_secs` to disable Podman's periodic health command.
+Explicit zero is invalid. OpenShell still gates readiness on the supervisor's
+authenticated health signal.
 
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.

@@ -219,6 +219,8 @@ pub struct ContainerSpec {
     cap_drop: Vec<String>,
     cap_add: Vec<String>,
     no_new_privileges: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apparmor_profile: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     seccomp_profile_path: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -341,8 +343,13 @@ struct SecretMount {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
-    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
-    pids_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pids: Option<PidsLimits>,
+}
+
+#[derive(Serialize)]
+struct PidsLimits {
+    limit: i64,
 }
 
 #[derive(Serialize)]
@@ -660,7 +667,7 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
-        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
+        pids: podman_pids_limit(config.sandbox_pids_limit).map(|limit| PidsLimits { limit }),
     }
 }
 
@@ -1141,6 +1148,7 @@ fn build_base_spec(
         cap_drop: vec!["ALL".into()],
         cap_add: Vec::new(),
         no_new_privileges: true,
+        apparmor_profile: None,
         // Omission selects the runtime default, never an unconfined profile.
         seccomp_profile_path: String::new(),
         sysctl: BTreeMap::new(),
@@ -1437,6 +1445,12 @@ pub fn build_isolation_specs(
         .collect();
     workload.cap_drop = vec!["ALL".into()];
     workload.cap_add.clear();
+    workload.apparmor_profile = input
+        .config
+        .app_armor_profile
+        .as_ref()
+        .and_then(openshell_core::config::AppArmorProfile::oci_security_opt)
+        .and_then(|option| option.strip_prefix("apparmor=").map(str::to_string));
     workload.seccomp_profile_path.clear();
     workload
         .sysctl
@@ -1535,18 +1549,18 @@ pub fn build_isolation_specs(
         secret.uid = input.identity.uid;
         secret.gid = input.identity.gid;
     }
-    supervisor.healthconfig.test = vec![
-        "CMD".into(),
-        "/openshell-supervisor".into(),
-        "health".into(),
-        "--socket".into(),
-        "/run/openshell/supervisor-health.sock".into(),
-    ];
-    supervisor.healthconfig.interval = input
-        .config
-        .health_check_interval_secs
-        .map_or(10, std::num::NonZeroU64::get)
-        * 1_000_000_000;
+    if let Some(interval) = input.config.health_check_interval_secs {
+        supervisor.healthconfig.test = vec![
+            "CMD".into(),
+            "/openshell-supervisor".into(),
+            "health".into(),
+            "--socket".into(),
+            "/run/openshell/supervisor-health.sock".into(),
+        ];
+        supervisor.healthconfig.interval = interval.get() * 1_000_000_000;
+    } else {
+        supervisor.healthconfig.test = vec!["NONE".into()];
+    }
     Ok(IsolationSpecs {
         workload,
         supervisor,
@@ -1675,7 +1689,10 @@ mod tests {
             name: "agent".into(),
             ..Default::default()
         };
-        let config = PodmanComputeConfig::default();
+        let mut config = PodmanComputeConfig::default();
+        config.app_armor_profile = Some(openshell_core::config::AppArmorProfile::Localhost(
+            "openshell-sandbox".into(),
+        ));
         let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
             1000,
             1001,
@@ -1711,6 +1728,14 @@ mod tests {
             assert!(spec.no_new_privileges);
         }
         assert_eq!(specs.workload.netns.nsmode, "none");
+        assert_eq!(
+            specs.workload.apparmor_profile.as_deref(),
+            Some("openshell-sandbox")
+        );
+        assert_eq!(specs.supervisor.apparmor_profile, None);
+        let workload_json = serde_json::to_string(&specs.workload).unwrap();
+        assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));
+        assert_eq!(specs.supervisor.healthconfig.test, vec!["NONE"]);
         assert!(specs.workload.networks.is_empty());
         assert!(specs.workload.portmappings.is_empty());
         assert_eq!(specs.supervisor.netns.nsmode, "host");
@@ -1827,20 +1852,17 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config);
 
+        assert_eq!(limits.cpu.quota, 50_000);
+        assert_eq!(limits.memory.limit, 2 * 1024 * 1024 * 1024);
         assert_eq!(
-            spec["resource_limits"]["cpu"]["quota"].as_u64(),
-            Some(50_000)
-        );
-        assert_eq!(
-            spec["resource_limits"]["memory"]["limit"].as_u64(),
-            Some(2 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(
-            spec["resource_limits"]["PidsLimit"].as_i64(),
+            limits.pids.as_ref().map(|pids| pids.limit),
             openshell_core::config::default_sandbox_pids_limit().map(std::num::NonZeroI64::get)
         );
+        let serialized = serde_json::to_string(&limits).unwrap();
+        assert!(serialized.contains("\"pids\":{\"limit\":2048}"));
+        assert!(!serialized.contains("PidsLimit"));
     }
 
     #[test]
@@ -1848,9 +1870,9 @@ mod tests {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.sandbox_pids_limit = None;
-        let spec = build_container_spec(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config);
 
-        assert!(spec["resource_limits"].get("PidsLimit").is_none());
+        assert!(limits.pids.is_none());
     }
 
     #[test]
