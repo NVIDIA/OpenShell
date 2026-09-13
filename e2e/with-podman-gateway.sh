@@ -182,9 +182,24 @@ cleanup() {
     for id in ${sandbox_ids}; do
       local sandbox_id
       sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
-      podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
+        # Only the companion is attached to the test network. Remove it first
+        # (it depends on the workload user namespace), then locate the isolated
+        # network=none workload by this test sandbox's immutable label.
+        podman_cmd rm -f "openshell-supervisor-${sandbox_id}" >/dev/null 2>&1 || true
+        local workload_ids workload_id
+        workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
+          --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
+          --filter "label=openshell.io/isolation-role=sandbox" 2>/dev/null || true)"
+        for workload_id in ${workload_ids}; do
+          podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
+        done
+        podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
+        local secret_prefix
+        for secret_prefix in openshell-token openshell-proxy-auth openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+          podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
+        done
       fi
     done
   fi
@@ -339,6 +354,26 @@ resolve_podman_supervisor_image() {
   printf '%s\n' "openshell/supervisor:dev"
 }
 
+resolve_podman_sandbox_runtime_image() {
+  if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+
+  if [ -n "${CI:-}" ]; then
+    if [ -z "${IMAGE_TAG:-}" ]; then
+      echo "ERROR: IMAGE_TAG must be set in CI when no Podman sandbox runtime image override is provided." >&2
+      exit 2
+    fi
+
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
+    return 0
+  fi
+
+  printf '%s\n' "openshell/sandbox:dev"
+}
+
 ensure_podman_supervisor_image() {
   local image=$1
 
@@ -430,6 +465,37 @@ ensure_podman_supervisor_image() {
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
   echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  exit 2
+}
+
+ensure_podman_sandbox_runtime_image() {
+  local image=$1
+
+  if [ "${image}" = "openshell/sandbox:dev" ] \
+     && [ -z "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ] \
+     && [ -z "${CI:-}" ]; then
+    echo "Building local Podman sandbox runtime image ${image}..."
+    with_podman_config env CONTAINER_ENGINE=podman IMAGE_TAG=dev \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
+    if podman_cmd image exists "${image}" 2>/dev/null; then
+      return 0
+    fi
+
+    echo "ERROR: expected sandbox runtime image '${image}' after local build." >&2
+    exit 2
+  fi
+
+  if podman_cmd image exists "${image}" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Pulling Podman sandbox runtime image ${image}..."
+  if podman_cmd pull "${image}"; then
+    return 0
+  fi
+
+  echo "ERROR: sandbox runtime image '${image}' is not available." >&2
+  echo "       Build it, push it, or set OPENSHELL_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -526,6 +592,10 @@ podman_cmd run --rm --network none --entrypoint /sbin/apk \
   "${SUPERVISOR_RUNTIME_IMAGE}" info -v | LC_ALL=C sort >"${SUPERVISOR_PACKAGE_MANIFEST}"
 SUPERVISOR_PACKAGE_MANIFEST_SHA256="$(sha256sum "${SUPERVISOR_PACKAGE_MANIFEST}" | cut -d' ' -f1)"
 echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST}, base ${SUPERVISOR_BASE_IMAGE} ID ${SUPERVISOR_BASE_IMAGE_ID} digest ${SUPERVISOR_BASE_IMAGE_DIGEST}, packages ${SUPERVISOR_PACKAGE_MANIFEST_SHA256})"
+
+SANDBOX_RUNTIME_IMAGE="$(resolve_podman_sandbox_runtime_image)"
+ensure_podman_sandbox_runtime_image "${SANDBOX_RUNTIME_IMAGE}"
+echo "Using Podman sandbox runtime image: ${SANDBOX_RUNTIME_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -651,7 +721,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
     driver_tls_ca_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CA}" | cut -d' ' -f1)"
     driver_tls_cert_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CERT}" | cut -d' ' -f1)"
     driver_tls_key_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_KEY}" | cut -d' ' -f1)"
-    external_driver_environment="$(printf '{\"OPENSHELL_COMPUTE_DRIVER_SOCKET\":\"%s\",\"OPENSHELL_PODMAN_SOCKET\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE_PULL_POLICY\":\"%s\",\"OPENSHELL_HEALTH_CHECK_INTERVAL_SECS\":%s,\"OPENSHELL_GRPC_ENDPOINT\":\"%s\",\"OPENSHELL_GATEWAY_PORT\":%s,\"OPENSHELL_NETWORK_NAME\":\"%s\",\"OPENSHELL_STOP_TIMEOUT\":%s,\"OPENSHELL_SUPERVISOR_IMAGE\":\"%s\",\"OPENSHELL_PODMAN_TLS_CA\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_CERT\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_KEY\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_ENABLE_BIND_MOUNTS\":%s}' \
+    external_driver_environment="$(printf '{\"OPENSHELL_COMPUTE_DRIVER_SOCKET\":\"%s\",\"OPENSHELL_PODMAN_SOCKET\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE_PULL_POLICY\":\"%s\",\"OPENSHELL_HEALTH_CHECK_INTERVAL_SECS\":%s,\"OPENSHELL_GRPC_ENDPOINT\":\"%s\",\"OPENSHELL_GATEWAY_PORT\":%s,\"OPENSHELL_NETWORK_NAME\":\"%s\",\"OPENSHELL_STOP_TIMEOUT\":%s,\"OPENSHELL_SANDBOX_RUNTIME_IMAGE\":\"%s\",\"OPENSHELL_SUPERVISOR_IMAGE\":\"%s\",\"OPENSHELL_PODMAN_TLS_CA\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_CERT\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_KEY\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_ENABLE_BIND_MOUNTS\":%s}' \
       "${DRIVER_SOCKET}" \
       "${OPENSHELL_PODMAN_SOCKET:-}" \
       "${SANDBOX_RUNTIME_IMAGE}" \
@@ -661,6 +731,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
       "${HOST_PORT}" \
       "${PODMAN_NETWORK_NAME}" \
       "${PODMAN_STOP_TIMEOUT_SECS}" \
+      "${SANDBOX_RUNTIME_IMAGE}" \
       "${SUPERVISOR_RUNTIME_IMAGE}" \
       "${EXTERNAL_DRIVER_TLS_CA}" \
       "${driver_tls_ca_sha256}" \
@@ -721,6 +792,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
+  OPENSHELL_SANDBOX_RUNTIME_IMAGE="${SANDBOX_RUNTIME_IMAGE}" \
   OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
   OPENSHELL_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
   OPENSHELL_PODMAN_TLS_CERT="${EXTERNAL_DRIVER_TLS_CERT}" \

@@ -5,6 +5,15 @@ gateway. A supported runtime provisions `openshell-sandbox` inside the workload,
 `openshell-supervisor` outside it, a protected channel between them, and an
 independent outer network fence. Drivers do not implement policy evaluation.
 
+Podman provisions a paired workload and supervisor container using its native
+libpod API. The workload uses `network=none`; the external supervisor alone joins
+the configured network. A per-sandbox named volume carries their mutually
+authenticated gRPC Unix socket, with supervisor credentials kept in its separate
+filesystem. Both containers run as the resolved non-root identity with all
+capabilities dropped. They share only a user namespace for volume ownership,
+not PID, mount, or network namespaces. Podman owns paired lifecycle and health;
+the common protocol owns process, identity, TCP, DNS, and forwarding semantics.
+
 ## Driver Contract
 
 Each runtime receives a sandbox spec and canonical policy from the gateway and

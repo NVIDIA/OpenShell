@@ -38,10 +38,10 @@ const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 /// harness), fall back to plain `podman`, leaving Linux behavior unchanged.
 fn podman_command() -> Command {
     let mut command = Command::new("podman");
-    if let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-        if !socket.is_empty() {
-            command.arg("--url").arg(format!("unix://{socket}"));
-        }
+    if let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET")
+        && !socket.is_empty()
+    {
+        command.arg("--url").arg(format!("unix://{socket}"));
     }
     command
 }
@@ -49,7 +49,15 @@ fn podman_command() -> Command {
 fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
     let sandbox_name_filter = format!("label={SANDBOX_NAME_LABEL}={sandbox_name}");
     let output = podman_command()
-        .args(["ps", "-aq", "--filter", MANAGED_BY_LABEL_FILTER, "--filter"])
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            MANAGED_BY_LABEL_FILTER,
+            "--filter",
+            "label=openshell.io/isolation-role=sandbox",
+            "--filter",
+        ])
         .arg(sandbox_name_filter)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

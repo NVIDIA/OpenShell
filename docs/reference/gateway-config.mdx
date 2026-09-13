@@ -22,28 +22,26 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Package-Managed Locations
 
-Package-managed gateways use either built-in defaults or a package-seeded TOML file. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
+Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
 
-| Package | Gateway TOML location |
+| Package | Optional Gateway TOML location |
 |---|---|
 | Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
-| Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml`; the systemd user service seeds this file from the packaged template on first start. |
+| Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
-The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence.
-
-Homebrew and RPM upgrades migrate only exact package-generated schema-v1 defaults. Homebrew recognizes both its empty v1 prefix config and the affected IPv6-loopback variant. RPM recognizes the v1 file seeded by its systemd user service. Package upgrades never rewrite an edited file; migrate an edited v1 file manually with the steps below.
+The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence. Upgrades preserve user-edited configs and migrate only an unchanged prefix config generated with the affected IPv6-loopback default.
 
 ## Layout
 
-The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Credential drivers own `[openshell.credential_drivers.<name>]` tables. Driver-specific values are never inherited from gateway scope.
+The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Credential drivers own `[openshell.credential_drivers.<name>]` tables. Shared compute-driver keys set at gateway scope are inherited into compute driver tables when not overridden.
 
 ```toml
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 # ... gateway-wide settings ...
@@ -116,7 +114,7 @@ A complete gateway configuration covering every section. Trim to the fields you 
 # SPDX-License-Identifier: Apache-2.0
 
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 name                  = "production-us-west"
@@ -126,14 +124,15 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
-# When omitted, the gateway auto-detects Kubernetes, then Podman, then Docker.
+# When empty, the gateway auto-detects Kubernetes, then Podman, then Docker.
 # VM is never auto-detected and requires an explicit entry here.
-compute_driver        = "kubernetes"
+compute_drivers       = ["kubernetes"]
 
 # Optional external provider credential storage backend. Omit this key to use
 # the gateway's default encrypted database credential storage.
 credential_drivers        = ["kubernetes-secrets"]
 
+sandbox_namespace     = "openshell"
 ssh_session_ttl_secs  = 3600
 
 # Reject invalid policy generations securely by default. Set
@@ -150,11 +149,18 @@ enable_loopback_service_http = true
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false
 
-# Guest TLS paths remain gateway settings. TLS-enabled Docker, Podman, and VM
-# gateways require a complete bundle unless package-managed local TLS supplies
-# it automatically. Omit all three when TLS is disabled. Kubernetes projects
-# sandbox TLS from client_tls_secret_name instead. Driver tables must not repeat
-# these fields.
+# Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
+# when the driver-specific table does not override them.
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+# Defaults to the gateway version; override to pin a specific build.
+sandbox_runtime_image   = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
+client_tls_secret_name  = "openshell-client-tls"
+service_account_name    = "openshell-sandbox"
+host_gateway_ip         = "10.0.0.1"
+enable_user_namespaces  = false
+sa_token_ttl_secs       = 3600
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
@@ -188,6 +194,7 @@ timeout = "500ms"
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
+require_client_auth   = false
 # Optional: SNI-based dual certificate for external (e.g. ACME) TLS.
 # external_cert_path    = "/etc/openshell/certs/external.pem"
 # external_key_path     = "/etc/openshell/certs/external-key.pem"
@@ -198,7 +205,7 @@ signing_key_path = "/etc/openshell/jwt/signing.pem"
 public_key_path  = "/etc/openshell/jwt/public.pem"
 kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
-# Omit only for local single-player Docker, Podman, or VM gateways.
+# Omit or set to 0 only for local single-player Docker, Podman, or VM gateways.
 ttl_secs         = 3600
 
 [openshell.gateway.auth]
@@ -241,33 +248,18 @@ failure_policy = "fail_closed"
 rpc    = "openshell.v1.OpenShell/UpdateConfig"
 phases = ["validate"]
 
-[openshell.drivers.kubernetes]
-namespace              = "openshell"
-# Required in raw TOML; Helm derives this from the gateway Service.
-grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
-default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-# Defaults to the gateway version; override to pin a specific build.
-# supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
-client_tls_secret_name = "openshell-client-tls"
-service_account_name   = "openshell-sandbox"
-host_gateway_ip        = "10.0.0.1"
-enable_user_namespaces = false
-sa_token_ttl_secs      = 3600
-
 [openshell.credential_drivers.kubernetes-secrets]
 namespace = "openshell"
 allow_reference_namespace = false
 ```
 
-Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
-
-The client-certificate handshake policy is derived and has no `require_client_auth` TOML field. This preserves bearer-only OIDC clients and prevents a file setting from silently weakening CA-only gateways.
+Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
-`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. Omit it for a non-expiring token: the token `exp` claim and `expires_at_ms` response field become `0`. Use this only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
+`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. It defaults to `3600` seconds and must be between `60` and `3600` seconds so sandbox sessions can rotate short-lived credentials safely.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -411,7 +403,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 `failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
-`image_pull_policy` is a shared driver setting with the canonical values `always`, `if_not_present`, `never`, and `newer`. Set it inside the relevant driver table. Drivers translate these values to their runtime APIs; `newer` is supported only by Podman and is rejected at Docker and Kubernetes startup.
+`image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
 ## Credential Drivers
 
@@ -500,9 +492,7 @@ args = [
 
 ## Driver References
 
-Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Drivers receive only their own tables, and the gateway rejects unknown gateway and driver fields.
-
-Kubernetes configurations set `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`. Docker configurations use `sandbox_label`; the legacy `sandbox_namespace` key is rejected.
+Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Driver-specific values override inherited gateway defaults. The gateway rejects unknown driver fields after inheritance is merged.
 
 ### Kubernetes
 
@@ -510,14 +500,14 @@ The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS ma
 
 ```toml
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 bind_address          = "0.0.0.0:8080"
 health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"
 log_level             = "info"
-compute_driver        = "kubernetes"
+compute_drivers       = ["kubernetes"]
 
 [openshell.gateway.tls]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
@@ -540,11 +530,15 @@ workspace_mode                 = "shared"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy              = "if_not_present"
+image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
+# Statically linked musl workload-side runtime.
+# sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
+sandbox_runtime_image_pull_policy = "IfNotPresent"
+# Dynamically linked glibc control-side runtime.
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
-supervisor_image_pull_policy   = "if_not_present"
+supervisor_image_pull_policy   = "IfNotPresent"
 
 [openshell.drivers.kubernetes.sandbox_runtime]
 # Set this only after verifying that the cluster CNI enforces both ingress and
@@ -577,10 +571,7 @@ boundary_port                 = 5500
 # Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
 # so its ACL becomes part of the egress boundary for proxied connections.
 # proxy_connect_by_hostname    = true
-# Required in raw gateway TOML because `namespace` identifies sandbox
-# placement, not the gateway Service. Helm renders this from the release's
-# gateway Service name and namespace.
-grpc_endpoint                  = "https://openshell-gateway.openshell.svc:8080"
+grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"
@@ -640,10 +631,9 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
-### MXC
+### Docker
 
-The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
-map Windows Sandboxing provider events into the gateway's OCSF stream.
+Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.
 
 ```toml
 [openshell]
@@ -652,44 +642,7 @@ version = 1
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_drivers = ["mxc"]
-
-[openshell.drivers.mxc]
-wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
-backend                 = "process_container"
-default_configuration_id = "composable"
-pc_least_privilege      = false
-pc_capabilities         = []
-debug                   = false
-etw_audit               = true
-```
-
-`etw_audit` defaults to `false`. When enabled, the gateway account must be an
-administrator or belong to the Windows Performance Log Users group. Workload
-commands and working directories remain sandbox-scoped and must be supplied in
-the `mxc` driver configuration when creating a sandbox.
-
-The driver records executable identity in process audit events and omits raw
-command arguments because they can contain credentials or personal data. See
-[OCSF JSON Export](/observability/ocsf-json-export) for durable Windows audit
-output.
-
-### Docker
-
-Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required). Configure guest mTLS paths once under `[openshell.gateway]`; the gateway validates and injects the bundle into the selected local driver.
-
-```toml
-[openshell]
-version = 2
-
-[openshell.gateway]
-bind_address    = "127.0.0.1:17670"
-log_level       = "info"
-compute_driver = "docker"
-# Gateway-owned bundle injected into the selected local driver.
-guest_tls_ca  = "/etc/openshell/certs/ca.pem"
-guest_tls_cert = "/etc/openshell/certs/client.pem"
-guest_tls_key  = "/etc/openshell/certs/client-key.pem"
+compute_drivers = ["docker"]
 
 [openshell.drivers.docker]
 socket_path        = "/var/run/docker.sock"
@@ -701,51 +654,35 @@ sandbox_label      = "docker-dev"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for this driver.
 grpc_endpoint      = "https://host.openshell.internal:17670"
-# Contains both /openshell-sandbox and /openshell-supervisor. Defaults to the
-# gateway version; override to pin a specific build.
+# Statically linked musl workload-side runtime. Defaults to the gateway version.
+# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# Dynamically linked glibc control-side runtime. Defaults to the gateway version.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
+guest_tls_ca       = "/etc/openshell/certs/ca.pem"
+guest_tls_cert     = "/etc/openshell/certs/client.pem"
+guest_tls_key      = "/etc/openshell/certs/client-key.pem"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts = false
-# Omit to use OpenShell's 2048-process default. Explicit 0 is invalid.
+# Set to 0 to leave Docker's runtime default unchanged.
 sandbox_pids_limit = 2048
-# Explicit supervisor-compatible default. RuntimeDefault requires Docker to
-# report AppArmor support; Localhost/<name> requires an operator-loaded profile.
-app_armor_profile = "Unconfined"
-# Corporate TLS egress proxy. These are supervisor argv settings, not workload
-# environment variables. Do not embed credentials in the URL.
-https_proxy = "https://proxy.corp.example:8443"
-no_proxy = ".svc.cluster.local,10.0.0.0/8"
-# Optional root-owned host file containing user:pass. An http:// proxy also
-# requires proxy_auth_allow_insecure = true as an explicit acknowledgement.
-proxy_auth_file = "/etc/openshell/secrets/proxy-auth"
-# Project a host Unix Workload API socket into the supervisor for provider
-# token exchange. The socket parent must be a dedicated absolute directory.
-provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
-
-Use `sandbox_label` for Docker configurations. The legacy
-`sandbox_namespace` key is rejected.
 
 ### Podman
 
-Sandboxes run as Podman containers on a user-mode bridge network. The supervisor image is mounted read-only via Podman's `type=image` mount. Configure guest mTLS paths once under `[openshell.gateway]`; the gateway validates and injects the bundle into the selected local driver.
+Each Podman sandbox has a workload container running `openshell-sandbox` with `network=none`, and a separate `openshell-supervisor` companion on the configured network. Both use non-root identities, drop all capabilities, and keep the runtime's default seccomp profile. A private named volume carries their authenticated gRPC Unix socket. Gateway JWTs, optional gateway mTLS material, and upstream proxy credentials are delivered only to the supervisor; user mounts and GPU devices stay with the workload.
 
 ```toml
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_driver = "podman"
-# Gateway-owned bundle injected into the selected local driver.
-guest_tls_ca  = "/etc/openshell/certs/ca.pem"
-guest_tls_cert = "/etc/openshell/certs/client.pem"
-guest_tls_key  = "/etc/openshell/certs/client-key.pem"
+compute_drivers = ["podman"]
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
@@ -754,8 +691,7 @@ guest_tls_key  = "/etc/openshell/certs/client-key.pem"
 # one. Set this to pin a specific Podman machine instead.
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy       = "if_not_present" # always | if_not_present | never | newer
-# Optional override. When omitted, the gateway derives this endpoint.
+image_pull_policy       = "missing"   # always | missing | never | newer
 grpc_endpoint           = "https://host.containers.internal:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
@@ -763,19 +699,25 @@ network_name            = "openshell"
 # Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
 # Set "" to force Podman's host-gateway resolver.
 # host_gateway_ip       = "192.168.127.254"
-ssh_socket_path         = "/run/openshell/ssh.sock"
+sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
-# Defaults to the gateway version; override to pin a specific build.
+# Statically linked musl workload-side runtime. Defaults to the gateway version.
+# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
+# Dynamically linked glibc control-side runtime. Defaults to the gateway version.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
+guest_tls_ca            = "/etc/openshell/certs/ca.pem"
+guest_tls_cert          = "/etc/openshell/certs/client.pem"
+guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts      = false
-# Omit to use OpenShell's 2048-process default. Explicit 0 is invalid.
+# Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
-# Health check interval in seconds. Omit to disable health checks; explicit 0
-# is invalid. Lower values detect readiness faster but increase process churn
-# (each check spawns a conmon subprocess).
+# Health check interval in seconds. Lower values detect readiness faster
+# but increase process churn (each check spawns a conmon subprocess).
+# Set to 0 to use a one-second check. Readiness checks cannot be disabled.
+# Default: 10.
 health_check_interval_secs = 10
 # User namespace mode for sandbox containers. Omit to use the default.
 # Supported modes: auto, host, keep-id, no-map, private.
@@ -786,7 +728,7 @@ health_check_interval_secs = 10
 # rootful Podman uses absolute host IDs (0:1000:1, 1:100000:65536).
 # uidmap                  = ["0:0:1", "1:1:65535"]
 # gidmap                  = ["0:0:1", "1:1:65535"]
-# Corporate forward proxy for sandbox egress. When set, the in-container
+# Corporate forward proxy for sandbox egress. When set, the external
 # supervisor chains policy-approved TLS tunnels through this proxy with HTTP
 # CONNECT instead of dialing destinations directly. Plain-HTTP requests are
 # not proxied and always dial the destination directly. http:// and https://
@@ -864,22 +806,7 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
-# Project a host Workload API Unix socket into the supervisor, or use an
-# explicit container-reachable TCP endpoint, for provider token exchange.
-# provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
-# provider_spiffe_workload_api_socket = "tcp:169.254.1.2:8081"
-# Omit app_armor_profile to preserve Podman's runtime-selected profile.
-# Set Unconfined only when the supervisor's mount setup requires it.
-# Explicit RuntimeDefault and Localhost/<name> require Podman to report
-# AppArmor support.
-# app_armor_profile = "Unconfined"
 ```
-
-Use `ssh_socket_path` for Podman configurations. The legacy
-`sandbox_ssh_socket_path` key is rejected. When `app_armor_profile` is omitted,
-OpenShell sends no override and Podman applies its runtime-selected profile.
-Set `Unconfined` explicitly only when the deployment requires the supervisor's
-mount setup to bypass that profile.
 
 ### MicroVM
 
@@ -887,17 +814,13 @@ Each sandbox runs inside its own libkrun microVM managed by the standalone `open
 
 ```toml
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 # VM is never auto-detected; an explicit entry here is required.
-compute_driver = "vm"
-# Gateway-owned bundle injected into the selected local driver.
-guest_tls_ca  = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
+compute_drivers = ["vm"]
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
@@ -913,20 +836,21 @@ krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048
 overlay_disk_mib = 4096
-# Resolved sandbox UID/GID for new rootfs /etc/passwd entries.
-# Defaults to the image's sandbox account, or 1000 when the account is absent;
-# matching GID is used if sandbox_gid is empty. Persisted overlays recover their
-# recorded identity, including 10001, rather than receiving a legacy fallback.
-# Values must fall within OpenShell's allowed non-root sandbox identity range.
+guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
+guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
+guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
+# Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# Any non-root Linux UID/GID is valid.
 # sandbox_uid = 20001
-# sandbox_gid = 20001
 # Corporate forward proxy for sandbox egress. The keys, their semantics, and
 # the fail-closed contract are identical to the Podman driver above: only TLS
 # (CONNECT) egress is chained, plain-HTTP destination requests always dial
 # directly, credentials must come from proxy_auth_file rather than the URL,
 # an http:// proxy with credentials requires proxy_auth_allow_insecure, and
 # any present-but-invalid value is rejected at gateway startup rather than
-# degrading to a direct dial. proxy_auth_file is a path on the gateway host.
+# degrading to a direct dial. proxy_auth_file and proxy_ca_bundle are paths on
+# the gateway host.
 #
 # The sandbox cannot select or override these settings. The driver passes them
 # only to the host supervisor.
@@ -942,18 +866,11 @@ overlay_disk_mib = 4096
 # https_proxy               = "http://host.openshell.internal:8080"
 # no_proxy                  = "10.0.0.0/8,.internal.example"
 # proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
-# An http:// proxy with proxy_auth_file requires this explicit acknowledgement:
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the Podman section above.
 # proxy_connect_by_hostname = true
-# Gateway-host PEM bundle trusted for an https:// proxy and for server
-# certificates re-signed by a TLS-intercepting proxy. Requires https_proxy.
+# Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
-# VM guests cannot mount a host Workload API Unix socket. Configure only a
-# separately operated guest-reachable TCP listener and explicitly acknowledge
-# the exposure; host-only sockets are never exposed automatically.
-# provider_spiffe_workload_api_tcp_endpoint = "tcp:192.0.2.10:8081"
-# provider_spiffe_allow_guest_tcp = true
 # Where the gateway stages rootfs tar archives for `--from ./rootfs.tar`.
 # Defaults to <state_dir>/rootfs-tar-staging. The gateway creates one
 # request-scoped subdirectory per staging slot and removes it after use.
@@ -981,65 +898,13 @@ key used for driver-owned sandbox config such as `template.driver_config.<name>`
 
 ```toml
 [openshell]
-version = 2
+version = 1
 
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_driver = "kyma"
+compute_drivers = ["kyma"]
 
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
-```
-
-## Preflight package configuration {#gateway-config-preflight}
-
-Before starting a package-managed gateway, validate the selected file without
-changing it:
-
-```shell
-openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
-```
-
-Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`.
-Otherwise, it validates an existing XDG gateway config when one is discovered.
-When neither source selects a config, preflight succeeds. An explicit missing path,
-a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails.
-Preflight merges the selected file with the current `OPENSHELL_*` environment and
-applies the daemon's read-only startup checks. These checks include selector and
-socket normalization, registered-driver selection and configuration, rate-limit
-pairs, TLS and mTLS relationships, interceptor registrations, and supervisor
-middleware registrations. When a selected file omits `compute_driver`, preflight
-validates each configured table for an auto-detectable driver without running the
-runtime detection probes, which can connect local sockets or launch discovery
-commands. It validates complete guest TLS path sets without requiring
-package-generated certificates to exist before certificate generation. It does
-not construct a compute driver or connect to a transport. A failed
-preflight always preserves the file; it never migrates, replaces, or rewrites
-configuration.
-
-To validate the exact daemon arguments that a wrapper will pass, place them after
-`--` instead of using `--path`:
-
-```shell
-openshell-gateway config preflight -- --config /etc/openshell/gateway.toml --grpc-rate-limit-requests 100 --grpc-rate-limit-window-seconds 60
-```
-
-Debian and Ubuntu run preflight from the systemd user unit before local certificate
-generation. The unit still loads the `gateway.env` environment file and starts the
-gateway with no configuration arguments. Snap replays the exact effective daemon
-arguments through preflight. It gives a nonempty `OPENSHELL_GATEWAY_CONFIG`
-precedence; otherwise it validates and passes its canonical
-`SNAP_COMMON/gateway.toml` only when that path exists in the filesystem. A broken
-symlink is therefore rejected instead of being treated as absent.
-
-Package startup does not modify an operator-owned v1 file. Back it up, follow
-[Migrate to schema version 2](#migrate-to-schema-version-2), then validate the
-result explicitly before restarting the service:
-
-```shell
-cp ~/.config/openshell/gateway.toml ~/.config/openshell/gateway.toml.v1.bak
-$EDITOR ~/.config/openshell/gateway.toml
-openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
-systemctl --user restart openshell-gateway
 ```
