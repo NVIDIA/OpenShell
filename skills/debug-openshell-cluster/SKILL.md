@@ -551,29 +551,43 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
-The Kubernetes driver creates a workload Pod and a separate supervisor Pod.
-The workload Pod runs `openshell-sandbox`, which owns the agent process tree,
-identifies binaries, and intercepts mediated requests. The supervisor Pod runs
-`openshell-supervisor`, owns gateway authentication and external egress, and
-connects to the workload through the per-sandbox boundary Service. NetworkPolicy
-allows only the paired supervisor-to-workload channel and denies direct workload
-egress.
+The Kubernetes driver creates a sandbox workload Pod and a separate, directly
+managed supervisor Pod. Helm must render
+`network_policy_enforced = true`. This is an explicit operator assertion that
+the cluster CNI enforces Kubernetes NetworkPolicy; the Kubernetes API cannot
+attest enforcement. Run sandboxes only in a trusted namespace
+where tenants cannot create Pods, copy OpenShell role labels, or read the
+bootstrap Secret.
 
-The workload must not receive gateway credentials, supervisor TLS private keys,
-or upstream proxy credentials. If startup or mediation fails, inspect both Pods,
-the boundary Service, the per-sandbox Secrets, and the selecting NetworkPolicies:
+The workload Pod runs `/openshell-sandbox`. It has no gateway credentials and
+no direct egress. One namespace-wide workload NetworkPolicy is created before
+the suspended Sandbox resource. It denies all workload egress and allows
+supervisor Pods to reach sandbox TLS listeners. The driver then creates a
+per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
+Pod before releasing either Pod. The supervisor Pod runs
+`/openshell-supervisor`. Both Pods use the
+same resolved non-root identity, request no capabilities, drop `ALL`, disable
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
+the sandbox over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication, and owns gateway policy, provider
+credentials, DNS, and mediated upstream connections.
+
+Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
+or loses readiness:
 
 ```bash
-kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}'
-kubectl -n <sandbox-namespace> get pod,service,secret,networkpolicy -l openshell.ai/sandbox-id=<sandbox-id>
-kubectl -n <sandbox-namespace> logs <workload-pod> -c agent --tail=200
-kubectl -n <sandbox-namespace> logs <supervisor-pod> --tail=200
+kubectl -n <sandbox-namespace> get sandbox,pod,service,secret -l openshell.ai/sandbox-id=<sandbox-id>
+kubectl -n <sandbox-namespace> get networkpolicy openshell-sandbox-workloads -o yaml
+kubectl -n <sandbox-namespace> describe pod -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=supervisor
+kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200
+kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload -o yaml
+kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
 
 Creation and recovery fail closed. A missing Secret leaves both pods inert; a
 missing or unobserved workload fence must prevent the driver from releasing the
 Sandbox; and readiness requires both Agent Sandbox readiness and an Available
-supervisor Deployment. Its exec readiness check succeeds only after the
+supervisor Pod. Its exec readiness check succeeds only after the
 supervisor has attached, confirmed enforcement, started or resumed the
 workload, and registered the gateway access plane. Use both Pod logs for
 bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked
@@ -623,7 +637,7 @@ destination that should be direct is missing from `no_proxy`. Inspect the
 network supervisor logs for CONNECT and upstream-proxy decisions:
 
 ```bash
-kubectl -n <sandbox-namespace> logs <supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
+kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
 ### Step 7: Check VM-Backed Gateways
