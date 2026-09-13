@@ -33,22 +33,21 @@ rules:
       - watch
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
-  # returned pod name and UID to its immutable sandbox labels. PATCH is used
-  # only to remove the driver-owned bootstrap scheduling gate after the
-  # immutable bootstrap material has been created.
+  # returned pod name and UID to its immutable sandbox labels. The driver also
+  # creates and deletes the directly managed supervisor Pod. PATCH removes the
+  # driver-owned bootstrap scheduling gate after immutable bootstrap material
+  # has been created.
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
+      - create
+      - delete
       - get
+      - list
       - patch
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["create", "delete", "get", "list", "patch", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["get"]
+      - watch
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "delete", "get"]
@@ -57,5 +56,5 @@ rules:
     verbs: ["create"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["create", "delete", "get", "list"]
+    verbs: ["create", "get"]
 {{- end }}

@@ -47,7 +47,7 @@ not a tenant isolation boundary.
 The gateway stores platform state and delegates sandbox workload creation to
 this driver. Kubernetes owns scheduling and pod lifecycle. The workload Pod
 stages the statically linked musl `openshell-sandbox` binary from
-`sandbox_runtime_image`, while a separate Deployment runs the dynamically
+`sandbox_runtime_image`, while a directly managed Pod runs the dynamically
 linked glibc `openshell-supervisor` from `supervisor_image`.
 
 The sandbox owns the agent process, applies Landlock and child seccomp filters,
@@ -63,10 +63,17 @@ default seccomp profile. The sandbox installs a nested seccomp user-notification
 filter without requesting a capability in the Pod spec. Startup fails closed
 when the runtime blocks the required seccomp or Landlock operations.
 
-The driver creates an empty-egress `NetworkPolicy` before it releases the
-workload Pod. A second rule permits only the paired supervisor Pod to reach the
-sandbox TLS port. The supervisor has normal egress for gateway, DNS, and
-policy-approved upstream connections. Set
+The supervisor Pod has a direct, non-controller owner reference to the Sandbox
+resource. This links its garbage-collection lifecycle to the sandbox without
+competing with the Agent Sandbox controller for workload-Pod ownership.
+
+The driver creates one namespace-wide `NetworkPolicy` before it releases any
+workload Pod. It selects every OpenShell workload, denies all workload egress,
+and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
+authenticated Sandbox Protocol binds each connection to the exact sandbox and
+supervisor Pod identities. Supervisors have normal egress for gateway, DNS,
+and policy-approved upstream connections unless an operator policy restricts
+them. Set
 `sandbox_runtime.network_policy_enforced = true` only after verifying that the cluster
 CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
 
@@ -74,15 +81,16 @@ Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
 supervisor. The TLS channel binds the namespace, Sandbox CR, workload Pod,
-supervisor Deployment, and egress policy identities. Stop deletes the workload
-Pod and scales the supervisor to zero. Start rotates both Secrets and the
-supervisor Deployment before creating a new workload Pod. Delete retains the
-egress fence until workload deletion is confirmed.
+supervisor Pod, and shared network-policy identities. Stop deletes the workload
+and supervisor Pods. Start rotates both Secrets and creates a new supervisor
+Pod before releasing a new workload Pod. The shared network fence remains for
+the lifetime of the namespace.
 
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or
-spoof the pair labels.
+spoof the OpenShell role labels. Exact supervisor-to-sandbox authorization is
+still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
 
 ## Sandbox Resource
 

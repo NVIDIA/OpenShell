@@ -258,7 +258,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Capability-free workload container. | Uses `network_mode=none`; a separate capability-free supervisor container mediates egress and access over a private daemon-local Unix socket volume. |
 | Podman | Existing rootless driver. | Container. | Not converted by this isolation stack. |
-| Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Uses empty-egress NetworkPolicy, paired-only supervisor ingress, and a separate capability-free supervisor Deployment over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace. |
+| Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Uses one namespace-wide empty-egress workload NetworkPolicy and a separate capability-free supervisor Pod over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun or QEMU VM. | The NIC-less guest runs `openshell-sandbox` as PID 1; host `openshell-supervisor` owns gateway networking and reaches the guest over vsock. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
@@ -334,7 +334,7 @@ Drivers deliver the two binaries to separate trust domains:
 |---|---|
 | Docker | A digest-pinned daemon-local volume supplies `openshell-sandbox`; the companion image runs `openshell-supervisor`. |
 | Podman | Existing driver behavior; not converted by this stack. |
-| Kubernetes | A non-root init container stages `openshell-sandbox` into a memory volume; the separate Deployment image runs `openshell-supervisor`. |
+| Kubernetes | A non-root init container stages `openshell-sandbox` into a memory volume; a directly managed Pod runs `openshell-supervisor`. |
 | VM | `openshell-sandbox` is embedded in the guest rootfs; a separately digest-checked native `openshell-supervisor` runs on the host. |
 | Extension | Defined by the out-of-tree driver. |
 
@@ -365,9 +365,9 @@ and explicit `/sandbox` values select `/sandbox`; other paths must already
 exist without symlink or reserved-mount collisions and must be usable by the
 resolved identity. Kubernetes and VM use `/sandbox`.
 
-The Kubernetes driver creates the empty-egress workload fence before a
-suspended Sandbox CR, then provisions split immutable bootstrap Secrets, the
-private runtime Service, and the supervisor Deployment. A
+The Kubernetes driver creates the namespace-wide empty-egress workload fence
+before a suspended Sandbox CR, then provisions split immutable bootstrap
+Secrets, the private runtime Service, and a gated supervisor Pod. A
 non-root init container stages `openshell-sandbox` and one-use bootstrap files
 into memory volumes. The workload Pod never mounts supervisor or gateway
 credentials. The driver removes its scheduling gate only after the companions
