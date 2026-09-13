@@ -23,13 +23,14 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, GatewayCallbackRoute, LABEL_MANAGED_BY,
     LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE,
     LABEL_SANDBOX_WORKSPACE, SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry,
     gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -57,7 +58,9 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
-use openshell_core::{Error, Result as CoreResult};
+use openshell_core::{
+    AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, UpstreamProxyConfig,
+};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
@@ -105,7 +108,10 @@ const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.
 const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
-const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/channel/supervisor";
+const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
+const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
+const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
+    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
 const LABEL_ISOLATION_BACKEND: &str = "openshell.ai/isolation-backend";
 const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -161,16 +167,22 @@ pub struct DockerComputeConfig {
     pub default_image: String,
 
     /// Image pull policy for sandbox images.
-    pub image_pull_policy: String,
+    pub image_pull_policy: ImagePullPolicy,
 
-    /// Namespace label applied to Docker sandboxes.
-    pub sandbox_namespace: String,
+    /// Value of the `openshell.sandbox_namespace` label applied to Docker sandboxes.
+    pub sandbox_label: String,
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
 
     /// Image containing the trusted `openshell-sandbox` binary.
     pub sandbox_runtime_image: Option<String>,
+
+    /// Optional host path to the trusted `openshell-sandbox` binary.
+    ///
+    /// This preserves the original `supervisor_bin` configuration name while
+    /// the split runtime transitions to the explicit sandbox image setting.
+    pub supervisor_bin: Option<PathBuf>,
 
     /// Image containing the trusted `openshell-supervisor` binary.
     pub supervisor_image: Option<String>,
@@ -190,15 +202,34 @@ pub struct DockerComputeConfig {
     /// Host gateway IP used for sandbox host aliases.
     pub host_gateway_ip: String,
 
+    /// Unix socket path used for interactive sandbox access.
+    pub ssh_socket_path: String,
+
     /// Container cgroup PID limit for Docker-managed sandboxes.
     ///
-    /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
-    pub sandbox_pids_limit: i64,
+    /// Omit the field to use `OpenShell`'s default sandbox process limit.
+    /// Explicit zero is invalid.
+    #[serde(
+        default = "openshell_core::config::default_sandbox_pids_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sandbox_pids_limit: Option<std::num::NonZeroI64>,
 
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+
+    /// Corporate forward-proxy settings supplied to the supervisor.
+    #[serde(flatten)]
+    pub upstream_proxy: UpstreamProxyConfig,
+
+    /// Host UNIX socket projected into the supervisor for provider identity.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+
+    /// `AppArmor` confinement requested for the workload container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_armor_profile: Option<AppArmorProfile>,
 }
 
 impl DockerComputeConfig {
@@ -213,6 +244,13 @@ impl DockerComputeConfig {
             )));
         }
         validate_sandbox_pids_limit(self.sandbox_pids_limit)?;
+        validate_image_pull_policy(self.image_pull_policy)?;
+        self.upstream_proxy.validate().map_err(Error::config)?;
+        validate_docker_proxy_auth_file(&self.upstream_proxy)?;
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(Error::config)?;
+        }
         parse_optional_host_gateway_ip(&self.host_gateway_ip)?;
         if gateway_bind_address.port() == 0 {
             return Err(Error::config(
@@ -228,18 +266,23 @@ impl Default for DockerComputeConfig {
         Self {
             socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
-            image_pull_policy: String::new(),
-            sandbox_namespace: "default".to_string(),
+            image_pull_policy: ImagePullPolicy::default(),
+            sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
             sandbox_runtime_image: None,
+            supervisor_bin: None,
             supervisor_image: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
-            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
+            upstream_proxy: UpstreamProxyConfig::default(),
+            provider_spiffe_workload_api_socket: None,
+            app_armor_profile: None,
         }
     }
 }
@@ -254,7 +297,7 @@ pub(crate) struct DockerGuestTlsPaths {
 #[derive(Debug, Clone)]
 struct DockerDriverRuntimeConfig {
     default_image: String,
-    image_pull_policy: String,
+    image_pull_policy: ImagePullPolicy,
     sandbox_namespace: String,
     gateway_route: DockerGatewayRoute,
     gateway_callback_bind_address: Option<SocketAddr>,
@@ -264,11 +307,15 @@ struct DockerDriverRuntimeConfig {
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
     gateway_tls_server_name: Option<String>,
+    ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
-    sandbox_pids_limit: i64,
+    sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
+    upstream_proxy: UpstreamProxyConfig,
+    provider_spiffe_workload_api_socket: Option<PathBuf>,
+    app_armor_profile: Option<AppArmorProfile>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -827,6 +874,8 @@ impl DockerComputeDriver {
             wsl_all_gpu_fallback_enabled,
         };
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
+        validate_image_pull_policy(docker_config.image_pull_policy)?;
+        validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
@@ -879,28 +928,38 @@ impl DockerComputeDriver {
             .unwrap_or_else(openshell_core::config::default_supervisor_image);
         let supervisor_image_id =
             ensure_runtime_image(&docker, &supervisor_image, "supervisor").await?;
-        let sandbox_runtime_image = docker_config
-            .sandbox_runtime_image
-            .clone()
-            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image);
-        let sandbox_runtime_image_id =
-            ensure_runtime_image(&docker, &sandbox_runtime_image, "sandbox runtime").await?;
-        let sandbox_binary = Arc::new(
-            extract_sandbox_binary_bytes(&docker, &sandbox_runtime_image_id)
-                .await
-                .map_err(|error| {
-                    Error::config(format!(
-                        "failed to load trusted sandbox binary from Docker image '{sandbox_runtime_image}': {error}"
-                    ))
-                })?,
-        );
+        let sandbox_binary = if let Some(path) = docker_config.supervisor_bin.as_deref() {
+            validate_linux_elf_binary(path).map_err(Error::config)?;
+            Arc::new(tokio::fs::read(path).await.map_err(|error| {
+                Error::config(format!(
+                    "failed to read trusted sandbox binary '{}': {error}",
+                    path.display()
+                ))
+            })?)
+        } else {
+            let sandbox_runtime_image = docker_config
+                .sandbox_runtime_image
+                .clone()
+                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image);
+            let sandbox_runtime_image_id =
+                ensure_runtime_image(&docker, &sandbox_runtime_image, "sandbox runtime").await?;
+            Arc::new(
+                extract_sandbox_binary_bytes(&docker, &sandbox_runtime_image_id)
+                    .await
+                    .map_err(|error| {
+                        Error::config(format!(
+                            "failed to load trusted sandbox binary from Docker image '{sandbox_runtime_image}': {error}"
+                        ))
+                    })?,
+            )
+        };
         let guest_tls = docker_guest_tls_paths(&docker_config)?;
         let driver = Self {
             docker: Arc::new(docker),
             config: DockerDriverRuntimeConfig {
                 default_image: docker_config.default_image.clone(),
-                image_pull_policy: docker_config.image_pull_policy.clone(),
-                sandbox_namespace: docker_config.sandbox_namespace.clone(),
+                image_pull_policy: docker_config.image_pull_policy,
+                sandbox_namespace: docker_config.sandbox_label.clone(),
                 gateway_route,
                 gateway_callback_bind_address,
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
@@ -909,11 +968,17 @@ impl DockerComputeDriver {
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
                 gateway_tls_server_name,
+                ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                upstream_proxy: docker_config.upstream_proxy.clone(),
+                provider_spiffe_workload_api_socket: docker_config
+                    .provider_spiffe_workload_api_socket
+                    .clone(),
+                app_armor_profile: docker_config.app_armor_profile.clone(),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1212,7 +1277,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await {
+        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
             return Ok(Some(pending));
         }
         let container = self
@@ -1967,7 +2032,9 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self.remove_pending_sandbox(sandbox_id, sandbox_name).await;
+        let pending = self
+            .remove_pending_sandbox(sandbox_id, sandbox_name)
+            .await?;
         if let Some(record) = pending.as_ref()
             && let Some(task) = record.task.as_ref()
         {
@@ -2079,7 +2146,10 @@ impl DockerComputeDriver {
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
         else {
-            if let Some(record) = self.remove_pending_sandbox(sandbox_id, sandbox_name).await {
+            if let Some(record) = self
+                .remove_pending_sandbox(sandbox_id, sandbox_name)
+                .await?
+            {
                 self.stop_control_process(&record.sandbox.id).await;
                 self.remove_auxiliary_containers_for_sandbox(&record.sandbox.id)
                     .await?;
@@ -2300,7 +2370,7 @@ impl DockerComputeDriver {
         let mut pending = self.pending.lock().await;
         if pending
             .values()
-            .any(|record| record.sandbox.id == sandbox.id || record.sandbox.name == sandbox.name)
+            .any(|record| record.sandbox.id == sandbox.id)
         {
             return Err(Status::already_exists("sandbox already exists"));
         }
@@ -2324,12 +2394,10 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<DriverSandbox> {
+    ) -> Result<Option<DriverSandbox>, Status> {
         let pending = self.pending.lock().await;
-        pending
-            .values()
-            .find(|record| pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name))
-            .map(|record| record.sandbox.clone())
+        let id = pending_sandbox_record_id(&pending, sandbox_id, sandbox_name)?;
+        Ok(id.and_then(|id| pending.get(&id).map(|record| record.sandbox.clone())))
     }
 
     async fn pending_snapshot_map(&self) -> HashMap<String, DriverSandbox> {
@@ -2349,12 +2417,12 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<PendingSandboxRecord> {
+    ) -> Result<Option<PendingSandboxRecord>, Status> {
         let mut pending = self.pending.lock().await;
-        let id = pending.iter().find_map(|(id, record)| {
-            pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name).then(|| id.clone())
-        })?;
-        pending.remove(&id)
+        let Some(id) = pending_sandbox_record_id(&pending, sandbox_id, sandbox_name)? else {
+            return Ok(None);
+        };
+        Ok(pending.remove(&id))
     }
 
     async fn fail_pending_sandbox(
@@ -2396,7 +2464,7 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<(), Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await {
+        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
             self.publish_sandbox_snapshot(pending);
             return Ok(());
         }
@@ -2637,9 +2705,8 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         image: &str,
     ) -> Result<DockerImageMetadata, Status> {
-        let policy = self.config.image_pull_policy.trim().to_ascii_lowercase();
-        let inspect = match policy.as_str() {
-            "" | "ifnotpresent" => {
+        let inspect = match self.config.image_pull_policy {
+            ImagePullPolicy::IfNotPresent => {
                 if let Ok(inspect) = self.docker.inspect_image(image).await {
                     self.publish_docker_progress(
                         sandbox_id,
@@ -2656,14 +2723,14 @@ impl DockerComputeDriver {
                         .map_err(|err| internal_status("inspect Docker image after pull", err))?
                 }
             }
-            "always" => {
+            ImagePullPolicy::Always => {
                 self.pull_image(sandbox_id, image).await?;
                 self.docker
                     .inspect_image(image)
                     .await
                     .map_err(|err| internal_status("inspect Docker image after pull", err))?
             }
-            "never" => match self.docker.inspect_image(image).await {
+            ImagePullPolicy::Never => match self.docker.inspect_image(image).await {
                 Ok(inspect) => {
                     self.publish_docker_progress(
                         sandbox_id,
@@ -2680,10 +2747,10 @@ impl DockerComputeDriver {
                 }
                 Err(err) => return Err(internal_status("inspect Docker image", err)),
             },
-            other => {
-                return Err(Status::failed_precondition(format!(
-                    "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
-                )));
+            ImagePullPolicy::Newer => {
+                return Err(Status::failed_precondition(
+                    "docker image_pull_policy = \"newer\" is supported only by the Podman compute driver",
+                ));
             }
         };
 
@@ -3269,9 +3336,28 @@ fn pending_sandbox_snapshot(
     }
 }
 
-fn pending_sandbox_matches(sandbox: &DriverSandbox, sandbox_id: &str, sandbox_name: &str) -> bool {
-    (!sandbox_id.is_empty() && sandbox.id == sandbox_id)
-        || (!sandbox_name.is_empty() && sandbox.name == sandbox_name)
+fn pending_sandbox_record_id(
+    pending: &HashMap<String, PendingSandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(pending
+            .get(sandbox_id)
+            .map(|record| record.sandbox.id.clone()));
+    }
+
+    let mut matches = pending
+        .values()
+        .filter(|record| !sandbox_name.is_empty() && record.sandbox.name == sandbox_name)
+        .map(|record| record.sandbox.id.clone());
+    let first = matches.next();
+    if first.is_some() && matches.next().is_some() {
+        return Err(Status::failed_precondition(format!(
+            "multiple pending Docker sandboxes are named '{sandbox_name}'; use sandbox_id"
+        )));
+    }
+    Ok(first)
 }
 
 fn provisioning_condition() -> DriverCondition {
@@ -3771,12 +3857,57 @@ fn docker_channel_volume_name_by_id(
     format!("openshell-channel-{}", &digest[..32])
 }
 
+fn docker_supervisor_volume_name(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> String {
+    docker_supervisor_volume_name_by_id(&sandbox.id, config)
+}
+
+fn docker_supervisor_volume_name_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config.sandbox_namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(sandbox_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("openshell-supervisor-{}", &digest[..32])
+}
+
 async fn create_docker_channel_volume(
     docker: &Docker,
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<(), Status> {
-    let name = docker_channel_volume_name(sandbox, config);
+    create_docker_runtime_volume(
+        docker,
+        sandbox,
+        config,
+        docker_channel_volume_name(sandbox, config),
+    )
+    .await?;
+    if let Err(error) = create_docker_runtime_volume(
+        docker,
+        sandbox,
+        config,
+        docker_supervisor_volume_name(sandbox, config),
+    )
+    .await
+    {
+        let _ = remove_docker_volume(docker, &docker_channel_volume_name(sandbox, config)).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn create_docker_runtime_volume(
+    docker: &Docker,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    name: String,
+) -> Result<(), Status> {
     let expected_labels = HashMap::from([
         (
             LABEL_MANAGED_BY.to_string(),
@@ -3800,7 +3931,7 @@ async fn create_docker_channel_volume(
         })
         .await
         .map_err(|error| {
-            Status::internal(format!("create Docker sandbox channel volume: {error}"))
+            Status::internal(format!("create Docker sandbox runtime volume: {error}"))
         })?;
     let volume = docker.inspect_volume(&name).await.map_err(|error| {
         Status::internal(format!("inspect Docker sandbox channel volume: {error}"))
@@ -3812,7 +3943,7 @@ async fn create_docker_channel_volume(
             .any(|(key, value)| volume.labels.get(key) != Some(value))
     {
         return Err(Status::failed_precondition(format!(
-            "Docker sandbox channel volume '{name}' already exists without the expected local-driver ownership labels"
+            "Docker sandbox runtime volume '{name}' already exists without the expected local-driver ownership labels"
         )));
     }
     Ok(())
@@ -3823,12 +3954,21 @@ async fn remove_docker_channel_volume_by_id(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<(), Status> {
-    let name = docker_channel_volume_name_by_id(sandbox_id, config);
+    remove_docker_volume(
+        docker,
+        &docker_channel_volume_name_by_id(sandbox_id, config),
+    )
+    .await?;
+    remove_docker_volume(
+        docker,
+        &docker_supervisor_volume_name_by_id(sandbox_id, config),
+    )
+    .await
+}
+
+async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status> {
     docker
-        .remove_volume(
-            &name,
-            None::<bollard::query_parameters::RemoveVolumeOptions>,
-        )
+        .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
         .await
         .or_else(|error| {
             if is_not_found_error(&error) {
@@ -3837,7 +3977,7 @@ async fn remove_docker_channel_volume_by_id(
                 Err(error)
             }
         })
-        .map_err(|error| Status::internal(format!("remove Docker sandbox channel volume: {error}")))
+        .map_err(|error| Status::internal(format!("remove Docker sandbox runtime volume: {error}")))
 }
 
 fn sandbox_token_host_path(
@@ -4243,16 +4383,9 @@ async fn docker_supervisor_bundle_archive(
         ));
     }
     let mut archive = tar::Builder::new(Vec::new());
-    append_docker_archive_directory(
-        &mut archive,
-        ".openshell/channel/supervisor",
-        0o700,
-        SUPERVISOR_UID,
-        SUPERVISOR_GID,
-    )?;
     append_docker_archive_file(
         &mut archive,
-        ".openshell/channel/supervisor/runtime-descriptor.json",
+        "runtime-descriptor.json",
         0o600,
         SUPERVISOR_UID,
         SUPERVISOR_GID,
@@ -4260,7 +4393,7 @@ async fn docker_supervisor_bundle_archive(
     )?;
     append_docker_archive_file(
         &mut archive,
-        ".openshell/channel/supervisor/auth.json",
+        "auth.json",
         0o600,
         SUPERVISOR_UID,
         SUPERVISOR_GID,
@@ -4269,7 +4402,7 @@ async fn docker_supervisor_bundle_archive(
     if let Some(tls) = &config.guest_tls {
         append_docker_archive_directory(
             &mut archive,
-            ".openshell/channel/supervisor/tls",
+            "tls",
             0o700,
             SUPERVISOR_UID,
             SUPERVISOR_GID,
@@ -4287,13 +4420,29 @@ async fn docker_supervisor_bundle_archive(
             })?;
             append_docker_archive_file(
                 &mut archive,
-                &format!(".openshell/channel/supervisor/tls/{name}"),
+                &format!("tls/{name}"),
                 0o600,
                 SUPERVISOR_UID,
                 SUPERVISOR_GID,
                 &contents,
             )?;
         }
+    }
+    if let Some(path) = config.upstream_proxy.proxy_auth_file.as_ref() {
+        let contents = tokio::fs::read(path).await.map_err(|error| {
+            Status::internal(format!(
+                "read Docker upstream proxy credential {}: {error}",
+                path.display()
+            ))
+        })?;
+        append_docker_archive_file(
+            &mut archive,
+            "upstream-proxy-auth",
+            0o600,
+            SUPERVISOR_UID,
+            SUPERVISOR_GID,
+            &contents,
+        )?;
     }
     archive
         .into_inner()
@@ -4428,8 +4577,8 @@ async fn stage_docker_supervisor_bundle(
                 host_config: Some(HostConfig {
                     network_mode: Some("none".to_string()),
                     mounts: Some(vec![Mount {
-                        target: Some(BOUNDARY_MOUNT_PATH.to_string()),
-                        source: Some(docker_channel_volume_name(sandbox, config)),
+                        target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
+                        source: Some(docker_supervisor_volume_name(sandbox, config)),
                         typ: Some(MountTypeEnum::VOLUME),
                         read_only: Some(false),
                         volume_options: Some(MountVolumeOptions {
@@ -4452,7 +4601,7 @@ async fn stage_docker_supervisor_bundle(
             ))
         })?;
     let options = UploadToContainerOptionsBuilder::default()
-        .path("/")
+        .path(SUPERVISOR_STATE_MOUNT_PATH)
         .copy_uidgid("true")
         .build();
     let result = docker
@@ -4537,8 +4686,9 @@ async fn spawn_docker_control_process(
         format!("{}={}", openshell_core::sandbox_env::SANDBOX_ID, sandbox.id),
         format!("{}={}", openshell_core::sandbox_env::SANDBOX, sandbox.name),
         format!(
-            "{}=/run/openshell/ssh.sock",
-            openshell_core::sandbox_env::SSH_SOCKET_PATH
+            "{}={}",
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            config.ssh_socket_path
         ),
         format!(
             "{}=/run/openshell/proxy-tls",
@@ -4582,6 +4732,14 @@ async fn spawn_docker_control_process(
             ),
         ]);
     }
+    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
+        let projected = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
+            .map_err(Status::failed_precondition)?;
+        environment.push(format!(
+            "{}={projected}",
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+        ));
+    }
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
     stage_docker_supervisor_bundle(docker, sandbox, config, supervisor_archive).await?;
     let labels = HashMap::from([
@@ -4597,19 +4755,57 @@ async fn spawn_docker_control_process(
             LABEL_ISOLATION_ROLE_SUPERVISOR.to_string(),
         ),
     ]);
+    let mut command = vec![
+        "--backend-descriptor-file".to_string(),
+        runtime_descriptor_path,
+        "--auth-bundle-file".to_string(),
+        auth_bundle_path,
+        "--workdir".to_string(),
+        workspace_root,
+        format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
+    ];
+    command.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+    let mut supervisor_mounts = vec![
+        Mount {
+            target: Some(BOUNDARY_MOUNT_PATH.to_string()),
+            source: Some(docker_channel_volume_name(sandbox, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(true),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Mount {
+            target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
+            source: Some(docker_supervisor_volume_name(sandbox, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(true),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ];
+    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
+        let parent = socket.parent().ok_or_else(|| {
+            Status::failed_precondition("provider SPIFFE socket has no parent directory")
+        })?;
+        supervisor_mounts.push(Mount {
+            target: Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.to_string()),
+            source: Some(parent.display().to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
     let create = ContainerCreateBody {
         image: Some(config.supervisor_image_id.clone()),
         user: Some(format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")),
         entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
-        cmd: Some(vec![
-            "--backend-descriptor-file".to_string(),
-            runtime_descriptor_path,
-            "--auth-bundle-file".to_string(),
-            auth_bundle_path,
-            "--workdir".to_string(),
-            workspace_root,
-            format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
-        ]),
+        cmd: Some(command),
         env: Some(environment),
         labels: Some(labels),
         healthcheck: Some(HealthConfig {
@@ -4631,17 +4827,7 @@ async fn spawn_docker_control_process(
             // approved upstream connections. Keep it on the daemon host's
             // network while the workload remains fenced by network=none.
             network_mode: Some(SUPERVISOR_NETWORK_MODE.to_string()),
-            mounts: Some(vec![Mount {
-                target: Some(BOUNDARY_MOUNT_PATH.to_string()),
-                source: Some(docker_channel_volume_name(sandbox, config)),
-                typ: Some(MountTypeEnum::VOLUME),
-                read_only: Some(true),
-                volume_options: Some(MountVolumeOptions {
-                    no_copy: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]),
+            mounts: Some(supervisor_mounts),
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: None,
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
@@ -5267,7 +5453,17 @@ fn build_container_create_body_for_image(
             ),
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: None,
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            security_opt: Some({
+                let mut options = vec!["no-new-privileges:true".to_string()];
+                if let Some(option) = config
+                    .app_armor_profile
+                    .as_ref()
+                    .and_then(AppArmorProfile::oci_security_opt)
+                {
+                    options.push(option);
+                }
+                options
+            }),
             network_mode: Some("none".to_string()),
             dns: Some(vec!["127.0.0.53".to_string()]),
             tmpfs: Some(HashMap::from([(
@@ -5573,26 +5769,92 @@ fn docker_resource_limits(
     })
 }
 
-fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
-    if value < 0 {
+fn validate_docker_proxy_auth_file(config: &UpstreamProxyConfig) -> CoreResult<()> {
+    let Some(path) = config.proxy_auth_file.as_ref() else {
+        return Ok(());
+    };
+    let raw = openshell_core::driver_utils::read_upstream_proxy_credential_file(
+        path.to_str()
+            .ok_or_else(|| Error::config("proxy_auth_file must be valid UTF-8"))?,
+    )
+    .map_err(Error::config)?;
+    openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+        .map_err(|error| Error::config(format!("proxy_auth_file is invalid: {error}")))?;
+    Ok(())
+}
+
+fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = config.https_proxy.as_ref() {
+        args.extend(["--upstream-proxy".to_string(), url.clone()]);
+    }
+    if let Some(no_proxy) = config.no_proxy.as_ref() {
+        args.extend(["--upstream-no-proxy".to_string(), no_proxy.clone()]);
+    }
+    if config.proxy_auth_file.is_some() {
+        args.extend([
+            "--upstream-proxy-auth-file".to_string(),
+            SUPERVISOR_PROXY_AUTH_MOUNT_PATH.to_string(),
+        ]);
+    }
+    if config.proxy_auth_allow_insecure == Some(true) {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    if config.proxy_connect_by_hostname == Some(true) {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
+fn validate_sandbox_pids_limit(value: Option<std::num::NonZeroI64>) -> CoreResult<()> {
+    if value.is_some_and(|value| value.get() <= 0) {
         return Err(Error::config(
-            "docker sandbox_pids_limit must be zero or greater",
+            "docker sandbox_pids_limit must be positive when set",
         ));
     }
     Ok(())
 }
 
-fn docker_pids_limit(value: i64) -> Result<Option<i64>, Status> {
-    if value < 0 {
-        return Err(Status::failed_precondition(
-            "docker sandbox_pids_limit must be zero or greater",
+fn validate_image_pull_policy(policy: ImagePullPolicy) -> CoreResult<()> {
+    if policy == ImagePullPolicy::Newer {
+        return Err(Error::config(
+            "docker image_pull_policy = \"newer\" is supported only by the Podman compute driver",
         ));
     }
-    if value == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(value))
+    Ok(())
+}
+
+fn validate_docker_app_armor_profile(
+    profile: Option<&AppArmorProfile>,
+    info: &SystemInfo,
+) -> CoreResult<()> {
+    let requires_apparmor = matches!(
+        profile,
+        Some(AppArmorProfile::RuntimeDefault | AppArmorProfile::Localhost(_))
+    );
+    if !requires_apparmor {
+        return Ok(());
     }
+    let available = info.security_options.as_ref().is_some_and(|options| {
+        options
+            .iter()
+            .any(|option| option.to_ascii_lowercase().contains("apparmor"))
+    });
+    if !available {
+        return Err(Error::config(
+            "app_armor_profile requires AppArmor, but Docker reports it is unavailable; enable AppArmor on the daemon host or set app_armor_profile = \"Unconfined\" explicitly",
+        ));
+    }
+    Ok(())
+}
+
+fn docker_pids_limit(value: Option<std::num::NonZeroI64>) -> Result<Option<i64>, Status> {
+    if value.is_some_and(|value| value.get() < 0) {
+        return Err(Status::failed_precondition(
+            "docker sandbox_pids_limit must be positive when set",
+        ));
+    }
+    Ok(value.map(std::num::NonZeroI64::get))
 }
 
 #[allow(clippy::cast_possible_truncation)]
