@@ -711,8 +711,9 @@ sandbox_label      = "docker-dev"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for this topology.
 grpc_endpoint      = "https://host.openshell.internal:17670"
-# Contains both /openshell-sandbox and /openshell-supervisor. Defaults to the
-# gateway version; override to pin a specific build.
+# The workload runtime and supervisor companion use separate images. Both
+# default to the gateway version; override either to pin a specific build.
+# sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
@@ -722,9 +723,10 @@ host_gateway_ip    = "172.17.0.1"
 enable_bind_mounts = false
 # Omit to use OpenShell's 2048-process default. Explicit 0 is invalid.
 sandbox_pids_limit = 2048
-# Explicit supervisor-compatible default. RuntimeDefault requires Docker to
-# report AppArmor support; Localhost/<name> requires an operator-loaded profile.
-app_armor_profile = "Unconfined"
+# Omit this field to keep Docker's runtime-selected AppArmor profile.
+# Localhost/<name> requires an operator-loaded profile; Unconfined is an
+# explicit operator opt-out.
+# app_armor_profile = "Localhost/openshell-sandbox"
 # Corporate TLS egress proxy. These are supervisor argv settings, not workload
 # environment variables. Do not embed credentials in the URL.
 https_proxy = "https://proxy.corp.example:8443"

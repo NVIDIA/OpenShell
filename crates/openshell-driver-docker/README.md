@@ -25,9 +25,10 @@ The driver creates two containers for each sandbox:
   inspection, DNS policy, and external upstream connections.
 
 Both containers are non-root, request no capabilities, and set
-no-new-privileges. They share only a driver-created Docker named volume. The
-volume carries an authenticated Unix socket and immutable bootstrap material;
-it is writable by the sandbox and read-only in the supervisor.
+no-new-privileges. A shared named volume carries the authenticated Unix socket
+and sandbox bootstrap material. A second supervisor-only volume carries the
+supervisor JWT and gateway client credentials and is never mounted into the
+workload.
 
 The workload uses `network_mode=none`. Its seccomp user-notification broker
 mediates every supported TCP and DNS operation, attributes it to the calling
@@ -72,8 +73,8 @@ LSM decisions remain authoritative.
 | `network_mode = none` on the workload | Removes direct external routes. |
 | `network_mode = host` on the supervisor | Lets the trusted supervisor originate approved gateway and upstream connections through the daemon host network. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
-| `PidsLimit` | Applies the configured sandbox PID budget. Set `sandbox_pids_limit = 0` to use the runtime default. |
-| Private named volume | Carries a per-generation mutual-TLS sandbox/supervisor channel without sharing daemon-host paths. The sandbox consumes its server key at startup; only the supervisor receives the client key. |
+| `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
+| Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
@@ -85,7 +86,7 @@ volumes. Start stages a fresh sandbox bootstrap bundle, restarts that workload,
 and creates a new supervisor companion. A durably stopped sandbox stays stopped
 across gateway restarts.
 
-Delete force-removes both containers, the driver-owned channel volume, and the
+Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
 
