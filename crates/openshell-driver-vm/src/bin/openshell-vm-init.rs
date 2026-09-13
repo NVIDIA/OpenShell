@@ -7,9 +7,11 @@ use std::ffi::OsString;
 use std::fmt;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
 const LOOPBACK_NAME: &[u8] = b"lo";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
