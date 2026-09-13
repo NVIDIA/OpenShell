@@ -70,9 +70,10 @@ mise run helm:skaffold:run
 ```
 
 The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
-and deploys the OpenShell Helm chart. The Kubernetes compute driver places
-`openshell-sandbox` in the workload Pod and `openshell-supervisor` in a separate
-Pod, then creates their authenticated channel and NetworkPolicy fence. The
+and deploys the OpenShell Helm chart. The Kubernetes driver creates a
+capability-free workload Pod and a directly managed capability-free supervisor
+Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
+workload Pod. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
 generates mTLS secrets on first install. The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
