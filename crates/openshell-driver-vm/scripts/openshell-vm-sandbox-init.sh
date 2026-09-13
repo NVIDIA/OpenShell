@@ -563,6 +563,7 @@ run_post_overlay_setup() {
     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
     wait
 
+    reconcile_sandbox_account
     setup_sandbox_workdir
 
     configure_hostname
