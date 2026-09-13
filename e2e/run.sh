@@ -249,15 +249,13 @@ mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--bin openshell-sandbox
 linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/openshell-sandbox"
 
-echo "==> Preparing ${linux_gateway_rust_target} build target"
-mise x -- rustup target add "${linux_gateway_rust_target}" >/dev/null
-echo "==> Building Linux openshell-supervisor (${linux_gateway_zig_target})"
+echo "==> Building Linux openshell-supervisor (${linux_musl_target})"
 mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--release \
-	--target "${linux_gateway_zig_target}" \
+	--target "${linux_musl_target}" \
 	-p openshell-supervisor \
 	--bin openshell-supervisor
-linux_supervisor_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-supervisor"
+linux_supervisor_bin="${target_dir}/${linux_musl_target}/release/openshell-supervisor"
 
 host_gateway_bin=
 guest_gateway_bin=
@@ -317,7 +315,16 @@ supervisor_rootfs="${run_dir}/supervisor-rootfs"
 supervisor_archive="${run_dir}/supervisor.tar"
 mkdir -p "${supervisor_rootfs}"
 install -m 0555 "${linux_supervisor_bin}" "${supervisor_rootfs}/openshell-supervisor"
-tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" openshell-supervisor
+"${ROOT}/tasks/scripts/verify-static-binary.sh" "${supervisor_rootfs}/openshell-supervisor"
+mkdir -p "${supervisor_rootfs}/etc/ssl/certs"
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+	install -m 0444 /etc/ssl/certs/ca-certificates.crt \
+		"${supervisor_rootfs}/etc/ssl/certs/ca-certificates.crt"
+else
+	die "/etc/ssl/certs/ca-certificates.crt is required to package the supervisor image"
+fi
+tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" \
+	openshell-supervisor etc/ssl/certs/ca-certificates.crt
 child_pid=
 runtime_log=
 keep=0
@@ -422,6 +429,7 @@ if [ "${mode}" = host ]; then
 			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
+		docker run --rm --network none "${supervisor_image}" --help >/dev/null
 		;;
 	podman)
 		podman import \
@@ -432,6 +440,7 @@ if [ "${mode}" = host ]; then
 			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
+		podman run --rm --network none "${supervisor_image}" --help >/dev/null
 		;;
 	esac
 
@@ -496,6 +505,7 @@ docker)
 		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
+	docker run --rm --network none "${supervisor_image}" --help >/dev/null
 	;;
 podman)
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
@@ -506,6 +516,8 @@ podman)
 		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
+	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" run \
+		--rm --network none "${supervisor_image}" --help >/dev/null
 	;;
 esac
 report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"

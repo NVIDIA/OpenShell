@@ -117,7 +117,7 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
-        image_pull_policy: String::new(),
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
         sandbox_namespace: "default".to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(
@@ -135,6 +135,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         gateway_tls_server_name: None,
+        ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -145,8 +146,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
         },
-        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
+        upstream_proxy: UpstreamProxyConfig::default(),
+        provider_spiffe_workload_api_socket: None,
+        app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
 }
 
@@ -658,7 +662,7 @@ async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let mut config = runtime_config();
-    config.image_pull_policy = "unsupported".to_string();
+    config.image_pull_policy = ImagePullPolicy::Newer;
     let driver = test_driver_with_config(config);
 
     async {
@@ -1300,12 +1304,13 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 
 #[test]
 fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
+    let default = openshell_core::config::default_sandbox_pids_limit();
     assert_eq!(
-        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
-        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
+        docker_pids_limit(default).unwrap(),
+        default.map(std::num::NonZeroI64::get)
     );
-    assert_eq!(docker_pids_limit(0).unwrap(), None);
-    assert!(docker_pids_limit(-1).is_err());
+    assert_eq!(docker_pids_limit(None).unwrap(), None);
+    assert!(docker_pids_limit(std::num::NonZeroI64::new(-1)).is_err());
 }
 
 #[test]
@@ -1315,10 +1320,26 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 }
 
 #[test]
+fn repository_e2e_docker_configuration_uses_the_supported_schema() {
+    let source = include_str!("../../../e2e/configs/gateway/docker.toml");
+    let (_, docker_table) = source
+        .split_once("[openshell.drivers.docker]")
+        .expect("Docker E2E config contains a driver table");
+    let config: DockerComputeConfig =
+        toml::from_str(docker_table).expect("Docker E2E driver config parses");
+
+    assert_eq!(config.image_pull_policy, ImagePullPolicy::IfNotPresent);
+    assert_eq!(config.sandbox_label, "openshell-e2e");
+}
+
+#[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
-    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
+    assert_eq!(
+        host_config.pids_limit,
+        openshell_core::config::default_sandbox_pids_limit().map(std::num::NonZeroI64::get)
+    );
 }
 
 #[test]
@@ -1416,7 +1437,10 @@ fn container_creation_uses_inspected_immutable_image() {
     assert_eq!(host.group_add, Some(vec!["1236".to_string()]));
     assert_eq!(
         host.security_opt,
-        Some(vec!["no-new-privileges:true".to_string()])
+        Some(vec![
+            "no-new-privileges:true".to_string(),
+            "apparmor=unconfined".to_string(),
+        ])
     );
     assert_eq!(host.network_mode.as_deref(), Some("none"));
     assert_eq!(host.dns, Some(vec!["127.0.0.53".to_string()]));
@@ -2364,7 +2388,10 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     );
     assert_eq!(
         host_config.security_opt.as_ref(),
-        Some(&vec!["no-new-privileges:true".to_string()])
+        Some(&vec![
+            "no-new-privileges:true".to_string(),
+            "apparmor=unconfined".to_string(),
+        ])
     );
     assert_eq!(host_config.network_mode.as_deref(), Some("none"));
     assert_eq!(host_config.extra_hosts, None);
@@ -3032,8 +3059,21 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(snapshot.name, "demo");
     assert_eq!(snapshot.namespace, "docker-dev");
     assert!(snapshot.spec.is_none());
-    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
-    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
+    let pending = HashMap::from([(
+        snapshot.id.clone(),
+        PendingSandboxRecord {
+            sandbox: snapshot.clone(),
+            task: None,
+        },
+    )]);
+    assert_eq!(
+        pending_sandbox_record_id(&pending, "sbx-123", "wrong-name").unwrap(),
+        Some("sbx-123".to_string())
+    );
+    assert_eq!(
+        pending_sandbox_record_id(&pending, "", "demo").unwrap(),
+        Some("sbx-123".to_string())
+    );
 
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
@@ -3043,6 +3083,70 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "Starting");
     assert_eq!(status.conditions[0].message, "Docker container is starting");
+}
+
+#[test]
+fn pending_lookup_is_id_authoritative_and_rejects_ambiguous_names() {
+    let mut alpha = test_sandbox();
+    alpha.id = "sbx-alpha".to_string();
+    alpha.workspace = "workspace-alpha".to_string();
+    let mut beta = alpha.clone();
+    beta.id = "sbx-beta".to_string();
+    beta.workspace = "workspace-beta".to_string();
+    let pending = [alpha, beta]
+        .into_iter()
+        .map(|sandbox| {
+            (
+                sandbox.id.clone(),
+                PendingSandboxRecord {
+                    sandbox,
+                    task: None,
+                },
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        pending_sandbox_record_id(&pending, "sbx-alpha", "demo").unwrap(),
+        Some("sbx-alpha".to_string())
+    );
+    assert!(pending_sandbox_record_id(&pending, "", "demo").is_err());
+}
+
+#[test]
+fn workload_mounts_only_the_shared_channel_volume() {
+    let config = runtime_config();
+    let sandbox = test_sandbox();
+    let identity = ResolvedWorkloadIdentity::new(
+        65_534,
+        65_534,
+        Vec::new(),
+        "65534:65534".to_string(),
+        "sha256:immutable".to_string(),
+    )
+    .unwrap();
+    let body = build_container_create_body_for_image(
+        &sandbox,
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &DockerImageMetadata {
+            id: "sha256:immutable".to_string(),
+            user: "65534:65534".to_string(),
+            working_dir: "/sandbox".to_string(),
+            volumes: Vec::new(),
+        },
+        &identity,
+    )
+    .unwrap();
+    let mounts = body.host_config.unwrap().mounts.unwrap();
+    let sources = mounts
+        .iter()
+        .filter_map(|mount| mount.source.as_deref())
+        .collect::<Vec<_>>();
+
+    assert!(sources.contains(&docker_channel_volume_name(&sandbox, &config).as_str()));
+    assert!(!sources.contains(&docker_supervisor_volume_name(&sandbox, &config).as_str()));
 }
 
 #[test]
