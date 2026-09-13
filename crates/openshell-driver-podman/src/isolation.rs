@@ -4,6 +4,7 @@
 //! Podman-owned provisioning for the common authenticated isolation channel.
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ use openshell_sandbox_backend::boundary_protocol::{
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
     generate_sandbox_tls_material,
 };
+use serde::{Deserialize, Serialize};
 
 pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
 pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
@@ -22,7 +24,7 @@ pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
-pub const RESTART_BUNDLE_PATH: &str = "/.openshell/supervisor/sandbox-bundle.tar";
+pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 
 pub fn supervisor_name(id: &str) -> String {
@@ -130,6 +132,12 @@ pub struct BootstrapArchives {
     pub supervisor: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartMetadata {
+    pub(crate) workload_identity: ResolvedWorkloadIdentity,
+    pub(crate) child_env: HashMap<String, String>,
+}
+
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
 /// gateway authorization, and the restart copy never enter that volume.
 pub fn bootstrap_archives(
@@ -184,7 +192,7 @@ pub fn bootstrap_archives(
         resource_claim_files: BTreeMap::new(),
         workload_identity: identity.clone(),
         driver_fence: driver_fence.clone(),
-        child_env,
+        child_env: child_env.clone(),
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),
@@ -228,7 +236,14 @@ pub fn bootstrap_archives(
         AUTH_BUNDLE_PATH,
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
-    supervisor.file(RESTART_BUNDLE_PATH, &channel)?;
+    let restart_metadata = RestartMetadata {
+        workload_identity: identity.clone(),
+        child_env,
+    };
+    supervisor.file(
+        RESTART_METADATA_PATH,
+        &serde_json::to_vec(&restart_metadata).map_err(invalid)?,
+    )?;
     Ok(BootstrapArchives {
         channel,
         workspace: workspace.finish()?,
@@ -236,22 +251,8 @@ pub fn bootstrap_archives(
     })
 }
 
-pub fn boundary_config_from_channel_archive(
-    archive: &[u8],
-) -> Result<BoundaryConfig, ComputeDriverError> {
-    for entry in tar::Archive::new(archive).entries().map_err(invalid)? {
-        let mut entry = entry.map_err(invalid)?;
-        if entry.path().map_err(invalid)?.as_ref() != std::path::Path::new("sandbox/bootstrap.json")
-        {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(invalid)?;
-        return serde_json::from_slice(&bytes).map_err(invalid);
-    }
-    Err(ComputeDriverError::Precondition(
-        "Podman restart bundle has no sandbox bootstrap".to_string(),
-    ))
+pub fn restart_metadata_from_slice(bytes: &[u8]) -> Result<RestartMetadata, ComputeDriverError> {
+    serde_json::from_slice(bytes).map_err(invalid)
 }
 
 struct Archive<'a> {
@@ -381,11 +382,12 @@ mod tests {
         )
         .unwrap();
         let authentication = authentication();
+        let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
         let archives = bootstrap_archives(
             "sandbox",
             "container",
             &identity,
-            HashMap::new(),
+            child_env.clone(),
             &authentication,
         )
         .unwrap();
@@ -427,11 +429,21 @@ mod tests {
         assert_eq!(config.driver_fence, runtime_descriptor.driver_fence);
         assert_eq!(config.workload_identity, identity);
         runtime_descriptor.driver_fence.validate().unwrap();
-        assert_eq!(
+        let restart_metadata: RestartMetadata = serde_json::from_slice(
             supervisor
-                .get(&PathBuf::from(RESTART_BUNDLE_PATH.trim_start_matches('/')))
+                .get(&PathBuf::from(
+                    RESTART_METADATA_PATH.trim_start_matches('/'),
+                ))
                 .unwrap(),
-            &archives.channel
+        )
+        .unwrap();
+        assert_eq!(restart_metadata.workload_identity, identity);
+        assert_eq!(restart_metadata.child_env, child_env);
+        let restart_bytes = serde_json::to_vec(&restart_metadata).unwrap();
+        assert!(
+            !restart_bytes
+                .windows(b"PRIVATE KEY".len())
+                .any(|window| window == b"PRIVATE KEY")
         );
     }
 }

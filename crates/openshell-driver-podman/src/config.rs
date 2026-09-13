@@ -93,11 +93,11 @@ pub struct PodmanComputeConfig {
     /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
     /// supervisors for provider token exchange client assertions.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
-    /// `AppArmor` confinement requested for sandbox containers. Omission sends
-    /// no override and preserves Podman's runtime-selected profile.
+    /// `AppArmor` confinement requested for the workload container. Omission
+    /// sends no override and preserves Podman's runtime-selected profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
-    /// Health check interval in seconds for sandbox containers.
+    /// Health check interval in seconds for supervisor containers.
     ///
     /// Podman runs the health check command at this interval to determine
     /// container readiness. Lower values detect readiness faster but
