@@ -18,6 +18,10 @@ pub use runtime::OpenShellRuntimeBackend;
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = "openshell-sandbox";
 
+/// Workload-visible directory for the supervisor's public HTTPS interception
+/// certificate and combined trust bundle.
+pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca";
+
 /// Generated gRPC transport envelope for the OpenShell Sandbox Protocol.
 #[allow(
     clippy::all,

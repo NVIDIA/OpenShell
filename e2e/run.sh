@@ -249,6 +249,14 @@ mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--bin openshell-sandbox
 linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/openshell-sandbox"
 
+echo "==> Building Linux openshell-supervisor (${linux_musl_target})"
+mise x -- cargo zigbuild "${cargo_jobs[@]}" \
+	--release \
+	--target "${linux_musl_target}" \
+	-p openshell-supervisor \
+	--bin openshell-supervisor
+linux_supervisor_bin="${target_dir}/${linux_musl_target}/release/openshell-supervisor"
+
 host_gateway_bin=
 guest_gateway_bin=
 if [ "${mode}" = host ]; then
@@ -259,8 +267,6 @@ if [ "${mode}" = host ]; then
 		--features bundled-z3
 	host_gateway_bin="${target_dir}/debug/openshell-gateway"
 else
-	echo "==> Preparing ${linux_gateway_rust_target} build target"
-	mise x -- rustup target add "${linux_gateway_rust_target}" >/dev/null
 	echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
 	(
 		eval "$(
@@ -279,7 +285,7 @@ else
 	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
 fi
 
-expected_binaries=("${host_cli_bin}" "${linux_sandbox_bin}")
+expected_binaries=("${host_cli_bin}" "${linux_sandbox_bin}" "${linux_supervisor_bin}")
 if [ "${mode}" = host ]; then
 	expected_binaries+=("${host_gateway_bin}")
 else
@@ -296,14 +302,29 @@ run_parent="${ROOT}/.cache/openshell-e2e/runs"
 mkdir -p "${run_parent}"
 run_dir="$(mktemp -d "${run_parent%/}/run.XXXXXX")"
 if ! command -v tar >/dev/null 2>&1; then
-	die "tar is required to package the supervisor image"
+	die "tar is required to package the runtime images"
 fi
+sandbox_runtime_image=localhost/openshell/sandbox:e2e-vm
+sandbox_runtime_rootfs="${run_dir}/sandbox-runtime-rootfs"
+sandbox_runtime_archive="${run_dir}/sandbox-runtime.tar"
+mkdir -p "${sandbox_runtime_rootfs}"
+install -m 0555 "${linux_sandbox_bin}" "${sandbox_runtime_rootfs}/openshell-sandbox"
+tar -C "${sandbox_runtime_rootfs}" -cf "${sandbox_runtime_archive}" openshell-sandbox
 supervisor_image=localhost/openshell/supervisor:e2e-vm
 supervisor_rootfs="${run_dir}/supervisor-rootfs"
 supervisor_archive="${run_dir}/supervisor.tar"
 mkdir -p "${supervisor_rootfs}"
-install -m 0555 "${linux_sandbox_bin}" "${supervisor_rootfs}/openshell-sandbox"
-tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" openshell-sandbox
+install -m 0555 "${linux_supervisor_bin}" "${supervisor_rootfs}/openshell-supervisor"
+"${ROOT}/tasks/scripts/verify-static-binary.sh" "${supervisor_rootfs}/openshell-supervisor"
+mkdir -p "${supervisor_rootfs}/etc/ssl/certs"
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+	install -m 0444 /etc/ssl/certs/ca-certificates.crt \
+		"${supervisor_rootfs}/etc/ssl/certs/ca-certificates.crt"
+else
+	die "/etc/ssl/certs/ca-certificates.crt is required to package the supervisor image"
+fi
+tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" \
+	openshell-supervisor etc/ssl/certs/ca-certificates.crt
 child_pid=
 runtime_log=
 keep=0
@@ -402,14 +423,24 @@ if [ "${mode}" = host ]; then
 		e2e_align_docker_host_with_cli_context
 		docker import \
 			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${sandbox_runtime_archive}" \
+			"${sandbox_runtime_image}" >/dev/null
+		docker import \
+			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
+		docker run --rm --network none "${supervisor_image}" --help >/dev/null
 		;;
 	podman)
 		podman import \
 			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${sandbox_runtime_archive}" \
+			"${sandbox_runtime_image}" >/dev/null
+		podman import \
+			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
+		podman run --rm --network none "${supervisor_image}" --help >/dev/null
 		;;
 	esac
 
@@ -427,6 +458,7 @@ else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
 	guest_launcher_path=/home/openshell/.cache/openshell-e2e/bin/launch-gateway
+	guest_sandbox_runtime_archive_path=/home/openshell/.cache/openshell-e2e/sandbox-runtime.tar
 	guest_supervisor_archive_path=/home/openshell/.cache/openshell-e2e/supervisor.tar
 	config_payload="$(base64 <"${gateway_config}" | tr -d '\r\n')"
 	jwt_signing_payload="$(base64 <"${jwt_source_dir}/signing.pem" | tr -d '\r\n')"
@@ -467,14 +499,25 @@ case '${gateway_driver}' in
 docker)
 	docker import \
 		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		"${guest_sandbox_runtime_archive_path}" \
+		"${sandbox_runtime_image}" >/dev/null
+	docker import \
+		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
+	docker run --rm --network none "${supervisor_image}" --help >/dev/null
 	;;
 podman)
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
 		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		"${guest_sandbox_runtime_archive_path}" \
+		"${sandbox_runtime_image}" >/dev/null
+	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
+		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
+	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" run \
+		--rm --network none "${supervisor_image}" --help >/dev/null
 	;;
 esac
 report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"
@@ -497,6 +540,7 @@ EOF
 	vm_args+=(
 		--copy "${guest_gateway_bin}:/usr/local/bin/openshell-gateway"
 		--copy "${guest_launcher}:${guest_launcher_path}"
+		--copy "${sandbox_runtime_archive}:${guest_sandbox_runtime_archive_path}"
 		--copy "${supervisor_archive}:${guest_supervisor_archive_path}"
 		--forward-port "${host_port}:${guest_port}"
 	)

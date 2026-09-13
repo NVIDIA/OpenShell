@@ -2384,12 +2384,15 @@ mod linux {
             (None, None) => return Ok(None),
             _ => {
                 return Err(
-                    "boundary proxy CA certificate and bundle must be supplied together"
-                        .to_string(),
+                    "supervisor CA certificate and bundle must be supplied together".to_string(),
                 );
             }
         };
-        install_ca_material_at(Path::new("/run/openshell-proxy-ca"), &ca_cert, &ca_bundle)
+        install_ca_material_at(
+            Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
+            &ca_cert,
+            &ca_bundle,
+        )
     }
 
     fn install_ca_material_at(
@@ -2402,33 +2405,30 @@ mod linux {
 
         let parent = directory
             .parent()
-            .ok_or_else(|| "boundary proxy CA directory has no parent".to_string())?;
+            .ok_or_else(|| "supervisor CA directory has no parent".to_string())?;
         for path in [parent, directory] {
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err(format!(
-                        "boundary proxy CA directory component is a symlink: {}",
+                        "supervisor CA directory component is a symlink: {}",
                         path.display()
                     ));
                 }
                 Ok(metadata) if !metadata.is_dir() => {
                     return Err(format!(
-                        "boundary proxy CA directory component is not a directory: {}",
+                        "supervisor CA directory component is not a directory: {}",
                         path.display()
                     ));
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     std::fs::create_dir(path).map_err(|error| {
-                        format!(
-                            "create boundary proxy CA directory {}: {error}",
-                            path.display()
-                        )
+                        format!("create supervisor CA directory {}: {error}", path.display())
                     })?;
                 }
                 Err(error) => {
                     return Err(format!(
-                        "inspect boundary proxy CA directory {}: {error}",
+                        "inspect supervisor CA directory {}: {error}",
                         path.display()
                     ));
                 }
@@ -2436,7 +2436,7 @@ mod linux {
             let current_mode = std::fs::metadata(path)
                 .map_err(|error| {
                     format!(
-                        "inspect boundary proxy CA directory permissions {}: {error}",
+                        "inspect supervisor CA directory permissions {}: {error}",
                         path.display()
                     )
                 })?
@@ -2446,14 +2446,14 @@ mod linux {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(
                     |error| {
                         format!(
-                            "set boundary proxy CA directory permissions {}: {error}",
+                            "set supervisor CA directory permissions {}: {error}",
                             path.display()
                         )
                     },
                 )?;
             } else if current_mode & 0o111 != 0o111 {
                 return Err(format!(
-                    "boundary proxy CA parent is not traversable by workload identities: {}",
+                    "supervisor CA parent is not traversable by workload identities: {}",
                     path.display()
                 ));
             }
@@ -2461,8 +2461,8 @@ mod linux {
         let ca_path = directory.join("ca.crt");
         let bundle_path = directory.join("ca-bundle.crt");
         for (path, contents, label) in [
-            (&ca_path, ca_cert, "boundary proxy CA"),
-            (&bundle_path, ca_bundle, "boundary proxy CA bundle"),
+            (&ca_path, ca_cert, "supervisor CA"),
+            (&bundle_path, ca_bundle, "supervisor CA bundle"),
         ] {
             let temporary = path.with_extension("tmp");
             if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
@@ -3452,18 +3452,18 @@ mod linux {
         }
 
         #[test]
-        fn installed_proxy_ca_is_readable_by_a_non_root_workload_identity() {
+        fn installed_supervisor_ca_is_readable_by_a_non_root_workload_identity() {
             use std::os::unix::fs::PermissionsExt as _;
 
             let root = tempfile::tempdir().expect("temporary CA root");
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-            let directory = root.path().join("openshell-proxy-ca");
+            let directory = root.path().join("openshell-supervisor-ca");
             let (ca_path, bundle_path) = install_ca_material_at(
                 &directory,
                 b"public test certificate",
                 b"public test bundle",
             )
-            .expect("install proxy CA")
+            .expect("install supervisor CA")
             .expect("CA paths");
 
             assert_eq!(
@@ -3494,15 +3494,15 @@ mod linux {
         }
 
         #[test]
-        fn proxy_ca_install_rejects_a_symlinked_directory() {
+        fn supervisor_ca_install_rejects_a_symlinked_directory() {
             let root = tempfile::tempdir().expect("temporary CA root");
             let target = root.path().join("target");
             std::fs::create_dir(&target).unwrap();
             let parent = root.path();
-            std::os::unix::fs::symlink(&target, parent.join("openshell-proxy-ca")).unwrap();
+            std::os::unix::fs::symlink(&target, parent.join("openshell-supervisor-ca")).unwrap();
 
             let error = install_ca_material_at(
-                &parent.join("openshell-proxy-ca"),
+                &parent.join("openshell-supervisor-ca"),
                 b"certificate",
                 b"bundle",
             )
