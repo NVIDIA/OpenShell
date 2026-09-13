@@ -353,6 +353,7 @@ fn build_driver_sandbox(
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            ..Default::default()
         }),
         workspace,
     }
@@ -761,6 +762,7 @@ mod tests {
                 sandbox_fd: String::new(),
                 conditions: vec![condition],
                 deleting: false,
+                ..Default::default()
             }),
             workspace: String::new(),
         };

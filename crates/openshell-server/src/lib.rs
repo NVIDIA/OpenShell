@@ -315,6 +315,12 @@ pub struct ServerState {
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
 
+    /// Launch-scoped gateway and Sandbox Protocol token authority.
+    pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
+
+    /// Active launch generation and refresh ordering for each sandbox.
+    pub sandbox_auth_sessions: Arc<auth::sandbox_session::SandboxSessionRegistry>,
+
     /// Authenticator that validates gateway-minted sandbox JWTs on every
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
@@ -423,6 +429,10 @@ impl ServerState {
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
+            sandbox_session_jwt_authority: None,
+            sandbox_auth_sessions: Arc::new(
+                auth::sandbox_session::SandboxSessionRegistry::default(),
+            ),
             sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
             grpc_rate_limiter,
@@ -465,57 +475,71 @@ pub(crate) async fn run_server(
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
-    let (sandbox_jwt_issuer, sandbox_jwt_authenticator) = if let Some(ref jwt) = config.gateway_jwt
-    {
-        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT signing key from {}: {e}",
-                jwt.signing_key_path.display()
-            ))
-        })?;
-        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT public key from {}: {e}",
-                jwt.public_key_path.display()
-            ))
-        })?;
-        let kid = std::fs::read_to_string(&jwt.kid_path)
-            .map_err(|e| {
+    let (sandbox_jwt_issuer, sandbox_jwt_authenticator, sandbox_session_jwt_authority) =
+        if let Some(ref jwt) = config.gateway_jwt {
+            let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
                 Error::config(format!(
-                    "failed to read sandbox JWT kid from {}: {e}",
-                    jwt.kid_path.display()
+                    "failed to read sandbox JWT signing key from {}: {e}",
+                    jwt.signing_key_path.display()
                 ))
-            })?
-            .trim()
-            .to_string();
-        if kid.is_empty() {
-            return Err(Error::config(format!(
-                "sandbox JWT kid file {} is empty",
-                jwt.kid_path.display()
-            )));
-        }
-        let issuer = Arc::new(
-            auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
-                &signing_pem,
-                kid.clone(),
-                &jwt.gateway_id,
-                jwt.sandbox_token_ttl(),
-            )
-            .map_err(Error::config)?,
-        );
-        let authenticator = Arc::new(
-            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+            })?;
+            let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
+                Error::config(format!(
+                    "failed to read sandbox JWT public key from {}: {e}",
+                    jwt.public_key_path.display()
+                ))
+            })?;
+            let kid = std::fs::read_to_string(&jwt.kid_path)
+                .map_err(|e| {
+                    Error::config(format!(
+                        "failed to read sandbox JWT kid from {}: {e}",
+                        jwt.kid_path.display()
+                    ))
+                })?
+                .trim()
+                .to_string();
+            if kid.is_empty() {
+                return Err(Error::config(format!(
+                    "sandbox JWT kid file {} is empty",
+                    jwt.kid_path.display()
+                )));
+            }
+            let issuer = Arc::new(
+                auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                    &signing_pem,
+                    kid.clone(),
+                    &jwt.gateway_id,
+                    jwt.sandbox_token_ttl(),
+                )
                 .map_err(Error::config)?,
-        );
-        info!(
-            gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
-            "gateway-minted sandbox JWT enabled"
-        );
-        (Some(issuer), Some(authenticator))
-    } else {
-        (None, None)
-    };
+            );
+            let authenticator = Arc::new(
+                auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+                    &public_pem,
+                    kid.clone(),
+                    &jwt.gateway_id,
+                )
+                .map_err(Error::config)?,
+            );
+            let session_authority = Arc::new(
+                auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                    &signing_pem,
+                    &public_pem,
+                    kid,
+                    &jwt.gateway_id,
+                    jwt.sandbox_token_ttl().unwrap_or(Duration::from_mins(15)),
+                )
+                .map_err(Error::config)?,
+            );
+            info!(
+                gateway_id = %jwt.gateway_id,
+                ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
+                "gateway-minted sandbox JWT enabled"
+            );
+            (Some(issuer), Some(authenticator), Some(session_authority))
+        } else {
+            (None, None, None)
+        };
 
     let middleware_registrations = config_file
         .as_ref()
@@ -666,6 +690,7 @@ pub(crate) async fn run_server(
     state.provider_profile_sources = provider_profile_sources;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = sandbox_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
@@ -700,15 +725,6 @@ pub(crate) async fn run_server(
         state.compute.gateway_listener_requirements(),
     )
     .await?;
-
-    if let Err(err) = state.compute.start_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to start persisted sandboxes during startup");
-    }
-
-    state.compute.spawn_watchers(shutdown_rx.clone());
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
-    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -793,6 +809,19 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         )));
     }
+
+    // Restored supervisors need the callback listeners while the compute
+    // driver reconciles persisted sandboxes. Serve them before starting that
+    // reconciliation so policy fetch and supervisor-session registration
+    // cannot deadlock gateway startup.
+    if let Err(err) = state.compute.start_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
+    }
+
+    state.compute.spawn_watchers(shutdown_rx.clone());
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");

@@ -92,7 +92,7 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 `Release Dev` publishes two chart versions for every dev build (see `.github/actions/release-helm-oci/action.yml:89-102`):
 
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls `ghcr.io/nvidia/openshell/gateway:<sha>` and `:supervisor:<sha>`.
+- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
 To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
 

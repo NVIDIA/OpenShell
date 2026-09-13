@@ -57,7 +57,7 @@ registries = []
 # -- Bans ----------------------------------------------------------------------
 [bans]
 deny = [
-    { name = "ring", wrappers = ["rustls", "rustls-webpki"], reason = "Use the AWS-LC crypto backend instead. These wrappers are required only by z3-sys's prebuilt archive downloader." },
+    { name = "ring", wrappers = ["rustls", "rustls-webpki", "x509-parser"], reason = "Use the AWS-LC crypto backend instead. These wrappers are required only by rcgen's CA certificate parser and z3-sys's prebuilt archive downloader." },
 ]
 multiple-versions = "warn"
 wildcards = "allow"

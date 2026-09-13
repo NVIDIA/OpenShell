@@ -172,6 +172,20 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-sandbox-image:
+    needs: [compute-versions, build-sandbox]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   build-supervisor-image:
     needs: [compute-versions, build-sandbox]
     permissions:
@@ -180,14 +194,14 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       component: supervisor
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
+      binary: openshell-supervisor
+      target-suffix: unknown-linux-gnu
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
   docker-e2e:
-    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -200,7 +214,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -224,7 +238,7 @@ jobs:
 
   tag-ghcr-release:
     name: Tag GHCR Images
-    needs: [compute-versions, build-gateway-image, build-supervisor-image, release]
+    needs: [compute-versions, build-gateway-image, build-sandbox-image, build-supervisor-image, release]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -239,7 +253,7 @@ jobs:
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
           SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
-          for component in gateway supervisor; do
+          for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
               --prefer-index=false \

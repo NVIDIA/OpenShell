@@ -548,6 +548,7 @@ network_policies:
                                     AgentProposals::default(),
                                     Arc::new(None),
                                     Arc::new(None),
+                                    Arc::new(None),
                                     None,
                                     None,
                                     None,

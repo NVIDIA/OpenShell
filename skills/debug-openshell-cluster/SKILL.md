@@ -173,7 +173,7 @@ rationale, configured and effective modes, active generation, and the explicit
 docker info
 docker ps --filter name=openshell
 docker logs <container> --tail=200
-docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-ghcr.io/nvidia/openshell/supervisor:latest}" --version
+docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-ghcr.io/nvidia/openshell/sandbox:latest}" --version
 openshell status
 ```
 
@@ -213,7 +213,7 @@ Common findings:
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
 - Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
-- Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
+- Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 - On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
   Homebrew gateway bound to `[::1]:17670` indicate that the Docker
@@ -222,7 +222,7 @@ Common findings:
   `127.0.0.1:17670` primary listener, and reuse it for authenticated sandbox
   callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
   upgrade.
-- Supervisor image exits before printing `openshell-sandbox --version`: verify the configured supervisor image contains a static executable at `/openshell-sandbox`.
+- Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the Docker or Podman driver supplied the `policy-dns-transparent-tcp` runtime capability and inspect supervisor logs for missing `nft`, synthetic-route overlap, or namespace-local DNS/TCP listener bind failures. Kubernetes, VM, sidecar, and out-of-tree drivers must reject this policy until they provide the complete substrate; use omitted protocol with an explicit proxy on those runtimes.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
@@ -269,12 +269,12 @@ Common findings:
 
 When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
-- Supervisor delivery uses bind-mount fallback instead of image volumes because
+- Sandbox runtime delivery uses bind-mount fallback instead of image volumes because
   overlay mounts do not support `idmapped` mounts. The supervisor binary is
-  extracted from the supervisor image and cached at
+  extracted from the sandbox runtime image and cached at
   `$XDG_DATA_HOME/openshell/podman-supervisor/` (typically
   `~/.local/share/openshell/podman-supervisor/`).
-- Stale cache: if the supervisor image is updated but the cached binary is not
+- Stale cache: if the sandbox runtime image is updated but the cached binary is not
   refreshed, sandbox creation may fail with an ELF validation error or version
   mismatch. Remove the cache directory and retry.
 - `auto` mode requires subuid/subgid ranges for the current user in
@@ -454,7 +454,7 @@ kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
-The gateway and supervisor images should use the same release tag. A stale supervisor image can make sandbox behavior lag behind gateway policy or protocol changes.
+The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
 
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes
@@ -733,7 +733,7 @@ configuration — check that the gateway spawned the driver binary you expect
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
-| Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
+| Gateway exits while resolving compute-driver listener requirements | The callback hostname is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |

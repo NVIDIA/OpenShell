@@ -372,7 +372,7 @@ async fn handle_create_sandbox_inner(
     };
 
     // Leave an omitted command empty rather than persisting a concrete shell:
-    // the supervisor resolves the default login shell against the sandbox image
+    // the sandbox boundary resolves the default login shell against the agent image
     // (bash when present, otherwise /bin/sh on minimal images like Alpine),
     // which the gateway cannot do since it does not see the sandbox filesystem.
     // The default is an interactive login shell, so request a TTY.
@@ -499,26 +499,49 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
-    // that bootstrap through another authentication mechanism may ignore it.
-    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
-        issuer.mint(&id).map(|minted| {
-            tracing::info!(
-                sandbox_id = %id,
-                "minted sandbox JWT"
-            );
-            minted.token
-        })
-    });
-    let sandbox_token = match sandbox_token {
-        Some(Ok(token)) => Some(token),
-        Some(Err(status)) => return Err(status),
-        None => None,
+    let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
+        let authentication = authority.mint_launch(
+            &id,
+            openshell_core::SandboxSessionId::new(),
+            openshell_core::jwt::CredentialEpoch::new(1)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )?;
+        state
+            .sandbox_auth_sessions
+            .activate(&id, &authentication, authority)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Some(authentication)
+    } else {
+        None
     };
+    let sandbox_token = if let Some(authentication) = &launch_authentication {
+        Some(
+            authentication
+                .supervisor
+                .gateway_token
+                .expose_secret()
+                .to_string(),
+        )
+    } else if let Some(issuer) = &state.sandbox_jwt_issuer {
+        Some(issuer.mint(&id)?.token)
+    } else {
+        None
+    };
+    let launch_authentication = launch_authentication
+        .map(|authentication| {
+            serde_json::to_vec(&authentication)
+                .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
+        })
+        .transpose()?;
 
     let sandbox = state
         .compute
-        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .create_sandbox_authenticated(
+            sandbox,
+            sandbox_token,
+            launch_authentication,
+            await_main_process_attachment,
+        )
         .await?;
 
     info!(
@@ -1327,6 +1350,9 @@ async fn handle_delete_sandbox_inner(
         .await?
         .name;
 
+    if let Ok(current) = sandbox_by_name(state, &workspace, &name).await {
+        state.sandbox_auth_sessions.deactivate(current.object_id());
+    }
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
@@ -1374,6 +1400,8 @@ async fn handle_stop_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let current = sandbox_by_name(state, &workspace, &req.name).await?;
+    state.sandbox_auth_sessions.deactivate(current.object_id());
     let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
@@ -1418,7 +1446,35 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    let current = sandbox_by_name(state, &workspace, &req.name).await?;
+    let launch_authentication = if current.phase() == SandboxPhase::Ready as i32 {
+        Vec::new()
+    } else if let Some(authentication) = state
+        .sandbox_auth_sessions
+        .authentication(current.object_id())
+    {
+        serde_json::to_vec(&authentication)
+            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
+    } else if let Some(authority) = &state.sandbox_session_jwt_authority {
+        let authentication = authority.mint_launch(
+            current.object_id(),
+            openshell_core::SandboxSessionId::new(),
+            openshell_core::jwt::CredentialEpoch::new(1)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )?;
+        state
+            .sandbox_auth_sessions
+            .activate(current.object_id(), &authentication, authority)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        serde_json::to_vec(&authentication)
+            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
+    } else {
+        Vec::new()
+    };
+    let sandbox = state
+        .compute
+        .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
+        .await?;
     info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -2269,10 +2325,7 @@ fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
     let phase = SandboxPhase::try_from(sandbox.phase()).ok();
     matches!(phase, Some(SandboxPhase::Ready))
         || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id())
-            && !state
-                .supervisor_sessions
-                .terminal_delivery_finalized(sandbox.object_id()))
+            && state.supervisor_sessions.has_session(sandbox.object_id()))
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -5928,6 +5981,9 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
+        assert!(sandbox_relay_reachable(&state, &sandbox));
+
+        assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
@@ -6716,7 +6772,16 @@ mod tests {
 
         let mut sandbox = test_sandbox("cross-ws", Vec::new());
         sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        sandbox.set_phase(SandboxPhase::Completed as i32);
         state.store.put_message(&sandbox).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let _ = state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "retained-terminal-session".to_string(),
+            tx,
+            shutdown_tx,
+        );
 
         // --- handle_watch_sandbox ---
         let err = handle_watch_sandbox(

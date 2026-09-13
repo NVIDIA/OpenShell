@@ -43,6 +43,7 @@ pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
 pub mod sandbox_env;
+pub mod sandbox_session;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
@@ -63,6 +64,7 @@ pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
 /// Build version string derived from git metadata.
 ///

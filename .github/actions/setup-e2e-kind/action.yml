@@ -14,7 +14,7 @@ inputs:
   images:
     description: Space-separated OpenShell image components to load
     required: false
-    default: gateway supervisor
+    default: gateway sandbox supervisor
   registry:
     description: Container registry and namespace
     required: false
@@ -71,7 +71,7 @@ runs:
         set -euo pipefail
         for component in $IMAGE_COMPONENTS; do
           case "$component" in
-            gateway | supervisor) ;;
+            gateway | sandbox | supervisor) ;;
             *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
           esac
           image="${REGISTRY}/${component}:${IMAGE_TAG}"

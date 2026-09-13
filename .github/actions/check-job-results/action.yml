@@ -8,6 +8,10 @@ inputs:
   results:
     description: JSON-encoded GitHub Actions needs context
     required: true
+  allowed-skipped-jobs:
+    description: Comma-separated job IDs that may be skipped but must not fail
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -16,12 +20,20 @@ runs:
       shell: bash
       env:
         JOB_RESULTS: ${{ inputs.results }}
+        ALLOWED_SKIPPED_JOBS: ${{ inputs.allowed-skipped-jobs }}
       run: |
         set -euo pipefail
         failures="$(
-          jq -r '
+          jq -r --arg allowed_skipped "$ALLOWED_SKIPPED_JOBS" '
+            ($allowed_skipped | split(",") | map(select(length > 0))) as $allowed_skipped_jobs
+            |
             to_entries[]
+            | . as $job
             | select(.value.result != "success")
+            | select(
+                .value.result != "skipped"
+                or ($allowed_skipped_jobs | index($job.key)) == null
+              )
             | "\(.key) concluded \(.value.result)"
           ' <<< "$JOB_RESULTS"
         )"

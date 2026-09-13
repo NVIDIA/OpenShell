@@ -1,10 +1,9 @@
 # Compute Runtimes
 
 Compute runtimes create, stop, start, delete, and watch sandbox workloads for the
-gateway. Supervisor-controlled runtimes start a workload that runs the
-`openshell-sandbox` supervisor, which enforces the sandbox contract locally.
-Driver-controlled runtimes apply the canonical sandbox policy while
-provisioning and report workload readiness directly.
+gateway. A supported runtime provisions `openshell-sandbox` inside the workload,
+`openshell-supervisor` outside it, a protected channel between them, and an
+independent outer network fence. Drivers do not implement policy evaluation.
 
 ## Driver Contract
 
@@ -12,11 +11,15 @@ Each runtime receives a sandbox spec and canonical policy from the gateway and
 is responsible for:
 
 - Selecting the sandbox image.
-- For supervisor-controlled runtimes, injecting sandbox identity and gateway
-  callback configuration, supplying callback credentials, and providing the
-  supervisor binary or image.
-- For runtimes without the standard supervisor, validating and applying the
-  canonical policy before launching the workload.
+- Resolving an immutable non-root sandbox identity before workload creation.
+- Supplying separate sandbox and supervisor bootstrap material.
+- Delivering `openshell-sandbox` to the workload and `openshell-supervisor` only
+  to the external supervisor placement.
+- Provisioning protected control and boundary configs plus a private Unix socket,
+  TLS-authenticated TCP, or vsock transport when the supervisor is separated.
+  Runtime-specific code supplies immutable resource claims and transport
+  coordinates; the shared boundary protocol supplies lifecycle, exec, signaling,
+  forwarding, and binary identity semantics.
 - Forwarding the exact canonical main-process argv and TTY mode without shell
   reconstruction. The sandbox-level environment and policy workspace apply to
   the main process.
@@ -127,32 +130,19 @@ defines the available implementation set, while the runtime consumes a generic
 registry. Adding or removing a compiled driver therefore changes registration
 rather than the server's selection flow. Alternate gateway binaries can install
 their own `ComputeDriverFactory` registrations and hand the completed registry
-to `run_cli_with_compute_drivers`. Factories expose the same side-effect-free
-configuration validation to package preflight and runtime startup, receive only
-the selected `[openshell.drivers.<name>]` table, and return either an in-process
-driver or a gateway-managed remote endpoint when built. Existing out-of-tree
-factories that implement only runtime construction remain source-compatible and
-can start normally, but package preflight fails closed until they explicitly
-advertise and implement side-effect-free configuration validation. If a selected config file
-omits the selector, preflight validates each configured table that belongs to an
-auto-detectable registration. It does not run runtime detection probes because
-those probes can connect local sockets or launch bounded discovery commands.
-Preflight never builds a driver or connects to its transport. The server constructs the common runtime
-adapter and snapshots `GetCapabilities` for either result. A configured UDS
-endpoint still takes precedence over a compiled registration with the same name.
+to `run_cli_with_compute_drivers`; factories receive merged driver config and
+return either an in-process driver or a gateway-managed remote endpoint. The
+server constructs the common runtime adapter and snapshots `GetCapabilities`
+for either result. A configured UDS endpoint still takes precedence over a
+compiled registration with the same name.
 
-The `openshell-gateway` composition crate exposes one feature per first-party
-registration: `compute-driver-kubernetes`, `compute-driver-docker`,
-`compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Builds
-can enable any subset. MXC links only on Windows; the other four features
-install rejection stubs on Windows and link their drivers on other platforms.
-The default `in-tree-compute-drivers` feature remains an alias for all five,
-preserving each platform's default registrations.
-`openshell-server` has no compute driver dependencies or backend-name dispatch.
-Protocol-only gateway builds disable the default features and link no
-compute-driver crates. E2E lanes compose that gateway with Docker, Podman,
-Kubernetes, and VM driver executables over the public UDS gRPC contract so an
-in-tree driver cannot silently depend on a server-only API.
+The `openshell-gateway` composition crate groups first-party registrations
+behind the `in-tree-compute-drivers` feature. `openshell-server` has no compute
+driver dependencies or backend-name dispatch. Protocol-only gateway builds
+disable the composition feature and link no compute-driver crates. E2E lanes
+compose that gateway with Docker, Podman, Kubernetes, and VM driver executables
+over the public UDS gRPC contract so an in-tree driver cannot silently depend
+on a server-only API.
 
 ## Stop and Start Lifecycle
 
@@ -176,6 +166,12 @@ exec, SSH, forwarding, and exposed services unavailable. Start reactivates the
 same resource. The gateway requires a fresh supervisor session before a
 starting sandbox returns to `Ready`; stale driver snapshots and supervisor
 sessions cannot promote a `Stopped` row.
+
+Runtime credentials are generation-scoped and memory-only after launch. A
+supervisor or Sandbox Runtime process replacement does not resume a running
+generation. Planned upgrades stop the sandbox first; the following start mints
+a fresh session, TLS identity, and credential pair. An unexpected replacement
+leaves the old workload on the normal fail-closed disconnect path.
 
 A driver stop operation does not complete while its backend still reports an
 in-progress stop. This prevents an immediate start from racing the previous
@@ -260,11 +256,11 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 | Runtime | Best fit | Sandbox boundary | Notes |
 |---|---|---|---|
-| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
-| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
-| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
-| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_driver = "<name>"` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--compute-driver <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| Docker | Local development with Docker available. | Capability-free workload container. | Uses `network_mode=none`; a separate capability-free supervisor container mediates egress and access over a private daemon-local Unix socket volume. |
+| Podman | Existing rootless driver. | Container. | Not converted by this isolation stack. |
+| Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Uses empty-egress NetworkPolicy, paired-only supervisor ingress, and a separate capability-free supervisor Deployment over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace. |
+| VM | Experimental microVM isolation. | Per-sandbox libkrun or QEMU VM. | The NIC-less guest runs `openshell-sandbox` as PID 1; host `openshell-supervisor` owns gateway networking and reaches the guest over vsock. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -291,42 +287,17 @@ operator override because they place gateway-host filesystem state inside the
 sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
 
-Network features follow the existing driver/substrate split. Compute drivers
-advertise only the runtime mechanics they can guarantee: namespace and
-capability ownership, DNS/TCP capture installation, and coupled
-restart ordering. The shared supervisor remains the sole owner of DNS
-eligibility, synthetic mappings, process authorization, destination filtering,
-pinned dialing, relay behavior, and OCSF decisions. Docker and Podman advertise
-`policy-dns-transparent-tcp`; other runtimes reject explicit TCP policy until
-they implement and validate the same complete contract. The capability marker
-is driver-owned supervisor input and is removed from workload environments.
-
-Kubernetes, Docker, and Podman share one AppArmor configuration model:
-`RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`. Each driver translates
-that model to its native API and rejects an explicitly requested confined
-profile when its backend reports AppArmor unavailable. Docker keeps its
-historical explicit `Unconfined` default. Podman sends no override when the
-field is omitted, preserving the runtime-selected profile; development paths
-that require the supervisor's namespace mount setup opt into `Unconfined`
-explicitly. The Helm chart independently uses `Unconfined` for Kubernetes.
-
-Corporate proxy settings are driver-owned supervisor inputs. Docker, Podman,
-and VM propagate `https_proxy`, `no_proxy`, an optional root-only auth file,
-and the explicit cleartext-Basic-auth acknowledgement without allowing
-workload environment to override them. Podman and VM can also project an
-operator CA bundle for an HTTPS or TLS-intercepting proxy. The VM driver validates and
-stages its credential and CA bundle under fixed guest paths, then forwards
-those paths through the protected supervisor argument file rather than the
-guest environment. Local containers project provider SPIFFE
-through a dedicated host UNIX-socket parent mount. A VM cannot safely expose
-that host socket: it accepts only a separately operated, concrete TCP listener
-when `provider_spiffe_allow_guest_tcp = true` explicitly acknowledges guest
-access. Host-only sockets are never implicitly forwarded to VM guests.
+Network features follow the driver/substrate split. Drivers own only the outer
+fence and protected channel. The sandbox owns seccomp notification, local DNS,
+socket virtualization, process observation, and binary identity. The supervisor
+owns DNS eligibility, policy authorization, destination filtering, upstream
+dials, relay behavior, credential rewriting, and OCSF decisions. No supported
+path requires nftables, a workload network namespace, proxy environment
+variables, added capabilities, or an unconfined AppArmor profile.
 
 The Kubernetes deployment packaging has two ownership boundaries. The gateway
 chart owns the gateway workload, configuration, Services, PKI, and
-cluster-scoped gateway resources. It can retain the legacy combined behavior,
-or omit workspace resources. The workspace chart is installed into a
+cluster-scoped gateway resources. The workspace chart is installed into a
 pre-provisioned sandbox namespace and owns only the sandbox ServiceAccount,
 namespaced RBAC, and sandbox ingress NetworkPolicy. Its RoleBinding names the
 gateway ServiceAccount and namespace explicitly, so the two releases have
@@ -339,14 +310,10 @@ can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
-matching `[A-Za-z0-9._-]{1,128}`. Each writable overlay records its effective
-sandbox UID/GID so later rootfs cache changes cannot rewrite persisted file
-ownership. Unmarked pre-migration overlays recover identity from concrete
-overlay or prepared-rootfs state, an explicit operator override, or the current
-image account. The driver never assumes `10001:10001`; it preserves that legacy
-identity only when persisted state reports it. The gateway-owned VM driver
-socket uses a private `run/` directory plus Unix peer UID/PID checks. Standalone unauthenticated TCP
-mode is disabled unless explicitly enabled for local development.
+matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
+private `run/` directory plus Unix peer UID/PID checks. Standalone
+unauthenticated TCP mode is disabled unless explicitly enabled for local
+development.
 
 Runtime-specific implementation notes belong in the driver crate README:
 
@@ -355,113 +322,57 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
 
-The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
-executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
-that identity when it execs the supervisor after mounting and network setup.
+The VM guest bootstrap runs once as root to prepare mounts, loopback, and the
+safe port-53 sysctl. It then drops to the resolved identity with empty
+capability sets and executes `openshell-sandbox` as guest PID 1.
 
 ## Supervisor Delivery
 
-The supervisor must be available inside each sandbox workload:
+Drivers deliver the two binaries to separate trust domains:
 
 | Runtime | Delivery model |
 |---|---|
-| Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
-| Podman | Read-only OCI image volume by default; host-cached bind mount when `userns` is configured. |
-| Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
-| VM | Embedded in the guest rootfs bundle. |
+| Docker | A digest-pinned daemon-local volume supplies `openshell-sandbox`; the companion image runs `openshell-supervisor`. |
+| Podman | Existing driver behavior; not converted by this stack. |
+| Kubernetes | A non-root init container stages `openshell-sandbox` into a memory volume; the separate Deployment image runs `openshell-supervisor`. |
+| VM | `openshell-sandbox` is embedded in the guest rootfs; a separately digest-checked native `openshell-supervisor` runs on the host. |
 | Extension | Defined by the out-of-tree driver. |
 
-Driver-controlled environment variables must override sandbox image or template
-values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
-paths, and command metadata.
+Driver-controlled sandbox bootstrap must override image or template values for
+sandbox identity, command metadata, resolver configuration, and public trust
+paths. Gateway endpoints, callback credentials, policy, and private TLS material
+belong only to the supervisor placement.
 
 ## Process Identity
 
-The gateway preserves whether each policy process field was omitted. The active
-driver then supplies one authoritative identity input to the supervisor:
+The gateway preserves whether each policy process field was omitted and passes
+the admitted selectors to the driver. The driver resolves one exact UID, GID,
+and supplementary-group set before creating the immutable workload:
 
-- Docker and Podman inspect the final sandbox image, pin container creation to
-  its immutable image ID, and pass its raw OCI `Config.User`. Docker also
-  resolves the workspace from OCI `Config.WorkingDir` during that inspection.
-- Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
-  SCC-derived values.
-- VM keeps its existing guest identity behavior.
+- Docker pins the image ID, resolves policy selectors against the image's
+  `/etc/passwd` and `/etc/group`, and validates its OCI working directory.
+- Kubernetes uses platform-resolved numeric values, including OpenShift
+  namespace ranges.
+- VM uses the configured numeric guest identity.
 
-Explicit numeric workload identities may use any Linux UID/GID from `1`
-through `u32::MAX - 1`. UID/GID `0` remains prohibited as root, and
-`u32::MAX` remains prohibited because Linux APIs and POSIX ACLs use it as an
-invalid identity sentinel. Infrastructure identities use separate validation:
-the Kubernetes network proxy UID remains at least `1000` and must not match the
-workload UID because its traffic bypasses the pod egress fence.
+UID/GID zero and `u32::MAX` are invalid. The sandbox and every child start with
+the resolved identity and zero capability masks; neither process performs an
+in-workload UID transition. Identity-changing policy updates require sandbox
+recreation, while other policy updates remain live.
 
-For Docker and Podman, policy values take precedence independently. An omitted
-`run_as_user` or `run_as_group` falls back to the corresponding identity from
-the image. The supervisor resolves names from the image's `/etc/passwd` and
-`/etc/group` before readiness, preserves declared name or numeric components,
-and uses the same privilege-drop path for direct and SSH children. When a
-declaration omits the group, the supervisor fills it with the user's numeric
-primary GID. It does not rewrite the account files.
+Docker uses an absolute OCI working directory as the workspace. Empty, root,
+and explicit `/sandbox` values select `/sandbox`; other paths must already
+exist without symlink or reserved-mount collisions and must be usable by the
+resolved identity. Kubernetes and VM use `/sandbox`.
 
-Docker uses an absolute OCI working directory as the workspace. An
-empty, root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which
-OpenShell creates and owns as a compatibility workspace. Any other workdir must already
-exist in the immutable image without symlink components. The completed
-identity, including supplementary groups, must already be able to traverse
-every parent and write and enter the workdir; OpenShell does not change that
-directory's ownership or mode. A one-shot validator drops to that identity and
-uses kernel effective-access checks so POSIX ACL and LSM decisions are honored.
-Path checks reserve the standard OCI runtime namespaces under `/proc`, `/sys`,
-and `/dev`, while separate collision checks are derived from actual OpenShell
-control paths.
-Docker performs the check in the final container before workload launch and
-rejects image `VOLUME` declarations that would mask the workdir ancestry. The
-resolved workspace is the child cwd and `HOME`; when
-`filesystem.include_workdir` is enabled, it becomes the automatic writable
-policy path. Podman, Kubernetes/OpenShift, and VM retain their existing
-`/sandbox` workspace behavior.
-
-Sandbox creation fails before the workload becomes ready when a required image
-identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
-The supervisor itself remains root so it can establish isolation before
-starting unprivileged children.
-
-Kubernetes can run the supervisor in the default combined topology or in a
-sidecar topology. Combined mode keeps network and process supervision in the
-agent container. Sidecar mode runs network enforcement, the proxy, and gateway
-session in a dedicated sidecar, while the agent container runs only the
-process-supervision leaf and launches the user workload after the sidecar
-serves bootstrap state over a local control socket. The network sidecar owns
-gateway credentials and sends policy plus workload-facing provider environment
-state to the process leaf over that socket. It also streams provider
-environment updates after settings polls so future process sessions see
-updated provider env without giving the process leaf gateway access. The
-pre-workload process supervisor is the only accepted control client: the
-network sidecar verifies its UID, GID, and PID with peer credentials, removes
-the listener after accepting it, and ignores workload-supplied relay targets.
-SSH relays use a Linux abstract socket and verify its peer PID against that
-authenticated process-supervisor connection, so workload filesystem access
-cannot replace the relay endpoint. Either supervisor exits when this control
-connection closes. This couples their restart lifecycle and prevents a workload
-that survives an isolated network-sidecar restart from becoming the next
-authoritative control client. In sidecar mode, an init container performs the
-privileged pod-network nftables setup with
-`NET_ADMIN`. The default binary-aware network sidecar runs as UID 0 without
-`NET_ADMIN` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` so it can resolve
-cross-UID workload process/binary identity through shared `/proc`. Operators
-can set the sidecar `process_binary_aware_network_policy` flag false to run the
-sidecar as the configured non-root proxy UID, omit both inspection capabilities,
-and downgrade network policy to endpoint/L7 matching without `policy.binaries`.
-The init path applies nftables as individual commands so optional conntrack and
-log expressions can fail without rolling back the required table, chain, and
-reject rules.
-The agent container runs as the resolved sandbox UID/GID with no added Linux
-capabilities. Sidecar mode preserves gateway session and SSH behavior, but
-treats the process leaf as network-only: Landlock filesystem policy and child
-seccomp still apply where supported, while process privilege dropping and
-supervisor identity mount isolation do not run because the agent container is
-already unprivileged. Sidecar pods use a shared process namespace so the
-network sidecar can resolve workload process and binary identity through
-`/proc/<entrypoint-pid>`.
+The Kubernetes driver creates the empty-egress workload fence before a
+suspended Sandbox CR, then provisions split immutable bootstrap Secrets, the
+private runtime Service, and the supervisor Deployment. A
+non-root init container stages `openshell-sandbox` and one-use bootstrap files
+into memory volumes. The workload Pod never mounts supervisor or gateway
+credentials. The driver removes its scheduling gate only after the companions
+exist; measured confirmation and supervisor-session registration gate public
+readiness.
 
 ## Images
 

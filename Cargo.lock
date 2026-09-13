@@ -3936,6 +3936,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openshell-binary-identity"
+version = "0.0.0"
+dependencies = [
+ "openshell-isolation-interface",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "openshell-bootstrap"
 version = "0.0.0"
 dependencies = [
@@ -4035,6 +4043,7 @@ dependencies = [
  "chrono",
  "glob",
  "ipnet",
+ "jsonwebtoken",
  "miette",
  "nix 0.29.0",
  "openshell-extension-core",
@@ -4058,6 +4067,8 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4348,6 +4359,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-isolation-interface"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "openshell-core",
+ "rustix 1.1.4",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -4435,31 +4458,71 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "capctl",
  "clap",
- "futures",
+ "hex",
+ "ipnet",
+ "landlock",
+ "libc",
  "miette",
  "nix 0.29.0",
+ "openshell-binary-identity",
  "openshell-core",
- "openshell-extension-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
- "openshell-supervisor-middleware",
- "openshell-supervisor-middleware-builtins",
- "openshell-supervisor-network",
- "openshell-supervisor-process",
- "prost",
- "prost-types",
+ "openshell-sandbox-backend",
+ "rand 0.10.2",
+ "rcgen",
+ "rustix 1.1.4",
  "rustls",
+ "rustls-pemfile",
+ "seccompiler",
  "serde",
  "serde_json",
- "temp-env",
+ "sha2 0.10.9",
+ "socket2",
  "tempfile",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-sandbox-backend"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "libc",
+ "openshell-core",
+ "openshell-isolation-interface",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
  "uuid",
 ]
 
@@ -4591,6 +4654,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-extension-core",
+ "openshell-isolation-interface",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-sandbox-backend",
+ "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
+ "openshell-supervisor-network",
+ "openshell-supervisor-process",
+ "prost",
+ "prost-types",
+ "rustix 1.1.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-supervisor-middleware"
 version = "0.0.0"
 dependencies = [
@@ -4627,6 +4725,7 @@ name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
  "apollo-parser",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
@@ -4642,7 +4741,9 @@ dependencies = [
  "libc",
  "miette",
  "noyalib",
+ "openshell-binary-identity",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4679,25 +4780,20 @@ name = "openshell-supervisor-process"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "bytes",
- "capctl",
  "hex",
- "ipnet",
- "landlock",
  "libc",
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
- "openshell-policy",
  "rand 0.10.2",
  "russh",
- "rustix 1.1.4",
- "seccompiler",
  "serde_json",
  "sha2 0.10.9",
- "socket2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5722,6 +5818,7 @@ dependencies = [
  "pem",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -8742,6 +8839,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
