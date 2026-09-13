@@ -854,7 +854,11 @@ impl VmDriver {
         let snapshot = sandbox_snapshot(sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
-            if registry.contains_key(&sandbox.id) {
+            if registry.values().any(|record| {
+                record.snapshot.id == sandbox.id
+                    || (record.snapshot.name == sandbox.name
+                        && record.snapshot.workspace == sandbox.workspace)
+            }) {
                 return Err(Status::already_exists("sandbox already exists"));
             }
             registry.insert(
@@ -1405,14 +1409,7 @@ impl VmDriver {
         }
         let record_id = {
             let registry = self.registry.lock().await;
-            if registry.contains_key(sandbox_id) {
-                Some(sandbox_id.to_string())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_registry_id(&registry, sandbox_id, sandbox_name)?
         }
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -1479,16 +1476,13 @@ impl VmDriver {
         }
         let (record_id, state_dir, already_running) = {
             let registry = self.registry.lock().await;
-            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
-                entry
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?
-            };
+            let id = resolve_registry_id(&registry, sandbox_id, sandbox_name)?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let record = registry
+                .get(&id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
             (
-                id.clone(),
+                id,
                 record.state_dir.clone(),
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
@@ -1544,14 +1538,7 @@ impl VmDriver {
 
         let record_id = {
             let registry = self.registry.lock().await;
-            if let Some((id, _record)) = registry.get_key_value(sandbox_id) {
-                Some(id.clone())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_registry_id(&registry, sandbox_id, sandbox_name)?
         };
 
         let Some(record_id) = record_id else {
@@ -6671,6 +6658,40 @@ fn spawn_vm_launcher(
     openshell_otel::record_error_result(command.spawn())
 }
 
+/// `sandbox_id` is authoritative: when the caller supplies one, the name is
+/// never consulted as an alternative. The name fallback rejects ambiguity
+/// instead of letting `HashMap` iteration order pick a match, because sandbox
+/// names are unique per workspace and the driver request carries no workspace.
+fn resolve_registry_id(
+    registry: &HashMap<String, SandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(registry
+            .contains_key(sandbox_id)
+            .then(|| sandbox_id.to_string()));
+    }
+    if sandbox_name.is_empty() {
+        return Ok(None);
+    }
+
+    let mut matches = registry
+        .iter()
+        .filter(|(_, record)| record.snapshot.name == sandbox_name)
+        .map(|(id, _)| id.clone());
+
+    let Some(id) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(
+            "sandbox_name matches multiple sandboxes; specify sandbox_id",
+        ));
+    }
+    Ok(Some(id))
+}
+
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {
     Sandbox {
         id: sandbox.id.clone(),
@@ -6860,6 +6881,88 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
+
+    fn test_record(id: &str, name: &str, workspace: &str) -> (String, SandboxRecord) {
+        let sandbox = Sandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+            ..Default::default()
+        };
+        (
+            id.to_string(),
+            SandboxRecord {
+                snapshot: sandbox,
+                state_dir: PathBuf::from("/tmp"),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        )
+    }
+
+    #[test]
+    fn resolve_registry_id_prefers_sandbox_id_over_sandbox_name() {
+        let mut registry = HashMap::new();
+        let (id, record) = test_record("sbx-alpha", "demo", "workspace-a");
+        registry.insert(id, record);
+
+        assert_eq!(
+            resolve_registry_id(&registry, "sbx-alpha", "stale-name")
+                .unwrap()
+                .as_deref(),
+            Some("sbx-alpha"),
+        );
+    }
+
+    #[test]
+    fn resolve_registry_id_ignores_the_name_when_the_id_is_not_registered() {
+        let mut registry = HashMap::new();
+        let (id, record) = test_record("sbx-other", "demo", "workspace-b");
+        registry.insert(id, record);
+
+        assert_eq!(
+            resolve_registry_id(&registry, "sbx-alpha", "demo")
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_registry_id_falls_back_to_the_name_when_no_id_is_supplied() {
+        let mut registry = HashMap::new();
+        let (id, record) = test_record("sbx-alpha", "demo", "workspace-a");
+        registry.insert(id, record);
+
+        assert_eq!(
+            resolve_registry_id(&registry, "", "demo").unwrap().as_deref(),
+            Some("sbx-alpha"),
+        );
+    }
+
+    #[test]
+    fn resolve_registry_id_rejects_an_ambiguous_name_only_lookup() {
+        let mut registry = HashMap::new();
+        let (id_a, rec_a) = test_record("sbx-a", "shared-name", "workspace-a");
+        let (id_b, rec_b) = test_record("sbx-b", "shared-name", "workspace-b");
+        registry.insert(id_a, rec_a);
+        registry.insert(id_b, rec_b);
+
+        let err = resolve_registry_id(&registry, "", "shared-name").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "sandbox_name matches multiple sandboxes; specify sandbox_id"
+        );
+    }
+
+    #[test]
+    fn resolve_registry_id_returns_none_without_any_identifier() {
+        let registry = HashMap::new();
+        assert_eq!(resolve_registry_id(&registry, "", "").unwrap(), None);
+    }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -9513,6 +9616,66 @@ mod tests {
         assert_eq!(err.code(), Code::AlreadyExists);
         assert!(state_dir.join("overlay.ext4").exists());
         assert!(driver.registry.lock().await.contains_key("sandbox-123"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_with_same_name_in_same_workspace_fails() {
+        let base = unique_temp_dir();
+        let driver_state = base.join("driver-state");
+        let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let driver = VmDriver {
+            config: VmDriverConfig {
+                state_dir: driver_state.clone(),
+                default_image: "ghcr.io/example/sandbox:latest".to_string(),
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+        };
+
+        {
+            let mut registry = driver.registry.lock().await;
+            registry.insert(
+                "sandbox-1".to_string(),
+                SandboxRecord {
+                    snapshot: Sandbox {
+                        id: "sandbox-1".to_string(),
+                        name: "shared-name".to_string(),
+                        workspace: "ws-1".to_string(),
+                        ..Default::default()
+                    },
+                    state_dir: PathBuf::from("/tmp"),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                },
+            );
+        }
+
+        let err = driver
+            .create_sandbox(&Sandbox {
+                id: "sandbox-2".to_string(),
+                name: "shared-name".to_string(),
+                workspace: "ws-1".to_string(),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("same name in same workspace should fail");
+
+        assert_eq!(err.code(), Code::AlreadyExists);
 
         let _ = std::fs::remove_dir_all(base);
     }
