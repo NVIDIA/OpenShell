@@ -14,6 +14,11 @@ repository.workspace = true
 name = "openshell-sandbox"
 path = "src/main.rs"
 
+[[bin]]
+name = "openshell-seccomp-perf"
+path = "src/bin/seccomp-perf.rs"
+required-features = ["perf-harness"]
+
 [features]
 perf-harness = []
 

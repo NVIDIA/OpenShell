@@ -243,3 +243,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+[[test]]
+name = "live_internet_traffic_perf"
+path = "tests/live_internet_traffic_perf.rs"
+required-features = ["e2e-host-gateway"]

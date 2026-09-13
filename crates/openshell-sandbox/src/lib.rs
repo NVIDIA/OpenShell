@@ -18,6 +18,8 @@ pub mod main_session;
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
+#[cfg(all(target_os = "linux", feature = "perf-harness"))]
+pub mod perf;
 #[cfg(unix)]
 pub mod process;
 mod pty;

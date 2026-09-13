@@ -3,10 +3,17 @@
 
 # Rust check, lint, and format tasks
 
+["perf:seccomp"]
+description = "Compare native and sandbox-filtered TCP socket performance"
+run = "cargo run --release -p openshell-sandbox --features perf-harness --bin openshell-seccomp-perf --"
+
 ["rust:check"]
 description = "Check all Rust crates for errors"
 depends = ["rust:lockfiles:check"]
-run = "cargo check --workspace"
+run = [
+  "cargo check --workspace",
+  "cargo check -p openshell-sandbox --all-targets --features perf-harness",
+]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check native"
 hide = true
 
@@ -21,6 +28,7 @@ description = "Lint Rust code with Clippy (deny warnings)"
 depends = ["rust:lockfiles:check"]
 run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy -p openshell-sandbox --all-targets --features perf-harness -- -D warnings",
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings",
