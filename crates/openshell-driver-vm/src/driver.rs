@@ -3954,6 +3954,16 @@ impl VmDriver {
                     write!(message, "; supervisor stderr tail:\n{stderr}")
                         .expect("writing to String cannot fail");
                 }
+                if component == "host supervisor"
+                    && let Some(state_dir) = state_dir.as_deref()
+                    && let Some(console) = read_vm_console_tail(
+                        &state_dir.join("rootfs-console.log"),
+                        VM_CONSOLE_DIAGNOSTIC_BYTES,
+                    )
+                {
+                    write!(message, "; guest console tail:\n{console}")
+                        .expect("writing to String cannot fail");
+                }
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
