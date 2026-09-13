@@ -11,9 +11,6 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::process::ExitCode;
 
-#[cfg(target_os = "linux")]
-const LOOPBACK_NAME: &[u8] = b"lo";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     PrepareNetwork,
@@ -157,15 +154,13 @@ const _: () = assert!(size_of::<InterfaceRequest>() == size_of::<libc::ifreq>())
 
 #[cfg(target_os = "linux")]
 impl InterfaceRequest {
-    #[allow(trivial_numeric_casts)]
     fn loopback() -> Self {
         let mut request = Self {
             name: [0; libc::IFNAMSIZ],
             data: InterfaceRequestData { storage: [0; 24] },
         };
-        for (destination, source) in request.name.iter_mut().zip(LOOPBACK_NAME) {
-            *destination = *source as libc::c_char;
-        }
+        request.name[0] = 108;
+        request.name[1] = 111;
         request
     }
 
@@ -236,11 +231,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[allow(trivial_numeric_casts)]
     fn loopback_request_has_a_fixed_interface_name() {
         let request = InterfaceRequest::loopback();
-        assert_eq!(request.name[0], b'l' as libc::c_char);
-        assert_eq!(request.name[1], b'o' as libc::c_char);
+        assert_eq!(request.name[0], 108);
+        assert_eq!(request.name[1], 111);
         assert!(request.name[2..].iter().all(|byte| *byte == 0));
     }
 }
