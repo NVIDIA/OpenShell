@@ -97,6 +97,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         ));
         let response = client
             .call_idempotent(Request::Attach {
+                supervisor_instance_id: client.supervisor_instance_id,
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
                 resource_claims: resource_claims.clone(),
             })
@@ -948,6 +949,7 @@ async fn dispatch_client_mediation_frame(
 
 struct BoundaryClient {
     runtime_descriptor: SandboxRuntimeDescriptor,
+    supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
@@ -972,6 +974,7 @@ impl BoundaryClient {
     ) -> Self {
         Self {
             runtime_descriptor,
+            supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
@@ -1980,6 +1983,7 @@ mod tests {
             test_bearer(&"a".repeat(32)),
         );
         let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
         };

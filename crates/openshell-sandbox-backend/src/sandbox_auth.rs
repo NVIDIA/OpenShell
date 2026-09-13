@@ -125,6 +125,7 @@ struct ConnectionState {
     active: Option<ActiveConnection>,
     pending: Option<ActiveConnection>,
     highest_epoch: Option<CredentialEpoch>,
+    supervisor_instance_id: Option<crate::boundary_protocol::SupervisorInstanceId>,
     terminal: bool,
 }
 
@@ -142,6 +143,7 @@ impl SandboxConnectionRegistry {
     pub fn attach(
         &self,
         principal: &SandboxProtocolPrincipal,
+        supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     ) -> Result<Option<SandboxConnectionId>, SandboxAuthError> {
         let epoch = principal
             .session
@@ -153,6 +155,13 @@ impl SandboxConnectionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.terminal {
             return Err(SandboxAuthError::TerminalSession);
+        }
+        match state.supervisor_instance_id {
+            Some(expected) if expected != supervisor_instance_id => {
+                return Err(SandboxAuthError::WrongSupervisorInstance);
+            }
+            Some(_) => {}
+            None => state.supervisor_instance_id = Some(supervisor_instance_id),
         }
         if let Some(active) = state.active {
             if active.id == principal.connection_id && active.epoch == epoch {
@@ -309,6 +318,8 @@ pub enum SandboxAuthError {
     MissingCredentialEpoch,
     #[error("Sandbox Protocol credential epoch is stale or already active")]
     StaleCredentialEpoch,
+    #[error("sandbox runtime is already bound to another supervisor process")]
+    WrongSupervisorInstance,
     #[error("Sandbox Protocol connection has not completed attach")]
     ConnectionNotAttached,
     #[error("sandbox session is terminal")]
@@ -418,13 +429,14 @@ mod tests {
             .authenticate(first_id, &metadata(first_token.token.expose_secret()))
             .expect("first principal");
         let registry = SandboxConnectionRegistry::default();
-        assert_eq!(registry.attach(&first), Ok(None));
-        assert_eq!(registry.attach(&first), Ok(None));
+        let instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        assert_eq!(registry.attach(&first, instance), Ok(None));
+        assert_eq!(registry.attach(&first, instance), Ok(None));
         assert_eq!(registry.confirm(&first), Ok(None));
         assert_eq!(registry.confirm(&first), Ok(None));
 
         assert!(registry.disconnect(first_id));
-        assert_eq!(registry.attach(&first), Ok(None));
+        assert_eq!(registry.attach(&first, instance), Ok(None));
         assert_eq!(registry.confirm(&first), Ok(None));
         registry.mark_terminal();
         assert_eq!(
@@ -432,9 +444,38 @@ mod tests {
             Err(SandboxAuthError::TerminalSession)
         );
         assert_eq!(
-            registry.attach(&first),
+            registry.attach(&first, instance),
             Err(SandboxAuthError::TerminalSession)
         );
+    }
+
+    #[test]
+    fn replacement_supervisor_cannot_resume_existing_runtime_generation() {
+        let (authenticator, token) = fixture(1);
+        let first_id = SandboxConnectionId::new();
+        let first = authenticator
+            .authenticate(first_id, &metadata(token.token.expose_secret()))
+            .expect("first principal");
+        let registry = SandboxConnectionRegistry::default();
+        let first_instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        registry
+            .attach(&first, first_instance)
+            .expect("attach first supervisor");
+        registry.confirm(&first).expect("confirm first supervisor");
+        assert!(registry.disconnect(first_id));
+
+        let replacement_id = SandboxConnectionId::new();
+        let replacement = authenticator
+            .authenticate(replacement_id, &metadata(token.token.expose_secret()))
+            .expect("replacement principal");
+        assert_eq!(
+            registry.attach(
+                &replacement,
+                crate::boundary_protocol::SupervisorInstanceId::new(),
+            ),
+            Err(SandboxAuthError::WrongSupervisorInstance)
+        );
+        assert_eq!(registry.attach(&replacement, first_instance), Ok(None));
     }
 
     #[test]
@@ -453,10 +494,11 @@ mod tests {
             )
             .expect("replacement principal");
         let registry = SandboxConnectionRegistry::default();
-        registry.attach(&first).expect("attach first");
+        let instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        registry.attach(&first, instance).expect("attach first");
         registry.confirm(&first).expect("confirm first");
 
-        assert_eq!(registry.attach(&replacement), Ok(None));
+        assert_eq!(registry.attach(&replacement, instance), Ok(None));
         registry
             .require_active(&first)
             .expect("first remains active");

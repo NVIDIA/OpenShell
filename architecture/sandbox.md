@@ -31,10 +31,14 @@ The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
 bridges before releasing the exclusive DNS mediation lease. The supervisor has
-30 seconds to reconnect, replay attach, and reconfirm the boundary. Confirmation
-resumes the workload; expiration terminates it. A credential replacement does
-not displace the active connection until the new connection is confirmed. Idle
-healthy connections remain usable.
+30 seconds to reconnect, replay attach, and reconfirm the boundary. Every
+supervisor process generates an ephemeral instance ID, and the sandbox pins the
+first ID it accepts for its process lifetime. The same process can therefore
+recover a dropped transport, but a replacement supervisor cannot reuse launch
+credentials to claim the existing runtime generation. Confirmation resumes the
+workload; expiration terminates it. A credential replacement does not displace
+the active connection until the new connection is confirmed. Idle healthy
+connections remain usable.
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload

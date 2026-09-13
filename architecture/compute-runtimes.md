@@ -167,6 +167,12 @@ same resource. The gateway requires a fresh supervisor session before a
 starting sandbox returns to `Ready`; stale driver snapshots and supervisor
 sessions cannot promote a `Stopped` row.
 
+Runtime credentials are generation-scoped and memory-only after launch. A
+supervisor or Sandbox Runtime process replacement does not resume a running
+generation. Planned upgrades stop the sandbox first; the following start mints
+a fresh session, TLS identity, and credential pair. An unexpected replacement
+leaves the old workload on the normal fail-closed disconnect path.
+
 A driver stop operation does not complete while its backend still reports an
 in-progress stop. This prevents an immediate start from racing the previous
 run's delayed exit event and regressing the new run to `Error`.

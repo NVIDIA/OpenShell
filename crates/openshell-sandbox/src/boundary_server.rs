@@ -1068,14 +1068,23 @@ mod linux {
             }
             _ => {}
         }
-        let is_attach = matches!(&request.request, Request::Attach { .. });
+        let supervisor_instance_id = match &request.request {
+            Request::Attach {
+                supervisor_instance_id,
+                ..
+            } => Some(*supervisor_instance_id),
+            _ => None,
+        };
+        let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
         let response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
-            runtime.commit_attach(principal)?;
+            let supervisor_instance_id = supervisor_instance_id
+                .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
+            runtime.commit_attach(principal, supervisor_instance_id)?;
         }
         if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
             runtime.commit_confirm(principal)?;
@@ -1374,10 +1383,14 @@ mod linux {
             }
         }
 
-        fn commit_attach(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+        fn commit_attach(
+            &self,
+            principal: &SandboxProtocolPrincipal,
+            supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
+        ) -> Result<(), String> {
             if let Some(replaced) = self
                 .connections
-                .attach(principal)
+                .attach(principal, supervisor_instance_id)
                 .map_err(|error| error.to_string())?
             {
                 self.close_connection(replaced);
@@ -1645,6 +1658,7 @@ mod linux {
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
                 Request::Attach {
+                    supervisor_instance_id: _,
                     policy,
                     resource_claims,
                 } => {
@@ -3315,6 +3329,11 @@ mod linux {
                 .expect("test session ID")
         }
 
+        fn test_supervisor_instance_id()
+        -> openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId {
+            openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId::new()
+        }
+
         fn test_verification_key() -> GatewayVerificationKey {
             let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
             GatewayVerificationKey {
@@ -3624,11 +3643,14 @@ mod linux {
         #[tokio::test(flavor = "multi_thread")]
         async fn disconnected_session_reconfirms_before_becoming_active() {
             let (runtime, token) = availability_test_runtime();
+            let supervisor_instance_id = test_supervisor_instance_id();
             let first_id = SandboxConnectionId::new();
             let first = runtime
                 .authenticate_request(first_id, bearer_request((), &token).metadata())
                 .expect("first principal");
-            runtime.commit_attach(&first).expect("attach first");
+            runtime
+                .commit_attach(&first, supervisor_instance_id)
+                .expect("attach first");
             runtime.commit_confirm(&first).expect("confirm first");
             assert_eq!(
                 *lock(&runtime.supervisor_connection),
@@ -3645,8 +3667,14 @@ mod linux {
             let replacement = runtime
                 .authenticate_request(replacement_id, bearer_request((), &token).metadata())
                 .expect("replacement principal");
+            assert!(
+                runtime
+                    .commit_attach(&replacement, test_supervisor_instance_id())
+                    .is_err(),
+                "a replacement supervisor process must not claim the generation"
+            );
             runtime
-                .commit_attach(&replacement)
+                .commit_attach(&replacement, supervisor_instance_id)
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
@@ -3671,11 +3699,14 @@ mod linux {
         #[tokio::test(flavor = "multi_thread")]
         async fn expired_recovery_makes_the_session_terminal() {
             let (runtime, token) = availability_test_runtime();
+            let supervisor_instance_id = test_supervisor_instance_id();
             let connection_id = SandboxConnectionId::new();
             let principal = runtime
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
-            runtime.commit_attach(&principal).expect("attach");
+            runtime
+                .commit_attach(&principal, supervisor_instance_id)
+                .expect("attach");
             runtime.commit_confirm(&principal).expect("confirm");
             runtime.transport_disconnected(connection_id);
             let connection_state = *lock(&runtime.supervisor_connection);
@@ -3693,17 +3724,24 @@ mod linux {
             let replacement = runtime
                 .authenticate_request(replacement_id, bearer_request((), &token).metadata())
                 .expect("replacement principal");
-            assert!(runtime.commit_attach(&replacement).is_err());
+            assert!(
+                runtime
+                    .commit_attach(&replacement, supervisor_instance_id)
+                    .is_err()
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn explicit_shutdown_acknowledges_terminal_session_state() {
             let (runtime, token) = availability_test_runtime();
+            let supervisor_instance_id = test_supervisor_instance_id();
             let connection_id = SandboxConnectionId::new();
             let principal = runtime
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
-            runtime.commit_attach(&principal).expect("attach");
+            runtime
+                .commit_attach(&principal, supervisor_instance_id)
+                .expect("attach");
             runtime.commit_confirm(&principal).expect("confirm");
 
             assert_eq!(
@@ -3723,13 +3761,14 @@ mod linux {
         #[tokio::test(flavor = "multi_thread")]
         async fn grpc_blackhole_expires_connection_and_releases_mediation_lease() {
             let (runtime, token) = availability_test_runtime();
+            let supervisor_instance_id = test_supervisor_instance_id();
             let connection_id = SandboxConnectionId::new();
             let principal = runtime
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
                 .connections
-                .attach(&principal)
+                .attach(&principal, supervisor_instance_id)
                 .expect("attach test connection");
             runtime
                 .connections
@@ -3811,7 +3850,7 @@ mod linux {
                 .expect("test principal");
             runtime
                 .connections
-                .attach(&principal)
+                .attach(&principal, supervisor_instance_id)
                 .expect("attach test connection");
             runtime
                 .connections
@@ -3855,7 +3894,7 @@ mod linux {
                 .expect("test principal");
             runtime
                 .connections
-                .attach(&principal)
+                .attach(&principal, test_supervisor_instance_id())
                 .expect("attach test connection");
             runtime
                 .connections
@@ -4133,6 +4172,7 @@ mod linux {
                 process: openshell_core::policy::ProcessPolicy::default(),
             });
             let request = RequestEnvelope::new(Request::Attach {
+                supervisor_instance_id: test_supervisor_instance_id(),
                 policy: Box::new(policy),
                 resource_claims: std::collections::BTreeMap::new(),
             })
