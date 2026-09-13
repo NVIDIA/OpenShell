@@ -36,7 +36,7 @@ tests:
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-            verbs: ["create", "delete", "get", "list"]
+            verbs: ["create", "get"]
       - notContains:
           path: rules
           content:
@@ -148,8 +148,8 @@ tests:
       - contains:
           path: rules
           content:
-            apiGroups: ["apps"]
-            resources: ["deployments"]
+            apiGroups: [""]
+            resources: ["pods"]
             verbs: ["create", "delete", "get", "list", "patch", "watch"]
       - contains:
           path: rules
@@ -165,8 +165,8 @@ tests:
       - contains:
           path: rules
           content:
-            apiGroups: ["apps"]
-            resources: ["deployments"]
+            apiGroups: [""]
+            resources: ["pods"]
             verbs: ["create", "delete", "get", "list", "patch", "watch"]
       - contains:
           path: rules
