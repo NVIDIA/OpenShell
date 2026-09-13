@@ -70,10 +70,10 @@ mise run helm:skaffold:run
 ```
 
 Both commands build the gateway and trusted runtime image and deploy the
-OpenShell Helm chart. The Kubernetes driver creates a sandbox workload Pod and a
-separate supervisor Deployment:
-a capability-free sandbox Pod behind an empty-egress NetworkPolicy and a
-separate capability-free supervisor Deployment. The default Skaffold values
+OpenShell Helm chart. The Kubernetes driver creates a capability-free sandbox
+workload Pod and a directly managed capability-free supervisor Pod. One
+namespace-wide NetworkPolicy denies direct egress from every OpenShell workload
+Pod. The default Skaffold values
 export gateway and Kubernetes-driver traces to the collector service installed
 by `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 

@@ -263,8 +263,8 @@ cleanup() {
       echo "=== gateway sandbox records ==="
       "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
         sandbox list --all-workspaces --output json 2>&1 || true
-      echo "=== sandbox-runtime supervisor Deployments ==="
-      kctl -n "${NAMESPACE}" get deployments \
+      echo "=== sandbox-runtime supervisor Pods ==="
+      kctl -n "${NAMESPACE}" get pods \
         -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
       echo "=== sandbox-runtime supervisor logs (last 200 lines each) ==="
       while IFS= read -r supervisor_pod; do

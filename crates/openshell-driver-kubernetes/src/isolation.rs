@@ -29,10 +29,10 @@ use openshell_sandbox_backend::boundary_protocol::{
 /// Isolation backend implemented by the `OpenShell` sandbox runtime.
 pub const BACKEND_NAME: &str = openshell_sandbox_backend::BACKEND_NAME;
 
-/// Label that binds the workload and control pods in one unique pair.
+/// Label that binds the workload and supervisor pods in one unique pair.
 pub const BOUNDARY_PAIR_LABEL: &str = "openshell.ai/boundary-pair";
 
-/// Label distinguishing the two pods in a boundary pair.
+/// Label distinguishing the two pods in a sandbox generation.
 pub const BOUNDARY_ROLE_LABEL: &str = "openshell.ai/boundary-role";
 
 const WORKLOAD_ROLE: &str = "workload";
@@ -47,8 +47,6 @@ const SUPERVISOR_ROLE: &str = "supervisor";
 pub struct KubernetesSandboxRuntimeNetworkFenceSpec {
     pub namespace: String,
     pub policy_name: String,
-    /// A unique, Kubernetes-label-safe value generated for this pod pair.
-    pub pair_label_value: String,
     pub boundary_port: u16,
 }
 
@@ -60,7 +58,7 @@ pub struct KubernetesSandboxRuntimeNetworkFence {
 }
 
 impl KubernetesSandboxRuntimeNetworkFenceSpec {
-    /// Render a default-deny workload fence with one control-to-boundary path.
+    /// Render the namespace-wide workload fence.
     ///
     /// Kubernetes `NetworkPolicy` is connection-aware: traffic returning over
     /// the control-initiated boundary connection is allowed even though the
@@ -68,8 +66,8 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
     /// for opening policy-approved upstream connections.
     #[must_use]
     pub fn provision(self) -> KubernetesSandboxRuntimeNetworkFence {
-        let workload_labels = boundary_pair_labels(&self.pair_label_value, WORKLOAD_ROLE);
-        let control_labels = boundary_pair_labels(&self.pair_label_value, SUPERVISOR_ROLE);
+        let workload_labels = role_labels(WORKLOAD_ROLE);
+        let control_labels = role_labels(SUPERVISOR_ROLE);
 
         let workload_policy = NetworkPolicy {
             metadata: ObjectMeta {
@@ -83,8 +81,9 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
                     ..Default::default()
                 },
                 policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
-                // Only the exactly paired control pod in this namespace may
-                // establish the authenticated boundary connection.
+                // Any trusted OpenShell supervisor in this namespace may
+                // reach a sandbox listener. The Sandbox Protocol enforces the
+                // exact sandbox, generation, and Pod UID binding.
                 ingress: Some(vec![NetworkPolicyIngressRule {
                     from: Some(vec![NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
@@ -115,19 +114,16 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
     }
 }
 
-fn boundary_pair_labels(pair: &str, role: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (BOUNDARY_PAIR_LABEL.to_string(), pair.to_string()),
-        (BOUNDARY_ROLE_LABEL.to_string(), role.to_string()),
-    ])
+fn role_labels(role: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(BOUNDARY_ROLE_LABEL.to_string(), role.to_string())])
 }
 
-/// Driver-owned inputs that bind one workload/proxy pair to one boundary.
+/// Driver-owned inputs that bind one workload/supervisor pair to one boundary.
 ///
 /// The driver constructs this only after Kubernetes has assigned every UID and
-/// after it has observed the exact egress policy resource version. The workload
-/// stays held until the matching boundary config and supervisor resources have been
-/// installed.
+/// after it has observed the namespace workload-policy resource version. The
+/// workload stays held until the matching boundary config and supervisor
+/// resources have been installed.
 pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub boundary_id: String,
     pub generation: String,
@@ -138,7 +134,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub sandbox_resource_uid: String,
     pub workload_pod_uid: String,
     pub workload_pod_uid_path: PathBuf,
-    pub control_deployment_uid: String,
+    pub supervisor_pod_uid: String,
     pub egress_policy_uid: String,
     pub egress_policy_resource_version: String,
     pub boundary_listener: SocketAddr,
@@ -173,8 +169,8 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.workload_pod_uid,
             ),
             (
-                "kubernetes.control_deployment_uid".to_string(),
-                self.control_deployment_uid,
+                "kubernetes.supervisor_pod_uid".to_string(),
+                self.supervisor_pod_uid,
             ),
             (
                 "kubernetes.egress_policy_uid".to_string(),
@@ -249,7 +245,7 @@ mod tests {
             sandbox_resource_uid: "sandbox-resource-uid".to_string(),
             workload_pod_uid: "pod-uid".to_string(),
             workload_pod_uid_path: PathBuf::from("/.openshell/pod-identity/uid"),
-            control_deployment_uid: "control-deployment-uid".to_string(),
+            supervisor_pod_uid: "supervisor-pod-uid".to_string(),
             egress_policy_uid: "network-policy-uid".to_string(),
             egress_policy_resource_version: "1945".to_string(),
             boundary_listener: "0.0.0.0:5500".parse().expect("valid listener"),
@@ -340,7 +336,6 @@ mod tests {
         let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
-            pair_label_value: "pair-1".to_string(),
             boundary_port: 5500,
         }
         .provision();
@@ -358,11 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn network_fence_allows_only_paired_control_to_boundary_port() {
+    fn network_fence_allows_namespace_supervisors_to_boundary_port() {
         let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
-            pair_label_value: "pair-1".to_string(),
             boundary_port: 5500,
         }
         .provision();

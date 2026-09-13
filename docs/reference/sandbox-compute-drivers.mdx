@@ -443,15 +443,16 @@ The driver creates copies only in gateway-owned managed namespaces. Do not
 reuse the gateway ServiceAccount for unrelated workloads.
 
 The Kubernetes driver always places the sandbox runtime in the workload Pod and
-the supervisor in a separate Deployment. The
+the supervisor in a separate, directly managed Pod. The
 workload Pod runs `openshell-sandbox` as the same non-root UID/GID as the agent
-and requests no added Linux capabilities. A separate Deployment runs
+and requests no added Linux capabilities. The supervisor Pod runs
 `openshell-supervisor`, authenticates to the gateway with a sandbox JWT, and
 owns upstream connections. Both containers disable privilege escalation, drop
 all capabilities, and use `RuntimeDefault` seccomp. The sandbox adds a nested
 seccomp user-notification filter and Landlock restrictions before it launches
-the agent. An empty-egress `NetworkPolicy` is the mandatory outer fence for the
-workload Pod.
+the agent. One namespace-wide, empty-egress `NetworkPolicy` is the mandatory
+outer fence for all OpenShell workload Pods. It permits supervisor Pods to
+reach sandbox listeners; TLS and JWT identity enforce the exact pairing.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

@@ -7,10 +7,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use k8s_openapi::ByteString;
-use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicySpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
@@ -37,6 +35,7 @@ pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json"
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
+pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 
 pub struct ProxyCaMaterial {
     pub certificate_pem: String,
@@ -68,9 +67,8 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
-    pub control_deployment: String,
+    pub supervisor_pod: String,
     pub workload_policy: String,
-    pub control_policy: String,
 }
 
 impl SandboxRuntimeNames {
@@ -81,9 +79,8 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
-            control_deployment: format!("os-supervisor-{suffix}"),
-            workload_policy: format!("os-boundary-{suffix}"),
-            control_policy: format!("os-supervisor-{suffix}"),
+            supervisor_pod: format!("os-supervisor-{suffix}"),
+            workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
         }
     }
 
@@ -113,13 +110,11 @@ pub fn pair_label_value(sandbox_id: &str) -> String {
 pub fn workload_fence(
     namespace: &str,
     names: &SandboxRuntimeNames,
-    sandbox_id: &str,
     boundary_port: u16,
 ) -> KubernetesSandboxRuntimeNetworkFence {
     KubernetesSandboxRuntimeNetworkFenceSpec {
         namespace: namespace.to_string(),
         policy_name: names.workload_policy.clone(),
-        pair_label_value: pair_label_value(sandbox_id),
         boundary_port,
     }
     .provision()
@@ -152,7 +147,7 @@ pub fn boundary_service(
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 #[must_use]
-pub fn control_deployment(
+pub fn supervisor_pod(
     namespace: &str,
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
@@ -176,7 +171,7 @@ pub fn control_deployment(
     proxy_connect_by_hostname: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
-) -> Deployment {
+) -> Pod {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
         env_var(
@@ -328,61 +323,25 @@ pub fn control_deployment(
         container["imagePullPolicy"] = serde_json::json!(supervisor_pull_policy);
     }
     serde_json::from_value(serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": names.control_deployment, "namespace": namespace, "ownerReferences": [owner], "labels": labels},
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": names.supervisor_pod, "namespace": namespace, "ownerReferences": [owner], "labels": labels, "annotations": {"openshell.ai/sandbox-id": sandbox_id}},
         "spec": {
-            "replicas": 0,
-            "strategy": {"type": "Recreate"},
-            "selector": {"matchLabels": pair_labels(sandbox_id, "supervisor")},
-            "template": {
-                "metadata": {"labels": control_labels(sandbox_id, gateway_id), "annotations": {"openshell.ai/sandbox-id": sandbox_id}},
-                "spec": {
-                    "serviceAccountName": service_account_name,
-                    "imagePullSecrets": image_pull_secrets.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
-                    "automountServiceAccountToken": false,
-                    "securityContext": {
-                        "fsGroup": control_gid,
-                        "fsGroupChangePolicy": "OnRootMismatch",
-                        "seccompProfile": {"type": "RuntimeDefault"}
-                    },
-                    "restartPolicy": "Always",
-                    "containers": [container],
-                    "volumes": volumes
-                }
-            }
+            "serviceAccountName": service_account_name,
+            "imagePullSecrets": image_pull_secrets.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
+            "automountServiceAccountToken": false,
+            "schedulingGates": [{"name": "openshell.ai/bootstrap"}],
+            "securityContext": {
+                "fsGroup": control_gid,
+                "fsGroupChangePolicy": "OnRootMismatch",
+                "seccompProfile": {"type": "RuntimeDefault"}
+            },
+            "restartPolicy": "Never",
+            "containers": [container],
+            "volumes": volumes
         }
     }))
-    .expect("control Deployment renderer must produce a valid object")
-}
-
-#[must_use]
-pub fn control_egress_policy(
-    namespace: &str,
-    names: &SandboxRuntimeNames,
-    sandbox_id: &str,
-    owner: OwnerReference,
-) -> NetworkPolicy {
-    NetworkPolicy {
-        metadata: ObjectMeta {
-            name: Some(names.control_policy.clone()),
-            namespace: Some(namespace.to_string()),
-            owner_references: Some(vec![owner]),
-            labels: Some(common_labels(sandbox_id, "control-egress")),
-            ..Default::default()
-        },
-        spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector {
-                match_labels: Some(pair_labels(sandbox_id, "supervisor")),
-                ..Default::default()
-            },
-            policy_types: Some(vec!["Egress".to_string()]),
-            // Control is the policy-enforcing egress principal. Namespace-wide
-            // default-deny policies must not prevent its gateway/DNS/upstream dials.
-            egress: Some(vec![NetworkPolicyEgressRule::default()]),
-            ..Default::default()
-        }),
-    }
+    .expect("supervisor Pod renderer must produce a valid object")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -529,7 +488,7 @@ mod tests {
     use super::*;
 
     fn owner() -> OwnerReference {
-        sandbox_owner_reference("demo", "uid-1", "agents.x-k8s.io/v1beta1", true)
+        sandbox_owner_reference("demo", "uid-1", "agents.x-k8s.io/v1beta1", false)
     }
 
     #[test]
@@ -548,18 +507,9 @@ mod tests {
     }
 
     #[test]
-    fn control_policy_explicitly_allows_control_egress() {
+    fn supervisor_pod_is_gated_non_restarting_and_unprivileged() {
         let names = SandboxRuntimeNames::new("pair");
-        let policy = control_egress_policy("sandbox", &names, "pair", owner());
-        let spec = policy.spec.unwrap();
-        assert_eq!(spec.policy_types.unwrap(), ["Egress"]);
-        assert_eq!(spec.egress.unwrap().len(), 1);
-    }
-
-    #[test]
-    fn control_deployment_is_singleton_ready_and_unprivileged() {
-        let names = SandboxRuntimeNames::new("pair");
-        let deployment = control_deployment(
+        let pod = supervisor_pod(
             "sandbox",
             &names,
             "pair",
@@ -584,16 +534,22 @@ mod tests {
             None,
             owner(),
         );
-        let spec = deployment.spec.as_ref().unwrap();
+        let pod_spec = pod.spec.as_ref().unwrap();
         assert_eq!(
-            spec.strategy
-                .as_ref()
-                .and_then(|strategy| strategy.type_.as_deref()),
-            Some("Recreate")
+            pod.metadata.owner_references.as_ref().unwrap()[0].controller,
+            None
         );
-        let container = &spec.template.spec.as_ref().unwrap().containers[0];
-        let pod_spec = spec.template.spec.as_ref().unwrap();
+        let container = &pod_spec.containers[0];
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(
+            pod_spec
+                .scheduling_gates
+                .as_ref()
+                .and_then(|gates| gates.first())
+                .map(|gate| gate.name.as_str()),
+            Some("openshell.ai/bootstrap")
+        );
         assert_eq!(
             pod_spec.image_pull_secrets.as_ref().unwrap()[0]
                 .name
