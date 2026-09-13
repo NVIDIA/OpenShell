@@ -4,9 +4,12 @@
 use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
-    CONDITION_WORKSPACE_VALIDATION_FAILED, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE,
-    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, supervisor_cache_path_with_base,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE,
+};
+use openshell_core::jwt::{
+    CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
+    SupervisorAuthBundle,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -16,15 +19,31 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
     GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
-    gateway_listener_requirement::Selector,
+    WorkloadIdentityRequest, gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use tempfile::TempDir;
 
-const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
-static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+fn test_launch_authentication() -> Vec<u8> {
+    serde_json::to_vec(&SandboxLaunchAuthentication {
+        supervisor: SupervisorAuthBundle {
+            session_id: openshell_core::SandboxSessionId::new(),
+            gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
+            gateway_expires_at: i64::MAX,
+            sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
+            sandbox_expires_at: i64::MAX,
+            credential_epoch: CredentialEpoch::new(1).unwrap(),
+        },
+        gateway_id: "gateway-test".to_string(),
+        verification_keys: vec![SessionVerificationKey {
+            key_id: "test-key".to_string(),
+            public_key_pem: b"public-key".to_vec(),
+        }],
+    })
+    .unwrap()
+}
 
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
@@ -51,7 +70,7 @@ fn test_sandbox() -> DriverSandbox {
             tty: false,
             await_main_process_attachment: false,
             workload_identity: None,
-            launch_authentication: Vec::new(),
+            launch_authentication: test_launch_authentication(),
         }),
         status: None,
         workspace: String::new(),
@@ -98,25 +117,24 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
-        image_pull_policy: ImagePullPolicy::IfNotPresent,
-        sandbox_label: "default".to_string(),
-        grpc_endpoint: "https://localhost:8443".to_string(),
-        network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+        image_pull_policy: String::new(),
+        sandbox_namespace: "default".to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
                 DEFAULT_SERVER_PORT,
             ),
-            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
         gateway_callback_bind_address: Some(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
             DEFAULT_SERVER_PORT,
         )),
-        ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
-        supervisor_bin: PathBuf::from("/tmp/openshell-sandbox"),
+        sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
+        supervisor_image_id: "sha256:supervisor-test".to_string(),
+        supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        gateway_tls_server_name: None,
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -127,159 +145,20 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
         },
-        sandbox_pids_limit: None,
+        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
-        upstream_proxy: UpstreamProxyConfig::default(),
-        provider_spiffe_workload_api_socket: None,
-        app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
 }
 
-#[test]
-fn docker_config_uses_canonical_sandbox_label_name() {
-    let config: DockerComputeConfig =
-        serde_json::from_value(serde_json::json!({ "sandbox_label": "tenant-a" })).unwrap();
-    assert_eq!(config.sandbox_label, "tenant-a");
-
-    let serialized = serde_json::to_value(config).unwrap();
-    assert_eq!(serialized["sandbox_label"], "tenant-a");
-    assert!(serialized.get("sandbox_namespace").is_none());
-}
-
-#[test]
-fn docker_config_rejects_legacy_sandbox_namespace() {
-    let error = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
-        "sandbox_namespace": "tenant-a"
-    }))
-    .expect_err("legacy sandbox_namespace must be rejected");
-    assert!(error.to_string().contains("sandbox_namespace"));
-}
-
-#[test]
-fn docker_config_keeps_explicit_unconfined_apparmor_default() {
-    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
-        .expect("default Docker config should deserialize");
-    assert_eq!(config.app_armor_profile, Some(AppArmorProfile::Unconfined));
-    let serialized = serde_json::to_value(config).expect("config should serialize");
-    assert_eq!(serialized["app_armor_profile"], "Unconfined");
-}
-
-#[test]
-fn docker_config_defaults_to_driver_owned_pids_limit() {
-    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
-        .expect("default Docker config should deserialize");
-    assert_eq!(
-        config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
-        Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
-    );
-}
-
-#[test]
-fn docker_config_rejects_invalid_pids_limits() {
-    let zero = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
-        "sandbox_pids_limit": 0
-    }))
-    .expect_err("zero PID limit must be rejected");
-    assert!(zero.to_string().contains("invalid value: integer `0`"));
-
-    let negative: DockerComputeConfig = serde_json::from_value(serde_json::json!({
-        "sandbox_pids_limit": -1
-    }))
-    .expect("nonzero integer deserializes before semantic validation");
-    let error = validate_sandbox_pids_limit(negative.sandbox_pids_limit).unwrap_err();
-    assert!(error.to_string().contains("must be positive"));
-}
-
-#[test]
-fn docker_rejects_newer_image_pull_policy() {
-    let error = validate_image_pull_policy(ImagePullPolicy::Newer).unwrap_err();
-    assert!(error.to_string().contains("supported only by the Podman"));
-}
-
-#[test]
-fn docker_apparmor_profiles_render_and_require_daemon_capability() {
-    for (profile, expected) in [
-        (AppArmorProfile::RuntimeDefault, None),
-        (
-            AppArmorProfile::Unconfined,
-            Some(vec!["apparmor=unconfined".to_string()]),
-        ),
-        (
-            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
-            Some(vec!["apparmor=openshell-supervisor".to_string()]),
-        ),
-    ] {
-        let mut config = runtime_config();
-        config.app_armor_profile = Some(profile.clone());
-        let body = build_container_create_body(&test_sandbox(), &config).unwrap();
-        assert_eq!(body.host_config.unwrap().security_opt, expected);
-    }
-
-    let unavailable = SystemInfo::default();
-    assert!(
-        validate_docker_app_armor_profile(Some(&AppArmorProfile::Unconfined), &unavailable).is_ok()
-    );
-    for confined in [
-        AppArmorProfile::RuntimeDefault,
-        AppArmorProfile::Localhost("openshell-supervisor".to_string()),
-    ] {
-        let error = validate_docker_app_armor_profile(Some(&confined), &unavailable)
-            .expect_err("confined profile requires daemon AppArmor support");
-        assert!(
-            error
-                .to_string()
-                .contains("Docker reports it is unavailable")
-        );
-    }
-
-    let available = SystemInfo {
-        security_options: Some(vec!["name=apparmor".to_string()]),
-        ..Default::default()
-    };
-    assert!(
-        validate_docker_app_armor_profile(
-            Some(&AppArmorProfile::Localhost(
-                "openshell-supervisor".to_string()
-            )),
-            &available
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn docker_config_uses_shared_proxy_contract_and_explicit_apparmor_default() {
-    let config: DockerComputeConfig = toml::from_str(
-        r#"
-https_proxy = "http://proxy.example:8080"
-no_proxy = ".svc"
-proxy_auth_file = "/run/secrets/proxy-auth"
-proxy_auth_allow_insecure = true
-app_armor_profile = "Localhost/openshell-supervisor"
-provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
-"#,
+fn test_workload_identity() -> ResolvedWorkloadIdentity {
+    ResolvedWorkloadIdentity::new(
+        1234,
+        1235,
+        vec![1236],
+        "test".to_string(),
+        "sha256:immutable".to_string(),
     )
-    .unwrap();
-    assert_eq!(
-        config.upstream_proxy.https_proxy.as_deref(),
-        Some("http://proxy.example:8080")
-    );
-    assert_eq!(
-        config.app_armor_profile,
-        Some(AppArmorProfile::Localhost(
-            "openshell-supervisor".to_string()
-        ))
-    );
-    assert!(config.upstream_proxy.validate().is_ok());
-    assert!(
-        openshell_core::driver_utils::validate_provider_spiffe_unix_socket(
-            config
-                .provider_spiffe_workload_api_socket
-                .as_deref()
-                .unwrap()
-        )
-        .is_ok()
-    );
+    .unwrap()
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
@@ -314,12 +193,14 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         ),
         config,
         events: broadcast::channel(WATCH_BUFFER).0,
-        pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        pending: Arc::new(Mutex::new(HashMap::new())),
         gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
             CdiGpuInventory::default(),
             wsl_all_gpu_fallback_enabled,
         )),
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
+        control_processes: Arc::new(Mutex::new(HashMap::new())),
+        runtime_failures: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -361,39 +242,16 @@ fn request_with_traceparent<T>(message: T) -> Request<T> {
     request
 }
 
-async fn fake_docker_with_no_containers() -> (String, JoinHandle<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-            let mut scratch = [0_u8; 4096_usize];
-            let _ = stream.read(&mut scratch).await;
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\n\
-                           Content-Type: application/json\r\n\
-                           Content-Length: 2\r\n\r\n[]",
-                )
-                .await;
-            let _ = stream.flush().await;
-        }
-    });
-    (format!("http://{address}"), server)
-}
-
 async fn standalone_traced_client() -> (
     TestDriverClient,
-    tokio::sync::oneshot::Sender<()>,
+    oneshot::Sender<()>,
     JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
     use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown, shutdown_rx) = oneshot::channel();
     let service = ComputeDriverService::new(test_driver_with_config(runtime_config()));
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -478,6 +336,78 @@ async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
         opentelemetry::trace::Status::Error { .. }
     ));
     provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn control_failure_overrides_running_container_readiness() {
+    let driver = test_driver_with_config(runtime_config());
+    driver.runtime_failures.lock().await.insert(
+        "sbx-123".to_string(),
+        DockerRuntimeFailure {
+            reason: "ControlSupervisorExited",
+            message: "control exited unexpectedly".to_string(),
+        },
+    );
+    let mut sandbox = pending_sandbox_snapshot(
+        &test_sandbox(),
+        "default",
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "BackendReady".to_string(),
+            message: "Container is running".to_string(),
+            last_transition_time: String::new(),
+        },
+        false,
+    );
+
+    driver.apply_runtime_failure(&mut sandbox).await;
+
+    let ready = sandbox
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|condition| condition.r#type == "Ready")
+        .expect("ready condition");
+    assert_eq!(ready.status, "False");
+    assert_eq!(ready.reason, "ControlSupervisorExited");
+    assert!(ready.message.contains("control exited unexpectedly"));
+}
+
+#[tokio::test]
+async fn control_failure_does_not_hide_a_terminal_container_exit() {
+    let driver = test_driver_with_config(runtime_config());
+    driver.runtime_failures.lock().await.insert(
+        "sbx-123".to_string(),
+        DockerRuntimeFailure {
+            reason: "ControlSupervisorExited",
+            message: "control exited unexpectedly".to_string(),
+        },
+    );
+    let mut sandbox = pending_sandbox_snapshot(
+        &test_sandbox(),
+        "default",
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: CONDITION_EXITED.to_string(),
+            message: "Container exited".to_string(),
+            last_transition_time: String::new(),
+        },
+        false,
+    );
+
+    driver.apply_runtime_failure(&mut sandbox).await;
+
+    let ready = sandbox
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|condition| condition.r#type == "Ready")
+        .expect("ready condition");
+    assert_eq!(ready.reason, CONDITION_EXITED);
 }
 
 #[tokio::test]
@@ -698,8 +628,7 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
-    DockerComputeDriver::start_sandbox(&driver, "", "")
-        .with_subscriber(subscriber)
+    Box::pin(DockerComputeDriver::start_sandbox(&driver, "", "", &[]).with_subscriber(subscriber))
         .await
         .expect_err("missing identifier should fail");
     provider.force_flush().unwrap();
@@ -729,17 +658,19 @@ async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let mut config = runtime_config();
-    config.image_pull_policy = ImagePullPolicy::Newer;
+    config.image_pull_policy = "unsupported".to_string();
     let driver = test_driver_with_config(config);
 
     async {
-        driver
-            .provision_sandbox_inner(&test_sandbox())
-            .instrument(tracing::info_span!(
-                "docker.provision",
-                otel.status_code = tracing::field::Empty
-            ))
-            .await
+        Box::pin(
+            driver
+                .provision_sandbox_inner(&test_sandbox())
+                .instrument(tracing::info_span!(
+                    "docker.provision",
+                    otel.status_code = tracing::field::Empty
+                )),
+        )
+        .await
     }
     .with_subscriber(subscriber)
     .await
@@ -1018,34 +949,6 @@ async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
 }
 
 #[test]
-fn container_visible_endpoint_rewrites_loopback_hosts() {
-    assert_eq!(
-        docker_container_openshell_endpoint(
-            "https://localhost:8443",
-            HOST_OPENSHELL_INTERNAL,
-            DEFAULT_SERVER_PORT,
-        ),
-        "https://host.openshell.internal:17670/"
-    );
-    assert_eq!(
-        docker_container_openshell_endpoint(
-            "http://127.0.0.1:8080",
-            HOST_OPENSHELL_INTERNAL,
-            DEFAULT_SERVER_PORT,
-        ),
-        "http://host.openshell.internal:17670/"
-    );
-    assert_eq!(
-        docker_container_openshell_endpoint(
-            "https://gateway.internal:8443",
-            HOST_OPENSHELL_INTERNAL,
-            DEFAULT_SERVER_PORT,
-        ),
-        "https://host.openshell.internal:17670/"
-    );
-}
-
-#[test]
 fn docker_bridge_gateway_ip_requires_ipv4_gateway() {
     let network = bollard::models::NetworkInspect {
         driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
@@ -1109,13 +1012,21 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
         ),
         DockerGatewayRoute::HostGateway
     );
-    assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
-        vec![
-            "host.docker.internal:host-gateway".to_string(),
-            "host.openshell.internal:host-gateway".to_string()
-        ]
-    );
+}
+
+#[test]
+fn vm_backed_docker_daemon_uses_daemon_local_companion_transport() {
+    let desktop = SystemInfo {
+        operating_system: Some("Docker Desktop".to_string()),
+        ..Default::default()
+    };
+    let native = SystemInfo {
+        operating_system: Some("Ubuntu 24.04".to_string()),
+        ..Default::default()
+    };
+
+    assert!(uses_host_gateway_alias(&desktop));
+    assert!(!uses_host_gateway_alias(&native));
 }
 
 #[test]
@@ -1159,13 +1070,6 @@ fn docker_gateway_route_uses_host_gateway_for_colima() {
             None,
         ),
         DockerGatewayRoute::HostGateway
-    );
-    assert_eq!(
-        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
-        vec![
-            "host.docker.internal:host-gateway".to_string(),
-            "host.openshell.internal:host-gateway".to_string()
-        ]
     );
 }
 
@@ -1251,15 +1155,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         route,
         DockerGatewayRoute::Bridge {
             bind_address: "172.18.0.1:17670".parse().unwrap(),
-            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         }
-    );
-    assert_eq!(
-        docker_extra_hosts(&route),
-        vec![
-            "host.docker.internal:172.18.0.1".to_string(),
-            "host.openshell.internal:172.18.0.1".to_string()
-        ]
     );
 }
 
@@ -1300,15 +1196,35 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
         route,
         DockerGatewayRoute::Bridge {
             bind_address: "172.20.0.4:17670".parse().unwrap(),
-            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)),
         }
     );
+}
+
+#[test]
+fn docker_supervisor_alias_matches_the_trusted_gateway_route() {
     assert_eq!(
-        docker_extra_hosts(&route),
-        vec![
-            "host.docker.internal:172.20.0.4".to_string(),
-            "host.openshell.internal:172.20.0.4".to_string()
-        ]
+        docker_supervisor_host_alias(&DockerGatewayRoute::Bridge {
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
+        }),
+        "172.20.0.4"
+    );
+    assert_eq!(
+        docker_supervisor_host_alias(&DockerGatewayRoute::HostGateway),
+        "host-gateway"
+    );
+}
+
+#[test]
+fn docker_boundary_pins_only_concrete_host_gateway_addresses() {
+    assert_eq!(
+        docker_boundary_host_gateway_ip(&DockerGatewayRoute::Bridge {
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
+        }),
+        Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)))
+    );
+    assert_eq!(
+        docker_boundary_host_gateway_ip(&DockerGatewayRoute::HostGateway),
+        None
     );
 }
 
@@ -1383,13 +1299,13 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 }
 
 #[test]
-fn docker_pids_limit_uses_runtime_default_when_omitted() {
+fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
     assert_eq!(
-        docker_pids_limit(std::num::NonZeroI64::new(2048)).unwrap(),
-        Some(2048)
+        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
+        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
     );
-    assert_eq!(docker_pids_limit(None).unwrap(), None);
-    assert!(docker_pids_limit(std::num::NonZeroI64::new(-1)).is_err());
+    assert_eq!(docker_pids_limit(0).unwrap(), None);
+    assert!(docker_pids_limit(-1).is_err());
 }
 
 #[test]
@@ -1399,109 +1315,51 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 }
 
 #[test]
-fn container_create_body_omits_pids_limit_by_default() {
+fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
-    assert_eq!(host_config.pids_limit, None);
+    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
 }
 
 #[test]
-fn container_create_body_emits_configured_positive_pids_limit() {
-    let mut config = runtime_config();
-    config.sandbox_pids_limit = std::num::NonZeroI64::new(4096);
-    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
-    assert_eq!(
-        body.host_config.expect("host config").pids_limit,
-        Some(4096)
-    );
-}
-
-#[test]
-fn build_environment_sets_docker_tls_paths() {
-    let env = build_environment(&test_sandbox(), &runtime_config());
-    assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
-    assert!(env.contains(&format!("OPENSHELL_TLS_CERT={TLS_CERT_MOUNT_PATH}")));
-    assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
-    assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
-    assert!(env.contains(&"SPEC_ENV=spec".to_string()));
-    assert!(env.contains(&format!(
-        "{}={}",
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
-    )));
-    let encoded = env
-        .iter()
-        .find_map(|entry| {
-            entry
-                .strip_prefix("OPENSHELL_MAIN_PROCESS_SPEC=")
-                .map(str::to_string)
-        })
-        .expect("main-process transport");
-    let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
-    // An omitted command is forwarded empty; the supervisor resolves the default
-    // login shell against the sandbox image at startup.
-    assert!(main.command.is_empty());
-    assert!(main.tty);
-}
-
-#[test]
-fn build_environment_keeps_network_capabilities_driver_controlled() {
-    let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().environment.insert(
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-        "spoofed".to_string(),
-    );
-    let env = build_environment(&sandbox, &runtime_config());
-    assert!(env.contains(&format!(
-        "{}={}",
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
-    )));
-    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
-}
-
-#[test]
-fn build_environment_protects_oci_identity_metadata() {
+fn docker_child_environment_strips_supervisor_control_keys() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    for (key, value) in [
-        (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
-        (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
-        (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+    for key in [
+        openshell_core::sandbox_env::ENDPOINT,
+        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::OCI_IMAGE_USER,
+        openshell_core::sandbox_env::SANDBOX_TOKEN,
+        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
     ] {
-        spec.environment.insert(key.to_string(), value.to_string());
+        spec.environment
+            .insert(key.to_string(), "spoofed".to_string());
     }
+    spec.environment
+        .insert("PATH".to_string(), "/agent/bin".to_string());
 
-    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+    let env = docker_child_environment(&sandbox);
 
-    assert!(env.contains(&format!(
-        "{}=app:staff",
-        openshell_core::sandbox_env::OCI_IMAGE_USER
-    )));
-    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_UID)));
-    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
-    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
-    assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
+    assert_eq!(env.get("PATH").map(String::as_str), Some("/agent/bin"));
+    assert!(env.contains_key("TEMPLATE_ENV"));
+    assert!(env.contains_key("SPEC_ENV"));
+    assert!(!env.values().any(|value| value == "spoofed"));
 }
 
 #[test]
-fn build_environment_strips_gateway_tls_server_name() {
-    let mut sandbox = test_sandbox();
-    let spec = sandbox.spec.as_mut().unwrap();
-    spec.environment.insert(
-        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
-        "evil.attacker.example.com".to_string(),
-    );
+fn boundary_environment_contains_only_driver_owned_values() {
+    let env = build_boundary_environment(&test_sandbox(), &runtime_config());
 
-    let env = build_environment(&sandbox, &runtime_config());
-
+    assert_eq!(env.len(), 2);
     assert!(
-        !env.iter().any(|entry| entry.starts_with(&format!(
-            "{}=",
-            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
-        ))),
-        "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+        env.iter()
+            .any(|entry| entry.starts_with("OPENSHELL_LOG_LEVEL="))
     );
+    assert!(env.iter().any(|entry| entry.starts_with(&format!(
+        "{}=",
+        openshell_core::sandbox_env::TELEMETRY_ENABLED
+    ))));
 }
 
 #[test]
@@ -1519,20 +1377,268 @@ fn container_creation_uses_inspected_immutable_image() {
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .unwrap();
 
     assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
-    assert_eq!(body.user.as_deref(), Some("0"));
+    assert_eq!(body.user.as_deref(), Some("1234:1235"));
     assert_eq!(body.working_dir.as_deref(), Some("/"));
     assert_eq!(
-        body.cmd.as_deref(),
-        Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
+        body.labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_ISOLATION_BACKEND))
+            .map(String::as_str),
+        Some(LABEL_ISOLATION_BACKEND_OPEN_SHELL)
     );
-    assert!(body.env.unwrap().contains(&format!(
-        "{}=1234:1235",
-        openshell_core::sandbox_env::OCI_IMAGE_USER
-    )));
+    assert_eq!(
+        body.labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_ISOLATION_ROLE))
+            .map(String::as_str),
+        Some(LABEL_ISOLATION_ROLE_SANDBOX)
+    );
+    assert_eq!(
+        body.cmd.as_deref(),
+        Some(
+            &[
+                "--bootstrap".to_string(),
+                BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
+            ][..]
+        )
+    );
+    assert!(body.env.unwrap().iter().all(|entry| {
+        !entry.starts_with(&format!("{}=", openshell_core::sandbox_env::OCI_IMAGE_USER))
+    }));
+    let host = body.host_config.unwrap();
+    assert_eq!(host.cap_add, None);
+    assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
+    assert_eq!(host.group_add, Some(vec!["1236".to_string()]));
+    assert_eq!(
+        host.security_opt,
+        Some(vec!["no-new-privileges:true".to_string()])
+    );
+    assert_eq!(host.network_mode.as_deref(), Some("none"));
+    assert_eq!(host.dns, Some(vec!["127.0.0.53".to_string()]));
+}
+
+#[test]
+fn docker_outer_fence_accepts_network_none_without_attachments() {
+    let inspected = bollard::models::ContainerInspectResponse {
+        host_config: Some(HostConfig {
+            network_mode: Some("none".to_string()),
+            ..Default::default()
+        }),
+        network_settings: Some(bollard::models::NetworkSettings {
+            networks: Some(HashMap::from([(
+                "none".to_string(),
+                bollard::models::EndpointSettings::default(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(validate_docker_outer_fence(&inspected).is_ok());
+}
+
+#[test]
+fn docker_outer_fence_rejects_network_mode_or_attached_network_drift() {
+    let bridge_mode = bollard::models::ContainerInspectResponse {
+        host_config: Some(HostConfig {
+            network_mode: Some("bridge".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let attached_network = bollard::models::ContainerInspectResponse {
+        host_config: Some(HostConfig {
+            network_mode: Some("none".to_string()),
+            ..Default::default()
+        }),
+        network_settings: Some(bollard::models::NetworkSettings {
+            networks: Some(HashMap::from([(
+                "unexpected".to_string(),
+                bollard::models::EndpointSettings::default(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(validate_docker_outer_fence(&bridge_mode).is_err());
+    assert!(validate_docker_outer_fence(&attached_network).is_err());
+}
+
+#[test]
+fn sandbox_bundle_prepares_only_the_driver_managed_workspace() {
+    let identity = test_workload_identity();
+    let default_archive = docker_sandbox_bundle_archive(
+        b"sandbox-binary",
+        b"{}",
+        DockerSandboxTls {
+            certificate: b"server-cert",
+            private_key: b"server-key",
+        },
+        &identity,
+        driver_mounts::DEFAULT_WORKSPACE_ROOT,
+    )
+    .unwrap();
+    let mut archive = tar::Archive::new(default_archive.as_slice());
+    let sandbox_entry = archive
+        .entries()
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.path().unwrap().as_ref() == Path::new("sandbox"))
+        .expect("managed /sandbox entry");
+    assert!(sandbox_entry.header().entry_type().is_dir());
+    assert_eq!(sandbox_entry.header().mode().unwrap(), 0o700);
+    assert_eq!(
+        sandbox_entry.header().uid().unwrap(),
+        u64::from(identity.uid)
+    );
+    assert_eq!(
+        sandbox_entry.header().gid().unwrap(),
+        u64::from(identity.gid)
+    );
+
+    let image_archive = docker_sandbox_bundle_archive(
+        b"sandbox-binary",
+        b"{}",
+        DockerSandboxTls {
+            certificate: b"server-cert",
+            private_key: b"server-key",
+        },
+        &identity,
+        "/workspace/project",
+    )
+    .unwrap();
+    let mut archive = tar::Archive::new(image_archive.as_slice());
+    assert!(
+        archive
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .all(|entry| { entry.path().unwrap().as_ref() != Path::new("workspace/project") })
+    );
+}
+
+#[test]
+fn sandbox_bundle_stages_private_tls_server_material() {
+    let identity = test_workload_identity();
+    let archive = docker_sandbox_bundle_archive(
+        b"sandbox-binary",
+        b"{}",
+        DockerSandboxTls {
+            certificate: b"server-cert",
+            private_key: b"server-key",
+        },
+        &identity,
+        driver_mounts::DEFAULT_WORKSPACE_ROOT,
+    )
+    .unwrap();
+    let mut archive = tar::Archive::new(archive.as_slice());
+    let entries = archive
+        .entries()
+        .unwrap()
+        .map(Result::unwrap)
+        .filter_map(|entry| {
+            let path = entry.path().ok()?.into_owned();
+            Some((
+                path,
+                (
+                    entry.header().mode().ok()?,
+                    entry.header().uid().ok()?,
+                    entry.header().gid().ok()?,
+                ),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    for path in [
+        ".openshell/channel/sandbox/server.crt",
+        ".openshell/channel/sandbox/server.key",
+    ] {
+        assert_eq!(
+            entries.get(Path::new(path)),
+            Some(&(0o600, u64::from(identity.uid), u64::from(identity.gid)))
+        );
+    }
+    assert_eq!(
+        entries.get(Path::new(".openshell/runtime/openshell-sandbox")),
+        Some(&(0o555, 0, 0)),
+        "the trusted sandbox executable must not be writable by the workload"
+    );
+    assert_eq!(
+        entries.get(Path::new(".openshell/channel")),
+        Some(&(0o755, 0, 0)),
+        "the workload must not be able to replace the supervisor secret directory"
+    );
+    assert_eq!(
+        entries.get(Path::new(".openshell/channel/sandbox")),
+        Some(&(0o711, u64::from(identity.uid), u64::from(identity.gid))),
+        "the supervisor must be able to traverse to the authenticated socket without reading sandbox secrets"
+    );
+}
+
+#[test]
+fn docker_identity_resolution_uses_pinned_image_accounts_and_exact_groups() {
+    let sandbox = test_sandbox();
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: "agent".to_string(),
+        working_dir: "/sandbox".to_string(),
+        volumes: Vec::new(),
+    };
+    let resolved = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"root:x:0:0:root:/root:/bin/sh\nagent:x:10001:10002::/sandbox:/bin/sh\n",
+        b"root:x:0:\nagent:x:10002:\nrender:x:10003:agent\n",
+    )
+    .unwrap();
+
+    assert_eq!(resolved.uid, 10001);
+    assert_eq!(resolved.gid, 10002);
+    assert_eq!(resolved.supplementary_gids, vec![10003]);
+    assert_eq!(resolved.source, "image");
+    assert_eq!(resolved.resource_digest, "sha256:image");
+}
+
+#[test]
+fn docker_identity_resolution_honors_policy_selectors_and_rejects_root() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().workload_identity = Some(WorkloadIdentityRequest {
+        user: "10001".to_string(),
+        group: "workers".to_string(),
+    });
+    let image = DockerImageMetadata {
+        id: "sha256:image".to_string(),
+        user: String::new(),
+        working_dir: "/sandbox".to_string(),
+        volumes: Vec::new(),
+    };
+    let resolved = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"agent:x:10001:10002::/sandbox:/bin/sh\n",
+        b"workers:x:10004:agent\n",
+    )
+    .unwrap();
+    assert_eq!((resolved.uid, resolved.gid), (10001, 10004));
+    assert_eq!(resolved.source, "policy");
+
+    sandbox.spec.as_mut().unwrap().workload_identity = Some(WorkloadIdentityRequest {
+        user: "root".to_string(),
+        group: "root".to_string(),
+    });
+    let error = resolve_docker_identity_from_accounts(
+        &sandbox,
+        &image,
+        b"root:x:0:0:root:/root:/bin/sh\n",
+        b"root:x:0:\n",
+    )
+    .unwrap_err();
+    assert!(error.message().contains("UID or GID zero"));
 }
 
 #[test]
@@ -1549,6 +1655,7 @@ fn container_creation_rejects_invalid_oci_working_dir() {
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .unwrap_err();
 
@@ -1570,6 +1677,7 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .unwrap_err();
 
@@ -1593,6 +1701,7 @@ fn container_creation_rejects_image_volume_that_masks_working_dir() {
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .unwrap_err();
 
@@ -1601,29 +1710,6 @@ fn container_creation_rejects_image_volume_that_masks_working_dir() {
             .message()
             .contains("masks OCI WorkingDir '/workspace/project'")
     );
-}
-
-#[test]
-fn container_creation_rejects_image_volume_over_configured_ssh_socket() {
-    let metadata = DockerImageMetadata {
-        id: "sha256:immutable".to_string(),
-        user: "1234:1235".to_string(),
-        working_dir: "/workspace".to_string(),
-        volumes: vec!["/custom-runtime".to_string()],
-    };
-    let mut config = runtime_config();
-    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
-
-    let error = build_container_create_body_for_image(
-        &test_sandbox(),
-        &config,
-        &DockerSandboxDriverConfig::default(),
-        None,
-        &metadata,
-    )
-    .unwrap_err();
-
-    assert!(error.message().contains("OpenShell control path"));
 }
 
 #[test]
@@ -1644,6 +1730,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &root_mount,
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .unwrap_err();
     assert!(
@@ -1666,6 +1753,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &ancestor_mount,
         None,
         &nested_metadata,
+        &test_workload_identity(),
     )
     .unwrap_err();
     assert!(
@@ -1683,6 +1771,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &nested_mount,
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .expect("nested workspace mounts remain supported");
 
@@ -1697,84 +1786,15 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &compatibility_path_mount,
         None,
         &metadata,
+        &test_workload_identity(),
     )
     .expect("/sandbox remains mountable when the inspected workspace is elsewhere");
 }
 
 #[test]
-fn build_environment_keeps_path_driver_controlled() {
-    let mut sandbox = test_sandbox();
-    let spec = sandbox.spec.as_mut().unwrap();
-    spec.environment
-        .insert("PATH".to_string(), "/malicious/spec/bin".to_string());
-    spec.template
-        .as_mut()
-        .unwrap()
-        .environment
-        .insert("PATH".to_string(), "/malicious/template/bin".to_string());
-
-    let env = build_environment(&sandbox, &runtime_config());
-    let path_entries = env
-        .iter()
-        .filter(|entry| entry.starts_with("PATH="))
-        .collect::<Vec<_>>();
-
-    let expected_path = format!("PATH={SUPERVISOR_PATH}");
-    assert_eq!(path_entries.len(), 1);
-    assert_eq!(path_entries[0], &expected_path);
-}
-
-#[test]
-fn build_environment_keeps_telemetry_toggle_driver_controlled() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    temp_env::with_vars(
-        [(
-            openshell_core::sandbox_env::TELEMETRY_ENABLED,
-            Some("false"),
-        )],
-        || {
-            let mut sandbox = test_sandbox();
-            sandbox.spec.as_mut().unwrap().environment.insert(
-                openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
-                "true".to_string(),
-            );
-
-            let env = build_environment(&sandbox, &runtime_config());
-            let telemetry_entries = env
-                .iter()
-                .filter(|entry| {
-                    entry.starts_with(&format!(
-                        "{}=",
-                        openshell_core::sandbox_env::TELEMETRY_ENABLED
-                    ))
-                })
-                .collect::<Vec<_>>();
-
-            assert_eq!(telemetry_entries.len(), 1);
-            assert_eq!(
-                telemetry_entries[0],
-                &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
-            );
-        },
-    );
-}
-
-#[test]
-fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
-    let targets = binds
-        .iter()
-        .filter_map(|bind| bind.split(':').nth(1).map(String::from))
-        .collect::<Vec<_>>();
-    assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_CERT_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_KEY_MOUNT_PATH.to_string()));
-    assert!(
-        targets
-            .iter()
-            .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
-    );
+fn build_binds_does_not_expose_host_runtime_material() {
+    let binds = build_binds(&test_sandbox(), &runtime_config());
+    assert!(binds.is_empty());
 }
 
 #[test]
@@ -1807,7 +1827,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         .mounts
         .expect("driver config mounts should be set");
 
-    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts.len(), 3);
     assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
@@ -1821,6 +1841,9 @@ fn build_container_create_body_includes_driver_config_mounts() {
     );
     assert_eq!(mounts[1].typ, Some(MountTypeEnum::TMPFS));
     assert_eq!(mounts[1].target.as_deref(), Some("/sandbox/cache"));
+    assert_eq!(mounts[2].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[2].target.as_deref(), Some(BOUNDARY_MOUNT_PATH));
+    assert_eq!(mounts[2].read_only, Some(false));
     assert_eq!(
         mounts[1]
             .tmpfs_options
@@ -2247,36 +2270,6 @@ fn driver_config_rejects_reserved_mount_targets() {
 }
 
 #[test]
-fn driver_config_rejects_mount_over_configured_ssh_socket() {
-    let mount_config: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
-        "mounts": [{
-            "type": "tmpfs",
-            "target": "/custom-runtime"
-        }]
-    }))
-    .unwrap();
-    let metadata = DockerImageMetadata {
-        id: "sha256:immutable".to_string(),
-        user: "1234:1235".to_string(),
-        working_dir: "/workspace".to_string(),
-        volumes: Vec::new(),
-    };
-    let mut config = runtime_config();
-    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
-
-    let error = build_container_create_body_for_image(
-        &test_sandbox(),
-        &config,
-        &mount_config,
-        None,
-        &metadata,
-    )
-    .unwrap_err();
-
-    assert!(error.message().contains("OpenShell control path"));
-}
-
-#[test]
 fn docker_local_volume_with_bind_option_is_bind_backed() {
     let volume = inspected_volume(
         "local",
@@ -2329,72 +2322,6 @@ fn docker_nonlocal_volume_with_bind_option_is_not_bind_backed() {
 }
 
 #[test]
-fn build_environment_uses_token_file_without_raw_token_env() {
-    let mut sandbox = test_sandbox();
-    let spec = sandbox.spec.as_mut().unwrap();
-    spec.sandbox_token = "secret.jwt.value".to_string();
-    spec.environment.insert(
-        openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
-        "user-provided-token".to_string(),
-    );
-
-    let env = build_environment(&sandbox, &runtime_config());
-
-    assert!(!env.iter().any(|entry| {
-        entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
-    }));
-    assert!(env.contains(&format!(
-        "{}={SANDBOX_TOKEN_MOUNT_PATH}",
-        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
-    )));
-}
-
-#[test]
-fn docker_container_projects_proxy_and_spiffe_without_credential_metadata() {
-    let mut config = runtime_config();
-    config.upstream_proxy = UpstreamProxyConfig {
-        https_proxy: Some("https://proxy.example:8443".to_string()),
-        no_proxy: Some(".svc".to_string()),
-        proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
-        proxy_auth_allow_insecure: None,
-        proxy_connect_by_hostname: Some(true),
-    };
-    config.provider_spiffe_workload_api_socket = Some(PathBuf::from("/run/spire/agent.sock"));
-    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
-    let command = body.cmd.unwrap();
-    assert!(
-        command
-            .windows(2)
-            .any(|args| args == ["--upstream-proxy", "https://proxy.example:8443"])
-    );
-    assert!(
-        command
-            .windows(2)
-            .any(|args| args == ["--upstream-proxy-auth-file", UPSTREAM_PROXY_AUTH_MOUNT_PATH])
-    );
-    assert!(
-        command
-            .windows(2)
-            .any(|args| args == ["--upstream-no-proxy", ".svc"])
-    );
-    assert!(command.contains(&"--upstream-proxy-connect-by-hostname".to_string()));
-    let binds = body.host_config.unwrap().binds.unwrap();
-    assert!(
-        binds
-            .iter()
-            .any(|bind| bind.contains(UPSTREAM_PROXY_AUTH_MOUNT_PATH))
-    );
-    assert!(binds.contains(&format!(
-        "/run/spire:{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}:ro"
-    )));
-    assert!(binds.iter().all(|bind| !bind.contains("rbind")));
-    let env = body.env.unwrap();
-    assert!(env.iter().any(|entry| entry
-        == "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/spiffe-workload-api/agent.sock"));
-    assert!(!env.iter().any(|entry| entry.contains("proxy-auth")));
-}
-
-#[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
         managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
@@ -2402,20 +2329,26 @@ fn managed_container_label_filters_include_gateway_namespace() {
 
     assert!(labels.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")));
     assert!(labels.contains(&format!("{LABEL_SANDBOX_NAMESPACE}=tenant-a")));
+    assert!(labels.contains(&format!(
+        "{LABEL_ISOLATION_ROLE}={LABEL_ISOLATION_ROLE_SANDBOX}"
+    )));
     assert!(labels.contains(&format!("{LABEL_SANDBOX_ID}=sbx-123")));
 }
 
 #[test]
-fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
+fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
-        Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
+        Some(vec![SANDBOX_BINARY_PATH.to_string()])
     );
     assert_eq!(
         create_body.cmd,
-        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+        Some(vec![
+            "--bootstrap".to_string(),
+            BOUNDARY_CONFIG_MOUNT_PATH.to_string(),
+        ])
     );
     assert_eq!(
         create_body
@@ -2431,27 +2364,11 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     );
     assert_eq!(
         host_config.security_opt.as_ref(),
-        Some(&vec!["apparmor=unconfined".to_string()])
+        Some(&vec!["no-new-privileges:true".to_string()])
     );
-    assert_eq!(
-        host_config.network_mode.as_deref(),
-        Some(DEFAULT_DOCKER_NETWORK_NAME)
-    );
-    assert_eq!(
-        host_config.extra_hosts.as_ref(),
-        Some(&vec![
-            "host.docker.internal:172.18.0.1".to_string(),
-            "host.openshell.internal:172.18.0.1".to_string()
-        ])
-    );
-    assert_eq!(
-        create_body
-            .networking_config
-            .as_ref()
-            .and_then(|config| config.endpoints_config.as_ref())
-            .and_then(|endpoints| endpoints.get(DEFAULT_DOCKER_NETWORK_NAME)),
-        Some(&EndpointSettings::default())
-    );
+    assert_eq!(host_config.network_mode.as_deref(), Some("none"));
+    assert_eq!(host_config.extra_hosts, None);
+    assert!(create_body.networking_config.is_none());
 }
 
 #[test]
@@ -2626,24 +2543,22 @@ fn validate_sandbox_rejects_template_errors_before_device_config() {
 }
 
 #[test]
-fn validate_sandbox_auth_requires_gateway_token() {
+fn validate_sandbox_auth_requires_launch_authentication() {
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().sandbox_token.clear();
+    sandbox.spec.as_mut().unwrap().launch_authentication.clear();
 
     let err = DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         err.message(),
-        "docker sandboxes require gateway JWT auth; configure [openshell.gateway.gateway_jwt]"
+        "docker sandboxes require launch-scoped gateway authentication"
     );
 }
 
 #[test]
-fn validate_sandbox_auth_accepts_gateway_token() {
-    let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
-
+fn validate_sandbox_auth_accepts_launch_authentication() {
+    let sandbox = test_sandbox();
     DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
 }
 
@@ -2900,23 +2815,17 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
 }
 
 #[test]
-fn build_container_create_body_uses_bridge_network() {
+fn build_container_create_body_disables_docker_networking() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = create_body.host_config.expect("host_config is populated");
 
     assert_eq!(
         host_config.network_mode,
-        Some(DEFAULT_DOCKER_NETWORK_NAME.to_string()),
-        "sandbox should join the driver-managed bridge network"
+        Some("none".to_string()),
+        "the sandbox must not receive direct Docker networking"
     );
-    assert_eq!(
-        host_config.extra_hosts,
-        Some(vec![
-            "host.docker.internal:172.18.0.1".to_string(),
-            "host.openshell.internal:172.18.0.1".to_string()
-        ]),
-        "sandbox should expose stable host aliases for gateway callbacks"
-    );
+    assert_eq!(host_config.extra_hosts, None);
+    assert_eq!(host_config.dns, Some(vec!["127.0.0.53".to_string()]));
 }
 
 #[test]
@@ -2925,10 +2834,10 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     // runtime config, not from `DriverSandbox.namespace`. The gateway
     // does not populate `DriverSandbox.namespace`, so a container created
     // with that empty value would not match subsequent list/get/find
-    // queries (which filter on `config.sandbox_label`), leaking
+    // queries (which filter on `config.sandbox_namespace`), leaking
     // sandboxes that the driver itself cannot observe.
     let mut config = runtime_config();
-    config.sandbox_label = "tenant-a".to_string();
+    config.sandbox_namespace = "tenant-a".to_string();
     let mut sandbox = test_sandbox();
     sandbox.namespace = "ignored-by-driver".to_string();
 
@@ -3109,17 +3018,8 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(snapshot.name, "demo");
     assert_eq!(snapshot.namespace, "docker-dev");
     assert!(snapshot.spec.is_none());
-    let pending = pending_map(&[&snapshot]);
-    assert_eq!(
-        resolve_pending_id(&pending, "sbx-123", "")
-            .unwrap()
-            .as_deref(),
-        Some("sbx-123")
-    );
-    assert_eq!(
-        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
-        Some("sbx-123")
-    );
+    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
+    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
 
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
@@ -3129,16 +3029,6 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "Starting");
     assert_eq!(status.conditions[0].message, "Docker container is starting");
-}
-
-#[test]
-fn validate_linux_elf_binary_rejects_non_elf_files() {
-    let tempdir = TempDir::new().unwrap();
-    let path = tempdir.path().join("openshell-sandbox");
-    fs::write(&path, b"not-elf").unwrap();
-
-    let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -3154,22 +3044,6 @@ fn docker_guest_tls_paths_require_all_files_for_https() {
     })
     .unwrap_err();
     assert!(err.to_string().contains("guest_tls_cert"));
-}
-
-#[test]
-fn linux_supervisor_candidates_follow_daemon_arch() {
-    assert_eq!(
-        linux_supervisor_candidates("amd64"),
-        vec![PathBuf::from(
-            "target/x86_64-unknown-linux-gnu/release/openshell-sandbox",
-        )]
-    );
-    assert_eq!(
-        linux_supervisor_candidates("arm64"),
-        vec![PathBuf::from(
-            "target/aarch64-unknown-linux-gnu/release/openshell-sandbox",
-        )]
-    );
 }
 
 #[test]
@@ -3259,67 +3133,11 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
 }
 
 #[test]
-fn docker_automatic_tls_detection_is_fail_closed_for_partial_bundles() {
-    for mask in 0_u8..8 {
-        let config = DockerComputeConfig {
-            guest_tls_ca: (mask & 1 != 0).then(|| PathBuf::from("/tmp/ca.pem")),
-            guest_tls_cert: (mask & 2 != 0).then(|| PathBuf::from("/tmp/cert.pem")),
-            guest_tls_key: (mask & 4 != 0).then(|| PathBuf::from("/tmp/key.pem")),
-            ..Default::default()
-        };
-        assert_eq!(
-            docker_guest_tls_configured(&config),
-            mask != 0,
-            "TLS presence mask {mask:03b}"
-        );
-
-        if mask != 0 && mask != 7 {
-            let mut inferred = config;
-            inferred.grpc_endpoint = "https://host.openshell.internal:8080".to_string();
-            assert!(
-                docker_guest_tls_paths(&inferred).is_err(),
-                "partial TLS presence mask {mask:03b} must fail"
-            );
-        }
-    }
-}
-
-#[test]
 fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
     let image = openshell_core::config::default_supervisor_image();
     assert!(
         image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
         "unexpected default image reference: {image}",
-    );
-}
-
-#[test]
-fn configured_supervisor_image_takes_precedence_over_local_binaries() {
-    let tempdir = TempDir::new().unwrap();
-    let bin_dir = tempdir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    let current_exe = bin_dir.join("openshell-gateway");
-    let sibling = bin_dir.join("openshell-sandbox");
-    fs::write(&current_exe, b"gateway").unwrap();
-    fs::write(&sibling, b"\x7fELFsibling").unwrap();
-
-    let local_build = tempdir.path().join("target/openshell-sandbox");
-    fs::create_dir_all(local_build.parent().unwrap()).unwrap();
-    fs::write(&local_build, b"\x7fELFlocal").unwrap();
-
-    let source = resolve_supervisor_bin_source(
-        &DockerComputeConfig {
-            supervisor_image: Some("example.com/openshell/supervisor:test".to_string()),
-            ..Default::default()
-        },
-        Some(&current_exe),
-        &[local_build],
-    )
-    .unwrap();
-
-    assert_eq!(
-        source,
-        SupervisorBinSource::Image("example.com/openshell/supervisor:test".to_string())
     );
 }
 
@@ -3365,63 +3183,6 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
     assert!(!supervisor_image_should_refresh(
         "ghcr.io/nvidia/openshell/supervisor@sha256:abc123"
     ));
-}
-
-#[test]
-fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
-    let base = PathBuf::from("/var/cache/share");
-    let path = supervisor_cache_path_with_base(
-        &base,
-        "docker-supervisor",
-        "sha256:abc123deadbeef0123456789cafe0123456789fe",
-    );
-
-    assert_eq!(
-        path,
-        PathBuf::from(
-            "/var/cache/share/openshell/docker-supervisor/sha256-abc123deadbeef0123456789cafe0123456789fe/openshell-sandbox",
-        ),
-    );
-}
-
-#[test]
-fn supervisor_cache_path_isolates_different_digests() {
-    let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
-    assert_ne!(
-        left.parent().unwrap(),
-        right.parent().unwrap(),
-        "digest-keyed directories must differ so rollouts are isolated",
-    );
-}
-
-#[test]
-fn write_cache_binary_atomic_materializes_file_with_executable_mode() {
-    let tempdir = TempDir::new().unwrap();
-    let target = tempdir.path().join("nested").join("openshell-sandbox");
-    fs::create_dir_all(target.parent().unwrap()).unwrap();
-
-    write_cache_binary_atomic(&target, b"\x7fELFpayload").unwrap();
-
-    assert!(target.is_file());
-    assert_eq!(fs::read(&target).unwrap(), b"\x7fELFpayload");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "expected 0755, got {mode:04o}");
-    }
-}
-
-#[test]
-fn write_cache_binary_atomic_overwrites_existing_file() {
-    let tempdir = TempDir::new().unwrap();
-    let target = tempdir.path().join("openshell-sandbox");
-    fs::write(&target, b"stale").unwrap();
-
-    write_cache_binary_atomic(&target, b"\x7fELFfresh").unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"\x7fELFfresh");
 }
 
 #[test]
@@ -3496,6 +3257,13 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
     fences.finish_start("sandbox-1");
     assert!(!fences.start_in_progress("sandbox-1"));
 
+    fences.request_stop("sandbox-1", "demo");
+    assert!(fences.stop_requested("sandbox-1", ""));
+    assert!(fences.stop_requested("", "demo"));
+    fences.clear_stop("sandbox-1", "demo");
+    assert!(!fences.stop_requested("sandbox-1", "demo"));
+    fences.request_stop("sandbox-1", "demo");
+
     fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
     assert_eq!(
         fences.previous_exit("sandbox-1").as_deref(),
@@ -3530,8 +3298,10 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
         Some(&new_exit),
     ));
 
-    fences.remove("sandbox-1");
+    fences.remove("sandbox-1", "demo");
     assert!(fences.previous_exit("sandbox-1").is_none());
+    assert!(!fences.stop_requested("sandbox-1", ""));
+    assert!(!fences.stop_requested("", "demo"));
 }
 
 fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
@@ -3565,15 +3335,6 @@ fn ready_reason(sandbox: &DriverSandbox) -> &str {
         .as_ref()
         .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
         .map(|c| c.reason.as_str())
-        .expect("Ready condition present")
-}
-
-fn ready_message(sandbox: &DriverSandbox) -> &str {
-    sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
-        .map(|c| c.message.as_str())
         .expect("Ready condition present")
 }
 
@@ -3615,24 +3376,6 @@ fn docker_ordinary_exit_stays_terminal() {
 }
 
 #[test]
-fn docker_workspace_validation_exit_is_reported_explicitly() {
-    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
-    let state = ContainerState {
-        status: Some(ContainerStateStatusEnum::EXITED),
-        exit_code: Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
-        ..Default::default()
-    };
-
-    apply_docker_exit_classification(&mut sandbox, &state);
-
-    assert_eq!(
-        ready_reason(&sandbox),
-        CONDITION_WORKSPACE_VALIDATION_FAILED
-    );
-    assert!(ready_message(&sandbox).contains("WorkingDir"));
-}
-
-#[test]
 fn docker_oom_kill_stays_terminal_despite_137() {
     // An OOM kill reports exit 137 but must NOT be treated as a recoverable
     // restart — it is a genuine failure and stays terminal.
@@ -3647,406 +3390,17 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
 }
 
-/// Minimal pending-map entry. Only the identity fields matter for lookup
-/// resolution, so the spec and status are left empty on purpose.
-fn pending_sandbox(id: &str, name: &str, workspace: &str) -> DriverSandbox {
-    DriverSandbox {
-        id: id.to_string(),
-        name: name.to_string(),
-        namespace: String::new(),
-        spec: None,
-        status: None,
-        workspace: workspace.to_string(),
-    }
-}
-
-fn pending_map(sandboxes: &[&DriverSandbox]) -> HashMap<String, PendingSandboxRecord> {
-    sandboxes
-        .iter()
-        .map(|sandbox| {
-            (
-                sandbox.id.clone(),
-                PendingSandboxRecord {
-                    sandbox: (*sandbox).clone(),
-                    task: None,
-                },
-            )
-        })
-        .collect()
-}
-
-async fn driver_with_pending(sandboxes: &[&DriverSandbox]) -> DockerComputeDriver {
-    let driver = test_driver_with_config(runtime_config());
-    for sandbox in sandboxes {
-        driver
-            .reserve_pending_sandbox(sandbox)
-            .await
-            .expect("reserving a distinct sandbox must succeed");
-    }
-    driver
-}
-
-fn pending_ids(pending: &HashMap<String, DriverSandbox>) -> Vec<String> {
-    let mut ids: Vec<String> = pending.keys().cloned().collect();
-    ids.sort();
-    ids
-}
-
 #[test]
-fn resolve_pending_id_prefers_sandbox_id_over_sandbox_name() {
-    // The id is authoritative. A stale or mismatched name travelling in the
-    // same request must not change which record is resolved.
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let pending = pending_map(&[&alpha]);
+fn concurrent_container_removal_is_idempotent() {
+    let removing = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "removal of container abc123 is already in progress".to_string(),
+    };
+    let other_conflict = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "container abc123 is running".to_string(),
+    };
 
-    assert_eq!(
-        resolve_pending_id(&pending, "sbx-alpha", "stale-name")
-            .unwrap()
-            .as_deref(),
-        Some("sbx-alpha")
-    );
-}
-
-#[test]
-fn resolve_pending_id_ignores_the_name_when_the_id_is_not_pending() {
-    // Regression for the `id OR name` match. `demo` exists in two workspaces:
-    // the beta copy is still provisioning, the alpha copy is already running.
-    // Deleting the alpha copy sends alpha's id plus the shared name. Matching
-    // on the name alone resolved to the beta record and evicted it, aborting
-    // an unrelated sandbox's provisioning task.
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let pending = pending_map(&[&beta]);
-
-    assert_eq!(
-        resolve_pending_id(&pending, "sbx-alpha", "demo").unwrap(),
-        None
-    );
-}
-
-#[test]
-fn resolve_pending_id_falls_back_to_the_name_when_no_id_is_supplied() {
-    // Direct driver callers may omit the id; a unique name still resolves.
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let pending = pending_map(&[&alpha]);
-
-    assert_eq!(
-        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
-        Some("sbx-alpha")
-    );
-}
-
-#[test]
-fn resolve_pending_id_rejects_an_ambiguous_name_only_lookup() {
-    // Two pending sandboxes share a name across workspaces and the driver
-    // request carries no workspace. Picking either one would make the outcome
-    // depend on `HashMap` iteration order, so refuse instead.
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let pending = pending_map(&[&alpha, &beta]);
-
-    let err = resolve_pending_id(&pending, "", "demo")
-        .expect_err("an ambiguous name-only lookup must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-}
-
-#[test]
-fn resolve_pending_id_returns_none_without_any_identifier() {
-    // `require_sandbox_identifier` rejects this upstream, but the resolver
-    // stays total so an empty request can never match an arbitrary record.
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let pending = pending_map(&[&alpha]);
-
-    assert_eq!(resolve_pending_id(&pending, "", "").unwrap(), None);
-}
-
-#[tokio::test]
-async fn remove_pending_sandbox_by_id_keeps_a_same_named_sandbox_in_another_workspace() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let driver = driver_with_pending(&[&alpha, &beta]).await;
-
-    let removed = driver
-        .remove_pending_sandbox("sbx-alpha", "demo")
-        .await
-        .expect("an id-scoped removal must succeed")
-        .expect("the alpha record must be removed");
-
-    assert_eq!(removed.sandbox.id, "sbx-alpha");
-    assert_eq!(
-        pending_ids(&driver.pending_snapshot_map().await),
-        ["sbx-beta"]
-    );
-}
-
-#[tokio::test]
-async fn remove_pending_sandbox_by_a_unique_name_still_removes_the_record() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let driver = driver_with_pending(&[&alpha]).await;
-
-    let removed = driver
-        .remove_pending_sandbox("", "demo")
-        .await
-        .expect("a unique name-only removal must succeed")
-        .expect("the alpha record must be removed");
-
-    assert_eq!(removed.sandbox.id, "sbx-alpha");
-    assert!(driver.pending_snapshot_map().await.is_empty());
-}
-
-#[tokio::test]
-async fn remove_pending_sandbox_rejects_an_ambiguous_name_and_keeps_both_records() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let driver = driver_with_pending(&[&alpha, &beta]).await;
-
-    let err = driver
-        .remove_pending_sandbox("", "demo")
-        .await
-        .map(|record| record.map(|record| record.sandbox.id))
-        .expect_err("an ambiguous name-only removal must be rejected");
-
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        pending_ids(&driver.pending_snapshot_map().await),
-        ["sbx-alpha", "sbx-beta"]
-    );
-}
-
-#[tokio::test]
-async fn pending_snapshot_by_id_ignores_a_same_named_sandbox_in_another_workspace() {
-    // `GetSandbox` falls through to the pending map when no container exists.
-    // Resolving by name there leaked another workspace's snapshot.
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let driver = driver_with_pending(&[&beta]).await;
-
-    assert!(
-        driver
-            .pending_snapshot("sbx-alpha", "demo")
-            .await
-            .expect("an id-scoped snapshot lookup must succeed")
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn pending_snapshot_rejects_an_ambiguous_name_only_lookup() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let driver = driver_with_pending(&[&alpha, &beta]).await;
-
-    let err = driver
-        .pending_snapshot("", "demo")
-        .await
-        .expect_err("an ambiguous name-only snapshot lookup must be rejected");
-
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-}
-
-#[tokio::test]
-async fn reserve_pending_sandbox_allows_the_same_name_in_a_different_workspace() {
-    // Sandbox names are unique per workspace, so this is a legitimate create.
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let beta = pending_sandbox("sbx-beta", "demo", "beta");
-    let driver = driver_with_pending(&[&alpha]).await;
-
-    driver
-        .reserve_pending_sandbox(&beta)
-        .await
-        .expect("a same-named sandbox in another workspace must be allowed");
-
-    assert_eq!(
-        pending_ids(&driver.pending_snapshot_map().await),
-        ["sbx-alpha", "sbx-beta"]
-    );
-}
-
-#[tokio::test]
-async fn reserve_pending_sandbox_rejects_a_duplicate_name_in_the_same_workspace() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let duplicate = pending_sandbox("sbx-other", "demo", "alpha");
-    let driver = driver_with_pending(&[&alpha]).await;
-
-    let err = driver
-        .reserve_pending_sandbox(&duplicate)
-        .await
-        .expect_err("a duplicate name within one workspace must be rejected");
-
-    assert_eq!(err.code(), tonic::Code::AlreadyExists);
-    assert_eq!(
-        pending_ids(&driver.pending_snapshot_map().await),
-        ["sbx-alpha"]
-    );
-}
-
-#[tokio::test]
-async fn reserve_pending_sandbox_rejects_a_duplicate_id() {
-    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
-    let duplicate = pending_sandbox("sbx-alpha", "other-name", "beta");
-    let driver = driver_with_pending(&[&alpha]).await;
-
-    let err = driver
-        .reserve_pending_sandbox(&duplicate)
-        .await
-        .expect_err("a duplicate sandbox id must be rejected regardless of workspace");
-
-    assert_eq!(err.code(), tonic::Code::AlreadyExists);
-    assert_eq!(
-        pending_ids(&driver.pending_snapshot_map().await),
-        ["sbx-alpha"]
-    );
-}
-
-fn managed_container_labels(
-    namespace: &str,
-    sandbox_id: &str,
-    sandbox_name: &str,
-) -> HashMap<String, String> {
-    HashMap::from([
-        (
-            LABEL_MANAGED_BY.to_string(),
-            LABEL_MANAGED_BY_VALUE.to_string(),
-        ),
-        (LABEL_SANDBOX_NAMESPACE.to_string(), namespace.to_string()),
-        (LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string()),
-        (LABEL_SANDBOX_NAME.to_string(), sandbox_name.to_string()),
-    ])
-}
-
-#[test]
-fn managed_container_identity_matches_on_id_despite_a_stale_name() {
-    // Requiring the name to agree with an authoritative id dropped the match
-    // and made the driver report a live sandbox as absent, stranding the
-    // container and leaking its token file.
-    let labels = managed_container_labels("default", "sbx-alpha", "demo");
-
-    assert!(managed_container_identity_matches(
-        &labels,
-        "default",
-        "sbx-alpha",
-        "stale-name"
-    ));
-}
-
-#[test]
-fn managed_container_identity_rejects_a_name_match_when_the_id_differs() {
-    // The mirror of the pending-map fix: a shared name must not stand in for
-    // an id that explicitly disagrees.
-    let labels = managed_container_labels("default", "sbx-beta", "demo");
-
-    assert!(!managed_container_identity_matches(
-        &labels,
-        "default",
-        "sbx-alpha",
-        "demo"
-    ));
-}
-
-#[test]
-fn managed_container_identity_falls_back_to_the_name_without_an_id() {
-    let labels = managed_container_labels("default", "sbx-alpha", "demo");
-
-    assert!(managed_container_identity_matches(
-        &labels, "default", "", "demo"
-    ));
-    assert!(!managed_container_identity_matches(
-        &labels, "default", "", "other"
-    ));
-}
-
-#[test]
-fn managed_container_identity_matches_nothing_without_an_identifier() {
-    // The label filters degenerate to "every managed container in the
-    // namespace" when neither identifier is supplied, so the predicate must
-    // not wave the container through.
-    let labels = managed_container_labels("default", "sbx-alpha", "demo");
-
-    assert!(!managed_container_identity_matches(
-        &labels, "default", "", ""
-    ));
-}
-
-#[test]
-fn managed_container_identity_requires_the_configured_namespace() {
-    let labels = managed_container_labels("other-namespace", "sbx-alpha", "demo");
-
-    assert!(!managed_container_identity_matches(
-        &labels,
-        "default",
-        "sbx-alpha",
-        "demo"
-    ));
-}
-
-#[tokio::test]
-async fn delete_sandbox_reclaims_token_file_when_container_and_pending_are_gone() {
-    let state_dir = tempfile::tempdir().unwrap();
-    let (endpoint, server) = fake_docker_with_no_containers().await;
-
-    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
-        let config = runtime_config();
-        let mut driver = test_driver_with_config(config.clone());
-        driver.docker = Arc::new(
-            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
-        );
-
-        // Arrange the leak: token on disk, container gone, `pending` empty.
-        let token = openshell_core::driver_utils::sandbox_token_path(
-            "docker-sandbox-tokens",
-            Some(&config.sandbox_label),
-            "sandbox-1",
-        )
-        .unwrap();
-
-        fs::create_dir_all(token.parent().unwrap()).unwrap();
-        fs::write(&token, "jwt\n").unwrap();
-
-        let deleted = driver.delete_sandbox_inner("sandbox-1", "").await.unwrap();
-        assert!(!deleted, "nothing was removed, must not claim a deletion");
-        assert!(!token.exists(), "token file must be reclaimed");
-    })
-    .await;
-
-    server.abort();
-}
-
-#[tokio::test]
-async fn delete_sandbox_by_name_only_leaves_the_namespace_directory_alone() {
-    // `DeleteSandbox` accepts a name without an id. With no id there is no
-    // token path to derive, so the cleanup must be a no-op: deriving a path
-    // from an empty id yields `<namespace>/sandbox.jwt`, whose parent is the
-    // shared namespace directory.
-    let state_dir = tempfile::tempdir().unwrap();
-    let (endpoint, server) = fake_docker_with_no_containers().await;
-
-    temp_env::async_with_vars([("XDG_STATE_HOME", Some(state_dir.path()))], async {
-        let config = runtime_config();
-        let mut driver = test_driver_with_config(config.clone());
-        driver.docker = Arc::new(
-            Docker::connect_with_http(&endpoint, 5, bollard::API_DEFAULT_VERSION).unwrap(),
-        );
-
-        let namespace_dir = openshell_core::driver_utils::sandbox_token_path(
-            "docker-sandbox-tokens",
-            Some(&config.sandbox_label),
-            "sandbox-1",
-        )
-        .unwrap()
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .to_path_buf();
-        fs::create_dir_all(&namespace_dir).unwrap();
-
-        let deleted = driver.delete_sandbox_inner("", "sandbox-1").await.unwrap();
-
-        assert!(!deleted, "nothing was removed, must not claim a deletion");
-        assert!(
-            namespace_dir.is_dir(),
-            "namespace directory must survive a name-only delete: {}",
-            namespace_dir.display()
-        );
-    })
-    .await;
-
-    server.abort();
+    assert!(is_removal_in_progress_error(&removing));
+    assert!(!is_removal_in_progress_error(&other_conflict));
 }
