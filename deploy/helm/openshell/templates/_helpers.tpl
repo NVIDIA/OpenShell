@@ -91,6 +91,25 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSandboxRuntimeRepository" -}}
+ghcr.io/nvidia/openshell/sandbox
+{{- end }}
+
+{{/* Whether Helm must propagate a sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/* Sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImage" -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default (include "openshell.defaultSandboxRuntimeRepository" .) -}}
+{{- $tag := .Values.sandboxRuntime.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
 {{/* Official supervisor repository used by the gateway's built-in default. */}}
 {{- define "openshell.defaultSupervisorRepository" -}}
 ghcr.io/nvidia/openshell/supervisor
@@ -194,25 +213,6 @@ the in-cluster Service DNS, release namespace, service port, and disableTls
 flag — so the default value works for any release name or namespace without
 override.
 */}}
-{{/*
-Supervisor sideload method. When supervisor.sideloadMethod is set, use it
-verbatim. Otherwise auto-detect from the cluster version: the ImageVolume
-feature gate is enabled by default starting in K8s v1.35 (GA in v1.36).
-Clusters on v1.33-v1.34 can opt in by setting sideloadMethod explicitly
-after enabling the feature gate.
-*/}}
-{{- define "openshell.supervisorSideloadMethod" -}}
-{{- if .Values.supervisor.sideloadMethod -}}
-{{- .Values.supervisor.sideloadMethod -}}
-{{- else -}}
-{{- if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version -}}
-image-volume
-{{- else -}}
-init-container
-{{- end -}}
-{{- end -}}
-{{- end }}
-
 {{- define "openshell.grpcEndpoint" -}}
 {{- if .Values.server.grpcEndpoint -}}
 {{- .Values.server.grpcEndpoint -}}
