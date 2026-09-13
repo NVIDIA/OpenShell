@@ -94,7 +94,7 @@ future version. To migrate an existing file:
    omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
    of 2048, and omit Podman `health_check_interval_secs` to disable health
    checks. Explicit zero values are invalid.
-7. Remove local Docker, Podman, or VM `grpc_endpoint` when the topology-derived
+7. Remove local Docker, Podman, or VM `grpc_endpoint` when the driver-derived
    callback is correct, or retain it as an explicit override. Kubernetes raw
    TOML requires an explicit endpoint; Helm derives one from the release's
    gateway Service. New VM root filesystems use an image-provided `sandbox`
@@ -546,13 +546,13 @@ image_pull_secrets             = ["regcred"]
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
-# Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
-# on older clusters or where the ImageVolume feature gate is off.
-supervisor_sideload_method     = "image-volume"
-# "combined" runs the existing single supervisor container with full process,
-# filesystem, and network enforcement in the agent container. "sidecar" moves
-# pod-level network enforcement and gateway session handling into a network sidecar.
-topology                       = "combined"
+[openshell.drivers.kubernetes.sandbox_runtime]
+# Set this only after verifying that the cluster CNI enforces both ingress and
+# egress NetworkPolicy in every sandbox namespace.
+network_policy_enforced       = true
+boundary_port                 = 5500
+
+[openshell.drivers.kubernetes]
 # Optional corporate HTTP forward proxy for policy-approved TLS egress. The
 # sandbox workload cannot select or override these settings. Only http:// proxy
 # endpoints and TLS CONNECT traffic are supported; plain HTTP egress remains
@@ -570,9 +570,7 @@ topology                       = "combined"
 # Secret prevents that Pod from starting; unreadable or malformed `user:pass`
 # content is validated fail-closed by the supervisor at startup and never
 # falls back to direct egress.
-# Proxy credential Secrets require `topology = "sidecar"`. Combined topology
-# shares its credential mount with the workload and can make it readable by the
-# sandbox group through Kubernetes `fsGroup` volume permission handling.
+# Proxy credentials mount only in the separately scheduled supervisor Pod.
 # Required with a credential Secret: Basic authentication to an http:// proxy
 # is cleartext on the connection to that proxy.
 # proxy_auth_allow_insecure    = true
@@ -587,7 +585,6 @@ ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
-app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
 # Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
 # field, using the cluster's default StorageClass. Set this on clusters with no
@@ -622,19 +619,12 @@ enabled = true
 gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
-[openshell.drivers.kubernetes.sidecar]
-# UID used by relaxed long-running network sidecars. Strict process/binary-aware
-# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
-# capabilities into the effective set. In sidecar topology the network init
-# container installs nftables rules that exempt the effective sidecar UID, so
-# this dedicated infrastructure UID must remain at least 1000 and must not
-# match the sandbox workload UID.
-proxy_uid                      = 1337
-# Keep process/binary-aware network policy enabled in sidecar topology. Set
-# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
-# inspection capabilities, and enforce endpoint/L7 policy without matching
-# policy.binaries.
-process_binary_aware_network_policy = true
+[openshell.drivers.kubernetes.sandbox_runtime]
+# Required acknowledgement that the cluster CNI enforces NetworkPolicy and the
+# sandbox namespaces prevent untrusted policy, pod, label, and Secret changes.
+network_policy_enforced = true
+# TLS-protected boundary listener reached only by the paired control pod.
+boundary_port = 5500
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named
@@ -709,7 +699,7 @@ image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
 # Optional override. When omitted, the gateway derives
-# https://host.openshell.internal:<gateway-port> for this topology.
+# https://host.openshell.internal:<gateway-port> for this driver.
 grpc_endpoint      = "https://host.openshell.internal:17670"
 # The workload runtime and supervisor companion use separate images. Both
 # default to the gateway version; override either to pin a specific build.
@@ -917,7 +907,7 @@ state_dir        = "/var/lib/openshell/vm"
 driver_dir       = "/usr/local/libexec/openshell"
 default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Optional override. When omitted, the gateway derives
-# https://host.openshell.internal:<gateway-port> for the VM topology.
+# https://host.openshell.internal:<gateway-port> for the VM driver.
 grpc_endpoint    = "https://host.openshell.internal:17670"
 # Empty falls back to default_image.
 bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

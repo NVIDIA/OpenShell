@@ -396,7 +396,7 @@ CA material, and the other sandbox half of the authenticated channel.
 
 For Kubernetes, the operator configures a Secret name and key rather than a
 gateway-host file path. Kubernetes projects that Secret only into the separate
-supervisor Deployment. The sandbox Pod never mounts corporate-proxy credentials
+supervisor Pod. The sandbox Pod never mounts corporate-proxy credentials
 or the interception CA private key.
 
 The Basic header travels over the plain-TCP connection to the `http://` proxy,

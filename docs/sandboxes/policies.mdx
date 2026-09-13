@@ -90,7 +90,7 @@ to forward conversation text. Malformed placeholder candidates and candidates
 longer than 4096 wire bytes are denied. Authentication headers and HTTP trailers
 retain their credential restrictions.
 
-In the separate sandbox/supervisor topology, the supervisor mediates DNS by
+When `openshell-sandbox` and the supervisor run separately, the supervisor mediates DNS by
 hostname. DNS sender identity is unavailable because native socket writes can
 come from a process that inherited the socket or replaced its executable.
 Resolving a name does not authorize a connection: the supervisor still checks

@@ -12,7 +12,6 @@ pub const OPT_ROOT: &str = "/opt/openshell";
 pub const ETC_ROOT: &str = "/etc/openshell";
 pub const TLS_ROOT: &str = "/etc/openshell-tls";
 pub const RUN_ROOT: &str = "/run/openshell";
-pub const SIDECAR_RUN_ROOT: &str = "/run/openshell-sidecar";
 pub const NETNS_MOUNT_ROOT: &str = "/run/netns";
 pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
 
@@ -34,7 +33,6 @@ pub const CONTROL_ROOTS: &[&str] = &[
     ETC_ROOT,
     TLS_ROOT,
     RUN_ROOT,
-    SIDECAR_RUN_ROOT,
     NETNS_MOUNT_ROOT,
     // The supervisor currently uses the conventional iproute2 spelling.
     NETNS_IPROUTE2_ROOT,
@@ -52,9 +50,6 @@ pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
 pub const POLICY_ADVISOR_SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 
 pub const SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
-pub const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
-pub const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
-pub const SIDECAR_CLIENT_TLS_DIR: &str = "/etc/openshell-tls/proxy/client";
 pub const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
 pub const SUPERVISOR_CA_CERT_PATH: &str = "/etc/openshell-tls/openshell-ca.pem";
 pub const SUPERVISOR_CA_BUNDLE_PATH: &str = "/etc/openshell-tls/ca-bundle.pem";
@@ -92,9 +87,6 @@ mod tests {
             CONTAINER_POLICY_PATH,
             POLICY_ADVISOR_SKILL_PATH,
             SSH_SOCKET_PATH,
-            SIDECAR_CONTROL_SOCKET,
-            SIDECAR_TLS_DIR,
-            SIDECAR_CLIENT_TLS_DIR,
             CLIENT_TLS_DIR,
             SUPERVISOR_CA_CERT_PATH,
             SUPERVISOR_CA_BUNDLE_PATH,

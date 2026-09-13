@@ -406,16 +406,10 @@ jobs:
         include:
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
-            topology: combined
-            extra_helm_values: ""
+            extra_helm_values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
-            topology: combined
-            extra_helm_values: ""
-          - agent_sandbox_api: v1beta1
-            agent_sandbox_version: v0.5.0
-            topology: sidecar
-            extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
+            extra_helm_values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
     permissions:
       actions: read
       contents: read
@@ -423,7 +417,7 @@ jobs:
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (Rust smoke, ${{ matrix.topology }}, Agent Sandbox ${{ matrix.agent_sandbox_api }})
+      job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       extra-helm-values: ${{ matrix.extra_helm_values }}
       conformance-artifact-prefix: openshell-conformance
@@ -440,6 +434,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
+      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-external-driver-e2e:
@@ -456,7 +451,8 @@ jobs:
       e2e-task: e2e:kubernetes:external-driver
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-kubernetes
-      cluster-images: supervisor
+      cluster-images: sandbox supervisor
+      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-operator-e2e:
@@ -471,6 +467,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
+      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-ha-e2e:

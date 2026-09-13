@@ -258,9 +258,34 @@ cleanup() {
        && kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
       echo "=== gateway pod state (preserved for debugging) ==="
       kctl -n "${NAMESPACE}" get pods -o wide 2>&1 || true
+      echo "=== Agent Sandbox resources ==="
+      kctl -n "${NAMESPACE}" get sandboxes.agents.x-k8s.io -o yaml 2>&1 || true
+      echo "=== gateway sandbox records ==="
+      "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
+        sandbox list --all-workspaces --output json 2>&1 || true
+      echo "=== sandbox-runtime supervisor Pods ==="
+      kctl -n "${NAMESPACE}" get pods \
+        -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
+      echo "=== sandbox-runtime supervisor logs (last 200 lines each) ==="
+      while IFS= read -r supervisor_pod; do
+        [ -n "${supervisor_pod}" ] || continue
+        echo "--- ${supervisor_pod} ---"
+        kctl -n "${NAMESPACE}" logs "${supervisor_pod}" \
+          --all-containers --prefix --tail=200 2>&1 || true
+        echo "--- ${supervisor_pod} (previous containers) ---"
+        kctl -n "${NAMESPACE}" logs "${supervisor_pod}" --previous \
+          --all-containers --prefix --tail=200 2>&1 || true
+      done < <(kctl -n "${NAMESPACE}" get pods \
+        -l "openshell.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
       echo "=== gateway events ==="
       kctl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 \
         | tail -n 80 || true
+      echo "=== gateway lifecycle and supervisor-session logs ==="
+      kctl -n "${NAMESPACE}" logs "$(kube_workload_ref "${RELEASE_NAME}")" \
+        --since=20m \
+        --all-containers --prefix 2>&1 \
+        | grep -Ei "sandbox phase changed|start_sandbox|stop_sandbox|supervisor session|sandbox-runtime|bootstrap" \
+        || true
       echo "=== gateway logs (last 200 lines) ==="
       kctl -n "${NAMESPACE}" logs \
         -l "app.kubernetes.io/instance=${RELEASE_NAME}" --tail=200 \
@@ -417,6 +442,8 @@ run_scenario() {
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
+    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_post_renderer_args[@]}" \
@@ -824,6 +851,8 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
   fi
   supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
@@ -837,6 +866,7 @@ fi
 if [ -n "${import_cluster_name}" ]; then
   for image in \
     "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+    "${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
     "${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"; do
     if docker image inspect "${image}" >/dev/null 2>&1; then
       echo "Importing ${image} into k3d cluster ${import_cluster_name}..."
@@ -848,7 +878,10 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
    && [[ "${KUBE_CONTEXT}" == kind-* ]] \
    && command -v kind >/dev/null 2>&1; then
   kind_cluster_name="${KUBE_CONTEXT#kind-}"
-  kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  kind_images=(
+    "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}"
+    "${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}"
+  )
   # The CI workflow loads its published supervisor archive before invoking this
   # wrapper. Only load a supervisor image here when this script rebuilt it.
   if [ "${reuse_supervisor_image}" != "1" ]; then
@@ -1038,6 +1071,8 @@ else
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
+    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
