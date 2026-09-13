@@ -809,6 +809,7 @@ impl VmDriver {
         tls_paths: Option<&VmDriverTlsPaths>,
         runtime_descriptor: &SandboxRuntimeDescriptor,
         auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
+        sandbox_owner: SandboxOwnerIdentity,
     ) -> Result<Child, Status> {
         let supervisor_binary = self.host_supervisor_binary().await?;
         let (openshell_endpoint, gateway_tls_server_name) =
@@ -847,8 +848,6 @@ impl VmDriver {
             sandbox.spec.as_ref(),
         )
         .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
-        let sandbox_user_id = self.config.resolve_sandbox_uid();
-        let primary_group_id = self.config.resolve_sandbox_gid(sandbox_user_id);
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
@@ -893,11 +892,11 @@ impl VmDriver {
             )
             .env(
                 openshell_core::sandbox_env::SANDBOX_UID,
-                sandbox_user_id.to_string(),
+                sandbox_owner.uid.to_string(),
             )
             .env(
                 openshell_core::sandbox_env::SANDBOX_GID,
-                primary_group_id.to_string(),
+                sandbox_owner.gid.to_string(),
             )
             .env(openshell_core::sandbox_env::OCI_IMAGE_USER, "")
             .env(
@@ -1429,7 +1428,6 @@ impl VmDriver {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let sandbox_user_id = self.config.resolve_sandbox_uid();
         let provisioning = VmBoundarySpec {
             boundary_id: sandbox.id.clone(),
             generation: boundary_generation.clone(),
@@ -1441,8 +1439,8 @@ impl VmDriver {
             supervisor_tls,
             sandbox_tls: guest_boundary_tls_paths(&boundary_generation),
             control_port: VM_CONTROL_PORT,
-            agent_uid: sandbox_user_id,
-            agent_gid: self.config.resolve_sandbox_gid(sandbox_user_id),
+            agent_uid: sandbox_owner_state.uid,
+            agent_gid: sandbox_owner_state.gid,
             child_env: merged_environment(&sandbox),
         }
         .provision()
@@ -1553,6 +1551,7 @@ impl VmDriver {
                 tls_paths.as_ref(),
                 &runtime_descriptor,
                 &launch_authentication.supervisor,
+                sandbox_owner_state,
             )
             .await
         {
