@@ -3171,8 +3171,14 @@ mod tests {
     fn runtime_ca_paths_are_added_to_the_effective_read_only_policy() {
         let mut policy = policy_with_process(ProcessPolicy::default());
         policy.filesystem.read_only = vec![PathBuf::from("/usr")];
-        let certificate = PathBuf::from("/run/openshell-proxy-ca/ca.crt");
-        let bundle = PathBuf::from("/run/openshell-proxy-ca/ca-bundle.crt");
+        let certificate = PathBuf::from(format!(
+            "{}/ca.crt",
+            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR
+        ));
+        let bundle = PathBuf::from(format!(
+            "{}/ca-bundle.crt",
+            openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR
+        ));
 
         let effective = policy_with_runtime_read_only(
             &policy,
@@ -3192,7 +3198,7 @@ mod tests {
     fn runtime_ca_material_remains_readable_after_landlock_for_non_root_workload() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let ca_directory = root.path().join("openshell-proxy-ca");
+        let ca_directory = root.path().join("openshell-supervisor-ca");
         std::fs::create_dir(&ca_directory).unwrap();
         std::fs::set_permissions(&ca_directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let certificate = ca_directory.join("ca.crt");
