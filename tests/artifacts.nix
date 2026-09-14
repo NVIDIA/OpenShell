@@ -15,8 +15,78 @@ let
   toolchainEnv = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (
     builtins.attrValues toolchains
   );
+
+  mkTestArchive = {
+    name,
+    workspacePath,
+    manifestPath,
+    package,
+    target,
+    output,
+  }:
+    pkgs.writeShellApplication {
+      name = "build-${name}-test-archive";
+      runtimeInputs = [
+        pkgs.cargo-nextest
+        pkgs.coreutils
+        pkgs.findutils
+        pkgs.git
+        pkgs.gnutar
+        rustToolchain
+      ];
+      runtimeEnv = toolchainEnv;
+      text = ''
+        root=$(git rev-parse --show-toplevel)
+        manifest_path="$root/${manifestPath}"
+        workspace_root="$root/${workspacePath}"
+        output="$root/${output}"
+        bundle_dir=$(mktemp -d -p /tmp openshell-test-bundle.XXXXXX)
+        cleanup() {
+          status=$?
+          trap - EXIT
+          rm -rf -- "$bundle_dir"
+          exit "$status"
+        }
+        trap cleanup EXIT
+
+        mkdir -p "$(dirname "$output")"
+        cd "$root"
+        cargo nextest archive \
+          --manifest-path "$manifest_path" \
+          --target ${target} \
+          -p ${package} \
+          -E 'kind(test)' \
+          --archive-file "$bundle_dir/tests.tar.zst"
+
+        cd "$workspace_root"
+        bundle_files=()
+        while IFS= read -r -d "" manifest; do
+          relative_path="''${manifest#./}"
+          install -D -m 0644 "$relative_path" "$bundle_dir/$relative_path"
+          bundle_files+=("$relative_path")
+        done < <(
+          find . \
+            \( -path ./.git -o -path ./.worktrees -o -path ./target \) -prune -o \
+            -type f -name Cargo.toml -print0
+        )
+
+        tar -C "$bundle_dir" -cf "$output" "''${bundle_files[@]}" tests.tar.zst
+        echo "Created nextest test bundle: $output"
+      '';
+    };
+
+  conformanceCliArchive = mkTestArchive {
+    name = "openshell-conformance";
+    workspacePath = "tests/suites/conformance";
+    manifestPath = "tests/suites/conformance/Cargo.toml";
+    package = "openshell-test-conformance-cli";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
+  };
 in
 rec {
+  inherit conformanceCliArchive;
+
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
     runtimeInputs = [
@@ -30,7 +100,6 @@ rec {
 
       cargo build --target ${muslToolchain.target} \
         -p openshell-cli \
-        -p openshell-conformance-cli \
         -p openshell-sandbox
 
       cargo build --target ${gnuToolchain.target} \
@@ -117,11 +186,13 @@ rec {
     name = "build-artifacts";
     runtimeInputs = [
       binaries
+      conformanceCliArchive
       images
       helm
     ];
     text = ''
       build-artifacts-binaries
+      build-openshell-conformance-test-archive
       build-artifacts-images
       build-artifacts-helm
     '';
