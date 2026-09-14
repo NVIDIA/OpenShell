@@ -1075,6 +1075,13 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                         .await?;
+                    // Rootless Podman can only join another container's user
+                    // namespace after that container has started and owns a
+                    // live namespace. openshell-sandbox keeps the agent
+                    // stopped until the authenticated supervisor confirms the
+                    // boundary, so starting it here does not release workload
+                    // execution before enforcement is established.
+                    self.client.start_container(&workload_id).await?;
                     specs.supervisor.join_user_namespace(&workload_id);
                     let supervisor_id = self
                         .client
@@ -1084,10 +1091,8 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&supervisor_id, "/", archives.supervisor)
                         .await?;
-                    // Both resources and private files exist before either
-                    // container can run. Only the trusted sandbox starts here;
-                    // authenticated confirmation gates subsequent agent exec.
-                    self.client.start_container(&workload_id).await?;
+                    // The trusted sandbox is already waiting for this
+                    // authenticated supervisor; confirmation gates agent exec.
                     self.client.start_container(&supervisor_id).await?;
                     Ok::<(), ComputeDriverError>(())
                 }
@@ -3276,7 +3281,10 @@ mod tests {
             name: name.to_string(),
             namespace: String::new(),
             workspace: String::new(),
-            spec: None,
+            spec: Some(DriverSandboxSpec {
+                launch_authentication: encoded_launch_authentication(),
+                ..Default::default()
+            }),
             status: None,
         }
     }
@@ -3490,9 +3498,9 @@ mod tests {
             fence_response(),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             created_response("supervisor"),
             StubResponse::new(StatusCode::OK, ""), // supervisor archive
-            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
         ]
     }
