@@ -13,15 +13,17 @@ use openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
 use openshell_core::{Error, NetworkSupervisorTrustBundle, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 use crate::config_file::SupervisorNetworkFileSection;
 
 pub const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_cert_paths";
 const ARTIFACT_DIRECTORY: &str = "network-supervisor";
-const ARTIFACT_FILE: &str = "additional-ca.crt";
+const ARTIFACT_FILE_PREFIX: &str = "additional-ca-";
+const ARTIFACT_FILE_SUFFIX: &str = ".crt";
+const ARTIFACT_TEMP_FILE_PREFIX: &str = ".additional-ca-";
+const ARTIFACT_TEMP_FILE_SUFFIX: &str = ".tmp";
 
 /// Normalized source material that has not yet been staged as a state artifact.
 ///
@@ -171,7 +173,7 @@ fn stage_normalized_in(
     normalized: NormalizedNetworkSupervisorTrust,
     state_dir: &Path,
 ) -> Result<NetworkSupervisorTrustBundle> {
-    let artifact_path = stage_artifact(state_dir, &normalized.normalized_pem)?;
+    let artifact_path = stage_artifact(state_dir, &normalized.normalized_pem, &normalized.digest)?;
     Ok(NetworkSupervisorTrustBundle::new(
         normalized.normalized_pem,
         normalized.certificate_count,
@@ -297,51 +299,142 @@ fn pem_label<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     .then_some(label)
 }
 
-fn stage_artifact(state_dir: &Path, normalized: &[u8]) -> Result<PathBuf> {
+fn stage_artifact(state_dir: &Path, normalized: &[u8], digest: &str) -> Result<PathBuf> {
     let artifact_dir = state_dir.join(ARTIFACT_DIRECTORY);
-    fs::create_dir_all(&artifact_dir).map_err(|error| {
-        Error::config(format!(
-            "failed to create network supervisor trust artifact directory '{}': {error}",
-            artifact_dir.display()
-        ))
-    })?;
-    set_artifact_directory_permissions(&artifact_dir)?;
+    ensure_artifact_directory(&artifact_dir)?;
 
-    let artifact_path = artifact_dir.join(ARTIFACT_FILE);
-    let mut temporary = NamedTempFile::new_in(&artifact_dir).map_err(|error| {
-        Error::config(format!(
-            "failed to create network supervisor trust artifact near '{}': {error}",
-            artifact_path.display()
-        ))
-    })?;
+    let artifact_path = artifact_dir.join(artifact_file_name(digest)?);
+    let temporary_path = stage_temporary_artifact(&artifact_dir, normalized)?;
+
+    // Both names are in `artifact_dir`, so hard_link is a same-filesystem,
+    // no-replace publication operation. Unlike rename/persist, it cannot
+    // overwrite an existing generation.
+    let published_new_artifact = match fs::hard_link(&temporary_path, &artifact_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // A concurrent gateway may have published this generation first.
+            // Reuse it only after the ordinary no-follow, exact-byte, regular
+            // file, and read-only verification succeeds.
+            verify_existing_artifact(&artifact_path, normalized, digest)?;
+            false
+        }
+        Err(error) => {
+            return Err(Error::config(format!(
+                "failed to atomically publish network supervisor trust artifact '{}': {error}",
+                artifact_path.display()
+            )));
+        }
+    };
+
+    // TempPath provides cleanup on every earlier return path. Drop it before
+    // syncing a new publication so the directory sync makes both the final
+    // name and removal of this process's temporary name durable where the
+    // platform supports directory syncs.
+    drop(temporary_path);
+    if published_new_artifact {
+        sync_artifact_directory(&artifact_dir)?;
+    }
+
+    // Generations are deliberately never removed or overwritten here. A
+    // running Docker or Podman sandbox can still be bind-mounting an older
+    // generation while a later gateway startup stages this one.
+    Ok(artifact_path)
+}
+
+/// Write a completed, read-only artifact to a private sibling temporary file.
+///
+/// `TempPath` retains ownership after its file handle is closed, so it removes
+/// the temporary name if publishing or validating a race winner returns an
+/// error.
+fn stage_temporary_artifact(artifact_dir: &Path, normalized: &[u8]) -> Result<tempfile::TempPath> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(ARTIFACT_TEMP_FILE_PREFIX)
+        .suffix(ARTIFACT_TEMP_FILE_SUFFIX)
+        .tempfile_in(artifact_dir)
+        .map_err(|error| {
+            Error::config(format!(
+                "failed to create network supervisor trust temporary artifact in '{}': {error}",
+                artifact_dir.display()
+            ))
+        })?;
+    let temporary_path = temporary.path().to_path_buf();
+
     temporary.write_all(normalized).map_err(|error| {
         Error::config(format!(
-            "failed to write network supervisor trust artifact '{}': {error}",
-            artifact_path.display()
+            "failed to write network supervisor trust temporary artifact '{}': {error}",
+            temporary_path.display()
         ))
     })?;
+    set_artifact_file_permissions(temporary.as_file(), &temporary_path)?;
     temporary.as_file().sync_all().map_err(|error| {
         Error::config(format!(
-            "failed to flush network supervisor trust artifact '{}': {error}",
-            artifact_path.display()
+            "failed to flush network supervisor trust temporary artifact '{}': {error}",
+            temporary_path.display()
         ))
     })?;
-    set_artifact_file_permissions(temporary.path())?;
-    temporary.persist(&artifact_path).map_err(|error| {
+
+    // into_temp_path drops the open File before returning while preserving
+    // TempPath's RAII removal behavior for the sibling temporary name.
+    Ok(temporary.into_temp_path())
+}
+
+fn artifact_file_name(digest: &str) -> Result<String> {
+    let hex = digest.strip_prefix("sha256:").filter(|hex| {
+        hex.len() == Sha256::output_size() * 2 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    let Some(hex) = hex else {
+        return Err(Error::config(
+            "failed to derive network supervisor trust artifact name from its digest",
+        ));
+    };
+    Ok(format!("{ARTIFACT_FILE_PREFIX}{hex}{ARTIFACT_FILE_SUFFIX}"))
+}
+
+fn ensure_artifact_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| {
         Error::config(format!(
-            "failed to install network supervisor trust artifact '{}': {}",
-            artifact_path.display(),
-            error.error
+            "failed to create network supervisor trust artifact directory '{}': {error}",
+            path.display()
         ))
     })?;
-    Ok(artifact_path)
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::config(format!(
+            "failed to inspect network supervisor trust artifact directory '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::config(format!(
+            "network supervisor trust artifact directory '{}' is not a directory",
+            path.display()
+        )));
+    }
+    set_artifact_directory_permissions(path)
+}
+
+fn verify_existing_artifact(path: &Path, normalized: &[u8], digest: &str) -> Result<()> {
+    NetworkSupervisorTrustBundle::new(normalized.to_vec(), 0, digest, path.to_path_buf())
+        .verify_artifact()
+        .map_err(|error| {
+            Error::config(format!(
+                "existing network supervisor trust artifact '{}' cannot be reused: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|error| {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
             Error::config(format!(
                 "failed to set permissions on network supervisor trust directory '{}': {error}",
                 path.display()
@@ -353,16 +446,37 @@ fn set_artifact_directory_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_artifact_file_permissions(path: &Path) -> Result<()> {
+fn set_artifact_file_permissions(file: &fs::File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(|error| {
-            Error::config(format!(
-                "failed to set permissions on network supervisor trust artifact '{}': {error}",
-                path.display()
-            ))
-        })?;
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o444))
+            .map_err(|error| {
+                Error::config(format!(
+                    "failed to set permissions on network supervisor trust temporary artifact '{}': {error}",
+                    path.display()
+                ))
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
+/// Durably record a successful hard-link publication on platforms that permit
+/// syncing directories. This follows the same `File::open(...).sync_all()`
+/// pattern used for other atomic state writes in the repository.
+fn sync_artifact_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                Error::config(format!(
+                    "failed to sync network supervisor trust artifact directory '{}': {error}",
+                    path.display()
+                ))
+            })?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -394,6 +508,41 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, contents).expect("write source fixture");
         path
+    }
+
+    fn staged_artifact_path(state_dir: &Path, digest: &str) -> PathBuf {
+        state_dir
+            .join(ARTIFACT_DIRECTORY)
+            .join(artifact_file_name(digest).expect("artifact file name"))
+    }
+
+    fn normalized_from_source(source: PathBuf) -> NormalizedNetworkSupervisorTrust {
+        normalize_sources(&[source])
+            .expect("normalize source")
+            .expect("configured source")
+    }
+
+    fn digest_for(contents: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(contents))
+    }
+
+    fn assert_no_artifact_temporary_names(state_dir: &Path) {
+        let artifact_dir = state_dir.join(ARTIFACT_DIRECTORY);
+        let temporary_names: Vec<_> = fs::read_dir(&artifact_dir)
+            .expect("read artifact directory")
+            .map(|entry| entry.expect("read artifact directory entry").file_name())
+            .filter(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with(ARTIFACT_TEMP_FILE_PREFIX)
+                        && name.ends_with(ARTIFACT_TEMP_FILE_SUFFIX)
+                })
+            })
+            .collect();
+        assert!(
+            temporary_names.is_empty(),
+            "temporary artifacts remained in '{}': {temporary_names:?}",
+            artifact_dir.display()
+        );
     }
 
     fn assert_rejected(path: &Path, state_dir: &Path, expected: &str) {
@@ -436,16 +585,422 @@ mod tests {
             fs::read(bundle.artifact_path()).expect("artifact"),
             bundle.pem()
         );
+        let digest_hex = bundle
+            .digest()
+            .strip_prefix("sha256:")
+            .expect("digest prefix");
+        assert_eq!(digest_hex.len(), Sha256::output_size() * 2);
         assert_eq!(
             bundle.artifact_path(),
             state_dir
                 .path()
                 .join(ARTIFACT_DIRECTORY)
-                .join(ARTIFACT_FILE)
+                .join(format!("additional-ca-{digest_hex}.crt"))
         );
         let debug = format!("{bundle:?}");
         assert!(!debug.contains(&first));
         assert!(!debug.contains(&second));
+    }
+
+    #[test]
+    fn same_generation_reuses_the_content_addressed_artifact() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("same-generation.example"),
+        );
+
+        let first = normalize_and_stage(std::slice::from_ref(&source), state_dir.path())
+            .expect("first stage")
+            .expect("configured bundle");
+        let second = normalize_and_stage(&[source], state_dir.path())
+            .expect("second stage")
+            .expect("configured bundle");
+
+        assert_eq!(first.digest(), second.digest());
+        assert_eq!(first.artifact_path(), second.artifact_path());
+        assert_eq!(
+            fs::read(second.artifact_path()).expect("artifact"),
+            second.pem()
+        );
+    }
+
+    #[test]
+    fn successful_publication_removes_its_temporary_artifact() {
+        let state_dir = tempdir().expect("state dir");
+        let normalized = b"canonical normalized CA bytes\n";
+        let digest = digest_for(normalized);
+
+        let artifact_path = stage_artifact(state_dir.path(), normalized, &digest)
+            .expect("publish a new artifact generation");
+
+        assert_eq!(
+            artifact_path,
+            staged_artifact_path(state_dir.path(), &digest)
+        );
+        assert_eq!(fs::read(&artifact_path).expect("artifact"), normalized);
+        verify_existing_artifact(&artifact_path, normalized, &digest)
+            .expect("new artifact satisfies reuse validation");
+        assert_no_artifact_temporary_names(state_dir.path());
+    }
+
+    #[test]
+    fn existing_race_winner_is_validated_and_removes_its_temporary_artifact() {
+        let state_dir = tempdir().expect("state dir");
+        let normalized = b"canonical normalized CA bytes\n";
+        let digest = digest_for(normalized);
+
+        let first_path =
+            stage_artifact(state_dir.path(), normalized, &digest).expect("publish the race winner");
+        let reused_path = stage_artifact(state_dir.path(), normalized, &digest)
+            .expect("validate and reuse existing race winner");
+
+        assert_eq!(reused_path, first_path);
+        assert_eq!(fs::read(&reused_path).expect("artifact"), normalized);
+        assert_no_artifact_temporary_names(state_dir.path());
+    }
+
+    #[test]
+    fn concurrent_same_generation_publication_returns_one_exact_artifact() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const CONTENDERS: usize = 12;
+
+        let state_dir = tempdir().expect("state dir");
+        let normalized = Arc::new(b"canonical normalized CA bytes\n".to_vec());
+        let digest = Arc::new(digest_for(&normalized));
+        let expected_path = staged_artifact_path(state_dir.path(), &digest);
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        // Spawn every contender before joining: each thread waits on the same
+        // barrier, so joining while constructing this list would deadlock.
+        let mut contenders = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            let state_dir = state_dir.path().to_path_buf();
+            let normalized = Arc::clone(&normalized);
+            let digest = Arc::clone(&digest);
+            let barrier = Arc::clone(&barrier);
+            contenders.push(thread::spawn(move || {
+                barrier.wait();
+                stage_artifact(&state_dir, normalized.as_slice(), digest.as_str())
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
+        let paths: Vec<_> = contenders
+            .into_iter()
+            .map(|contender| {
+                contender
+                    .join()
+                    .expect("publication contender must not panic")
+                    .expect("each contender must publish or validate the same generation")
+            })
+            .collect();
+        assert!(
+            paths.iter().all(|path| path == &expected_path),
+            "all contenders must return the same artifact path: {paths:?}"
+        );
+        assert_eq!(
+            fs::read(&expected_path).expect("artifact"),
+            normalized.as_slice()
+        );
+        verify_existing_artifact(&expected_path, normalized.as_slice(), &digest)
+            .expect("concurrent publication leaves a valid artifact");
+        assert_no_artifact_temporary_names(state_dir.path());
+    }
+
+    #[test]
+    fn failed_existing_generation_validation_cleans_its_temporary_artifact() {
+        let state_dir = tempdir().expect("state dir");
+        let normalized = b"canonical normalized CA bytes\n";
+        let digest = digest_for(normalized);
+        let artifact_path = staged_artifact_path(state_dir.path(), &digest);
+        ensure_artifact_directory(artifact_path.parent().expect("artifact directory"))
+            .expect("create artifact directory");
+        let replacement = b"different CA bytes that must not be disclosed\n";
+        fs::write(&artifact_path, replacement).expect("write invalid existing generation");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o444))
+                .expect("make invalid generation read-only");
+        }
+
+        let error = stage_artifact(state_dir.path(), normalized, &digest)
+            .expect_err("a wrong existing generation must fail closed");
+
+        assert!(error.to_string().contains("does not match"));
+        assert!(!error.to_string().contains("different CA bytes"));
+        assert_eq!(fs::read(&artifact_path).expect("artifact"), replacement);
+        assert_no_artifact_temporary_names(state_dir.path());
+    }
+
+    #[test]
+    fn staging_does_not_remove_preexisting_temporary_names() {
+        let state_dir = tempdir().expect("state dir");
+        let artifact_dir = state_dir.path().join(ARTIFACT_DIRECTORY);
+        ensure_artifact_directory(&artifact_dir).expect("create artifact directory");
+        let stale_temporary = artifact_dir.join(".additional-ca-stale.tmp");
+        fs::write(&stale_temporary, b"stale temporary bytes").expect("write stale temporary");
+        let normalized = b"canonical normalized CA bytes\n";
+        let digest = digest_for(normalized);
+
+        stage_artifact(state_dir.path(), normalized, &digest).expect("publish artifact");
+
+        assert_eq!(
+            fs::read(&stale_temporary).expect("stale temporary"),
+            b"stale temporary bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directory_sync_reports_a_missing_directory() {
+        let state_dir = tempdir().expect("state dir");
+        let missing = state_dir.path().join("missing-artifact-directory");
+
+        let error = sync_artifact_directory(&missing)
+            .expect_err("syncing a missing artifact directory must fail");
+
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn different_generations_have_distinct_content_addressed_artifacts() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let first_source = write_source(
+            source_dir.path(),
+            "first.pem",
+            certificate_pem("first-generation.example"),
+        );
+        let second_source = write_source(
+            source_dir.path(),
+            "second.pem",
+            certificate_pem("second-generation.example"),
+        );
+
+        let first = normalize_and_stage(&[first_source], state_dir.path())
+            .expect("first stage")
+            .expect("configured bundle");
+        let second = normalize_and_stage(&[second_source], state_dir.path())
+            .expect("second stage")
+            .expect("configured bundle");
+
+        assert_ne!(first.digest(), second.digest());
+        assert_ne!(first.artifact_path(), second.artifact_path());
+        assert!(first.artifact_path().is_file());
+        assert!(second.artifact_path().is_file());
+    }
+
+    #[test]
+    fn fixed_legacy_artifact_path_is_not_consumed() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let legacy_dir = state_dir.path().join(ARTIFACT_DIRECTORY);
+        fs::create_dir(&legacy_dir).expect("legacy artifact directory");
+        let legacy_path = legacy_dir.join("additional-ca.crt");
+        let legacy_contents = b"legacy artifact must remain untouched";
+        fs::write(&legacy_path, legacy_contents).expect("legacy artifact");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("legacy-path.example"),
+        );
+
+        let bundle = normalize_and_stage(&[source], state_dir.path())
+            .expect("stage")
+            .expect("configured bundle");
+
+        assert_ne!(bundle.artifact_path(), legacy_path);
+        assert_eq!(
+            fs::read(&legacy_path).expect("legacy artifact"),
+            legacy_contents
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_artifact_and_its_directory_have_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("permissions.example"),
+        );
+        let bundle = normalize_and_stage(&[source], state_dir.path())
+            .expect("stage")
+            .expect("configured bundle");
+
+        assert_eq!(
+            fs::metadata(state_dir.path().join(ARTIFACT_DIRECTORY))
+                .expect("artifact directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(bundle.artifact_path())
+                .expect("artifact")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_preexisting_symlink_generation_without_changing_it() {
+        use std::os::unix::fs::symlink;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("symlink-generation.example"),
+        );
+        let normalized = normalized_from_source(source);
+        let artifact_path = staged_artifact_path(state_dir.path(), normalized.digest());
+        fs::create_dir(artifact_path.parent().expect("artifact parent")).expect("artifact dir");
+        let target = state_dir.path().join("symlink-target");
+        let target_contents = b"symlink target bytes must not leak";
+        fs::write(&target, target_contents).expect("target");
+        symlink(&target, &artifact_path).expect("artifact symlink");
+
+        let error = stage_normalized_in(normalized, state_dir.path())
+            .expect_err("symlink generation must be rejected");
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(!error.to_string().contains("symlink target bytes"));
+        assert!(
+            fs::symlink_metadata(&artifact_path)
+                .expect("artifact link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).expect("target"), target_contents);
+    }
+
+    #[test]
+    fn rejects_preexisting_directory_generation_without_changing_it() {
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("directory-generation.example"),
+        );
+        let normalized = normalized_from_source(source);
+        let artifact_path = staged_artifact_path(state_dir.path(), normalized.digest());
+        fs::create_dir_all(&artifact_path).expect("artifact directory");
+
+        let error = stage_normalized_in(normalized, state_dir.path())
+            .expect_err("directory generation must be rejected");
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(
+            fs::metadata(&artifact_path)
+                .expect("artifact directory")
+                .is_dir()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_preexisting_wrong_generation_bytes_without_changing_or_disclosing_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("wrong-bytes-generation.example"),
+        );
+        let normalized = normalized_from_source(source);
+        let artifact_path = staged_artifact_path(state_dir.path(), normalized.digest());
+        fs::create_dir(artifact_path.parent().expect("artifact parent")).expect("artifact dir");
+        let replacement = b"replacement CA bytes must not leak";
+        fs::write(&artifact_path, replacement).expect("replacement artifact");
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o444))
+            .expect("read-only replacement");
+
+        let error = stage_normalized_in(normalized, state_dir.path())
+            .expect_err("wrong generation bytes must be rejected");
+        assert!(error.to_string().contains("does not match"));
+        assert!(!error.to_string().contains("replacement CA bytes"));
+        assert_eq!(fs::read(&artifact_path).expect("artifact"), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_preexisting_oversized_generation_without_changing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("oversized-generation.example"),
+        );
+        let normalized = normalized_from_source(source);
+        let artifact_path = staged_artifact_path(state_dir.path(), normalized.digest());
+        fs::create_dir(artifact_path.parent().expect("artifact parent")).expect("artifact dir");
+        let oversized = vec![b'x'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES + 1];
+        fs::write(&artifact_path, &oversized).expect("oversized artifact");
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o444))
+            .expect("read-only permissions");
+
+        let error = stage_normalized_in(normalized, state_dir.path())
+            .expect_err("oversized generation must be rejected");
+        assert!(error.to_string().contains("exceeds the shared"));
+        assert!(!error.to_string().contains(&"x".repeat(64)));
+        assert_eq!(
+            fs::metadata(&artifact_path).expect("artifact").len(),
+            oversized.len() as u64
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_preexisting_writable_generation_without_changing_or_disclosing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_dir = tempdir().expect("source dir");
+        let state_dir = tempdir().expect("state dir");
+        let source = write_source(
+            source_dir.path(),
+            "bundle.pem",
+            certificate_pem("writable-generation.example"),
+        );
+        let normalized = normalized_from_source(source);
+        let artifact_path = staged_artifact_path(state_dir.path(), normalized.digest());
+        fs::create_dir(artifact_path.parent().expect("artifact parent")).expect("artifact dir");
+        let expected_bytes = normalized.normalized_pem.clone();
+        fs::write(&artifact_path, &expected_bytes).expect("writable artifact");
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o644))
+            .expect("writable permissions");
+
+        let error = stage_normalized_in(normalized, state_dir.path())
+            .expect_err("writable generation must be rejected");
+        assert!(error.to_string().contains("required read-only permissions"));
+        assert!(!error.to_string().contains("BEGIN CERTIFICATE"));
+        assert_eq!(fs::read(&artifact_path).expect("artifact"), expected_bytes);
+        assert_eq!(
+            fs::metadata(&artifact_path)
+                .expect("artifact")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
     }
 
     #[test]
