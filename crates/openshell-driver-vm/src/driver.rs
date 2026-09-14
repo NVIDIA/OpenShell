@@ -1482,8 +1482,12 @@ impl VmDriver {
             .collect::<Result<Vec<_>, _>>()?;
         let provisioning = VmBoundarySpec {
             boundary_id: sandbox.id.clone(),
-            generation: boundary_generation.clone(),
+            generation: launch_authentication
+                .supervisor
+                .runtime_generation
+                .to_string(),
             session_id,
+            session_rotation: launch_authentication.supervisor.session_rotation,
             gateway_id: launch_authentication.gateway_id.clone(),
             verification_keys,
             image_identity,
@@ -8602,6 +8606,13 @@ mod tests {
         let authentication = SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id,
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .expect("runtime generation"),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                predecessor_session_id: None,
                 gateway_token: SecretJwt::parse(format!("gateway-{label}")).expect("gateway token"),
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
