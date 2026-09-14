@@ -53,13 +53,14 @@ tests:
       certManager.enabled: true
       certManager.clientCaFromServerTlsSecret: false
       pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: openshell-ca-tls
     asserts:
       - equal:
           path: spec.template.spec.volumes[3].name
           value: tls-client-ca
       - equal:
           path: spec.template.spec.volumes[3].secret.secretName
-          value: openshell-server-client-ca
+          value: openshell-ca-tls
       - notExists:
           path: spec.template.spec.volumes[3].secret.items
 

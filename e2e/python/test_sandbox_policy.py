@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING
 
+import grpc
 import pytest
 
 from openshell._proto import datamodel_pb2, sandbox_pb2
@@ -117,6 +119,7 @@ def _proxy_connect_then_http():
                 import os
 
                 ctx = ssl.create_default_context()
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                 ca_file = os.environ.get("SSL_CERT_FILE")
                 if ca_file:
                     ctx.load_verify_locations(ca_file)
@@ -319,7 +322,11 @@ def _proxy_connect_then_http_with_server():
                     {"connect_status": connect_resp.strip(), "http_status": 0}
                 )
 
-            request = f"{method} {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+            request = (
+                f"{method} {path} HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                "Connection: close\r\n\r\n"
+            )
             conn.sendall(request.encode())
 
             data = b""
@@ -629,7 +636,9 @@ def test_l4_log_fields(
 
         # Verify OCSF shorthand fields in allow line
         assert "ALLOWED" in log, "Expected ALLOWED in OCSF shorthand"
-        assert "api.anthropic.com" in log, "Expected destination host in log"
+        assert re.search(
+            r"(?:^|\s)dst_endpoint=api\.anthropic\.com:443(?:\s|$)", log, re.MULTILINE
+        ), "Expected destination host in log"
         assert "engine:opa" in log, "Expected engine:opa in log context"
 
         # Verify deny line exists
@@ -1956,8 +1965,8 @@ def test_overlapping_policies_with_conflicting_destination_metadata_are_rejected
     """OVL-1: Conflicting metadata on the same host:port fails closed.
 
     One endpoint permits any resolved address while the other constrains
-    ``allowed_ips``. The complete candidate is ambiguous and must not activate
-    either entry.
+    ``allowed_ips``. The complete candidate is ambiguous and must be rejected
+    before the sandbox is provisioned.
     """
     policy = _base_policy(
         network_policies={
@@ -1985,16 +1994,16 @@ def test_overlapping_policies_with_conflicting_destination_metadata_are_rejected
         },
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
-    with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(
-            _forward_proxy_with_server(),
-            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
-        )
-        assert result.exit_code == 0, result.stderr
-        assert "403" in result.stdout, (
-            "Conflicting overlapping policies should fail closed; "
-            f"expected 403, got: {result.stdout}"
-        )
+    with (
+        pytest.raises(grpc.RpcError) as exc_info,
+        sandbox(spec=spec, delete_on_exit=True),
+    ):
+        pytest.fail("ambiguous policy unexpectedly created a sandbox")
+
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    details = exc_info.value.details() or ""
+    assert "network endpoint ambiguity validation failed" in details
+    assert "allowed_ips" in details
 
 
 def test_overlapping_policies_l7_connect_does_not_crash(

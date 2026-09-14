@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Docker E2E Test
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        required: true
+        type: string
+      runner:
+        required: false
+        type: string
+        default: linux-amd64-cpu8
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+      gateway-artifact:
+        required: false
+        type: string
+        default: ""
+      external-driver-binary:
+        required: false
+        type: string
+        default: ""
+      suite-matrix:
+        required: false
+        type: string
+        default: >-
+          [{"suite":"python","cmd":"mise run --no-deps --skip-deps e2e:python","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-python","cmd":"mise run --no-deps --skip-deps e2e:oidc-python:docker","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-pkce-docker","cmd":"mise run --no-deps --skip-deps e2e:oidc-pkce:docker","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker","cmd":"mise run --no-deps --skip-deps e2e:rust","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"mcp","cmd":"mise run --no-deps --skip-deps e2e:mcp","apt_packages":"","python_proto":false,"mcp":true}]
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.suite }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.suite-matrix) }}
+    container:
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /home/runner/_work:/home/runner/_work
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e-cli
+
+      - uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-name: ${{ inputs.gateway-artifact }}
+
+      - if: inputs.external-driver-binary != ''
+        uses: ./.github/actions/setup-e2e-driver
+        with:
+          binary: ${{ inputs.external-driver-binary }}
+
+      - name: Check out MCP conformance tests
+        if: matrix.mcp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: modelcontextprotocol/conformance
+          ref: b9041ea41b0188581803459dbae71bc7e02fd995
+          path: .cache/mcp-conformance
+          persist-credentials: false
+
+      - name: Install OS test dependencies
+        if: matrix.apt_packages != ''
+        shell: bash
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
+        run: |
+          read -ra apt_packages <<< "$APT_PACKAGES"
+          apt-get update
+          apt-get install -y "${apt_packages[@]}"
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Install Python dependencies and generate protobuf stubs
+        if: matrix.python_proto
+        run: uv sync --frozen && mise run --no-deps python:proto
+
+      - name: Run tests
+        env:
+          OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
+        run: ${{ matrix.cmd }}

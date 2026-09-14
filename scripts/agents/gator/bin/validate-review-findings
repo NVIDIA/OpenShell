@@ -43,7 +43,7 @@ jq -e '
     if (
         .schema_version != 1 or
         (.reviewed_head_sha | test("^[0-9A-Fa-f]{40}$") | not) or
-        (.review_mode | IN("initial", "follow_up", "human_checkpoint") | not) or
+        (.review_mode | IN("initial", "follow_up", "critical_only") | not) or
         (.findings | type != "array")
     ) then
         error("invalid review findings envelope")

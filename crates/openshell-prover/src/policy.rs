@@ -257,18 +257,26 @@ pub struct FilesystemPolicy {
     pub read_write: Vec<String>,
 }
 
+/// Symbol used when the prover does not know the image-resolved workspace.
+///
+/// Keeping this distinct from `/sandbox` prevents the model from inventing a
+/// literal compatibility workspace for images that declare another workdir.
+pub const WORKDIR_PATH_SYMBOL: &str = "<OCI_WORKDIR>";
+
 impl FilesystemPolicy {
     /// All readable paths (union of `read_only` and `read_write`), with workdir
-    /// added when `include_workdir` is true and not already present.
-    pub fn readable_paths(&self) -> Vec<String> {
+    /// added when `include_workdir` is true and not already present. When the
+    /// resolved workdir is unavailable, retain it as a symbolic path.
+    pub fn readable_paths(&self, resolved_workdir: Option<&str>) -> Vec<String> {
         let mut paths: Vec<String> = self
             .read_only
             .iter()
             .chain(self.read_write.iter())
             .cloned()
             .collect();
-        if self.include_workdir && !paths.iter().any(|p| p == "/sandbox") {
-            paths.push("/sandbox".to_owned());
+        let workdir = resolved_workdir.unwrap_or(WORKDIR_PATH_SYMBOL);
+        if self.include_workdir && !paths.iter().any(|path| path == workdir) {
+            paths.push(workdir.to_owned());
         }
         paths
     }

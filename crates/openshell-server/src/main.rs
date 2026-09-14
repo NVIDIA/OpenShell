@@ -7,5 +7,8 @@ use miette::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    openshell_server::cli::run_cli().await
+    openshell_server::cli::run_cli_with_compute_drivers(
+        openshell_server::install_default_compute_drivers(),
+    )
+    .await
 }

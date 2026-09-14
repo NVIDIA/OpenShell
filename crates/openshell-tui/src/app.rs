@@ -711,6 +711,13 @@ pub struct App {
     pub draft_viewport_height: usize,
     /// When true, the detail popup is shown for the selected draft chunk.
     pub draft_detail_open: bool,
+    /// Scroll offset, in rendered rows, of the draft detail popup body.
+    pub draft_detail_scroll: usize,
+    /// Total rows of detail-popup content (set by the draw pass).
+    pub draft_detail_rows: usize,
+    /// Visible rows in the detail-popup body, excluding the pinned hint row
+    /// (set by the draw pass).
+    pub draft_detail_body_height: usize,
 
     /// Per-sandbox count of pending draft recommendations (parallel to `sandbox_names`).
     pub sandbox_draft_counts: Vec<usize>,
@@ -1032,6 +1039,9 @@ impl App {
             draft_scroll: 0,
             draft_viewport_height: 0,
             draft_detail_open: false,
+            draft_detail_scroll: 0,
+            draft_detail_rows: 0,
+            draft_detail_body_height: 0,
             sandbox_draft_counts: Vec::new(),
             pending_draft_approve: false,
             pending_draft_reject: false,
@@ -1648,6 +1658,7 @@ impl App {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
+                self.draft_detail_scroll = 0;
                 self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
@@ -1856,6 +1867,25 @@ impl App {
         }
     }
 
+    /// Largest useful scroll offset for the draft detail popup.
+    fn draft_detail_max_scroll(&self) -> usize {
+        self.draft_detail_rows
+            .saturating_sub(self.draft_detail_body_height)
+    }
+
+    /// One screenful of the draft detail popup body.
+    fn draft_detail_page(&self) -> isize {
+        isize::try_from(self.draft_detail_body_height.max(1)).unwrap_or(1)
+    }
+
+    /// Move the draft detail popup by `delta` rows, clamped to the content.
+    fn scroll_draft_detail(&mut self, delta: isize) {
+        let max = isize::try_from(self.draft_detail_max_scroll()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.draft_detail_scroll).unwrap_or(0);
+        let next = current.saturating_add(delta).clamp(0, max);
+        self.draft_detail_scroll = usize::try_from(next).unwrap_or(0);
+    }
+
     fn handle_draft_key(&mut self, key: KeyEvent) {
         // Approve-all confirmation modal intercepts all keys when open.
         if self.approve_all_confirm_open {
@@ -1880,6 +1910,7 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.draft_detail_open = false;
+                    self.draft_detail_scroll = 0;
                 }
                 // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
@@ -1893,6 +1924,7 @@ impl App {
                             if st == "pending" || st == "rejected" {
                                 self.pending_draft_approve = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
@@ -1908,9 +1940,26 @@ impl App {
                             if st == "pending" || st == "approved" {
                                 self.pending_draft_reject = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
+                }
+                // Scroll the detail body; long rejection guidance and rationales
+                // can exceed the fixed popup height.
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_draft_detail(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_draft_detail(-1),
+                KeyCode::PageDown => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(page);
+                }
+                KeyCode::PageUp => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(-page);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.draft_detail_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.draft_detail_scroll = self.draft_detail_max_scroll();
                 }
                 _ => {}
             }
@@ -1937,6 +1986,7 @@ impl App {
             }
             KeyCode::Enter if !self.draft_chunks.is_empty() => {
                 self.draft_detail_open = true;
+                self.draft_detail_scroll = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {

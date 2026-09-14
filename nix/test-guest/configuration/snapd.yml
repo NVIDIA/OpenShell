@@ -1,0 +1,38 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Configure snapd
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate snapd support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          snapd is currently configured only for Ubuntu test guests,
+          not {{ ansible_facts.distribution }}.
+
+    - name: Refresh Ubuntu package metadata
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install snapd
+      ansible.builtin.apt:
+        name: snapd
+        state: present
+        install_recommends: false
+
+    - name: Start snapd socket activation
+      ansible.builtin.systemd_service:
+        name: snapd.socket
+        enabled: true
+        state: started
+
+    - name: Wait for snapd seed
+      ansible.builtin.command:
+        cmd: snap wait system seed.loaded
+      changed_when: false

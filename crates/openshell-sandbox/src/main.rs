@@ -32,13 +32,14 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
+const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
-const SIDECAR_STATE_DIR: &str = "/run/openshell-sidecar";
-const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_STATE_DIR: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 #[cfg(target_os = "linux")]
-const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
+const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
 #[cfg(target_os = "linux")]
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
@@ -110,8 +111,7 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
-    /// Defaults to `/bin/bash` if neither is provided.
+    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -229,6 +229,56 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
+    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
+    /// re-signed upstream certificates and the sandbox trust bundle.
+    #[arg(long)]
+    upstream_proxy_ca_bundle: Option<String>,
+}
+
+/// Internal one-shot command used by the privileged supervisor to validate an
+/// image-provided workdir as the final sandbox identity.
+#[derive(Parser, Debug)]
+#[command(name = "validate-workspace", hide = true)]
+struct ValidateWorkspaceArgs {
+    #[arg(long)]
+    workdir: String,
+    #[arg(long)]
+    expected_uid: u32,
+    #[arg(long)]
+    expected_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace(args: &[String]) -> Result<()> {
+    let args = ValidateWorkspaceArgs::try_parse_from(
+        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
+    )
+    .into_diagnostic()?;
+    let actual = (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    );
+    if actual != (args.expected_uid, args.expected_gid) {
+        return Err(miette::miette!(
+            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
+            args.expected_uid,
+            args.expected_gid,
+            actual.0,
+            actual.1
+        ));
+    }
+    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
+        &args.workdir,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_workspace(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "workspace validation is only supported on Unix"
+    ))
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -427,16 +477,23 @@ fn run_network_init(
 
 #[cfg(target_os = "linux")]
 fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id != 0
+        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&proxy_user_id)
+    {
         return Err(miette::miette!(
-            "--proxy-uid must be 0 or at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-uid must be 0 or in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_PROXY_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+        .contains(&proxy_primary_group_id)
+    {
         return Err(miette::miette!(
-            "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-gid must be in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
     Ok(())
@@ -478,6 +535,9 @@ fn main() -> Result<()> {
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
+    }
+    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
+        return validate_workspace(&raw_args[2..]);
     }
 
     let args = Args::parse();
@@ -595,14 +655,19 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Get command - either from CLI args, environment variable, or default to /bin/bash
-        let command = if !args.command.is_empty() {
-            args.command
-        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
-            // Simple shell-like splitting on whitespace
-            c.split_whitespace().map(String::from).collect()
+        // Resolve an exact canonical process. Explicit offline/test argv wins;
+        // drivers otherwise provide a versioned JSON transport so argument
+        // boundaries are never reconstructed with shell parsing.
+        let workdir = args.workdir.clone();
+        let (command, interactive) = if !args.command.is_empty() {
+            (args.command, args.interactive)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (config.command, config.tty)
         } else {
-            vec!["/bin/bash".to_string()]
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (config.command, config.tty)
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -616,13 +681,14 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
 
         run_sandbox(
             command,
-            args.workdir,
+            workdir,
             args.timeout,
-            args.interactive,
+            interactive,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,
@@ -647,6 +713,31 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_validation_subcommand_uses_final_policy_identity() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        if uid < 1000 || gid < 1000 {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec![
+            "--workdir".to_string(),
+            root.display().to_string(),
+            "--expected-uid".to_string(),
+            uid.to_string(),
+            "--expected-gid".to_string(),
+            gid.to_string(),
+        ];
+
+        validate_workspace(&args).expect("current identity should retain workspace authority");
+    }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.
@@ -733,17 +824,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+        validate_network_init_ids(0, 30).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_init_still_rejects_low_non_root_proxy_ids() {
+    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
         let uid_err =
             validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_non_root_system_proxy_group() {
+        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

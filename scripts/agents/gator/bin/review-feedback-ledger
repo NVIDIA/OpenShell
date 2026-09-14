@@ -194,7 +194,7 @@ read_input "$@" | jq '
         }
     end
     | {
-        schema_version: 3,
+        schema_version: 4,
         pr_author: ([.thread_pages[] | thread_pull_request.author.login][0] // null),
         current_head_sha: (
             [.thread_pages[] | thread_pull_request.headRefOid]
@@ -412,7 +412,7 @@ read_input "$@" | jq '
               else null
               end
         ),
-        convergence_checkpoint_required: (.finding_bearing_rounds >= 3),
+        review_budget_exhausted: (.finding_bearing_rounds >= 3),
         current_patch_matches_last_review: (
             .current_patch_id != null and
             .last_reviewed_patch_id != null and
@@ -428,8 +428,8 @@ read_input "$@" | jq '
                 .review_telemetry.current_patch_matches_last_review
             ) then
                 "already_reviewed"
-            elif .review_telemetry.convergence_checkpoint_required then
-                "human_checkpoint"
+            elif .review_telemetry.review_budget_exhausted then
+                "critical_only"
             else
                 "follow_up"
             end
@@ -441,8 +441,8 @@ read_input "$@" | jq '
         current_merge_base_sha: .current_merge_base_sha,
         current_patch_id: .current_patch_id,
         rebase_equivalent: .review_telemetry.current_patch_matches_last_review,
-        convergence_checkpoint_required:
-            .review_telemetry.convergence_checkpoint_required
+        review_budget_exhausted:
+            .review_telemetry.review_budget_exhausted
     }
     | if .pr_author == null then
         error("pull request not found in ledger input")

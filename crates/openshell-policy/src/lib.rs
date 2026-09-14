@@ -16,12 +16,14 @@ mod middleware;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::net::IpAddr;
 use std::path::Path;
 
 mod ambiguity;
 
 pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
+use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
@@ -34,10 +36,13 @@ pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
     is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
 };
-pub use l7_validate::{L7EndpointFields, L7Protocol, validate_l7_endpoint_semantics};
+pub use l7_validate::{
+    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
+};
 pub use merge::{
-    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
-    merge_policy, policy_covers_rule,
+    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
+    canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
@@ -103,6 +108,10 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint DTO mirrors independent policy schema toggles."
+)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -144,6 +153,10 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
+    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
+    /// inspect or rewrite. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -157,9 +170,17 @@ struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_region: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<NetworkCredentialBindingDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkCredentialBindingDef {
+    provider: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -737,6 +758,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
+                            // Provider credential provenance is derived by the
+                            // gateway and cannot be authored in policy YAML.
+                            provider_credentialed: false,
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -759,6 +784,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             credential_signing: e.credential_signing,
                             signing_service: e.signing_service,
                             signing_region: e.signing_region,
+                            credential_binding: e.credential_binding.map(|binding| {
+                                openshell_core::proto::NetworkCredentialBinding {
+                                    provider: binding.provider,
+                                }
+                            }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
                             mcp: mcp_options(&e.mcp),
                         }
@@ -888,6 +918,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -907,6 +938,11 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             credential_signing: e.credential_signing.clone(),
                             signing_service: e.signing_service.clone(),
                             signing_region: e.signing_region.clone(),
+                            credential_binding: e.credential_binding.as_ref().map(|binding| {
+                                NetworkCredentialBindingDef {
+                                    provider: binding.provider.clone(),
+                                }
+                            }),
                             json_rpc,
                             mcp,
                         }
@@ -941,13 +977,24 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 // Sandbox UID/GID constants
 // ---------------------------------------------------------------------------
 
-/// Minimum accepted UID for sandbox process identity.
-/// UIDs below this are reserved for system users and are rejected.
-pub const MIN_SANDBOX_UID: u32 = 1000;
+/// Minimum accepted UID/GID for sandbox workload identity.
+///
+/// Linux reserves only identity `0` for root. Non-root system identities are
+/// valid workload identities when selected explicitly by the operator.
+pub const MIN_SANDBOX_UID: u32 = 1;
 
-/// Maximum accepted UID for sandbox process identity.
-/// UIDs above this exceed typical OS limits and are rejected.
-pub const MAX_SANDBOX_UID: u32 = 2_000_000_000;
+/// Maximum accepted UID/GID for sandbox workload identity.
+///
+/// `u32::MAX` represents an invalid or unchanged identity in Linux APIs and
+/// POSIX ACLs, so the largest usable workload identity is one less.
+pub const MAX_SANDBOX_UID: u32 = u32::MAX - 1;
+
+/// Minimum UID for the Kubernetes network proxy identity.
+///
+/// The proxy UID is exempt from the pod egress fence, so it remains in a
+/// dedicated infrastructure range even though workload identities may use
+/// non-root system IDs.
+pub const MIN_SANDBOX_PROXY_UID: u32 = 1000;
 
 /// The literal string value accepted as a valid sandbox user/group name.
 const SANDBOX_NAME: &str = "sandbox";
@@ -959,8 +1006,8 @@ const SANDBOX_NAME: &str = "sandbox";
 ///
 /// Rejects:
 /// - The empty string (represents an omitted policy field)
-/// - UID 0 or values below `MIN_SANDBOX_UID`
-/// - Values above `MAX_SANDBOX_UID`
+/// - UID/GID 0 (root)
+/// - `u32::MAX`, the invalid identity sentinel
 /// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
 pub fn is_valid_sandbox_identity(value: &str) -> bool {
     if value == SANDBOX_NAME {
@@ -1044,7 +1091,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 ///
 /// When the gateway provides no policy at sandbox creation time, the sandbox
 /// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
+pub use openshell_core::container_paths::CONTAINER_POLICY_PATH;
 
 /// Legacy path used before the navigator → openshell rename.
 ///
@@ -1074,7 +1121,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -1127,6 +1174,26 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// A network endpoint has no hostname.
+    MissingEndpointHost { policy_name: String },
+    /// An explicit TCP endpoint has no DNS hostname.
+    MissingTcpEndpointHost { policy_name: String },
+    /// An explicit TCP endpoint uses an IP literal instead of a DNS hostname.
+    TcpEndpointIpLiteral { policy_name: String, host: String },
+    /// An explicit TCP endpoint has a hostname that policy DNS cannot resolve.
+    InvalidTcpEndpointHost {
+        policy_name: String,
+        host: String,
+        reason: String,
+    },
+    /// A network endpoint has no effective destination port.
+    MissingEndpointPort { policy_name: String, host: String },
+    /// A network endpoint contains a port outside the TCP/UDP range.
+    InvalidEndpointPort {
+        policy_name: String,
+        host: String,
+        port: u32,
+    },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
@@ -1139,6 +1206,12 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// An endpoint contains a deterministic L7 semantic error.
+    InvalidL7Endpoint {
+        policy_name: String,
+        endpoint_index: usize,
+        reason: String,
+    },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
@@ -1196,6 +1269,50 @@ impl fmt::Display for PolicyViolation {
                      use subdomain wildcards like '*.example.com' instead"
                 )
             }
+            Self::MissingEndpointHost { policy_name } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint host must not be empty unless allowed_ips constrains a non-TCP proxy endpoint"
+                )
+            }
+            Self::MissingTcpEndpointHost { policy_name } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy"
+                )
+            }
+            Self::TcpEndpointIpLiteral { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp endpoint '{host}' must use a DNS hostname, not an IP literal; direct IP connections bypass policy DNS and are blocked"
+                )
+            }
+            Self::InvalidTcpEndpointHost {
+                policy_name,
+                host,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp endpoint has invalid DNS host selector '{host}': {reason}"
+                )
+            }
+            Self::MissingEndpointPort { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' must declare at least one port"
+                )
+            }
+            Self::InvalidEndpointPort {
+                policy_name,
+                host,
+                port,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has invalid port {port}; expected 1..=65535"
+                )
+            }
             Self::InvalidHostWildcard { policy_name, host } => {
                 write!(
                     f,
@@ -1229,6 +1346,14 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
+            Self::InvalidL7Endpoint {
+                policy_name,
+                endpoint_index,
+                reason,
+            } => write!(
+                f,
+                "network policy '{policy_name}': endpoint {endpoint_index} has invalid L7 configuration: {reason}"
+            ),
             Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
             }
@@ -1364,7 +1489,50 @@ pub fn validate_sandbox_policy(
         } else {
             rule.name.clone()
         };
-        for ep in &rule.endpoints {
+        for (endpoint_index, ep) in rule.endpoints.iter().enumerate() {
+            let explicit_tcp = l7_validate::is_explicit_tcp_protocol(&ep.protocol);
+            if ep.host.trim().is_empty() && explicit_tcp {
+                violations.push(PolicyViolation::MissingTcpEndpointHost {
+                    policy_name: name.clone(),
+                });
+            } else if ep.host.trim().is_empty() && ep.allowed_ips.is_empty() {
+                violations.push(PolicyViolation::MissingEndpointHost {
+                    policy_name: name.clone(),
+                });
+            } else if explicit_tcp {
+                if ep.host.parse::<IpAddr>().is_ok() {
+                    violations.push(PolicyViolation::TcpEndpointIpLiteral {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                } else if let Err(reason) = validate_tcp_dns_host_selector(&ep.host) {
+                    violations.push(PolicyViolation::InvalidTcpEndpointHost {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        reason,
+                    });
+                }
+            }
+            let effective_ports: Vec<u32> = if ep.ports.is_empty() {
+                (ep.port != 0).then_some(ep.port).into_iter().collect()
+            } else {
+                ep.ports.clone()
+            };
+            if effective_ports.is_empty() {
+                violations.push(PolicyViolation::MissingEndpointPort {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            for port in effective_ports {
+                if !(1..=u16::MAX.into()).contains(&port) {
+                    violations.push(PolicyViolation::InvalidEndpointPort {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        port,
+                    });
+                }
+            }
             if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
                 let label_count = ep.host.split('.').count();
                 if label_count <= 2 {
@@ -1404,6 +1572,127 @@ pub fn validate_sandbox_policy(
                     host: ep.host.clone(),
                 });
             }
+
+            let rules_would_deny_all = !ep.rules.is_empty()
+                && ep.rules.iter().all(|rule| {
+                    rule.allow.as_ref().is_none_or(|allow| {
+                        allow.method.is_empty()
+                            && allow.path.is_empty()
+                            && allow.command.is_empty()
+                            && allow.operation_type.is_empty()
+                            && allow.operation_name.is_empty()
+                            && allow.fields.is_empty()
+                            && allow.params.is_empty()
+                    })
+                });
+            let fields = L7EndpointFields {
+                protocol: &ep.protocol,
+                access: &ep.access,
+                has_rules: !ep.rules.is_empty(),
+                has_deny_rules: !ep.deny_rules.is_empty(),
+                rules_would_deny_all,
+                allow_all_known_mcp_methods: ep
+                    .mcp
+                    .as_ref()
+                    .and_then(|mcp| mcp.allow_all_known_mcp_methods)
+                    .unwrap_or(false),
+            };
+            let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            let mut explicit_tcp_fields = Vec::new();
+            if !ep.enforcement.is_empty() {
+                explicit_tcp_fields.push("enforcement");
+            }
+            if !ep.path.is_empty() {
+                explicit_tcp_fields.push("path");
+            }
+            if ep.allow_encoded_slash {
+                explicit_tcp_fields.push("allow_encoded_slash");
+            }
+            if ep.websocket_credential_rewrite {
+                explicit_tcp_fields.push("websocket_credential_rewrite");
+            }
+            if ep.request_body_credential_rewrite {
+                explicit_tcp_fields.push("request_body_credential_rewrite");
+            }
+            if !ep.persisted_queries.is_empty() {
+                explicit_tcp_fields.push("persisted_queries");
+            }
+            if !ep.graphql_persisted_queries.is_empty() {
+                explicit_tcp_fields.push("graphql_persisted_queries");
+            }
+            if ep.graphql_max_body_bytes > 0 {
+                explicit_tcp_fields.push("graphql_max_body_bytes");
+            }
+            if ep.json_rpc_max_body_bytes > 0 {
+                explicit_tcp_fields.push("json_rpc_max_body_bytes");
+            }
+            if ep.mcp.is_some() {
+                explicit_tcp_fields.push("mcp");
+            }
+            l7_errors.extend(validate_explicit_tcp_additional_fields(
+                &ep.protocol,
+                &explicit_tcp_fields,
+            ));
+            if !ep.path.is_empty() && !ep.path.starts_with('/') && ep.path != "**" {
+                l7_errors.push("path must start with '/' or be '**'".to_string());
+            }
+            if !ep.persisted_queries.is_empty()
+                && !matches!(ep.persisted_queries.as_str(), "deny" | "allow_registered")
+            {
+                l7_errors.push(format!(
+                    "persisted_queries must be 'deny' or 'allow_registered', got '{}'",
+                    ep.persisted_queries
+                ));
+            }
+            if ep.protocol == "sql" && ep.enforcement == "enforce" {
+                l7_errors.push(
+                    "SQL enforcement requires full SQL parsing; use enforcement: audit".to_string(),
+                );
+            }
+            if ep.mcp.is_some() && ep.protocol != "mcp" {
+                l7_errors.push("mcp options are only valid for protocol mcp".to_string());
+            }
+            if ep.protocol == "graphql" {
+                for (rule_index, rule) in ep.rules.iter().enumerate() {
+                    let operation_type = rule
+                        .allow
+                        .as_ref()
+                        .map(|allow| allow.operation_type.as_str())
+                        .unwrap_or_default();
+                    if !matches!(operation_type, "query" | "mutation" | "subscription") {
+                        l7_errors.push(format!(
+                            "rules[{rule_index}].allow.operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+                for (rule_index, rule) in ep.deny_rules.iter().enumerate() {
+                    if !matches!(
+                        rule.operation_type.as_str(),
+                        "query" | "mutation" | "subscription"
+                    ) {
+                        l7_errors.push(format!(
+                            "deny_rules[{rule_index}].operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+                for (key, operation) in &ep.graphql_persisted_queries {
+                    if !matches!(
+                        operation.operation_type.as_str(),
+                        "query" | "mutation" | "subscription"
+                    ) {
+                        l7_errors.push(format!(
+                            "graphql_persisted_queries[{key}].operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+            }
+            violations.extend(l7_errors.into_iter().map(|reason| {
+                PolicyViolation::InvalidL7Endpoint {
+                    policy_name: name.clone(),
+                    endpoint_index,
+                    reason,
+                }
+            }));
         }
     }
 
@@ -1433,6 +1722,39 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
         .skip(1)
         .copied()
         .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
+}
+
+/// Validate that an explicit-TCP host selector can produce names accepted by
+/// policy DNS. Wildcards are replaced with a representative DNS label before
+/// parsing because the authored selector itself is not a concrete DNS name.
+fn validate_tcp_dns_host_selector(host: &str) -> std::result::Result<(), String> {
+    if host.trim() != host {
+        return Err("leading or trailing whitespace is not allowed".to_string());
+    }
+    if host.ends_with('.') {
+        return Err("omit the trailing DNS root dot".to_string());
+    }
+
+    openshell_core::host_pattern::HostSelector::new(&[host.to_string()], &[])?;
+
+    let representative = host
+        .split('.')
+        .map(|label| {
+            if label == "**" {
+                "x".to_string()
+            } else {
+                label.replace('*', "x")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let absolute = format!("{representative}.");
+    let parsed = Name::from_ascii(&absolute)
+        .map_err(|error| format!("selector cannot represent a valid DNS name: {error}"))?;
+    if parsed.is_root() {
+        return Err("DNS root is not a destination hostname".to_string());
+    }
+    Ok(())
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -1654,8 +1976,8 @@ network_policies:
             "read_only should contain /usr"
         );
         assert!(
-            fs.read_write.iter().any(|p| p == "/sandbox"),
-            "read_write should contain /sandbox"
+            !fs.read_write.iter().any(|p| p == "/sandbox"),
+            "the workspace should be granted through include_workdir, not a literal /sandbox path"
         );
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),
@@ -2356,6 +2678,209 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_yaml_tcp_endpoint_without_host_or_port() {
+        let policy = parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  invalid:
+    endpoints:
+      - host: ""
+        protocol: tcp
+"#,
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        let violations = validate_sandbox_policy(&policy).expect_err("endpoint is incomplete");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingTcpEndpointHost { policy_name } if policy_name == "invalid"
+        )));
+        assert!(violations.iter().any(|violation| {
+            violation.to_string().contains(
+                "protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy",
+            )
+        }));
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingEndpointPort { policy_name, .. } if policy_name == "invalid"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_hostless_allowed_ips_for_non_tcp_proxy_endpoint() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  legacy-proxy:
+    endpoints:
+      - port: 9443
+        allowed_ips:
+          - 10.0.5.0/24
+",
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        validate_sandbox_policy(&policy)
+            .expect("hostless allowed_ips remains valid for non-TCP proxy endpoints");
+    }
+
+    #[test]
+    fn validate_rejects_hostless_allowed_ips_for_explicit_tcp() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  native-tcp:
+    endpoints:
+      - port: 6379
+        protocol: tcp
+        allowed_ips:
+          - 10.0.5.0/24
+",
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        let violations =
+            validate_sandbox_policy(&policy).expect_err("transparent TCP requires a DNS hostname");
+        let violation = violations
+            .iter()
+            .find(|violation| matches!(violation, PolicyViolation::MissingTcpEndpointHost { .. }))
+            .expect("missing TCP hostname violation");
+        assert_eq!(
+            violation.to_string(),
+            "network policy 'native-tcp': protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ip_literal_hosts_for_explicit_tcp() {
+        for host in ["192.0.2.10", "2001:db8::10"] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "native-tcp".into(),
+                NetworkPolicyRule {
+                    name: "native-tcp".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 6379,
+                        protocol: "tcp".into(),
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy)
+                .expect_err("transparent TCP must reject direct IP destinations");
+            let violation = violations
+                .iter()
+                .find(|violation| matches!(violation, PolicyViolation::TcpEndpointIpLiteral { .. }))
+                .expect("TCP IP-literal violation");
+            assert!(
+                violation
+                    .to_string()
+                    .contains("direct IP connections bypass policy DNS and are blocked"),
+                "unexpected diagnostic: {violation}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_dns_selectors_for_explicit_tcp() {
+        for (host, expected_reason) in [
+            (" db.example.com", "leading or trailing whitespace"),
+            ("db.example.com.", "omit the trailing DNS root dot"),
+            ("db..example.com", "empty DNS labels"),
+            ("bad name.example.com", "whitespace"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com",
+                "cannot represent a valid DNS name",
+            ),
+        ] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "native-tcp".into(),
+                NetworkPolicyRule {
+                    name: "native-tcp".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 6379,
+                        protocol: "tcp".into(),
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy)
+                .expect_err("malformed transparent TCP hostname must be rejected");
+            let violation = violations
+                .iter()
+                .find(|violation| {
+                    matches!(violation, PolicyViolation::InvalidTcpEndpointHost { .. })
+                })
+                .expect("invalid TCP hostname violation");
+            assert!(
+                violation.to_string().contains(expected_reason),
+                "expected {expected_reason:?} in diagnostic for {host:?}, got {violation}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_raw_endpoint_zero_and_out_of_range_ports() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "invalid".into(),
+            NetworkPolicyRule {
+                name: "invalid".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "database.example.com".into(),
+                    ports: vec![0, u32::from(u16::MAX) + 1],
+                    protocol: "tcp".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("ports are invalid");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidEndpointPort { port: 0, .. }
+        )));
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidEndpointPort { port: 65_536, .. }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_raw_endpoint_without_effective_port() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "invalid".into(),
+            NetworkPolicyRule {
+                name: "invalid".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "database.example.com".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("port is missing");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingEndpointPort { policy_name, host }
+                if policy_name == "invalid" && host == "database.example.com"
+        )));
+    }
+
+    #[test]
     fn validate_accepts_empty_process() {
         let policy = SandboxPolicy {
             version: 1,
@@ -2768,7 +3293,11 @@ network_policies:
     }
 
     #[test]
-    fn valid_identity_accepts_numeric_uid_in_range() {
+    fn valid_identity_accepts_non_root_numeric_uid() {
+        assert!(is_valid_sandbox_identity("1"));
+        assert!(is_valid_sandbox_identity("30"));
+        assert!(is_valid_sandbox_identity("500"));
+        assert!(is_valid_sandbox_identity("999"));
         assert!(is_valid_sandbox_identity("1000"));
         assert!(is_valid_sandbox_identity("50000"));
         assert!(is_valid_sandbox_identity("1000660000"));
@@ -2786,14 +3315,7 @@ network_policies:
     }
 
     #[test]
-    fn valid_identity_rejects_system_uids_below_min() {
-        assert!(!is_valid_sandbox_identity("999"));
-        assert!(!is_valid_sandbox_identity("100"));
-        assert!(!is_valid_sandbox_identity("1"));
-    }
-
-    #[test]
-    fn valid_identity_rejects_uid_above_max() {
+    fn valid_identity_rejects_invalid_uid_sentinel() {
         assert!(!is_valid_sandbox_identity(
             &MAX_SANDBOX_UID.saturating_add(1).to_string()
         ));
@@ -2846,20 +3368,13 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_uid_out_of_range_low() {
+    fn validate_accepts_non_root_system_uid() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: "500".into(),
-            run_as_group: "sandbox".into(),
+            run_as_group: "30".into(),
         });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            PolicyViolation::InvalidProcessIdentity {
-                field: "run_as_user",
-                ..
-            }
-        )));
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -3002,6 +3517,37 @@ network_policies:
         let ep2 = &proto2.network_policies["test"].endpoints[0];
         assert_eq!(ep1.path, "/graphql");
         assert_eq!(ep1.path, ep2.path);
+    }
+
+    #[test]
+    fn round_trip_preserves_endpoint_credential_binding() {
+        let yaml = r"
+version: 1
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        credential_binding:
+          provider: work-gcp
+";
+
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let endpoint = &proto1.network_policies["gcp_storage"].endpoints[0];
+        assert_eq!(
+            endpoint
+                .credential_binding
+                .as_ref()
+                .map(|binding| binding.provider.as_str()),
+            Some("work-gcp")
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto1, proto2);
+        assert!(yaml_out.contains("credential_binding:"));
+        assert!(yaml_out.contains("provider: work-gcp"));
     }
 
     #[test]
@@ -3438,6 +3984,32 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_allow_uninspected_credentials() {
+        let yaml = r"
+version: 1
+network_policies:
+  vendor_api:
+    endpoints:
+      - host: api.vendor.example
+        port: 443
+        tls: skip
+        allow_uninspected_credentials: true
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["vendor_api"].endpoints[0];
+        assert!(ep.allow_uninspected_credentials);
+        assert!(
+            !ep.provider_credentialed,
+            "provider provenance must not be authorable from policy YAML"
+        );
+        assert!(yaml_out.contains("allow_uninspected_credentials: true"));
+        assert!(!yaml_out.contains("provider_credentialed"));
+    }
+
+    #[test]
     fn websocket_credential_rewrite_defaults_false() {
         let yaml = r"
 version: 1
@@ -3455,6 +4027,8 @@ network_policies:
         let ep = &proto.network_policies["gateway"].endpoints[0];
         assert!(!ep.websocket_credential_rewrite);
         assert!(!ep.request_body_credential_rewrite);
+        assert!(!ep.allow_uninspected_credentials);
+        assert!(!ep.provider_credentialed);
     }
 
     #[test]

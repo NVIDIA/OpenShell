@@ -513,6 +513,32 @@ impl PodmanClient {
         }
     }
 
+    /// Download a file from a container as a tar archive.
+    ///
+    /// Calls `GET /libpod/containers/{name}/archive?path={path}` and returns
+    /// the raw tar bytes. The container does not need to be running.
+    pub async fn copy_from_container(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<Bytes, PodmanApiError> {
+        validate_name(name)?;
+        let encoded_path = url_encode(path);
+        let (status, bytes) = self
+            .request(
+                hyper::Method::GET,
+                &format!("/libpod/containers/{name}/archive?path={encoded_path}"),
+                None,
+                API_TIMEOUT,
+            )
+            .await?;
+        if status.is_success() {
+            Ok(bytes)
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
+    }
+
     /// Inspect a container by name or ID.
     pub async fn inspect_container(&self, name: &str) -> Result<ContainerInspect, PodmanApiError> {
         validate_name(name)?;

@@ -339,6 +339,38 @@ impl Store {
         ))
     }
 
+    /// Atomically insert a generic named object with an application-owned scope.
+    ///
+    /// Unlike [`Self::put_scoped`], this never updates an existing object. A
+    /// duplicate id or `(object_type, workspace, name)` returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_scoped", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
+    )]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_scoped(
+            object_type,
+            id,
+            name,
+            workspace,
+            scope,
+            payload,
+            labels
+        ))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",

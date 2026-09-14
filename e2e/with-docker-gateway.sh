@@ -109,6 +109,11 @@ GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
+DRIVER_BIN=""
+DRIVER_PID=""
+DRIVER_LOG="${WORKDIR}/docker-driver.log"
+DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
+DRIVER_CONFIG="${WORKDIR}/docker-driver.toml"
 E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
@@ -134,6 +139,7 @@ cleanup() {
   local exit_code=$?
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
+  e2e_stop_process "${DRIVER_PID}" "external Docker compute driver"
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -182,6 +188,11 @@ cleanup() {
   fi
 
   e2e_print_gateway_log_on_failure "${exit_code}" "${GATEWAY_LOG}"
+  if [ "${exit_code}" -ne 0 ] && [ -f "${DRIVER_LOG}" ]; then
+    echo "=== external Docker compute driver log ==="
+    cat "${DRIVER_LOG}" || true
+    echo "=== end external Docker compute driver log ==="
+  fi
 
   rm -rf "${WORKDIR}" 2>/dev/null || true
 }
@@ -426,6 +437,10 @@ ensure_sandbox_image_available() {
 }
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  e2e_build_external_driver \
+    "${ROOT}" openshell-driver-docker openshell-driver-docker DRIVER_BIN
+fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
 build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
@@ -495,20 +510,50 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     fi
   fi
   printf '[openshell.drivers.docker]\n'
-  printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
-  printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
-  printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
-  printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
-  printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
-  printf 'enable_bind_mounts = true\n'
-  printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-  if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-    printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
+  else
+    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
+    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
+    printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
+    printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
+    printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
+    printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
+    printf 'enable_bind_mounts = true\n'
+    printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
+    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
+    fi
   fi
 } > "${GATEWAY_CONFIG}"
+
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  {
+    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
+    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
+    printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
+    printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
+    printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
+    printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
+    printf 'enable_bind_mounts = true\n'
+    printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
+    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
+    fi
+  } >"${DRIVER_CONFIG}"
+  "${DRIVER_BIN}" \
+    --bind-socket "${DRIVER_SOCKET}" \
+    --config "${DRIVER_CONFIG}" \
+    --gateway-bind "127.0.0.1:${HOST_PORT}" \
+    >"${DRIVER_LOG}" 2>&1 &
+  DRIVER_PID=$!
+  e2e_wait_for_socket \
+    "${DRIVER_SOCKET}" "${DRIVER_PID}" "external Docker compute driver"
+fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"

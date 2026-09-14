@@ -293,7 +293,7 @@ def resolve_go_name(full_name: str) -> str | None:
         if candidate in GO_KNOWN:
             return GO_KNOWN[candidate]
     # Try just org/repo for github.com paths
-    if full_name.startswith("github.com/") and len(parts) >= 3:
+    if len(parts) >= 3 and parts[0] == "github.com":
         base = "/".join(parts[:3])
         if base in GO_KNOWN:
             return GO_KNOWN[base]
@@ -345,6 +345,10 @@ def needs_fix(comp: dict) -> bool:
     if not licenses:
         return True
     for entry in licenses:
+        if "expression" in entry:
+            if entry["expression"].startswith("sha256:"):
+                return True
+            continue
         lic = entry.get("license", {})
         lid = lic.get("id", "")
         lname = lic.get("name", "")

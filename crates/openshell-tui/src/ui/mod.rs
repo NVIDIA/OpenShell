@@ -103,8 +103,13 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // Draft detail popup renders over the full frame.
     if app.focus == Focus::SandboxDraft && app.draft_detail_open {
         let abs = app.draft_scroll + app.draft_selected;
-        if let Some(chunk) = app.draft_chunks.get(abs) {
-            sandbox_draft::draw_detail_popup(frame, chunk, frame.size(), &app.theme);
+        let scroll = app.draft_detail_scroll;
+        let metrics = app.draft_chunks.get(abs).map(|chunk| {
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.size(), &app.theme, scroll)
+        });
+        if let Some(metrics) = metrics {
+            app.draft_detail_rows = metrics.total_rows;
+            app.draft_detail_body_height = metrics.body_height;
         }
     }
 

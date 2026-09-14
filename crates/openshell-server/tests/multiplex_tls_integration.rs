@@ -62,6 +62,9 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -101,6 +104,9 @@ async fn mtls_valid_client_cert_accepted() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -129,6 +135,9 @@ async fn no_client_cert_accepted_with_ca() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -165,6 +174,9 @@ async fn no_client_cert_rejected_when_required() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         true,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -202,6 +214,9 @@ async fn mtls_wrong_ca_client_cert_rejected() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 

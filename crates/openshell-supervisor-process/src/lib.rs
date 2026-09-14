@@ -13,6 +13,7 @@ pub mod debug_rpc;
 #[cfg(unix)]
 pub mod identity;
 pub mod log_push;
+pub mod main_session;
 pub mod managed_children;
 pub mod process;
 pub mod run;

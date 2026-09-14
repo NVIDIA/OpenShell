@@ -102,7 +102,9 @@ Read through the full diff (and the PR description if available). Produce a summ
 <short fenced code snippets that illustrate the most important changes -- max 3 snippets>
 
 ### Potential Concerns  <- omit if none
-- <risk or issue worth discussing>
+- **<concise user-visible behavior>** — Before this PR, <affected persona>
+  experienced <previous behavior>. With this PR, <new concerning behavior>, so
+  <user-visible impact>. Details: `<file>:<line>`.
 ```
 
 **Guidelines for the summary:**
@@ -110,7 +112,28 @@ Read through the full diff (and the PR description if available). Produce a summ
 - **Overview**: State what changed and why. Pull context from the PR description if available.
 - **Key Design Decisions**: Focus on _why_ something was done a particular way, not _what_ changed. Include `file_path:line_number` references. Examples: choice of algorithm, new abstraction introduced, API contract change, migration strategy.
 - **Notable Code**: Include only the most instructive or surprising snippets. Keep each snippet under 15 lines. Always include the file path above the code block.
-- **Potential Concerns**: Only include if there are genuine risks — missing error handling, breaking changes, performance implications, security issues. Do not fabricate concerns.
+- **Potential Concerns**: Only include genuine risks that warrant a change or a
+  deliberate accept/reject decision. Describe each concern in terms of observable
+  behavior for the affected persona, such as a sandbox creator, sandbox user,
+  operator, administrator, SDK consumer, or developer maintaining the system.
+  Always compare the previous behavior with the new concerning behavior and state
+  the resulting user-visible impact. Prefer the compact form: "Before this PR,
+  `<persona>` experienced `<old behavior>`. With this PR, `<new behavior>`, so
+  `<impact>`." Add only the minimum file and line references needed to substantiate
+  the finding.
+  - Use the PR base as the normal previous-behavior baseline. Review older history
+    only when the change is fixing or extending an earlier feature and that history
+    is necessary to explain the behavioral contract. In that case, describe the
+    relevant transitions explicitly: "Before `<commit>`, ... After `<commit>`, ...
+    With this PR, ...".
+  - Translate internal failure modes and race conditions into what the affected
+    person would observe. Internal implementation details belong in the trailing
+    file and line references, not in place of the behavior description.
+  - Do not assign P0/P1/P2 or similar priority labels. The behavioral comparison
+    and impact should give maintainers enough context to accept or reject the
+    suggested change.
+  - Do not fabricate concerns or claim a behavioral regression without evidence
+    for both the prior and proposed behavior.
 - **Agent infrastructure**: When the PR changes behavior, commands, or development workflows, use the `sync-agent-infra` maintenance map to check that related skills were updated. When it adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references, apply the full consistency checklist. Report missing companion updates or drift under **Potential Concerns**.
 
 ## Step 5: Output

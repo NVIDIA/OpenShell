@@ -6,6 +6,7 @@ pub mod config;
 pub(crate) mod container;
 pub mod driver;
 pub mod grpc;
+pub mod otel_tracing;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub(crate) mod watcher;

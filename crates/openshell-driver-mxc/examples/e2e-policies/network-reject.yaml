@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# network-reject.yaml — Network policy rejection scenario.
+#
+# A filesystem grant plus a network_policies rule. The driver rejects sandbox
+# create at map time with invalid_argument naming the network rule on every
+# backend until MXC has a bound, enforcing egress path.
+#
+# This scenario requires NO live backend — it passes even on this box and in
+# mock mode because the rejection happens in the policy mapper before wxc-exec
+# is invoked. It is the only scenario that never SKIPs.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/work/openshell-mxc-e2e"
+
+network_policies:
+  test_rule:
+    name: test-network-reject
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only

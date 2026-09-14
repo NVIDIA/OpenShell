@@ -60,6 +60,63 @@ The chart also runs a pre-install hook in JWT-only mode to create the gateway's
 sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
 certificate Secrets and is mounted at `/etc/openshell-jwt`.
 
+## Using a real Issuer for the server certificate
+
+By default, cert-manager issues both the server and client certificates from
+a self-signed CA the chart creates — this rotates automatically, but the
+server certificate is still not publicly trusted. `certManager.serverIssuerRef`
+overrides the `issuerRef` on the server `Certificate` resource to point at a
+real `Issuer` or `ClusterIssuer` instead, for example an ACME issuer:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set certManager.enabled=true \
+  --set certManager.serverIssuerRef.name=letsencrypt-prod \
+  --set certManager.serverIssuerRef.kind=ClusterIssuer \
+  --set certManager.serverDnsNames[0]=openshell.example.com
+```
+
+### Dual certificate architecture
+
+When `serverIssuerRef` is set, the chart creates **two** server certificates:
+
+1. **Internal certificate** (`openshell-server-tls`): signed by the chart CA
+   with internal SANs (`*.svc.cluster.local`, `localhost`, etc.).
+2. **External certificate** (`openshell-server-external-tls`): signed by the
+   configured issuer (e.g. ACME) with only the hostnames from
+   `certManager.serverDnsNames`.
+
+The gateway uses **SNI** to select which certificate to present:
+supervisors connect via internal service names and receive the internal
+certificate (verified against the chart CA they already trust), while CLI
+users connecting through a Route or ingress use the external hostname and
+receive the ACME certificate. This keeps supervisor trust pinned to only
+the operator's chart CA — no WebPKI root trust is needed.
+
+<Note>
+Public CAs such as Let's Encrypt reject certificate requests that include
+internal-only names per CA/Browser Forum baseline requirements. The chart
+validates this at install time and fails with an actionable error if
+`certManager.serverDnsNames` contains internal-only entries while
+`serverIssuerRef` is set.
+
+You do **not** need to set `server.grpcEndpoint` to the external hostname.
+Supervisors connect via the internal service name automatically. Setting
+`server.grpcEndpoint` to an external hostname would cause supervisors to
+receive the ACME certificate (via SNI) which they cannot verify against the
+chart CA.
+</Note>
+
+The default `clientCaFromServerTlsSecret=true` is correct even when
+`serverIssuerRef` is set: the internal server certificate is always signed
+by the chart CA (the same CA that signs the client certificate), so its
+`ca.crt` is the right trust anchor for mTLS verification.
+
 ## Next Steps
 
-Return to [Setup](/kubernetes/setup) to complete the installation.
+Return to [Setup](/kubernetes/setup) to complete the installation. For
+exposing the gateway externally on OpenShift with a real certificate, see
+[OpenShift](/kubernetes/openshift).

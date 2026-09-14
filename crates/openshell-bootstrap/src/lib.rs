@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(target_os = "windows"))]
+pub mod build;
+#[cfg(target_os = "windows")]
+#[path = "build_windows.rs"]
 pub mod build;
 pub mod edge_token;
 pub mod jwt;

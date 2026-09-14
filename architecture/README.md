@@ -141,6 +141,10 @@ bridge networks, port mappings, NAT traversal, or bespoke tunnels. The common
 runtime requirement is narrower: the supervisor must be able to reach the
 gateway.
 
+The Windows MXC driver is an explicit exception. It launches and monitors a
+one-shot workload in the driver, self-reports readiness, and does not expose a
+supervisor session, interactive connect, live policy delivery, or governed egress.
+
 The gateway delivers desired state; the sandbox applies it locally. Policy,
 settings, credentials, and inference routes flow from the gateway to the
 supervisor. The supervisor validates and applies what can change at runtime,
@@ -163,10 +167,12 @@ that crate's `README.md`.
 |---|---|
 | [Gateway](gateway.md) | Gateway control plane, auth, APIs, persistence, settings, and relay coordination. |
 | [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, credentials, inference, connect, and logs. |
+| [Sandbox Limits](sandbox-limits.md) | Sandbox supervisor and egress safety ceilings, ownership rules, current enforcement, and known gaps. |
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
 | [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
+| [Windows MSVC Build](windows-msvc-build.md) | Build-only native Windows MSVC lane (x64/ARM64) and unsupported-runtime behavior on Windows. |
 
 ## `rfc/` vs `architecture/`
 

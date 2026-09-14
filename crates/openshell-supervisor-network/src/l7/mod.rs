@@ -22,7 +22,40 @@ pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
 pub use openshell_policy::L7Protocol;
-use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
+use openshell_policy::{
+    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+};
+
+pub(crate) fn build_credential_endpoint_mismatch_finding(
+    policy_name: &str,
+    host: &str,
+    protocol: Option<&str>,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+
+    let mut evidence = vec![("policy", policy_name), ("host", host)];
+    if let Some(protocol) = protocol {
+        evidence.push(("protocol", protocol));
+    }
+    evidence.push(("disposition", "denied"));
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.endpoint_mismatch",
+            "Provider credential used at an unauthorized endpoint",
+        ))
+        .evidence_pairs(&evidence)
+        .message(message)
+        .build()
+}
 
 /// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -96,6 +129,10 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in supported textual REST
     /// request bodies before forwarding upstream.
     pub request_body_credential_rewrite: bool,
+    /// Explicit opt-in to credential-bearing traffic that cannot be inspected.
+    pub allow_uninspected_credentials: bool,
+    /// Internal gateway-derived credential provenance for this endpoint.
+    pub provider_credentialed: bool,
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
@@ -179,6 +216,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
+    let allow_uninspected_credentials =
+        get_object_bool(val, "allow_uninspected_credentials").unwrap_or(false);
+    let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -234,11 +274,31 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
+        allow_uninspected_credentials,
+        provider_credentialed,
         websocket_graphql_policy,
         credential_signing,
         signing_service,
         signing_region,
     })
+}
+
+pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
+    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(openshell_ocsf::SeverityId::High)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.credentials.traffic_uninspectable",
+            "Credential-bearing traffic cannot be inspected",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", host),
+            ("surface", surface),
+            ("disposition", "denied"),
+        ])
+        .message("Uninspected credential-bearing traffic denied")
+        .build();
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 impl L7EndpointConfig {
@@ -253,19 +313,14 @@ impl L7EndpointConfig {
             self.path.chars().filter(|c| *c != '*').count()
         }
     }
+
+    pub fn deny_uninspected_body_credentials(&self, has_resolver: bool) -> bool {
+        !self.allow_uninspected_credentials && (self.provider_credentialed || has_resolver)
+    }
 }
 
 pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
@@ -277,6 +332,34 @@ pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
         Some("skip") => TlsMode::Skip,
         // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointCredentialGuard {
+    pub provider_credentialed: bool,
+    pub allow_uninspected_credentials: bool,
+    pub has_l7_protocol: bool,
+    pub tls: TlsMode,
+}
+
+impl EndpointCredentialGuard {
+    pub fn blocks_uninspected(self) -> bool {
+        self.provider_credentialed && !self.allow_uninspected_credentials
+    }
+
+    pub fn blocks_connect(self) -> bool {
+        self.blocks_uninspected() && (!self.has_l7_protocol || self.tls == TlsMode::Skip)
+    }
+}
+
+pub fn parse_endpoint_credential_guard(val: &regorus::Value) -> EndpointCredentialGuard {
+    EndpointCredentialGuard {
+        provider_credentialed: get_object_bool(val, "provider_credentialed").unwrap_or(false),
+        allow_uninspected_credentials: get_object_bool(val, "allow_uninspected_credentials")
+            .unwrap_or(false),
+        has_l7_protocol: get_object_str(val, "protocol").is_some(),
+        tls: parse_tls_mode(val),
     }
 }
 
@@ -919,6 +1002,69 @@ fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
 /// warnings are logged but don't block.
+fn additional_l7_fields(ep: &serde_json::Value) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    let non_empty_string = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let enabled = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    for (name, present) in [
+        ("enforcement", non_empty_string("enforcement")),
+        ("path", non_empty_string("path")),
+        ("allow_encoded_slash", enabled("allow_encoded_slash")),
+        (
+            "websocket_credential_rewrite",
+            enabled("websocket_credential_rewrite"),
+        ),
+        (
+            "request_body_credential_rewrite",
+            enabled("request_body_credential_rewrite"),
+        ),
+        ("persisted_queries", non_empty_string("persisted_queries")),
+        (
+            "graphql_persisted_queries",
+            ep.get("graphql_persisted_queries").is_some(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            ep.get("graphql_max_body_bytes").is_some(),
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            ep.get("json_rpc_max_body_bytes").is_some(),
+        ),
+        (
+            "mcp.strict_tool_names",
+            ep.get("mcp_strict_tool_names").is_some(),
+        ),
+        (
+            "mcp.allow_all_known_mcp_methods",
+            ep.get("mcp_allow_all_known_mcp_methods").is_some(),
+        ),
+        ("credential_signing", non_empty_string("credential_signing")),
+        ("signing_service", non_empty_string("signing_service")),
+        ("signing_region", non_empty_string("signing_region")),
+        (
+            "credential_binding",
+            ep.get("credential_binding")
+                .is_some_and(|value| !value.is_null()),
+        ),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
+}
+
 pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -1049,6 +1195,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 allow_all_known_mcp_methods: mcp_allow_all_known_mcp_methods,
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                errors.push(format!("{loc}: {msg}"));
+            }
+            for msg in validate_explicit_tcp_additional_fields(protocol, &additional_l7_fields(ep))
+            {
                 errors.push(format!("{loc}: {msg}"));
             }
 
@@ -1675,6 +1825,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_endpoint_credential_guard_handles_l4_and_opt_in() {
+        let guarded = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true}"#,
+        )
+        .unwrap();
+        let guard = parse_endpoint_credential_guard(&guarded);
+        assert!(guard.blocks_connect());
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true,"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(!parse_endpoint_credential_guard(&opted_in).blocks_connect());
+    }
+
+    #[test]
+    fn generic_resolver_enables_rest_body_backstop_without_provider_marker() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443]}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.deny_uninspected_body_credentials(false));
+        assert!(config.deny_uninspected_body_credentials(true));
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443],"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !parse_l7_config(&opted_in)
+                .unwrap()
+                .deny_uninspected_body_credentials(true)
+        );
+    }
+
+    #[test]
     fn parse_l7_config_allow_encoded_slash_defaults_false() {
         let val = regorus::Value::from_json_str(
             r#"{"protocol": "rest", "host": "api.example.com", "port": 443}"#,
@@ -1795,6 +1982,63 @@ mod tests {
                 .any(|w| w.contains("websocket_credential_rewrite is ignored")),
             "expected websocket_credential_rewrite warning: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn validate_explicit_tcp_rejects_additional_l7_field_families() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "database.example.com",
+                        "port": 5432,
+                        "protocol": "tcp",
+                        "enforcement": "enforce",
+                        "path": "/query",
+                        "allow_encoded_slash": true,
+                        "websocket_credential_rewrite": true,
+                        "request_body_credential_rewrite": true,
+                        "persisted_queries": "allow_registered",
+                        "graphql_persisted_queries": {},
+                        "graphql_max_body_bytes": 1024,
+                        "json_rpc_max_body_bytes": 1024,
+                        "mcp_strict_tool_names": false,
+                        "mcp_allow_all_known_mcp_methods": false,
+                        "credential_signing": "sigv4",
+                        "signing_service": "rds",
+                        "signing_region": "us-west-2",
+                        "credential_binding": {"provider": "database"}
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        let tcp_error = errors
+            .iter()
+            .find(|error| error.contains("protocol tcp does not support L7-only fields"))
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp.strict_tool_names",
+            "mcp.allow_all_known_mcp_methods",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+            "credential_binding",
+        ] {
+            assert!(tcp_error.contains(field), "missing {field}: {tcp_error}");
+        }
     }
 
     #[test]

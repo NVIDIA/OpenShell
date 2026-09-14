@@ -100,8 +100,8 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
-if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://[::1]:17670" ]; then
-  echo "FAIL: macOS local gateway endpoint must use IPv6 loopback" >&2
+if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://localhost:17670" ]; then
+  echo "FAIL: macOS local gateway endpoint must use a TLS-compatible loopback hostname" >&2
   exit 1
 fi
 

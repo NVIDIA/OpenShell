@@ -72,13 +72,9 @@ curl -sf http://localhost:8080/healthz
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-**From PyPI (any platform with [uv](https://docs.astral.sh/uv/)):**
-
-```shell
-uv tool install -U openshell
-```
-
 <Note>
+The `openshell` package on PyPI provides the Python SDK only and does not install the CLI.
+
 On Windows without WSL, install the CLI inside a WSL 2 distribution (for example AlmaLinux or Ubuntu) and run all `openshell` commands from that distribution.
 </Note>
 

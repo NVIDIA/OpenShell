@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: VM E2E Test
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+      gateway-artifact:
+        required: false
+        type: string
+        default: ""
+      suite-name:
+        required: false
+        type: string
+        default: managed
+      e2e-task:
+        required: false
+        type: string
+        default: e2e:vm
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  e2e:
+    name: E2E (rust-vm-${{ inputs.suite-name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e-cli
+
+      - uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-name: ${{ inputs.gateway-artifact }}
+
+      - uses: ./.github/actions/setup-e2e-vm-driver
+
+      - uses: ./.github/actions/setup-e2e-vm
+
+      - name: Run tests
+        env:
+          E2E_TASK: ${{ inputs.e2e-task }}
+        run: mise run --no-deps --skip-deps "$E2E_TASK"

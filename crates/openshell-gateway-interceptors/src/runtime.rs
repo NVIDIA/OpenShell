@@ -14,6 +14,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorEvaluation, InterceptorResult, JsonPatch, ModifyOperationEvaluation,
     PostCommitEvaluation, ValidateEvaluation, interceptor_evaluation,
 };
+use openshell_extension_core::BearerTokenSlot;
 use prost::Message as _;
 use prost_types::Struct;
 use serde_json::{Map, Value};
@@ -77,10 +78,13 @@ impl ValidatedOperation {
 }
 
 impl GatewayInterceptorRuntime {
-    pub(crate) async fn build(configs: Vec<GatewayInterceptorConfig>) -> Result<Self> {
+    pub(crate) async fn build(
+        configs: Vec<GatewayInterceptorConfig>,
+        token_slots: Option<BTreeMap<String, BearerTokenSlot>>,
+    ) -> Result<Self> {
         let codec = ProtoJsonCodec::openshell()?;
         let routes = routes::OpenShellRouteIndex::from_descriptor_pool(codec.descriptor_pool())?;
-        let plan = ExecutionPlan::load(configs, routes).await?;
+        let plan = ExecutionPlan::load(configs, routes, token_slots).await?;
         Ok(Self {
             plan: Arc::new(plan),
             codec,
@@ -602,6 +606,7 @@ mod tests {
         CreateProviderRequest, CreateSandboxRequest, Provider, SandboxSpec, SandboxTemplate,
         UpdateConfigRequest,
     };
+    use openshell_extension_core::BearerTokenInterceptor;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{
@@ -724,8 +729,9 @@ mod tests {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_patches: DEFAULT_MAX_PATCHES,
-            client: GatewayInterceptorClient::new(
+            client: GatewayInterceptorClient::with_interceptor(
                 Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                BearerTokenInterceptor::disabled(),
             ),
         }
     }
@@ -923,8 +929,9 @@ mod tests {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_patches: DEFAULT_MAX_PATCHES,
-            client: GatewayInterceptorClient::new(
+            client: GatewayInterceptorClient::with_interceptor(
                 Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                BearerTokenInterceptor::disabled(),
             ),
         };
         let result = InterceptorResult {
@@ -1107,8 +1114,9 @@ mod tests {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_patches: DEFAULT_MAX_PATCHES,
-            client: GatewayInterceptorClient::new(
+            client: GatewayInterceptorClient::with_interceptor(
                 Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                BearerTokenInterceptor::disabled(),
             ),
         };
         let operation = json!({ "name": "demo" });

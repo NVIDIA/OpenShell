@@ -26,7 +26,7 @@ export GH_NO_UPDATE_NOTIFIER=1
 export GH_NO_EXTENSION_UPDATE_NOTIFIER=1
 export GH_TELEMETRY=false
 export DO_NOT_TRACK=1
-export HOME=/sandbox/home
+export HOME="${OPENSHELL_AGENT_HOME:-/sandbox/home}"
 
 echo "openshell-agent: preparing Codex harness auth and workspace" >&2
 mkdir -p "$HOME/.codex"
@@ -34,13 +34,9 @@ node - <<'NODE'
 const fs = require("fs");
 const path = `${process.env.HOME}/.codex/auth.json`;
 const b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
-const providerPlaceholder = (envName) => {
-  const value = process.env[envName];
-  if (value && value.startsWith("openshell:resolve:env:")) {
-    return `openshell:resolve:env:${envName}`;
-  }
-  return value;
-};
+// Preserve gateway-issued revision and stable-handle placeholders verbatim.
+// Endpoint-bound credentials reject identityless aliases by design.
+const providerValue = (envName) => process.env[envName];
 const now = Math.floor(Date.now() / 1000);
 const fallbackIdToken = [
   b64u({ alg: "none", typ: "JWT" }),
@@ -59,10 +55,10 @@ fs.writeFileSync(path, JSON.stringify({
   auth_mode: "chatgpt",
   OPENAI_API_KEY: null,
   tokens: {
-    id_token: providerPlaceholder("CODEX_AUTH_ID_TOKEN") || fallbackIdToken,
-    access_token: providerPlaceholder("CODEX_AUTH_ACCESS_TOKEN"),
-    refresh_token: providerPlaceholder("CODEX_AUTH_REFRESH_TOKEN") || "gateway-managed-refresh-token",
-    account_id: providerPlaceholder("CODEX_AUTH_ACCOUNT_ID"),
+    id_token: providerValue("CODEX_AUTH_ID_TOKEN") || fallbackIdToken,
+    access_token: providerValue("CODEX_AUTH_ACCESS_TOKEN"),
+    refresh_token: providerValue("CODEX_AUTH_REFRESH_TOKEN") || "gateway-managed-refresh-token",
+    account_id: providerValue("CODEX_AUTH_ACCOUNT_ID"),
   },
   last_refresh: new Date().toISOString(),
 }, null, 2));

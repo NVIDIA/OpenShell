@@ -11,7 +11,7 @@ Review an issue that outlines a security, vulnerability, or privacy concern.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
-- The issue must have `topic:security`. In unattended queue mode it must also have `agent:plan-requested`; a direct user request to review a specific issue does not require that label.
+- The issue must have `topic:security`. In unattended queue mode it must also have `agent:plan-requested`; for a direct user request, warn if that workflow label is missing and continue without changing it.
 
 ## Agent Comment Marker
 
@@ -44,7 +44,7 @@ First, check the issue's labels from the metadata fetched in Step 1.
 - **If the issue has `agent:implementation-requested`**, the issue has already been reviewed and a human authorized remediation. There is no review to perform. Suggest using `fix-security-issue` and stop.
 - **If `topic:security` is missing**, report that this specialized skill only reviews security issues and stop.
 - **If this is queue mode and `agent:plan-requested` is missing**, report that the issue is not ready for unattended pickup and stop.
-- **If the user directly requested review of this issue**, proceed even when `agent:plan-requested` is absent. Never add or offer to add the human-only request label.
+- **If the user directly requested review of this issue**, warn that `agent:plan-requested` is missing, then proceed without it. Never add or offer to add the human-only request label.
 
 Next, fetch existing comments on the issue:
 
@@ -145,7 +145,7 @@ After posting a legitimate-concern review with a remediation plan, replace `agen
 gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"
 ```
 
-This signals that an unattended agent produced a remediation plan that awaits human review. For an unlabeled direct invocation, leave the `agent:*` labels unchanged. A later direct request can authorize remediation without `agent:implementation-requested`; unattended remediation still requires that label. For a not-actionable determination, remove `agent:plan-requested` if present, do not add another `agent:*` label, and report that a human should close the issue or record the risk decision.
+This signals that an unattended agent produced a remediation plan that awaits human review. For an unlabeled direct invocation, leave the `agent:*` labels unchanged. A later direct request can authorize remediation without `agent:implementation-requested`; warn that the expected label is missing and continue, while unattended remediation still requires that label. For a not-actionable determination, remove `agent:plan-requested` if present, do not add another `agent:*` label, and report that a human should close the issue or record the risk decision.
 
 ## Step 6: Address Follow-up Comments
 

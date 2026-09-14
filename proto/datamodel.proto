@@ -68,6 +68,17 @@ message Workspace {
   WorkspaceStatus status = 2;
 }
 
+// Opaque handle for a provider credential stored by gateway credential storage.
+// Handles are created by OpenShell and must not be authored by users.
+message CredentialHandle {
+  // Internal storage owner or credential driver that owns this handle.
+  string driver = 1;
+  // Owner-owned opaque handle string.
+  string handle = 2;
+  // Owner-owned non-secret metadata.
+  map<string, string> metadata = 3;
+}
+
 // Provider model stored by OpenShell.
 message Provider {
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
@@ -85,4 +96,7 @@ message Provider {
   // Empty string = platform/global scope. Must be empty or match
   // metadata.workspace; cross-workspace references are rejected.
   string profile_workspace = 6;
+  // Opaque handles for secret values stored through gateway credential storage.
+  // This map is internal gateway state and is not accepted as user-authored input.
+  map<string, CredentialHandle> credential_handles = 7;
 }

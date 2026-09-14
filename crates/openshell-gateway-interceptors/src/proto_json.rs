@@ -371,6 +371,7 @@ mod tests {
             ("openshell.compute.v1.DriverSandboxSpec", "sandbox_token"),
             ("openshell.v1.IssueSandboxTokenResponse", "token"),
             ("openshell.v1.RefreshSandboxTokenResponse", "token"),
+            ("openshell.v1.ExtensionServiceCredential", "token"),
             ("openshell.v1.CreateSshSessionResponse", "token"),
             ("openshell.v1.RevokeSshSessionRequest", "token"),
             ("openshell.v1.TcpForwardInit", "authorization_token"),

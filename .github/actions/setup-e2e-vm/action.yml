@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup E2E VM
+description: Configure a bare Linux KVM host for VM E2E tests
+
+inputs:
+  mise-version:
+    description: mise release to install
+    required: false
+    default: v2026.4.25
+  rust-cache-key:
+    description: Shared key for Rust test artifacts
+    required: false
+    default: e2e-vm-linux-amd64
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          libssl-dev \
+          openssh-client \
+          pkg-config \
+          socat \
+          zstd
+
+    - name: Enable KVM access
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ ! -c /dev/kvm ]]; then
+          echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
+          lscpu
+          grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
+          ls -la /dev
+          exit 1
+        fi
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --settle --name-match=kvm
+        ls -l /dev/kvm
+        exec 3<>/dev/kvm
+        exec 3>&-
+
+    - name: Validate VM host tools
+      shell: bash
+      run: |
+        command -v mke2fs
+        command -v mkfs.ext4
+        command -v debugfs
+
+    - uses: ./.github/actions/setup-mise
+      with:
+        version: ${{ inputs.mise-version }}
+
+    - name: Cache Rust target and registry
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.rust-cache-key }}
+        cache-on-failure: "true"

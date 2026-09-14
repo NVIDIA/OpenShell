@@ -38,11 +38,13 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
-    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
@@ -52,6 +54,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_vfio::SysfsRoot;
+use opentelemetry::trace::TraceContextExt as _;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -72,7 +75,8 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{Instrument as _, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::{Host, Url};
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
@@ -143,12 +147,12 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Both names ultimately route through the gvproxy NAT path on
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
-const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
-const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
-const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
-const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
-const GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
-const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
+const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
+const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
+const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
 /// `init.d` drop-ins the guest init script is allowed to execute.
 ///
@@ -156,13 +160,18 @@ const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 /// else found under `init.d` — e.g. files baked into a user-controlled
 /// guest image — is ignored. The driver writes this file into the overlay
 /// upperdir on every launch, so the image cannot forge or shadow it.
-const GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
+const GUEST_INIT_DROPIN_MANIFEST: &str =
+    openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
+const SANDBOX_STOPPED_FILE: &str = "stopped";
+/// Durable tombstone preventing driver restart from relaunching a sandbox
+/// whose canonical main process already terminated.
+const MAIN_PROCESS_EXITED_FILE: &str = "main-process-exited";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -392,6 +401,27 @@ enum OverlayPreparation {
     PreserveExisting,
 }
 
+fn provisioning_span(
+    parent: &opentelemetry::Context,
+    sandbox_id: &str,
+    image_ref: &str,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: None,
+        "vm.provision",
+        otel.name = "vm.provision",
+        otel.status_code = tracing::field::Empty,
+        sandbox.id = %sandbox_id,
+        image.ref = %image_ref,
+    );
+    let parent_span_context = parent.span().span_context().clone();
+    if parent_span_context.is_valid() {
+        let parent = opentelemetry::Context::new().with_remote_span_context(parent_span_context);
+        let _ = span.set_parent(parent);
+    }
+    span
+}
+
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
@@ -493,6 +523,7 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
         }
     }
 
@@ -580,7 +611,7 @@ impl VmDriver {
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
-                "write sandbox resume metadata failed: {err}"
+                "write sandbox start metadata failed: {err}"
             )));
         }
 
@@ -600,17 +631,22 @@ impl VmDriver {
         let sandbox_id = sandbox.id.clone();
         let image_ref_for_task = image_ref.clone();
         let state_dir_for_task = state_dir.clone();
-        let task = tokio::spawn(async move {
-            driver
-                .provision_sandbox(
-                    sandbox_for_task,
-                    image_ref_for_task,
-                    state_dir_for_task,
-                    tls_paths,
-                    OverlayPreparation::Fresh,
-                )
-                .await;
-        });
+        let parent = tracing::Span::current().context();
+        let provisioning_span = provisioning_span(&parent, &sandbox_id, &image_ref);
+        let task = tokio::spawn(
+            async move {
+                driver
+                    .provision_sandbox(
+                        sandbox_for_task,
+                        image_ref_for_task,
+                        state_dir_for_task,
+                        tls_paths,
+                        OverlayPreparation::Fresh,
+                    )
+                    .await;
+            }
+            .instrument(provisioning_span),
+        );
 
         let mut registry = self.registry.lock().await;
         if let Some(record) = registry.get_mut(&sandbox_id) {
@@ -645,6 +681,7 @@ impl VmDriver {
             )
             .await
         {
+            tracing::Span::current().record("otel.status_code", "ERROR");
             if err.code() == tonic::Code::Cancelled {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
@@ -942,7 +979,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let child = match command.spawn() {
+        let child = match spawn_vm_launcher(&mut command, &sandbox.id, &plan.backend) {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -983,7 +1020,6 @@ impl VmDriver {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
                     record.qemu_network_allocated = plan.backend == VmBackend::Qemu;
-                    record.provisioning_task = None;
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -1029,11 +1065,145 @@ impl VmDriver {
         Ok(())
     }
 
+    pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let record_id = {
+            let registry = self.registry.lock().await;
+            if registry.contains_key(sandbox_id) {
+                Some(sandbox_id.to_string())
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .map(|(id, _)| id.clone())
+            }
+        }
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry
+                .get(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?
+                .state_dir
+                .clone()
+        };
+
+        // Persist intent before detaching process handles or releasing host
+        // allocations. If this write fails, the live record remains intact.
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .map_err(|err| Status::internal(format!("persist stop marker failed: {err}")))?;
+
+        let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
+            let mut registry = self.registry.lock().await;
+            let record = registry
+                .get_mut(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                record.process.take(),
+                record.provisioning_task.take(),
+                record.gpu_bdf.take().is_some(),
+                std::mem::take(&mut record.qemu_network_allocated),
+                record.snapshot.clone(),
+            )
+        };
+
+        if let Some(task) = provisioning_task {
+            task.abort();
+        }
+        if let Some(process) = process {
+            let mut process = process.lock().await;
+            process.deleting = true;
+            terminate_vm_process(&mut process.child)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+        }
+        self.lifecycle_extensions
+            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
+            .await;
+        self.release_allocations(&record_id, has_gpu, has_qemu_network);
+
+        if let Some(snapshot) = self
+            .set_snapshot_condition(&record_id, stopped_condition(), false)
+            .await
+        {
+            self.publish_snapshot(snapshot);
+        }
+        self.publish_platform_event(
+            record_id,
+            platform_event("vm", "Normal", "Stopped", "VM sandbox stopped".to_string()),
+        );
+        Ok(())
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let (record_id, state_dir, already_running) = {
+            let registry = self.registry.lock().await;
+            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
+                entry
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?
+            };
+            (
+                id.clone(),
+                record.state_dir.clone(),
+                record.process.is_some() || record.provisioning_task.is_some(),
+            )
+        };
+        if already_running {
+            return Ok(());
+        }
+
+        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|err| {
+                Status::internal(format!("read sandbox start metadata failed: {err}"))
+            })?;
+        let stopped_record = self
+            .registry
+            .lock()
+            .await
+            .remove(&record_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let restored = self
+            .restore_persisted_sandbox(sandbox, state_dir, true, &tracing::Span::current())
+            .await;
+        if !restored {
+            self.registry
+                .lock()
+                .await
+                .entry(record_id)
+                .or_insert(stopped_record);
+            return Err(Status::internal("failed to start persisted VM sandbox"));
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        name = "vm.delete",
+        skip(self),
+        fields(
+            otel.name = "vm.delete",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            sandbox.name = %sandbox_name,
+        )
+    )]
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResponse, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
@@ -1051,7 +1221,7 @@ impl VmDriver {
         };
 
         let Some(record_id) = record_id else {
-            return Ok(DeleteSandboxResponse { deleted: false });
+            return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
         };
 
         let (
@@ -1064,7 +1234,7 @@ impl VmDriver {
         ) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(&record_id) else {
-                return Ok(DeleteSandboxResponse { deleted: false });
+                return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
             };
             record.deleting = true;
             (
@@ -1110,7 +1280,7 @@ impl VmDriver {
         }
 
         self.publish_deleted(record_id);
-        Ok(DeleteSandboxResponse { deleted: true })
+        span_status.finish(Ok(DeleteSandboxResponse { deleted: true }))
     }
 
     pub async fn get_sandbox(
@@ -1146,6 +1316,14 @@ impl VmDriver {
         snapshots
     }
 
+    #[tracing::instrument(
+        name = "reconcile",
+        skip_all,
+        fields(
+            otel.name = "reconcile.sandboxes",
+            driver.name = "vm",
+        )
+    )]
     async fn restore_persisted_sandboxes(&self) {
         let state_root = sandboxes_root_dir(&self.config.state_dir);
         let mut entries = match tokio::fs::read_dir(&state_root).await {
@@ -1216,18 +1394,81 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir).await;
+            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok()
+            {
+                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
+                continue;
+            }
+
+            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap_or(false)
+            {
+                let snapshot = sandbox_snapshot(
+                    &sandbox,
+                    error_condition(
+                        "ProcessExited",
+                        "Canonical main process exited before VM driver restart",
+                    ),
+                    false,
+                );
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(
+                    sandbox_id = %sandbox.id,
+                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                );
+                continue;
+            }
+
+            self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
+                .await;
         }
     }
 
-    async fn restore_persisted_sandbox(&self, sandbox: Sandbox, state_dir: PathBuf) {
+    /// Restore a persisted sandbox and report whether the driver accepted it.
+    /// For explicit start, the stop marker is cleared only after all
+    /// restore preflight checks pass and the replacement registry record is
+    /// installed. A failed restore therefore remains durably stopped.
+    async fn restore_persisted_sandbox(
+        &self,
+        sandbox: Sandbox,
+        state_dir: PathBuf,
+        clear_stop_marker: bool,
+        reconciliation_span: &tracing::Span,
+    ) -> bool {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
                 "vm driver: cannot restore persisted sandbox without image"
             );
-            return;
+            return false;
         };
         let tls_paths = match self.config.tls_paths() {
             Ok(paths) => paths,
@@ -1238,7 +1479,7 @@ impl VmDriver {
                     error = %err,
                     "vm driver: cannot restore persisted sandbox TLS configuration"
                 );
-                return;
+                return false;
             }
         };
 
@@ -1250,7 +1491,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: cannot restore persisted sandbox extension state"
             );
-            return;
+            return false;
         }
 
         let persisted = RestoreContext {
@@ -1265,14 +1506,14 @@ impl VmDriver {
                 error = %err,
                 "vm driver: lifecycle extension rejected persisted sandbox restore"
             );
-            return;
+            return false;
         }
 
         let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                return;
+                return false;
             }
             registry.insert(
                 sandbox.id.clone(),
@@ -1288,6 +1529,23 @@ impl VmDriver {
             );
         }
 
+        if clear_stop_marker {
+            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    self.registry.lock().await.remove(&sandbox.id);
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: cannot clear stop marker for persisted sandbox restore"
+                    );
+                    return false;
+                }
+            }
+        }
+
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -1301,17 +1559,32 @@ impl VmDriver {
 
         let driver = self.clone();
         let sandbox_id = sandbox.id.clone();
-        let task = tokio::spawn(async move {
-            driver
-                .provision_sandbox(
-                    sandbox,
-                    image_ref,
-                    state_dir,
-                    tls_paths,
-                    OverlayPreparation::PreserveExisting,
-                )
-                .await;
-        });
+        let restoration_span = tracing::info_span!(
+            parent: reconciliation_span,
+            "vm.restore",
+            otel.name = "vm.restore",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        );
+        let reconciliation_span = reconciliation_span.clone();
+        let provisioning_span =
+            provisioning_span(&restoration_span.context(), &sandbox_id, &image_ref);
+        let task = tokio::spawn(
+            async move {
+                driver
+                    .provision_sandbox(
+                        sandbox,
+                        image_ref,
+                        state_dir,
+                        tls_paths,
+                        OverlayPreparation::PreserveExisting,
+                    )
+                    .await;
+                drop(reconciliation_span);
+            }
+            .instrument(provisioning_span)
+            .instrument(restoration_span),
+        );
 
         let mut registry = self.registry.lock().await;
         if let Some(record) = registry.get_mut(&sandbox_id) {
@@ -1323,6 +1596,7 @@ impl VmDriver {
         } else {
             task.abort();
         }
+        true
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -1605,6 +1879,21 @@ impl VmDriver {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_for_provisioning_for_test(&self, sandbox_id: &str) {
+        let task = self
+            .registry
+            .lock()
+            .await
+            .get_mut(sandbox_id)
+            .and_then(|record| record.provisioning_task.take())
+            .unwrap_or_else(|| panic!("provisioning task for {sandbox_id}"));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap_or_else(|_| panic!("provisioning task for {sandbox_id} timed out"))
+            .unwrap_or_else(|err| panic!("provisioning task for {sandbox_id} failed: {err}"));
+    }
+
     async fn assign_gpu_to_record(
         &self,
         sandbox_id: &str,
@@ -1658,7 +1947,6 @@ impl VmDriver {
                 return;
             }
             record.process = None;
-            record.provisioning_task = None;
             record.gpu_bdf = None;
             record.qemu_network_allocated = false;
             record.snapshot.status = Some(status_with_condition(
@@ -1686,11 +1974,22 @@ impl VmDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "vm.prepare_images",
+        skip(self),
+        fields(
+            otel.name = "vm.prepare_images",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            image.ref = %image_ref,
+        )
+    )]
     async fn prepare_runtime_images(
         &self,
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<RuntimeImagePlan, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
@@ -1698,23 +1997,23 @@ impl VmDriver {
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
 
         if image_ref.trim() == bootstrap_image_ref.trim() {
-            return Ok(RuntimeImagePlan {
+            return span_status.finish(Ok(RuntimeImagePlan {
                 root_disk,
                 image_disk: None,
                 image_identity: bootstrap_image_identity.clone(),
                 bootstrap_image_identity,
-            });
+            }));
         }
 
         let prepared = self
             .ensure_prepared_image_disk(sandbox_id, image_ref, &root_disk)
             .await?;
-        Ok(RuntimeImagePlan {
+        span_status.finish(Ok(RuntimeImagePlan {
             root_disk,
             image_disk: Some(prepared.disk_path),
             image_identity: prepared.image_identity,
             bootstrap_image_identity,
-        })
+        }))
     }
 
     fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
@@ -1729,6 +2028,16 @@ impl VmDriver {
         sandbox_image_ref.to_string()
     }
 
+    #[tracing::instrument(
+        name = "vm.prepare_overlay",
+        skip_all,
+        fields(
+            otel.name = "vm.prepare_overlay",
+            otel.status_code = tracing::field::Empty,
+            overlay.path = %overlay_disk.display(),
+            preparation = ?preparation,
+        )
+    )]
     async fn prepare_runtime_overlay(
         &self,
         overlay_disk: &Path,
@@ -1736,6 +2045,7 @@ impl VmDriver {
         sandbox_token: Option<&str>,
         preparation: OverlayPreparation,
     ) -> Result<(), String> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let tls_materials = match tls_paths {
             Some(paths) => Some(read_guest_tls_materials(paths).await?),
             None => None,
@@ -1764,7 +2074,7 @@ impl VmDriver {
             .map_err(|err| format!("overlay template preparation panicked: {err}"))??;
         }
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_overlay_image(
                 &template_path,
                 &overlay_disk,
@@ -1775,7 +2085,8 @@ impl VmDriver {
             )
         })
         .await
-        .map_err(|err| format!("overlay image preparation panicked: {err}"))?
+        .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
+        span_status.finish(result)
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -1787,15 +2098,26 @@ impl VmDriver {
             })
     }
 
+    #[tracing::instrument(
+        name = "vm.resolve_bootstrap_image",
+        skip(self),
+        fields(
+            otel.name = "vm.resolve_bootstrap_image",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            image.ref = %image_ref,
+        )
+    )]
     async fn ensure_cached_bootstrap_rootfs_image(
         &self,
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if let Some((engine, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
-            return self
+            let result = self
                 .ensure_cached_local_image_rootfs_image(
                     sandbox_id,
                     image_ref,
@@ -1803,6 +2125,7 @@ impl VmDriver {
                     &image_identity,
                 )
                 .await;
+            return span_status.finish(result);
         }
 
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
@@ -1884,7 +2207,7 @@ impl VmDriver {
             );
             self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity);
+            return span_status.finish(Ok(image_identity));
         }
 
         info!(
@@ -1934,7 +2257,7 @@ impl VmDriver {
             );
             self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity);
+            return span_status.finish(Ok(image_identity));
         }
 
         self.build_cached_registry_image_rootfs_image(
@@ -1948,7 +2271,7 @@ impl VmDriver {
         .await?;
         self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
-        Ok(image_identity)
+        span_status.finish(Ok(image_identity))
     }
 
     async fn resolve_local_container_image(
@@ -2876,6 +3199,25 @@ impl VmDriver {
             };
 
             if let Some(status) = exit_status {
+                let state_dir = {
+                    let registry = self.registry.lock().await;
+                    registry
+                        .get(&sandbox_id)
+                        .map(|record| record.state_dir.clone())
+                };
+                if let Some(state_dir) = state_dir
+                    && let Err(error) = write_private_file(
+                        &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+                        b"terminal\n".to_vec(),
+                    )
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "vm driver: failed to persist canonical-process exit tombstone"
+                    );
+                }
                 let message = status.code().map_or_else(
                     || "VM process exited".to_string(),
                     |code| format!("VM process exited with status {code}"),
@@ -3061,11 +3403,22 @@ impl ComputeDriver for VmDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the vm compute driver",
-        ))
+        let request = request.into_inner();
+        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -3109,7 +3462,11 @@ impl ComputeDriver for VmDriver {
             }
 
             loop {
-                match rx.recv().await {
+                let event = tokio::select! {
+                    () = tx.closed() => return,
+                    event = rx.recv() => event,
+                };
+                match event {
                     Ok(event) => {
                         if let Some(watch_sandboxes_event::Payload::Sandbox(sandbox_event)) =
                             &event.payload
@@ -3128,7 +3485,22 @@ impl ComputeDriver for VmDriver {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+        let stream: Self::WatchSandboxesStream = Box::pin(ReceiverStream::new(out_rx));
+        Ok(Response::new(stream))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -4117,9 +4489,17 @@ fn build_guest_environment(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         GUEST_SSH_SOCKET_PATH.to_string(),
     );
+    // The libkrun guest environment path does not preserve spaces in values
+    // before guest startup. Use a whitespace-free base64url envelope so
+    // command arguments remain lossless.
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
+            sandbox.spec.as_ref(),
+        )
+        .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        "tail -f /dev/null".to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
@@ -4143,8 +4523,19 @@ fn build_guest_environment(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    // Runtime capabilities are driver-owned. The VM driver does not yet
+    // provide policy DNS and transparent TCP interception.
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        String::new(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     if sandbox
         .spec
         .as_ref()
@@ -4677,10 +5068,21 @@ fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), St
 }
 
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(
+    name = "vm.prepare_guest",
+    skip(dropins),
+    fields(
+        otel.name = "vm.prepare_guest",
+        otel.status_code = tracing::field::Empty,
+        overlay.path = %overlay_disk.display(),
+        dropin.count = dropins.len(),
+    )
+)]
 fn inject_guest_init_dropins(
     overlay_disk: &Path,
     dropins: &[GuestInitDropin],
 ) -> Result<(), Status> {
+    let span_status = openshell_otel::ErrorStatusGuard::current();
     validate_guest_init_dropins(dropins).map_err(Status::failed_precondition)?;
 
     // Drop-ins are *executed* in a child shell by run_openshell_init_dropins
@@ -4709,7 +5111,7 @@ fn inject_guest_init_dropins(
     // explicitly injected this launch are eligible to run, and a guest
     // image cannot smuggle in extra `init.d` entries.
     write_guest_init_dropin_manifest(overlay_disk, dropins)?;
-    Ok(())
+    span_status.finish(Ok(()))
 }
 
 /// Render the drop-in allow-list as newline-separated, ASCII-sorted,
@@ -4979,6 +5381,24 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     }
 }
 
+#[tracing::instrument(
+    name = "vm.launch",
+    skip(command),
+    fields(
+        otel.name = "vm.launch",
+        otel.status_code = tracing::field::Empty,
+        sandbox.id = %sandbox_id,
+        vm.backend = ?backend,
+    )
+)]
+fn spawn_vm_launcher(
+    command: &mut Command,
+    sandbox_id: &str,
+    backend: &VmBackend,
+) -> Result<Child, std::io::Error> {
+    openshell_otel::record_error_result(command.spawn())
+}
+
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {
     Sandbox {
         id: sandbox.id.clone(),
@@ -5028,6 +5448,16 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn stopped_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Stopped".to_string(),
+        status: "True".to_string(),
+        reason: "ComputeStopped".to_string(),
+        message: "VM compute is stopped and persistent state is retained".to_string(),
         last_transition_time: String::new(),
     }
 }
@@ -5161,6 +5591,587 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    struct TestTracing {
+        exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+        _provider: opentelemetry_sdk::trace::SdkTracerProvider,
+        dispatch: tracing::Dispatch,
+    }
+
+    impl TestTracing {
+        fn new() -> Self {
+            use opentelemetry::trace::TracerProvider as _;
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer().with_tracer(provider.tracer("vm-driver-test")),
+            );
+            Self {
+                exporter,
+                _provider: provider,
+                dispatch: tracing::Dispatch::new(subscriber),
+            }
+        }
+    }
+
+    fn assert_is_root(span: &opentelemetry_sdk::trace::SpanData) {
+        assert_eq!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "{:?} should be a trace root",
+            span.name
+        );
+    }
+
+    fn assert_has_parent(span: &opentelemetry_sdk::trace::SpanData) {
+        assert_ne!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "{:?} should have a parent",
+            span.name
+        );
+    }
+
+    fn request_with_traceparent<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+
+    type TestDriverClient =
+        openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+            tonic::transport::Channel,
+        >;
+
+    struct TracedDriverClient {
+        client: TestDriverClient,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        server: JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl std::ops::Deref for TracedDriverClient {
+        type Target = TestDriverClient;
+
+        fn deref(&self) -> &Self::Target {
+            &self.client
+        }
+    }
+
+    impl std::ops::DerefMut for TracedDriverClient {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.client
+        }
+    }
+
+    impl TracedDriverClient {
+        async fn shutdown(self) {
+            let Self {
+                client,
+                shutdown,
+                server,
+            } = self;
+            drop(client);
+            let _ = shutdown.send(());
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("traced driver test server should stop")
+                .expect("traced driver test server task should not panic")
+                .expect("traced driver test server should stop cleanly");
+        }
+    }
+
+    async fn traced_driver_client(driver: VmDriver) -> TracedDriverClient {
+        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(crate::otel_tracing::compute_driver_rpc_layer())
+                .add_service(ComputeDriverServer::new(driver))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+        });
+
+        let client = TestDriverClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        TracedDriverClient {
+            client,
+            shutdown,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rpc_span_continues_the_gateway_trace() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut client = traced_driver_client(driver).await;
+
+        client
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .await
+            .unwrap();
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let rpc_spans = spans
+            .iter()
+            .filter(|span| span.name == "driver.get_capabilities")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rpc_spans.len(),
+            1,
+            "middleware should create exactly one VM driver RPC span, got {:?}",
+            spans.iter().map(|span| &span.name).collect::<Vec<_>>()
+        );
+        let span = rpc_spans[0];
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span.parent_span_id.to_string(), "00f067aa0ba902b7");
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rpcs_record_server_spans_and_error_status() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut client = traced_driver_client(driver).await;
+
+        client
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
+                    sandbox: None,
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .create_sandbox(request_with_traceparent(CreateSandboxRequest {
+                    sandbox: None,
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .get_sandbox(request_with_traceparent(GetSandboxRequest {
+                    sandbox_id: String::new(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .is_err()
+        );
+        client
+            .list_sandboxes(request_with_traceparent(ListSandboxesRequest {}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .stop_sandbox(request_with_traceparent(StopSandboxRequest {
+                    sandbox_id: String::new(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .is_err()
+        );
+        client
+            .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
+                sandbox_id: String::new(),
+                sandbox_name: String::new(),
+            }))
+            .await
+            .unwrap();
+        let watch = client
+            .watch_sandboxes(request_with_traceparent(WatchSandboxesRequest {}))
+            .await
+            .unwrap();
+        drop(watch);
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let expected = [
+            "driver.get_capabilities",
+            "driver.validate_sandbox_create",
+            "driver.create_sandbox",
+            "driver.get_sandbox",
+            "driver.list_sandboxes",
+            "driver.stop_sandbox",
+            "driver.delete_sandbox",
+            "driver.watch_sandboxes",
+        ];
+        for name in expected {
+            let span = spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("missing {name} span"));
+            assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Server);
+            assert_has_parent(span);
+        }
+        for name in [
+            "driver.validate_sandbox_create",
+            "driver.create_sandbox",
+            "driver.get_sandbox",
+            "driver.stop_sandbox",
+        ] {
+            let span = spans.iter().find(|span| span.name == name).unwrap();
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{name} should record an error status, got {:?}",
+                span.status
+            );
+        }
+        let delete_rpc = spans
+            .iter()
+            .find(|span| span.name == "driver.delete_sandbox")
+            .expect("delete RPC span");
+        let cleanup = spans
+            .iter()
+            .find(|span| {
+                span.name == "vm.delete"
+                    && span.span_context.trace_id() == delete_rpc.span_context.trace_id()
+            })
+            .expect("delete cleanup span");
+        assert_has_parent(cleanup);
+    }
+
+    #[tokio::test]
+    async fn spawned_provisioning_and_phases_have_parents() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-spawned-trace".to_string(),
+            name: "spawned-trace".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "invalid image reference".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = request_with_traceparent(CreateSandboxRequest {
+            sandbox: Some(sandbox),
+        });
+
+        let mut client = traced_driver_client(driver.clone()).await;
+        client.create_sandbox(request).await.unwrap();
+        driver
+            .wait_for_provisioning_for_test("sb-spawned-trace")
+            .await;
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let provisioning = spans
+            .iter()
+            .find(|span| span.name == "vm.provision")
+            .expect("spawned provisioning span");
+        assert_has_parent(provisioning);
+        let prepare_images = spans
+            .iter()
+            .find(|span| span.name == "vm.prepare_images")
+            .expect("image preparation span");
+        assert_has_parent(prepare_images);
+        let resolve_bootstrap = spans
+            .iter()
+            .find(|span| span.name == "vm.resolve_bootstrap_image")
+            .expect("bootstrap image resolution span");
+        assert_has_parent(resolve_bootstrap);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_is_root_and_restore_operations_have_parents() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        for suffix in ["a", "b"] {
+            let sandbox = Sandbox {
+                id: format!("sb-restored-trace-{suffix}"),
+                name: format!("restored-trace-{suffix}"),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        image: "invalid image reference".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+            tokio::fs::create_dir_all(&state_dir).await.unwrap();
+            write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        }
+
+        driver.restore_persisted_sandboxes().await;
+        for suffix in ["a", "b"] {
+            driver
+                .wait_for_provisioning_for_test(&format!("sb-restored-trace-{suffix}"))
+                .await;
+        }
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+
+        let reconciliations = spans
+            .iter()
+            .filter(|span| span.name == "reconcile.sandboxes")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reconciliations.len(),
+            1,
+            "startup should reconcile all persisted sandboxes in one trace"
+        );
+        let reconciliation = reconciliations[0];
+        assert_is_root(reconciliation);
+        let restorations = spans
+            .iter()
+            .filter(|span| span.name == "vm.restore")
+            .collect::<Vec<_>>();
+        assert_eq!(restorations.len(), 2);
+        for restoration in restorations {
+            assert_has_parent(restoration);
+        }
+        let provisioning = spans
+            .iter()
+            .filter(|span| span.name == "vm.provision")
+            .collect::<Vec<_>>();
+        assert_eq!(provisioning.len(), 2);
+        for span in provisioning {
+            assert_has_parent(span);
+        }
+        let prepare_images = spans
+            .iter()
+            .filter(|span| span.name == "vm.prepare_images")
+            .collect::<Vec<_>>();
+        assert_eq!(prepare_images.len(), 2);
+        for span in prepare_images {
+            assert_has_parent(span);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_restore_terminal_canonical_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-terminal-main".to_string(),
+            name: "terminal-main".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "unused-image".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_private_file(
+            &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+            b"terminal\n".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).expect("terminal record");
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.reason == "ProcessExited" && condition.status == "False"
+        }));
+    }
+
+    #[tokio::test]
+    async fn background_provisioning_does_not_extend_the_rpc_span_lifetime() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let rpc = tracing::info_span!("driver.create_sandbox");
+        let entered = rpc.enter();
+        let provisioning =
+            provisioning_span(&rpc.context(), "sb-lifetime", "invalid image reference");
+        drop(entered);
+        drop(rpc);
+
+        assert!(
+            traced
+                .exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .any(|span| span.name == "driver.create_sandbox"),
+            "the RPC span should finish while background provisioning is still active"
+        );
+        drop(provisioning);
+    }
+
+    #[tokio::test]
+    async fn overlay_preparation_records_a_provisioning_phase_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.overlay_disk_mib = u64::MAX;
+        let parent = tracing::info_span!("vm.provision");
+
+        let result = driver
+            .prepare_runtime_overlay(Path::new("/unused"), None, None, OverlayPreparation::Fresh)
+            .instrument(parent)
+            .await;
+        assert!(result.is_err(), "overflow should stop before disk I/O");
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let overlay = spans
+            .iter()
+            .find(|span| span.name == "vm.prepare_overlay")
+            .expect("overlay preparation span");
+        assert_has_parent(overlay);
+        assert!(
+            matches!(overlay.status, opentelemetry::trace::Status::Error { .. }),
+            "failed overlay preparation should mark its phase span, got {:?}",
+            overlay.status
+        );
+    }
+
+    #[tokio::test]
+    async fn post_overlay_provisioning_stages_record_child_spans() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::with(vec![Arc::new(
+            AlwaysFailsExtension,
+        )]));
+        let sandbox = Sandbox {
+            id: "sb-post-overlay".to_string(),
+            ..Default::default()
+        };
+        let mut plan = driver
+            .build_vm_launch_plan(&sandbox.id, false, false, None)
+            .unwrap();
+        let provisioning = tracing::info_span!("vm.provision");
+
+        async {
+            driver
+                .lifecycle_extensions
+                .configure_launch(&sandbox, Path::new("/unused"), &mut plan)
+                .await
+                .unwrap();
+            let before_launch = driver
+                .lifecycle_extensions
+                .before_launch(&sandbox, Path::new("/unused"), &mut plan)
+                .await;
+            assert!(
+                before_launch.is_err(),
+                "the lifecycle hook should reject launch"
+            );
+            let invalid_dropin = GuestInitDropin::new("../invalid", Vec::new());
+            assert!(
+                inject_guest_init_dropins(Path::new("/unused"), &[invalid_dropin]).is_err(),
+                "an invalid drop-in should fail after creating its span"
+            );
+        }
+        .instrument(provisioning)
+        .await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        for name in [
+            "vm.configure_launch",
+            "vm.before_launch",
+            "vm.prepare_guest",
+        ] {
+            let span = spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("missing {name} span"));
+            assert_has_parent(span);
+        }
+        for name in ["vm.before_launch", "vm.prepare_guest"] {
+            let span = spans.iter().find(|span| span.name == name).unwrap();
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{name} should record an error status, got {:?}",
+                span.status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_spawn_failure_records_a_failed_provisioning_phase_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let provisioning = tracing::info_span!("vm.provision");
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+
+        let result =
+            async { spawn_vm_launcher(&mut command, "sb-launch-trace", &VmBackend::Libkrun) }
+                .instrument(provisioning)
+                .await;
+        assert!(result.is_err(), "the nonexistent launcher should fail");
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let launch = spans
+            .iter()
+            .find(|span| span.name == "vm.launch")
+            .expect("launcher span");
+        assert_has_parent(launch);
+        assert!(
+            matches!(launch.status, opentelemetry::trace::Status::Error { .. }),
+            "failed launcher spawn should mark its phase span, got {:?}",
+            launch.status
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_failure_marks_the_delete_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+
+        assert!(driver.delete_sandbox("../invalid", "").await.is_err());
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let deletion = spans
+            .iter()
+            .find(|span| span.name == "vm.delete")
+            .expect("delete span");
+        assert!(
+            matches!(deletion.status, opentelemetry::trace::Status::Error { .. }),
+            "failed deletion should mark its span, got {:?}",
+            deletion.status
+        );
+    }
 
     fn gpu_device_ids_config(device_ids: &[&str]) -> Struct {
         list_string_driver_config("gpu_device_ids", device_ids)
@@ -5655,13 +6666,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_request_metadata_round_trips_for_resume() {
+    async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
         let state_dir = base.join("sandboxes").join("sandbox-123");
         std::fs::create_dir_all(&state_dir).unwrap();
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
-            name: "resume-sandbox".to_string(),
+            name: "start-sandbox".to_string(),
             namespace: "vm-dev".to_string(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([("KEY".to_string(), "value".to_string())]),
@@ -5701,8 +6712,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn failed_start_preserves_stopped_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-stopped".to_string(),
+            name: "stopped".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+
+        let err = driver
+            .start_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .expect_err("start without an image should fail");
+
+        assert_eq!(err.code(), Code::Internal);
+        assert!(
+            tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its durable stop marker"
+        );
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .expect("failed start must retain its stopped registry record");
+        let condition = restored
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.first())
+            .expect("stopped condition");
+        assert_eq!(condition.r#type, "Stopped");
+        assert_eq!(condition.status, "True");
+    }
+
     #[test]
-    fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_preserves_existing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -5726,7 +6793,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -5991,6 +7058,87 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_identity_accepts_non_root_system_ids() {
+        let config = VmDriverConfig {
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
+            ..Default::default()
+        };
+        assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
+    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        // Requests persisted before the canonical-main contract have a
+        // present DriverSandboxSpec but no command or tty fields.
+        let sandbox = Sandbox {
+            id: "legacy-sandbox".to_string(),
+            name: "legacy-sandbox".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+            .expect("legacy persisted request should produce a valid main config");
+
+        assert_eq!(
+            main,
+            openshell_core::sandbox_env::MainProcessConfig::scratch()
+        );
+    }
+
+    #[test]
+    fn build_guest_environment_preserves_main_command_spaces() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let command = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo ready; while true; do sleep 1; done".to_string(),
+        ];
+        let sandbox = Sandbox {
+            id: "space-command".to_string(),
+            name: "space-command".to_string(),
+            spec: Some(SandboxSpec {
+                command: command.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+
+        assert!(!encoded.contains(char::is_whitespace));
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        assert_eq!(main.command, command);
+    }
+
+    #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -6020,6 +7168,36 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_strips_gateway_tls_server_name() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+                    "evil.attacker.example.com".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(
+            !env.iter().any(|v| v.starts_with(&format!(
+                "{}=",
+                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+            ))),
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
+        );
     }
 
     #[test]
@@ -6066,6 +7244,36 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn build_guest_environment_clears_unsupported_network_capabilities() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                    openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(env.contains(&format!(
+            "{}=",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+        )));
+        assert!(!env.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+        )));
     }
 
     #[test]

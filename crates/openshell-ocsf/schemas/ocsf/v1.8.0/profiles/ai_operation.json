@@ -1,0 +1,26 @@
+{
+    "attributes": {
+        "ai_model": {
+            "type": "object_t",
+            "description": "The AI Model object describes the characteristics of an AI/ML model. Examples include language models like GPT-4, embedding models like text-embedding-ada-002, and computer vision models like CLIP.",
+            "group": "context",
+            "requirement": "recommended",
+            "caption": "AI Model",
+            "object_type": "ai_model",
+            "object_name": "AI Model"
+        },
+        "message_context": {
+            "type": "object_t",
+            "description": "Communication context for AI system interactions including protocols, roles, clients, and session information for MCP and other AI communication systems.",
+            "group": "context",
+            "requirement": "optional",
+            "caption": "Message Context",
+            "object_type": "message_context",
+            "object_name": "Message Context"
+        }
+    },
+    "meta": "profile",
+    "name": "ai_operation",
+    "description": "AI-specific attributes for model operations, retrieval systems, and agent activities. e.g. model_name, total_token_counts etc.",
+    "caption": "AI Operation"
+}

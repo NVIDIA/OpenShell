@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# fs-readonly.yaml — Read-only grant + read-write share scenario.
+#
+# The read_only path is a prepared directory whose content the agent can read
+# but not write; the read_write path is DemoDir (host-visible share).
+# Used by the fs-readonly scenario in run-mxc-e2e.ps1.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only:
+    - "C:/work/openshell-mxc-e2e-ro-src"
+  read_write:
+    - "C:/work/openshell-mxc-e2e"

@@ -14,7 +14,7 @@ use std::fs;
 #[must_use]
 pub fn load_class_schema(class: &str) -> Value {
     let path = format!(
-        "{}/schemas/ocsf/v1.7.0/classes/{class}.json",
+        "{}/schemas/ocsf/v1.8.0/classes/{class}.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let data =
@@ -30,7 +30,7 @@ pub fn load_class_schema(class: &str) -> Value {
 #[must_use]
 pub fn load_object_schema(object: &str) -> Value {
     let path = format!(
-        "{}/schemas/ocsf/v1.7.0/objects/{object}.json",
+        "{}/schemas/ocsf/v1.8.0/objects/{object}.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let data =
@@ -43,15 +43,28 @@ pub fn load_object_schema(object: &str) -> Value {
 /// The OCSF schema stores attributes as an object where each key is a field name
 /// and the value contains a `requirement` field.
 pub fn validate_required_fields(event: &Value, schema: &Value) {
-    if let Some(attrs) = schema.get("attributes").and_then(|a| a.as_object()) {
-        for (name, def) in attrs {
-            if def.get("requirement").and_then(|r| r.as_str()) == Some("required") {
-                assert!(
-                    event.get(name).is_some(),
-                    "Missing required field '{name}' in OCSF event. Event keys: {:?}",
-                    event.as_object().map(|o| o.keys().collect::<Vec<_>>())
-                );
-            }
+    let attrs = match schema.get("attributes") {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| item.as_object())
+            .flat_map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect::<Vec<_>>(),
+        _ => return,
+    };
+
+    for (name, def) in &attrs {
+        let is_required = def.get("requirement").and_then(|r| r.as_str()) == Some("required");
+        let is_profile_field = def.get("profile").is_some() || def.get("profiles").is_some();
+        if is_required && !is_profile_field {
+            assert!(
+                event.get(name).is_some(),
+                "Missing required field '{name}' in OCSF event. Event keys: {:?}",
+                event.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
         }
     }
 }

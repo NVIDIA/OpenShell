@@ -33,15 +33,13 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 
 async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> String {
     let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "create", "--name", name]);
+    cmd.args(["sandbox", "create", "--detach", "--name", name]);
 
     for (key, value) in labels {
         cmd.arg("--label").arg(format!("{key}={value}"));
     }
 
-    cmd.args(["--", "echo", "test"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

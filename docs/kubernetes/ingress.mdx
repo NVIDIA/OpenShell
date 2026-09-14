@@ -91,7 +91,7 @@ Envoy Gateway only terminates TLS here — it does not perform OIDC. Do not enab
 
 Because Envoy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
 
-For headless agents and CI, the CLI obtains the token via the OAuth2 client-credentials grant (no browser): set `OPENSHELL_OIDC_CLIENT_SECRET` to the OAuth client secret before running `openshell gateway add`. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your IdP client uses a different id. Interactive human users get the browser-based Authorization Code + PKCE flow by default.
+For an interactive login on a headless machine, set `OPENSHELL_NO_BROWSER=1` before running `openshell gateway add`. The CLI uses the Device Authorization Grant with S256 PKCE and prompts the user to approve the login from another browser. For unattended agents and CI, set `OPENSHELL_OIDC_CLIENT_SECRET` to use the OAuth2 client-credentials grant instead. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your identity provider uses a different id. Interactive users with a local browser get the Authorization Code flow with PKCE by default.
 
 ### Provide a TLS certificate
 

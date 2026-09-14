@@ -818,9 +818,9 @@ workspace authorization path. The gateway is the actor.
   workspace — the driver has no workspace concept. The gateway must query all
   stored sandboxes across all workspaces to produce the full set for comparison.
 
-- **Startup resume** (`resume_persisted_sandboxes`). On gateway startup, the
-  resume path iterates all stored sandboxes whose phase indicates they should
-  be running and asks the driver to resume each one. This must cover all
+- **Startup start** (`start_persisted_sandboxes`). On gateway startup, the
+  start path iterates all stored sandboxes whose phase indicates they should
+  be running and asks the driver to start each one. This must cover all
   workspaces.
 
 - **Provider credential refresh** (`refresh_provider_credential`). A background
@@ -1144,7 +1144,7 @@ foundations. The work can be phased to deliver value incrementally:
   Backward compatibility is desirable but not a hard requirement
   at this stage — existing users must recreate service endpoints when upgrading.
   Add a cross-workspace `list_by_type(object_type, limit, offset)` store method
-  for internal infrastructure operations (reconciler, resume, provider refresh)
+  for internal infrastructure operations (reconciler, start, provider refresh)
   that need to query workspace-scoped resources across all workspaces. Thread
   workspace through `StoredProviderCredentialRefreshState` so the provider
   refresh worker can unambiguously resolve workspace-scoped providers — with
@@ -1271,7 +1271,7 @@ depend only on Phase 1.
   has no access-control gate — it is a persistence-layer primitive. Authorization
   for cross-workspace queries is enforced at the gRPC handler level (Platform
   Admin check for `all_workspaces` on list RPCs) and by code-level access
-  control for internal operations (only the reconciler, resume, and refresh
+  control for internal operations (only the reconciler, start, and refresh
   worker call it). This relies on internal code discipline rather than an
   enforced store-level boundary. A future extension could add a store-level
   caller identity parameter if defense-in-depth is desired.

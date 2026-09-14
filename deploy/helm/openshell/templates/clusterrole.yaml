@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -25,9 +26,124 @@ rules:
       - list
       - watch
   # Read namespace annotations for OpenShift SCC UID/GID range resolution.
+  # Managed/operator modes additionally need list+watch for cluster-wide
+  # namespace discovery. Managed mode needs create+delete for namespace
+  # lifecycle.
   - apiGroups:
       - ""
     resources:
       - namespaces
     verbs:
       - get
+      {{- if ne $workspaceMode "shared" }}
+      - list
+      - watch
+      {{- end }}
+      {{- if eq $workspaceMode "managed" }}
+      - create
+      - delete
+      {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  # Cluster-wide sandbox CRD access for managed/operator workspace modes.
+  - apiGroups:
+      - agents.x-k8s.io
+    resources:
+      - sandboxes
+      - sandboxes/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+  {{- end }}
+  {{- $copiedSecretNames := list }}
+  {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
+  {{- $copiedSecretNames = append $copiedSecretNames .Values.server.tls.clientTlsSecretName }}
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  {{- range .Values.server.sandboxImagePullSecrets }}
+  {{- if .name }}
+  {{- $copiedSecretNames = append $copiedSecretNames .name }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- $copiedSecretNames = uniq $copiedSecretNames }}
+  {{- if $copiedSecretNames }}
+  # Copy only explicitly configured TLS and image-pull Secrets into workspace
+  # namespaces. Server-side apply authorizes these requests as patch operations.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      {{- range $copiedSecretNames }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs:
+      - get
+      - patch
+  # Server-side apply uses PATCH for an existing Secret, but the API server
+  # additionally authorizes CREATE when the named Secret does not exist yet.
+  # Kubernetes RBAC cannot restrict CREATE by resourceNames because create
+  # authorization happens before the object name is available to RBAC. Keep
+  # reads and mutations name-restricted above; this broader grant is required
+  # only to create the initial copy in a gateway-owned managed namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+  {{- end }}
+  {{- if and (ne $workspaceMode "shared") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+  # The kubernetes-secrets credential driver uses dynamic hashed names in
+  # workspace namespaces, so Kubernetes RBAC cannot restrict resourceNames.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+      - delete
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  # ServiceAccount creation in managed namespaces.
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - create
+      - get
+  {{- if .Values.networkPolicy.enabled }}
+  # Apply gateway-only SSH ingress isolation in managed namespaces.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - create
+      - patch
+      - update
+  {{- end }}
+  {{- end }}

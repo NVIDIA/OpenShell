@@ -11,7 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
@@ -27,6 +27,7 @@ bytes = { workspace = true }
 flate2 = "1"
 glob = { workspace = true }
 hex = "0.4"
+hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
@@ -34,6 +35,7 @@ rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,16 +49,22 @@ tokio-rustls = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-webpki-roots = { workspace = true }
+webpki-roots = { workspace = true, optional = true }
+
+[features]
+default = ["bundled-ca-roots"]
+bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tempfile = "3"
 tonic = { workspace = true }
 temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

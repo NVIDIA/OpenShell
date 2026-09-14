@@ -32,6 +32,8 @@ pub enum LaunchAbortReason {
     /// opportunity to release host resources they allocated in
     /// [`LifecycleExtension::before_launch`].
     ProcessExited,
+    /// The gateway intentionally stopped the sandbox while retaining disk state.
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -550,12 +552,22 @@ impl LifecycleExtensionRegistry {
             .collect()
     }
 
+    #[tracing::instrument(
+        name = "vm.configure_launch",
+        skip_all,
+        fields(
+            otel.name = "vm.configure_launch",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+        )
+    )]
     pub async fn configure_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         for ext in self.active_for(sandbox) {
             let descriptor = ext.descriptor();
             for backend in descriptor.required_backends {
@@ -585,19 +597,29 @@ impl LifecycleExtensionRegistry {
                     .map(|p| p.display().to_string()),
             );
         }
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
+    #[tracing::instrument(
+        name = "vm.before_launch",
+        skip_all,
+        fields(
+            otel.name = "vm.before_launch",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+        )
+    )]
     pub async fn before_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
         }
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
     pub async fn after_launch_failed(

@@ -103,6 +103,8 @@ impl LifecycleResource {
 pub enum LifecycleOperation {
     Create,
     Delete,
+    Stop,
+    Start,
     Update,
 }
 
@@ -112,6 +114,8 @@ impl LifecycleOperation {
         match self {
             Self::Create => "create",
             Self::Delete => "delete",
+            Self::Stop => "stop",
+            Self::Start => "start",
             Self::Update => "update",
         }
     }
@@ -161,6 +165,7 @@ pub enum TelemetryComputeDriver {
     Kubernetes,
     Podman,
     Vm,
+    Mxc,
     Unknown,
 }
 
@@ -172,6 +177,7 @@ impl TelemetryComputeDriver {
             Self::Kubernetes => "kubernetes",
             Self::Podman => "podman",
             Self::Vm => "vm",
+            Self::Mxc => "mxc",
             Self::Unknown => "unknown",
         }
     }
@@ -183,6 +189,7 @@ impl TelemetryComputeDriver {
             "k8s" | "kubernetes" => Self::Kubernetes,
             "podman" => Self::Podman,
             "vm" => Self::Vm,
+            "mxc" => Self::Mxc,
             _ => Self::Unknown,
         }
     }
@@ -194,6 +201,7 @@ impl TelemetryComputeDriver {
             Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
             Some(crate::ComputeDriverKind::Podman) => Self::Podman,
             Some(crate::ComputeDriverKind::Vm) => Self::Vm,
+            Some(crate::ComputeDriverKind::Mxc) => Self::Mxc,
             None => Self::Unknown,
         }
     }

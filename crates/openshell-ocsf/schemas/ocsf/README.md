@@ -5,7 +5,7 @@ for offline test validation.
 
 ## Version
 
-- **OCSF v1.7.0** — fetched from `https://schema.ocsf.io/api/1.7.0/`
+- **OCSF v1.8.0** — fetched from `https://schema.ocsf.io/api/1.8.0/`
 
 ## Contents
 
@@ -25,14 +25,18 @@ for offline test validation.
 - `metadata`, `network_endpoint`, `network_proxy`, `process`, `actor`
 - `device`, `container`, `product`, `firewall_rule`, `finding_info`
 - `evidences`, `http_request`, `http_response`, `url`, `attack`
-- `remediation`, `connection_info`
+- `remediation`, `connection_info`, `ai_model`
+
+### Profiles (1)
+
+- `ai_operation`
 
 ## Updating
 
 To update to a new OCSF version:
 
 ```bash
-VERSION=1.7.0
+VERSION=1.8.0
 
 for class in network_activity http_activity ssh_activity process_activity \
              detection_finding application_lifecycle device_config_state_change base_event; do

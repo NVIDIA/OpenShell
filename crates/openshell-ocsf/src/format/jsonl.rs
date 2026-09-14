@@ -38,7 +38,7 @@ mod tests {
             "Other",
             SeverityId::Informational,
             Metadata {
-                version: "1.7.0".to_string(),
+                version: "1.8.0".to_string(),
                 product: Product::openshell_sandbox("0.1.0"),
                 profiles: vec!["container".to_string()],
                 uid: Some("sandbox-abc123".to_string()),
@@ -63,7 +63,7 @@ mod tests {
         assert_eq!(json["time"], 1_742_054_400_000_i64);
         assert_eq!(json["severity_id"], 1);
         assert_eq!(json["severity"], "Informational");
-        assert_eq!(json["metadata"]["version"], "1.7.0");
+        assert_eq!(json["metadata"]["version"], "1.8.0");
     }
 
     #[test]

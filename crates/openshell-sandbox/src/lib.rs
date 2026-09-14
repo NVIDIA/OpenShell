@@ -16,6 +16,7 @@ mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -26,9 +27,9 @@ use tracing::{debug, info, warn};
 use openshell_core::PolicyValidationFailureMode;
 
 use openshell_ocsf::{
-    ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
-    ocsf_emit,
+    ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
+    DetectionFindingBuilder, DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId,
+    StateId, StatusId, ocsf_emit,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -70,9 +72,18 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
-const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
+
+#[cfg(any(test, target_os = "linux"))]
+fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) -> bool {
+    capabilities.is_some_and(|capabilities| {
+        capabilities
+            .split(',')
+            .any(|capability| capability.trim() == required)
+    })
+}
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
@@ -83,6 +94,7 @@ const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 /// Returns an error if the command fails to start or encounters a fatal error.
 #[allow(
     clippy::too_many_arguments,
+    clippy::implicit_hasher,
     clippy::similar_names,
     clippy::fn_params_excessive_bools
 )]
@@ -155,6 +167,11 @@ pub async fn run_sandbox(
         None
     };
 
+    // Extension credentials are owned by this supervisor and shared by every
+    // gateway connection it opens, so the middleware registry's bearer slots
+    // and the policy poll loop that rotates them stay the same objects.
+    let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -165,6 +182,7 @@ pub async fn run_sandbox(
         middleware_registry_status,
         loaded_policy_origin,
         initial_agent_proposals_enabled,
+        initial_extension_authentication_enabled,
     ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
         let (policy, opa_engine, retained_proto, loaded_policy_origin) =
             load_policy_from_sidecar_bootstrap(bootstrap)?;
@@ -175,6 +193,7 @@ pub async fn run_sandbox(
             MiddlewareRegistryStatus::Synchronized,
             loaded_policy_origin,
             bootstrap.agent_proposals_enabled,
+            false,
         )
     } else {
         load_policy(
@@ -183,101 +202,159 @@ pub async fn run_sandbox(
             openshell_endpoint.clone(),
             policy_rules,
             policy_data,
+            &extension_credentials,
         )
         .await?
     };
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
-    // OpenShift retain their authoritative numeric pair; Docker and Podman
-    // fill only omitted policy fields from OCI Config.User.
+    // OpenShift retain their authoritative numeric pair; Docker fills only
+    // omitted policy fields from OCI Config.User.
     #[cfg(unix)]
-    let resolved_process_identity = {
+    let (resolved_process_identity, workspace) = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
-        openshell_supervisor_process::identity::resolve_process_identity(
+        let use_workdir_as_home = matches!(
+            &driver_identity,
+            openshell_supervisor_process::identity::DriverIdentity::OciUser { .. }
+        );
+        let resolved = openshell_supervisor_process::identity::resolve_process_identity(
             &mut policy,
             &driver_identity,
-        )?
+        )?;
+        (
+            resolved,
+            openshell_supervisor_process::process::ResolvedWorkspace::new(
+                workdir.clone(),
+                use_workdir_as_home,
+            ),
+        )
     };
     #[cfg(not(unix))]
-    let resolved_process_identity =
-        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
+    let (resolved_process_identity, workspace) = (
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
+        openshell_supervisor_process::process::ResolvedWorkspace::new(workdir.clone(), false),
+    );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let (provider_credentials, mut provider_env) =
-        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-                bootstrap.provider_env_revision,
-                bootstrap.provider_child_env.clone(),
-            );
-            (provider_credentials, bootstrap.provider_child_env.clone())
-        } else {
-            // Fetch provider environment variables from the server.
-            // This is done after loading the policy so the sandbox can still start
-            // even if provider env fetch fails (graceful degradation).
-            let (
-                provider_env_revision,
-                provider_env,
-                provider_credential_expires_at_ms,
-                dynamic_credentials,
-            ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-                match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
-                    Ok(result) => {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .message(format!(
-                                    "Fetched provider environment [env_count:{}]",
-                                    result.environment.len()
-                                ))
-                                .build()
-                        );
-                        (
-                            result.provider_env_revision,
-                            result.environment,
-                            result.credential_expires_at_ms,
-                            result.dynamic_credentials,
-                        )
-                    }
-                    Err(e) => {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Medium)
-                                .status(StatusId::Failure)
-                                .state(StateId::Other, "degraded")
-                                .message(format!(
-                                    "Failed to fetch provider environment, continuing without: {e}"
-                                ))
-                                .build()
-                        );
-                        (
-                            0,
-                            std::collections::HashMap::new(),
-                            std::collections::HashMap::new(),
-                            std::collections::HashMap::new(),
-                        )
-                    }
+    let (provider_credentials, mut provider_env) = if let Some(bootstrap) =
+        sidecar_bootstrap.as_ref()
+    {
+        let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
+            bootstrap.provider_env_revision,
+            bootstrap.provider_child_env.clone(),
+        );
+        (provider_credentials, bootstrap.provider_child_env.clone())
+    } else {
+        // Fetch provider environment variables from the server.
+        // This is done after loading the policy so the sandbox can still start
+        // even if provider env fetch fails (graceful degradation).
+        let (
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+        ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(result) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [env_count:{}]",
+                                result.environment.len()
+                            ))
+                            .build()
+                    );
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                        result.dynamic_credentials,
+                        result.static_credential_bindings,
+                        result.non_secret_environment_keys,
+                    )
                 }
-            } else {
-                (
-                    0,
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                )
-            };
-
-            let provider_credentials = ProviderCredentialState::from_environment(
-                provider_env_revision,
-                provider_env,
-                provider_credential_expires_at_ms,
-                dynamic_credentials,
-            );
-            let provider_env = provider_credentials.child_env_with_gcp_resolved();
-            (provider_credentials, provider_env)
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(format!(
+                                "Failed to fetch provider environment; no provider credentials are active: {e}"
+                            ))
+                            .build()
+                    );
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        Vec::new(),
+                    )
+                }
+            }
+        } else {
+            (
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
+            )
         };
+
+        let dynamic_credentials_fallback = dynamic_credentials.clone();
+        let provider_credentials = match ProviderCredentialState::from_bound_environment(
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+        ) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(format!(
+                                "Rejected provider environment bindings; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
+                            ))
+                            .build()
+                    );
+                ProviderCredentialState::from_environment(
+                    provider_env_revision,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    dynamic_credentials_fallback,
+                )
+            }
+        };
+        let provider_env = provider_credentials.child_env_with_gcp_resolved();
+        (provider_credentials, provider_env)
+    };
+
+    if credential_gating_unavailable(
+        &loaded_policy_origin,
+        provider_credentials.resolver().is_some(),
+        network_enabled,
+    ) {
+        report_credential_gating_unavailable();
+    }
+
+    // Canonical-process overrides are deliberately applied only to the main
+    // child. Keep the provider snapshot pristine because Kubernetes forwards
+    // it to the process sidecar for later exec/editor/SFTP children.
 
     // Shared agent-proposals feature flag. Seed from the same initial settings
     // snapshot that produced the policy so networking and process setup agree
@@ -287,13 +364,25 @@ pub async fn run_sandbox(
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
+    let process_exit_ack = Arc::new(tokio::sync::Mutex::new(None));
+    let initial_provider_env_generation = sidecar_bootstrap
+        .as_ref()
+        .map_or(0, |bootstrap| bootstrap.provider_env_generation);
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
+        sidecar_control::send_provider_env_applied(
+            &connection.writer,
+            initial_provider_env_generation,
+        )
+        .await?;
         process_control_closed = Some(connection.closed);
         spawn_sidecar_control_update_watcher(
             connection.updates,
+            Some(connection.writer),
             provider_credentials.clone(),
             agent_proposals.clone(),
+            Arc::clone(&process_exit_ack),
+            initial_provider_env_generation,
         );
     }
 
@@ -313,6 +402,87 @@ pub async fn run_sandbox(
         None
     };
 
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_requested = opa_engine
+        .as_ref()
+        .map(|engine| engine.policy_dns_eligibility_snapshot())
+        .transpose()?
+        .is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    #[cfg(target_os = "linux")]
+    let runtime_capabilities =
+        std::env::var(openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES).ok();
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_capable = has_network_runtime_capability(
+        runtime_capabilities.as_deref(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_capable = false;
+    #[cfg(target_os = "linux")]
+    let transparent_runtime = if transparent_tcp_requested {
+        if !transparent_tcp_capable {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_runtime")
+                    .message(
+                        "Policy DNS and transparent TCP unavailable: runtime capability is missing"
+                    )
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy contains protocol: tcp endpoints, but the selected runtime does not advertise policy DNS and transparent TCP support"
+            ));
+        }
+        if sidecar_network_enforcement {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_topology")
+                    .message("Policy DNS and transparent TCP unavailable: sidecar topology is unsupported")
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy DNS and transparent TCP are not yet supported by the sidecar topology"
+            ));
+        }
+        let namespace = netns.as_ref().ok_or_else(|| {
+            miette::miette!("policy DNS and transparent TCP require a workload network namespace")
+        })?;
+        let listeners = namespace
+            .bind_transparent_tcp_listeners()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind transparent TCP listeners")?;
+        let (dns_udp, dns_tcp) = namespace
+            .bind_policy_dns_sockets()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind policy DNS listeners")?;
+        let proxy_port = policy
+            .network
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.http_addr)
+            .map_or(3128, |address| address.port());
+        let runtime = openshell_supervisor_network::run::TransparentRuntimeSetup::new(
+            listeners,
+            dns_udp,
+            dns_tcp,
+            sandbox_id.as_deref(),
+        )?;
+        let (ipv4_cidr, ipv6_cidr) = runtime.synthetic_cidrs();
+        namespace.install_transparent_tcp_rules(proxy_port, &ipv4_cidr, &ipv6_cidr)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_substrate_ready = transparent_runtime.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_substrate_ready = false;
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)
@@ -352,7 +522,7 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let networking = if network_enabled {
+    let mut networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
             .as_ref()
@@ -378,6 +548,8 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                #[cfg(target_os = "linux")]
+                transparent_runtime,
             )
             .await?,
         )
@@ -409,6 +581,7 @@ pub async fn run_sandbox(
             sidecar_control::BootstrapData {
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
+                provider_env_generation: 0,
                 provider_child_env: provider_env.clone(),
                 agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
@@ -444,12 +617,15 @@ pub async fn run_sandbox(
         sidecar_control_task = Some(connection_task);
         spawn_sidecar_entrypoint_handler(
             entrypoint_rx,
-            entrypoint_pid.clone(),
-            opa_engine.clone(),
-            retained_proto.clone(),
-            openshell_endpoint.clone(),
-            sandbox_id.clone(),
-            std::path::PathBuf::from(trusted_ssh_socket_path),
+            SidecarEntrypointHandler {
+                entrypoint_pid: entrypoint_pid.clone(),
+                opa_engine: opa_engine.clone(),
+                retained_proto: retained_proto.clone(),
+                openshell_endpoint: openshell_endpoint.clone(),
+                sandbox_id: sandbox_id.clone(),
+                trusted_ssh_socket_path: std::path::PathBuf::from(trusted_ssh_socket_path),
+                control_publisher: sidecar_control_publisher.clone(),
+            },
         );
     }
 
@@ -584,7 +760,13 @@ pub async fn run_sandbox(
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
             workspace_tx,
+            extension_credentials: extension_credentials.clone(),
+            extension_authentication_enabled: initial_extension_authentication_enabled,
             middleware_connector: default_middleware_connector(),
+            transparent_tcp: TransparentTcpReloadState {
+                capable: transparent_tcp_capable,
+                substrate_ready: transparent_tcp_substrate_ready,
+            },
         };
 
         tokio::spawn(async move {
@@ -641,12 +823,26 @@ pub async fn run_sandbox(
     }
 
     let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+    let main_env = provider_env.clone();
     let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
         bootstrap
             .proxy_ca_cert_path
             .clone()
             .zip(bootstrap.proxy_ca_bundle_path.clone())
     });
+
+    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
+        .as_mut()
+        .and_then(|n| n.proxy.as_mut())
+        .and_then(ProxyHandle::take_exit_receiver)
+    {
+        Box::pin(async {
+            let _ = rx.await;
+        })
+    } else {
+        Box::pin(std::future::pending())
+    };
+    tokio::pin!(proxy_exited);
 
     let exit_code = if process_enabled {
         let ca_file_paths = networking
@@ -662,14 +858,30 @@ pub async fn run_sandbox(
                 }
             });
 
+        let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx {
+            Box::pin(async {
+                let _ = rx.await;
+            })
+        } else {
+            Box::pin(std::future::pending())
+        };
+        tokio::pin!(ssh_exited);
+
         let entrypoint_started_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     match rx.await {
-                        Ok(pid) => {
+                        Ok((pid, instance_id)) => {
                             if let Err(err) =
-                                sidecar_control::send_entrypoint_started(&writer, pid).await
+                                sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
+                                    .await
                             {
                                 warn!(error = %err, "Failed to send sidecar entrypoint event");
                             }
@@ -683,24 +895,55 @@ pub async fn run_sandbox(
             } else {
                 None
             };
+        let sidecar_exit_tx =
+            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+                let exit_ack = Arc::clone(&process_exit_ack);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                    openshell_supervisor_process::run::SidecarExitReport,
+                >(1);
+                tokio::spawn(async move {
+                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
+                        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+                        *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                        let result = match sidecar_control::send_main_process_exited(
+                            &writer,
+                            instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => durable_rx.await.map_err(|_| {
+                                "sidecar durable exit acknowledgement closed".to_string()
+                            }),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        let _ = ack.send(result);
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
 
         let process = openshell_supervisor_process::run::run_process(
             program,
             args,
-            workdir.as_deref(),
+            workspace,
             timeout_secs,
             interactive,
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
             sidecar_network_enforcement,
+            ssh_exit_tx,
             &process_policy,
             resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
+            sidecar_exit_tx,
             provider_credentials,
-            provider_env,
+            main_env,
             ca_file_paths,
             agent_proposals.clone(),
             #[cfg(target_os = "linux")]
@@ -729,9 +972,71 @@ pub async fn run_sandbox(
                         "authoritative network-sidecar control channel closed"
                     ));
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            process.await?
+            tokio::select! {
+                result = process => result?,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     } else {
         // Network-only sidecar mode: keep the proxy and its background
@@ -747,15 +1052,62 @@ pub async fn run_sandbox(
                     warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
                     1
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     };
 
@@ -845,6 +1197,9 @@ type LoadedPolicyBundle = (
     LoadedPolicyOrigin,
 );
 
+type MainProcessExitAckWaiter =
+    Arc<tokio::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
 fn load_policy_from_sidecar_bootstrap(
     bootstrap: &sidecar_control::BootstrapData,
 ) -> Result<LoadedPolicyBundle> {
@@ -865,27 +1220,45 @@ fn load_policy_from_sidecar_bootstrap(
 
 fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
+    writer: Option<Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
     provider_credentials: ProviderCredentialState,
     agent_proposals: AgentProposals,
+    exit_ack: MainProcessExitAckWaiter,
+    mut provider_env_generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
                 sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
+                    generation,
                     provider_child_env,
                 } => {
-                    if revision <= provider_credentials.snapshot().revision {
+                    if generation <= provider_env_generation {
                         continue;
                     }
                     let env_count = provider_credentials
                         .install_child_env_snapshot(revision, provider_child_env);
+                    provider_env_generation = generation;
+                    if let Some(writer) = writer.as_ref()
+                        && let Err(error) =
+                            sidecar_control::send_provider_env_applied(writer, generation).await
+                    {
+                        warn!(
+                            error = %error,
+                            provider_env_revision = revision,
+                            provider_env_generation = generation,
+                            "Failed to acknowledge sidecar provider environment"
+                        );
+                        continue;
+                    }
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
                             .status(StatusId::Success)
                             .state(StateId::Enabled, "loaded")
                             .unmapped("provider_env_revision", serde_json::json!(revision))
+                            .unmapped("provider_env_generation", serde_json::json!(generation))
                             .message(format!(
                                 "Sidecar provider environment refreshed [revision:{revision} env_count:{env_count}]"
                             ))
@@ -917,26 +1290,80 @@ fn spawn_sidecar_control_update_watcher(
                         skills::install_static_skills,
                     );
                 }
+                sidecar_control::ControlUpdate::MainProcessExitAck { instance_id } => {
+                    let mut waiter = exit_ack.lock().await;
+                    if waiter
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected == &instance_id)
+                        && let Some((_, ack)) = waiter.take()
+                    {
+                        let _ = ack.send(());
+                    }
+                }
             }
         }
     })
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_sidecar_entrypoint_handler(
-    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+struct SidecarEntrypointHandler {
     entrypoint_pid: Arc<AtomicU32>,
     opa_engine: Option<Arc<OpaEngine>>,
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
     trusted_ssh_socket_path: std::path::PathBuf,
+    control_publisher: Option<sidecar_control::Publisher>,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_sidecar_entrypoint_handler(
+    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+    handler: SidecarEntrypointHandler,
 ) {
     tokio::spawn(async move {
+        let SidecarEntrypointHandler {
+            entrypoint_pid,
+            opa_engine,
+            retained_proto,
+            openshell_endpoint,
+            sandbox_id,
+            trusted_ssh_socket_path,
+            control_publisher,
+        } = handler;
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
+            if let Some(exit_code) = started.exit_code {
+                terminating.store(true, Ordering::Release);
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::report_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process exit report failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                    if let Some(publisher) = control_publisher.as_ref() {
+                        publisher.publish_main_process_exit_ack(started.instance_id.clone());
+                    }
+                }
+                break;
+            }
             entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
@@ -985,6 +1412,7 @@ fn spawn_sidecar_entrypoint_handler(
                     None,
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
+                    started.instance_id.clone(),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
@@ -1158,9 +1586,9 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
     "/dev/urandom",
 ];
 
-/// Minimum read-write paths required for a proxy-mode sandbox child process:
-/// user working directory and temporary files.
-const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
+/// Minimum read-write paths required for a proxy-mode sandbox child process.
+/// The active workspace is granted separately through `include_workdir`.
+const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp"];
 
 /// GPU read-only paths.
 ///
@@ -1474,6 +1902,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 mod baseline_tests {
     use super::*;
     use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    use std::path::PathBuf;
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1509,10 +1938,10 @@ mod baseline_tests {
     }
 
     #[test]
-    fn baseline_read_write_always_includes_sandbox_and_tmp() {
+    fn baseline_read_write_does_not_hardcode_sandbox() {
         let (_ro, rw) = baseline_enrichment_paths();
-        assert!(rw.contains(&"/sandbox".to_string()));
         assert!(rw.contains(&"/tmp".to_string()));
+        assert!(!rw.contains(&"/sandbox".to_string()));
     }
 
     #[test]
@@ -1705,7 +2134,7 @@ mod baseline_tests {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
-                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
             },
@@ -1720,17 +2149,14 @@ mod baseline_tests {
         enrich_sandbox_baseline_paths(&mut policy);
 
         assert!(
-            policy
-                .filesystem
-                .read_only
-                .contains(&std::path::PathBuf::from("/tmp")),
+            policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
             "explicit read_only baseline path should be preserved"
         );
         assert!(
             !policy
                 .filesystem
                 .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
+                .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
@@ -1838,12 +2264,14 @@ async fn load_policy(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
 ) -> Result<(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
+    bool,
     bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
@@ -1893,6 +2321,7 @@ async fn load_policy(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
             false,
         ));
     }
@@ -2056,10 +2485,32 @@ async fn load_policy(
         let middleware_registry_status = if middleware_services.is_empty() {
             MiddlewareRegistryStatus::Synchronized
         } else if let Err(error) = grpc_retry("Middleware connect", || {
-            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-                openshell_supervisor_middleware_builtins::services(),
-                middleware_services.clone(),
-            )
+            let middleware_services = middleware_services.clone();
+            let extension_credentials = extension_credentials.clone();
+            let extension_authentication_enabled = snapshot.extension_authentication_enabled;
+            async move {
+                let credentials = if extension_authentication_enabled {
+                    // Share the supervisor's store so the slots installed here
+                    // are the ones the policy poll loop later rotates in place.
+                    openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+                        endpoint,
+                        extension_credentials,
+                    )
+                    .await?
+                    .refresh_extension_credentials(&middleware_services)
+                    .await?
+                } else {
+                    std::collections::HashMap::new()
+                };
+                connect_middleware_registry(
+                    &middleware_services,
+                    &MiddlewareAuthentication {
+                        credentials,
+                        enabled: extension_authentication_enabled,
+                    },
+                )
+                .await
+            }
         })
         .await
         .and_then(|registry| engine.replace_middleware_registry(registry))
@@ -2102,6 +2553,7 @@ async fn load_policy(
                 has_last_valid_policy,
             },
             agent_proposals_enabled_from_settings(&snapshot.settings),
+            snapshot.extension_authentication_enabled,
         ));
     }
 
@@ -2230,12 +2682,14 @@ enum MiddlewareRegistryStatus {
 #[derive(Debug)]
 enum GatewayRuntimeReloadError {
     PolicyValidation(miette::Report),
+    TransparentTcpPrerequisite(miette::Report),
     MiddlewareRegistry(miette::Report),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GatewayRuntimeFailureClass {
     PolicyValidation,
+    TransparentTcpPrerequisite,
     MiddlewareRegistry,
 }
 
@@ -2243,6 +2697,9 @@ impl GatewayRuntimeReloadError {
     fn class(&self) -> GatewayRuntimeFailureClass {
         match self {
             Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
+            Self::TransparentTcpPrerequisite(_) => {
+                GatewayRuntimeFailureClass::TransparentTcpPrerequisite
+            }
             Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
         }
     }
@@ -2265,19 +2722,46 @@ impl FailedRuntimeRevision {
     }
 }
 
+struct MiddlewareReloadContext<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &'a MiddlewareAuthentication,
+    registry_changed: bool,
+    connector: &'a MiddlewareConnector,
+}
+
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    middleware_registry_changed: bool,
-    middleware_connector: &MiddlewareConnector,
+    middleware: MiddlewareReloadContext<'_>,
+    transparent_tcp: TransparentTcpReloadState,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
+    if let Some(policy) = policy
+        && policy_contains_explicit_tcp(policy)
+    {
+        if !transparent_tcp.capable {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but the runtime does not advertise transparent TCP support; previous policy remains active"
+                ),
+            ));
+        }
+        if !transparent_tcp.substrate_ready {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but this sandbox started without the transparent TCP substrate; recreate the sandbox to enable TCP; previous policy remains active"
+                ),
+            ));
+        }
+    }
     match policy {
-        Some(policy) if middleware_registry_changed => {
-            let registry = middleware_connector(desired_services.to_vec())
-                .await
-                .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+        Some(policy) if middleware.registry_changed => {
+            let registry = (middleware.connector)(
+                middleware.desired_services.to_vec(),
+                middleware.authentication.clone(),
+            )
+            .await
+            .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
@@ -2292,6 +2776,20 @@ async fn reload_gateway_policy_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
     }
+}
+
+fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
+    policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| endpoint.protocol.eq_ignore_ascii_case("tcp"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TransparentTcpReloadState {
+    capable: bool,
+    substrate_ready: bool,
 }
 
 /// True when the installed middleware registry no longer matches the desired
@@ -2517,10 +3015,70 @@ fn unchanged_policy_revision_candidate(
 
 fn unchanged_policy_revision_ready_to_ack(
     candidate: Option<u32>,
+    provider_env_reconciled: bool,
     policy_runtime_changed: bool,
     policy_runtime_reconciled: bool,
 ) -> Option<u32> {
-    candidate.filter(|_| !policy_runtime_changed || policy_runtime_reconciled)
+    candidate.filter(|_| {
+        provider_env_reconciled && (!policy_runtime_changed || policy_runtime_reconciled)
+    })
+}
+
+/// Whether the credential-provenance gates cannot apply to the loaded policy.
+///
+/// The gateway derives `provider_credentialed` and deliberately keeps it out of
+/// the policy YAML schema, so a local-file policy never carries it and never
+/// will: gateway revisions are observed for settings and providers but must not
+/// replace the local OPA policy. Provider credentials still arrive from the
+/// gateway on that path, so the raw-tunnel and WebSocket binary-frame refusals
+/// have nothing to match on. The request-body backstop is unaffected because it
+/// keys off the secret resolver rather than endpoint provenance.
+fn credential_gating_unavailable(
+    origin: &LoadedPolicyOrigin,
+    has_resolver: bool,
+    network_enabled: bool,
+) -> bool {
+    network_enabled && has_resolver && matches!(origin, LoadedPolicyOrigin::LocalOverride)
+}
+
+/// Report that credential provenance is unavailable for the loaded policy.
+///
+/// Carries no credential name, host, or value: the finding states which
+/// controls are inactive, nothing about what they would have protected.
+fn report_credential_gating_unavailable() {
+    ocsf_emit!(
+        DetectionFindingBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .severity(SeverityId::High)
+            .confidence(ConfidenceId::High)
+            .is_alert(true)
+            .finding_info(
+                FindingInfo::new(
+                    "credential-gating-unavailable",
+                    "Credential Provenance Unavailable",
+                )
+                .with_desc(
+                    "Provider credentials are injected, but the loaded policy comes from local \
+                     files and carries no gateway-derived credential provenance. Uninspected \
+                     credentialed tunnels and WebSocket binary frames are not refused. Load \
+                     policy from the gateway to enable these controls."
+                ),
+            )
+            .evidence_pairs(&[
+                ("policy_source", "local-override"),
+                ("uninspected_connect_gate", "inactive"),
+                ("websocket_binary_gate", "inactive"),
+                ("request_body_backstop", "active"),
+            ])
+            .remediation(
+                "Remove the local policy override so the gateway-delivered effective policy \
+                 applies, or detach provider credentials from this sandbox."
+            )
+            .message(
+                "Credential provenance unavailable for local-file policy; uninspected credential gates inactive"
+            )
+            .build()
+    );
 }
 
 /// Deliver policy status updates independently from policy reconciliation.
@@ -2543,6 +3101,17 @@ trait PolicyGatewayClient: Clone + Send + Sync + 'static {
         error: &str,
     ) -> Result<()>;
 
+    async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn extension_credentials_for(
+        &self,
+        _services: &[openshell_core::proto::SupervisorMiddlewareService],
+    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
+        Ok(std::collections::HashMap::new())
+    }
+
     fn workspace(&self) -> String;
 }
 
@@ -2564,6 +3133,17 @@ impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient 
     ) -> Result<()> {
         self.report_policy_status(sandbox_id, version, loaded, error)
             .await
+    }
+
+    async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        self.refresh_installed_extension_credentials().await
+    }
+
+    async fn extension_credentials_for(
+        &self,
+        services: &[openshell_core::proto::SupervisorMiddlewareService],
+    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
+        self.extension_credentials_for(services).await
     }
 
     fn workspace(&self) -> String {
@@ -2728,13 +3308,18 @@ struct PolicyPollLoopContext {
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
     workspace_tx: tokio::sync::watch::Sender<String>,
+    extension_credentials: openshell_extension_core::ExtensionCredentialStore,
+    extension_authentication_enabled: bool,
     middleware_connector: MiddlewareConnector,
+    /// Immutable driver capability and startup substrate state.
+    transparent_tcp: TransparentTcpReloadState,
 }
 
 type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
-        ) -> std::pin::Pin<
+            MiddlewareAuthentication,
+        ) -> Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,
@@ -2744,18 +3329,36 @@ type MiddlewareConnector = Arc<
         + Sync,
 >;
 
+#[derive(Clone, Default)]
+struct MiddlewareAuthentication {
+    credentials: std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+    enabled: bool,
+}
+
 fn default_middleware_connector() -> MiddlewareConnector {
-    Arc::new(|services| Box::pin(async move { connect_middleware_registry(&services).await }))
+    Arc::new(|services, authentication| {
+        Box::pin(async move { connect_middleware_registry(&services, &authentication).await })
+    })
 }
 
 async fn connect_middleware_registry(
     services: &[openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &MiddlewareAuthentication,
 ) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
-    openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-        openshell_supervisor_middleware_builtins::services(),
-        services.to_vec(),
-    )
-    .await
+    if authentication.enabled {
+        openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
+            openshell_supervisor_middleware_builtins::services(),
+            services.to_vec(),
+            &authentication.credentials,
+        )
+        .await
+    } else {
+        openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            services.to_vec(),
+        )
+        .await
+    }
 }
 
 async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
@@ -2767,27 +3370,76 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
     opa_engine.replace_middleware_registry(registry)
 }
 
+/// Wait the configured poll interval, but never past the point at which an
+/// installed extension credential must be rotated.
+fn next_poll_delay(
+    store: &openshell_extension_core::ExtensionCredentialStore,
+    interval: Duration,
+) -> Duration {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    store.next_refresh_delay(interval, now_ms)
+}
+
+/// Drop credentials for services no longer in the installed registry.
+///
+/// Call only after a registry swap succeeds, so a failed candidate cannot
+/// invalidate the last-known-good clients.
+fn retain_extension_credentials(
+    store: &openshell_extension_core::ExtensionCredentialStore,
+    installed: &[openshell_core::proto::SupervisorMiddlewareService],
+    extension_authentication_enabled: bool,
+) {
+    let retained = if extension_authentication_enabled {
+        installed
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect()
+    } else {
+        std::collections::HashSet::default()
+    };
+    store.retain(&retained);
+}
+
+struct MiddlewareRegistryReconciliation<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: MiddlewareAuthentication,
+    registry_changed: bool,
+    extension_credentials: &'a openshell_extension_core::ExtensionCredentialStore,
+    current_services: &'a mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    status: &'a mut MiddlewareRegistryStatus,
+}
+
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     middleware_connector: &MiddlewareConnector,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
-    status: &mut MiddlewareRegistryStatus,
+    reconciliation: MiddlewareRegistryReconciliation<'_>,
 ) {
-    if *status == MiddlewareRegistryStatus::Synchronized
-        && desired_services == current_services.as_slice()
-    {
+    if !reconciliation.registry_changed {
         return;
     }
 
-    match middleware_connector(desired_services.to_vec())
-        .await
-        .and_then(|registry| opa_engine.replace_middleware_registry(registry))
+    match middleware_connector(
+        reconciliation.desired_services.to_vec(),
+        reconciliation.authentication.clone(),
+    )
+    .await
+    .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
         Ok(()) => {
-            current_services.clear();
-            current_services.extend_from_slice(desired_services);
-            *status = MiddlewareRegistryStatus::Synchronized;
+            retain_extension_credentials(
+                reconciliation.extension_credentials,
+                reconciliation.desired_services,
+                reconciliation.authentication.enabled,
+            );
+            reconciliation.current_services.clear();
+            reconciliation
+                .current_services
+                .extend_from_slice(reconciliation.desired_services);
+            *reconciliation.status = MiddlewareRegistryStatus::Synchronized;
             ocsf_emit!(
                 ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::Informational)
@@ -2795,11 +3447,11 @@ async fn reconcile_middleware_registry(
                     .state(StateId::Enabled, "loaded")
                     .unmapped(
                         "supervisor_middleware_service_count",
-                        serde_json::json!(current_services.len())
+                        serde_json::json!(reconciliation.current_services.len())
                     )
                     .message(format!(
                         "Supervisor middleware registry reloaded [service_count:{}]",
-                        current_services.len()
+                        reconciliation.current_services.len()
                     ))
                     .build()
             );
@@ -2807,7 +3459,7 @@ async fn reconcile_middleware_registry(
         Err(error) => {
             // Emit only on the transition into the failed state to avoid
             // repeating the same finding on every poll during an outage.
-            if *status == MiddlewareRegistryStatus::Synchronized {
+            if *reconciliation.status == MiddlewareRegistryStatus::Synchronized {
                 ocsf_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Medium)
@@ -2819,7 +3471,7 @@ async fn reconcile_middleware_registry(
                         .build()
                 );
             }
-            *status = MiddlewareRegistryStatus::NeedsReconciliation;
+            *reconciliation.status = MiddlewareRegistryStatus::NeedsReconciliation;
         }
     }
 }
@@ -2847,6 +3499,10 @@ enum GatewayRuntimeFailureDisposition {
     MiddlewareUnavailable {
         error: String,
     },
+    TransparentTcpExpansionRejected {
+        error: String,
+        active_generation: u64,
+    },
 }
 
 fn apply_gateway_runtime_reload_failure(
@@ -2868,12 +3524,42 @@ fn apply_gateway_runtime_reload_failure(
             )?;
             Ok(GatewayRuntimeFailureDisposition::PolicyRejected { error, disposition })
         }
+        GatewayRuntimeReloadError::TransparentTcpPrerequisite(error) => Ok(
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                error: error.to_string(),
+                active_generation: engine.current_generation(),
+            },
+        ),
         GatewayRuntimeReloadError::MiddlewareRegistry(error) => {
             Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable {
                 error: error.to_string(),
             })
         }
     }
+}
+
+fn emit_transparent_tcp_expansion_rejection(
+    version: u32,
+    policy_hash: &str,
+    active_generation: u64,
+    error: &str,
+) {
+    let message = format!(
+        "Transparent TCP policy expansion rejected; previous policy IS active [version:{version} active_generation:{active_generation} error:{error}]"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Enabled, "retained_previous_policy")
+            .unmapped("candidate_version", serde_json::json!(version))
+            .unmapped("candidate_policy_hash", serde_json::json!(policy_hash))
+            .unmapped("previous_policy_active", serde_json::json!(true))
+            .unmapped("active_generation", serde_json::json!(active_generation))
+            .unmapped("validation_error", serde_json::json!(error))
+            .message(message)
+            .build()
+    );
 }
 
 fn apply_policy_validation_failure(
@@ -3006,7 +3692,11 @@ fn emit_policy_validation_failure(
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
-    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(&ctx.endpoint).await?;
+    let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+        &ctx.endpoint,
+        ctx.extension_credentials.clone(),
+    )
+    .await?;
     run_policy_poll_loop_with_client(ctx, client).await
 }
 
@@ -3029,6 +3719,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let mut current_policy_version: u32 = 0;
     let mut current_policy_hash = String::new();
     let mut current_middleware_services = Vec::new();
+    let mut current_extension_authentication_enabled = ctx.extension_authentication_enabled;
     let mut middleware_registry_status = ctx.middleware_registry_status;
     let mut current_settings: std::collections::HashMap<
         String,
@@ -3065,6 +3756,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_policy_version = candidate.version;
                     current_policy_hash.clone_from(&candidate.policy_hash);
                     current_middleware_services = result.supervisor_middleware_services;
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
                     current_settings = result.settings;
                     enqueue_policy_status(
                         &status_sender,
@@ -3089,6 +3782,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_config_revision = result.config_revision;
                     current_policy_hash = result.policy_hash.clone();
                     current_middleware_services = result.supervisor_middleware_services;
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
                     current_settings = result.settings;
                     debug!(
                         config_revision = current_config_revision,
@@ -3107,7 +3802,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         let result = if let Some(result) = pending_result.take() {
             result
         } else {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
             match client.poll_settings(&ctx.sandbox_id).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
@@ -3115,19 +3810,50 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
+                    if current_extension_authentication_enabled
+                        && let Err(refresh_error) =
+                            client.refresh_installed_extension_credentials().await
+                    {
+                        warn!(
+                            error = %refresh_error,
+                            "Settings poll: extension credential refresh failed while configuration was unavailable"
+                        );
+                    }
                     continue;
                 }
             }
         };
 
+        // Reuse installed per-service credentials, rotating only when one is
+        // missing or due. Rotation happens on the existing gateway channel and
+        // updates slots in place, so it is independent of config revision and
+        // registry equality.
+        let middleware_credentials = if result.extension_authentication_enabled {
+            match client
+                .extension_credentials_for(&result.supervisor_middleware_services)
+                .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    warn!(error = %error, "Settings poll: extension credential refresh failed");
+                    std::collections::HashMap::new()
+                }
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let config_changed = result.config_revision != current_config_revision;
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
         let policy_changed = result.policy_hash != current_policy_hash;
-        let middleware_registry_changed = middleware_registry_needs_rebuild(
-            middleware_registry_status,
-            &current_middleware_services,
-            &result.supervisor_middleware_services,
-        );
+        let extension_authentication_changed =
+            current_extension_authentication_enabled != result.extension_authentication_enabled;
+        let middleware_registry_changed = extension_authentication_changed
+            || middleware_registry_needs_rebuild(
+                middleware_registry_status,
+                &current_middleware_services,
+                &result.supervisor_middleware_services,
+            );
         // A valid candidate may intentionally restore byte-for-byte policy
         // content that was active before a rejected update. Its hash then
         // equals `current_policy_hash`, but the runtime is still quarantined
@@ -3137,6 +3863,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 .as_ref()
                 .is_some_and(|rejected| rejected.policy_hash != result.policy_hash);
         let policy_runtime_changed = recovering_rejected_policy
+            || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
                 reloads_gateway_policy,
                 &current_policy_hash,
@@ -3156,6 +3883,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             &result,
         );
         let mut policy_runtime_reconciled = false;
+        let mut provider_env_reconciled = !provider_env_changed;
 
         // A local policy override is not coupled to the gateway policy
         // snapshot, so its service registry can still be reconciled alone.
@@ -3165,11 +3893,22 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             reconcile_middleware_registry(
                 &ctx.opa_engine,
                 &ctx.middleware_connector,
-                &result.supervisor_middleware_services,
-                &mut current_middleware_services,
-                &mut middleware_registry_status,
+                MiddlewareRegistryReconciliation {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    extension_credentials: &ctx.extension_credentials,
+                    current_services: &mut current_middleware_services,
+                    status: &mut middleware_registry_status,
+                },
             )
             .await;
+            if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
+                current_extension_authentication_enabled = result.extension_authentication_enabled;
+            }
         }
 
         if !config_changed
@@ -3231,56 +3970,101 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             .await
             {
                 Ok(env_result) => {
-                    ctx.provider_credentials.install_environment(
-                        env_result.provider_env_revision,
+                    let provider_env_revision = env_result.provider_env_revision;
+                    let install_result = ctx.provider_credentials.install_bound_environment(
+                        provider_env_revision,
                         env_result.environment,
                         env_result.credential_expires_at_ms,
                         env_result.dynamic_credentials,
+                        env_result.static_credential_bindings,
+                        env_result.non_secret_environment_keys,
                     );
-                    let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
-                    let env_count = child_env.len();
-                    if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
-                        publisher.publish_provider_env(
-                            env_result.provider_env_revision,
-                            child_env.clone(),
+                    if let Err(error) = install_result {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .state(StateId::Disabled, "fail_closed")
+                                .message(format!(
+                                    "Rejected provider environment refresh; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
+                                ))
+                                .build()
+                        );
+                    } else {
+                        let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
+                        let env_count = child_env.len();
+                        if let Some(publisher) = ctx.sidecar_control_publisher.as_ref()
+                            && let Err(error) = publisher
+                                .publish_provider_env(
+                                    provider_env_revision,
+                                    child_env.clone(),
+                                    Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS),
+                                )
+                                .await
+                        {
+                            warn!(
+                                error = %error,
+                                provider_env_revision,
+                                "Settings poll: process supervisor did not apply provider environment"
+                            );
+                            continue;
+                        }
+                        current_provider_env_revision = provider_env_revision;
+                        provider_env_reconciled = true;
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped(
+                                    "provider_env_revision",
+                                    serde_json::json!(provider_env_revision)
+                                )
+                                .message(format!(
+                                    "Provider environment refreshed [revision:{provider_env_revision} env_count:{env_count}]"
+                                ))
+                                .build()
                         );
                     }
-                    current_provider_env_revision = env_result.provider_env_revision;
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "provider_env_revision",
-                                serde_json::json!(env_result.provider_env_revision)
-                            )
-                            .message(format!(
-                                "Provider environment refreshed [revision:{} env_count:{env_count}]",
-                                env_result.provider_env_revision
-                            ))
-                            .build()
-                    );
                 }
                 Err(e) => {
+                    ctx.provider_credentials
+                        .revoke_static_provider_environment(result.provider_env_revision);
                     warn!(
                         error = %e,
                         provider_env_revision = result.provider_env_revision,
-                        "Settings poll: failed to refresh provider environment"
+                        "Settings poll: failed to refresh provider environment; static provider credentials were revoked; previous dynamic token grants remain active"
+                    );
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(
+                                "Provider environment refresh failed; static provider credentials were revoked; previous dynamic token grants remain active"
+                            )
+                            .build()
                     );
                 }
             }
         }
 
-        if policy_runtime_changed {
+        if policy_runtime_changed && provider_env_reconciled {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_policy_runtime(
                 &ctx.opa_engine,
                 result.policy.as_ref(),
                 pid,
-                &result.supervisor_middleware_services,
-                middleware_registry_changed,
-                &ctx.middleware_connector,
+                MiddlewareReloadContext {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: &MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    connector: &ctx.middleware_connector,
+                },
+                ctx.transparent_tcp,
             )
             .await;
 
@@ -3379,6 +4163,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
                     current_policy_hash.clone_from(&result.policy_hash);
                     current_middleware_services.clone_from(&result.supervisor_middleware_services);
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
+                    retain_extension_credentials(
+                        &ctx.extension_credentials,
+                        &result.supervisor_middleware_services,
+                        result.extension_authentication_enabled,
+                    );
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
                     last_failed_runtime_revision = None;
                 }
@@ -3437,6 +4228,26 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                                     ))
                                     .build());
                             }
+                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                                error,
+                                active_generation,
+                            } => {
+                                emit_transparent_tcp_expansion_rejection(
+                                    result.version,
+                                    &result.policy_hash,
+                                    active_generation,
+                                    &error,
+                                );
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
+                            }
                         }
                     }
                     last_failed_runtime_revision = Some(failed_revision);
@@ -3450,6 +4261,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         if let Some(version) = unchanged_policy_revision_ready_to_ack(
             unchanged_policy_revision,
+            provider_env_reconciled,
             policy_runtime_changed,
             policy_runtime_reconciled,
         ) {
@@ -3640,6 +4452,21 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_tcp_capability_requires_exact_driver_marker() {
+        let required = openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY;
+        assert!(!has_network_runtime_capability(None, required));
+        assert!(!has_network_runtime_capability(Some(""), required));
+        assert!(!has_network_runtime_capability(
+            Some("policy-dns-transparent-tcp-extra"),
+            required
+        ));
+        assert!(has_network_runtime_capability(
+            Some("other, policy-dns-transparent-tcp"),
+            required
+        ));
+    }
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
@@ -3709,20 +4536,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_control_provider_env_update_installs_newer_revision() {
+    async fn sidecar_control_provider_env_update_orders_by_generation() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-            1,
+            u64::MAX,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
+        let agent_proposals = AgentProposals::new(true);
         let handle = spawn_sidecar_control_update_watcher(
             rx,
+            None,
             provider_credentials.clone(),
-            AgentProposals::default(),
+            agent_proposals.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            10,
         );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 2,
+            revision: 1,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "new".to_string(),
@@ -3730,6 +4562,62 @@ mod tests {
         })
         .unwrap();
 
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if provider_credentials.snapshot().revision == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 11,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "duplicate-generation".to_string(),
+            )]),
+        })
+        .unwrap();
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 1,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            provider_credentials
+                .snapshot()
+                .child_env
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 12,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "newest".to_string(),
+            )]),
+        })
+        .unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
                 if provider_credentials.snapshot().revision == 2 {
@@ -3740,29 +4628,33 @@ mod tests {
         })
         .await
         .unwrap();
-        let snapshot = provider_credentials.snapshot();
-        assert_eq!(snapshot.revision, 2);
-        assert_eq!(
-            snapshot.child_env.get("TOKEN").map(String::as_str),
-            Some("new")
-        );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 1,
+            revision: u64::MAX,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "stale".to_string(),
             )]),
         })
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: true,
+            config_revision: 2,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 2);
         assert_eq!(
-            provider_credentials
-                .snapshot()
-                .child_env
-                .get("TOKEN")
-                .map(String::as_str),
-            Some("new")
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("newest")
         );
         handle.abort();
     }
@@ -3773,8 +4665,14 @@ mod tests {
         let provider_credentials =
             ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
         let agent_proposals = AgentProposals::new(true);
-        let handle =
-            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            None,
+            provider_credentials,
+            agent_proposals.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            0,
+        );
 
         tx.send(sidecar_control::ControlUpdate::AgentProposals {
             enabled: false,
@@ -3971,6 +4869,24 @@ filesystem_policy:
         openshell_policy::restrictive_default_policy()
     }
 
+    fn proto_tcp_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  redis:
+    name: redis
+    endpoints:
+      - host: redis.example.com
+        port: 6379
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/redis-cli
+"#,
+        )
+        .expect("parse TCP policy")
+    }
+
     fn settings_poll_result(
         policy: Option<openshell_core::proto::SandboxPolicy>,
         version: u32,
@@ -3988,6 +4904,7 @@ filesystem_policy:
             supervisor_middleware_services: Vec::new(),
             workspace: String::new(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            extension_authentication_enabled: false,
         }
     }
 
@@ -4034,6 +4951,49 @@ filesystem_policy:
         }
     }
 
+    #[derive(Clone)]
+    struct CredentialRejectingPolicyGateway {
+        inner: ScriptedPolicyGateway,
+        credential_requests: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
+        async fn poll_settings(
+            &self,
+            sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.inner.poll_settings(sandbox_id).await
+        }
+
+        async fn report_policy_status(
+            &self,
+            sandbox_id: &str,
+            version: u32,
+            loaded: bool,
+            error: &str,
+        ) -> Result<()> {
+            self.inner
+                .report_policy_status(sandbox_id, version, loaded, error)
+                .await
+        }
+
+        async fn extension_credentials_for(
+            &self,
+            _services: &[openshell_core::proto::SupervisorMiddlewareService],
+        ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>>
+        {
+            self.credential_requests.fetch_add(1, Ordering::SeqCst);
+            Err(miette::miette!(
+                "gateway extension authentication is unavailable"
+            ))
+        }
+
+        fn workspace(&self) -> String {
+            self.inner.workspace()
+        }
+    }
+
     fn scripted_policy_gateway() -> (
         ScriptedPolicyGateway,
         UnboundedSender<openshell_core::grpc_client::SettingsPollResult>,
@@ -4074,7 +5034,10 @@ filesystem_policy:
             middleware_registry_status: MiddlewareRegistryStatus::Synchronized,
             sidecar_control_publisher: None,
             workspace_tx,
+            extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
+            extension_authentication_enabled: false,
             middleware_connector,
+            transparent_tcp: TransparentTcpReloadState::default(),
         }
     }
 
@@ -4143,6 +5106,54 @@ filesystem_policy:
     }
 
     #[tokio::test]
+    async fn poll_rejects_first_tcp_expansion_and_reports_previous_policy_active() {
+        let v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let v2 = settings_poll_result(
+            Some(proto_tcp_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let active_generation = engine.current_generation();
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: false,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("TCP rejection report timed out")
+            .expect("policy reporter stopped");
+
+        assert_eq!(report.0, 2);
+        assert!(!report.1);
+        assert!(report.2.contains("recreate the sandbox"), "{}", report.2);
+        assert!(report.2.contains("previous policy remains active"));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn same_hash_ack_waits_for_failed_middleware_reconciliation_and_retries_once() {
         let mut v1 = settings_poll_result(
             Some(proto_policy_fixture()),
@@ -4164,14 +5175,14 @@ filesystem_policy:
         let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
         let middleware_connector: MiddlewareConnector = {
             let connector_attempts = connector_attempts.clone();
-            Arc::new(move |_services| {
+            Arc::new(move |_services, _authentication| {
                 let attempt = connector_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 attempt_tx.send(attempt).unwrap();
                 Box::pin(async move {
                     if attempt == 1 {
                         Err(miette::miette!("scripted middleware connection failure"))
                     } else {
-                        connect_middleware_registry(&[]).await
+                        connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
                     }
                 })
             })
@@ -4217,6 +5228,134 @@ filesystem_policy:
         polls.send(v2).unwrap();
         expect_no_policy_report(&mut reports).await;
         assert_eq!(connector_attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn no_signer_capability_uses_legacy_middleware_connector_without_credentials() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        v2.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "legacy-guard".to_string(),
+                grpc_endpoint: "http://legacy.invalid".to_string(),
+                ..Default::default()
+            }];
+        assert!(!v2.extension_authentication_enabled);
+
+        let (inner, polls, mut reports) = scripted_policy_gateway();
+        let credential_requests = Arc::new(AtomicUsize::new(0));
+        let client = CredentialRejectingPolicyGateway {
+            inner,
+            credential_requests: credential_requests.clone(),
+        };
+        let (connector_tx, mut connector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector: MiddlewareConnector = Arc::new(move |_services, authentication| {
+            connector_tx
+                .send((authentication.credentials.len(), authentication.enabled))
+                .unwrap();
+            Box::pin(async move {
+                connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
+            })
+        });
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), connector_rx.recv())
+                .await
+                .unwrap(),
+            Some((0, false))
+        );
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(credential_requests.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn enabled_extension_authentication_keeps_credential_failure_fail_closed() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        v2.extension_authentication_enabled = true;
+        v2.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "authenticated-guard".to_string(),
+                grpc_endpoint: "https://guard.invalid".to_string(),
+                ..Default::default()
+            }];
+
+        let (inner, polls, mut reports) = scripted_policy_gateway();
+        let credential_requests = Arc::new(AtomicUsize::new(0));
+        let client = CredentialRejectingPolicyGateway {
+            inner,
+            credential_requests: credential_requests.clone(),
+        };
+        let (connector_tx, mut connector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector: MiddlewareConnector = Arc::new(move |_services, authentication| {
+            connector_tx
+                .send((authentication.credentials.len(), authentication.enabled))
+                .unwrap();
+            Box::pin(async move {
+                if authentication.enabled && authentication.credentials.is_empty() {
+                    Err(miette::miette!(
+                        "missing authenticated middleware credential"
+                    ))
+                } else {
+                    connect_middleware_registry(&[], &authentication).await
+                }
+            })
+        });
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), connector_rx.recv())
+                .await
+                .unwrap(),
+            Some((0, true))
+        );
+        expect_no_policy_report(&mut reports).await;
+        assert_eq!(credential_requests.load(Ordering::SeqCst), 1);
         handle.abort();
     }
 
@@ -4373,10 +5512,10 @@ filesystem_policy:
         let invalid_external = openshell_core::proto::SupervisorMiddlewareService {
             name: "unavailable-guard".into(),
             grpc_endpoint: "http://127.0.0.1:1".into(),
-            max_body_bytes: 1024,
+            max_payload_bytes: 1024,
             ..Default::default()
         };
-        connect_middleware_registry(&[invalid_external])
+        connect_middleware_registry(&[invalid_external], &MiddlewareAuthentication::default())
             .await
             .expect_err("unavailable external service must not replace built-ins");
 
@@ -4393,7 +5532,7 @@ filesystem_policy:
         let unavailable_service = openshell_core::proto::SupervisorMiddlewareService {
             name: "unavailable-guard".into(),
             grpc_endpoint: "http://127.0.0.1:1".into(),
-            max_body_bytes: 1024,
+            max_payload_bytes: 1024,
             ..Default::default()
         };
 
@@ -4401,9 +5540,13 @@ filesystem_policy:
             &engine,
             Some(&proto_policy_fixture()),
             0,
-            &[unavailable_service],
-            true,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[unavailable_service],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: true,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
         )
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
@@ -4422,6 +5565,74 @@ filesystem_policy:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_without_startup_substrate_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let active_generation = engine.current_generation();
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState {
+                capable: true,
+                substrate_ready: false,
+            },
+        )
+        .await
+        .expect_err("TCP expansion must require startup substrate");
+        let disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            2,
+        )
+        .expect("runtime prerequisite failure handling must succeed");
+
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                active_generation: generation,
+                ..
+            } if generation == active_generation
+        ));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_on_unsupported_runtime_is_rejected() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+        )
+        .await
+        .expect_err("unsupported runtime must reject TCP expansion");
+
+        assert!(matches!(
+            failure,
+            GatewayRuntimeReloadError::TransparentTcpPrerequisite(_)
+        ));
+        assert_eq!(engine.current_generation(), 0);
     }
 
     #[test]
@@ -4776,25 +5987,64 @@ filesystem_policy:
     #[test]
     fn unchanged_policy_revision_waits_for_required_runtime_reconciliation() {
         assert_eq!(
-            unchanged_policy_revision_ready_to_ack(Some(2), false, false),
+            unchanged_policy_revision_ready_to_ack(Some(2), true, false, false),
             Some(2),
             "a same-hash revision needs no OPA reload"
         );
         assert_eq!(
-            unchanged_policy_revision_ready_to_ack(Some(2), true, false),
+            unchanged_policy_revision_ready_to_ack(Some(2), false, false, false),
+            None,
+            "a failed provider refresh must keep the revision pending"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), true, true, false),
             None,
             "failed runtime reconciliation must keep the revision pending"
         );
         assert_eq!(
-            unchanged_policy_revision_ready_to_ack(Some(2), true, true),
+            unchanged_policy_revision_ready_to_ack(Some(2), true, true, true),
             Some(2),
             "successful runtime reconciliation permits acknowledgement"
         );
         assert_eq!(
-            unchanged_policy_revision_ready_to_ack(None, false, true),
+            unchanged_policy_revision_ready_to_ack(None, true, false, true),
             None,
             "runtime success cannot manufacture a revision candidate"
         );
+    }
+
+    #[test]
+    fn credential_gating_unavailable_for_local_override_with_credentials() {
+        assert!(credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn credential_gating_available_without_local_override_or_credentials() {
+        // A gateway policy is stamped with provenance, so the gates apply.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::Gateway {
+                revision: None,
+                has_last_valid_policy: true,
+            },
+            true,
+            true
+        ));
+        // No provider credentials means there is nothing to leak.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            false,
+            true
+        ));
+        // Without networking the proxy never evaluates endpoint provenance.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -4958,11 +6208,21 @@ filesystem_policy:
             "fail_closed"
         );
         assert_eq!(config["unmapped"]["previous_policy_active"], false);
+        assert_eq!(
+            config["unmapped"]["validation_error"],
+            "conflicting tls metadata"
+        );
         assert!(
             config["message"]
                 .as_str()
                 .unwrap()
                 .contains("previous policy IS NOT active")
+        );
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("error:conflicting tls metadata")
         );
 
         let finding = finding.to_json().unwrap();

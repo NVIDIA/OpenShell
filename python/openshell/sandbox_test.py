@@ -16,10 +16,13 @@ from typing import Any, cast
 
 import pytest
 
+import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
+    _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
+    ClientCredentialsAuth,
     InferenceRouteClient,
     Sandbox,
     SandboxClient,
@@ -27,6 +30,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
@@ -34,7 +38,352 @@ from openshell.sandbox import (
     _OidcRefresher,
     _read_oidc_token_bundle,
     _sandbox_ref,
+    _validate_oauth_url,
 )
+
+
+def _client_credentials_fixture() -> dict[str, Any]:
+    return json.loads(
+        (
+            Path(__file__).parents[2] / "sdk/conformance/oauth-client-credentials.json"
+        ).read_text()
+    )
+
+
+def test_oauth_client_credentials_conformance_fixture() -> None:
+    fixture = _client_credentials_fixture()
+    assert fixture["expiry"]["leeway_seconds"] == _OIDC_TOKEN_EXPIRY_GRACE_SECONDS
+    for value in fixture["urls"]["allowed"]:
+        assert _validate_oauth_url("issuer", value) == value
+    for value in fixture["urls"]["rejected"]:
+        with pytest.raises(SandboxError):
+            _validate_oauth_url("issuer", value)
+
+
+def test_client_credentials_auth_exact_form_cache_and_redaction() -> None:
+    fixture = _client_credentials_fixture()
+    seen: list[tuple[str, bytes]] = []
+
+    def handler(request: Any) -> Any:
+        import httpx
+
+        seen.append((str(request.url), bytes(request.content)))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com/",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "service-token",
+                "expires_in": fixture["expiry"]["valid_expires_in"],
+            },
+        )
+
+    import httpx
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="service-client",
+        client_secret="conformance-secret",
+        scopes=("sandbox:read", "sandbox:write"),
+        audience="openshell-gateway",
+        _transport=httpx.MockTransport(handler),
+    )
+    assert auth() == "service-token"
+    assert auth() == "service-token"
+    assert len(seen) == 2
+    form = dict(__import__("urllib.parse").parse.parse_qsl(seen[1][1].decode()))
+    assert form == {
+        field: fixture["request"][field]
+        for field in (
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "scope",
+            "audience",
+        )
+    }
+    assert "conformance-secret" not in repr(auth)
+
+
+def test_client_credentials_auth_preserves_explicit_empty_scopes() -> None:
+    import httpx
+
+    form: dict[str, str] = {}
+
+    def handler(request: Any) -> Any:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        form.update(
+            __import__("urllib.parse").parse.parse_qsl(request.content.decode())
+        )
+        return httpx.Response(200, json={"access_token": "token", "expires_in": 120})
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        scopes=(),
+        _transport=httpx.MockTransport(handler),
+    )
+    auth._apply_gateway_metadata({"oidc_scopes": "sandbox:read sandbox:write"})
+
+    assert auth() == "token"
+    assert auth._scopes == ()
+    assert "scope" not in form
+
+
+@pytest.mark.parametrize(
+    "expires_in", _client_credentials_fixture()["expiry"]["invalid_expires_in"]
+)
+def test_client_credentials_auth_rejects_invalid_expiry(expires_in: object) -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+
+    def handler(request: Any) -> Any:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": fixture["discovery"]["matching_issuer"],
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            200, json={"access_token": "token", "expires_in": expires_in}
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer=fixture["discovery"]["configured_issuer"],
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match="positive finite expires_in"):
+        auth()
+
+
+@pytest.mark.parametrize(
+    "status", _client_credentials_fixture()["discovery"]["redirect_statuses"]
+)
+def test_client_credentials_auth_refuses_discovery_redirect(status: int) -> None:
+    import httpx
+
+    requests = 0
+
+    def handler(_request: Any) -> Any:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            status,
+            headers={"location": "https://attacker.example.com/discovery"},
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match=f"HTTP {status}"):
+        auth()
+    assert requests == 1
+
+
+@pytest.mark.parametrize(
+    "status", _client_credentials_fixture()["discovery"]["redirect_statuses"]
+)
+def test_client_credentials_auth_refuses_token_redirect(status: int) -> None:
+    import httpx
+
+    requests: list[str] = []
+
+    def handler(request: Any) -> Any:
+        requests.append(str(request.url))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            status,
+            headers={"location": "https://attacker.example.com/token"},
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match=f"HTTP {status}"):
+        auth()
+    assert requests == [
+        "https://issuer.example.com/.well-known/openid-configuration",
+        "https://issuer.example.com/token",
+    ]
+
+
+def test_client_credentials_auth_rejects_discovery_issuer_mismatch() -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+    auth = ClientCredentialsAuth(
+        issuer=fixture["discovery"]["configured_issuer"],
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "issuer": fixture["discovery"]["mismatched_issuer"],
+                    "token_endpoint": "https://attacker.example.com/token",
+                },
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="issuer mismatch"):
+        auth()
+
+
+def test_client_credentials_auth_rejects_oversized_response() -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, content=b"x" * (fixture["limits"]["max_response_bytes"] + 1)
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="too large"):
+        auth()
+
+
+def test_client_credentials_auth_single_flight_and_retry() -> None:
+    import httpx
+
+    token_calls = 0
+    release = threading.Event()
+
+    def handler(request: Any) -> Any:
+        nonlocal token_calls
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "http://127.0.0.1:8080",
+                    "token_endpoint": "http://127.0.0.1:8080/token",
+                },
+            )
+        token_calls += 1
+        release.wait(timeout=2)
+        return httpx.Response(200, json={"access_token": "shared", "expires_in": 120})
+
+    auth = ClientCredentialsAuth(
+        issuer="http://127.0.0.1:8080",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    results: list[str] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(auth())) for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    while token_calls == 0:
+        time.sleep(0.001)
+    release.set()
+    for thread in threads:
+        thread.join()
+    assert results == ["shared"] * 8
+    assert token_calls == 1
+
+
+def test_client_credentials_auth_fails_closed_and_redacts_errors() -> None:
+    import httpx
+
+    def supplier() -> str:
+        raise RuntimeError("supplier-sensitive-detail")
+
+    auth = ClientCredentialsAuth(
+        issuer="http://localhost:8080",
+        client_id="client",
+        client_secret=supplier,
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "issuer": "http://localhost:8080",
+                    "token_endpoint": "http://localhost:8080/token",
+                },
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="supplier failed") as exc_info:
+        auth()
+    assert "supplier-sensitive-detail" not in str(exc_info.value)
+    with pytest.raises(SandboxError, match="must use HTTPS"):
+        ClientCredentialsAuth(
+            issuer="http://remote.example.com",
+            client_id="client",
+            client_secret="secret",
+        )()
+
+
+def test_client_credentials_auth_does_not_use_stale_token_after_renewal_failure() -> (
+    None
+):
+    import httpx
+
+    exchanges = 0
+
+    def handler(request: Any) -> Any:
+        nonlocal exchanges
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "http://localhost:8080",
+                    "token_endpoint": "http://localhost:8080/token",
+                },
+            )
+        exchanges += 1
+        if exchanges == 1:
+            return httpx.Response(200, json={"access_token": "stale", "expires_in": 30})
+        return httpx.Response(503, json={"error": "provider-sensitive-detail"})
+
+    auth = ClientCredentialsAuth(
+        issuer="http://localhost:8080",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    assert auth() == "stale"
+    with pytest.raises(SandboxError, match="HTTP 503") as exc_info:
+        auth()
+    assert "stale" not in str(exc_info.value)
+    assert "provider-sensitive-detail" not in str(exc_info.value)
 
 
 class _FakeStub:
@@ -1185,6 +1534,113 @@ def test_sandbox_client_close_invokes_bearer_close() -> None:
     assert closed[0] == 1
 
 
+def test_from_active_cluster_fills_client_credentials_from_metadata(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(tmp_path, monkeypatch, auth_mode="oidc")
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+            "oidc_audience": "gateway",
+            "oidc_scopes": "sandbox:read sandbox:write",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    auth = ClientCredentialsAuth(client_secret="secret")
+    client = SandboxClient.from_active_cluster(
+        client_credentials=auth,
+        insecure=True,
+    )
+    try:
+        assert auth._issuer == "https://issuer.example.com"
+        assert auth._client_id == "service-client"
+        assert auth._audience == "gateway"
+        assert auth._scopes == ("sandbox:read", "sandbox:write")
+        assert auth._insecure is True
+    finally:
+        client.close()
+
+
+def test_sandbox_client_rejects_client_credentials_on_remote_plaintext(
+    monkeypatch: Any,
+) -> None:
+    channel_opened = False
+
+    def insecure_channel(_endpoint: str) -> Any:
+        nonlocal channel_opened
+        channel_opened = True
+        raise AssertionError("plaintext channel must not be opened")
+
+    monkeypatch.setattr(sandbox_module.grpc, "insecure_channel", insecure_channel)
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient("gateway.example.com:50051", client_credentials=auth)
+    assert not channel_opened
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["localhost:50051", "127.42.0.1:50051", "[::1]:50051"],
+)
+def test_sandbox_client_allows_client_credentials_on_plaintext_loopback(
+    endpoint: str,
+) -> None:
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    client = SandboxClient(endpoint, client_credentials=auth)
+    client.close()
+
+
+def test_from_active_cluster_rejects_client_credentials_on_remote_plaintext(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(
+        tmp_path,
+        monkeypatch,
+        endpoint="http://gateway.example.com:8080",
+        auth_mode="oidc",
+    )
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    auth = ClientCredentialsAuth(client_secret="secret")
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient.from_active_cluster(client_credentials=auth)
+
+
+def test_sandbox_client_rejects_ambiguous_bearer_configuration() -> None:
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    with pytest.raises(SandboxError, match="mutually exclusive"):
+        SandboxClient(
+            "localhost:50051",
+            bearer_token="static",
+            client_credentials=auth,
+        )
+
+
 def test_sandbox_client_close_releases_refresher_http_client(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1279,6 +1735,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         assert leftovers == [], f"orphan tmp files: {leftovers}"
     finally:
         r.close()
+
+
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
 
 
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
@@ -1482,6 +1997,8 @@ class _FakeSandboxStub:
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
         self._listed = listed or []
 
     def GetSandbox(
@@ -1505,6 +2022,38 @@ class _FakeSandboxStub:
         self.delete_request = request
         _ = timeout
         return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
 
     def CreateSandbox(
         self,
@@ -1578,6 +2127,23 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
 def test_create_without_args_sends_empty_metadata() -> None:
@@ -1658,6 +2224,15 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     ref = _sandbox_ref(proto)
 
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
+
+
+def test_sandbox_ref_includes_main_process_result() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.status.exit_code = 0
+
+    status = _sandbox_ref(proto).status
+
+    assert status.exit_code == 0
 
 
 def test_returned_labels_are_immutable() -> None:

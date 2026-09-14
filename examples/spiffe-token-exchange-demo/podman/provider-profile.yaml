@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Template rendered by podman/demo.sh.
+# __TOKEN_ISSUER_BASE_URL__ must be reachable from both the gateway process and
+# the sandbox container. For local HTTP, OpenShell profile validation permits
+# loopback hosts and Kubernetes-style service DNS names.
+
+id: spiffe-token-exchange-demo-podman
+display_name: SPIFFE token exchange demo (Podman)
+description: Dynamic token exchange for local Podman alpha/beta demo services using stored user subject tokens and SPIFFE JWT-SVID authentication
+category: other
+credentials:
+  - name: subject_token
+    description: Demo user subject token stored for gateway-side token exchange only
+    required: true
+  - name: access_token
+    description: Access token obtained via RFC 8693 token exchange
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: __TOKEN_ISSUER_BASE_URL__/token
+      audience: demo-default
+      jwt_svid_audience: __TOKEN_ISSUER_BASE_URL__
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [demo]
+      cache_ttl_seconds: 60
+      subject_token:
+        source: provider_credential
+        credential: subject_token
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      audience_overrides:
+        - host: alpha-exchange
+          port: 8080
+          audience: alpha
+          scopes: [alpha]
+        - host: beta-exchange
+          port: 8080
+          audience: beta
+          scopes: [beta]
+endpoints:
+  - host: alpha-exchange
+    port: 8080
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+  - host: beta-exchange
+    port: 8080
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

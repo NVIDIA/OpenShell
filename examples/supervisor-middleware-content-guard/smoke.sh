@@ -214,7 +214,7 @@ ttl_secs = 0
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://$SERVICE_HOST:$MIDDLEWARE_PORT"
-max_body_bytes = 262144
+max_payload_bytes = 262144
 timeout = "500ms"
 EOF
 }

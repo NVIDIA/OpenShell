@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
+requires = ["setuptools>=80", "setuptools-scm[simple]>=8"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "openshell"
@@ -29,8 +29,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Programming Language :: Rust",
-    "License :: OSI Approved :: Apache Software License",
     "Topic :: Security",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -51,33 +49,23 @@ dev = [
     "pytest-xdist>=3.0",
     "ruff>=0.4",
     "ty>=0.0.1a6",
-    "maturin>=1.5,<2.0",
-    "setuptools-scm>=8",
     "grpcio-tools>=1.60",
     "pyelftools>=0.30",
     "pyyaml==6.0.2",
     "types-pyyaml>=6.0.12.20260518",
 ]
 
-[tool.uv]
-# Don't try to install the root package with uv sync - use uv pip install . instead
-# This is needed because maturin bin packages don't install the binary with editable installs
-# (both `uv pip install -e .` and `maturin develop` skip binary installation)
-# Use `uv pip install .` (without -e) to install the openshell CLI binary
-package = false
+[tool.setuptools]
+package-dir = { "" = "python" }
+include-package-data = false
 
-[tool.maturin]
-bindings = "bin"
-manifest-path = "crates/openshell-cli/Cargo.toml"
-python-source = "python"
-module-name = "openshell"
-# _proto/ stubs are gitignored; force them into the wheel so git-aware
-# maturin builds don't drop them (package-relative paths).
-include = [
-    "openshell/_proto/*_pb2.py",
-    "openshell/_proto/*_pb2_grpc.py",
-    "openshell/_proto/*.pyi",
-]
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["openshell*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+openshell = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
 
 [tool.ruff]
 target-version = "py311"

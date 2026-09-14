@@ -11,7 +11,7 @@ Implement a code fix for a security issue that has already been reviewed by the 
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
-- The issue must have `topic:security`. In unattended scan mode it must also have `agent:implementation-requested`; a direct user request to fix a specific issue does not require that label.
+- The issue must have `topic:security`. In unattended scan mode it must also have `agent:implementation-requested`; for a direct user request, warn if that workflow label is missing and continue without changing it.
 - The issue must have a prior security review comment (posted by `review-security-issue`) with a **Legitimate concern** determination and a remediation plan
 
 ## Agent Comment Marker
@@ -30,7 +30,7 @@ The user may provide an issue number directly, or ask the agent to find issues t
 
 ### If an issue number is provided
 
-Strip any leading `#` and proceed to Step 2 with that issue ID. The user's explicit fix request authorizes implementation; do not refuse solely because `agent:implementation-requested` is absent.
+Strip any leading `#` and proceed to Step 2 with that issue ID. The user's explicit fix request authorizes implementation. If `agent:implementation-requested` is absent, warn that the expected workflow label is missing and continue without changing it.
 
 ### If no issue number is provided
 
@@ -61,7 +61,7 @@ Check the issue's `labels` array from the response above:
 
 If `topic:security` is missing, report that this skill only handles security issues and stop. If queue mode selected an issue without `agent:implementation-requested`, report that it is not ready for unattended pickup and stop.
 
-Never apply `agent:implementation-requested` yourself. Its absence does not block a direct user request to fix a specific issue.
+Never apply `agent:implementation-requested` yourself. In direct mode, warn about its absence and continue; the missing label does not block the user's request to fix the specific issue.
 
 ### Validate the security review
 
@@ -307,7 +307,8 @@ User says: "Fix security issue #55"
 1. Fetch issue #55 metadata
 2. Labels are `["topic:security"]` -- missing `agent:implementation-requested`
 3. Confirm that a legitimate security review and remediation plan exist
-4. Proceed because the user's direct request authorizes implementation
+4. Warn that `agent:implementation-requested` is missing from the expected workflow state
+5. Proceed because the user's direct request authorizes implementation; leave the labels unchanged
 
 ### Issue without a review
 

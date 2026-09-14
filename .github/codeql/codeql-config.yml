@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: OpenShell Rust and SDKs
+
+paths:
+  - crates
+  - examples
+  - sdk/go
+  - sdk/typescript/src
+  - python/openshell
+
+paths-ignore:
+  - python/openshell/_proto
+  - sdk/typescript/src/gen

@@ -15,17 +15,23 @@ from __future__ import annotations
 
 import contextlib
 import os
+import urllib.parse
+from pathlib import Path
 
 import grpc
 import pytest
 
+from openshell import ClientCredentialsAuth, SandboxClient, TlsConfig
 from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
 
 from .helpers import (
+    KEYCLOAK_REALM,
+    _gateway_endpoint,
+    _mtls_dir,
     extract_sub,
-    get_ci_token,
     get_token,
     grpc_channel,
+    keycloak_url,
     stub_with_token,
 )
 
@@ -180,9 +186,28 @@ class TestClientCredentials:
     def test_ci_token_can_list_sandboxes(self) -> None:
         admin_token = get_token("admin@test", "admin", scopes="openid openshell:all")
         admin_stub, admin_md = stub_with_token(admin_token)
-        ci_token = get_ci_token()
+        auth = ClientCredentialsAuth(
+            issuer=f"{keycloak_url()}/realms/{KEYCLOAK_REALM}",
+            client_id="openshell-ci",
+            client_secret="ci-test-secret",
+        )
+        ci_token = auth()
         ci_sub = extract_sub(ci_token)
-        ci_stub, ci_md = stub_with_token(ci_token)
+        gateway_endpoint, is_tls = _gateway_endpoint()
+        parsed = urllib.parse.urlparse(gateway_endpoint)
+        target = f"{parsed.hostname}:{parsed.port or (443 if is_tls else 80)}"
+        tls = None
+        if is_tls:
+            if ca_path := os.environ.get("OPENSHELL_E2E_GATEWAY_CA_CERT"):
+                tls = TlsConfig(ca_path=Path(ca_path))
+            else:
+                mtls = _mtls_dir()
+                tls = TlsConfig(
+                    ca_path=mtls / "ca.crt",
+                    cert_path=mtls / "tls.crt",
+                    key_path=mtls / "tls.key",
+                )
+        ci_client = SandboxClient(target, tls=tls, client_credentials=auth)
 
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
@@ -194,8 +219,9 @@ class TestClientCredentials:
                 metadata=admin_md,
             )
         try:
-            ci_stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=ci_md)
+            ci_client.list(workspace="default")
         finally:
+            ci_client.close()
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(

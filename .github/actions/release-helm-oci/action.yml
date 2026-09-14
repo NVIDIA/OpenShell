@@ -29,6 +29,10 @@ inputs:
       pushed by docker-build.yml.
     required: false
     default: ""
+  repository:
+    description: OCI repository prefix that receives helm-chart
+    required: false
+    default: ghcr.io/nvidia/openshell
 
 runs:
   using: composite
@@ -62,10 +66,11 @@ runs:
       if: inputs.release-kind == 'public'
       env:
         CHART_VERSION: ${{ steps.prep.outputs.chart_version }}
+        OCI_REPOSITORY: ${{ inputs.repository }}
       shell: bash
       run: |
         set -euo pipefail
-        OCI_CHART="oci://ghcr.io/nvidia/openshell/helm-chart"
+        OCI_CHART="oci://${OCI_REPOSITORY}/helm-chart"
         if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
           echo "::error::Chart ${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
           exit 1
@@ -81,16 +86,19 @@ runs:
         ls /tmp/helm-chart-*.tgz
 
     - name: Push Helm chart to GHCR OCI
+      env:
+        OCI_REPOSITORY: ${{ inputs.repository }}
       shell: bash
       run: |
         set -euo pipefail
-        helm push /tmp/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
+        helm push /tmp/helm-chart-*.tgz "oci://${OCI_REPOSITORY}"
 
     - name: Push SHA-pinned chart
       if: inputs.pin-sha != ''
       env:
         PIN_SHA: ${{ inputs.pin-sha }}
         CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
+        OCI_REPOSITORY: ${{ inputs.repository }}
       shell: bash
       run: |
         set -euo pipefail
@@ -99,4 +107,4 @@ runs:
         sed -i "s/^version:.*/version: 0.0.0-dev.${PIN_SHA}/" "${SHA_CHART_DIR}/Chart.yaml"
         sed -i "s/^appVersion:.*/appVersion: \"${PIN_SHA}\"/" "${SHA_CHART_DIR}/Chart.yaml"
         helm package "${SHA_CHART_DIR}" --destination /tmp/sha-pin
-        helm push /tmp/sha-pin/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
+        helm push /tmp/sha-pin/helm-chart-*.tgz "oci://${OCI_REPOSITORY}"

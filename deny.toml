@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+no-default-features = false
+
+# -- Advisories (RustSec + NVD) ------------------------------------------------
+[advisories]
+yanked = "warn"
+unmaintained = "workspace"
+maximum-db-staleness = "P30D"
+ignore = [
+    # Pre-existing advisories acknowledged at onboarding. Each should be
+    # resolved by upgrading the affected transitive dependency and then
+    # removing the ignore entry.
+    { id = "RUSTSEC-2026-0190", reason = "anyhow unsoundness in downcast_mut — awaiting upstream fix" },
+    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch pointer deref — transitive via metrics/quanta" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — transitive via spiffe, no direct exposure" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via older kube/hyper" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints — transitive via older rustls" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints — transitive via older rustls" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic — transitive via older rustls" },
+    { id = "RUSTSEC-2025-0068", reason = "serde_yml unsound+unmaintained — direct dep, no maintained alternative yet" },
+]
+
+# -- Licenses ------------------------------------------------------------------
+[licenses]
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+ignore = true
+registries = []
+
+# -- Bans ----------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# -- Sources -------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

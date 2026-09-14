@@ -70,7 +70,9 @@ The simplest way to get a sandbox running:
 openshell sandbox create
 ```
 
-This creates a sandbox with defaults and drops you into an interactive shell.
+This creates a sandbox whose canonical main process is `/bin/bash -l` and
+attaches your terminal to that retained process. Add `--detach` to return after
+the sandbox becomes ready without attaching.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
@@ -122,7 +124,22 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
-Profile-backed provider policy and composition are controlled by the gateway-global `providers_v2_enabled` setting:
+Static provider credentials resolve only for hosts, ports, and paths declared by
+the provider profile. Use `provider profile export` to inspect that boundary
+when a placeholder is present but requests receive
+`credential_endpoint_mismatch`. A profileless static provider fails closed
+because the gateway cannot construct a binding.
+
+When an inspected request receives `request_authority_mismatch`, compare its
+HTTP authority with the CONNECT tunnel endpoint. The host and effective port
+must match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; `Host: api.example.com` omits the non-default
+port and is rejected. An absolute-form request target must use the same
+authority.
+
+Profile-backed provider policy composition is controlled by the gateway-global
+`providers_v2_enabled` setting. Static credential endpoint binding remains
+active even when policy composition is disabled:
 
 ```bash
 openshell settings get --global
@@ -165,6 +182,43 @@ openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TO
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+The gateway stores secret refresh material through its active credential driver.
+With Vault selected, refresh tokens, client secrets, and private keys live in
+Vault alongside injectable provider credentials; refresh state contains only
+opaque handles. A credential-backend read or write failure makes refresh fail
+closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
+gateway does not migrate legacy inline refresh material or move secrets between
+credential backends. Reconfigure affected grants after upgrading, and remove or
+reconfigure credentials while the original backend remains available before
+changing backends. Do not run mixed gateway versions against the same refresh
+records.
+
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
+When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
+`provider refresh status`; do not infer the remedy from HTTP status or parse
+`LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
+user must obtain a new OAuth grant and run `provider refresh configure`,
+`fix_configuration` means an operator must repair the OAuth client, scopes, or
+administrator policy, and `investigate` means the issuer returned an
+unrecognized response. The gateway parks `reauthorize` records until a manual
+rotate or reconfiguration. It retries
+`fix_configuration` records hourly so externally repaired configuration can
+recover without rapid token-endpoint traffic. The existing access credential
+remains usable only until its recorded expiry.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -183,19 +237,25 @@ openshell sandbox create \
 ```
 
 Key flags:
-- `--provider`: Attach one or more providers (repeatable)
+- `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
-- `--env KEY=VALUE`: Inject sandbox environment variables (repeatable)
+- `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--tty`: Allocate a retained PTY for the canonical main process
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+Do not combine `--upload` with a trailing main command. Uploads currently finish
+after the canonical process starts; create a scratch sandbox and use
+`sandbox exec`, or build the files into the image.
 
 ### List and inspect sandboxes
 
@@ -214,7 +274,12 @@ openshell sandbox connect my-sandbox
 openshell sandbox connect my-sandbox --editor vscode
 ```
 
-Opens an interactive SSH shell. To configure VS Code Remote-SSH:
+Attaches to the sandbox's existing canonical main process. Disconnecting leaves
+that process running; reconnecting targets the same process instance and replays
+recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. Press
+`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. `Ctrl-C` retains
+its normal terminal behavior and interrupts the foreground process. Configure
+VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
@@ -223,16 +288,22 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ### Upload and download files
 
 ```bash
-# Upload local files to sandbox
-openshell sandbox upload my-sandbox ./src /sandbox/src
+# Upload local files to the sandbox working directory
+openshell sandbox upload my-sandbox ./src
 
-# Download files from sandbox
-openshell sandbox download my-sandbox /sandbox/output ./local-output
+# Download a path relative to the sandbox working directory
+openshell sandbox download my-sandbox output ./local-output
 ```
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
+When the upload destination is omitted, the CLI discovers the remote working
+directory. Uploading a named directory merges it into an existing directory of
+the same name, overwriting matching entries without deleting unrelated entries.
+Downloads accept paths relative to that working directory or absolute paths
+within it.
 
 ### Execute a non-interactive command
 
@@ -241,7 +312,11 @@ openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
-`sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+`sandbox exec` starts an independent sibling process, streams output, and exits
+with the remote command's exit code. Use `sandbox connect` to attach to the
+canonical main process.
+Use `--env` only for non-secret values. Attach credentials to the sandbox with a
+provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
 ### Change attached providers
 
@@ -275,13 +350,33 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
 
+### Stop and start sandboxes
+
+Use stop to halt compute while retaining the sandbox and its persistent
+workspace:
+
+```bash
+openshell sandbox stop [name]
+openshell sandbox start [name]
+```
+
+Both commands default to the last-used sandbox. Stop stops background
+forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
+file transfer, forwarding, and exposed services are unavailable while
+stopped. Delete remains the operation that removes retained state.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
+
+An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
+`protocol: tcp` requests policy DNS and transparent TCP and currently requires
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
+workload rather than activating only part of the network contract.
 
 ```
 Create sandbox with initial policy
@@ -344,9 +439,11 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+
+Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
 ### Step 5: Push the updated policy
 
@@ -359,7 +456,10 @@ provider-profile policy—before it stores a direct update, incremental merge,
 approved proposal, provider attachment, or profile update that affects attached
 sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
 candidate does not create a policy revision or partially update affected
-sandboxes. Fix the conflicting endpoint selectors and submit again.
+sandboxes. The same fail-closed response applies when `credential_signing`
+does not have an attached AWS profile whose credential boundary covers the
+endpoint, or an explicit binding to an endpointless AWS profile. Fix the
+conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully
@@ -405,7 +505,7 @@ Avoid `--yes` during interactive work. A global policy locks policy control for 
 
 ### Review agent-authored rule proposals
 
-Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
 
 ```bash
 openshell rule get dev --status pending
@@ -414,7 +514,7 @@ openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
 openshell rule history dev
 ```
 
-Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 
@@ -436,7 +536,10 @@ For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
-fields.
+fields. Explicit numeric fields may use any UID/GID from `1` through
+`4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
+Warn users that low IDs can inherit permissions from matching accounts, image
+files, mounted volumes, or devices.
 
 ### Forward ports
 
@@ -499,7 +602,22 @@ When denied actions appear:
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
    `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
-2. Use full YAML replacement for broad changes or non-network fields:
+
+   A rule authorizes every binary it lists to reach every endpoint it lists, so
+   an update that adds a binary or an endpoint to an existing rule must declare
+   that rule's whole binary and endpoint scope. The gateway rejects an update
+   that would grant a binary-to-endpoint pair the update never asked for, and
+   the error names the binaries still missing. To grant one binary access to
+   only part of a rule's endpoints, send the narrow authorization under its own
+   `--rule-name`; it stays on its own rule instead of folding into the broader
+   one.
+
+   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
+   that host and port appears in more than one rule, or twice in one rule under
+   different paths, the update is rejected as ambiguous. Fall back to full YAML
+   replacement for those endpoints.
+2. Use full YAML replacement for broad changes or non-network fields, including
+   any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`
@@ -628,7 +746,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -650,6 +768,8 @@ $ openshell sandbox upload --help
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
+| Stop sandbox compute | `openshell sandbox stop [name]` |
+| Start sandbox compute | `openshell sandbox start [name]` |
 | Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |

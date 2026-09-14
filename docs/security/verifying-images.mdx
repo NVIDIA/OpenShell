@@ -1,0 +1,36 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Verify the Contents of Published OpenShell Images"
+sidebar-title: "Verify Image Contents"
+slug: "security/verify-image-contents"
+description: "Read the SBOM attestation attached to published gateway and supervisor images to audit what each image contains."
+keywords: "Generative AI, Cybersecurity, Supply Chain, SBOM, Container Images"
+position: 2
+---
+
+Published gateway and supervisor images carry one SPDX SBOM per platform as OCI attestations.
+
+## Inspect an Image
+
+Read a platform's document without pulling the image:
+
+```shell
+docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+```
+
+List the packages instead of the full document:
+
+```shell
+docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest --format '{{ range (index .SBOM "linux/amd64").SPDX.packages }}{{ .name }}@{{ .versionInfo }}{{ println }}{{ end }}'
+```
+
+The same commands work for `ghcr.io/nvidia/openshell/supervisor`.
+
+## Coverage
+
+Every SBOM lists the base-image packages. Release Dev and Release Tag images also list the Rust crates compiled into their OpenShell binary.
+
+<Note>
+OpenShell also publishes minimal SLSA provenance. It records how BuildKit produced the image, including its source revision, build platform, and base-image materials, without the extra build parameters included by full provenance.
+</Note>

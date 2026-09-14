@@ -12,6 +12,7 @@
 //! that needs an instance metadata emulator can implement the trait.
 
 use miette::Result;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -70,6 +71,9 @@ pub async fn run<H: MetadataHandler>(
 
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                // Small-request IMDS-style endpoint an agent polls for
+                // credentials/identity — disable Nagle to avoid delayed-ACK stalls.
+                set_tcp_nodelay_best_effort(&stream);
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(handler.as_ref(), stream).await {

@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Workflow Security Reports
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: nix develop --command bash -euo pipefail {0}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Actionlint (informational)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
+
+      - name: Run Actionlint
+        run: |
+          set -uo pipefail
+          mkdir -p reports
+          echo "::add-matcher::.github/actionlint-matcher.json"
+
+          set +e
+          actionlint -shellcheck= -pyflakes= 2>&1 | tee reports/actionlint.txt
+          status=${PIPESTATUS[0]}
+
+          echo "::remove-matcher owner=actionlint::"
+          actionlint \
+            -shellcheck= \
+            -pyflakes= \
+            -format "$(cat .github/actionlint-sarif-template.txt)" \
+            > reports/actionlint.sarif
+          sarif_status=$?
+          set -e
+
+          if [ "$status" -le 1 ] && [ "$sarif_status" -ne "$status" ]; then
+            echo "::error::Actionlint could not produce SARIF (exit $sarif_status)."
+            exit "$sarif_status"
+          fi
+
+          {
+            echo "### Actionlint"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$status" in
+            0)
+              echo "No findings." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              echo "::warning::Actionlint reported findings; this check is informational."
+              echo "Findings were reported as annotations and do not fail CI." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2|3)
+              echo "::error::Actionlint could not complete (exit $status)."
+              echo "Actionlint failed to run correctly (exit $status)." >> "$GITHUB_STEP_SUMMARY"
+              exit "$status"
+              ;;
+            *)
+              echo "::error::Actionlint returned unexpected exit code $status."
+              echo "Actionlint returned unexpected exit code $status." >> "$GITHUB_STEP_SUMMARY"
+              exit "$status"
+              ;;
+          esac
+
+      - name: Upload Actionlint SARIF to Code Scanning
+        if: success()
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: reports/actionlint.sarif
+          category: actionlint
+
+      - name: Upload Actionlint report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: actionlint-${{ github.run_id }}
+          path: |
+            reports/actionlint.txt
+            reports/actionlint.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+  zizmor:
+    name: Zizmor High report (informational)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
+
+      - name: Run Zizmor
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+
+          zizmor \
+            --offline \
+            --persona=regular \
+            --min-severity=high \
+            --no-exit-codes \
+            --format=json \
+            . > reports/zizmor-high.json
+
+          zizmor \
+            --offline \
+            --persona=regular \
+            --min-severity=high \
+            --no-exit-codes \
+            --format=sarif \
+            . > reports/zizmor-high.sarif
+
+          finding_count=$(jq 'length' reports/zizmor-high.json)
+          {
+            echo "### Zizmor high-severity report"
+            echo
+            echo "Zizmor has no critical severity; high is its maximum level."
+            echo
+            echo "Findings: $finding_count"
+            if [ "$finding_count" -gt 0 ]; then
+              echo
+              jq -r \
+                'group_by(.ident) | .[] | "- `\(.[0].ident)`: \(length)"' \
+                reports/zizmor-high.json
+              echo
+              echo "These findings are informational and do not fail CI."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$finding_count" -gt 0 ]; then
+            echo "::warning::Zizmor reported $finding_count high-severity findings; this check is informational."
+          fi
+
+      - name: Upload Zizmor SARIF to Code Scanning
+        if: success()
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: reports/zizmor-high.sarif
+          category: zizmor-high
+
+      - name: Upload Zizmor reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zizmor-high-${{ github.run_id }}
+          path: |
+            reports/zizmor-high.json
+            reports/zizmor-high.sarif
+          if-no-files-found: ignore
+          retention-days: 14

@@ -8,7 +8,7 @@ body:
 
         OpenShell uses a vouch system for first-time contributors. Fill out this
         form to request approval. A maintainer will review and comment `/vouch`
-        if approved.
+        if approved. Approved requests are closed automatically.
 
         **Write in your own words.** Do not have an AI generate this request.
         Requests that read like LLM output will be denied.

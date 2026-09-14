@@ -13,7 +13,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  CI_IMAGE: ghcr.io/nvidia/openshell/ci
+  CI_IMAGE: ghcr.io/globster-monday/openshell/ci
 
 permissions:
   contents: read
@@ -28,10 +28,10 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runner: linux-amd64-cpu8
+            runner: ubuntu-24.04
           - arch: arm64
             platform: linux/arm64
-            runner: linux-arm64-cpu8
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -87,7 +87,7 @@ jobs:
   merge-ci-image:
     name: Merge manifest
     needs: build-ci-image
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Log in to GitHub Container Registry

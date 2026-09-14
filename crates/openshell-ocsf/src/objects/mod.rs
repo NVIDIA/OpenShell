@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OCSF v1.7.0 object types.
+//! OCSF v1.8.0 object types.
 
+mod ai_model;
+mod api;
 mod attack;
 mod connection;
 mod container;
@@ -14,6 +16,8 @@ mod http;
 mod metadata;
 mod process;
 
+pub use ai_model::AiModel;
+pub use api::Api;
 pub use attack::{Attack, Tactic, Technique};
 pub use connection::ConnectionInfo;
 pub use container::{Container, Image};

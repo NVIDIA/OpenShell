@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build VM Driver
+
+on:
+  workflow_call:
+    inputs:
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: openshell-driver-vm (${{ matrix.triple }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
+            interpreter: /lib64/ld-linux-x86-64.so.2
+          - arch: aarch64
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
+            interpreter: /lib/ld-linux-aarch64.so.1
+          - arch: aarch64
+            triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+            dev_shell: .#devShells.aarch64-darwin.default
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop ${{ matrix.dev_shell }} -c bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Download openshell-sandbox
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
+          path: sandbox
+
+      - name: Build VM runtime
+        run: nix build .#vm-runtime
+
+      - name: Compress Linux VM runtime
+        if: runner.os == 'Linux'
+        run: |
+          install -d target/vm-runtime-compressed
+          zstd -19 -T0 result/libkrun.so -o target/vm-runtime-compressed/libkrun.so.zst
+          zstd -19 -T0 result/libkrunfw.so.5 -o target/vm-runtime-compressed/libkrunfw.so.5.zst
+          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
+          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
+
+      - name: Compress macOS VM runtime
+        if: runner.os == 'macOS'
+        run: |
+          install -d target/vm-runtime-compressed
+          zstd -19 -T0 result/libkrun.dylib -o target/vm-runtime-compressed/libkrun.dylib.zst
+          zstd -19 -T0 result/libkrunfw.5.dylib -o target/vm-runtime-compressed/libkrunfw.5.dylib.zst
+          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
+          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
+
+      - name: Add openshell-sandbox to VM runtime
+        run: zstd -19 -T0 sandbox/openshell-sandbox -o target/vm-runtime-compressed/openshell-sandbox.zst
+
+      - name: Build openshell-driver-vm
+        uses: ./.github/actions/build-rust-binary
+        env:
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ github.workspace }}/target/vm-runtime-compressed
+        with:
+          package: openshell-driver-vm
+          binary: openshell-driver-vm
+          triple: ${{ matrix.triple }}
+          dev-shell: ${{ matrix.dev_shell }}
+          cargo-version: ${{ inputs['cargo-version'] }}
+          image-tag: ${{ inputs['image-tag'] }}
+          interpreter: ${{ matrix.interpreter }}

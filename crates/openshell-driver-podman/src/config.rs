@@ -126,6 +126,9 @@ pub struct PodmanComputeConfig {
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+    /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
+    /// supervisors for provider token exchange client assertions.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
     /// Health check interval in seconds for sandbox containers.
     ///
     /// Podman runs the health check command at this interval to determine
@@ -135,13 +138,16 @@ pub struct PodmanComputeConfig {
     /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
     pub health_check_interval_secs: u64,
     /// Corporate forward proxy URL passed to the in-container supervisor
-    /// (e.g. `http://proxy.corp.com:8080`).
+    /// (e.g. `http://proxy.corp.com:8080` or `https://proxy.corp.com:3130`).
     ///
     /// The supervisor chains policy-approved TLS tunnels through this proxy
     /// with HTTP CONNECT instead of dialing upstream destinations directly.
-    /// Only `http://` proxy URLs in explicit `http://host:port` form (scheme
-    /// and port required) are supported. This is an operator-owned egress
-    /// boundary delivered on the supervisor's command line, so
+    /// `http://` and `https://` proxy URLs in explicit `scheme://host:port`
+    /// form (scheme and port required) are supported; for an `https://` proxy
+    /// the supervisor wraps the proxy connection in TLS, verifying the proxy
+    /// certificate against the built-in and system roots plus the optional
+    /// [`proxy_ca_bundle`](Self::proxy_ca_bundle). This is an operator-owned
+    /// egress boundary delivered on the supervisor's command line, so
     /// sandbox/template environment cannot override it, and the conventional
     /// `HTTPS_PROXY` variables are not used.
     pub https_proxy: Option<String>,
@@ -185,9 +191,69 @@ pub struct PodmanComputeConfig {
     /// pointing the gateway host at the corporate resolver so validated-IP
     /// CONNECT works in split-horizon networks.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
+    /// proxy.
+    ///
+    /// A CA certificate is not secret, so the gateway bind-mounts this file
+    /// read-only into the sandbox (at
+    /// [`PROXY_CA_MOUNT_PATH`](openshell_core::driver_utils::PROXY_CA_MOUNT_PATH))
+    /// and passes its path to the supervisor via `--upstream-proxy-ca-bundle`.
+    /// The supervisor trusts it for the TLS handshake with an `https://`
+    /// proxy and, because a TLS-intercepting proxy re-signs tunneled server
+    /// certificates with the same CA, folds it into the sandbox trust bundle
+    /// and upstream verification. Only meaningful with `https_proxy` set; the
+    /// bundle must exist and contain at least one certificate.
+    pub proxy_ca_bundle: Option<String>,
+    /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
+    /// When unset, containers use the default user namespace.
+    pub userns: Option<String>,
+    /// Explicit UID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[serde(default)]
+    pub uidmap: Vec<String>,
+    /// Explicit GID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[serde(default)]
+    pub gidmap: Vec<String>,
 }
 
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
+
+/// Parse a single `"container_id:host_id:size"` mapping entry.
+///
+/// Returns `(container_id, host_id, size)` on success.
+pub fn parse_id_map_entry(
+    field: &str,
+    entry: &str,
+) -> Result<(u32, u32, u32), crate::client::PodmanApiError> {
+    let parts: Vec<&str> = entry.split(':').collect();
+    if parts.len() != 3 {
+        return Err(crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}' must be 'container_id:host_id:size'",
+        )));
+    }
+    let container_id: u32 = parts[0].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': container_id must be a non-negative integer",
+        ))
+    })?;
+    let host_id: u32 = parts[1].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': host_id must be a non-negative integer",
+        ))
+    })?;
+    let size: u32 = parts[2].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': size must be a non-negative integer",
+        ))
+    })?;
+    if size == 0 {
+        return Err(crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': size must be greater than 0",
+        )));
+    }
+    Ok((container_id, host_id, size))
+}
 
 impl PodmanComputeConfig {
     /// Returns `true` when all three TLS paths are configured.
@@ -245,16 +311,16 @@ impl PodmanComputeConfig {
     /// Shares validation semantics with the in-container supervisor through
     /// [`openshell_core::driver_utils::parse_upstream_proxy_url`], so a value
     /// accepted here can never be rejected by the supervisor at sandbox
-    /// startup (or vice versa). The supervisor only supports `http://`
-    /// forward proxies, so other schemes are rejected at config time instead
-    /// of failing inside every sandbox. Credentials must be supplied through
-    /// `proxy_auth_file`; an inline `user:pass@` in the URL is rejected
-    /// because it would otherwise be stored in `gateway.toml` and exposed in
-    /// container metadata.
+    /// startup (or vice versa). The supervisor supports `http://` and
+    /// `https://` forward proxies, so other schemes (SOCKS, etc.) are rejected
+    /// at config time instead of failing inside every sandbox. Credentials
+    /// must be supplied through `proxy_auth_file`; an inline `user:pass@` in
+    /// the URL is rejected because it would otherwise be stored in
+    /// `gateway.toml` and exposed in container metadata.
     pub fn validate_proxy_config(&self) -> Result<(), crate::client::PodmanApiError> {
         use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
-        if let Some(url) = &self.https_proxy {
-            parse_upstream_proxy_url(url).map_err(|err| {
+        let proxy_secure = if let Some(url) = &self.https_proxy {
+            let addr = parse_upstream_proxy_url(url).map_err(|err| {
                 crate::client::PodmanApiError::InvalidInput(match err {
                     UpstreamProxyUrlError::Empty => {
                         "https_proxy must not be empty when set".to_string()
@@ -267,7 +333,10 @@ impl PodmanComputeConfig {
                     err => format!("https_proxy {err}"),
                 })
             })?;
-        }
+            addr.secure
+        } else {
+            false
+        };
 
         // The supervisor treats a present-but-empty driver-supplied argument
         // as a fatal misconfiguration, so never accept (and later pass) one.
@@ -301,8 +370,10 @@ impl PodmanComputeConfig {
             // Basic auth over the plain-TCP proxy connection is readable by
             // anyone on the network path; sending it requires an explicit
             // operator acknowledgement rather than being an implicit side
-            // effect of configuring credentials.
-            if self.proxy_auth_allow_insecure != Some(true) {
+            // effect of configuring credentials. For an https:// proxy the
+            // credential is inside the verified TLS session, so the
+            // acknowledgement is unnecessary (but tolerated).
+            if self.proxy_auth_allow_insecure != Some(true) && !proxy_secure {
                 return Err(crate::client::PodmanApiError::InvalidInput(
                     "proxy_auth_file sends the credential as cleartext Basic auth over the \
                      plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
@@ -324,6 +395,107 @@ impl PodmanComputeConfig {
             return Err(crate::client::PodmanApiError::InvalidInput(
                 "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
             ));
+        }
+
+        // A CA bundle only makes sense relative to a proxy boundary (an
+        // https:// proxy handshake, or a TLS-intercepting proxy's re-sign CA).
+        // Mirror the proxy_auth_file pairing so a stray setting cannot hide a
+        // fail-open state. The file's readability and certificate content are
+        // checked at sandbox-create time (see the driver) and fail closed in
+        // the supervisor.
+        if let Some(path) = self.proxy_ca_bundle.as_deref() {
+            if path.trim().is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_ca_bundle must not be empty when set".to_string(),
+                ));
+            }
+            if self.https_proxy.is_none() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_ca_bundle is set but no https_proxy is configured".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and canonicalize the optional `userns` mode.
+    ///
+    /// Supported modes: `auto` (with optional params, e.g. `auto:size=65536`),
+    /// `host`, `keep-id` (with optional params), `no-map` (alias `nomap`),
+    /// and `private` (requires explicit `uidmap`/`gidmap`).
+    /// Modes that don't accept parameters (`host`, `no-map`, `private`) are
+    /// rejected when a colon-separated suffix is present.
+    ///
+    /// On success, `self.userns` is rewritten with the canonical lowercase
+    /// mode string so downstream code can rely on exact matches.
+    pub fn canonicalize_userns(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        let Some(mode) = self.userns.as_deref() else {
+            return Ok(());
+        };
+        let (base, has_params) = mode
+            .split_once(':')
+            .map_or((mode, false), |(b, _)| (b, true));
+        let canonical = match base.to_ascii_lowercase().as_str() {
+            "auto" => "auto",
+            "host" => "host",
+            "keep-id" => "keep-id",
+            "nomap" | "no-map" => "no-map",
+            "private" => "private",
+            _ => {
+                return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                    "unsupported userns mode '{mode}'; \
+                     supported modes: auto, host, keep-id, no-map, private",
+                )));
+            }
+        };
+        if has_params {
+            match canonical {
+                "auto" | "keep-id" => {}
+                _ => {
+                    return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                        "userns mode '{canonical}' does not accept parameters",
+                    )));
+                }
+            }
+        }
+        self.userns = Some(if has_params {
+            let params = mode.split_once(':').unwrap().1;
+            format!("{canonical}:{params}")
+        } else {
+            canonical.to_string()
+        });
+        Ok(())
+    }
+
+    /// Validate `uidmap`/`gidmap` consistency with the userns mode.
+    ///
+    /// `private` requires at least one entry in both `uidmap` and `gidmap`;
+    /// other modes (or no userns) reject non-empty mappings. Each entry must
+    /// be `"container_id:host_id:size"` with `size > 0`.
+    pub fn validate_userns_mappings(&self) -> Result<(), crate::client::PodmanApiError> {
+        let is_private = self
+            .userns
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("private"));
+
+        if is_private {
+            if self.uidmap.is_empty() || self.gidmap.is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "userns mode 'private' requires at least one entry in both \
+                     uidmap and gidmap"
+                        .to_string(),
+                ));
+            }
+        } else if !self.uidmap.is_empty() || !self.gidmap.is_empty() {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "uidmap/gidmap are only valid with userns = \"private\"".to_string(),
+            ));
+        }
+
+        for (field, entries) in [("uidmap", &self.uidmap), ("gidmap", &self.gidmap)] {
+            for entry in entries {
+                parse_id_map_entry(field, entry)?;
+            }
         }
         Ok(())
     }
@@ -364,7 +536,7 @@ impl Default for PodmanComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
-            sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            sandbox_ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
@@ -374,12 +546,17 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
+            provider_spiffe_workload_api_socket: None,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
             https_proxy: None,
             no_proxy: None,
             proxy_auth_file: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
+            userns: None,
+            uidmap: Vec::new(),
+            gidmap: Vec::new(),
         }
     }
 }
@@ -403,6 +580,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
             .field(
+                "provider_spiffe_workload_api_socket",
+                &self.provider_spiffe_workload_api_socket,
+            )
+            .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
             )
@@ -412,6 +593,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_file", &self.proxy_auth_file.is_some())
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field("userns", &self.userns)
+            .field("uidmap", &self.uidmap)
+            .field("gidmap", &self.gidmap)
             .finish()
     }
 }
@@ -482,7 +667,7 @@ mod tests {
     // ── Proxy config validation ───────────────────────────────────────
 
     #[test]
-    fn validate_proxy_config_accepts_unset_and_http() {
+    fn validate_proxy_config_accepts_unset_http_and_https() {
         assert!(
             PodmanComputeConfig::default()
                 .validate_proxy_config()
@@ -494,11 +679,18 @@ mod tests {
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.validate_proxy_config().is_ok());
+        // An https:// proxy URL is now supported (scheme and port required).
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
     }
 
     #[test]
-    fn validate_proxy_config_rejects_non_http_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+    fn validate_proxy_config_rejects_socks_schemes() {
+        // http:// and https:// are supported; only other schemes are rejected.
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             let cfg = PodmanComputeConfig {
                 https_proxy: Some(url.to_string()),
                 ..PodmanComputeConfig::default()
@@ -509,6 +701,46 @@ mod tests {
                 "{url}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_ca_bundle_with_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+        // A CA bundle is also valid with an http:// proxy: a TLS-intercepting
+        // proxy reached over plain HTTP still re-signs upstream certificates.
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_ca_bundle_without_proxy() {
+        let cfg = PodmanComputeConfig {
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+        assert!(err.to_string().contains("no https_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_empty_ca_bundle() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_ca_bundle: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
     }
 
     #[test]
@@ -633,6 +865,16 @@ mod tests {
             );
             assert!(err.to_string().contains("cleartext"), "{allow:?}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_auth_file_without_acknowledgement_for_https_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
     }
 
     #[test]
@@ -793,5 +1035,175 @@ mod tests {
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn canonicalize_userns_accepts_supported_modes() {
+        for mode in [
+            "auto",
+            "host",
+            "keep-id",
+            "no-map",
+            "private",
+            "auto:size=65536",
+            "keep-id:uid=1000,gid=1000",
+        ] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            cfg.canonicalize_userns()
+                .unwrap_or_else(|_| panic!("mode '{mode}' should be accepted"));
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_normalizes_case_and_aliases() {
+        let cases = [
+            ("Auto", "auto"),
+            ("HOST", "host"),
+            ("KEEP-ID:uid=1000", "keep-id:uid=1000"),
+            ("nomap", "no-map"),
+            ("no-map", "no-map"),
+            ("Private", "private"),
+            ("auto:SIZE=65536", "auto:SIZE=65536"),
+        ];
+        for (input, expected) in cases {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(input.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            cfg.canonicalize_userns()
+                .unwrap_or_else(|_| panic!("mode '{input}' should be accepted"));
+            assert_eq!(
+                cfg.userns.as_deref(),
+                Some(expected),
+                "input '{input}' should canonicalize to '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_rejects_unsupported_modes() {
+        for mode in ["container:foo", "ns:/proc/1/ns/user", "4000:5000"] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg
+                .canonicalize_userns()
+                .expect_err(&format!("mode '{mode}' should be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("unsupported userns mode"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_rejects_params_on_non_parameterizable_modes() {
+        for mode in ["host:foo", "no-map:x=1", "private:x=1"] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg
+                .canonicalize_userns()
+                .expect_err(&format!("mode '{mode}' should be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("does not accept parameters"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_accepts_none() {
+        let mut cfg = PodmanComputeConfig::default();
+        cfg.canonicalize_userns().expect("None should be accepted");
+    }
+
+    // ── Userns mapping validation ────────────────────────────────────
+
+    #[test]
+    fn validate_userns_mappings_accepts_private_with_maps() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            uidmap: vec!["0:1000:1".to_string(), "1:100000:65536".to_string()],
+            gidmap: vec!["0:1000:1".to_string(), "1:100000:65536".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        cfg.validate_userns_mappings()
+            .expect("private with mappings should be accepted");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_private_without_uidmap() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            gidmap: vec!["0:1000:1".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_userns_mappings()
+            .expect_err("private without uidmap should be rejected");
+        assert!(err.to_string().contains("uidmap"), "{err}");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_private_without_gidmap() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            uidmap: vec!["0:1000:1".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_userns_mappings()
+            .expect_err("private without gidmap should be rejected");
+        assert!(err.to_string().contains("gidmap"), "{err}");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_maps_without_private() {
+        for mode in [Some("auto"), Some("host"), Some("keep-id"), None] {
+            let cfg = PodmanComputeConfig {
+                userns: mode.map(ToString::to_string),
+                uidmap: vec!["0:1000:1".to_string()],
+                gidmap: vec!["0:1000:1".to_string()],
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_userns_mappings().expect_err(&format!(
+                "mappings without private should be rejected (mode={mode:?})"
+            ));
+            assert!(
+                err.to_string().contains("only valid with"),
+                "{mode:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_malformed_entries() {
+        let cases = [
+            ("0:1000", "too few fields"),
+            ("0:1000:1:extra", "too many fields"),
+            ("abc:1000:1", "non-numeric container_id"),
+            ("0:abc:1", "non-numeric host_id"),
+            ("0:1000:abc", "non-numeric size"),
+            ("0:1000:0", "zero size"),
+        ];
+        for (entry, desc) in cases {
+            let cfg = PodmanComputeConfig {
+                userns: Some("private".to_string()),
+                uidmap: vec![entry.to_string()],
+                gidmap: vec!["0:1000:1".to_string()],
+                ..PodmanComputeConfig::default()
+            };
+            cfg.validate_userns_mappings()
+                .expect_err(&format!("{desc}: '{entry}' should be rejected"));
+        }
+    }
+
+    #[test]
+    fn validate_userns_mappings_accepts_no_userns_no_maps() {
+        let cfg = PodmanComputeConfig::default();
+        cfg.validate_userns_mappings()
+            .expect("no userns and no maps should be accepted");
     }
 }

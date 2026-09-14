@@ -240,12 +240,20 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                let message_ctx =
-                    if detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty() {
-                        message_tag(&e.base)
-                    } else {
-                        String::new()
-                    };
+                // Most network messages duplicate the structured action and
+                // destination shown above. Transparent TCP correlation is the
+                // exception: its message intentionally carries the logical,
+                // synthetic, and actual dial targets needed to follow the
+                // policy-DNS mapping in the human-readable audit log.
+                let show_correlation_message =
+                    e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                let message_ctx = if show_correlation_message
+                    || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 
@@ -297,6 +305,50 @@ impl OcsfEvent {
                     String::new()
                 };
                 format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
+            }
+
+            Self::ApiActivity(e) => {
+                let model_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " {}",
+                            escape_context_field(&truncate_with_ellipsis(&m.name, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
+                let provider_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " via {}",
+                            escape_context_field(&truncate_with_ellipsis(
+                                &m.ai_provider,
+                                MAX_REASON_LEN
+                            ))
+                        )
+                    })
+                    .unwrap_or_default();
+                let latency = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|u| u.get("latency_ms"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|ms| format!(" {ms}ms"))
+                    .unwrap_or_default();
+                let op =
+                    escape_context_field(&truncate_with_ellipsis(&e.api.operation, MAX_REASON_LEN));
+                let status_ctx = e
+                    .base
+                    .status
+                    .map(|s| format!(" {}", s.label()))
+                    .unwrap_or_default();
+                format!("API:INFERENCE {sev}{status_ctx}{model_ctx}{provider_ctx}{latency} [{op}]")
             }
 
             Self::SshActivity(e) => {
@@ -481,7 +533,7 @@ mod tests {
 
     fn test_metadata() -> Metadata {
         Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),

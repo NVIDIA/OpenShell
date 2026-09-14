@@ -14,7 +14,8 @@ use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 use openshell_core::secrets::{
-    SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
+    CREDENTIAL_MARKER_SCAN_TAIL_BYTES, SecretResolver, contains_reserved_credential_marker,
+    contains_reserved_credential_marker_bytes, rewrite_http_header_block,
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
@@ -45,7 +46,7 @@ async fn max_middleware_body_bytes() -> usize {
     }])
     .await
     .expect("describe built-in middleware");
-    chain[0].max_body_bytes()
+    chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
@@ -240,6 +241,11 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(miette!("Unsupported HTTP version: {version}"));
     }
+    let host_authority = request_host_authority_from_str(header_str)?;
+    if version == "HTTP/1.1" && host_authority.is_none() {
+        return Err(miette!("HTTP/1.1 request is missing a Host header"));
+    }
+    validate_absolute_form_authority(&target, host_authority.as_ref())?;
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
@@ -383,6 +389,130 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct RequestAuthority {
+    pub(crate) authority: http::uri::Authority,
+    pub(crate) effective_port: u16,
+}
+
+pub(crate) fn request_authority(
+    raw_header: &[u8],
+    transport_default_port: Option<u16>,
+) -> Result<Option<RequestAuthority>> {
+    let header_end = raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let headers = std::str::from_utf8(&raw_header[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let Some(host_authority) = request_host_authority_from_str(headers)? else {
+        return Ok(None);
+    };
+
+    let request_target = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| miette!("HTTP request is missing a request target"))?;
+    let absolute_uri = absolute_form_uri(request_target)?;
+    let (authority, default_port) = if let Some(uri) = absolute_uri {
+        let authority = uri
+            .authority()
+            .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?
+            .clone();
+        let default_port = default_port_for_scheme(uri.scheme_str()).ok_or_else(|| {
+            miette!("HTTP absolute-form request target uses an unsupported scheme")
+        })?;
+        (authority, default_port)
+    } else {
+        let default_port = transport_default_port
+            .ok_or_else(|| miette!("HTTP origin-form request transport scheme is unavailable"))?;
+        (host_authority, default_port)
+    };
+
+    let effective_port = authority.port_u16().unwrap_or(default_port);
+    Ok(Some(RequestAuthority {
+        authority,
+        effective_port,
+    }))
+}
+
+fn request_host_authority_from_str(headers: &str) -> Result<Option<http::uri::Authority>> {
+    let mut authorities = headers.lines().skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    });
+    let Some(authority) = authorities.next() else {
+        return Ok(None);
+    };
+    if authorities.next().is_some() {
+        return Err(miette!("HTTP request contains multiple Host headers"));
+    }
+    authority
+        .parse()
+        .map(Some)
+        .map_err(|_| miette!("HTTP request Host header contains an invalid authority"))
+}
+
+fn validate_absolute_form_authority(
+    target: &str,
+    host_authority: Option<&http::uri::Authority>,
+) -> Result<()> {
+    let Some(uri) = absolute_form_uri(target)? else {
+        return Ok(());
+    };
+    let request_authority = uri
+        .authority()
+        .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?;
+    let host_authority = host_authority
+        .ok_or_else(|| miette!("HTTP absolute-form request is missing a Host header"))?;
+    if !authorities_match(request_authority, host_authority, uri.scheme_str()) {
+        return Err(miette!(
+            "HTTP absolute-form request authority does not match the Host header"
+        ));
+    }
+    Ok(())
+}
+
+/// Return a URI only when the request-target uses HTTP absolute form.
+///
+/// Origin-form request-targets can legitimately contain `://` in a path or
+/// query value, so a substring check would incorrectly make those requests
+/// participate in authority validation.
+fn absolute_form_uri(target: &str) -> Result<Option<http::Uri>> {
+    let uri = target
+        .parse::<http::Uri>()
+        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    Ok(uri.scheme().is_some().then_some(uri))
+}
+
+fn authorities_match(
+    left: &http::uri::Authority,
+    right: &http::uri::Authority,
+    scheme: Option<&str>,
+) -> bool {
+    if !normalized_authority_host(left.host())
+        .eq_ignore_ascii_case(normalized_authority_host(right.host()))
+    {
+        return false;
+    }
+    let default_port = default_port_for_scheme(scheme);
+    left.port_u16().or(default_port) == right.port_u16().or(default_port)
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    }
+}
+
+fn normalized_authority_host(host: &str) -> &str {
+    host.trim_end_matches('.')
 }
 
 fn validate_http_request_line(request_line: &str) -> Result<()> {
@@ -593,9 +723,11 @@ where
         upstream,
         RelayRequestOptions {
             resolver,
+            credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
+            deny_uninspected_credentials: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
@@ -616,14 +748,48 @@ pub(crate) enum WebSocketExtensionMode {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
+    pub(crate) deny_uninspected_credentials: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
     pub(crate) signing_service: &'a str,
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialGenerationGuard<'a> {
+    state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+    revision: u64,
+}
+
+impl<'a> CredentialGenerationGuard<'a> {
+    pub(crate) fn new(
+        state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+        revision: u64,
+    ) -> Self {
+        Self { state, revision }
+    }
+
+    pub(crate) fn ensure_current(self) -> Result<()> {
+        if self.state.revision() == self.revision {
+            Ok(())
+        } else {
+            Err(miette!(
+                "provider credential generation changed before upstream write"
+            ))
+        }
+    }
+}
+
+fn ensure_credential_generation_current(options: RelayRequestOptions<'_>) -> Result<()> {
+    if let Some(guard) = options.credential_generation {
+        guard.ensure_current()?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -636,6 +802,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
         .windows(4)
@@ -677,8 +844,8 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    let rewrite_result =
+        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -706,19 +873,18 @@ where
             client.flush().await.into_diagnostic()?;
         }
         if let Some(resolver) = options.resolver {
-            let access_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
-            let secret_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
-            let session_token_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
+            let access_key = resolver
+                .resolve_current_env_key_checked("AWS_ACCESS_KEY_ID", "sigv4")
+                .map_err(miette::Report::new)?;
+            let secret_key = resolver
+                .resolve_current_env_key_checked("AWS_SECRET_ACCESS_KEY", "sigv4")
+                .map_err(miette::Report::new)?;
+            let session_token = resolver
+                .resolve_current_env_key_checked("AWS_SESSION_TOKEN", "sigv4")
+                .map_err(miette::Report::new)?;
 
-            match (
-                resolver.resolve_placeholder(&access_key_placeholder),
-                resolver.resolve_placeholder(&secret_key_placeholder),
-            ) {
+            match (access_key, secret_key) {
                 (Some(access_key), Some(secret_key)) => {
-                    let session_token = resolver.resolve_placeholder(&session_token_placeholder);
                     // Use explicit signing_region from policy if set,
                     // otherwise extract from hostname.
                     let region = if options.signing_region.is_empty() {
@@ -815,6 +981,7 @@ where
                             secret_key,
                             session_token,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
                         // Sign headers only, stream body through.
@@ -834,6 +1001,7 @@ where
                             session_token,
                             signable_body,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
                             .await
@@ -917,11 +1085,29 @@ where
             options.generation_guard,
         )
         .await?;
+        ensure_credential_generation_current(options)?;
         upstream.write_all(&body.headers).await.into_diagnostic()?;
         if !body.body.is_empty() {
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
+    } else if options.deny_uninspected_credentials {
+        if let Err(error) = relay_request_body_with_marker_guard(
+            req,
+            client,
+            upstream,
+            &rewrite_result.rewritten,
+            &req.raw_header[header_end..],
+            options.generation_guard,
+        )
+        .await
+        {
+            if error.to_string().contains("credential placeholder") {
+                emit_uninspected_body_credential_denial(req, &options);
+            }
+            return Err(error);
+        }
     } else {
+        ensure_credential_generation_current(options)?;
         upstream
             .write_all(&rewrite_result.rewritten)
             .await
@@ -970,6 +1156,218 @@ where
     .await?;
 
     Ok(outcome)
+}
+
+#[derive(Default)]
+struct ReservedMarkerStreamGuard {
+    pending: Vec<u8>,
+}
+
+impl ReservedMarkerStreamGuard {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.pending.extend_from_slice(bytes);
+        if contains_reserved_credential_marker_bytes(&self.pending) {
+            return Err(miette!(
+                "request body credential placeholder denied because rewrite is disabled"
+            ));
+        }
+        let safe_len = self
+            .pending
+            .len()
+            .saturating_sub(CREDENTIAL_MARKER_SCAN_TAIL_BYTES);
+        Ok(self.pending.drain(..safe_len).collect())
+    }
+
+    fn finish(mut self) -> Result<Vec<u8>> {
+        if contains_reserved_credential_marker_bytes(&self.pending) {
+            return Err(miette!(
+                "request body credential placeholder denied because rewrite is disabled"
+            ));
+        }
+        Ok(std::mem::take(&mut self.pending))
+    }
+}
+
+async fn relay_request_body_with_marker_guard<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    headers: &[u8],
+    already_read: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
+where
+    C: AsyncRead + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    upstream.write_all(headers).await.into_diagnostic()?;
+    match req.body_length {
+        BodyLength::None => {
+            let mut scanner = ReservedMarkerStreamGuard::default();
+            let safe = scanner.push(already_read)?;
+            upstream.write_all(&safe).await.into_diagnostic()?;
+            upstream
+                .write_all(&scanner.finish()?)
+                .await
+                .into_diagnostic()?;
+        }
+        BodyLength::ContentLength(len) => {
+            let initial_len = usize::try_from(len)
+                .unwrap_or(usize::MAX)
+                .min(already_read.len());
+            let mut scanner = ReservedMarkerStreamGuard::default();
+            let safe = scanner.push(&already_read[..initial_len])?;
+            upstream.write_all(&safe).await.into_diagnostic()?;
+            let mut remaining = len.saturating_sub(initial_len as u64);
+            let mut buf = vec![0u8; RELAY_BUF_SIZE];
+            while remaining > 0 {
+                let to_read = usize::try_from(remaining)
+                    .unwrap_or(buf.len())
+                    .min(buf.len());
+                let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
+                if n == 0 {
+                    return Err(miette!(
+                        "Connection closed with {remaining} body bytes remaining"
+                    ));
+                }
+                if let Some(guard) = generation_guard {
+                    guard.ensure_current()?;
+                }
+                let safe = scanner.push(&buf[..n])?;
+                upstream.write_all(&safe).await.into_diagnostic()?;
+                remaining -= n as u64;
+            }
+            upstream
+                .write_all(&scanner.finish()?)
+                .await
+                .into_diagnostic()?;
+        }
+        BodyLength::Chunked => {
+            relay_chunked_with_marker_guard(client, upstream, already_read, generation_guard)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    writer
+        .write_all(format!("{:X}\r\n", payload.len()).as_bytes())
+        .await
+        .into_diagnostic()?;
+    writer.write_all(payload).await.into_diagnostic()?;
+    writer.write_all(b"\r\n").await.into_diagnostic()?;
+    Ok(())
+}
+
+async fn relay_chunked_with_marker_guard<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    already_read: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
+where
+    C: AsyncRead + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let mut read_state = ChunkedReadState {
+        buffered_pos: 0,
+        wire_bytes: 0,
+        max_wire_bytes: None,
+    };
+    let mut scanner = ReservedMarkerStreamGuard::default();
+
+    loop {
+        let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
+            .await
+            .map_err(CollectChunkedError::into_report)?;
+        let size_line = std::str::from_utf8(&size_line)
+            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
+        let size_token = size_line
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+
+        if chunk_size == 0 {
+            write_chunk(upstream, &scanner.finish()?).await?;
+            upstream.write_all(b"0\r\n").await.into_diagnostic()?;
+            loop {
+                let trailer =
+                    read_chunked_line(client, already_read, &mut read_state, generation_guard)
+                        .await
+                        .map_err(CollectChunkedError::into_report)?;
+                if contains_reserved_credential_marker_bytes(&trailer) {
+                    return Err(miette!(
+                        "request body credential placeholder denied because rewrite is disabled"
+                    ));
+                }
+                upstream.write_all(&trailer).await.into_diagnostic()?;
+                upstream.write_all(b"\r\n").await.into_diagnostic()?;
+                if trailer.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut remaining = chunk_size;
+        while remaining > 0 {
+            let block_len = remaining.min(RELAY_BUF_SIZE);
+            let mut block = Vec::with_capacity(block_len);
+            read_buffered_exact(
+                client,
+                already_read,
+                &mut read_state,
+                block_len,
+                &mut block,
+                generation_guard,
+            )
+            .await
+            .map_err(CollectChunkedError::into_report)?;
+            write_chunk(upstream, &scanner.push(&block)?).await?;
+            remaining -= block_len;
+        }
+
+        let mut terminator = Vec::with_capacity(2);
+        read_buffered_exact(
+            client,
+            already_read,
+            &mut read_state,
+            2,
+            &mut terminator,
+            generation_guard,
+        )
+        .await
+        .map_err(CollectChunkedError::into_report)?;
+        if terminator.as_slice() != b"\r\n" {
+            return Err(miette!("Chunk missing terminating CRLF"));
+        }
+    }
+}
+
+fn emit_uninspected_body_credential_denial(req: &L7Request, options: &RelayRequestOptions<'_>) {
+    let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(openshell_ocsf::ActivityId::Traffic)
+        .action(openshell_ocsf::ActionId::Denied)
+        .disposition(openshell_ocsf::DispositionId::Blocked)
+        .severity(openshell_ocsf::SeverityId::High)
+        .status(openshell_ocsf::StatusId::Failure)
+        .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+            options.host,
+            options.port,
+        ))
+        .message(format!(
+            "{} request body credential traffic denied for {}:{}",
+            req.action, options.host, options.port
+        ))
+        .build();
+    openshell_ocsf::ocsf_emit!(event);
+    crate::l7::emit_uninspected_credential_finding(options.host, "", "http-request-body");
 }
 
 struct PreparedRequestBody {
@@ -1295,7 +1693,7 @@ fn rewrite_buffered_body(
     } else {
         resolver
             .rewrite_text_placeholders(&mut text, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?
+            .map_err(miette::Report::new)?
     };
     if replacements == 0 || contains_reserved_credential_marker(&text) {
         return Err(miette!(
@@ -1342,7 +1740,7 @@ fn rewrite_form_urlencoded_body(body: &str, resolver: &SecretResolver) -> Result
         let mut rewritten_value = decoded_value;
         let field_replacements = resolver
             .rewrite_text_placeholders(&mut rewritten_value, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?;
+            .map_err(miette::Report::new)?;
         if field_replacements == 0 || contains_reserved_credential_marker(&rewritten_value) {
             return Err(miette!(
                 "request body credential rewrite left unresolved credential placeholders"
@@ -1673,12 +2071,7 @@ fn is_rewritable_content_type(content_type: Option<&str>) -> bool {
 }
 
 fn body_bytes_contain_reserved_marker(body: &[u8]) -> bool {
-    if body.is_empty() {
-        return false;
-    }
-    String::from_utf8_lossy(body)
-        .split('\0')
-        .any(contains_reserved_credential_marker)
+    contains_reserved_credential_marker_bytes(body)
 }
 
 fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
@@ -2020,6 +2413,12 @@ fn validate_websocket_upgrade_request(raw_header: &[u8]) -> Result<bool> {
     parse_websocket_upgrade_request(raw_header).map(|request| request.is_some())
 }
 
+pub(crate) fn websocket_requested_subprotocols(raw_header: &[u8]) -> Result<Vec<String>> {
+    Ok(parse_websocket_upgrade_request(raw_header)?
+        .map(|request| request.subprotocols)
+        .unwrap_or_default())
+}
+
 fn parse_websocket_upgrade_request(raw_header: &[u8]) -> Result<Option<WebSocketUpgradeRequest>> {
     let header_str = std::str::from_utf8(raw_header)
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
@@ -2219,14 +2618,36 @@ pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     send_forbidden_json(policy_name, body, client).await
 }
 
+/// Send a platform-owned availability response when shared middleware work
+/// admission is exhausted before the request body is buffered.
+pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    send_json_response(policy_name, body, client, "503 Service Unavailable").await
+}
+
 async fn send_forbidden_json<C: AsyncWrite + Unpin>(
     policy_name: &str,
     body: serde_json::Value,
     client: &mut C,
 ) -> Result<()> {
+    send_json_response(policy_name, body, client, "403 Forbidden").await
+}
+
+async fn send_json_response<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+) -> Result<()> {
     let body_bytes = body.to_string();
     let response = format!(
-        "HTTP/1.1 403 Forbidden\r\n\
+        "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\
@@ -2760,7 +3181,7 @@ where
         if !options.client_requested_upgrade {
             return Ok(RelayOutcome::Consumed);
         }
-        let websocket_permessage_deflate = validate_websocket_response(
+        let (websocket_permessage_deflate, websocket_subprotocol) = validate_websocket_response(
             &header_str,
             options.websocket_extensions,
             options.websocket.as_ref(),
@@ -2779,6 +3200,7 @@ where
         return Ok(RelayOutcome::Upgraded {
             overflow,
             websocket_permessage_deflate,
+            websocket_subprotocol,
         });
     }
 
@@ -2908,9 +3330,10 @@ fn validate_websocket_response(
     headers: &str,
     mode: WebSocketExtensionMode,
     websocket: Option<&WebSocketResponseValidation>,
-) -> Result<bool> {
+) -> Result<(bool, Option<String>)> {
     let Some(validation) = websocket else {
-        return validate_websocket_response_extensions_preserved(headers, mode);
+        return validate_websocket_response_extensions_preserved(headers, mode)
+            .map(|compressed| (compressed, None));
     };
 
     let mut upgrade_websocket = false;
@@ -2970,11 +3393,11 @@ fn validate_websocket_response(
             "websocket upgrade response has multiple Sec-WebSocket-Protocol headers"
         ));
     }
-    if let Some(protocol) = selected_subprotocol
+    if let Some(ref protocol) = selected_subprotocol
         && !validation
             .offered_subprotocols
             .iter()
-            .any(|offered| offered == &protocol)
+            .any(|offered| offered == protocol)
     {
         return Err(miette!(
             "upstream selected WebSocket subprotocol that was not offered"
@@ -2986,8 +3409,10 @@ fn validate_websocket_response(
         (None, Some(_)) => Err(miette!(
             "upstream negotiated WebSocket extension that was not offered"
         )),
-        (None | Some(_), None) => Ok(false),
-        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => Ok(true),
+        (None | Some(_), None) => Ok((false, selected_subprotocol)),
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => {
+            Ok((true, selected_subprotocol))
+        }
         (Some(_), Some(_)) => Err(miette!(
             "upstream negotiated WebSocket extension that does not match the safe offer"
         )),
@@ -3562,6 +3987,7 @@ mod tests {
             let RelayOutcome::Upgraded {
                 overflow,
                 websocket_permessage_deflate,
+                ..
             } = outcome
             else {
                 panic!("expected upgraded relay outcome");
@@ -3575,6 +4001,7 @@ mod tests {
                 443,
                 crate::l7::relay::UpgradeRelayOptions {
                     websocket_request: true,
+                    assembly_budget: Some(crate::l7::websocket::WebSocketAssemblyBudget::default()),
                     websocket: crate::l7::relay::WebSocketUpgradeBehavior {
                         credential_rewrite,
                         permessage_deflate: websocket_permessage_deflate,
@@ -4380,7 +4807,7 @@ mod tests {
             &mut client,
             &[],
             None,
-            Some(openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES),
+            Some(openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES),
         )
         .await
         .expect("chunked body should decode");
@@ -4408,7 +4835,7 @@ mod tests {
             &req,
             &mut client,
             None,
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES,
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES,
         )
         .await
         .expect("oversized body should produce a capacity result");
@@ -4709,6 +5136,73 @@ mod tests {
         assert_eq!(
             req.raw_header, b"GET /secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
             "outbound request line must carry the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_absolute_authority_mismatched_with_host() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET http://attacker.example.test/v1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let error = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect_err("absolute-form authority mismatch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("request authority does not match the Host header"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn origin_form_targets_with_embedded_urls_use_host_authority() {
+        let host: http::uri::Authority = "api.example.test".parse().unwrap();
+
+        for target in ["/fetch/http://example.test", "/?next=http://example.test"] {
+            assert!(
+                absolute_form_uri(target).unwrap().is_none(),
+                "{target} must remain origin-form"
+            );
+            validate_absolute_form_authority(target, Some(&host))
+                .expect("embedded URL must not trigger absolute-form validation");
+
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n");
+            let authority = request_authority(raw.as_bytes(), Some(443))
+                .unwrap()
+                .expect("origin-form request with Host must have an authority");
+            assert_eq!(authority.authority, host);
+            assert_eq!(authority.effective_port, 443);
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_keeps_embedded_url_in_origin_form_path() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET /fetch/http://example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let request = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("embedded URL origin-form request must parse")
+        .expect("request must be present");
+        assert_eq!(request.target, "/fetch/http:/example.test");
+        assert_eq!(
+            request.raw_header,
+            b"GET /fetch/http:/example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
         );
     }
 
@@ -6075,7 +6569,7 @@ mod tests {
             offered_subprotocols: Vec::new(),
         };
 
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
             WebSocketExtensionMode::PermessageDeflate,
             Some(&validation),
@@ -6083,6 +6577,7 @@ mod tests {
         .expect("reordered safe extension params should canonicalize");
 
         assert!(negotiated);
+        assert_eq!(subprotocol, None);
     }
 
     #[test]
@@ -6105,7 +6600,7 @@ mod tests {
 
     #[test]
     fn preserve_mode_leaves_malformed_extension_response_raw() {
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\n\r\n",
             WebSocketExtensionMode::Preserve,
             None,
@@ -6113,6 +6608,7 @@ mod tests {
         .expect("preserve mode should not parse or reject raw extension negotiation");
 
         assert!(!negotiated);
+        assert_eq!(subprotocol, None);
     }
 
     #[test]
@@ -6136,7 +6632,7 @@ mod tests {
             offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
         };
 
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
             WebSocketExtensionMode::PermessageDeflate,
             Some(&validation),
@@ -6144,6 +6640,7 @@ mod tests {
         .expect("offered subprotocol should validate");
 
         assert!(!negotiated);
+        assert_eq!(subprotocol.as_deref(), Some("superchat"));
     }
 
     #[test]
@@ -6712,6 +7209,109 @@ mod tests {
         assert_eq!(lower.matches("connection: upgrade\r\n").count(), 1);
         assert_eq!(lower.matches("upgrade: websocket\r\n").count(), 1);
         assert!(!lower.contains("upgrade: h2c"));
+    }
+
+    #[test]
+    fn streamed_body_guard_detects_marker_split_across_reads() {
+        let mut guard = ReservedMarkerStreamGuard::default();
+        assert!(guard.push(b"prefix-openshell:res").is_ok());
+        let error = guard
+            .push(b"olve:env:API_TOKEN-suffix")
+            .expect_err("split marker must be detected");
+        assert!(error.to_string().contains("rewrite is disabled"));
+    }
+
+    /// Worst case for the retained window: a fully percent-encoded marker, the
+    /// longest detectable wire form, delivered one byte short and then
+    /// completed. A window narrower than that form drains its leading bytes
+    /// before the match completes, and the remainder decodes to a non-marker.
+    #[test]
+    fn streamed_body_guard_detects_fully_encoded_marker_completed_by_one_byte() {
+        const ENCODED: &str = "%6F%70%65%6E%73%68%65%6C%6C%3A%72%65%73%6F%6C%76%65%3A%65%6E%76%3A";
+        assert!(
+            contains_reserved_credential_marker(ENCODED),
+            "fixture must be a recognized marker form"
+        );
+        assert_eq!(
+            ENCODED.len(),
+            3 * openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC.len(),
+            "fixture must stay the fully encoded form of the current marker"
+        );
+        let (head, tail) = ENCODED.as_bytes().split_at(ENCODED.len() - 1);
+
+        let mut guard = ReservedMarkerStreamGuard::default();
+        let forwarded = guard.push(head).expect("partial marker is not a match");
+        let error = guard
+            .push(tail)
+            .expect_err("encoded marker completed across reads must be detected");
+
+        assert!(error.to_string().contains("rewrite is disabled"));
+        assert!(
+            forwarded.is_empty(),
+            "no marker byte may be forwarded early"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_content_length_does_not_forward_placeholder() {
+        let body = b"prefix-openshell:resolve:env:API_TOKEN-suffix";
+        let split = 20;
+        let mut raw_header = format!(
+            "POST /api HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(&body[..split]);
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut client_side, mut proxy_client) = tokio::io::duplex(1024);
+        client_side.write_all(&body[split..]).await.unwrap();
+        drop(client_side);
+        let (mut proxy_upstream, mut upstream_side) = tokio::io::duplex(4096);
+
+        let error = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_client,
+            &mut proxy_upstream,
+            RelayRequestOptions {
+                deny_uninspected_credentials: true,
+                host: "api.example.com",
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("placeholder must fail closed");
+        assert!(error.to_string().contains("rewrite is disabled"));
+
+        drop(proxy_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(!contains_reserved_credential_marker_bytes(&forwarded));
+    }
+
+    #[tokio::test]
+    async fn guarded_chunked_body_detects_encoded_placeholder() {
+        let wire = b"8\r\nprefix-o\r\n1D\r\npenshell%3Aresolve%3Aenv%3AKEY\r\n0\r\n\r\n";
+        let (mut upstream_writer, mut upstream_reader) = tokio::io::duplex(4096);
+        let error = relay_chunked_with_marker_guard(
+            &mut tokio::io::empty(),
+            &mut upstream_writer,
+            wire,
+            None,
+        )
+        .await
+        .expect_err("encoded placeholder must fail closed");
+        assert!(error.to_string().contains("rewrite is disabled"));
+        drop(upstream_writer);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        assert!(!String::from_utf8_lossy(&forwarded).contains("env%3AKEY"));
     }
 
     #[tokio::test]

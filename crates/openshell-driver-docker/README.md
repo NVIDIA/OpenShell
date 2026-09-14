@@ -2,6 +2,21 @@
 
 Docker-backed compute driver for local OpenShell gateways.
 
+When the gateway configures `[openshell.gateway.otlp]`, Docker compute-driver
+spans export to the same OTLP/gRPC collector with the service name
+`openshell-driver-docker`. The in-process driver preserves the gateway trace
+context and emits the compute-driver RPC boundary that a standalone driver
+would expose.
+
+`mise run gateway:docker` enables this export only when a local collector is
+listening on `127.0.0.1:4317`. Otherwise, it omits the gateway OTLP configuration
+so the development gateway does not repeatedly report export failures.
+
+The standalone `openshell-driver-docker` binary accepts
+`OPENSHELL_OTLP_ENDPOINT`. When set, it exports Docker driver spans to that
+collector, continues W3C trace context from gateway RPC metadata, and flushes
+spans during graceful shutdown.
+
 The driver manages sandbox containers through the local Docker daemon with the
 `bollard` client. It is intended for developer environments where Docker is
 already available and running Kubernetes would be unnecessary.
@@ -18,21 +33,64 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
+## Stop and Start
+
+Stop stops the managed container without removing it. Docker retains the
+container writable layer, attached volumes, labels, token material, and restart
+policy. Start starts that same container, so files in the resolved OCI
+workspace remain available. A durably stopped sandbox is excluded from
+gateway startup recovery and stays stopped across gateway restarts. Delete
+continues to force-remove the container and clean up driver-owned material.
+Graceful gateway shutdown sends `StopSandbox` for each sandbox whose persisted
+phase requires running compute without changing that persisted intent. On
+startup, the gateway sends an idempotent `StartSandbox` request for the same
+sandboxes, restarting their retained containers. Explicitly stopped sandboxes
+remain excluded.
+
 Before creating the container, the driver inspects the final sandbox image and
-captures its immutable image ID and raw OCI `Config.User`. Container creation
-uses that image ID, preventing a mutable tag from changing between inspection
-and launch. The supervisor runs as root, resolves omitted policy identity fields
-from the image declaration, and drops only agent children to the resulting
-identity. Named OCI components remain names after validation; a missing group
-is filled with the user's numeric primary GID. Explicit `process.run_as_user`
-and `process.run_as_group` values take precedence independently.
+captures its immutable image ID, raw OCI `Config.User`, and OCI
+`Config.WorkingDir`. Container creation uses that image ID, preventing a
+mutable tag from changing between inspection and launch. The supervisor runs as
+root, resolves omitted policy identity fields from the image declaration, and
+drops only agent children to the resulting identity. Named OCI components
+remain names after validation; a missing group is filled with the user's
+numeric primary GID. Explicit `process.run_as_user` and
+`process.run_as_group` values take precedence independently.
+
+An absolute OCI working directory becomes the agent workspace. An empty,
+root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
+creates when necessary and owns as a compatibility workspace. Any other image
+workdir must already exist without symlink components. The completed identity,
+including supplementary groups, must already be able to traverse every parent
+and write and enter the workdir. OpenShell does not change its ownership or
+mode.
+
+OpenShell deliberately asks the Linux kernel to make this access decision
+under the completed sandbox identity instead of reproducing permission rules
+from ownership and mode bits. Mode-bit inspection alone can reject authority
+granted by a POSIX ACL or overlook a denial imposed by a Linux Security Module
+such as SELinux or AppArmor. OpenShell does not configure or otherwise manage
+ACLs or LSM policy here; the one-shot validator only observes the kernel's
+effective decision. This keeps the no-authority-expansion invariant aligned
+with the access the eventual workload will receive without adding a separate,
+incomplete permission model to OpenShell.
+
+Image `VOLUME` declarations must not cover the workdir or one of its parents
+because Docker would mount the volume before the supervisor could validate the
+immutable image path.
+Workdirs under the standard OCI runtime namespaces `/proc`, `/sys`, and `/dev`
+are rejected, as are paths that overlap concrete OpenShell control resources.
+The workspace is the child cwd and `HOME`. The supervisor starts from `/`, then
+reports an invalid workdir as a readiness failure.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
 names for reaching the gateway host. On Docker Desktop, Colima, Rancher
 Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
-`host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
-gateway IP so containers can call back to the host process.
+`host-gateway` alias. The driver requests a separate IPv4 loopback callback
+listener when the primary listener does not already cover it. On native Linux
+Docker, the gateway also binds the bridge gateway IP so containers can call
+back to the host process.
 
 ## Container Contract
 
@@ -45,9 +103,10 @@ contract:
 | `network_mode = openshell` | Places the supervisor on the managed Docker bridge network. |
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
-| `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
+| `restart_policy = no` | A canonical main-process exit remains terminal and is not silently restarted by Docker. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
 | CDI GPU request | Uses opaque `driver_config.cdi_devices` values when set; otherwise selects the requested count of NVIDIA CDI GPUs in round-robin order when daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
+| `policy-dns-transparent-tcp` capability | Declares that the combined Docker supervisor can own namespace-local DNS/TCP capture and coupled workload restart. The shared supervisor still owns DNS eligibility, mappings, authorization, pinned dialing, relaying, and OCSF decisions. The marker is stripped from the workload environment. |
 
 The agent child process does not retain these supervisor privileges.
 
@@ -77,9 +136,11 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 `subpath`. User-supplied bind and volume mounts are read-only by default; set
 `read_only: false` to make them writable. Mount `source`, `target`, and
 `subpath` values must not contain surrounding whitespace. Mount targets must be
-absolute container paths and must not replace the workspace root (`/sandbox`)
-or overlap OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
-or `/run/netns`.
+absolute container paths and must not replace or contain the resolved workspace
+root. Nested workspace mounts remain valid. Mounts also must not overlap the
+configured SSH socket or the reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots.
 
 Example named-volume usage:
 
@@ -135,7 +196,7 @@ overwrites security-critical keys:
 - `OPENSHELL_SANDBOX_ID`
 - `OPENSHELL_SANDBOX`
 - `OPENSHELL_SSH_SOCKET_PATH`
-- `OPENSHELL_SANDBOX_COMMAND`
+- `OPENSHELL_MAIN_PROCESS_SPEC`
 - TLS path variables when HTTPS is enabled
 
 Do not allow sandbox images or templates to override these values.

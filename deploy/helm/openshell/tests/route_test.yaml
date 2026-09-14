@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: OpenShift Route
+templates:
+  - templates/route.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a passthrough Route when enabled
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: openshell.apps.example.com
+    asserts:
+      - isKind:
+          of: Route
+      - equal:
+          path: apiVersion
+          value: route.openshift.io/v1
+      - equal:
+          path: spec.host
+          value: openshell.apps.example.com
+      - equal:
+          path: spec.to.kind
+          value: Service
+      - equal:
+          path: spec.to.name
+          value: openshell
+      - equal:
+          path: spec.port.targetPort
+          value: grpc
+      - equal:
+          path: spec.tls.termination
+          value: passthrough
+      - equal:
+          path: spec.wildcardPolicy
+          value: None
+
+  - it: omits host when not set
+    set:
+      openshiftRoute.enabled: true
+    asserts:
+      - notExists:
+          path: spec.host
+
+  - it: fails when passthrough Route is enabled with TLS disabled
+    set:
+      openshiftRoute.enabled: true
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS."
+
+  - it: fails when external issuer is set but Route host is empty
+    set:
+      openshiftRoute.enabled: true
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.enabled=true with certManager.serverIssuerRef requires an explicit openshiftRoute.host \u2014 without one, OpenShift generates a hostname absent from certManager.serverDnsNames, causing the gateway to serve its internal certificate to external clients."
+
+  - it: accepts a Route host covered by a wildcard serverDnsNames entry
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: gateway.example.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - equal:
+          path: spec.host
+          value: gateway.example.com
+
+  - it: rejects a Route host not covered by wildcard or exact serverDnsNames
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: gateway.other.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.host \"gateway.other.com\" is not covered by certManager.serverDnsNames [*.example.com] \u2014 the Route will forward SNI for a hostname the external certificate does not cover, causing TLS verification failures for CLI clients. Exact names and single-level wildcards (e.g. *.example.com) are checked."
+
+  - it: rejects a multi-level subdomain against a single-level wildcard
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: deep.sub.example.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.host \"deep.sub.example.com\" is not covered by certManager.serverDnsNames [*.example.com] \u2014 the Route will forward SNI for a hostname the external certificate does not cover, causing TLS verification failures for CLI clients. Exact names and single-level wildcards (e.g. *.example.com) are checked."
+
+  - it: renders custom annotations
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: openshell.apps.example.com
+      openshiftRoute.annotations:
+        haproxy.router.openshift.io/balance: roundrobin
+    asserts:
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/balance"]
+          value: roundrobin

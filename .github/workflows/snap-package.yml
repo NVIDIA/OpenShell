@@ -37,8 +37,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
+            rust_arch: x86_64
             runner: linux-amd64-cpu8
           - arch: arm64
+            rust_arch: aarch64
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -79,35 +81,27 @@ jobs:
       - name: Download prebuilt CLI binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: cli-linux-${{ matrix.arch }}
+          name: openshell-${{ matrix.rust_arch }}-unknown-linux-musl
           path: prebuilt/cli
 
       - name: Download prebuilt gateway binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: gateway-binary-linux-${{ matrix.arch }}
+          name: openshell-gateway-${{ matrix.rust_arch }}-unknown-linux-gnu
           path: prebuilt/gateway
 
       - name: Download prebuilt sandbox binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: supervisor-binary-linux-${{ matrix.arch }}
+          name: openshell-sandbox-${{ matrix.rust_arch }}-unknown-linux-musl
           path: prebuilt/sandbox
 
-      - name: Extract prebuilt binaries
+      - name: Configure prebuilt binaries
         run: |
           set -euo pipefail
-          mkdir -p prebuilt/{cli,gateway,sandbox}
-
-          for d in cli gateway sandbox; do
-            for tarball in prebuilt/$d/*.tar.gz; do
-              if [ -f "$tarball" ]; then
-                tar -xzf "$tarball" -C "prebuilt/$d"
-              else
-                echo "WARNING: no tarball found in prebuilt/$d/" >&2
-              fi
-            done
-          done
+          chmod +x prebuilt/cli/openshell
+          chmod +x prebuilt/gateway/openshell-gateway
+          chmod +x prebuilt/sandbox/openshell-sandbox
           ls -laR prebuilt/
 
       - name: Prepare snap build directory
@@ -169,6 +163,7 @@ jobs:
       - name: Upload snap to Snap Store
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
+          INPUTS_UPLOAD_CHANNEL: ${{ inputs.upload-channel }}
         run: |
           set -euo pipefail
           SNAP_FILE="${{ steps.capture.outputs.snap-file }}"
@@ -182,5 +177,5 @@ jobs:
             COMPONENT_ARGS+=(--component "$comp")
           done
 
-          echo "Uploading $SNAP_FILE to ${{ inputs.upload-channel }}"
-          snapcraft upload --release "${{ inputs.upload-channel }}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"
+          echo "Uploading $SNAP_FILE to ${INPUTS_UPLOAD_CHANNEL}"
+          snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"

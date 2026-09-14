@@ -81,9 +81,13 @@ impl Inference for InferenceService {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found(format!("sandbox '{sandbox_id}' not found")))?;
         let workspace = sandbox.object_workspace();
-        resolve_inference_bundle(self.state.store.as_ref(), workspace)
-            .await
-            .map(Response::new)
+        resolve_inference_bundle_with_credentials(
+            self.state.store.as_ref(),
+            workspace,
+            Some(&self.state.credentials),
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn set_inference_route(
@@ -106,9 +110,10 @@ impl Inference for InferenceService {
                 .ensure_active()?;
         let route_name = effective_route_name(&req.route_name)?;
         let verify = !req.no_verify;
-        let route = upsert_inference_route(
+        let route = upsert_cluster_inference_route_with_credentials(
             self.state.store.as_ref(),
             &workspace,
+            Some(&self.state.credentials),
             route_name,
             &req.provider_name,
             &req.model_id,
@@ -216,9 +221,56 @@ impl Inference for InferenceService {
     }
 }
 
+#[cfg(test)]
+async fn upsert_cluster_inference_route(
+    store: &Store,
+    workspace: &str,
+    route_name: &str,
+    provider_name: &str,
+    model_id: &str,
+    timeout_secs: u64,
+    verify: bool,
+) -> Result<UpsertedInferenceRoute, Status> {
+    upsert_cluster_inference_route_with_credentials(
+        store,
+        workspace,
+        None,
+        route_name,
+        provider_name,
+        model_id,
+        timeout_secs,
+        verify,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn upsert_inference_route(
     store: &Store,
     workspace: &str,
+    route_name: &str,
+    provider_name: &str,
+    model_id: &str,
+    timeout_secs: u64,
+    verify: bool,
+) -> Result<UpsertedInferenceRoute, Status> {
+    upsert_cluster_inference_route(
+        store,
+        workspace,
+        route_name,
+        provider_name,
+        model_id,
+        timeout_secs,
+        verify,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_cluster_inference_route_with_credentials(
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     route_name: &str,
     provider_name: &str,
     model_id: &str,
@@ -241,6 +293,7 @@ async fn upsert_inference_route(
                 "provider '{provider_name}' not found in workspace '{workspace}'"
             ))
         })?;
+    let provider = resolve_provider_credentials(provider, credentials).await?;
 
     let resolved = resolve_provider_route(&provider, model_id)?;
     let validation = if verify {
@@ -645,6 +698,22 @@ fn resolve_vertex_ai_route(
         |p| p.eq_ignore_ascii_case("anthropic"),
     );
 
+    // Vertex's OpenAI-compatible endpoint requires the request body's `model`
+    // field to carry a publisher prefix: `<publisher>/<model_id>` (e.g.
+    // `google/gemini-2.5-flash`). The publisher is taken from the explicit
+    // VERTEX_AI_PUBLISHER config value (when set to a non-Anthropic value) or
+    // inferred from the model name. For unrecognised models with no explicit
+    // publisher, the bare model ID is forwarded unchanged; Vertex will return
+    // a 400 in that case, which is the correct observable signal to the caller.
+    // Anthropic rawPredict routes encode the model in the URL path, not the
+    // body, so they are unaffected.
+    let body_model_id: String = if is_anthropic {
+        model_id.to_string()
+    } else {
+        let publisher = explicit_publisher.or_else(|| infer_vertex_publisher(model_id));
+        publisher.map_or_else(|| model_id.to_string(), |p| format!("{p}/{model_id}"))
+    };
+
     // Escape hatch: caller-supplied full base URL still uses the model-derived
     // protocol and path contract, but only for the OpenAI-compatible Vertex surface.
     // Anthropic-on-Vertex needs model-path shaping and body adaptation that a fully
@@ -668,7 +737,7 @@ fn resolve_vertex_ai_route(
         return Ok(build_vertex_route(
             route_name,
             base_url,
-            model_id,
+            &body_model_id,
             api_key,
             vec!["openai_chat_completions".to_string()],
             profile,
@@ -719,7 +788,7 @@ fn resolve_vertex_ai_route(
         Ok(build_vertex_route(
             route_name,
             endpoint,
-            model_id,
+            &body_model_id,
             api_key,
             protocols,
             profile,
@@ -961,16 +1030,39 @@ fn authorize_inference_bundle(
     }
 }
 
-/// Resolve the inference bundle for a workspace (all managed routes + revision hash).
+/// Resolve the inference bundle (all managed routes + revision hash).
+#[cfg(test)]
 async fn resolve_inference_bundle(
     store: &Store,
     workspace: &str,
 ) -> Result<GetInferenceBundleResponse, Status> {
+    resolve_inference_bundle_with_credentials(store, workspace, None).await
+}
+
+async fn resolve_inference_bundle_with_credentials(
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
-    if let Some(r) = resolve_route_by_name(store, workspace, CLUSTER_INFERENCE_ROUTE_NAME).await? {
+    if let Some(r) = resolve_route_by_name_with_credentials(
+        store,
+        workspace,
+        credentials,
+        CLUSTER_INFERENCE_ROUTE_NAME,
+    )
+    .await?
+    {
         routes.push(r);
     }
-    if let Some(r) = resolve_route_by_name(store, workspace, SANDBOX_SYSTEM_ROUTE_NAME).await? {
+    if let Some(r) = resolve_route_by_name_with_credentials(
+        store,
+        workspace,
+        credentials,
+        SANDBOX_SYSTEM_ROUTE_NAME,
+    )
+    .await?
+    {
         routes.push(r);
     }
 
@@ -1007,9 +1099,19 @@ async fn resolve_inference_bundle(
     })
 }
 
+#[cfg(test)]
 async fn resolve_route_by_name(
     store: &Store,
     workspace: &str,
+    route_name: &str,
+) -> Result<Option<ResolvedRoute>, Status> {
+    resolve_route_by_name_with_credentials(store, workspace, None, route_name).await
+}
+
+async fn resolve_route_by_name_with_credentials(
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     route_name: &str,
 ) -> Result<Option<ResolvedRoute>, Status> {
     let route = store
@@ -1047,13 +1149,14 @@ async fn resolve_route_by_name(
                 config.provider_name
             ))
         })?;
+    let provider = resolve_provider_credentials(provider, credentials).await?;
 
     let resolved = resolve_provider_route(&provider, &config.model_id)?;
 
     Ok(Some(ResolvedRoute {
         name: route_name.to_string(),
         base_url: resolved.route.endpoint,
-        model_id: config.model_id.clone(),
+        model_id: resolved.route.model.clone(),
         api_key: resolved.route.api_key,
         protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
@@ -1061,6 +1164,48 @@ async fn resolve_route_by_name(
         model_in_path: resolved.route.model_in_path,
         request_path_override: resolved.route.request_path_override,
     }))
+}
+
+async fn resolve_provider_credentials(
+    mut provider: Provider,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+) -> Result<Provider, Status> {
+    if provider.credential_handles.is_empty() {
+        return Ok(provider);
+    }
+
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "provider '{}' stores credentials as handles, but credential storage is unavailable",
+            provider.object_name()
+        ))
+    })?;
+    let resolved = credentials
+        .resolve_provider_handles(&provider, current_time_ms())
+        .await?;
+    provider.credentials.extend(resolved.values);
+
+    // Merge expiration times, keeping the earliest non-zero value
+    for (key, driver_expires_at_ms) in resolved.expires_at_ms {
+        let provider_expires_at_ms = provider
+            .credential_expires_at_ms
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+
+        let effective_expires_at_ms = match (provider_expires_at_ms, driver_expires_at_ms) {
+            (0, driver) => driver,
+            (provider, 0) => provider,
+            (provider, driver) => provider.min(driver),
+        };
+
+        if effective_expires_at_ms > 0 {
+            provider
+                .credential_expires_at_ms
+                .insert(key, effective_expires_at_ms);
+        }
+    }
+    Ok(provider)
 }
 
 #[cfg(test)]
@@ -1138,6 +1283,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -1311,6 +1457,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1386,6 +1533,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1438,6 +1586,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1597,10 +1746,48 @@ mod tests {
             route.request_path_override,
             Some("/chat/completions".to_string())
         );
-        assert_eq!(route.model_id, "gemini-2.0-flash-001");
+        assert_eq!(route.model_id, "google/gemini-2.0-flash-001");
         assert_eq!(
             route.base_url,
             "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-gcp-project/locations/us-central1/endpoints/openapi"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_vertex_ai_non_anthropic_model_id_carries_publisher_prefix() {
+        // Regression test: the bundle's model_id must carry the publisher prefix
+        // so the router sends e.g. "google/gemini-2.5-flash" in the request body,
+        // not the bare "gemini-2.5-flash" that Vertex AI rejects with HTTP 400.
+        let store = test_store().await;
+        let config = [
+            (
+                "VERTEX_AI_PROJECT_ID".to_string(),
+                "my-gcp-project".to_string(),
+            ),
+            ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-dev", config);
+        store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+        let route = make_route(
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "vertex-dev",
+            "gemini-2.5-flash",
+        );
+        store.put_message(&route).await.expect("persist route");
+
+        let resp = resolve_inference_bundle(&store, "default")
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(resp.routes.len(), 1);
+        assert_eq!(
+            resp.routes[0].model_id, "google/gemini-2.5-flash",
+            "bundle model_id must carry publisher prefix for non-Anthropic Vertex routes"
         );
     }
 
@@ -1669,6 +1856,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1719,6 +1907,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_route_resolves_default_credential_handles() {
+        let store = test_store().await;
+        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
+            &openshell_core::Config::new(None),
+            Arc::new(store.clone()),
+        )
+        .expect("credential runtime should connect to default encrypted store");
+        let handles = credentials
+            .store_provider_credentials(
+                "openai-dev",
+                "default",
+                "provider-1",
+                &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-encrypted".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .expect("credential should be stored");
+
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-1".to_string(),
+                name: "openai-dev".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            r#type: "openai".to_string(),
+            credentials: HashMap::new(),
+            config: std::iter::once((
+                "OPENAI_BASE_URL".to_string(),
+                "https://station.example.com/v1".to_string(),
+            ))
+            .collect(),
+            credential_expires_at_ms: HashMap::new(),
+            credential_handles: handles,
+            profile_workspace: String::new(),
+        };
+        store
+            .put_message(&provider)
+            .await
+            .expect("provider should persist");
+
+        upsert_cluster_inference_route_with_credentials(
+            &store,
+            "default",
+            Some(&credentials),
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "test/model",
+            0,
+            false,
+        )
+        .await
+        .expect("route should be created from handle-backed provider");
+
+        let managed = resolve_route_by_name_with_credentials(
+            &store,
+            "default",
+            Some(&credentials),
+            CLUSTER_INFERENCE_ROUTE_NAME,
+        )
+        .await
+        .expect("route should resolve")
+        .expect("managed route should exist");
+
+        assert_eq!(managed.base_url, "https://station.example.com/v1");
+        assert_eq!(managed.api_key, "sk-encrypted");
+    }
+
+    #[tokio::test]
     async fn resolve_managed_route_reflects_provider_key_rotation() {
         let store = test_store().await;
 
@@ -1748,6 +2008,7 @@ mod tests {
             config: provider.config.clone(),
             credential_expires_at_ms: provider.credential_expires_at_ms.clone(),
             profile_workspace: provider.profile_workspace.clone(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&rotated_provider)
@@ -1819,6 +2080,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -2154,6 +2416,7 @@ mod tests {
             config,
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -2404,6 +2667,11 @@ mod tests {
                 .contains(&"anthropic_messages".to_string()),
             "must not have anthropic_messages protocol for gemini"
         );
+        // Vertex OpenAI-compatible endpoint requires publisher prefix in body model field
+        assert_eq!(
+            resolved.route.model, "google/gemini-pro",
+            "Vertex non-Anthropic body model must carry publisher prefix"
+        );
     }
 
     #[test]
@@ -2442,6 +2710,67 @@ mod tests {
                 .contains(&"anthropic_messages".to_string()),
             "must not have anthropic_messages for unknown model"
         );
+        // Unknown models have no inferred publisher; body model ID is unchanged
+        assert_eq!(resolved.route.model, "some-unknown-model");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_non_anthropic_publisher_prefix_gemini() {
+        // Gemini models must get `google/<model>` in route.model so the
+        // OpenAI-compatible Vertex endpoint accepts the request body.
+        let config =
+            std::iter::once(("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string())).collect();
+        let provider = make_vertex_provider_with_config("vertex-gemini-flash", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "gemini-2.5-flash").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "google/gemini-2.5-flash");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_non_anthropic_publisher_prefix_llama() {
+        let config =
+            std::iter::once(("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string())).collect();
+        let provider = make_vertex_provider_with_config("vertex-llama", config);
+
+        let resolved = resolve_provider_route(&provider, "llama-3-70b").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "meta/llama-3-70b");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_explicit_publisher_overrides_inference() {
+        // VERTEX_AI_PUBLISHER takes precedence over infer_vertex_publisher for
+        // unknown model names.
+        let config = [
+            ("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string()),
+            ("VERTEX_AI_PUBLISHER".to_string(), "acme".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-explicit", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "some-acme-model").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "acme/some-acme-model");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_base_url_override_gemini_gets_publisher_prefix() {
+        // Publisher prefix must also be applied when a base URL override is used.
+        let config = std::iter::once((
+            "VERTEX_AI_BASE_URL".to_string(),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi".to_string(),
+        ))
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-base-url-gemini", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "gemini-2.0-flash").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "google/gemini-2.0-flash");
     }
 
     #[test]
@@ -3238,6 +3567,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&alpha_provider)
@@ -3264,6 +3594,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&beta_provider)
