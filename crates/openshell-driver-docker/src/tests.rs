@@ -119,6 +119,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         sandbox_namespace: "default".to_string(),
+        network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
