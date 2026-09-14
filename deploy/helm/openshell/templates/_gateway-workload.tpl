@@ -136,6 +136,11 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        # The gateway stages normalized, content-addressed supervisor trust
+        # artifacts under its XDG state directory. Keep that state on a
+        # dedicated writable volume for both StatefulSet and Deployment modes.
+        - name: XDG_STATE_HOME
+          value: /var/lib/openshell-state
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
         {{- if $spiffeSocketPath }}
@@ -207,6 +212,8 @@ spec:
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        - name: gateway-state
+          mountPath: /var/lib/openshell-state
       ports:
         - name: grpc
           containerPort: {{ .Values.service.port }}
@@ -323,6 +330,8 @@ spec:
     {{- with .Values.server.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+    - name: gateway-state
+      emptyDir: {}
   {{- with .Values.nodeSelector }}
   nodeSelector:
     {{- toYaml . | nindent 4 }}

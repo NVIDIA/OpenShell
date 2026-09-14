@@ -99,45 +99,30 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
 
-  - it: grants shared namespace ConfigMap apply permissions when workspace resources are external
+  - it: grants only namespace-wide ConfigMap get and create in shared mode
     template: templates/role.yaml
     set:
       supervisor.network.additionalCaConfigMapName: private-destination-ca
       workspaceResources.enabled: false
     asserts:
       - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create"]
+      - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["configmaps"]
             resourceNames: ["openshell-network-additional-ca-openshell"]
-            verbs: ["get", "patch"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["configmaps"]
-            verbs: ["create"]
+          any: true
       - notContains:
           path: rules
           content:
             apiGroups: ["agents.x-k8s.io"]
           any: true
-
-  - it: derives shared namespace ConfigMap RBAC from a custom effective gateway ID
-    template: templates/role.yaml
-    set:
-      supervisor.network.additionalCaConfigMapName: private-destination-ca
-      workspaceResources.enabled: false
-      server.sandboxJwt.gatewayId: gateway-a
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-gateway-a"]
-            verbs: ["get", "patch"]
 
   - it: binds shared namespace ConfigMap permissions when workspace resources are external
     template: templates/rolebinding.yaml
@@ -148,40 +133,25 @@ tests:
       - hasDocuments:
           count: 1
 
-  - it: grants managed namespace ConfigMap get and patch only for the default gateway ConfigMap
+  - it: grants only cluster-wide ConfigMap get and create in managed mode
     template: templates/clusterrole.yaml
     set:
       supervisor.network.additionalCaConfigMapName: private-destination-ca
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
       - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create"]
+      - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["configmaps"]
             resourceNames: ["openshell-network-additional-ca-openshell"]
-            verbs: ["get", "patch"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["configmaps"]
-            verbs: ["create"]
-
-  - it: derives managed namespace ConfigMap RBAC from a custom effective gateway ID
-    template: templates/clusterrole.yaml
-    set:
-      supervisor.network.additionalCaConfigMapName: private-destination-ca
-      server.drivers.kubernetes.workspaceMode: managed
-      server.sandboxJwt.gatewayId: gateway-a
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-gateway-a"]
-            verbs: ["get", "patch"]
+          any: true
 
   - it: omits a shared Role in managed workspace mode
     template: templates/role.yaml
@@ -192,7 +162,7 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: grants operator namespace ConfigMap get and patch only for the managed name through the ClusterRole
+  - it: grants only cluster-wide ConfigMap get and create in operator mode
     template: templates/clusterrole.yaml
     set:
       supervisor.network.additionalCaConfigMapName: private-destination-ca
@@ -203,14 +173,14 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-openshell"]
-            verbs: ["get", "patch"]
-      - contains:
+            verbs: ["get", "create"]
+      - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["configmaps"]
-            verbs: ["create"]
+            resourceNames: ["openshell-network-additional-ca-openshell"]
+          any: true
 
   - it: omits a shared Role in operator workspace mode
     template: templates/role.yaml
