@@ -311,6 +311,10 @@ pub struct ServerState {
     /// Internal endpoint other gateway replicas can dial for peer RPCs.
     pub peer_endpoint: Option<String>,
 
+    /// Reused peer connections, peer token, and owner lookups for relay
+    /// forwarding. Keeps per-relay cost off the connection and auth paths.
+    pub peer_routes: Arc<supervisor_session::PeerRouteCache>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -437,6 +441,7 @@ impl ServerState {
             gateway_shutting_down: AtomicBool::new(false),
             replica_id,
             peer_endpoint,
+            peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -762,6 +767,10 @@ pub(crate) async fn run_server(
                             service_account.trim().to_string(),
                             required_labels,
                         ));
+                        let cache_ttl = auth::peer::peer_token_cache_ttl_from_env();
+                        let resolver = Arc::new(auth::peer::CachingGatewayPeerResolver::new(
+                            resolver, cache_ttl,
+                        ));
                         let authenticator =
                             auth::peer::PeerServiceAccountAuthenticator::new(resolver);
                         state.peer_authenticator = Some(Arc::new(authenticator));
@@ -769,6 +778,7 @@ pub(crate) async fn run_server(
                             namespace = %namespace.trim(),
                             service_account = %service_account.trim(),
                             audience,
+                            token_cache_ttl_secs = cache_ttl.as_secs(),
                             "gateway peer ServiceAccount TokenReview authentication enabled"
                         );
                     }
