@@ -6705,7 +6705,6 @@ mod tests {
     #[test]
     fn ready_false_condition_message_prefers_reason_and_message() {
         let status = SandboxStatus {
-            sandbox: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -6726,7 +6725,6 @@ mod tests {
     #[test]
     fn ready_false_condition_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
-            sandbox: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),

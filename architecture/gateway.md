@@ -75,7 +75,9 @@ the sandbox with a string `sandbox` and carries its workspace selector as
 a separate request field. Canonical sandbox IDs remain internal metadata used
 at authentication, persistence, and compute-driver boundaries; public callers
 do not use them as sandbox references. The gateway resolves the name to the
-persisted sandbox record and authorizes that record's workspace. Missing and
+persisted sandbox record only after authorizing the selected workspace. A
+sandbox principal is instead resolved by the immutable ID in its authenticated
+identity, then checked against the requested name and workspace. Missing and
 unauthorized references use the same response within each principal class so
 the resolver does not expose an object-existence oracle. Sandbox, sandbox
 template, provider, and service list RPCs also accept an all-workspaces marker
@@ -348,7 +350,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`ee6f37067c5c0ce72cef5ea241e9fee59a5f9bfb993cfd4f97c5f04b9d7650ab`).
+(`b1302cff115e399ef7a3b771c0793d6b698be06d27792b6261057497c440bd7e`).
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
@@ -369,7 +371,7 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The 12 encoded durable roots above have a closure of 81 messages and eight
-enums (`54a83fc7ecc9f39672090fbdc08c4ad5b298d22c80d19d63a648db2cc9a706b3`).
+enums (`04c1e82bb685d83ef56128a0036500876fe0e734c465bac25c42ec725ee605f7`).
 Its intersection with the public RPC closure contains 71 messages and eight
 enums (`05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415`).
 The descriptor-derived test owns these full inventories; the tables here record

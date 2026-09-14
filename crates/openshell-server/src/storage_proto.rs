@@ -111,6 +111,7 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::{SandboxPhase, SandboxStatus};
     use prost::Message;
     use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorSet};
     use sha2::{Digest, Sha256};
@@ -119,9 +120,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ee6f37067c5c0ce72cef5ea241e9fee59a5f9bfb993cfd4f97c5f04b9d7650ab";
+        "b1302cff115e399ef7a3b771c0793d6b698be06d27792b6261057497c440bd7e";
     const DURABLE_SCHEMA_SHA256: &str =
-        "54a83fc7ecc9f39672090fbdc08c4ad5b298d22c80d19d63a648db2cc9a706b3";
+        "04c1e82bb685d83ef56128a0036500876fe0e734c465bac25c42ec725ee605f7";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
     // Synthetic payloads generated with the public declarations at v0.0.116,
@@ -136,6 +137,10 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
+    // SandboxStatus encoded before its redundant parent sandbox name was removed.
+    // Field 1 is ignored while the remaining durable status fields retain their tags.
+    const PRE_CANONICAL_SANDBOX_REFERENCE_STATUS: &str =
+        "0a0b6c65676163792d6e616d6512056167656e7430023807";
     const STORAGE_MESSAGE_NAMES: [&str; 7] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
@@ -593,6 +598,17 @@ mod tests {
         assert_eq!(draft.host, "example.com");
         assert_eq!(draft.port, 443);
         assert_eq!(draft.hit_count, 1);
+    }
+
+    #[test]
+    fn sandbox_status_without_parent_reference_decodes_previous_payload() {
+        let status =
+            SandboxStatus::decode(legacy_bytes(PRE_CANONICAL_SANDBOX_REFERENCE_STATUS).as_slice())
+                .expect("previous sandbox status must decode");
+
+        assert_eq!(status.agent_pod, "agent");
+        assert_eq!(status.phase, SandboxPhase::Ready as i32);
+        assert_eq!(status.current_policy_version, 7);
     }
 
     #[tokio::test]

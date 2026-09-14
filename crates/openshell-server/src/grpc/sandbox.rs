@@ -137,41 +137,50 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     if sandbox_name.is_empty() {
         return Err(Status::invalid_argument("sandbox is required"));
     }
-    let sandbox = match principal {
-        crate::auth::principal::Principal::Sandbox(sandbox_principal) => {
-            let sandbox = state
-                .store
-                .get_message::<Sandbox>(&sandbox_principal.sandbox_id)
-                .await
-                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-            sandbox.filter(|sandbox| {
-                sandbox.metadata.as_ref().is_some_and(|metadata| {
-                    metadata.name == sandbox_name
-                        && workspace_scope.is_none_or(|scope| {
-                            crate::auth::workspace_authz::selected_workspace_name(Some(scope))
-                                .is_ok_and(|workspace| workspace == sandbox.object_workspace())
-                        })
-                })
-            })
-        }
-        crate::auth::principal::Principal::User(_)
-        | crate::auth::principal::Principal::Anonymous => {
-            let workspace = crate::auth::workspace_authz::selected_workspace_name(workspace_scope)?;
-            state
-                .store
-                .get_message_by_name::<Sandbox>(workspace, sandbox_name)
-                .await
-                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        }
+    let crate::auth::principal::Principal::Sandbox(sandbox_principal) = principal else {
+        let workspace = crate::auth::workspace_authz::selected_workspace_name(workspace_scope)?;
+        authorize_sandbox_workspace(
+            &state.store,
+            &state.admin_role,
+            principal,
+            workspace,
+            min_role,
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == tonic::Code::PermissionDenied {
+                Status::not_found("sandbox not found")
+            } else {
+                error
+            }
+        })?;
+
+        return state
+            .store
+            .get_message_by_name::<Sandbox>(workspace, sandbox_name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"));
     };
-    let sandbox = match sandbox {
-        Some(sandbox) => sandbox,
-        None if matches!(principal, crate::auth::principal::Principal::Sandbox(_)) => {
-            return Err(Status::permission_denied(
-                "sandbox not found or not owned by caller",
-            ));
-        }
-        None => return Err(Status::not_found("sandbox not found")),
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_principal.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .filter(|sandbox| {
+            sandbox.metadata.as_ref().is_some_and(|metadata| {
+                metadata.name == sandbox_name
+                    && workspace_scope.is_none_or(|scope| {
+                        crate::auth::workspace_authz::selected_workspace_name(Some(scope))
+                            .is_ok_and(|workspace| workspace == sandbox.object_workspace())
+                    })
+            })
+        });
+    let Some(sandbox) = sandbox else {
+        return Err(Status::permission_denied(
+            "sandbox not found or not owned by caller",
+        ));
     };
 
     authorize_sandbox_workspace(

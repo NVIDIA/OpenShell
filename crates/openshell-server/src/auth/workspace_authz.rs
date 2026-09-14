@@ -200,12 +200,10 @@ pub async fn authorize_workspace(
     }
 }
 
-/// Authorize a data-plane operation where the workspace is resolved from the
-/// sandbox record rather than the request message.
-///
 /// Used by `ExecSandbox`, `ForwardTcp`, `WatchSandbox`, `CreateSshSession` — these
-/// RPCs identify a sandbox by name/ID and the handler resolves the workspace
-/// from the sandbox record.
+/// RPCs identify a sandbox by its canonical name within an explicit workspace.
+/// User requests authorize that workspace before lookup; sandbox principals
+/// remain bound to the immutable ID from their authenticated identity.
 #[allow(clippy::result_large_err)]
 pub async fn authorize_sandbox_workspace(
     store: &Store,
