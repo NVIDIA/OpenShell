@@ -18,6 +18,16 @@ pub use runtime::OpenShellRuntimeBackend;
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = "openshell-sandbox";
 
+/// Memory-backed parent used for supervisor CA material.
+pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
+
+/// Workload-visible directory for the supervisor's public HTTPS interception
+/// certificate and combined trust bundle.
+///
+/// Keeping the material below the mount root lets runtimes that cannot assign
+/// tmpfs ownership create this child as the unprivileged sandbox identity.
+pub const SUPERVISOR_CA_RUNTIME_DIR: &str = "/run/openshell-supervisor-ca/material";
+
 /// Generated gRPC transport envelope for the OpenShell Sandbox Protocol.
 #[allow(
     clippy::all,
