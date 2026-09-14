@@ -1392,16 +1392,6 @@ pub struct IsolationSpecs {
     pub supervisor: ContainerSpec,
 }
 
-impl ContainerSpec {
-    pub(crate) fn join_user_namespace(&mut self, container_id: &str) {
-        self.userns = Some(UserNS {
-            nsmode: "container".to_string(),
-            value: Some(container_id.to_string()),
-        });
-        self.idmappings = None;
-    }
-}
-
 pub fn build_isolation_specs(
     input: IsolationSpecInput<'_>,
 ) -> Result<IsolationSpecs, ComputeDriverError> {
@@ -1515,7 +1505,15 @@ pub fn build_isolation_specs(
     supervisor.cap_add.clear();
     supervisor.seccomp_profile_path.clear();
     // The trusted supervisor originates approved egress from the Podman host
-    // network. The workload remains fenced by network=none.
+    // network. Keep it in the caller's user namespace as well: joining the
+    // workload's user namespace is incompatible with host networking under
+    // rootless Podman, and the authenticated channel does not require a shared
+    // user namespace. The workload remains fenced by network=none.
+    supervisor.userns = Some(UserNS {
+        nsmode: "host".into(),
+        value: None,
+    });
+    supervisor.idmappings = None;
     supervisor.netns.nsmode = "host".into();
     supervisor.networks.clear();
     supervisor.portmappings.clear();
@@ -1693,6 +1691,7 @@ mod tests {
         config.app_armor_profile = Some(openshell_core::config::AppArmorProfile::Localhost(
             "openshell-sandbox".into(),
         ));
+        config.userns = Some("auto".into());
         let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
             1000,
             1001,
@@ -1729,6 +1728,14 @@ mod tests {
         }
         assert_eq!(specs.workload.netns.nsmode, "none");
         assert_eq!(
+            specs
+                .workload
+                .userns
+                .as_ref()
+                .map(|userns| userns.nsmode.as_str()),
+            Some("auto")
+        );
+        assert_eq!(
             specs.workload.apparmor_profile.as_deref(),
             Some("openshell-sandbox")
         );
@@ -1739,6 +1746,15 @@ mod tests {
         assert!(specs.workload.networks.is_empty());
         assert!(specs.workload.portmappings.is_empty());
         assert_eq!(specs.supervisor.netns.nsmode, "host");
+        assert_eq!(
+            specs
+                .supervisor
+                .userns
+                .as_ref()
+                .map(|userns| userns.nsmode.as_str()),
+            Some("host")
+        );
+        assert!(specs.supervisor.idmappings.is_none());
         assert!(specs.supervisor.networks.is_empty());
         assert!(specs.supervisor.portmappings.is_empty());
         assert!(specs.workload.env.is_empty());

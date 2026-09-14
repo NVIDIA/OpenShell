@@ -1031,7 +1031,7 @@ impl PodmanComputeDriver {
                     tls_secrets: tls_secret_names.as_ref(),
                     identity: &identity,
                 });
-                let mut specs = match specs {
+                let specs = match specs {
                     Ok(spec) => spec,
                     Err(e) => {
                         cleanup_all().await;
@@ -1075,14 +1075,6 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                         .await?;
-                    // Rootless Podman can only join another container's user
-                    // namespace after that container has started and owns a
-                    // live namespace. openshell-sandbox keeps the agent
-                    // stopped until the authenticated supervisor confirms the
-                    // boundary, so starting it here does not release workload
-                    // execution before enforcement is established.
-                    self.client.start_container(&workload_id).await?;
-                    specs.supervisor.join_user_namespace(&workload_id);
                     let supervisor_id = self
                         .client
                         .create_typed_container(&specs.supervisor)
@@ -1091,8 +1083,10 @@ impl PodmanComputeDriver {
                     self.client
                         .copy_to_container(&supervisor_id, "/", archives.supervisor)
                         .await?;
-                    // The trusted sandbox is already waiting for this
-                    // authenticated supervisor; confirmation gates agent exec.
+                    // Start the sandbox only after both containers and their
+                    // bootstrap material exist. It keeps the agent stopped
+                    // until the authenticated supervisor confirms the boundary.
+                    self.client.start_container(&workload_id).await?;
                     self.client.start_container(&supervisor_id).await?;
                     Ok::<(), ComputeDriverError>(())
                 }
@@ -3498,9 +3492,9 @@ mod tests {
             fence_response(),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
-            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             created_response("supervisor"),
             StubResponse::new(StatusCode::OK, ""), // supervisor archive
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
         ]
     }
