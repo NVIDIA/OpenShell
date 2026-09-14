@@ -2530,7 +2530,8 @@ message SessionAccepted {
   // Complete gateway-owned configuration. During the staged rollout this may
   // be omitted only when the gateway cannot build the projection.
   ConfigBootstrap bootstrap = 3;
-  // Exact internal stream protocol revision implemented by this gateway.
+  // Stream semantics negotiated from the supervisor's offered revision. The
+  // gateway echoes a supported compatibility revision during rollout.
   uint32 protocol_revision = 4;
 }
 

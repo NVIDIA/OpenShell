@@ -22,7 +22,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Supervisor connections and policy recovery
 
-During supervisor reconnects, the gateway waits at most one second for the optional configuration bootstrap. If a credential backend stalls, the gateway accepts the session without that bootstrap so SSH, exec, and service connections can resume. Supervisor polling continues to supply configuration.
+Current supervisors open `ConnectSupervisor` before initializing gateway-owned runtime state and require a complete configuration bootstrap before the gateway accepts the session as initialized. They apply later policy, settings, middleware, and provider snapshots from that stream without configuration fetch polling. If first-start image policy discovery or image-specific baseline enrichment changes policy, the supervisor commits that repair and reconnects before installing the fresh stream bootstrap; it does not initialize from the mutation response. The gateway gives bootstrap construction the same bounded 45-second window as other snapshot builds and rejects the connection when construction fails or times out. Immediately previous supervisors retain the Stage 1 compatibility behavior: the gateway waits at most one second for an optional bootstrap, accepts the session without it when necessary, and relies on supervisor polling for configuration.
 
 On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
 
@@ -252,10 +252,10 @@ namespace              = "openshell"
 # Required in raw TOML; Helm derives this from the gateway Service.
 grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-# Defaults to the gateway version. Custom builds must match the gateway's
-# internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed remain compatible for
-# one release.
+# Defaults to the gateway version. The gateway accepts its current internal
+# supervisor protocol revision, the immediately previous revision through
+# polling compatibility, and pre-handshake supervisors for one release. Other
+# revisions reject the session. Compatibility sessions emit gateway warnings.
 # supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name = "openshell-client-tls"
 service_account_name   = "openshell-sandbox"
@@ -551,10 +551,10 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy              = "if_not_present"
 image_pull_secrets             = ["regcred"]
-# Defaults to the gateway version. Custom builds must match the gateway's
-# internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed remain compatible for
-# one release.
+# Defaults to the gateway version. The gateway accepts its current internal
+# supervisor protocol revision, the immediately previous revision through
+# polling compatibility, and pre-handshake supervisors for one release. Other
+# revisions reject the session. Compatibility sessions emit gateway warnings.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
@@ -726,10 +726,10 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
 # When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-# Defaults to the gateway version. Custom builds must match the gateway's
-# internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed remain compatible for
-# one release.
+# Defaults to the gateway version. The gateway accepts its current internal
+# supervisor protocol revision, the immediately previous revision through
+# polling compatibility, and pre-handshake supervisors for one release. Other
+# revisions reject the session. Compatibility sessions emit gateway warnings.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
@@ -793,10 +793,10 @@ network_name            = "openshell"
 # host_gateway_ip       = "192.168.127.254"
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
-# Defaults to the gateway version. Custom builds must match the gateway's
-# internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed remain compatible for
-# one release.
+# Defaults to the gateway version. The gateway accepts its current internal
+# supervisor protocol revision, the immediately previous revision through
+# polling compatibility, and pre-handshake supervisors for one release. Other
+# revisions reject the session. Compatibility sessions emit gateway warnings.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can

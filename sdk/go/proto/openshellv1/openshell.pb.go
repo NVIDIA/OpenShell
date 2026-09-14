@@ -11049,7 +11049,8 @@ type SessionAccepted struct {
 	// Complete gateway-owned configuration. During the staged rollout this may
 	// be omitted only when the gateway cannot build the projection.
 	Bootstrap *ConfigBootstrap `protobuf:"bytes,3,opt,name=bootstrap,proto3" json:"bootstrap,omitempty"`
-	// Exact internal stream protocol revision implemented by this gateway.
+	// Stream semantics negotiated from the supervisor's offered revision. The
+	// gateway echoes a supported compatibility revision during rollout.
 	ProtocolRevision uint32 `protobuf:"varint,4,opt,name=protocol_revision,json=protocolRevision,proto3" json:"protocol_revision,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache

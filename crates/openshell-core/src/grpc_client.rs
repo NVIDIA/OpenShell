@@ -960,6 +960,29 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
     }
 }
 
+impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
+    fn from(inner: crate::proto::SandboxConfigSnapshot) -> Self {
+        Self {
+            policy: inner.policy,
+            version: inner.version,
+            policy_hash: inner.policy_hash,
+            config_revision: inner.config_revision,
+            policy_source: PolicySource::try_from(inner.policy_source)
+                .unwrap_or(PolicySource::Unspecified),
+            settings: inner.settings,
+            global_policy_version: inner.global_policy_version,
+            provider_env_revision: inner.provider_env_revision,
+            supervisor_middleware_services: inner.supervisor_middleware_services,
+            workspace: inner.workspace,
+            policy_validation_failure_mode: inner
+                .policy_validation_failure_mode
+                .parse()
+                .unwrap_or_default(),
+            extension_authentication_enabled: inner.extension_authentication_enabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod settings_poll_tests {
     use super::settings_poll_result;
@@ -1001,6 +1024,25 @@ mod settings_poll_tests {
         let legacy = settings_poll_result(GetSandboxConfigResponse::default());
         assert!(!legacy.extension_authentication_enabled);
     }
+
+    #[test]
+    fn delivered_sandbox_snapshot_uses_the_polling_projection() {
+        let result = super::SettingsPollResult::from(crate::proto::SandboxConfigSnapshot {
+            version: 7,
+            policy_hash: "hash-7".to_string(),
+            config_revision: 42,
+            provider_env_revision: 9,
+            workspace: "workspace-a".to_string(),
+            extension_authentication_enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(result.version, 7);
+        assert_eq!(result.policy_hash, "hash-7");
+        assert_eq!(result.config_revision, 42);
+        assert_eq!(result.provider_env_revision, 9);
+        assert_eq!(result.workspace, "workspace-a");
+        assert!(result.extension_authentication_enabled);
+    }
 }
 
 pub struct ProviderEnvironmentResult {
@@ -1010,6 +1052,80 @@ pub struct ProviderEnvironmentResult {
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
     pub non_secret_environment_keys: Vec<String>,
+}
+
+impl From<crate::proto::ProviderEnvironmentSnapshot> for ProviderEnvironmentResult {
+    fn from(snapshot: crate::proto::ProviderEnvironmentSnapshot) -> Self {
+        use crate::proto::ProviderEnvironmentValueClassification;
+
+        let mut environment = HashMap::with_capacity(snapshot.values.len());
+        let mut credential_expires_at_ms = HashMap::new();
+        let mut static_credential_bindings = HashMap::new();
+        let mut non_secret_environment_keys = Vec::new();
+        for value in snapshot.values {
+            environment.insert(value.name.clone(), value.value);
+            if let Some(expires_at_ms) = value.expires_at_ms {
+                credential_expires_at_ms.insert(value.name.clone(), expires_at_ms);
+            }
+            match ProviderEnvironmentValueClassification::try_from(value.classification)
+                .unwrap_or_default()
+            {
+                ProviderEnvironmentValueClassification::NonSecret => {
+                    non_secret_environment_keys.push(value.name);
+                }
+                ProviderEnvironmentValueClassification::StaticCredential => {
+                    if let Some(binding) = value.static_credential_binding {
+                        static_credential_bindings.insert(value.name, binding);
+                    }
+                }
+                ProviderEnvironmentValueClassification::Unspecified => {}
+            }
+        }
+        Self {
+            environment,
+            provider_env_revision: snapshot.provider_env_revision,
+            credential_expires_at_ms,
+            dynamic_credentials: snapshot.dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_snapshot_tests {
+    use super::ProviderEnvironmentResult;
+    use crate::proto::{
+        ProviderEnvironmentSnapshot, ProviderEnvironmentValue,
+        ProviderEnvironmentValueClassification, StaticCredentialBinding,
+    };
+
+    #[test]
+    fn delivered_provider_snapshot_preserves_secret_classification_metadata() {
+        let result = ProviderEnvironmentResult::from(ProviderEnvironmentSnapshot {
+            provider_env_revision: 11,
+            values: vec![
+                ProviderEnvironmentValue {
+                    name: "REGION".to_string(),
+                    value: "west".to_string(),
+                    classification: ProviderEnvironmentValueClassification::NonSecret.into(),
+                    ..Default::default()
+                },
+                ProviderEnvironmentValue {
+                    name: "TOKEN".to_string(),
+                    value: "redacted".to_string(),
+                    classification: ProviderEnvironmentValueClassification::StaticCredential.into(),
+                    static_credential_binding: Some(StaticCredentialBinding::default()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        assert_eq!(result.provider_env_revision, 11);
+        assert_eq!(result.environment.len(), 2);
+        assert_eq!(result.non_secret_environment_keys, ["REGION"]);
+        assert!(result.static_credential_bindings.contains_key("TOKEN"));
+    }
 }
 
 pub struct ProviderSubjectTokenExchangeResult {

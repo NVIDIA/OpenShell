@@ -23,6 +23,8 @@ pub use sqlite::SqliteStore;
 pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 /// Object type string for draft policy chunk records.
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+/// Object type string for compact supervisor component observations.
+pub const CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE: &str = "config_component_observation";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 

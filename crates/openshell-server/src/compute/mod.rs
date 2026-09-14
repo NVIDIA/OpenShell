@@ -10,8 +10,9 @@ pub mod rootfs_tar;
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectListQuery, ObjectName, ObjectRecord,
-    ObjectType, POLICY_OBJECT_TYPE, Store, WriteCondition,
+    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId,
+    ObjectListQuery, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE, Store,
+    WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -3350,6 +3351,10 @@ impl ComputeRuntime {
         for (object_type, label) in [
             (POLICY_OBJECT_TYPE, "policy revisions"),
             (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunks"),
+            (
+                CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                "configuration component observations",
+            ),
         ] {
             self.store
                 .delete_by_scope(object_type, sandbox.object_id())
@@ -6304,6 +6309,19 @@ mod tests {
             )
             .await
             .unwrap();
+        runtime
+            .store
+            .put_scoped(
+                CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                "observation-owned",
+                "observation-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"outcome":"applied"}"#,
+                None,
+            )
+            .await
+            .unwrap();
         session
     }
 
@@ -6369,6 +6387,18 @@ mod tests {
             runtime
                 .store
                 .get(DRAFT_CHUNK_OBJECT_TYPE, "draft-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(
+                    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                    "observation-owned",
+                )
                 .await
                 .unwrap()
                 .is_some(),
