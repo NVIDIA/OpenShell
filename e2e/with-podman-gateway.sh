@@ -578,6 +578,10 @@ if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
   exit 2
 fi
 SUPERVISOR_BASE_IMAGE="$(awk '$1 == "FROM" { print $2; exit }' "${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}")"
+if ! podman_cmd image exists "${SUPERVISOR_BASE_IMAGE}" 2>/dev/null; then
+  echo "Pulling Podman supervisor base image ${SUPERVISOR_BASE_IMAGE}..."
+  podman_cmd pull "${SUPERVISOR_BASE_IMAGE}"
+fi
 SUPERVISOR_BASE_IMAGE_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SUPERVISOR_BASE_IMAGE}")"
 SUPERVISOR_BASE_IMAGE_ID="${SUPERVISOR_BASE_IMAGE_ID#sha256:}"
 SUPERVISOR_BASE_IMAGE_DIGEST="$(podman_cmd image inspect --format '{{.Digest}}' "${SUPERVISOR_BASE_IMAGE}")"
@@ -588,8 +592,9 @@ if ! [[ "${SUPERVISOR_BASE_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]] \
 fi
 SUPERVISOR_PACKAGE_MANIFEST="${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE:-${WORKDIR}/supervisor.packages.txt}"
 mkdir -p "$(dirname "${SUPERVISOR_PACKAGE_MANIFEST}")"
-podman_cmd run --rm --network none --entrypoint /sbin/apk \
-  "${SUPERVISOR_RUNTIME_IMAGE}" info -v | LC_ALL=C sort >"${SUPERVISOR_PACKAGE_MANIFEST}"
+podman_cmd run --rm --network none --entrypoint /usr/bin/dpkg-query \
+  "${SUPERVISOR_RUNTIME_IMAGE}" -W '-f=${binary:Package}=${Version}\n' \
+  | LC_ALL=C sort >"${SUPERVISOR_PACKAGE_MANIFEST}"
 SUPERVISOR_PACKAGE_MANIFEST_SHA256="$(sha256sum "${SUPERVISOR_PACKAGE_MANIFEST}" | cut -d' ' -f1)"
 echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST}, base ${SUPERVISOR_BASE_IMAGE} ID ${SUPERVISOR_BASE_IMAGE_ID} digest ${SUPERVISOR_BASE_IMAGE_DIGEST}, packages ${SUPERVISOR_PACKAGE_MANIFEST_SHA256})"
 
