@@ -217,11 +217,10 @@
 //
 // # SSH Session Management
 //
-// Create an SSH session for a sandbox and use the returned connection details.
-// Note: CreateSession accepts a sandbox ID, not a name. For name-based access
-// with automatic session cleanup, prefer SSH().Tunnel() instead.
+// Create an SSH session for a sandbox by its canonical name in a workspace and
+// use the returned connection details.
 //
-//	session, err := client.SSH().CreateSession(ctx, "default", sandbox.ID)
+//	session, err := client.SSH().CreateSession(ctx, "default", sandbox.Name)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}

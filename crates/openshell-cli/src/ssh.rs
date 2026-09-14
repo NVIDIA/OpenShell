@@ -153,6 +153,7 @@ async fn ssh_session_config(
         &exe_command,
         &gateway_url,
         name,
+        workspace,
         &session.token,
         gateway_name,
     );
@@ -1429,6 +1430,7 @@ async fn sandbox_sync_down_directory(
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
     sandbox_name: &str,
+    workspace: &str,
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1440,7 +1442,7 @@ pub async fn sandbox_ssh_proxy(
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: sandbox_name.to_string(),
-                workspace_scope: None,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
                 service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
@@ -1535,6 +1537,7 @@ pub async fn sandbox_ssh_proxy_by_name(
     sandbox_ssh_proxy(
         &session.gateway_url,
         &session.sandbox_name,
+        workspace,
         &session.token,
         tls,
     )

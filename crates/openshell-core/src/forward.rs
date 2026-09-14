@@ -295,11 +295,14 @@ fn proxy_command_option_present(args: &[&str], proxy_index: usize) -> bool {
 }
 
 fn proxy_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "--gateway" | "--token" | "--gateway-name")
+    matches!(
+        arg,
+        "--gateway" | "--workspace" | "--token" | "--gateway-name"
+    )
 }
 
 fn proxy_option_has_inline_value(arg: &str) -> bool {
-    ["--gateway=", "--token=", "--gateway-name="]
+    ["--gateway=", "--workspace=", "--token=", "--gateway-name="]
         .iter()
         .any(|prefix| arg.starts_with(prefix))
 }
@@ -800,20 +803,22 @@ pub fn shell_escape(value: &str) -> String {
 /// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
 ///
 /// Every interpolated argument is shell-escaped so that server-supplied values
-/// (gateway URL, sandbox name, token, gateway name) cannot inject shell
+/// (gateway URL, sandbox name, workspace, token, gateway name) cannot inject shell
 /// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
 pub fn build_proxy_command(
     exe: &str,
     gateway_url: &str,
     sandbox_name: &str,
+    workspace: &str,
     token: &str,
     gateway_name: &str,
 ) -> String {
     format!(
-        "{} ssh-proxy --gateway {} --sandbox {} --token {} --gateway-name {}",
+        "{} ssh-proxy --gateway {} --sandbox {} --workspace {} --token {} --gateway-name {}",
         shell_escape(exe),
         shell_escape(gateway_url),
         shell_escape(sandbox_name),
+        shell_escape(workspace),
         shell_escape(token),
         shell_escape(gateway_name),
     )
@@ -1200,6 +1205,7 @@ mod tests {
             "/usr/local/bin/openshell",
             "https://gw:443/connect",
             "x$(touch /tmp/pwn)x",
+            "ws; touch /tmp/pwn",
             "tok`id`",
             "gw-name",
         );
@@ -1219,8 +1225,9 @@ mod tests {
     fn build_proxy_command_empty_values_quote_rather_than_vanish() {
         // An empty value must become `''` rather than disappearing — otherwise
         // downstream argv splitting would misalign.
-        let cmd = build_proxy_command("exe", "gw", "", "tok", "name");
+        let cmd = build_proxy_command("exe", "gw", "", "", "tok", "name");
         assert!(cmd.contains("--sandbox ''"));
+        assert!(cmd.contains("--workspace ''"));
     }
 
     #[test]
@@ -1229,12 +1236,13 @@ mod tests {
             "/usr/local/bin/openshell",
             "gw",
             "sb-123",
+            "workspace-1",
             "tok.456",
             "name_1",
         );
         assert_eq!(
             cmd,
-            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --token tok.456 --gateway-name name_1"
+            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --workspace workspace-1 --token tok.456 --gateway-name name_1"
         );
     }
 
@@ -1532,7 +1540,7 @@ mod tests {
 
     #[test]
     fn ssh_forward_command_matches_generated_forward_shape() {
-        let command = "/usr/bin/ssh -N -o ProxyCommand=/path/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox sbx-1 --token tok_123 --gateway-name local -o ExitOnForwardFailure=yes -L 127.0.0.1:80:127.0.0.1:80 -f sandbox";
+        let command = "/usr/bin/ssh -N -o ProxyCommand=/path/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox sbx-1 --workspace team-a --token tok_123 --gateway-name local -o ExitOnForwardFailure=yes -L 127.0.0.1:80:127.0.0.1:80 -f sandbox";
 
         assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
     }
@@ -1579,7 +1587,7 @@ mod tests {
         // ProxyCommand element and matches correctly.
         let exe = "/Application Support/openshell";
         let proxy_arg = format!(
-            "ProxyCommand={} ssh-proxy --gateway https://127.0.0.1:9443 --sandbox sbx-1 --token tok_123 --gateway-name local",
+            "ProxyCommand={} ssh-proxy --gateway https://127.0.0.1:9443 --sandbox sbx-1 --workspace=team-a --token tok_123 --gateway-name local",
             shell_escape(exe)
         );
         // Mirror process_forward_match_tokens: the ProxyCommand element is expanded.

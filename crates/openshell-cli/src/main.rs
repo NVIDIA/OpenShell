@@ -3801,7 +3801,8 @@ async fn run_async() -> Result<()> {
                     if let Some(ref g) = gateway_name_opt {
                         apply_auth(&mut effective_tls, g)?;
                     }
-                    run::sandbox_ssh_proxy(&gw, &sandbox, &tok, &effective_tls).await?;
+                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
+                        .await?;
                 }
                 // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(g), Some(n)) => {
@@ -4479,12 +4480,15 @@ mod tests {
             "https://gw.example.com:8080/proxy/connect",
             "--sandbox",
             "my-box",
+            "--workspace",
+            "team-a",
             "--token",
             "tok-abc",
             "--gateway-name",
             "my-gateway",
         ])
         .expect("TUI proxy command flags must be accepted by the CLI");
+        assert_eq!(cli.workspace, "team-a");
 
         match cli.command {
             Some(Commands::SshProxy {
