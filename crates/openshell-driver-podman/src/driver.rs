@@ -1919,6 +1919,12 @@ mod tests {
         SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id: openshell_core::SandboxSessionId::new(),
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .unwrap(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+                predecessor_session_id: None,
                 gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
