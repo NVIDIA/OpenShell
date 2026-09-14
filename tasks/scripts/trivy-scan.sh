@@ -33,7 +33,7 @@ HELM_PROFILES=(
   cert-manager credential-driver-kubernetes-secrets credential-driver-vault
   gateway gateway-tls high-availability openshift-route-cert-manager spire
   tls-disabled workspace-managed workspace-operator
-  corporate-proxy-e2e keycloak sidecar sidecar-kata skaffold
+  corporate-proxy-e2e keycloak sandbox-runtime skaffold
 )
 
 # Reject ignore entries broader than one concrete basename.
