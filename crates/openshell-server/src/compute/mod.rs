@@ -1349,6 +1349,11 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         launch_authentication: Vec<u8>,
     ) -> Result<Sandbox, Status> {
+        let generation_id =
+            openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
+                sandbox_resource_version(&starting),
+            )
+            .into_string();
         let result = self
             .driver
             .call(
@@ -1363,6 +1368,7 @@ impl ComputeRuntime {
                                 sandbox_id,
                                 sandbox_name,
                                 launch_authentication,
+                                generation_id,
                             }))
                             .await
                     }
@@ -2323,6 +2329,10 @@ impl ComputeRuntime {
             }
 
             let sandbox_name = sandbox.object_name().to_string();
+            let generation_id = openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
+                sandbox_resource_version(&sandbox),
+            )
+            .into_string();
             match self
                 .driver
                 .call(
@@ -2337,6 +2347,7 @@ impl ComputeRuntime {
                                     sandbox_id,
                                     sandbox_name,
                                     launch_authentication: Vec::new(),
+                                    generation_id,
                                 }))
                                 .await
                         }
@@ -2499,6 +2510,10 @@ impl ComputeRuntime {
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
+                    let generation_id = openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
+                        sandbox_resource_version(&sandbox),
+                    )
+                    .into_string();
                     if let Err(err) = self
                         .driver
                         .call(
@@ -2510,6 +2525,7 @@ impl ComputeRuntime {
                                         sandbox_id: driver_sandbox_id,
                                         sandbox_name,
                                         launch_authentication: Vec::new(),
+                                        generation_id,
                                     }))
                                     .await
                             },

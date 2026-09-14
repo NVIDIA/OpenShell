@@ -424,6 +424,9 @@ message StartSandboxRequest {
   // Fresh launch credentials for start-from-stopped. Empty only for drivers
   // that do not implement the OpenShell Sandbox Protocol.
   bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
+  // Stable identity of this gateway start transition. Retries of the same
+  // transition carry the same generation ID; a later start uses a new ID.
+  string generation_id = 4;
 }
 
 message StartSandboxResponse {}
