@@ -16,7 +16,8 @@ OpenShell builds these main artifacts:
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
-| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
+| Sandbox runtime binary and container image | `crates/openshell-sandbox` and `deploy/docker/Dockerfile.sandbox` |
+| Supervisor binary and container image | `crates/openshell-supervisor` and `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
@@ -28,8 +29,8 @@ Sandbox community images are built outside this repository.
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
-collect telemetry: `openshell-gateway`, `openshell-sandbox`
-(supervisor), and `openshell-driver-vm`. Every crate depends on
+collect telemetry: `openshell-gateway`, `openshell-sandbox`,
+`openshell-supervisor`, and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build
 graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
@@ -87,8 +88,9 @@ SONAMEs.
 
 The workload-side `openshell-sandbox` binary is statically linked with musl so
 drivers can stage it into an arbitrary agent image without depending on that
-image's libc. The host-side `openshell-supervisor` binary is dynamically linked
-with glibc and built with the same glibc 2.28 compatibility floor as the gateway.
+image's libc. The supervisor is also statically linked: release images use the
+default musl build, while distribution-specific builds may select the
+`glibc-static` variant.
 
 ## Container Builds
 
