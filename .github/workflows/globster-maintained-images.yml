@@ -1,31 +1,329 @@
-name: Globster maintained images
+name: Globster compatibility publication
 
 on:
   workflow_dispatch:
 
+concurrency:
+  group: globster-openshell-0.0.116-compatibility-publication
+  cancel-in-progress: false
+
 permissions:
+  artifact-metadata: write
+  attestations: write
   contents: read
+  id-token: write
   packages: write
 
+env:
+  SOURCE_COMMIT: 9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
+  CARGO_VERSION: 0.0.116-globster.1
+  ARTIFACT_TAG: 0.0.116-globster-9b5c49ee
+  CHART_VERSION: 0.0.116-globster.1
+  GATEWAY_REPOSITORY: ghcr.io/globster-monday/openshell/gateway
+  SUPERVISOR_REPOSITORY: ghcr.io/globster-monday/openshell/supervisor
+  CHART_REPOSITORY: oci://ghcr.io/globster-monday/openshell/helm-chart
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      state: ${{ steps.probe.outputs.state }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .release-source
+          ref: ${{ env.SOURCE_COMMIT }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the reviewed source pin
+        run: >-
+          python3 tasks/scripts/globster_compatibility_release.py verify-source
+          --repository .release-source
+      - name: Refuse partial or conflicting publication state
+        id: probe
+        run: |
+          set -euo pipefail
+          probe_image() {
+            local reference=$1
+            local output
+            if output=$(timeout 60s docker buildx imagetools inspect "$reference" 2>&1); then
+              printf true
+            elif grep -Eqi '(: not found|404 Not Found|manifest unknown|name unknown)([[:space:]]|$)' <<<"$output"; then
+              printf false
+            else
+              printf '%s\n' "$output" >&2
+              echo "::error::Unable to determine publication state for $reference" >&2
+              printf error
+            fi
+          }
+          probe_chart() {
+            local output
+            if output=$(timeout 60s helm show chart "$CHART_REPOSITORY" --version "$CHART_VERSION" 2>&1); then
+              printf true
+            elif grep -Eqi '(: not found|404 Not Found|manifest unknown|name unknown)([[:space:]]|$)' <<<"$output"; then
+              printf false
+            else
+              printf '%s\n' "$output" >&2
+              echo "::error::Unable to determine publication state for chart $CHART_VERSION" >&2
+              printf error
+            fi
+          }
+          states=(
+            "$(probe_image "$GATEWAY_REPOSITORY:$ARTIFACT_TAG")"
+            "$(probe_image "$GATEWAY_REPOSITORY:$ARTIFACT_TAG-amd64")"
+            "$(probe_image "$GATEWAY_REPOSITORY:$ARTIFACT_TAG-arm64")"
+            "$(probe_image "$SUPERVISOR_REPOSITORY:$ARTIFACT_TAG")"
+            "$(probe_image "$SUPERVISOR_REPOSITORY:$ARTIFACT_TAG-amd64")"
+            "$(probe_image "$SUPERVISOR_REPOSITORY:$ARTIFACT_TAG-arm64")"
+            "$(probe_chart)"
+          )
+          published=0
+          for state in "${states[@]}"; do
+            case "$state" in
+              true) published=$((published + 1)) ;;
+              false) ;;
+              error)
+                echo "state=conflict" >>"$GITHUB_OUTPUT"
+                echo "::error::Compatibility publication state could not be verified"
+                exit 1
+                ;;
+              *)
+                echo "::error::Compatibility publication probe returned an invalid state"
+                exit 1
+                ;;
+            esac
+          done
+          if [[ "$published" -eq 0 ]]; then
+            echo "state=publish" >>"$GITHUB_OUTPUT"
+          elif [[ "$published" -eq "${#states[@]}" ]]; then
+            echo "state=already-published" >>"$GITHUB_OUTPUT"
+          else
+            echo "state=conflict" >>"$GITHUB_OUTPUT"
+            echo "::error::Compatibility publication is partial; immutable tags will not be overwritten"
+            exit 1
+          fi
+
+  gateway-binaries:
+    needs: preflight
+    if: needs.preflight.outputs.state == 'publish'
+    uses: globster-monday/OpenShell/.github/workflows/build-gateway-binaries.yml@9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
+    with:
+      cargo-version: 0.0.116-globster.1
+      image-tag: 0.0.116-globster-9b5c49ee
+      checkout-ref: 9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
+    secrets: inherit
+
+  supervisor-binaries:
+    needs: preflight
+    if: needs.preflight.outputs.state == 'publish'
+    uses: globster-monday/OpenShell/.github/workflows/build-sandbox-binaries.yml@9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
+    with:
+      cargo-version: 0.0.116-globster.1
+      image-tag: 0.0.116-globster-9b5c49ee
+      checkout-ref: 9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
+    secrets: inherit
+
   gateway:
-    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@a4e5b4acd155c920a3d1dc60c17b19afdada856d
+    needs: [preflight, gateway-binaries]
+    if: >-
+      always() && needs.preflight.outputs.state == 'publish' &&
+      needs.gateway-binaries.result == 'success'
+    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
     with:
       component: gateway
-      cargo-version: 0.0.92-globster.1
-      image-tag: 0.0.92-resident-1e64e463
-      checkout-ref: 1e64e4638ca1ef772ffd3d9dcd2709fb510eed83
-      platform: linux/amd64,linux/arm64
-      timeout-minutes: 60
+      binary: openshell-gateway
+      target-suffix: unknown-linux-gnu
+      image-tag: 0.0.116-globster-9b5c49ee
+      image-repository: ghcr.io/globster-monday/openshell
+      checkout-ref: 9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
     secrets: inherit
 
   supervisor:
-    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@a4e5b4acd155c920a3d1dc60c17b19afdada856d
+    needs: [preflight, supervisor-binaries]
+    if: >-
+      always() && needs.preflight.outputs.state == 'publish' &&
+      needs.supervisor-binaries.result == 'success'
+    uses: globster-monday/OpenShell/.github/workflows/docker-build.yml@9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
     with:
       component: supervisor
-      cargo-version: 0.0.92-globster.1
-      image-tag: 0.0.92-resident-1e64e463
-      checkout-ref: 1e64e4638ca1ef772ffd3d9dcd2709fb510eed83
-      platform: linux/amd64,linux/arm64
-      timeout-minutes: 60
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+      image-tag: 0.0.116-globster-9b5c49ee
+      image-repository: ghcr.io/globster-monday/openshell
+      checkout-ref: 9b5c49eeca05868c7cd1d2353336a8be1e3bdd8c
     secrets: inherit
+
+  chart:
+    needs: [preflight, gateway, supervisor]
+    if: >-
+      always() && needs.preflight.outputs.state == 'publish' &&
+      needs.gateway.result == 'success' && needs.supervisor.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .release-source
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the published image digests
+        id: images
+        run: |
+          set -euo pipefail
+          gateway_metadata=$(docker buildx imagetools inspect "$GATEWAY_REPOSITORY:$ARTIFACT_TAG" --format '{{json .}}')
+          supervisor_metadata=$(docker buildx imagetools inspect "$SUPERVISOR_REPOSITORY:$ARTIFACT_TAG" --format '{{json .}}')
+          exact_platforms='[.manifest.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          jq -e "$exact_platforms" <<<"$gateway_metadata" >/dev/null
+          jq -e "$exact_platforms" <<<"$supervisor_metadata" >/dev/null
+          gateway=$(jq -er .manifest.digest <<<"$gateway_metadata")
+          supervisor=$(jq -er .manifest.digest <<<"$supervisor_metadata")
+          echo "gateway=$gateway" >>"$GITHUB_OUTPUT"
+          echo "supervisor=$supervisor" >>"$GITHUB_OUTPUT"
+      - name: Refuse a chart-version overwrite
+        run: |
+          set -euo pipefail
+          if output=$(timeout 60s helm show chart "$CHART_REPOSITORY" --version "$CHART_VERSION" 2>&1); then
+            echo "::error::Compatibility chart version already exists and will not be overwritten"
+            exit 1
+          elif grep -Eqi '(: not found|404 Not Found|manifest unknown|name unknown)([[:space:]]|$)' <<<"$output"; then
+            echo "Compatibility chart version is available for first publication"
+          else
+            printf '%s\n' "$output" >&2
+            echo "::error::Unable to determine compatibility chart publication state" >&2
+            exit 1
+          fi
+      - name: Render and publish the digest-pinned chart
+        env:
+          GATEWAY_DIGEST: ${{ steps.images.outputs.gateway }}
+          SUPERVISOR_DIGEST: ${{ steps.images.outputs.supervisor }}
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/globster_compatibility_release.py render-chart \
+            --source .release-source \
+            --destination "$RUNNER_TEMP/helm-chart" \
+            --gateway-digest "$GATEWAY_DIGEST" \
+            --supervisor-digest "$SUPERVISOR_DIGEST"
+          helm lint "$RUNNER_TEMP/helm-chart"
+          helm package "$RUNNER_TEMP/helm-chart" --destination "$RUNNER_TEMP"
+          helm push "$RUNNER_TEMP/helm-chart-$CHART_VERSION.tgz" \
+            oci://ghcr.io/globster-monday/openshell
+
+  verify:
+    needs: [preflight, chart]
+    if: >-
+      always() && needs.preflight.result == 'success' &&
+      (needs.preflight.outputs.state == 'already-published' || needs.chart.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .release-source
+          ref: ${{ env.SOURCE_COMMIT }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and verify the remote compatibility set from a clean client
+        id: verify
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/globster_compatibility_release.py verify-source \
+            --repository .release-source
+          output=$(helm pull "$CHART_REPOSITORY" --version "$CHART_VERSION" --destination "$RUNNER_TEMP" 2>&1)
+          printf '%s\n' "$output"
+          chart_digest=$(sed -n 's/^Digest: \(sha256:[a-f0-9]\{64\}\)$/\1/p' <<<"$output")
+          [[ -n "$chart_digest" ]] || {
+            echo "::error::Remote chart digest was not reported"
+            exit 1
+          }
+          embedded=$(python3 tasks/scripts/globster_compatibility_release.py verify-chart \
+            --archive "$RUNNER_TEMP/helm-chart-$CHART_VERSION.tgz")
+          gateway_digest=$(jq -er .artifacts.gateway.digest <<<"$embedded")
+          supervisor_digest=$(jq -er .artifacts.supervisor.digest <<<"$embedded")
+          gateway_metadata=$(docker buildx imagetools inspect "$GATEWAY_REPOSITORY@$gateway_digest" --format '{{json .}}')
+          supervisor_metadata=$(docker buildx imagetools inspect "$SUPERVISOR_REPOSITORY@$supervisor_digest" --format '{{json .}}')
+          exact_platforms='[.manifest.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          jq -e "$exact_platforms" <<<"$gateway_metadata" >/dev/null
+          jq -e "$exact_platforms" <<<"$supervisor_metadata" >/dev/null
+          python3 tasks/scripts/globster_compatibility_release.py write-receipt \
+            --gateway-digest "$gateway_digest" \
+            --supervisor-digest "$supervisor_digest" \
+            --chart-digest "$chart_digest" \
+            --output "$RUNNER_TEMP/compatibility-publication-receipt.json"
+          {
+            echo "gateway_digest=$gateway_digest"
+            echo "supervisor_digest=$supervisor_digest"
+            echo "chart_archive=$RUNNER_TEMP/helm-chart-$CHART_VERSION.tgz"
+            echo "receipt=$RUNNER_TEMP/compatibility-publication-receipt.json"
+          } >>"$GITHUB_OUTPUT"
+      - name: Attest the gateway manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ env.GATEWAY_REPOSITORY }}
+          subject-digest: ${{ steps.verify.outputs.gateway_digest }}
+          push-to-registry: true
+      - name: Attest the supervisor manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ env.SUPERVISOR_REPOSITORY }}
+          subject-digest: ${{ steps.verify.outputs.supervisor_digest }}
+          push-to-registry: true
+      - name: Attest the chart bytes and compatibility receipt
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ steps.verify.outputs.chart_archive }}
+            ${{ steps.verify.outputs.receipt }}
+      - name: Verify the published provenance from the clean client
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATEWAY_DIGEST: ${{ steps.verify.outputs.gateway_digest }}
+          SUPERVISOR_DIGEST: ${{ steps.verify.outputs.supervisor_digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify \
+            "oci://$GATEWAY_REPOSITORY@$GATEWAY_DIGEST" \
+            --repo "$GITHUB_REPOSITORY"
+          gh attestation verify \
+            "oci://$SUPERVISOR_REPOSITORY@$SUPERVISOR_DIGEST" \
+            --repo "$GITHUB_REPOSITORY"
+          gh attestation verify \
+            "${{ steps.verify.outputs.chart_archive }}" \
+            --repo "$GITHUB_REPOSITORY"
+          gh attestation verify \
+            "${{ steps.verify.outputs.receipt }}" \
+            --repo "$GITHUB_REPOSITORY"
+      - name: Retain the immutable publication receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-0.0.116-compatibility-publication-receipt
+          path: ${{ steps.verify.outputs.receipt }}
+          if-no-files-found: error
+          retention-days: 90
