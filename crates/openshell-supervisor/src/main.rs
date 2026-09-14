@@ -102,6 +102,53 @@ struct Args {
 
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
+
+    /// Read end of a driver-owned pipe. EOF means the owning driver exited.
+    #[arg(long, hide = true)]
+    parent_liveness_fd: Option<i32>,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
+    use std::io::Read as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    let Some(raw_fd) = raw_fd else {
+        return Ok(());
+    };
+    if raw_fd <= 2 {
+        return Err(miette::miette!("parent liveness descriptor is invalid"));
+    }
+    nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFD)
+        .map_err(|error| miette::miette!("parent liveness descriptor is not open: {error}"))?;
+    // SAFETY: the driver transfers this inherited descriptor to the
+    // supervisor exactly once through the private command line.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    std::thread::Builder::new()
+        .name("supervisor-parent-liveness".to_string())
+        .spawn(move || {
+            let mut stream = std::fs::File::from(fd);
+            let mut byte = [0_u8; 1];
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => std::process::exit(1),
+                    Ok(_) => {}
+                }
+            }
+        })
+        .map(|_| ())
+        .into_diagnostic()
+}
+
+#[cfg(not(unix))]
+fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
+    if raw_fd.is_some() {
+        return Err(miette::miette!(
+            "parent liveness descriptors are unsupported on this platform"
+        ));
+    }
+    Ok(())
 }
 
 fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
@@ -162,6 +209,7 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    arm_parent_liveness(args.parent_liveness_fd)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let backend_descriptor = backend_descriptor(&args)?;
     let auth_bundle = auth_bundle(&args)?;

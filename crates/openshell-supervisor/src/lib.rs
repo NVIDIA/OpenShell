@@ -581,6 +581,15 @@ pub async fn run_sandbox(
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
+    let (remote_ready, backend_name, ca_file_paths) = {
+        let (bound, backend_name, ca_file_paths) = remote_boundary;
+        let ready = bound
+            .confirm()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
+        (ready, backend_name, ca_file_paths)
+    };
 
     let mut networking = Some(
         openshell_supervisor_network::run::run_networking(
@@ -611,23 +620,15 @@ pub async fn run_sandbox(
         .await?,
     );
 
-    let remote_ready = {
-        let (bound, backend_name, ca_file_paths) = remote_boundary;
-        ca_file_paths
-            .lock()
-            .map_err(|_| miette::miette!("boundary CA path lock is poisoned"))?
-            .clone_from(
-                &networking
-                    .as_ref()
-                    .and_then(|runtime| runtime.ca_file_paths.clone()),
-            );
-        let ready = bound
-            .confirm()
-            .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
-        (ready, backend_name)
-    };
+    ca_file_paths
+        .lock()
+        .map_err(|_| miette::miette!("boundary CA path lock is poisoned"))?
+        .clone_from(
+            &networking
+                .as_ref()
+                .and_then(|runtime| runtime.ca_file_paths.clone()),
+        );
+    let remote_ready = (remote_ready, backend_name);
 
     // Spawn the denial-aggregator flush task. The aggregator drains proxy
     // denial events, batches them, and ships summaries to the gateway via

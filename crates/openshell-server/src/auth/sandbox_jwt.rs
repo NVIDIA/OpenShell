@@ -29,6 +29,7 @@ pub use openshell_extension_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     io::Cursor,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tonic::Status;
@@ -37,9 +38,9 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    AuthenticatedSandboxSession, CredentialEpoch, SandboxId, SandboxLaunchAuthentication,
-    SandboxSessionIdentity, SessionJwtIssuer, SessionJwtVerifier, SessionTokenProfile,
-    SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
+    SandboxLaunchAuthentication, SandboxSessionIdentity, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
 };
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
@@ -145,7 +146,7 @@ impl SandboxSessionJwtAuthority {
         gateway_id: &str,
         ttl: Duration,
     ) -> Result<Self, String> {
-        let clock = std::sync::Arc::new(SystemJwtClock);
+        let clock = Arc::new(SystemJwtClock);
         let issuer = SessionJwtIssuer::from_ed25519_pem(
             signing_key_pem,
             key_id.clone(),
@@ -210,6 +211,67 @@ impl SandboxSessionJwtAuthority {
         self.gateway_verifier
             .verify(token)
             .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
+    }
+}
+
+/// Authenticates launch-scoped supervisor tokens and checks that their
+/// generation is still active in the gateway registry.
+pub struct SandboxSessionJwtAuthenticator {
+    authority: Arc<SandboxSessionJwtAuthority>,
+    sessions: Arc<crate::auth::sandbox_session::SandboxSessionRegistry>,
+}
+
+impl SandboxSessionJwtAuthenticator {
+    pub fn new(
+        authority: Arc<SandboxSessionJwtAuthority>,
+        sessions: Arc<crate::auth::sandbox_session::SandboxSessionRegistry>,
+    ) -> Self {
+        Self {
+            authority,
+            sessions,
+        }
+    }
+}
+
+impl std::fmt::Debug for SandboxSessionJwtAuthenticator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxSessionJwtAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Authenticator for SandboxSessionJwtAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        path: &str,
+    ) -> Result<Option<Principal>, Status> {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return Ok(None);
+        };
+        let Ok(header) = decode_header(token) else {
+            return Ok(None);
+        };
+        if header.typ.as_deref() != Some(GATEWAY_SESSION_JWT_TYPE) {
+            return Ok(None);
+        }
+        let authenticated = self.authority.verify_gateway_token(token)?;
+        let allow_last_refresh = path == "/openshell.v1.OpenShell/RefreshSandboxToken";
+        self.sessions
+            .authorize(&authenticated, allow_last_refresh)?;
+        Ok(Some(Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: authenticated.sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "launch-session".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })))
     }
 }
 
