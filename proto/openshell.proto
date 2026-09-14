@@ -1118,6 +1118,8 @@ message SandboxStatus {
   repeated EndpointStatus endpoint_statuses = 10;
   // Independent of infrastructure phase; retained across driver observations.
   SandboxConfigurationAdmission configuration_admission = 11;
+  // Durable first-acceptance marker. Absent on legacy records; never reset by restart.
+  optional bool configuration_activated = 12;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.

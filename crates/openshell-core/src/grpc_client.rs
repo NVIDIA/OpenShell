@@ -43,6 +43,15 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::{debug, info, warn};
 
+/// Preserve the gRPC status as a source so callers can classify retryable errors.
+/// `IntoDiagnostic` alone hides the wrapped error's concrete type.
+pub fn grpc_status_error(status: Status) -> miette::Report {
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("{0}")]
+    struct GrpcStatusError(#[source] Status);
+    GrpcStatusError(status).into()
+}
+
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
@@ -920,7 +929,7 @@ async fn fetch_settings_snapshot_with_client(
             sandbox_id: sandbox_id.to_string(),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
 }
@@ -957,7 +966,7 @@ async fn sync_policy_with_client(
             ..Default::default()
         })
         .await
-        .into_diagnostic()
+        .map_err(grpc_status_error)
         .wrap_err("failed to sync policy to server")?;
 
     Ok(())
@@ -1052,7 +1061,7 @@ pub async fn report_sandbox_configuration(
             }),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
     Ok(())
 }
 
@@ -1075,7 +1084,7 @@ pub async fn fetch_provider_environment(
             supports_static_credential_bindings: true,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     provider_environment_result(response.into_inner())
 }

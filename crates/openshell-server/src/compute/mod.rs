@@ -4538,6 +4538,7 @@ fn public_status_from_driver(
         exit_code: None,
         endpoint_statuses: Vec::new(),
         configuration_admission: None,
+        configuration_activated: None,
     }
 }
 
@@ -4667,6 +4668,7 @@ fn apply_driver_snapshot(
         status
             .configuration_admission
             .clone_from(&current_status.configuration_admission);
+        status.configuration_activated = current_status.configuration_activated;
     }
     if old_phase != phase {
         info!(
@@ -7614,7 +7616,8 @@ mod tests {
     async fn stop_and_start_follow_durable_state_machine() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record("sb-lifecycle", "sandbox-lifecycle", SandboxPhase::Ready);
+        let mut sandbox = sandbox_record("sb-lifecycle", "sandbox-lifecycle", SandboxPhase::Ready);
+        sandbox.status.as_mut().unwrap().configuration_activated = Some(true);
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = ssh_session_record("lifecycle-session", sandbox.object_id());
         runtime.store.put_message(&session).await.unwrap();
@@ -7684,6 +7687,13 @@ mod tests {
             SandboxPhase::Starting as i32,
             "driver/session readiness cannot bypass restart configuration admission"
         );
+        assert_eq!(
+            blocked.status.as_ref().unwrap().configuration_activated,
+            Some(true)
+        );
+        assert!(!crate::policy_store::permits_initial_static_policy_repair(
+            &blocked
+        ));
         // Simulate the supervisor's successful exact-generation admission report.
         runtime
             .store

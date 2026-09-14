@@ -436,6 +436,14 @@ and number; this coordinated pre-1.0 API change does not alter durable schemas.
 The outcome alone does not provide request deduplication. Opted-in unary methods
 require a request UUID for the admission contract.
 
+Configuration admission adds `SandboxStatus.configuration_admission` at field
+11 and optional `configuration_activated` at field 12, extending the public and
+durable closures. New sandboxes explicitly store `false` until first acceptance;
+acceptance stores `true` permanently, including across restart. Legacy rows
+have neither field and conservatively retain static-policy restrictions. No
+database rewrite is required. A pre-admission byte fixture verifies that legacy
+phase and policy-version fields survive without fabricated admission or activation.
+
 | Dual-purpose encoded root | Current decision |
 |---|---|
 | `Sandbox` | Defer a storage twin; govern its complete dependency closure as durable. |

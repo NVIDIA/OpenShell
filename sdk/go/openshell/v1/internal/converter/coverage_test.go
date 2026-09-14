@@ -126,12 +126,10 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"exit_code":              true,
 		"configuration_admission": true,
 	}
-	// These fields coordinate internal gateway/supervisor lifecycle fencing
-	// and idempotent status reconciliation. They remain available only through
-	// the raw protobuf API.
-	skipped := fieldSet{
-		"main_process_instance_id": true,
-	}
+	// The instance ID coordinates internal gateway/supervisor lifecycle
+	// fencing. The first-activation marker governs static policy repair.
+	// Both are exposed only through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }

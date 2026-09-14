@@ -627,6 +627,9 @@ condition, even when the container backend reports readiness. Gateway management
 operations remain available. Replacing the policy or repairing providers allows
 the same supervisor to reconcile and launch; it does not recreate the sandbox.
 Static policy fields can be replaced before the first accepted activation.
+A durable first-activation marker closes this repair window permanently, including
+across stop/start and later rejected configurations. Legacy records without the
+marker retain static-field immutability.
 Admission validates policy composition; image and host setup failures, such as
 an unresolved OCI user or unavailable isolation facilities, retain their existing
 startup error behavior.
@@ -636,7 +639,10 @@ provider-environment revision, and reporting supervisor instance. Startup captur
 the matching provider environment and constructs the runtime before reporting
 acceptance. Live reconciliation begins only after the main process has spawned,
 so it cannot replace the configuration captured for that launch. Restart resets
-admission and requires a fresh accepted configuration.
+admission and requires a fresh accepted configuration. Permanent gateway errors
+and exhausted transient retries terminate startup; only acknowledged configuration
+rejections wait indefinitely for repair. Process-sidecar discovery uses the
+existing sidecar readiness timeout.
 
 Policy and provider refreshes are prepared before publication. Publication
 invalidates prior policy guards before exposing new provider material and swaps
