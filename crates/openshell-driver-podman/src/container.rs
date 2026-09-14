@@ -8,6 +8,9 @@ use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
+use openshell_core::network_trust::NETWORK_SUPERVISOR_TRUST_GENERATION_KEY;
+#[cfg(test)]
+use openshell_core::network_trust::NETWORK_SUPERVISOR_TRUST_GENERATION_NONE;
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
@@ -41,6 +44,11 @@ pub use openshell_core::driver_utils::{
 
 /// Label applied to all managed containers.
 pub const LABEL_MANAGED: &str = "openshell.managed";
+/// Protected non-secret marker indicating a driver-owned sandbox JWT secret.
+///
+/// This lets stopped-sandbox replacement retain tokenless compatibility while
+/// never putting the token itself into container metadata.
+pub const LABEL_SANDBOX_TOKEN_SECRET: &str = "openshell.ai/sandbox-token-secret";
 /// Label filter string for list/event queries.
 pub const LABEL_MANAGED_FILTER: &str = "openshell.managed=true";
 
@@ -484,12 +492,18 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
 }
 
 /// Build the destination-trust argument independently of corporate proxy
-/// configuration. The gateway-owned host path is never exposed in argv.
-fn network_trust_cli_args(network_trust_artifact: Option<&Path>) -> Vec<String> {
+/// configuration. The gateway-owned host path is never exposed in argv; its
+/// retained snapshot digest binds the mounted bytes at supervisor startup.
+fn network_trust_cli_args(
+    network_trust_artifact: Option<&Path>,
+    network_trust_generation: &str,
+) -> Vec<String> {
     network_trust_artifact.map_or_else(Vec::new, |_| {
         vec![
             "--network-additional-ca-bundle".to_string(),
             NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+            "--network-additional-ca-digest".to_string(),
+            network_trust_generation.to_string(),
         ]
     })
 }
@@ -527,6 +541,7 @@ fn build_env(
     config: &PodmanComputeConfig,
     image: &str,
     oci_user: &str,
+    include_sandbox_token_file: bool,
 ) -> BTreeMap<String, String> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
@@ -647,9 +662,7 @@ fn build_env(
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.
-    if let Some(s) = spec
-        && !s.sandbox_token.is_empty()
-    {
+    if include_sandbox_token_file {
         env.insert(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
             SANDBOX_TOKEN_MOUNT_PATH.into(),
@@ -663,7 +676,11 @@ fn build_env(
 ///
 /// User-supplied labels are inserted first so that the managed labels
 /// always win -- preventing template overrides of internal tracking labels.
-fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
+fn build_labels(
+    sandbox: &DriverSandbox,
+    network_trust_generation: &str,
+    sandbox_token_secret_provisioned: bool,
+) -> BTreeMap<String, String> {
     let template = sandbox.spec.as_ref().and_then(|s| s.template.as_ref());
 
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
@@ -678,6 +695,16 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
     labels.insert(LABEL_SANDBOX_WORKSPACE.into(), sandbox.workspace.clone());
     labels.insert(LABEL_MANAGED.into(), "true".into());
+    // Gateway-owned startup metadata must win over a template label. It lets
+    // a stopped sandbox detect both changed trust and an explicit removal.
+    labels.insert(
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.into(),
+        network_trust_generation.into(),
+    );
+    labels.insert(
+        LABEL_SANDBOX_TOKEN_SECRET.into(),
+        sandbox_token_secret_provisioned.to_string(),
+    );
 
     labels
 }
@@ -1073,6 +1100,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_container_spec_for_image(
     sandbox: &DriverSandbox,
@@ -1086,11 +1114,52 @@ pub fn build_container_spec_for_image(
     tls_secret_names: Option<&[String; 3]>,
     network_trust_artifact: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
+    build_container_spec_for_image_with_network_trust_generation(
+        sandbox,
+        config,
+        token_secret_name,
+        gpu_device_ids,
+        requested_image,
+        image_id,
+        oci_user,
+        supervisor_bin_path,
+        tls_secret_names,
+        network_trust_artifact,
+        NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+    )
+}
+
+/// Build a container spec with gateway-owned destination-trust generation
+/// metadata. Local drivers use this when they hold the startup trust snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn build_container_spec_for_image_with_network_trust_generation(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_secret_name: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
+    requested_image: &str,
+    image_id: &str,
+    oci_user: &str,
+    supervisor_bin_path: Option<&Path>,
+    tls_secret_names: Option<&[String; 3]>,
+    network_trust_artifact: Option<&Path>,
+    network_trust_generation: &str,
+) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, requested_image, oci_user);
-    let labels = build_labels(sandbox);
+    let env = build_env(
+        sandbox,
+        config,
+        requested_image,
+        oci_user,
+        token_secret_name.is_some(),
+    );
+    let labels = build_labels(
+        sandbox,
+        network_trust_generation,
+        token_secret_name.is_some(),
+    );
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
@@ -1141,7 +1210,10 @@ pub fn build_container_spec_for_image(
         driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
     ];
     command.extend(upstream_proxy_cli_args(config));
-    command.extend(network_trust_cli_args(network_trust_artifact));
+    command.extend(network_trust_cli_args(
+        network_trust_artifact,
+        network_trust_generation,
+    ));
 
     let container_spec = ContainerSpec {
         name,
@@ -2353,7 +2425,7 @@ mod tests {
         artifact: &Path,
     ) -> Result<Value, ComputeDriverError> {
         let image = resolve_image(sandbox, config);
-        build_container_spec_for_image(
+        build_container_spec_for_image_with_network_trust_generation(
             sandbox,
             config,
             None,
@@ -2364,6 +2436,7 @@ mod tests {
             None,
             None,
             Some(artifact),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
     }
 
@@ -2405,6 +2478,14 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(arguments.len(), 1);
             assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+            let digest = command
+                .windows(2)
+                .find(|args| args[0] == "--network-additional-ca-digest")
+                .expect("network trust digest argument");
+            assert_eq!(
+                digest[1],
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            );
             assert!(
                 !command
                     .iter()
@@ -2441,6 +2522,12 @@ mod tests {
             args == [
                 "--network-additional-ca-bundle",
                 NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+            ]
+        }));
+        assert!(command.windows(2).any(|args| {
+            args == [
+                "--network-additional-ca-digest",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             ]
         }));
         assert!(command.windows(2).any(|args| {
@@ -2511,6 +2598,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(arguments.len(), 1);
         assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+        assert!(command.windows(2).any(|args| {
+            args == [
+                "--network-additional-ca-digest",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ]
+        }));
         assert!(!command.iter().any(|arg| arg == "/tmp/user-ca.crt"));
 
         let _ = std::fs::remove_file(artifact);
@@ -2587,6 +2680,14 @@ mod tests {
             "openshell.ai/sandbox-namespace".to_string(),
             "spoofed-namespace".to_string(),
         );
+        label_overrides.insert(
+            NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
+            "spoofed-generation".to_string(),
+        );
+        label_overrides.insert(
+            LABEL_SANDBOX_TOKEN_SECRET.to_string(),
+            "spoofed-token-state".to_string(),
+        );
         sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
                 labels: label_overrides,
@@ -2621,6 +2722,44 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("real-namespace"),
             "openshell.sandbox-namespace must not be overridden by template labels"
+        );
+        assert_eq!(
+            labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .and_then(|v| v.as_str()),
+            Some(NETWORK_SUPERVISOR_TRUST_GENERATION_NONE),
+            "network trust generation must not be overridden by template labels"
+        );
+        assert_eq!(
+            labels
+                .get(LABEL_SANDBOX_TOKEN_SECRET)
+                .and_then(|v| v.as_str()),
+            Some("false"),
+            "sandbox token-secret marker must not be overridden by template labels"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_gateway_trust_generation_label() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec_for_image_with_network_trust_generation(
+            &sandbox,
+            &config,
+            None,
+            None,
+            "example:test",
+            "sha256:immutable",
+            "",
+            None,
+            None,
+            None,
+            "sha256:gateway-trust-generation",
+        )
+        .expect("container spec should be valid");
+        assert_eq!(
+            spec["labels"][NETWORK_SUPERVISOR_TRUST_GENERATION_KEY].as_str(),
+            Some("sha256:gateway-trust-generation")
         );
     }
 
@@ -3285,6 +3424,11 @@ mod tests {
 
         let spec = build_container_spec_with_token(&sandbox, &config, Some(&secret_name));
 
+        assert_eq!(
+            spec["labels"][LABEL_SANDBOX_TOKEN_SECRET].as_str(),
+            Some("true"),
+            "a token secret marker must be recorded without exposing the token"
+        );
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
             env_map
@@ -3314,6 +3458,53 @@ mod tests {
                 .iter()
                 .any(|m| { m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt") })
         );
+    }
+
+    #[test]
+    fn tokenless_container_spec_has_false_marker_and_no_token_mount_or_env() {
+        let sandbox = test_sandbox("tokenless-id", "tokenless-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+
+        assert_eq!(
+            spec["labels"][LABEL_SANDBOX_TOKEN_SECRET].as_str(),
+            Some("false")
+        );
+        assert!(
+            spec["env"].as_object().is_some_and(
+                |env| !env.contains_key(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            )
+        );
+        assert!(spec["secrets"].as_array().is_some_and(|secrets| {
+            !secrets
+                .iter()
+                .any(|secret| secret["target"].as_str() == Some(SANDBOX_TOKEN_MOUNT_PATH))
+        }));
+    }
+
+    #[test]
+    fn replacement_spec_reuses_token_secret_with_redacted_durable_snapshot() {
+        let sandbox = test_sandbox("token-id", "token-name");
+        assert!(
+            sandbox
+                .spec
+                .as_ref()
+                .is_none_or(|spec| spec.sandbox_token.is_empty())
+        );
+        let secret_name = token_secret_name(&sandbox.id);
+
+        let spec = build_container_spec_with_token(&sandbox, &test_config(), Some(&secret_name));
+
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::SANDBOX_TOKEN_FILE].as_str(),
+            Some(SANDBOX_TOKEN_MOUNT_PATH)
+        );
+        assert!(spec["secrets"].as_array().is_some_and(|secrets| {
+            secrets.iter().any(|secret| {
+                secret["source"].as_str() == Some(secret_name.as_str())
+                    && secret["target"].as_str() == Some(SANDBOX_TOKEN_MOUNT_PATH)
+                    && secret["mode"].as_u64() == Some(0o400)
+            })
+        }));
     }
 
     #[test]

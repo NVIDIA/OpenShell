@@ -56,6 +56,10 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
+        /// The optional durable provisioning snapshot supplied by newer
+        /// gateways. Keeping it in the fake makes compatibility and
+        /// reconciliation tests able to verify the start contract.
+        sandbox: Option<DriverSandbox>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -381,6 +385,7 @@ impl ComputeDriver for FakeComputeDriver {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
                 sandbox_name: request.sandbox_name,
+                sandbox: request.sandbox,
             });
         });
         Ok(Response::new(StartSandboxResponse {}))

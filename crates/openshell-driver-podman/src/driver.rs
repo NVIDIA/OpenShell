@@ -5,12 +5,15 @@
 
 use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
-use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
+use crate::container::{
+    self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, PodmanSandboxDriverConfig,
+};
 use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
     driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
+use openshell_core::NetworkSupervisorTrustBundle;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
     GatewayCallbackTopology, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
@@ -21,6 +24,9 @@ use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
+use openshell_core::network_trust::{
+    NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+};
 #[cfg(target_os = "linux")]
 use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
 #[cfg(target_os = "macos")]
@@ -30,16 +36,24 @@ use openshell_core::proto::compute::v1::{
     GpuResourceCapabilities, GpuResourceRequirements, MemoryResourceCapabilities,
     ResourceCapabilities, gateway_listener_requirement::Selector,
 };
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Instrument as _, debug, info, warn};
 use url::Url;
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+/// Makes temporary reconciliation names distinct for calls in the same process
+/// even if the system clock resolution is coarse.
+static RECONCILIATION_TEMP_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
@@ -56,9 +70,9 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
-    /// Gateway-owned normalized destination CA artifact staged into each
+    /// Gateway-owned normalized destination trust snapshot staged into each
     /// sandbox through the fixed supervisor mount contract.
-    network_trust_artifact: Option<PathBuf>,
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     /// The host's IP on the bridge network, when that bridge exists in the
     /// gateway's network namespace (notably rootful Podman).
     network_gateway_ip: Option<String>,
@@ -69,6 +83,10 @@ pub struct PodmanComputeDriver {
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
+    /// Fine-grained reconciliation serialization. Different sandboxes can
+    /// reconcile concurrently; only a single sandbox's rename transaction is
+    /// serialized.
+    replacement_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl std::fmt::Debug for PodmanComputeDriver {
@@ -79,7 +97,7 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("network_name", &self.config.network_name)
             .field(
                 "network_trust_configured",
-                &self.network_trust_artifact.is_some(),
+                &self.network_trust_bundle.is_some(),
             )
             .field("rootless", &self.rootless)
             .field("rootless_network_cmd", &self.rootless_network_cmd)
@@ -102,6 +120,36 @@ fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDr
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+/// Generate a validated, collision-resistant temporary name for a stopped
+/// container during reconciliation. The canonical name may already be 255
+/// bytes long, so reserve space for the suffix before appending it.
+fn reconciliation_temporary_name(canonical_name: &str) -> Result<String, ComputeDriverError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = RECONCILIATION_TEMP_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
+    let suffix = format!("-reconcile-{process_id}-{timestamp}-{counter}");
+    let prefix_len = crate::client::MAX_NAME_LEN
+        .checked_sub(suffix.len())
+        .ok_or_else(|| {
+            ComputeDriverError::Precondition(
+                "could not generate a valid temporary Podman reconciliation name".to_string(),
+            )
+        })?;
+    // `canonical_name` has already passed Podman's ASCII-only name validation,
+    // so byte truncation cannot split a UTF-8 character.
+    let prefix = &canonical_name[..canonical_name.len().min(prefix_len)];
+    let temporary_name = format!("{prefix}{suffix}");
+    crate::client::validate_name(&temporary_name).map_err(|_| {
+        ComputeDriverError::Precondition(
+            "could not generate a valid temporary Podman reconciliation name".to_string(),
+        )
+    })?;
+    Ok(temporary_name)
 }
 
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
@@ -133,6 +181,51 @@ async fn create_sandbox_token_secret(
         .await
         .map_err(ComputeDriverError::from)?;
     Ok(Some(secret_name))
+}
+
+async fn replacement_token_secret_name(
+    client: &PodmanClient,
+    sandbox_id: &str,
+    labels: &HashMap<String, String>,
+) -> Result<Option<String>, ComputeDriverError> {
+    let secret_name = container::token_secret_name(sandbox_id);
+    match labels
+        .get(container::LABEL_SANDBOX_TOKEN_SECRET)
+        .map(String::as_str)
+    {
+        Some("true") => {
+            if client.secret_exists(&secret_name).await.map_err(|_| {
+                ComputeDriverError::Precondition(
+                    "stopped Podman sandbox replacement requires its existing driver-owned authentication state"
+                        .to_string(),
+                )
+            })? {
+                Ok(Some(secret_name))
+            } else {
+                Err(ComputeDriverError::Precondition(
+                    "stopped Podman sandbox replacement requires its existing driver-owned authentication state"
+                        .to_string(),
+                ))
+            }
+        }
+        Some("false") => Ok(None),
+        Some(_) => Err(ComputeDriverError::Precondition(
+            "stopped Podman sandbox has an invalid token-secret marker".to_string(),
+        )),
+        // Resources created before the marker existed may have either token
+        // mode. A deterministic lookup distinguishes those cases; 404 is a
+        // normal tokenless legacy result, while other failures fail closed.
+        None => client
+            .secret_exists(&secret_name)
+            .await
+            .map(|exists| exists.then_some(secret_name))
+            .map_err(|_| {
+                ComputeDriverError::Precondition(
+                    "stopped Podman sandbox replacement could not determine its existing driver-owned authentication state"
+                        .to_string(),
+                )
+            }),
+    }
 }
 
 async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) {
@@ -354,7 +447,7 @@ impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(
         mut config: PodmanComputeConfig,
-        network_trust_artifact: Option<&Path>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -494,7 +587,7 @@ impl PodmanComputeDriver {
         Ok(Self {
             client,
             config,
-            network_trust_artifact: network_trust_artifact.map(Path::to_path_buf),
+            network_trust_bundle,
             network_gateway_ip,
             rootless,
             rootless_network_cmd,
@@ -504,6 +597,7 @@ impl PodmanComputeDriver {
             )),
             gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            replacement_locks: Arc::default(),
         })
     }
 
@@ -866,6 +960,13 @@ impl PodmanComputeDriver {
         // failure. The supervisor independently validates the certificate
         // content at startup.
         validate_sandbox_proxy_ca_bundle(&self.config).await?;
+        if let Some(bundle) = &self.network_trust_bundle {
+            bundle.verify_artifact().map_err(|error| {
+                ComputeDriverError::Precondition(format!(
+                    "network additional CA artifact verification failed: {error}"
+                ))
+            })?;
+        }
 
         // Create workspace volume and per-sandbox token secret.
         let (token_secret_name, proxy_auth_secret_name) = async {
@@ -969,24 +1070,31 @@ impl PodmanComputeDriver {
                     }
                 };
 
-                let spec = match container::build_container_spec_for_image(
-                    sandbox,
-                    &self.config,
-                    token_secret_name.as_deref(),
-                    gpu_devices.as_deref(),
-                    &image,
-                    &immutable_image_id,
-                    &image_user,
-                    supervisor_bin_path.as_deref(),
-                    tls_secret_names.as_ref(),
-                    self.network_trust_artifact.as_deref(),
-                ) {
-                    Ok(spec) => spec,
-                    Err(e) => {
-                        cleanup_all().await;
-                        return Err(e);
-                    }
-                };
+                let spec =
+                    match container::build_container_spec_for_image_with_network_trust_generation(
+                        sandbox,
+                        &self.config,
+                        token_secret_name.as_deref(),
+                        gpu_devices.as_deref(),
+                        &image,
+                        &immutable_image_id,
+                        &image_user,
+                        supervisor_bin_path.as_deref(),
+                        tls_secret_names.as_ref(),
+                        self.network_trust_bundle
+                            .as_ref()
+                            .map(NetworkSupervisorTrustBundle::artifact_path),
+                        self.network_trust_bundle.as_ref().map_or(
+                            NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+                            NetworkSupervisorTrustBundle::digest,
+                        ),
+                    ) {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            cleanup_all().await;
+                            return Err(e);
+                        }
+                    };
                 match self.client.create_container(&spec).await {
                     Ok(_) => Ok(tls_secret_names),
                     Err(PodmanApiError::Conflict(_)) => {
@@ -1108,6 +1216,97 @@ impl PodmanComputeDriver {
         }
     }
 
+    /// Build the replacement spec for a stopped sandbox from the gateway's
+    /// durable snapshot and current driver configuration only. In particular,
+    /// no provisioning input is recovered from the old container inspection.
+    async fn replacement_container_spec(
+        &self,
+        sandbox: &DriverSandbox,
+        old_labels: &HashMap<String, String>,
+    ) -> Result<serde_json::Value, ComputeDriverError> {
+        let validated = self.validated_sandbox_create(sandbox).await?;
+        validate_sandbox_proxy_ca_bundle(&self.config).await?;
+
+        // The durable public snapshot deliberately omits the raw JWT. The
+        // protected marker determines whether the deterministic secret must be
+        // mounted; absent legacy markers are resolved by a 404-safe lookup.
+        let token_secret_name =
+            replacement_token_secret_name(&self.client, &sandbox.id, old_labels).await?;
+
+        // All fallible launch preparation happens before the old container is
+        // removed. This includes image inspection, GPU selection, mount
+        // validation, and container-spec generation.
+        let supervisor_pull_policy = supervisor_image_pull_policy(&self.config.supervisor_image);
+        self.client
+            .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let image = container::resolve_image(sandbox, &self.config);
+        if image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "no sandbox image configured: set default_image in [openshell.drivers.podman] or provide an image in the sandbox template".to_string(),
+            ));
+        }
+        let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
+        self.client
+            .pull_image(image, pull_policy)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let inspected_image = self
+            .client
+            .inspect_image(image)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if inspected_image.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "podman image '{image}' inspection did not return an immutable image ID"
+            )));
+        }
+        for mount_image in
+            container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
+                .map_err(ComputeDriverError::Precondition)?
+        {
+            self.client
+                .pull_image(&mount_image, pull_policy)
+                .await
+                .map_err(ComputeDriverError::from)?;
+        }
+        let gpu_devices = self.resolve_gpu_cdi_devices(
+            validated.gpu_requirements,
+            &validated.driver_config,
+            CdiGpuDefaultSelector::next_device_ids,
+        )?;
+        let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref()) {
+            Some(extract_supervisor_bin(&self.client, &self.config).await?)
+        } else {
+            None
+        };
+        let tls_secret_names = (userns_remaps_uids(self.config.userns.as_deref())
+            && self.config.tls_enabled())
+        .then(|| container::tls_secret_names(&sandbox.id));
+        container::build_container_spec_for_image_with_network_trust_generation(
+            sandbox,
+            &self.config,
+            token_secret_name.as_deref(),
+            gpu_devices.as_deref(),
+            image,
+            &inspected_image.id,
+            inspected_image
+                .config
+                .as_ref()
+                .map_or("", |config| config.user.as_str()),
+            supervisor_bin_path.as_deref(),
+            tls_secret_names.as_ref(),
+            self.network_trust_bundle
+                .as_ref()
+                .map(NetworkSupervisorTrustBundle::artifact_path),
+            self.network_trust_bundle.as_ref().map_or(
+                NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+                NetworkSupervisorTrustBundle::digest,
+            ),
+        )
+    }
+
     /// Stop a sandbox container without deleting it.
     #[tracing::instrument(
         name = "podman.stop_sandbox",
@@ -1210,6 +1409,279 @@ impl PodmanComputeDriver {
             .start_container(&container_id)
             .await
             .map_err(ComputeDriverError::from);
+        span_status.finish(result)
+    }
+
+    /// Resume a sandbox using a gateway-provided durable provisioning snapshot.
+    ///
+    /// A trust-generation mismatch is reconciled only while the matching
+    /// gateway-owned container is stopped. The replacement is generated from
+    /// `sandbox` and current driver configuration; container inspection is
+    /// used solely to prove identity, state, and the protected generation.
+    #[tracing::instrument(
+        name = "podman.start_sandbox_with_snapshot",
+        skip(self, sandbox),
+        fields(
+            otel.name = "podman.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
+    pub async fn start_sandbox_with_snapshot(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox: Option<&DriverSandbox>,
+    ) -> Result<(), ComputeDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = async {
+            let Some(sandbox) = sandbox else {
+                return self.start_sandbox(sandbox_id).await;
+            };
+            if sandbox.id != sandbox_id || sandbox.name != sandbox_name {
+                return Err(ComputeDriverError::InvalidArgument(
+                    "start sandbox snapshot identity does not match request".to_string(),
+                ));
+            }
+            // Validate the intended replacement name before any resource is
+            // removed. The old container's name is deliberately not used as
+            // provisioning input.
+            let replacement_name = validated_container_name(sandbox)?;
+            let container = self
+                .find_container(sandbox_id)
+                .await?
+                .ok_or(ComputeDriverError::NotFound)?;
+            let inspected = self
+                .client
+                .inspect_container(&container.id)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            let labels = &inspected.config.labels;
+            let owned = labels.get(container::LABEL_MANAGED).map(String::as_str) == Some("true")
+                && labels.get(LABEL_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+                && labels.get(LABEL_SANDBOX_NAME).map(String::as_str)
+                    == Some(sandbox.name.as_str());
+            if !owned {
+                return Err(ComputeDriverError::Precondition(
+                    "resolved Podman sandbox is not owned by this gateway snapshot".to_string(),
+                ));
+            }
+
+            // Never mutate a live sandbox. This is checked from inspection,
+            // rather than the potentially stale list response used for lookup.
+            if inspected.state.status == "running" || inspected.state.running {
+                return Ok(());
+            }
+            if !matches!(inspected.state.status.as_str(), "exited" | "stopped") {
+                return Err(ComputeDriverError::Precondition(format!(
+                    "resolved Podman sandbox is not stopped (state: {})",
+                    inspected.state.status
+                )));
+            }
+
+            // A configured artifact is mounted into both a normal start and
+            // a replacement. Revalidate it after stopped ownership is proven,
+            // before generation equality can permit an ordinary start.
+            if let Some(bundle) = &self.network_trust_bundle {
+                bundle.verify_artifact().map_err(|error| {
+                    ComputeDriverError::Precondition(format!(
+                        "network additional CA artifact verification failed: {error}"
+                    ))
+                })?;
+            }
+
+            let desired_generation = self.network_trust_bundle.as_ref().map_or(
+                NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+                NetworkSupervisorTrustBundle::digest,
+            );
+            let actual_generation = labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .map(String::as_str);
+            if actual_generation == Some(desired_generation) {
+                self.lifecycle_event_fences
+                    .record_previous_exit(sandbox_id, inspected.state.finished_at.as_deref());
+                return self
+                    .client
+                    .start_container(&container.id)
+                    .await
+                    .map_err(ComputeDriverError::from);
+            }
+
+            let replacement = self.replacement_container_spec(sandbox, labels).await?;
+
+            // Concurrent replacement of different sandboxes remains fully
+            // parallel. Before this sandbox transaction mutates a name,
+            // re-inspect the exact resolved ID while holding its own lock.
+            let replacement_lock = {
+                let mut locks = self
+                    .replacement_locks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                locks
+                    .entry(sandbox_id.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone()
+            };
+            let _replacement_guard = replacement_lock.lock().await;
+            let current = self
+                .client
+                .inspect_container(&container.id)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            let current_labels = &current.config.labels;
+            let current_owned = current.id == container.id
+                && current_labels.get(container::LABEL_MANAGED).map(String::as_str) == Some("true")
+                && current_labels.get(LABEL_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+                && current_labels.get(LABEL_SANDBOX_NAME).map(String::as_str)
+                    == Some(sandbox.name.as_str());
+            if !current_owned {
+                return Err(ComputeDriverError::Precondition(
+                    "resolved Podman sandbox changed before network additional CA reconciliation"
+                        .to_string(),
+                ));
+            }
+            if current.state.status == "running" || current.state.running {
+                return Ok(());
+            }
+            if !matches!(current.state.status.as_str(), "exited" | "stopped") {
+                return Err(ComputeDriverError::Precondition(format!(
+                    "resolved Podman sandbox is not stopped (state: {})",
+                    current.state.status
+                )));
+            }
+            if current_labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .map(String::as_str)
+                == Some(desired_generation)
+            {
+                self.lifecycle_event_fences
+                    .record_previous_exit(sandbox_id, current.state.finished_at.as_deref());
+                return self
+                    .client
+                    .start_container(&current.id)
+                    .await
+                    .map_err(ComputeDriverError::from);
+            }
+
+            // Preserve delayed exit-event fencing when the old container is
+            // replaced rather than started in place.
+            self.lifecycle_event_fences
+                .record_previous_exit(sandbox_id, current.state.finished_at.as_deref());
+
+            // Renaming rather than deleting gives the replacement create a
+            // rollback point while freeing the canonical name. Retry a
+            // collision with a fresh unique, validated name: a stale failed
+            // reconciliation must not prevent this stopped sandbox from being
+            // recovered.
+            let mut temporary_name = None;
+            for _ in 0..3 {
+                let candidate = reconciliation_temporary_name(&replacement_name)?;
+                match self.client.rename_container(&current.id, &candidate).await {
+                    Ok(()) => {
+                        temporary_name = Some(candidate);
+                        break;
+                    }
+                    Err(PodmanApiError::Conflict(_)) => {}
+                    Err(_) => {
+                        return Err(ComputeDriverError::Message(
+                            "failed to prepare stopped sandbox container for network additional CA reconciliation; refusing to continue".to_string(),
+                        ));
+                    }
+                }
+            }
+            let temporary_name = temporary_name.ok_or_else(|| {
+                ComputeDriverError::Message(
+                    "could not reserve a temporary Podman container name for network additional CA reconciliation; refusing to continue".to_string(),
+                )
+            })?;
+
+            let replacement_id = if let Ok(response) = self.client.create_container(&replacement).await {
+                response
+                    .get("Id")
+                    .or_else(|| response.get("ID"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        ComputeDriverError::Message(
+                            "network additional CA reconciliation replacement did not return a stable container ID; refusing to continue"
+                                .to_string(),
+                        )
+                    })?
+            } else {
+                let rollback_failed = self
+                    .client
+                    .rename_container(&temporary_name, &replacement_name)
+                    .await
+                    .is_err();
+                let rollback_status = if rollback_failed {
+                    "; rollback to the original stopped sandbox also failed"
+                } else {
+                    "; restored the original stopped sandbox"
+                };
+                return Err(ComputeDriverError::Message(format!(
+                    "network additional CA reconciliation could not create its replacement; workspace volume and sandbox secrets were preserved{rollback_status}; refusing to continue"
+                )));
+            };
+
+            // The old container is no longer needed only after the canonical
+            // replacement exists. Do not let Podman delete the named workspace
+            // volume in either the normal or compensation path.
+            self.lifecycle_event_fences
+                .record_intentional_removal(&current.id);
+            if self
+                .client
+                .remove_container_preserving_volumes(&temporary_name)
+                .await
+                .is_err()
+            {
+                self.lifecycle_event_fences
+                    .record_intentional_removal(&replacement_id);
+                let replacement_cleanup_failed = self
+                    .client
+                    .remove_container_preserving_volumes(&replacement_name)
+                    .await
+                    .is_err();
+                let rollback_failed = self
+                    .client
+                    .rename_container(&temporary_name, &replacement_name)
+                    .await
+                    .is_err();
+                if !rollback_failed {
+                    // A proven rollback means old removal did not happen, so
+                    // do not suppress a future external removal of this ID.
+                    self.lifecycle_event_fences
+                        .clear_intentional_removal(&current.id);
+                }
+                let cleanup_status = if replacement_cleanup_failed {
+                    "; removal of the unstarted replacement also failed"
+                } else {
+                    ""
+                };
+                let rollback_status = if rollback_failed {
+                    "; rollback to the original stopped sandbox also failed"
+                } else {
+                    "; restored the original stopped sandbox"
+                };
+                return Err(ComputeDriverError::Message(format!(
+                    "network additional CA reconciliation could not remove the previous stopped sandbox{cleanup_status}{rollback_status}; workspace volume and sandbox secrets were preserved; refusing to continue"
+                )));
+            }
+
+            // A start failure deliberately leaves the correctly configured
+            // replacement stopped. A normal retry will then take the ordinary
+            // matching-generation start path without losing its workspace or
+            // driver-managed secrets.
+            self.client
+                .start_container(&replacement_name)
+                .await
+                .map_err(|_| {
+                    ComputeDriverError::Message(
+                        "network additional CA reconciliation created a replacement sandbox container but could not start it; the replacement remains stopped and workspace volume and sandbox secrets were preserved; refusing to continue".to_string(),
+                    )
+                })
+        }
+        .await;
         span_status.finish(result)
     }
 
@@ -1396,7 +1868,7 @@ impl PodmanComputeDriver {
         Self {
             client,
             config,
-            network_trust_artifact: None,
+            network_trust_bundle: None,
             network_gateway_ip: None,
             rootless: false,
             rootless_network_cmd: String::new(),
@@ -1408,6 +1880,7 @@ impl PodmanComputeDriver {
                 (refresh_inventory.clone(), allow_all_default_gpu)
             }),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            replacement_locks: Arc::default(),
         }
     }
 }
@@ -1639,6 +2112,8 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     // ── socket resolution ───────────────────────────────────────────────
@@ -2488,8 +2963,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "openshell-podman-gpu-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos()
         ));
@@ -2515,8 +2990,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "openshell-podman-dxg-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos()
         ));
@@ -2713,6 +3188,885 @@ mod tests {
 
     fn test_driver_with_config(config: PodmanComputeConfig) -> PodmanComputeDriver {
         PodmanComputeDriver::for_tests(config)
+    }
+
+    fn test_driver_with_network_trust(
+        socket_path: PathBuf,
+        bundle: Option<NetworkSupervisorTrustBundle>,
+    ) -> PodmanComputeDriver {
+        let mut driver = test_driver(socket_path);
+        driver.network_trust_bundle = bundle;
+        driver
+    }
+
+    fn write_test_network_trust_artifact(path: &Path, contents: &[u8]) {
+        #[cfg(unix)]
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+                .expect("test trust artifact should be writable");
+        }
+        fs::write(path, contents).expect("test trust artifact should be written");
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+            .expect("test trust artifact should be read-only");
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("test trust artifact metadata should be readable")
+                .permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions)
+                .expect("test trust artifact should be read-only");
+        }
+    }
+
+    fn network_trust_bundle(
+        test_name: &str,
+        contents: &[u8],
+        generation: &str,
+    ) -> (NetworkSupervisorTrustBundle, PathBuf) {
+        let path = crate::test_utils::unique_socket_path(test_name).with_extension("crt");
+        write_test_network_trust_artifact(&path, contents);
+        (
+            NetworkSupervisorTrustBundle::new(contents.to_vec(), 1, generation, path.clone()),
+            path,
+        )
+    }
+
+    fn stopped_inspect(generation: Option<&str>, sandbox_name: &str) -> String {
+        let mut labels = serde_json::Map::from_iter([
+            (
+                container::LABEL_MANAGED.to_string(),
+                serde_json::json!("true"),
+            ),
+            (LABEL_SANDBOX_ID.to_string(), serde_json::json!("sandbox-1")),
+            (
+                LABEL_SANDBOX_NAME.to_string(),
+                serde_json::json!(sandbox_name),
+            ),
+        ]);
+        if let Some(generation) = generation {
+            labels.insert(
+                NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
+                serde_json::json!(generation),
+            );
+        }
+        serde_json::json!({
+            "Id": "ctr-1",
+            "Name": "openshell---demo-sandbox-1",
+            "State": {
+                "Status": "exited",
+                "Running": false,
+                "FinishedAt": "2026-08-12T16:39:13Z"
+            },
+            "Config": {"Labels": labels},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn reconciliation_temporary_names_are_valid_unique_and_fit_maximum_length() {
+        let canonical_name = "a".repeat(crate::client::MAX_NAME_LEN);
+        let first = reconciliation_temporary_name(&canonical_name)
+            .expect("temporary reconciliation name should be generated");
+        let second = reconciliation_temporary_name(&canonical_name)
+            .expect("temporary reconciliation name should be generated");
+
+        crate::client::validate_name(&first).expect("first temporary name should be valid");
+        crate::client::validate_name(&second).expect("second temporary name should be valid");
+        assert!(first.len() <= crate::client::MAX_NAME_LEN);
+        assert!(second.len() <= crate::client::MAX_NAME_LEN);
+        assert_ne!(first, second);
+    }
+
+    fn temporary_name_from_rename_request(request: &str) -> String {
+        let prefix = format!("POST {}/libpod/containers/ctr-1/rename?name=", api_path(""));
+        request
+            .strip_prefix(&prefix)
+            .expect("first reconciliation rename must rename the old container")
+            .to_string()
+    }
+
+    fn assert_replacement_request_order(requests: &[String]) {
+        // Setup is list, inspect, token-secret inspection, pull supervisor,
+        // pull sandbox image, and inspect sandbox image. The transactional
+        // sequence is rename-old, create-canonical, remove-old, start-canonical.
+        assert_eq!(requests.len(), 11);
+        assert_eq!(
+            requests[2],
+            format!(
+                "GET {}",
+                api_path("/libpod/secrets/openshell-token-sandbox-1/json")
+            )
+        );
+        assert_eq!(
+            requests[6],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json")),
+            "the transaction must re-inspect the owned stopped ID immediately before rename"
+        );
+        assert!(requests[7].starts_with(&format!(
+            "POST {}",
+            api_path("/libpod/containers/ctr-1/rename?name=")
+        )));
+        let temporary_name = temporary_name_from_rename_request(&requests[7]);
+        crate::client::validate_name(&temporary_name)
+            .expect("temporary reconciliation name must be Podman-safe");
+        assert!(temporary_name.starts_with("openshell---demo-sandbox-1-reconcile-"));
+        assert_eq!(
+            requests[8],
+            format!("POST {}", api_path("/libpod/containers/create"))
+        );
+        assert_eq!(
+            requests[9],
+            format!(
+                "DELETE {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}?force=true&volumes=false&timeout=0"
+                ))
+            )
+        );
+        assert_eq!(
+            requests[10],
+            format!(
+                "POST {}",
+                api_path("/libpod/containers/openshell---demo-sandbox-1/start")
+            )
+        );
+    }
+
+    async fn assert_stopped_generation_replaced(
+        test_name: &str,
+        old_generation: Option<&str>,
+        desired_bundle: Option<(&str, &[u8])>,
+    ) {
+        let (bundle, artifact) = desired_bundle.map_or((None, None), |(generation, contents)| {
+            let (bundle, path) = network_trust_bundle(test_name, contents, generation);
+            (Some(bundle), Some(path))
+        });
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            test_name,
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(old_generation, "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(old_generation, "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old aside
+                StubResponse::new(StatusCode::CREATED, r#"{"Id":"ctr-replacement"}"#), // create replacement
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove old, no volumes
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // start replacement
+            ],
+        );
+        test_driver_with_network_trust(socket_path.clone(), bundle)
+            .start_sandbox_with_snapshot(
+                "sandbox-1",
+                "demo",
+                Some(&plain_sandbox("sandbox-1", "demo")),
+            )
+            .await
+            .expect("stopped sandbox should be replaced");
+        handle.await.expect("stub should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log should not be poisoned");
+        assert_replacement_request_order(&requests);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/libpod/volumes/"))
+        );
+        assert!(requests.iter().all(|request| {
+            !request.starts_with("DELETE ") || !request.contains("/libpod/secrets/")
+        }));
+        drop(requests);
+        if let Some(artifact) = artifact {
+            let _ = fs::remove_file(artifact);
+        }
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_retries_a_temporary_name_collision_before_creating() {
+        let (bundle, artifact) = network_trust_bundle("trust-temp-collision", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-temp-collision",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(
+                    StatusCode::CONFLICT,
+                    r#"{"message":"existing temporary name"}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::CREATED, r#"{"Id":"ctr-replacement"}"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect("a temporary-name collision should be retried");
+        handle.await.expect("stub should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log should not be poisoned");
+        assert_eq!(requests.len(), 12);
+        let first_temporary_name = temporary_name_from_rename_request(&requests[7]);
+        let second_temporary_name = temporary_name_from_rename_request(&requests[8]);
+        assert_ne!(first_temporary_name, second_temporary_name);
+        assert_eq!(
+            requests[9],
+            format!("POST {}", api_path("/libpod/containers/create"))
+        );
+        assert_eq!(
+            requests[10],
+            format!(
+                "DELETE {}",
+                api_path(&format!(
+                    "/libpod/containers/{second_temporary_name}?force=true&volumes=false&timeout=0"
+                ))
+            )
+        );
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_with_matching_trust_generation_starts_without_replacement() {
+        let (bundle, artifact) = network_trust_bundle("trust-matching", b"CA-A", "sha256:A");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-matching",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect("matching trust generation should start existing container");
+        handle.await.expect("stub should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log should not be poisoned");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.ends_with("/containers/ctr-1/start"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE "))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/containers/create"))
+        );
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_replaces_container_when_trust_generation_changes() {
+        assert_stopped_generation_replaced(
+            "trust-a-to-b",
+            Some("sha256:A"),
+            Some(("sha256:B", b"CA-B")),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_replaces_container_when_trust_is_added() {
+        assert_stopped_generation_replaced(
+            "trust-none-to-a",
+            Some("none"),
+            Some(("sha256:A", b"CA-A")),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_replaces_container_when_trust_is_removed() {
+        assert_stopped_generation_replaced("trust-a-to-none", Some("sha256:A"), None).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_replaces_container_when_legacy_generation_is_missing() {
+        assert_stopped_generation_replaced("trust-legacy", None, Some(("sha256:A", b"CA-A"))).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_start_never_mutates_a_running_container() {
+        let (bundle, artifact) = network_trust_bundle("trust-running", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-running",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"openshell---demo-sandbox-1","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.managed":"true","openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-name":"demo","openshell.ai/network-additional-ca-generation":"sha256:A"}}}"#,
+                ),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect("running sandbox must remain untouched");
+        handle.await.expect("stub should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE "))
+        );
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_start_rejects_identity_mismatch_before_podman_lookup() {
+        let socket_path = crate::test_utils::unique_socket_path("trust-identity");
+        let snapshot = plain_sandbox("other-id", "demo");
+        let error = test_driver(socket_path)
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("mismatched snapshot must be rejected");
+        assert!(error.to_string().contains("snapshot identity"));
+    }
+
+    #[tokio::test]
+    async fn replacement_failure_preserves_workspace_and_secrets_and_redacts_podman_error() {
+        let (bundle, artifact) = network_trust_bundle("trust-replace-fail", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-replace-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old aside
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"operator-private-ca-must-not-leak"}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old back
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let error = test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("failed replacement creation must fail closed");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("could not create its replacement"));
+        assert!(message.contains("workspace volume and sandbox secrets were preserved"));
+        assert!(!message.contains("operator-private-ca-must-not-leak"));
+        assert!(message.contains("restored the original stopped sandbox"));
+        let requests = request_log
+            .lock()
+            .expect("request log should not be poisoned");
+        assert_eq!(requests.len(), 10);
+        let temporary_name = temporary_name_from_rename_request(&requests[7]);
+        assert_eq!(
+            requests[8],
+            format!("POST {}", api_path("/libpod/containers/create"))
+        );
+        assert_eq!(
+            requests[9],
+            format!(
+                "POST {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}/rename?name=openshell---demo-sandbox-1"
+                ))
+            )
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/libpod/volumes/"))
+        );
+        assert!(requests.iter().all(|request| {
+            !request.starts_with("DELETE ") || !request.contains("/libpod/secrets/")
+        }));
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_creation_failure_reports_failed_rollback_without_podman_response() {
+        let (bundle, artifact) =
+            network_trust_bundle("trust-replace-rollback-fail", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-replace-rollback-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old aside
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-create-error"}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-rollback-error"}"#,
+                ),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let error = test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("failed creation and rollback must fail closed");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("rollback to the original stopped sandbox also failed"));
+        assert!(!message.contains("private-ca-create-error"));
+        assert!(!message.contains("private-ca-rollback-error"));
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 10);
+        let temporary_name = temporary_name_from_rename_request(&requests[7]);
+        assert_eq!(
+            requests[9],
+            format!(
+                "POST {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}/rename?name=openshell---demo-sandbox-1"
+                ))
+            )
+        );
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn old_removal_failure_removes_replacement_then_restores_old_container() {
+        let (bundle, artifact) = network_trust_bundle("trust-remove-fail", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-remove-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old aside
+                StubResponse::new(StatusCode::CREATED, r#"{"Id":"ctr-replacement"}"#), // create replacement
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-remove-error"}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove replacement
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // restore old
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let driver = test_driver_with_network_trust(socket_path.clone(), Some(bundle));
+        let error = driver
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("failed old removal must roll back");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("restored the original stopped sandbox"));
+        assert!(!message.contains("private-ca-remove-error"));
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 12);
+        let temporary_name = temporary_name_from_rename_request(&requests[7]);
+        assert_eq!(
+            requests[9],
+            format!(
+                "DELETE {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}?force=true&volumes=false&timeout=0"
+                ))
+            )
+        );
+        assert_eq!(
+            requests[10],
+            format!(
+                "DELETE {}",
+                api_path(
+                    "/libpod/containers/openshell---demo-sandbox-1?force=true&volumes=false&timeout=0"
+                )
+            )
+        );
+        assert_eq!(
+            requests[11],
+            format!(
+                "POST {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}/rename?name=openshell---demo-sandbox-1"
+                ))
+            )
+        );
+        assert!(requests.iter().all(|request| !request.ends_with("/start")));
+        drop(requests);
+        assert!(
+            !driver
+                .lifecycle_event_fences
+                .intentional_removal_is_pending("ctr-1"),
+            "a proven rename rollback must clear the old container's fence"
+        );
+        assert!(
+            driver
+                .lifecycle_event_fences
+                .intentional_removal_is_pending("ctr-replacement"),
+            "the replacement removal fence remains until its matching event arrives"
+        );
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn old_removal_failure_reports_failed_compensation_without_podman_response() {
+        let (bundle, artifact) =
+            network_trust_bundle("trust-remove-rollback-fail", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-remove-rollback-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::CREATED, r#"{"Id":"ctr-replacement"}"#),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-remove-old"}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-remove-new"}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-restore-old"}"#,
+                ),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let driver = test_driver_with_network_trust(socket_path.clone(), Some(bundle));
+        let error = driver
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("failed compensation must fail closed");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("removal of the unstarted replacement also failed"));
+        assert!(message.contains("rollback to the original stopped sandbox also failed"));
+        assert!(!message.contains("private-ca-remove-old"));
+        assert!(!message.contains("private-ca-remove-new"));
+        assert!(!message.contains("private-ca-restore-old"));
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 12);
+        let temporary_name = temporary_name_from_rename_request(&requests[7]);
+        assert_eq!(
+            requests[11],
+            format!(
+                "POST {}",
+                api_path(&format!(
+                    "/libpod/containers/{temporary_name}/rename?name=openshell---demo-sandbox-1"
+                ))
+            )
+        );
+        drop(requests);
+        assert!(
+            driver
+                .lifecycle_event_fences
+                .intentional_removal_is_pending("ctr-1"),
+            "an ambiguous old removal must retain its fence"
+        );
+        assert!(
+            driver
+                .lifecycle_event_fences
+                .intentional_removal_is_pending("ctr-replacement"),
+            "an ambiguous replacement cleanup must retain its fence"
+        );
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_start_failure_leaves_the_replacement_stopped() {
+        let (bundle, artifact) = network_trust_bundle("trust-start-fail", b"CA-B", "sha256:B");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-start-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+                StubResponse::new(StatusCode::OK, "{}"), // inspect token secret
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":""}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")), // re-inspect before rename
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // rename old aside
+                StubResponse::new(StatusCode::CREATED, r#"{"Id":"ctr-replacement"}"#), // create replacement
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove old, no volumes
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"private-ca-start-error"}"#,
+                ),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let error = test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("failed replacement start must leave it stopped");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("replacement remains stopped"));
+        assert!(!message.contains("private-ca-start-error"));
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_replacement_request_order(&requests);
+        drop(requests);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn tampered_trust_artifact_fails_before_container_removal_without_pem_leakage() {
+        let (bundle, artifact) =
+            network_trust_bundle("trust-tamper", b"expected-private-ca", "sha256:B");
+        write_test_network_trust_artifact(&artifact, b"tampered-private-ca");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-tamper",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+            ],
+        );
+        let snapshot = plain_sandbox("sandbox-1", "demo");
+        let error = test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot("sandbox-1", "demo", Some(&snapshot))
+            .await
+            .expect_err("tampered artifact must fail closed");
+        handle.await.expect("stub should finish");
+        let message = error.to_string();
+        assert!(message.contains("artifact verification failed"));
+        assert!(!message.contains("expected-private-ca"));
+        assert!(!message.contains("tampered-private-ca"));
+        assert!(
+            request_log
+                .lock()
+                .expect("request log should not be poisoned")
+                .iter()
+                .all(|request| !request.starts_with("DELETE "))
+        );
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_token_marker_true_requires_existing_secret_and_mounts_it() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "token-marker-true",
+            vec![StubResponse::new(StatusCode::OK, "{}")],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+        let labels = HashMap::from([(
+            container::LABEL_SANDBOX_TOKEN_SECRET.to_string(),
+            "true".to_string(),
+        )]);
+        let secret = replacement_token_secret_name(&client, "sandbox-1", &labels)
+            .await
+            .expect("true marker requires a present secret")
+            .expect("true marker must include the token secret");
+        handle.await.expect("stub should finish");
+        assert_eq!(
+            request_log.lock().expect("request log lock").as_slice(),
+            [format!(
+                "GET {}",
+                api_path("/libpod/secrets/openshell-token-sandbox-1/json")
+            )]
+        );
+
+        let spec = container::build_container_spec_with_token(
+            &plain_sandbox("sandbox-1", "demo"),
+            &PodmanComputeConfig::default(),
+            Some(&secret),
+        );
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::SANDBOX_TOKEN_FILE].as_str(),
+            Some(openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH)
+        );
+        assert!(spec["secrets"].as_array().is_some_and(|secrets| {
+            secrets
+                .iter()
+                .any(|mount| mount["source"].as_str() == Some(secret.as_str()))
+        }));
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_token_marker_true_missing_secret_fails_closed() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "token-marker-missing",
+            vec![StubResponse::new(
+                StatusCode::NOT_FOUND,
+                "private secret response body",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+        let labels = HashMap::from([(
+            container::LABEL_SANDBOX_TOKEN_SECRET.to_string(),
+            "true".to_string(),
+        )]);
+        let error = replacement_token_secret_name(&client, "sandbox-1", &labels)
+            .await
+            .expect_err("true marker with no secret must fail closed");
+        handle.await.expect("stub should finish");
+        assert!(error.to_string().contains("requires its existing"));
+        assert!(!error.to_string().contains("private secret response body"));
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn replacement_token_marker_false_skips_lookup_and_mount() {
+        let client = PodmanClient::new(crate::test_utils::unique_socket_path("token-marker-false"));
+        let labels = HashMap::from([(
+            container::LABEL_SANDBOX_TOKEN_SECRET.to_string(),
+            "false".to_string(),
+        )]);
+        assert_eq!(
+            replacement_token_secret_name(&client, "sandbox-1", &labels)
+                .await
+                .expect("false marker needs no secret"),
+            None
+        );
+        let spec = container::build_container_spec_with_token(
+            &plain_sandbox("sandbox-1", "demo"),
+            &PodmanComputeConfig::default(),
+            None,
+        );
+        assert!(
+            spec["env"]
+                .get(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+                .is_none()
+        );
+        assert!(spec["secrets"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn legacy_replacement_token_lookup_supports_present_and_absent_secrets() {
+        for (test_name, status, expected) in [
+            ("legacy-token-present", StatusCode::OK, true),
+            ("legacy-token-absent", StatusCode::NOT_FOUND, false),
+        ] {
+            let (socket_path, request_log, handle) = spawn_podman_stub(
+                test_name,
+                vec![StubResponse::new(status, "legacy secret response")],
+            );
+            let client = PodmanClient::new(socket_path.clone());
+            let secret = replacement_token_secret_name(&client, "sandbox-1", &HashMap::new())
+                .await
+                .expect("legacy lookup should only fail for non-404 errors");
+            handle.await.expect("stub should finish");
+            assert_eq!(secret.is_some(), expected);
+            assert_eq!(request_log.lock().expect("request log lock").len(), 1);
+            let _ = fs::remove_file(socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_generation_with_tampered_artifact_never_starts() {
+        let (bundle, artifact) =
+            network_trust_bundle("trust-matching-tamper", b"expected-private-ca", "sha256:A");
+        write_test_network_trust_artifact(&artifact, b"tampered-private-ca");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "trust-matching-tamper",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"exited"}]"#),
+                StubResponse::new(StatusCode::OK, stopped_inspect(Some("sha256:A"), "demo")),
+            ],
+        );
+        let error = test_driver_with_network_trust(socket_path.clone(), Some(bundle))
+            .start_sandbox_with_snapshot(
+                "sandbox-1",
+                "demo",
+                Some(&plain_sandbox("sandbox-1", "demo")),
+            )
+            .await
+            .expect_err("tampered matching-generation artifact must fail closed");
+        handle.await.expect("stub should finish");
+        assert!(error.to_string().contains("artifact verification failed"));
+        assert!(
+            request_log
+                .lock()
+                .expect("request log lock")
+                .iter()
+                .all(|request| {
+                    !request.ends_with("/start") && !request.contains("/containers/create")
+                })
+        );
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(socket_path);
     }
 
     fn json_struct(value: serde_json::Value) -> prost_types::Struct {

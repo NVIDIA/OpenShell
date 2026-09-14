@@ -115,30 +115,31 @@ pods do not need direct external ingress for SSH.
 
 Additional sandbox destination roots use the global
 `[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
-Kubernetes driver key. Before sandbox creation, the in-process driver GETs one
-deterministically named normalized `ca.crt` ConfigMap,
-`openshell-network-additional-ca-<gateway-id>`, in the selected shared,
-managed, or operator namespace. It creates the object when absent, handles a
-create conflict by rereading it, and accepts an existing object only when both
-`openshell.ai/managed-by=openshell` and the matching
-`openshell.ai/gateway-id` labels are present. Only after that check does it use
-forced server-side apply, allowing a restarted same-owner gateway to replace a
-stale field manager's data while never adopting a foreign object. The normalized
-PEM is bounded below Kubernetes's 1 MiB ConfigMap limit.
+Kubernetes driver key. Before sandbox creation, the in-process driver derives
+an immutable, content-addressed ConfigMap name from the gateway identity and
+normalized bundle generation in the selected shared, managed, or operator
+namespace. It creates the object when absent and handles a create conflict by
+rereading it. An existing object is accepted only when its managed-by and
+gateway-id labels, generation annotation, immutability, and exact `ca.crt` data
+match. The driver never patches or updates these ConfigMaps. The normalized PEM
+is bounded below Kubernetes's 1 MiB ConfigMap limit.
 
 Combined topology mounts it only in the agent container that runs network
 supervision. Sidecar topology mounts it only in `openshell-network`; workload
-and init containers do not receive it. Both use the read-only
-`/etc/openshell-tls/network-additional-ca.crt` path and the
-`--network-additional-ca-bundle` argument. This material augments destination
-trust and remains separate from callback mTLS Secrets and corporate-proxy trust.
+and unrelated init containers do not receive it. The sidecar `network-init` and
+long-running network supervisor both receive the read-only
+`/etc/openshell-tls/network-additional-ca.crt` path and gateway-issued SHA-256
+digest. Each canonicalizes the mounted PEM and rejects a generation mismatch
+before network setup. This material augments destination trust and remains
+separate from callback mTLS Secrets and corporate-proxy trust.
 Running supervisors load it only at startup. When the global setting is removed,
 newly created or recreated pods receive no ConfigMap volume or mount; existing
-supervisors retain their startup material until restarted. The driver
-intentionally has no list/delete permission, so unused managed ConfigMaps can
-remain. After verifying no sandbox uses it, an operator can identify the exact
-name plus the managed-by and gateway-id labels and delete that named ConfigMap
-from the relevant namespace.
+supervisors retain their startup material until restarted. The driver needs
+ConfigMap `get` and `create` in each target namespace but intentionally has no
+`list`, `watch`, `patch`, `update`, or `delete` permission. Unused generations
+can therefore remain. An operator with separate list/delete authority may use
+the managed-by and gateway-id labels to inventory them, but must verify that no
+Sandbox resource or pod volume references a generation before deleting it.
 
 The driver forwards the canonical main-process specification to the process
 supervisor and sets pod `restartPolicy: Never`. Main-process environment

@@ -903,6 +903,7 @@ dependencies = [
  "base64",
  "glob",
  "ipnet",
+ "libc",
  "miette",
  "nix",
  "openshell-extension-core",

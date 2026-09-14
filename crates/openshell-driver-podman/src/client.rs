@@ -47,7 +47,7 @@ pub enum PodmanApiError {
 /// Maximum resource name length. Podman container names become directory
 /// names in the storage driver, so we cap at 255 to stay within ext4/xfs
 /// filename limits.
-const MAX_NAME_LEN: usize = 255;
+pub const MAX_NAME_LEN: usize = 255;
 
 /// Validate that a resource name is safe for URL path interpolation.
 ///
@@ -517,6 +517,40 @@ impl PodmanClient {
         }
     }
 
+    /// Rename a stopped container by name or ID.
+    ///
+    /// The libpod rename endpoint frees the old canonical name without
+    /// deleting the container. Reconciliation uses it as a rollback point
+    /// while a replacement is created.
+    pub async fn rename_container(&self, name: &str, new_name: &str) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        validate_name(new_name)?;
+        self.request_ok(
+            hyper::Method::POST,
+            &format!("/libpod/containers/{name}/rename?name={new_name}"),
+            None,
+        )
+        .await
+    }
+
+    /// Remove a stopped container without asking Podman to remove volumes.
+    ///
+    /// This is deliberately separate from [`Self::remove_container`]: stopped
+    /// sandbox trust reconciliation replaces only the container and must never
+    /// remove its pre-existing named workspace volume.
+    pub async fn remove_container_preserving_volumes(
+        &self,
+        name: &str,
+    ) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        self.request_ok(
+            hyper::Method::DELETE,
+            &format!("/libpod/containers/{name}?force=true&volumes=false&timeout=0"),
+            None,
+        )
+        .await
+    }
+
     /// Download a file from a container as a tar archive.
     ///
     /// Calls `GET /libpod/containers/{name}/archive?path={path}` and returns
@@ -643,6 +677,30 @@ impl PodmanClient {
                 }
             }
             _ => Err(error_from_response(status.as_u16(), &bytes)),
+        }
+    }
+
+    /// Check whether a named Podman secret exists without reading its value.
+    ///
+    /// A 404 is an expected compatibility signal for legacy tokenless
+    /// sandboxes, so return it as `Ok(false)` without parsing or exposing the
+    /// response body. All other API failures remain errors.
+    pub async fn secret_exists(&self, name: &str) -> Result<bool, PodmanApiError> {
+        validate_name(name)?;
+        let (status, bytes) = self
+            .request(
+                hyper::Method::GET,
+                &format!("/libpod/secrets/{name}/json"),
+                None,
+                API_TIMEOUT,
+            )
+            .await?;
+        if status.is_success() {
+            Ok(true)
+        } else if status == hyper::StatusCode::NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
         }
     }
 
@@ -1034,6 +1092,58 @@ mod tests {
                 .expect("request log lock should not be poisoned")
                 .as_slice(),
             ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn secret_exists_treats_not_found_as_absent_without_exposing_body() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "secret-not-found",
+            vec![StubResponse::new(
+                StatusCode::NOT_FOUND,
+                "sensitive daemon diagnostic",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        assert!(
+            !client
+                .secret_exists("openshell-token-sandbox-1")
+                .await
+                .expect("404 must be a normal absent-secret result")
+        );
+        handle.await.expect("stub should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/secrets/openshell-token-sandbox-1/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn rename_container_uses_libpod_rename_endpoint() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "rename-container",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "")],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        client
+            .rename_container("sandbox-123", "sandbox-123-rollback-1")
+            .await
+            .expect("container rename should succeed");
+
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["POST /v5.0.0/libpod/containers/sandbox-123/rename?name=sandbox-123-rollback-1"]
         );
         let _ = std::fs::remove_file(socket_path);
     }

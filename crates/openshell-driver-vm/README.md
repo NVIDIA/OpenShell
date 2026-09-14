@@ -168,9 +168,10 @@ Additional destination roots use the global
 VM driver key. The gateway passes its normalized artifact to the managed driver
 through an internal option. Before each fresh or preserved-overlay launch, the
 driver validates the artifact, writes it read-only at
-`/etc/openshell-tls/network-additional-ca.crt`, and adds
-`--network-additional-ca-bundle` to the protected supervisor argument file.
-Restarting without the global setting removes stale material from the overlay.
+`/etc/openshell-tls/network-additional-ca.crt`, and adds the guest path plus the
+retained SHA-256 digest to the protected supervisor argument file. Before
+networking starts, the supervisor canonicalizes the guest PEM and rejects a
+generation mismatch. Restarting without the global setting removes stale material from the overlay.
 This trust augments destination roots and remains separate from callback mTLS
 and `proxy_ca_bundle`.
 

@@ -201,7 +201,11 @@ impl ComputeDriver for ComputeDriverService {
                     return Err(Status::invalid_argument("sandbox_id is required"));
                 }
                 self.driver
-                    .start_sandbox(&request.sandbox_id)
+                    .start_sandbox_with_snapshot(
+                        &request.sandbox_id,
+                        &request.sandbox_name,
+                        request.sandbox.as_ref(),
+                    )
                     .await
                     .map_err(Status::from)?;
                 Ok(Response::new(StartSandboxResponse {}))
@@ -653,6 +657,27 @@ mod tests {
 
     fn api_path(path: &str) -> String {
         format!("/v5.0.0{path}")
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_forwards_durable_snapshot_for_identity_validation() {
+        let service = test_service(unique_socket_path("start-snapshot-identity"));
+        let error = ComputeDriver::start_sandbox(
+            &service,
+            Request::new(StartSandboxRequest {
+                sandbox_id: "sandbox-1".to_string(),
+                sandbox_name: "demo".to_string(),
+                sandbox: Some(openshell_core::proto::compute::v1::DriverSandbox {
+                    id: "other-sandbox".to_string(),
+                    name: "demo".to_string(),
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await
+        .expect_err("mismatched durable snapshot should be forwarded to the driver");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("snapshot identity"));
     }
 
     #[tokio::test]

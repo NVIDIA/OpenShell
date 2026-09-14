@@ -102,9 +102,11 @@ The chart mounts the source into the gateway and renders
 `[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
 and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
 separate managed ConfigMap in each target sandbox namespace and mounts it only
-into the container that runs network supervision. The configured roots augment
-default destination trust. They do not configure the corporate proxy, OIDC, or
-gateway callback mTLS trust.
+at the network-supervisor boundary. The sandbox receives the expected generation
+as a protected startup argument and rejects mounted PEM whose canonical digest
+differs before network setup. The configured roots augment default destination
+trust. They do not configure the corporate proxy, OIDC, or gateway callback mTLS
+trust.
 
 Changing only the source ConfigMap does not roll or reload the gateway. Restart
 the gateway, then recreate or restart affected sandboxes to use the new roots.
@@ -113,32 +115,38 @@ created or recreated sandbox pods then have no additional-CA volume or mount.
 Existing running sandbox supervisors retain their startup trust until they are
 restarted or recreated.
 
-The driver manages the deterministic name
-`openshell-network-additional-ca-<effective-gateway-id>` (the effective ID is
-`server.sandboxJwt.gatewayId`, or the chart fullname when unset). Its `get` and
-`patch` permissions must be restricted to that exact name; `create` must remain
-a separate unrestricted ConfigMap permission because Kubernetes cannot apply
-`resourceNames` to create authorization. Enabling this therefore gives the
-gateway/driver service account namespace-wide ConfigMap-create authority. In
-managed/operator modes, the chart's ClusterRoleBinding makes that permission
-cluster-wide for the bound service account; use a dedicated service account and
-scoped bindings when that boundary matters. If you render the TOML setting
-outside this Helm value, grant that same split RBAC policy in every sandbox
-namespace.
+The driver creates one immutable, content-addressed ConfigMap generation in
+each target namespace. Names begin with
+`openshell-network-additional-ca-` and include DNS-safe hashes of the effective
+gateway ID and normalized bundle generation. Existing objects are accepted only
+when their ownership labels, generation annotation, immutability, and exact
+`ca.crt` data match; the driver never patches or updates them.
 
-Disabling the setting intentionally does not delete driver-managed ConfigMaps:
-the driver has no list/delete permissions, and a shared or operator namespace
-may contain resources still used by another gateway instance. After all
-affected sandboxes are restarted, identify an unused object by its exact name
-and the labels `openshell.ai/managed-by=openshell` and matching
-`openshell.ai/gateway-id`, then delete it explicitly in the target namespace:
+Kubernetes cannot restrict `create` by `resourceNames`, and `resourceNames`
+cannot express the digest-bearing name prefix needed for `get`. Enabling this
+feature therefore gives the gateway/driver service account namespace-wide
+ConfigMap `get` and `create` permissions in shared mode. In managed/operator
+modes, the chart's ClusterRoleBinding makes those permissions cluster-wide for
+the bound service account. The chart does not grant ConfigMap `list`, `watch`,
+`patch`, `update`, or `delete`. Use a dedicated gateway service account and
+namespace-scoped bindings when this boundary matters. If you render the TOML
+setting outside this Helm value, grant `get` and `create` in every target
+sandbox namespace.
+
+Disabling the setting intentionally does not delete driver-managed generations:
+the gateway has no ConfigMap list/delete permissions, and an older object may
+still be referenced by a running or stopped sandbox. An operator with separate
+list/delete authority can inventory the gateway's generations by label:
 
 ```shell
 kubectl -n <sandbox-namespace> get configmap \
-  openshell-network-additional-ca-<effective-gateway-id> --show-labels
-kubectl -n <sandbox-namespace> delete configmap \
-  openshell-network-additional-ca-<effective-gateway-id>
+  -l 'openshell.ai/managed-by=openshell,openshell.ai/gateway-id=<effective-gateway-id>'
 ```
+
+Before deleting a named generation, verify that no Sandbox resource or pod
+volume in that namespace references it. Delete only the confirmed unreferenced
+name; removing a referenced generation can make a later pod start or reschedule
+fail closed.
 
 A configured CA can authenticate every policy-permitted TLS endpoint with a
 matching certificate chain and hostname. Scope private CAs accordingly.

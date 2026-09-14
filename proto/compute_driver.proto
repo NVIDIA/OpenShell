@@ -379,6 +379,12 @@ message StartSandboxRequest {
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
   string sandbox_name = 2;
+  // Durable provisioning input reconstructed by the gateway from its persisted
+  // public Sandbox record. Local drivers use this only when a stopped resource
+  // must be rebuilt (for example after gateway-owned startup material changes).
+  // It is optional so independently versioned remote drivers can continue to
+  // implement ID/name-only start semantics.
+  DriverSandbox sandbox = 3;
 }
 
 message StartSandboxResponse {}

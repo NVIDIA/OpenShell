@@ -4037,6 +4037,7 @@ dependencies = [
  "glob",
  "h2",
  "ipnet",
+ "libc",
  "miette",
  "nix 0.29.0",
  "openshell-extension-core",
@@ -4090,6 +4091,9 @@ dependencies = [
  "clap",
  "futures",
  "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "openshell-core",
  "openshell-otel",
@@ -4111,6 +4115,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4137,6 +4142,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "temp-env",
  "thiserror 2.0.18",
  "tokio",
@@ -4271,6 +4277,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "rustix 1.1.4",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",

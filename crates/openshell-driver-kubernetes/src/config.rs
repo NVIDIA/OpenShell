@@ -5,6 +5,7 @@ pub use openshell_core::AppArmorProfile;
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
 use openshell_core::{ImagePullPolicy, config};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -25,19 +26,96 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
 /// Prefix for the gateway-managed destination trust `ConfigMap`.
 pub const NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-network-additional-ca-";
+const NETWORK_ADDITIONAL_CA_GATEWAY_PREFIX_MAX_LEN: usize = 30;
+const NETWORK_ADDITIONAL_CA_HASH_LABEL_LEN: usize = 32;
 
 /// Key containing normalized destination CA certificates in the managed `ConfigMap`.
 pub const NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY: &str = "ca.crt";
 
-/// Derive the stable gateway-owned destination trust `ConfigMap` name.
-pub fn network_additional_ca_config_map_name(gateway_id: &str) -> Result<String, String> {
-    let name = format!("{NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX}{gateway_id}");
+/// Derive the immutable gateway-owned destination trust `ConfigMap` name.
+///
+/// The name binds both the gateway identity and the complete normalized-bundle
+/// digest.  It intentionally uses bounded human-readable identity plus SHA-256
+/// components rather than putting either input directly in the name: gateway
+/// identities can be longer than a Kubernetes DNS label and the digest contains
+/// punctuation that is not DNS-safe.  Splitting each 64-character hash into
+/// 32-character DNS labels keeps the result below Kubernetes's 253-character
+/// DNS-subdomain limit.
+pub fn network_additional_ca_config_map_name(
+    gateway_id: &str,
+    normalized_bundle_digest: &str,
+) -> Result<String, String> {
+    if gateway_id.is_empty() {
+        return Err(
+            "gateway_id must not be empty when deriving a network additional CA ConfigMap name"
+                .to_string(),
+        );
+    }
+    if normalized_bundle_digest.is_empty() {
+        return Err(
+            "network additional CA bundle digest must not be empty when deriving a ConfigMap name"
+                .to_string(),
+        );
+    }
+
+    let gateway_prefix =
+        dns1123_name_fragment(gateway_id, NETWORK_ADDITIONAL_CA_GATEWAY_PREFIX_MAX_LEN);
+    let gateway_hash = sha256_hex(gateway_id.as_bytes());
+    let digest_hash = sha256_hex(normalized_bundle_digest.as_bytes());
+    let name = format!(
+        "{NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX}{gateway_prefix}.{}.{}.{}.{}",
+        &gateway_hash[..NETWORK_ADDITIONAL_CA_HASH_LABEL_LEN],
+        &gateway_hash[NETWORK_ADDITIONAL_CA_HASH_LABEL_LEN..],
+        &digest_hash[..NETWORK_ADDITIONAL_CA_HASH_LABEL_LEN],
+        &digest_hash[NETWORK_ADDITIONAL_CA_HASH_LABEL_LEN..],
+    );
+
     if !is_dns1123_subdomain(&name) {
-        return Err(format!(
-            "gateway_id '{gateway_id}' cannot be used for the network additional CA ConfigMap name"
-        ));
+        return Err("could not derive a DNS-safe network additional CA ConfigMap name".to_string());
     }
     Ok(name)
+}
+
+/// Convert arbitrary gateway identity text to a short DNS-1123 display
+/// fragment. The following SHA-256 labels retain collision resistance, so this
+/// fragment is only for operator readability.
+fn dns1123_name_fragment(value: &str, max_len: usize) -> String {
+    let mut fragment = String::with_capacity(max_len);
+    let mut previous_was_hyphen = false;
+
+    for byte in value.bytes() {
+        let normalized = if byte.is_ascii_alphanumeric() {
+            byte.to_ascii_lowercase()
+        } else {
+            b'-'
+        };
+        if normalized == b'-' {
+            if fragment.is_empty() || previous_was_hyphen {
+                continue;
+            }
+            previous_was_hyphen = true;
+        } else {
+            previous_was_hyphen = false;
+        }
+        if fragment.len() == max_len {
+            break;
+        }
+        fragment.push(char::from(normalized));
+    }
+
+    while fragment.ends_with('-') {
+        fragment.pop();
+    }
+    if fragment.is_empty() {
+        "gateway".to_string()
+    } else {
+        fragment
+    }
+}
+
+/// Return the lowercase SHA-256 digest of `input`.
+fn sha256_hex(input: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(input))
 }
 
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
@@ -896,22 +974,58 @@ mod tests {
     }
 
     #[test]
-    fn additional_ca_config_map_name_is_stable_and_gateway_scoped() {
+    fn additional_ca_config_map_name_is_stable_gateway_scoped_and_content_addressed() {
+        let generation_a =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let generation_b =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let gateway_a = network_additional_ca_config_map_name("gateway-a", generation_a).unwrap();
+
         assert_eq!(
-            network_additional_ca_config_map_name("gateway-a").unwrap(),
-            "openshell-network-additional-ca-gateway-a"
+            gateway_a,
+            network_additional_ca_config_map_name("gateway-a", generation_a).unwrap()
         );
         assert_ne!(
-            network_additional_ca_config_map_name("gateway-a").unwrap(),
-            network_additional_ca_config_map_name("gateway-b").unwrap()
+            gateway_a,
+            network_additional_ca_config_map_name("gateway-b", generation_a).unwrap()
+        );
+        assert_ne!(
+            gateway_a,
+            network_additional_ca_config_map_name("gateway-a", generation_b).unwrap()
         );
     }
 
     #[test]
-    fn additional_ca_config_map_name_rejects_unusable_gateway_identity() {
-        let error = network_additional_ca_config_map_name(&"x".repeat(240)).unwrap_err();
-        assert!(error.contains("gateway_id"));
-        assert!(error.contains("ConfigMap"));
+    fn additional_ca_config_map_name_is_dns_safe_and_bounded_for_long_gateway_ids() {
+        let name = network_additional_ca_config_map_name(
+            &format!("Gateway / identity {}", "x".repeat(1_000)),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        assert!(is_dns1123_subdomain(&name));
+        assert!(name.len() <= 253);
+        assert!(name.starts_with(NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX));
+    }
+
+    #[test]
+    fn additional_ca_config_map_name_rejects_missing_identity_or_generation() {
+        assert!(
+            network_additional_ca_config_map_name(
+                "",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_err()
+        );
+        assert!(network_additional_ca_config_map_name("gateway-a", "").is_err());
+    }
+
+    #[test]
+    fn sha256_name_hash_matches_the_standard_algorithm() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

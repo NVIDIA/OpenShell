@@ -205,7 +205,11 @@ impl ComputeDriver for ComputeDriverService {
                     return Err(Status::invalid_argument("sandbox_id is required"));
                 }
                 self.driver
-                    .start_sandbox(&request.sandbox_id)
+                    .start_sandbox_with_snapshot(
+                        &request.sandbox_id,
+                        &request.sandbox_name,
+                        request.sandbox.as_ref(),
+                    )
                     .await
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))

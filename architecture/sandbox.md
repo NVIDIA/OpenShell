@@ -72,13 +72,14 @@ than falling back to public roots. The bundle augments bundled, system, or
 native roots and preserves normal hostname verification.
 
 Drivers deliver the normalized material at their runtime boundary. Docker and
-Podman bind-mount a gateway-owned artifact. Kubernetes server-side-applies one
-gateway-scoped ConfigMap per target namespace; combined topology mounts it only
-in the agent container that runs the supervisor, while sidecar topology mounts
-it only in `openshell-network`. VM writes it into the per-sandbox overlay. All
-paths converge on `/etc/openshell-tls/network-additional-ca.crt` and the
-operator-controlled `--network-additional-ca-bundle` argument. The supervisor
-also includes these roots in its child-process trust files.
+Podman bind-mount a gateway-owned artifact. Kubernetes creates immutable,
+content-addressed ConfigMap generations in each target namespace and validates
+an existing generation without mutation; combined topology mounts it only in
+the agent container that runs the supervisor, while sidecar topology mounts it
+only in `openshell-network`. VM writes it into the per-sandbox overlay. All paths
+converge on `/etc/openshell-tls/network-additional-ca.crt` and protected
+supervisor startup arguments. The supervisor verifies the expected generation
+before including these roots in destination and child-process trust files.
 
 Destination trust remains separate from corporate-proxy CA material, gateway
 listener TLS, OIDC trust, and sandbox-to-gateway mTLS through

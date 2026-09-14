@@ -191,10 +191,17 @@ Additional sandbox destination roots use the global
 `[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
 Docker driver key. The gateway normalizes certificate-only PEM at startup. The
 in-process driver bind-mounts the gateway-owned artifact read-only at
-`/etc/openshell-tls/network-additional-ca.crt` and passes the operator-controlled
-`--network-additional-ca-bundle` argument. This trust augments default
-destination roots and remains separate from callback mTLS and corporate-proxy
-CA configuration.
+`/etc/openshell-tls/network-additional-ca.crt` and passes that protected path
+with the gateway-issued SHA-256 digest. Before networking starts, the supervisor
+canonicalizes the mounted PEM and rejects a generation mismatch. This trust
+augments default destination roots and remains separate from callback mTLS and
+corporate-proxy CA configuration.
+
+When a stopped sandbox needs a different trust generation, the driver replaces
+its container while preserving the workspace. It streams the bounded Docker
+archive through the validator directly into one private temporary file and
+admits only one archive transfer at a time, bounding gateway temporary-storage
+use across concurrent sandbox starts.
 
 ## Corporate proxy, SPIFFE, and AppArmor
 

@@ -514,7 +514,7 @@ prepare_additional_ca_source() {
 
 configure_additional_ca_gateway() {
   local workload_ref old_checksum new_checksum old_pod_uids current_pod_uids
-  local service_account changed_source
+  local service_account changed_source authorization
 
   workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
   old_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o json \
@@ -545,10 +545,20 @@ configure_additional_ca_gateway() {
 
   service_account="$(kctl -n "${NAMESPACE}" get "${workload_ref}" \
     -o jsonpath='{.spec.template.spec.serviceAccountName}')"
-  for verb in get create patch; do
+  for verb in get create; do
     kctl auth can-i "${verb}" configmaps -n "${NAMESPACE}" \
       --as="system:serviceaccount:${NAMESPACE}:${service_account}" \
       | grep -Fxq yes
+  done
+  for verb in list watch patch update delete; do
+    authorization="$(
+      kctl auth can-i "${verb}" configmaps -n "${NAMESPACE}" \
+        --as="system:serviceaccount:${NAMESPACE}:${service_account}" || :
+    )"
+    if [ "${authorization}" != "no" ]; then
+      echo "ERROR: additional CA RBAC unexpectedly grants ConfigMap ${verb}" >&2
+      return 1
+    fi
   done
 
   # Updating only the operator-owned source ConfigMap must not mutate the
@@ -1174,6 +1184,7 @@ else
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_grpc_portforward || exit 1
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT}"
     GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \

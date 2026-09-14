@@ -632,7 +632,7 @@ export OPENSHELL_E2E_DRIVER="podman"
 export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
-  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor"
   export OPENSHELL_E2E_GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 fi
 

@@ -32,7 +32,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config_with_additional,
-    read_additional_ca_bundle, read_system_ca_bundle, write_ca_files_with_additional,
+    read_system_ca_bundle, write_ca_files_with_additional,
 };
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
@@ -195,14 +195,13 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
-    network_additional_ca_bundle: Option<&std::path::Path>,
+    additional_ca_bundle: Option<&str>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
-    // Validate the driver-staged material before starting any networking task.
-    // The gateway already normalized it, but this second boundary check catches
-    // a missing, replaced, or truncated mount and must never downgrade to the
-    // default roots.
-    let additional_ca_bundle = initialize_additional_ca_bundle(network_additional_ca_bundle)?;
+    // `run_sandbox` authenticated the mounted bundle before creating any
+    // network resources and retained only its canonical bytes. This layer
+    // consumes those bytes without re-opening the mount path, closing the
+    // staging-to-use TOCTOU window.
 
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -373,7 +372,7 @@ pub async fn run_networking(
                 ca.as_ref(),
                 tls_dir,
                 &system_ca_bundle,
-                additional_ca_bundle.as_deref(),
+                additional_ca_bundle,
             ) {
                 Ok(paths) => {
                     // /etc/openshell-tls is subsumed by the /etc baseline path
@@ -391,7 +390,7 @@ pub async fn run_networking(
                     let state = if let Some(ca) = ca {
                         let upstream_config = build_upstream_client_config_with_additional(
                             &system_ca_bundle,
-                            additional_ca_bundle.as_deref(),
+                            additional_ca_bundle,
                         )?;
                         let cert_cache = CertCache::new(ca);
                         ocsf_emit!(
@@ -514,50 +513,6 @@ pub async fn run_networking(
         #[cfg(target_os = "linux")]
         _transparent_tcp: transparent_tcp,
     })
-}
-
-fn initialize_additional_ca_bundle(path: Option<&std::path::Path>) -> Result<Option<String>> {
-    path.map(read_additional_ca_bundle).transpose()
-}
-
-#[cfg(test)]
-mod additional_ca_tests {
-    use super::*;
-    use rcgen::generate_simple_self_signed;
-
-    #[test]
-    fn omitted_additional_bundle_preserves_legacy_startup() {
-        assert!(initialize_additional_ca_bundle(None).unwrap().is_none());
-    }
-
-    #[test]
-    fn explicitly_requested_invalid_bundles_fail_startup() {
-        let directory = tempfile::tempdir().unwrap();
-        let cases = [
-            ("empty.pem", Vec::new()),
-            ("malformed.pem", b"not PEM material".to_vec()),
-            (
-                "private-key.pem",
-                generate_simple_self_signed(vec!["destination.example".to_string()])
-                    .unwrap()
-                    .key_pair
-                    .serialize_pem()
-                    .into_bytes(),
-            ),
-        ];
-        for (name, contents) in cases {
-            let path = directory.path().join(name);
-            std::fs::write(&path, contents).unwrap();
-            let error = initialize_additional_ca_bundle(Some(&path)).unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("destination CA bundle"), "{message}");
-            assert!(message.contains(&path.display().to_string()), "{message}");
-        }
-
-        let missing = directory.path().join("missing.pem");
-        let error = initialize_additional_ca_bundle(Some(&missing)).unwrap_err();
-        assert!(error.to_string().contains(&missing.display().to_string()));
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

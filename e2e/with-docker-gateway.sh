@@ -505,7 +505,7 @@ export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
-  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
+  export OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT="${XDG_STATE_HOME}/openshell/network-supervisor"
   export OPENSHELL_E2E_GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 fi
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then

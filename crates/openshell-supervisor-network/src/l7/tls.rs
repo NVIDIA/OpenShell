@@ -13,6 +13,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -382,6 +383,30 @@ fn append_pem(target: &mut String, pem: &str) {
     target.push_str(pem);
 }
 
+/// Validate the gateway-issued digest syntax accepted for a mounted
+/// destination trust bundle.
+///
+/// Digests deliberately have one canonical representation. Accepting uppercase
+/// hexadecimal or another prefix would weaken the protected argv contract and
+/// make the supervisor's comparison differ from gateway normalization.
+pub fn validate_additional_ca_digest(digest: &str) -> Result<()> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(miette!(
+            "--network-additional-ca-digest must use sha256:<64 lowercase hexadecimal characters> format"
+        ));
+    };
+    if hex.len() != Sha256::output_size() * 2
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(miette!(
+            "--network-additional-ca-digest must use sha256:<64 lowercase hexadecimal characters> format"
+        ));
+    }
+    Ok(())
+}
+
 /// Read, strictly validate, and canonicalize the supervisor's explicitly
 /// requested staged destination bundle.
 pub fn read_additional_ca_bundle(path: &Path) -> Result<String> {
@@ -429,6 +454,27 @@ pub fn read_additional_ca_bundle(path: &Path) -> Result<String> {
     Ok(canonical_pem(&certificates))
 }
 
+/// Read and verify a driver-mounted destination trust bundle before it is used
+/// to create listeners, bypass rules, or child-process trust files.
+///
+/// The digest is calculated over canonical PEM bytes, not raw mounted bytes.
+/// That exactly matches the gateway's normalization boundary, so harmless PEM
+/// whitespace differences are accepted while a valid replacement certificate
+/// fails closed. Diagnostics intentionally disclose only the non-secret
+/// expected digest and path; mounted certificate or key bytes never appear.
+pub fn read_and_verify_additional_ca_bundle(path: &Path, expected_digest: &str) -> Result<String> {
+    validate_additional_ca_digest(expected_digest)?;
+    let canonical = read_additional_ca_bundle(path)?;
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()));
+    if actual_digest != expected_digest {
+        return Err(miette!(
+            "network additional CA digest mismatch at {}: expected {expected_digest}; mounted bundle does not match",
+            path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 fn strict_pem_certificates(
     source: &[u8],
     description: &str,
@@ -456,34 +502,54 @@ fn strict_pem_certificates(
     Ok(certificates)
 }
 
+/// Enforce the same strict PEM envelope as gateway normalization.
+///
+/// `rustls_pemfile` permissively skips text around PEM blocks and does not
+/// require paired labels. The gateway deliberately rejects such material, so
+/// runtime verification must make the exact same canonicalization decision.
 fn validate_pem_envelope(text: &str, description: &str) -> Result<()> {
-    let mut in_block = false;
+    let mut begin_label = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if !in_block {
-            if line.starts_with("-----BEGIN ") && line.ends_with("-----") {
-                in_block = true;
-            } else {
-                return Err(miette!(
-                    "{description} contains non-PEM content outside certificate blocks"
-                ));
+        if let Some(expected_label) = begin_label {
+            if let Some(end_label) = pem_label(line, "-----END ") {
+                if end_label != expected_label {
+                    return Err(miette!(
+                        "{description} contains malformed PEM data: END label does not match BEGIN label"
+                    ));
+                }
+                begin_label = None;
+            } else if pem_label(line, "-----BEGIN ").is_some()
+                || !line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            {
+                return Err(miette!("{description} contains malformed PEM data"));
             }
-        } else if line.starts_with("-----END ") && line.ends_with("-----") {
-            in_block = false;
-        } else if !line
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-        {
-            return Err(miette!("{description} contains malformed PEM data"));
+        } else if let Some(label) = pem_label(line, "-----BEGIN ") {
+            begin_label = Some(label);
+        } else {
+            return Err(miette!(
+                "{description} contains non-PEM content outside certificate blocks"
+            ));
         }
     }
-    if in_block {
+    if begin_label.is_some() {
         return Err(miette!("{description} contains an unterminated PEM block"));
     }
     Ok(())
+}
+
+fn pem_label<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let label = line.strip_prefix(prefix)?.strip_suffix("-----")?;
+    (!label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' '))
+    .then_some(label)
 }
 
 fn canonical_pem(certificates: &[CertificateDer<'static>]) -> String {
@@ -839,6 +905,71 @@ mod tests {
             assert!(error.contains("destination CA bundle"), "{error}");
             assert!(error.contains(&path.display().to_string()), "{error}");
             assert!(!error.contains("BEGIN CERTIFICATE"), "{error}");
+            assert!(!error.contains("PRIVATE KEY"), "{error}");
+        }
+    }
+
+    #[test]
+    fn verified_additional_bundle_accepts_gateway_canonical_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("additional.pem");
+        let generated = generate_ca_pem();
+        // Gateway normalization permits surrounding whitespace but computes its
+        // digest over the canonical representation. Verify that exact contract
+        // here rather than raw mounted bytes.
+        std::fs::write(&path, format!("\n{generated}\n")).unwrap();
+        let canonical = read_additional_ca_bundle(&path).unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()));
+
+        assert_eq!(
+            read_and_verify_additional_ca_bundle(&path, &digest).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn kubernetes_style_valid_but_different_mounted_bundle_fails_supervisor_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected_path = directory.path().join("expected.pem");
+        let mounted_path = directory.path().join("mounted.pem");
+        std::fs::write(&expected_path, generate_ca_pem()).unwrap();
+        let expected_canonical = read_additional_ca_bundle(&expected_path).unwrap();
+        let expected_digest = format!("sha256:{:x}", Sha256::digest(expected_canonical.as_bytes()));
+
+        let replacement = generate_ca_pem();
+        let replacement_payload = replacement
+            .lines()
+            .find(|line| !line.starts_with("-----") && !line.is_empty())
+            .unwrap()
+            .to_string();
+        std::fs::write(&mounted_path, &replacement).unwrap();
+
+        let error = read_and_verify_additional_ca_bundle(&mounted_path, &expected_digest)
+            .expect_err("a valid but different mounted CA must fail closed");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("network additional CA digest mismatch"));
+        assert!(diagnostic.contains(&expected_digest));
+        assert!(!diagnostic.contains(&replacement_payload));
+        assert!(!diagnostic.contains("BEGIN CERTIFICATE"));
+        assert!(!diagnostic.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn additional_ca_digest_requires_canonical_sha256_syntax() {
+        let valid = format!("sha256:{}", "a".repeat(64));
+        validate_additional_ca_digest(&valid).unwrap();
+        for invalid in [
+            "sha256:abc",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let error = validate_additional_ca_digest(invalid).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("sha256:<64 lowercase hexadecimal characters>"),
+                "{error}"
+            );
         }
     }
 

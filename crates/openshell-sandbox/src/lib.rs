@@ -128,10 +128,19 @@ pub async fn run_sandbox(
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     network_additional_ca_bundle: Option<std::path::PathBuf>,
+    network_additional_ca_digest: Option<String>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| miette::miette!("No command specified"))?;
+
+    // Authenticate the mounted bundle before any network namespace, listener,
+    // proxy, or child trust file is created. Retain only canonical bytes after
+    // this boundary; later setup must never re-open the mutable mount path.
+    let additional_ca_bundle = load_network_additional_ca_bundle(
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
+    )?;
 
     // Initialize the process-wide OCSF context early so that events emitted
     // during policy loading (filesystem config, validation) have a context.
@@ -553,7 +562,7 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
-                network_additional_ca_bundle.as_deref(),
+                additional_ca_bundle.as_deref(),
                 #[cfg(target_os = "linux")]
                 transparent_runtime,
             )
@@ -1177,6 +1186,44 @@ async fn wait_for_shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
         info!("Received Ctrl-C, shutting down network-only supervisor");
     }
+}
+
+/// Validate the protected all-or-nothing destination-trust argv pair.
+///
+/// This is intentionally separate from mounted-file verification so the binary
+/// rejects malformed or incoherent CLI input before it begins any runtime
+/// setup. The file itself is authenticated by
+/// [`load_network_additional_ca_bundle`] immediately on supervisor startup.
+pub fn validate_network_additional_ca_args(
+    bundle: Option<&std::path::Path>,
+    digest: Option<&str>,
+) -> Result<()> {
+    match (bundle, digest) {
+        (None, None) => Ok(()),
+        (Some(_), Some(digest)) => {
+            openshell_supervisor_network::l7::tls::validate_additional_ca_digest(digest)
+        }
+        _ => Err(miette::miette!(
+            "--network-additional-ca-bundle and --network-additional-ca-digest must be set together"
+        )),
+    }
+}
+
+/// Load a protected destination trust bundle into the immutable canonical form
+/// consumed by the networking supervisor.
+fn load_network_additional_ca_bundle(
+    bundle: Option<&std::path::Path>,
+    digest: Option<&str>,
+) -> Result<Option<String>> {
+    validate_network_additional_ca_args(bundle, digest)?;
+    bundle
+        .zip(digest)
+        .map(|(path, digest)| {
+            openshell_supervisor_network::l7::tls::read_and_verify_additional_ca_bundle(
+                path, digest,
+            )
+        })
+        .transpose()
 }
 
 fn sidecar_network_enforcement_enabled() -> bool {

@@ -206,9 +206,10 @@ Destination trust uses a separate global gateway setting:
 `[openshell.supervisor.network].additional_ca_cert_paths`. The gateway
 normalizes that material once, and the in-process Podman driver mounts the
 gateway-owned artifact read-only at
-`/etc/openshell-tls/network-additional-ca.crt` and passes
-`--network-additional-ca-bundle` to the supervisor. This setting does not
-configure a corporate proxy and does not alter the gateway callback mTLS CA.
+`/etc/openshell-tls/network-additional-ca.crt` and passes that protected path
+with the gateway-issued SHA-256 digest. Before networking starts, the supervisor
+canonicalizes the mounted PEM and rejects a generation mismatch. This setting
+does not configure a corporate proxy and does not alter the gateway callback mTLS CA.
 The Podman-specific `proxy_ca_bundle` setting remains paired with
 `https_proxy` and retains its existing proxy validation and mount path.
 
