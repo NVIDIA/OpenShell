@@ -127,6 +127,7 @@ const BOUNDARY_CONFIG_FILE: &str = "boundary-bootstrap.json";
 const BOUNDARY_CERTIFICATE_FILE: &str = "boundary-server.crt";
 const BOUNDARY_PRIVATE_KEY_FILE: &str = "boundary-server.key";
 const SUPERVISOR_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
+const START_GENERATION_FILE: &str = "start-generation";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
@@ -2208,16 +2209,22 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        generation_id: &str,
         launch_authentication: &[u8],
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            generation_id.to_string(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.lifecycle_event_fences
             .clear_stop(sandbox_id, sandbox_name);
         self.lifecycle_event_fences.begin_start(sandbox_id);
         let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
             sandbox_id,
             sandbox_name,
+            &generation,
             launch_authentication,
         ))
         .await;
@@ -2229,6 +2236,7 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        generation: &openshell_core::sandbox_generation::SandboxGenerationId,
         launch_authentication: &[u8],
     ) -> Result<bool, Status> {
         let Some(container) = self
@@ -2258,6 +2266,7 @@ impl DockerComputeDriver {
         };
         drop(inspected);
         if !container_state_needs_start(state) {
+            verify_docker_start_generation(sandbox_id, &self.config, generation).await?;
             self.ensure_control_process_for_container(&container)
                 .await?;
             return Ok(true);
@@ -2274,6 +2283,12 @@ impl DockerComputeDriver {
             .as_ref()
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
+        write_docker_boundary_file(
+            &docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
+                .join(START_GENERATION_FILE),
+            generation.as_str().as_bytes(),
+        )
+        .await?;
         // Normal starts rotate the launch-scoped credentials supplied by the
         // gateway. Startup recovery deliberately sends no new credentials;
         // retain the persisted bundle until the gateway can issue a refresh.
@@ -2352,6 +2367,7 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => return Ok(false),
             Err(err) => return Err(internal_status("start docker sandbox container", err)),
         }
+        verify_docker_start_generation(resolved_sandbox_id, &self.config, generation).await?;
         self.ensure_control_process_for_container(&container)
             .await?;
         Ok(true)
@@ -3173,6 +3189,7 @@ impl ComputeDriver for DockerComputeDriver {
             self,
             &request.sandbox_id,
             &request.sandbox_name,
+            &request.generation_id,
             &request.launch_authentication,
         ))
         .await?
@@ -4057,6 +4074,27 @@ async fn write_docker_boundary_file(path: &Path, contents: &[u8]) -> Result<(), 
             path.display()
         ))
     })
+}
+
+async fn verify_docker_start_generation(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+) -> Result<(), Status> {
+    let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(START_GENERATION_FILE);
+    let active = tokio::fs::read_to_string(&path).await.map_err(|error| {
+        Status::failed_precondition(format!(
+            "read active Docker sandbox generation {}: {error}",
+            path.display()
+        ))
+    })?;
+    if active.trim() == requested.as_str() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "Docker sandbox is already running generation {}",
+        active.trim()
+    )))
 }
 
 fn append_docker_archive_directory(
