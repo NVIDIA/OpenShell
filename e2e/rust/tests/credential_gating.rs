@@ -518,6 +518,8 @@ async fn handle_http_probe(
     if expected_total.is_some_and(|expected| received.len() >= expected) {
         let result = if observation.saw_secret && !observation.saw_placeholder {
             "BODY_REWRITTEN"
+        } else if observation.saw_placeholder && !observation.saw_secret {
+            "BODY_TEXT"
         } else {
             "BODY_BAD"
         };
@@ -558,7 +560,7 @@ with socket.create_connection((host, port), timeout=10) as sock:
         if not chunk:
             break
         response += chunk
-    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_DENIED")
+    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_TEXT" if b"BODY_TEXT" in response else "BODY_DENIED")
 "#
     )
 }
@@ -840,12 +842,12 @@ async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
     Ok(output)
 }
 
-async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), String> {
-    let denied = run_profile_body_sandbox(server.port).await?;
-    assert!(denied.contains("BODY_DENIED"));
+async fn assert_rest_body_preserves_placeholder(server: &HttpProbeServer) -> Result<(), String> {
+    let output = run_profile_body_sandbox(server.port).await?;
+    assert!(output.contains("BODY_TEXT"));
     let observations = server.wait_for_observations(1).await;
     assert_eq!(observations.len(), 1, "observations: {observations:?}");
-    assert!(!observations[0].saw_placeholder);
+    assert!(observations[0].saw_placeholder);
     assert!(!observations[0].saw_secret);
     Ok(())
 }
@@ -896,7 +898,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_rest_body_backstop(&server).await?;
+        assert_rest_body_preserves_placeholder(&server).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
     .await;
@@ -909,13 +911,13 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install endpointless provider");
     let endpointless_result = async {
         assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
-        let denied = run_body_sandbox(
+        let literal = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: false },
             CredentialSource::PolicyBinding,
         )
         .await?;
-        assert!(denied.contains("BODY_DENIED"));
+        assert!(literal.contains("BODY_TEXT"));
         let rewritten = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: true },
@@ -927,7 +929,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
         let observations = server.wait_for_observations(3).await;
         assert_eq!(observations.len(), 3, "observations: {observations:?}");
-        assert!(!observations[1].saw_placeholder);
+        assert!(observations[1].saw_placeholder);
         assert!(!observations[1].saw_secret);
         assert!(!observations[2].saw_placeholder);
         assert!(observations[2].saw_secret);
