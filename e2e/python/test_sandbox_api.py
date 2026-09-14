@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
-from openshell._proto import openshell_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,10 +71,11 @@ def test_sandbox_interactive_exec_honors_tty(
     stdout_sentinel = b"stdout-sentinel"
     stderr_sentinel = b"stderr-sentinel"
 
-    def exec_interactive(sandbox_id: str, *, tty: bool) -> tuple[bytes, bytes]:
+    def exec_interactive(sandbox_name: str, *, tty: bool) -> tuple[bytes, bytes]:
         request = openshell_pb2.ExecSandboxInput(
             start=openshell_pb2.ExecSandboxRequest(
-                sandbox_id=sandbox_id,
+                sandbox=sandbox_name,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 command=[
                     "/bin/sh",
                     "-c",
@@ -118,7 +119,7 @@ def test_sandbox_interactive_exec_honors_tty(
         return b"".join(stdout), b"".join(stderr)
 
     with sandbox(delete_on_exit=True) as sb:
-        stdout, stderr = exec_interactive(sb.id, tty=False)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=False)
         assert b"NNN" in stdout
         assert b"stdin:" + stdin_sentinel in stdout
         assert stdout_sentinel in stdout
@@ -126,7 +127,7 @@ def test_sandbox_interactive_exec_honors_tty(
         assert stderr_sentinel in stderr
         assert stderr_sentinel not in stdout
 
-        stdout, stderr = exec_interactive(sb.id, tty=True)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=True)
         assert b"TTT" in stdout + stderr
 
 

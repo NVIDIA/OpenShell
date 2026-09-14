@@ -798,6 +798,9 @@ openshell service get my-app web
 openshell service delete my-app web
 ```
 
+Use `openshell service list --all-workspaces` for a Platform Admin view across
+workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
+
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 
 ---

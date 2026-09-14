@@ -31,7 +31,7 @@ func WithTunnelServiceID(id string) TunnelOption {
 
 // SSHInterface defines operations for managing SSH sessions.
 type SSHInterface interface {
-	CreateSession(ctx context.Context, workspace, sandboxID string) (*SSHSession, error)
+	CreateSession(ctx context.Context, workspace, sandboxName string) (*SSHSession, error)
 	RevokeSession(ctx context.Context, workspace, token string) (bool, error)
 	Tunnel(ctx context.Context, workspace, sandboxName string, port uint32, opts ...TunnelOption) (io.ReadWriteCloser, error)
 }

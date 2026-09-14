@@ -291,7 +291,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.get_sandbox(request).await }
@@ -347,7 +347,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox(request).await }
@@ -361,7 +361,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.stop_sandbox(request).await }
@@ -375,7 +375,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.start_sandbox(request).await }
@@ -570,9 +570,9 @@ impl OpenShellClient {
     /// For streaming output, drop down to [`OpenShellClient::raw_grpc`] and
     /// call `exec_sandbox` directly.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector("default")),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
@@ -851,7 +851,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.get_sandbox(request).await }
@@ -905,7 +905,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox(request).await }
@@ -920,7 +920,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.stop_sandbox(request).await }
@@ -935,7 +935,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.start_sandbox(request).await }
@@ -999,9 +999,9 @@ impl WorkspaceScopedClient {
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,

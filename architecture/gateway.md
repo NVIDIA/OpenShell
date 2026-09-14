@@ -70,13 +70,20 @@ cross-origin or sibling-subdomain request.
 
 Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
 select one non-empty workspace explicitly; `default` is an ordinary explicit
-name, not an omitted-value fallback. Sandbox, sandbox template, provider, and
-service list RPCs also accept an all-workspaces marker after Platform Admin
-authorization. Single-workspace handlers reject that marker. Platform-global
-policy operations require the selector to be absent, while workspace policy
-operations require it. The gateway authorizes the selected scope before
-performing resource lookup so malformed, unsupported, and unauthorized scopes
-have consistent behavior across resource types.
+name, not an omitted-value fallback. Every public sandbox-scoped RPC identifies
+the sandbox with a string `sandbox` and carries its workspace selector as
+a separate request field. Canonical sandbox IDs remain internal metadata used
+at authentication, persistence, and compute-driver boundaries; public callers
+do not use them as sandbox references. The gateway resolves the name to the
+persisted sandbox record only after authorizing the selected workspace. A
+sandbox principal is instead resolved by the immutable ID in its authenticated
+identity, then checked against the requested name and workspace. Missing and
+unauthorized references use the same response within each principal class so
+the resolver does not expose an object-existence oracle. Sandbox, sandbox
+template, provider, and service list RPCs also accept an all-workspaces marker
+after Platform Admin authorization. Single-workspace handlers reject that
+marker. Platform-global policy operations require `sandbox` and
+`workspace_scope` to be absent, while sandbox policy operations require both.
 
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway
@@ -343,7 +350,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`8ac68c71d93e6a5e56406b8df1882ee40c6066270969e03eb99803f0e6396fc1`).
+(`b1302cff115e399ef7a3b771c0793d6b698be06d27792b6261057497c440bd7e`).
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
@@ -364,7 +371,7 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The 12 encoded durable roots above have a closure of 81 messages and eight
-enums (`369b36511c2e38b9df9621704a00123516c7538d8ee89a499158d7de5cee1882`).
+enums (`04c1e82bb685d83ef56128a0036500876fe0e734c465bac25c42ec725ee605f7`).
 Its intersection with the public RPC closure contains 71 messages and eight
 enums (`05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415`).
 The descriptor-derived test owns these full inventories; the tables here record

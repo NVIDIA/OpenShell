@@ -23,9 +23,9 @@ func newPolicyClient(conn grpc.ClientConnInterface) *policyClient {
 func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName string, opts ...GetDraftOption) (*DraftPolicy, error) {
 	cfg := types.ApplyGetDraftOptions(opts)
 	resp, err := p.client.GetDraftPolicy(ctx, &pb.GetDraftPolicyRequest{
-		Name:           sandboxName,
-		StatusFilter:   cfg.StatusFilter(),
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		StatusFilter:   cfg.StatusFilter(),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,9 +35,9 @@ func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName stri
 
 func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reviewToken string) (*ApproveResult, error) {
 	resp, err := p.client.ApproveDraftChunk(ctx, &pb.ApproveDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
 		ReviewToken:    reviewToken,
 	})
 	if err != nil {
@@ -48,10 +48,10 @@ func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandbox
 
 func (p *policyClient) RejectDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reason string) error {
 	_, err := p.client.RejectDraftChunk(ctx, &pb.RejectDraftChunkRequest{
-		Name:           sandboxName,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		ChunkId:        chunkID,
 		Reason:         reason,
-		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -69,10 +69,10 @@ func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, san
 		})
 	}
 	resp, err := p.client.ApproveAllDraftChunks(ctx, &pb.ApproveAllDraftChunksRequest{
-		Name:                   sandboxName,
 		IncludeSecurityFlagged: cfg.IncludeSecurityFlagged(),
-		WorkspaceScope:         namedWorkspaceScope(workspace),
 		Approvals:              approvals,
+		Sandbox:                sandboxName,
+		WorkspaceScope:         namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -82,7 +82,7 @@ func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, san
 
 func (p *policyClient) ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error) {
 	resp, err := p.client.ClearDraftChunks(ctx, &pb.ClearDraftChunksRequest{
-		Name:           sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -93,7 +93,7 @@ func (p *policyClient) ClearDraftChunks(ctx context.Context, workspace, sandboxN
 
 func (p *policyClient) GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error) {
 	resp, err := p.client.GetDraftHistory(ctx, &pb.GetDraftHistoryRequest{
-		Name:           sandboxName,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
@@ -115,11 +115,11 @@ func (p *policyClient) GetDraftHistory(ctx context.Context, workspace, sandboxNa
 func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error) {
 	cfg := types.ApplyGetStatusOptions(opts)
 	req := &pb.GetSandboxPolicyStatusRequest{
-		Name:    sandboxName,
 		Version: cfg.Version(),
 		Global:  cfg.Global(),
 	}
 	if !cfg.Global() {
+		req.Sandbox = sandboxName
 		req.WorkspaceScope = namedWorkspaceScope(workspace)
 	}
 	resp, err := p.client.GetSandboxPolicyStatus(ctx, req)
@@ -139,7 +139,7 @@ func (p *policyClient) List(workspace, sandboxName string, opts ...ListPolicyOpt
 	}
 	return newPager(cfg.PageToken(), func(ctx context.Context, pageToken string) (*Page[SandboxPolicyRevision], error) {
 		req := &pb.ListSandboxPoliciesRequest{
-			Name: sandboxName, PageSize: cfg.PageSize(), PageToken: pageToken, Global: cfg.Global(),
+			Sandbox: sandboxName, PageSize: cfg.PageSize(), PageToken: pageToken, Global: cfg.Global(),
 		}
 		if !cfg.Global() {
 			req.WorkspaceScope = namedWorkspaceScope(workspace)
@@ -168,10 +168,10 @@ func (p *policyClient) ListAll(ctx context.Context, workspace, sandboxName strin
 
 func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error {
 	_, err := p.client.EditDraftChunk(ctx, &pb.EditDraftChunkRequest{
-		Name:           sandboxName,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		ChunkId:        chunkID,
 		ProposedRule:   converter.NetworkPolicyRuleToProto(proposedRule),
-		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -181,9 +181,9 @@ func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxNam
 
 func (p *policyClient) UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error) {
 	resp, err := p.client.UndoDraftChunk(ctx, &pb.UndoDraftChunkRequest{
-		Name:           sandboxName,
-		ChunkId:        chunkID,
+		Sandbox:        sandboxName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

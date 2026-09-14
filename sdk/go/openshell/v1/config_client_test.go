@@ -143,7 +143,7 @@ func TestConfigGetSandbox(t *testing.T) {
 
 	// Verify request was forwarded with resolved ID (stubSandboxResolver returns "sb-<name>").
 	mock.mu.Lock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastSandboxReq.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetSandbox())
 	mock.mu.Unlock()
 
 	// Scalar fields.
@@ -222,7 +222,7 @@ func TestConfigGetSandbox_Error(t *testing.T) {
 
 // --- Name-to-ID resolution tests ---
 
-func TestConfigGetSandbox_ResolvesNameToID(t *testing.T) {
+func TestConfigGetSandbox_UsesName(t *testing.T) {
 	mock := newMockConfigServer()
 	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{Version: 1}
 
@@ -235,7 +235,7 @@ func TestConfigGetSandbox_ResolvesNameToID(t *testing.T) {
 
 	// stubSandboxResolver returns ID "sb-<name>" — verify the proto has the resolved ID, not the name.
 	mock.mu.Lock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastSandboxReq.GetSandboxId(), "GetSandbox should send resolved sandbox ID, not the name")
+	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -361,7 +361,7 @@ func TestConfigUpdate_SandboxScope(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, req)
-	assert.Equal(t, "my-sandbox", req.GetName())
+	assert.Equal(t, "my-sandbox", req.GetSandbox())
 	assert.Equal(t, "max_tokens", req.GetSettingKey())
 	assert.False(t, req.GetGlobal())
 	assert.Equal(t, uint64(4), req.GetExpectedResourceVersion())
@@ -397,7 +397,7 @@ func TestConfigUpdate_GlobalScope(t *testing.T) {
 	mock.mu.Unlock()
 
 	assert.True(t, req.GetGlobal())
-	assert.Empty(t, req.GetName())
+	assert.Empty(t, req.GetSandbox())
 }
 
 func TestConfigUpdate_DeleteSetting(t *testing.T) {

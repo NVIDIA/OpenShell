@@ -506,7 +506,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
-                        sandbox_name=sb.sandbox.name,
+                        sandbox=sb.sandbox.name,
                         provider_name=provider_name,
                     )
                 )
@@ -520,7 +520,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
-                        sandbox_name=sb.sandbox.name,
+                        sandbox=sb.sandbox.name,
                         provider_name=provider_name,
                     )
                 )
@@ -532,7 +532,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                             workspace_scope=datamodel_pb2.WorkspaceSelector(
                                 workspace="default"
                             ),
-                            sandbox_name=sb.sandbox.name,
+                            sandbox=sb.sandbox.name,
                             provider_name=provider_name,
                         )
                     )
@@ -770,7 +770,7 @@ def test_credentials_not_in_persisted_spec_environment(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
-                    name=sb.sandbox.name,
+                    sandbox=sb.sandbox.name,
                 )
             )
             persisted_env = dict(fetched.sandbox.spec.environment)

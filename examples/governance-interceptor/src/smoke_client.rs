@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.clone(),
+            sandbox: sandbox_name.clone(),
+            workspace_scope: None,
         })
         .await?
         .into_inner();
@@ -83,9 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy_result = client
         .update_config(UpdateConfigRequest {
-            name: sandbox_name.clone(),
-            policy: Some(widened_policy),
+            sandbox: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            policy: Some(widened_policy),
             ..Default::default()
         })
         .await;
@@ -108,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
-            name: sandbox_name,
+            name: sandbox_name.clone(),
             network_activity_summaries: vec![NetworkActivitySummary {
                 network_activity_count: 1,
                 ..Default::default()
@@ -120,7 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|status| format!("telemetry-only policy analysis was denied: {status}"))?;
 
     let after = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox: sandbox_name,
+            workspace_scope: None,
+        })
         .await?
         .into_inner();
     if after.version != before.version || after.policy_hash != before.policy_hash {

@@ -110,7 +110,6 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
 		"agent_pod":              true,
 		"agent_fd":               true,
 		"sandbox_fd":             true,
