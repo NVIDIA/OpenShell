@@ -2386,6 +2386,18 @@ fn is_retryable_error(err: &miette::Report) -> bool {
     true
 }
 
+/// Bound the complete attempt, including connection setup and a pending unary
+/// response. Dropping a timed-out future prevents it from stalling startup.
+async fn grpc_attempt<T>(op_name: &str, operation: impl Future<Output = Result<T>>) -> Result<T> {
+    timeout(Duration::from_secs(10), operation)
+        .await
+        .map_err(|_| {
+            openshell_core::grpc_client::grpc_status_error(tonic::Status::deadline_exceeded(
+                format!("{op_name} timed out after 10 seconds"),
+            ))
+        })?
+}
+
 /// Retry a gRPC operation with exponential backoff (capped at 4 s).
 ///
 /// Non-transient gRPC errors (e.g. `NOT_FOUND`, `INVALID_ARGUMENT`,
@@ -2397,7 +2409,7 @@ where
 {
     let mut last_err = None;
     for attempt in 1..=5u32 {
-        match f().await {
+        match grpc_attempt(op_name, f()).await {
             Ok(val) => return Ok(val),
             Err(e) => {
                 if !is_retryable_error(&e) {
@@ -2889,15 +2901,17 @@ async fn load_policy_with_gateway(
             // The gateway compares the entire tuple again. A concurrent repair or
             // provider rotation invalidates this candidate before any workload
             // identity, child environment or services are captured.
-            if let Err(error) = gateway
-                .report(
+            if let Err(error) = grpc_attempt(
+                "Startup acceptance report",
+                gateway.report(
                     id,
                     &instance_id,
                     Some(&snapshot),
                     ConfigurationAdmissionState::Accepted,
                     "",
-                )
-                .await
+                ),
+            )
+            .await
             {
                 if !is_retryable_error(&error) {
                     return Err(error);
@@ -5441,6 +5455,8 @@ network_policies:
         reject_next_accept: Arc<AtomicBool>,
         snapshot_error: Option<tonic::Code>,
         report_error: Option<tonic::Code>,
+        pending_snapshot: bool,
+        pending_acceptance: bool,
     }
 
     #[tonic::async_trait]
@@ -5449,6 +5465,9 @@ network_policies:
             &self,
             _id: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            if self.pending_snapshot {
+                return std::future::pending().await;
+            }
             if let Some(code) = self.snapshot_error {
                 return Err(openshell_core::grpc_client::grpc_status_error(
                     tonic::Status::new(code, "snapshot unavailable"),
@@ -5489,6 +5508,9 @@ network_policies:
             }
             self.reports.send(state).unwrap();
             if state == ConfigurationAdmissionState::Accepted {
+                if self.pending_acceptance {
+                    return std::future::pending().await;
+                }
                 if self.reject_next_accept.swap(false, Ordering::SeqCst) {
                     return Err(miette::miette!(
                         "desired generation changed before activation"
@@ -5500,6 +5522,54 @@ network_policies:
                 );
             }
             Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_pending_gateway_calls_exhaust_their_budgets() {
+        for pending_snapshot in [true, false] {
+            let mut policy = proto_policy_fixture();
+            enrich_proto_baseline_paths(&mut policy);
+            let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = TestStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    Some(policy),
+                    1,
+                    openshell_core::proto::PolicySource::Sandbox,
+                ))),
+                reports,
+                reject_next_accept: Arc::new(AtomicBool::new(false)),
+                snapshot_error: None,
+                report_error: None,
+                pending_snapshot,
+                pending_acceptance: !pending_snapshot,
+            };
+            let result = timeout(
+                Duration::from_secs(120),
+                load_policy_with_gateway(
+                    Some("sandbox-id".to_string()),
+                    Some("sandbox".to_string()),
+                    Some("http://unused.invalid".to_string()),
+                    None,
+                    None,
+                    &openshell_extension_core::ExtensionCredentialStore::new(),
+                    Some(sidecar_control::ImagePolicyDiscovery::Missing),
+                    &gateway,
+                ),
+            )
+            .await
+            .expect("pending RPC must not hang startup");
+            let Err(error) = result else {
+                panic!("pending gateway unexpectedly admitted startup")
+            };
+            assert!(
+                error.to_string().contains(if pending_snapshot {
+                    "failed after 5 attempts"
+                } else {
+                    "did not stabilize after 5 attempts"
+                }),
+                "{error}"
+            );
         }
     }
 
@@ -5546,6 +5616,8 @@ network_policies:
                 reject_next_accept: Arc::new(AtomicBool::new(false)),
                 snapshot_error,
                 report_error,
+                pending_snapshot: false,
+                pending_acceptance: false,
             };
             let result = timeout(
                 Duration::from_secs(1),
@@ -5588,6 +5660,8 @@ network_policies:
             reject_next_accept: Arc::new(AtomicBool::new(true)),
             snapshot_error: None,
             report_error: None,
+            pending_snapshot: false,
+            pending_acceptance: false,
         };
         let active_gateway = gateway.clone();
         let handle = tokio::spawn(async move {

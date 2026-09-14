@@ -78,6 +78,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }

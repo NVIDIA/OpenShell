@@ -539,7 +539,8 @@ the matching provider environment and constructs the runtime before reporting
 acceptance. Live reconciliation begins only after the main process has spawned,
 so it cannot replace the configuration captured for that launch. Restart resets
 admission and requires a fresh accepted configuration. Permanent gateway errors
-and exhausted transient retries terminate startup; only acknowledged configuration
+and exhausted transient retries terminate startup; each RPC attempt has a
+10-second deadline, including acceptance reports; only acknowledged configuration
 rejections wait indefinitely for repair. Process-sidecar discovery uses the
 existing sidecar readiness timeout.
 
