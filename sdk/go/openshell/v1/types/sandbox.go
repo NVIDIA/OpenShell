@@ -109,7 +109,7 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName          string
+	Sandbox              string
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string

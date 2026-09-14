@@ -3474,7 +3474,7 @@ fn print_service_endpoint_table(
             };
             Some((
                 workspace.to_string(),
-                endpoint.sandbox_name.clone(),
+                endpoint.sandbox.clone(),
                 service,
                 target,
                 url,
@@ -3563,7 +3563,7 @@ fn service_endpoint_to_json(
 
     Some(serde_json::json!({
         "workspace": workspace,
-        "sandbox": endpoint.sandbox_name,
+        "sandbox": endpoint.sandbox,
         "service": endpoint.service_name,
         "target_port": endpoint.target_port,
         "url": url,
@@ -5940,7 +5940,7 @@ mod tests {
                     workspace: "team-a".to_string(),
                     ..Default::default()
                 }),
-                sandbox_name: "api".to_string(),
+                sandbox: "api".to_string(),
                 service_name: String::new(),
                 target_port: 8080,
                 ..Default::default()
@@ -6705,7 +6705,7 @@ mod tests {
     #[test]
     fn ready_false_condition_message_prefers_reason_and_message() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
+            sandbox: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -6726,7 +6726,7 @@ mod tests {
     #[test]
     fn ready_false_condition_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
+            sandbox: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),

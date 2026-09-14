@@ -2177,7 +2177,7 @@ func (x *SandboxWorkloadTemplateProvenance) GetResourceVersion() string {
 type SandboxStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Compute-platform sandbox object name.
-	SandboxName string `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Name of the agent pod or equivalent runtime instance.
 	AgentPod string `protobuf:"bytes,2,opt,name=agent_pod,json=agentPod,proto3" json:"agent_pod,omitempty"`
 	// File descriptor or endpoint for reaching the agent service, when available.
@@ -2231,9 +2231,9 @@ func (*SandboxStatus) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{28}
 }
 
-func (x *SandboxStatus) GetSandboxName() string {
+func (x *SandboxStatus) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -4419,7 +4419,7 @@ type ServiceEndpoint struct {
 	// Sandbox object ID.
 	SandboxId string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	// Sandbox name.
-	SandboxName string `protobuf:"bytes,3,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	Sandbox string `protobuf:"bytes,3,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Service name within the sandbox.
 	ServiceName string `protobuf:"bytes,4,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
 	// Loopback TCP port inside the sandbox.
@@ -4474,9 +4474,9 @@ func (x *ServiceEndpoint) GetSandboxId() string {
 	return ""
 }
 
-func (x *ServiceEndpoint) GetSandboxName() string {
+func (x *ServiceEndpoint) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -14416,9 +14416,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"b\n" +
 	"!SandboxWorkloadTemplateProvenance\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
-	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\x9a\x03\n" +
-	"\rSandboxStatus\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1b\n" +
+	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\x91\x03\n" +
+	"\rSandboxStatus\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
 	"\bagent_fd\x18\x03 \x01(\tR\aagentFd\x12\x1d\n" +
 	"\n" +
@@ -14579,12 +14579,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12R\n" +
 	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"1\n" +
 	"\x15DeleteServiceResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xef\x01\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xe6\x01\n" +
 	"\x0fServiceEndpoint\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\x03 \x01(\tR\vsandboxName\x12!\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x18\n" +
+	"\asandbox\x18\x03 \x01(\tR\asandbox\x12!\n" +
 	"\fservice_name\x18\x04 \x01(\tR\vserviceName\x12\x1f\n" +
 	"\vtarget_port\x18\x05 \x01(\rR\n" +
 	"targetPort\x12\x16\n" +

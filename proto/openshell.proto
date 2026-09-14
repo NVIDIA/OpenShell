@@ -1045,7 +1045,7 @@ message SandboxWorkloadTemplateProvenance {
 // Public status does not embed driver-only flags such as `deleting`.
 message SandboxStatus {
   // Compute-platform sandbox object name.
-  string sandbox_name = 1;
+  string sandbox = 1;
   // Name of the agent pod or equivalent runtime instance.
   string agent_pod = 2;
   // File descriptor or endpoint for reaching the agent service, when available.
@@ -1452,7 +1452,7 @@ message ServiceEndpoint {
   // Sandbox object ID.
   string sandbox_id = 2;
   // Sandbox name.
-  string sandbox_name = 3;
+  string sandbox = 3;
   // Service name within the sandbox.
   string service_name = 4;
   // Loopback TCP port inside the sandbox.

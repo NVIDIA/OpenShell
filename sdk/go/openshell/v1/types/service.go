@@ -7,7 +7,7 @@ package types
 type ServiceEndpoint struct {
 	ID          string
 	SandboxID   string
-	SandboxName string
+	Sandbox     string
 	ServiceName string
 	TargetPort  uint32
 	Domain      bool

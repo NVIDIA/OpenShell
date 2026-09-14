@@ -67,7 +67,7 @@ func TestSandboxFromProto(t *testing.T) {
 			ResourceVersion: "7",
 		},
 		Status: &pb.SandboxStatus{
-			SandboxName:           "sb-compute-1",
+			Sandbox:               "sb-compute-1",
 			AgentPod:              "agent-pod-xyz",
 			AgentFd:               "fd-agent",
 			SandboxFd:             "fd-sandbox",
@@ -130,7 +130,7 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "val", nested["key"])
 
 	// Status
-	assert.Equal(t, "sb-compute-1", s.Status.SandboxName)
+	assert.Equal(t, "sb-compute-1", s.Status.Sandbox)
 	assert.Equal(t, "agent-pod-xyz", s.Status.AgentPod)
 	assert.Equal(t, "fd-agent", s.Status.AgentFd)
 	assert.Equal(t, "fd-sandbox", s.Status.SandboxFd)

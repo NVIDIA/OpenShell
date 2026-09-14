@@ -623,7 +623,7 @@ impl OpenShell for TestOpenShell {
             provisioning.set_phase(SandboxPhase::Provisioning as i32);
             let mut error = Sandbox {
                 status: Some(SandboxStatus {
-                    sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
+                    sandbox: sandbox_id.trim_start_matches("id-").to_string(),
                     conditions: vec![SandboxCondition {
                         r#type: "Ready".to_string(),
                         status: "False".to_string(),

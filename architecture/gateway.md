@@ -334,7 +334,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`6c803d61db1b667d78a6fd7e781316e681bf9093eaef7010f07cb3b9aa672ccb`).
+(`8ddde6ce644b153aa91f515a417eaeaa37521030d490bc045e1543c4d571c12c`).
 
 Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
@@ -350,7 +350,7 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The 12 encoded durable roots above have a closure of 81 messages and eight
-enums (`920a5243dfb37ce709f0f562a47d17791a5ede90fd7f662ed01542abd60a0dfb`).
+enums (`05322f3c82030b30387ff6829e3c7fef1ecc39de7a588d8ee549f44814367fa3`).
 Its intersection with the public RPC closure contains 71 messages and eight
 enums (`05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415`).
 The descriptor-derived test owns these full inventories; the tables here record
@@ -394,6 +394,9 @@ Public API compatibility and storage compatibility are reviewed independently:
   dependency requires both public-wire review and storage-migration review.
   Wire-incompatible changes require a migration or fallback decoder and a
   fixture for the earlier format.
+- Renaming `SandboxStatus.sandbox_name` and `ServiceEndpoint.sandbox_name` to
+  `sandbox` retains their field numbers and string wire types. Checked-in
+  payloads from before the rename verify that no storage migration is needed.
 - Mixed-version writers are unsupported. An older Prost writer can discard
   fields it does not know when it reads and rewrites a record, even when the
   newer field is wire-compatible.

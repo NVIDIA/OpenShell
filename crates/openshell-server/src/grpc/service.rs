@@ -101,7 +101,7 @@ pub(super) async fn handle_expose_service(
             deletion_timestamp_ms: 0,
         }),
         sandbox_id: sandbox.object_id().to_string(),
-        sandbox_name: sandbox_name.to_string(),
+        sandbox: sandbox_name.to_string(),
         service_name: req.service.clone(),
         target_port: req.target_port,
         domain: true,
@@ -301,7 +301,7 @@ fn service_endpoint_response(
     let url = service_routing::endpoint_url(
         &state.config,
         workspace,
-        &endpoint.sandbox_name,
+        &endpoint.sandbox,
         &endpoint.service_name,
     )
     .unwrap_or_default();

@@ -3773,7 +3773,7 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
             })
         });
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
-        sandbox_name: sandbox_name.clone(),
+        sandbox: sandbox_name.clone(),
         ..Default::default()
     });
     status.main_process_instance_id = instance_id.to_string();
@@ -4180,7 +4180,7 @@ fn build_platform_resources_config(
 
 fn driver_status_from_public(status: &SandboxStatus) -> DriverSandboxStatus {
     DriverSandboxStatus {
-        sandbox_name: status.sandbox_name.clone(),
+        sandbox_name: status.sandbox.clone(),
         instance_id: status.agent_pod.clone(),
         agent_fd: status.agent_fd.clone(),
         sandbox_fd: status.sandbox_fd.clone(),
@@ -4240,7 +4240,7 @@ fn public_status_from_driver(
     current_policy_version: u32,
 ) -> SandboxStatus {
     SandboxStatus {
-        sandbox_name: status.sandbox_name.clone(),
+        sandbox: status.sandbox_name.clone(),
         agent_pod: status.instance_id.clone(),
         agent_fd: status.agent_fd.clone(),
         sandbox_fd: status.sandbox_fd.clone(),
@@ -4341,9 +4341,9 @@ fn apply_driver_snapshot(
     }
 
     if let Some(status) = status.as_mut()
-        && status.sandbox_name.is_empty()
+        && status.sandbox.is_empty()
     {
-        status.sandbox_name.clone_from(sandbox_name);
+        status.sandbox.clone_from(sandbox_name);
     }
     if let (Some(status), Some(current_status)) = (status.as_mut(), sandbox.status.as_ref()) {
         status
@@ -4537,7 +4537,7 @@ fn upsert_ready_condition(
     condition: SandboxCondition,
 ) {
     let status = status.get_or_insert_with(|| SandboxStatus {
-        sandbox_name: sandbox_name.to_string(),
+        sandbox: sandbox_name.to_string(),
         ..Default::default()
     });
 
@@ -6227,7 +6227,7 @@ mod tests {
                 deletion_timestamp_ms: 0,
             }),
             sandbox_id: sandbox.object_id().to_string(),
-            sandbox_name: sandbox.object_name().to_string(),
+            sandbox: sandbox.object_name().to_string(),
             service_name: "web".to_string(),
             target_port: 8080,
             domain: true,
@@ -6714,7 +6714,7 @@ mod tests {
     #[test]
     fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
         let mut status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             agent_pod: "test-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -6747,7 +6747,7 @@ mod tests {
     fn rewrite_user_facing_conditions_leaves_non_gpu_unschedulable_message_unchanged() {
         let original = "0/1 nodes are available: 1 Insufficient cpu.";
         let mut status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
+            sandbox: "test".to_string(),
             agent_pod: "test-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -9268,7 +9268,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
-            sandbox_name: "sandbox-a".to_string(),
+            sandbox: "sandbox-a".to_string(),
             main_process_instance_id: "instance-1".to_string(),
             ..Default::default()
         });
@@ -9331,7 +9331,7 @@ mod tests {
             SandboxPhase::Stopped,
         );
         sandbox.status = Some(SandboxStatus {
-            sandbox_name: sandbox.object_name().to_string(),
+            sandbox: sandbox.object_name().to_string(),
             phase: SandboxPhase::Stopped as i32,
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
@@ -9368,7 +9368,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Completed);
         sandbox.status = Some(SandboxStatus {
-            sandbox_name: "sandbox-a".to_string(),
+            sandbox: "sandbox-a".to_string(),
             phase: SandboxPhase::Completed as i32,
             main_process_instance_id: "instance-1".to_string(),
             exit_code: Some(0),
@@ -9400,7 +9400,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
-            sandbox_name: "sandbox-a".to_string(),
+            sandbox: "sandbox-a".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "True".to_string(),
@@ -9528,7 +9528,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
-            sandbox_name: "sandbox-a".to_string(),
+            sandbox: "sandbox-a".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "True".to_string(),

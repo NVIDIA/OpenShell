@@ -55,7 +55,7 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 			Metadata: &dm.ObjectMeta{
 				Id: "ep-" + req.GetService(),
 			},
-			SandboxName: req.GetSandbox(),
+			Sandbox:     req.GetSandbox(),
 			ServiceName: req.GetService(),
 			TargetPort:  req.GetTargetPort(),
 			Domain:      req.GetDomain(),
@@ -155,7 +155,7 @@ func TestServiceExpose(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ep)
 	assert.Equal(t, "ep-api", ep.ID)
-	assert.Equal(t, "web-app", ep.SandboxName)
+	assert.Equal(t, "web-app", ep.Sandbox)
 	assert.Equal(t, "api", ep.ServiceName)
 	assert.Equal(t, uint32(8080), ep.TargetPort)
 	assert.True(t, ep.Domain)
@@ -202,7 +202,7 @@ func TestServiceGet(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ep)
 	assert.Equal(t, "api", ep.ServiceName)
-	assert.Equal(t, "web-app", ep.SandboxName)
+	assert.Equal(t, "web-app", ep.Sandbox)
 }
 
 func TestServiceGet_NotFound(t *testing.T) {
