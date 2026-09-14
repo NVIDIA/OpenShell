@@ -136,6 +136,10 @@
             type = "app";
             program = "${artifacts.binaries}/bin/build-artifacts-binaries";
           };
+          build-artifacts-test-archives = {
+            type = "app";
+            program = "${artifacts.conformanceCliArchive}/bin/build-openshell-conformance-test-archive";
+          };
           build-artifacts-helm = {
             type = "app";
             program = "${artifacts.helm}/bin/build-artifacts-helm";
