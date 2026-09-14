@@ -203,6 +203,36 @@ server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
 ```
 
+#### Database PVC storage
+
+Size the gateway database claim and select its StorageClass with
+`server.databaseStorageSize` and `server.databaseStorageClass`. Omitting both
+requests `1Gi` from the cluster's default StorageClass. Set
+`server.databaseStorageClass` on clusters with no default StorageClass,
+otherwise the gateway PVC stays Pending. Both values are ignored under
+`workload.kind=deployment`, which mounts no PVC.
+
+```yaml
+server:
+  databaseStorageSize: 20Gi
+  databaseStorageClass: fast-ssd
+```
+
+`volumeClaimTemplates` is immutable, so set both at install time. To grow an
+existing claim, expand it in place when its StorageClass allows expansion, then
+recreate the StatefulSet so its template matches:
+
+```shell
+kubectl -n openshell patch pvc openshell-data-openshell-0 \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl -n openshell delete statefulset openshell --cascade=orphan
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+  --reuse-values -n openshell --set server.databaseStorageSize=20Gi
+```
+
+A recreated StatefulSet re-adopts existing claims unchanged, so changing
+StorageClass means copying the data to a new claim.
+
 #### External PostgreSQL
 
 Use external PostgreSQL when the gateway should connect to a database managed
