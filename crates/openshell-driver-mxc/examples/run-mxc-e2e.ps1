@@ -146,6 +146,7 @@ $policyDir = Join-Path $here "e2e-policies"
 
 $cmdExe     = "C:\Windows\System32\cmd.exe"
 $demoDirFwd = $DemoDir.Replace('\', '/')
+$defaultDemoDir = "C:\work\openshell-mxc-e2e"
 $roSrc      = "$DemoDir-ro-src"      # matches e2e-policies/fs-readonly.yaml read_only path
 $denyProbe  = "$DemoDir-deny-probe"  # ungranted, NOT the share: used to prove default-deny
 
@@ -515,6 +516,19 @@ try {
                 continue
             }
 
+            # Render a disposable policy for every scenario. The source YAML
+            # intentionally carries the documented default paths, while
+            # -DemoDir is a supported override. Both the read-write path and
+            # the read-only sibling share the same default prefix, so one
+            # exact prefix substitution keeps their relative naming intact.
+            $policyUsed = Join-Path $resultDir "policy.$($sc.Name).yaml"
+            $policyText = Get-Content $sc.PolicyFile -Raw
+            $policyText = $policyText.Replace(
+                $defaultDemoDir.Replace('\', '/'),
+                $DemoDir.Replace('\', '/')
+            )
+            Set-Content -Path $policyUsed -Value $policyText -Encoding UTF8
+
             # Per-scenario gateway logs land in the bundle under their own names.
             $gwLog    = Join-Path $resultDir "gateway.$($sc.Name).log"
             $gwErrLog = Join-Path $resultDir "gateway.$($sc.Name).err.log"
@@ -547,7 +561,8 @@ try {
             Render-Toml
             # Preserve the exact rendered config + policy fixture used for this scenario.
             Copy-Item $toml (Join-Path $resultDir "mxc-gateway.$($sc.Name).toml") -Force -ErrorAction SilentlyContinue
-            Copy-Item $sc.PolicyFile (Join-Path $resultDir "policy.$($sc.Name).yaml") -Force -ErrorAction SilentlyContinue
+            # policyUsed already lives in the result bundle and is the exact
+            # rendered policy passed to OpenShell.
 
             $gw = Start-Gw
             Info "gateway pid $($gw.Id)"
@@ -563,7 +578,7 @@ try {
             try {
                 $createResult = Invoke-NativeCaptured $cli @(
                     "sandbox", "create", "--name", $sandboxName,
-                    "--policy", [string]$sc.PolicyFile,
+                    "--policy", [string]$policyUsed,
                     "--driver-config-json", $driverConfig,
                     "--no-tty"
                 )

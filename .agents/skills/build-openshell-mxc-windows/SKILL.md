@@ -17,6 +17,7 @@ Windows MSVC for the supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
+- `openshell-supervisor-relay.exe` (Windows-only MXC workload relay)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
@@ -115,7 +116,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for bundled Z3 and other native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses MSVC's Visual Studio generator. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses an architecture-specific prebuilt release. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -135,6 +136,8 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
+| `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
+| `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
 | `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
@@ -153,9 +156,17 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
-mise run --skip-tools windows:test:mxc-real:x64
-mise run --skip-tools windows:test:mxc-real:arm64
 ```
+
+The two `windows:test:mxc-real:*` tasks are host-specific and mutually
+exclusive on a single host (each rejects the other architecture -- see the
+table below): run `windows:test:mxc-real:x64` on an x64 host, or
+`windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
+subsystem -- run the one matching your host architecture, not both, and not
+neither. Both are skip-safe (they print a SKIP reason and exit 0 when
+`wxc-exec` or the matching backend isn't available), so running the
+arch-appropriate task is always safe even without real MXC hardware. Neither
+is part of `windows:ci`'s ordered contract, so invoke it explicitly.
 
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:
@@ -165,12 +176,14 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
+        mise run --skip-tools windows:test:mxc-real:x64
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
         mise run --skip-tools windows:build:arm64
         mise run --skip-tools windows:test:arm64
         mise run --skip-tools windows:test:unsupported:arm64
+        mise run --skip-tools windows:test:mxc-real:arm64
         mise run --skip-tools windows:artifacts
     }
     default {
@@ -205,8 +218,8 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and builds bundled Z3 with native MSVC `cl.exe` and the Visual
-Studio generator.
+`clang-cl`, and uses the official prebuilt Z3 static library for the target
+architecture.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -317,8 +330,8 @@ Useful log files:
 | `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
 | `test-aarch64-pc-windows-msvc-mxc-real.log` | Native ARM64 real-MXC integration output. |
 
-The first check builds bundled Z3 from source through `z3-sys`. Cargo stores the
-native build output in its target tree, so the Windows target cache reuses it.
+The first check downloads the pinned prebuilt Z3 release through `z3-sys`.
+Cargo stores the extracted archive in its target tree for subsequent builds.
 The resulting release executables do not require `libz3.dll`. The artifact
 report computes SHA256 through .NET directly and does not rely on the
 `Get-FileHash` module being available inside the mise-launched Windows

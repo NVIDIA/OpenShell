@@ -34,9 +34,18 @@ uuid = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-supervisor-network = { path = "../openshell-supervisor-network" }
 windows = { workspace = true }
+# WebSocket relay embedded in the gateway for ProcessContainer host<->sandbox
+# connectivity (see src/relay.rs).
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+# Per-forward auth nonce for the relay (see src/relay.rs module docs).
+rand = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"
 # Used by Windows-only integration tests to parse policy YAML into the typed

@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# mxc-openclaw-gateway.toml
+#
+# Runs OpenClaw's gateway inside an MXC ProcessContainer, with its port
+# reachable from the host via dynamic `openshell forward service` bridging
+# (openshell-supervisor-relay.exe + the driver's on-demand relay -- see
+# crates/openshell-driver-mxc/src/relay.rs). There is no static/always-on
+# bridge: every `forward service` call opens its own short-lived relay.
+#
+# Driven by run-openclaw-forward-test.ps1, which patches wxc_exec_path and
+# stages node.exe / openclaw-capture.mjs / openshell-supervisor-relay.exe /
+# the caller's OpenClaw install into share_dir before creating the sandbox
+# (the AppContainer here can only read paths under share_dir -- see the
+# script's "Stage artifacts into share_dir" step for why).
+
+[openshell]
+version = 2
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+
+backend           = "process_container"
+pc_capabilities   = ["privateNetworkClientServer"]
+pc_least_privilege = false
+# UI capability is now a SandboxPolicy concern, not gateway TOML -- see
+# openclaw-gateway.yaml's `ui: { allow_graphical_ui: true, ... }`. Needed
+# because Node.js (OpenClaw's runtime) touches user32/gdi32 during its own
+# startup and dies with STATUS_DLL_INIT_FAILED under the Win32k lockdown
+# that applies when a policy has no `ui:` section, confirmed empirically
+# against mxc-release-binaries-v0.8.0, even though this target never
+# actually opens a window.
+
+# Egress proxy for outbound TCP connectivity.
+egress_proxy      = true
+egress_proxy_addr = "127.0.0.1:18080"
+
+# Do not seed from host env — use only the curated set in agent_env below.
+pc_minimal_env = true
+
+share_dir = "C:/openshell-openclaw"
+agent_cwd = "C:/openshell-openclaw"
+
+agent_command = [
+  "C:/openshell-openclaw/node.exe",
+  "C:/openshell-openclaw/openclaw-capture.mjs",
+  "gateway", "run", "--dev", "--allow-unconfigured",
+  "--auth", "token", "--bind", "loopback", "--port", "18889",
+]
+
+# Verified-minimal env set (binary-searched down from a 39-entry "copy the
+# whole host env" list): each var here was confirmed load-bearing by
+# stripping it and re-testing against a live sandbox. Two surprises from that
+# search, worth knowing before touching this list:
+#   - SYSTEMROOT/WINDIR/PATH/COMSPEC alone are NOT enough. Without
+#     LOCALAPPDATA, CreateProcessW itself fails with ERROR_ENVVAR_NOT_FOUND
+#     (Win32 203) under this sandbox's appcontainer-dacl fallback tier --
+#     before Node.js ever runs. This is a Windows AppContainer-profile
+#     requirement, not a Node.js one.
+#   - SYSTEMDRIVE was tested and confirmed NOT required, despite looking
+#     like a natural companion to SYSTEMROOT.
+# Bare keys are resolved from the gateway host env at sandbox creation time.
+# KEY=VALUE entries are passed verbatim.
+agent_env = [
+  "SYSTEMROOT",
+  "WINDIR",
+  "PATH",
+  "COMSPEC",
+  # LOCALAPPDATA redirected to share_dir: the AppContainer cannot write to the
+  # host user's AppData path, and OpenClaw uses LOCALAPPDATA as a fallback
+  # temp dir for its SQLite read-only backup worker.
+  "LOCALAPPDATA=C:/openshell-openclaw/local",
+  # Home/temp redirected to share_dir so openclaw can write state
+  "HOME=C:/openshell-openclaw/home",
+  "USERPROFILE=C:/openshell-openclaw/home",
+  "TEMP=C:/openshell-openclaw/temp",
+  "TMP=C:/openshell-openclaw/temp",
+  "NEMOCLAW_MXC_CAPTURE_ENTRY=C:/openshell-openclaw/runtime/node_modules/openclaw/openclaw.mjs",
+  "NEMOCLAW_MXC_CAPTURE_LOG=C:/openshell-openclaw/openclaw-capture.log",
+  # Node 22 only consults HTTP_PROXY/HTTPS_PROXY for fetch when this option
+  # is enabled. The driver supplies the actual per-sandbox proxy URL.
+  "NODE_OPTIONS=--use-env-proxy",
+  "NEMOCLAW_MXC_EGRESS_PROOF=1",
+  "NEMOCLAW_MXC_EGRESS_ALLOWED_URL=https://example.com/",
+  "NEMOCLAW_MXC_EGRESS_DENIED_URL=https://example.org/",
+  "NEMOCLAW_MXC_EGRESS_DIRECT_HOST=1.1.1.1",
+  "NEMOCLAW_MXC_EGRESS_LOOPBACK_PORT=29999",
+  # Credential-free target-side probe used only by the qualification harness.
+  # It records response byte counts, never response payloads.
+  "NEMOCLAW_MXC_CAPTURE_SELF_PROBE_PORT=18889",
+  # Required for a stable/known token instead of a fresh random one every
+  # restart. run-openclaw-forward-test.ps1 sets this in the gateway's own
+  # process env before launching it.
+  "OPENCLAW_GATEWAY_TOKEN",
+]
+
+# Launch agent_command via the generic openshell-supervisor-relay binary
+# instead of directly. The driver sends agent_command/agent_env over the
+# control channel once the spawner announces readiness (the "launch"
+# handshake), and spawns OpenClaw with no relay awareness. pc_relay_target_port
+# is OpenClaw's own
+# --port above: used as an early liveness check (does the target ever bind
+# it?) and as the target port openshell-supervisor-relay bridges by default.
+# There is no static bridge -- relay bridging is entirely on-demand via
+# ForwardSink::open_dynamic_forward / the control channel's "forward" op,
+# driven by `openshell forward service --target-port 18889`.
+pc_relay_spawner_path = "C:/openshell-openclaw/openshell-supervisor-relay.exe"
+pc_relay_target_port  = 18889
+
+debug = true

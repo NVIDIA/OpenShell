@@ -60,10 +60,7 @@ pub fn build_policy_update_plan(
             endpoints: vec![endpoint.clone()],
             binaries: deduped_binaries
                 .iter()
-                .map(|path| NetworkBinary {
-                    path: path.clone(),
-                    ..Default::default()
-                })
+                .map(|path| NetworkBinary { path: path.clone() })
                 .collect(),
         };
         merge_operations.push(PolicyMergeOperation {

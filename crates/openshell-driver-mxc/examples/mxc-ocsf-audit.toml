@@ -13,6 +13,9 @@
 # egress-proxy switch into a disposable copy of this file. Workload command and
 # cwd are sandbox-scoped and passed separately through --driver-config-json.
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe on the box (patched by the run script; default is the
 # location observed on the MXC test boxes).

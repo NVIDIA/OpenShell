@@ -96,8 +96,11 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 ## Credentials, TLS, and Relay
 
 The driver injects gateway callback configuration, sandbox identity, TLS client
-material, and the supervisor SSH socket path into the workload. Driver-owned
-values must override image-provided environment variables.
+material, and the supervisor SSH socket path into the workload. The callback
+endpoint is required because the sandbox namespace does not identify the
+Gateway Service; Helm renders it from the release topology, while standalone
+and raw TOML configurations must set it explicitly. Driver-owned values must
+override image-provided environment variables.
 
 Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
@@ -152,14 +155,13 @@ abstract socket whose peer PID must match that authenticated supervisor. Both
 supervisors exit if the control connection closes, coupling their container
 restart lifecycle before a new authoritative client can be established.
 
-The driver can request a Kubernetes AppArmor profile through
-`app_armor_profile`.
-
+The driver uses the shared AppArmor model through `app_armor_profile`.
 Supported values are `Unconfined`, `RuntimeDefault`, and
-`Localhost/<profile-name>`. An empty or unset value omits
-`securityContext.appArmorProfile`. Helm deployments default sandbox agent
-containers to `Unconfined` because runtime/default AppArmor profiles can block
-the supervisor's network namespace mount setup on AppArmor-enabled nodes.
+`Localhost/<profile-name>`; an empty or unset value omits
+`securityContext.appArmorProfile`. Docker and Podman translate the same values
+to OCI security options. Helm deployments default sandbox agent containers to
+`Unconfined` because runtime/default AppArmor profiles can block the
+supervisor's network namespace mount setup on AppArmor-enabled nodes.
 
 ## GPU Support
 

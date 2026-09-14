@@ -35,6 +35,16 @@ only when the set is already empty; any other outcome fails the spawn.
 6. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
 
+## Deletion Authority
+
+The public delete API resolves a sandbox name to its immutable metadata ID and
+holds that ID's lifecycle lock through the pre-mutation check. Callers that
+already observed a sandbox may also supply its expected ID and resource
+version. OpenShell revalidates those preconditions under the lifecycle and
+gateway-global locks, then returns `ABORTED` without changing durable state or
+calling the compute driver if either value drifted. An unguarded delete retains
+the interactive CLI's existing name-based behavior.
+
 ## Isolation Layers
 
 OpenShell uses overlapping controls rather than a single sandbox primitive:

@@ -125,6 +125,13 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
+SHAs. PR runs compare the tested merge commit with its
+first parent; change detection and scans must use the same pair. On reruns, do
+not substitute the current `main` tip or the event's older PR base SHA. Merge
+groups and manual runs use their explicit baseline. Findings are reported by
+`Reject new high or critical findings`; distinguish those from scanner failures.
+
 View logs for a specific run:
 
 ```bash

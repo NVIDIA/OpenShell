@@ -9,6 +9,20 @@ use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSa
 use prost::Message;
 use std::collections::HashMap;
 
+#[derive(Clone, PartialEq, Message)]
+struct RawPolicyRevisionPayload {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    policy: Option<Vec<u8>>,
+    #[prost(string, tag = "2")]
+    hash: String,
+    #[prost(string, tag = "3")]
+    load_error: String,
+    #[prost(int64, tag = "4")]
+    loaded_at_ms: i64,
+    #[prost(map = "string, string", tag = "5")]
+    provenance: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AtomicPolicyRevisionWrite {
     pub id: String,
@@ -448,10 +462,10 @@ impl PolicyStoreExt for Store {
 }
 
 pub fn policy_payload_from_record(record: &PolicyRecord) -> PersistenceResult<Vec<u8>> {
-    let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+    ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("decode policy payload failed: {e}")))?;
-    Ok(PolicyRevisionPayload {
-        policy: Some(policy),
+    Ok(RawPolicyRevisionPayload {
+        policy: Some(record.policy_payload.clone()),
         hash: record.policy_hash.clone(),
         load_error: record.load_error.clone().unwrap_or_default(),
         loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
@@ -468,16 +482,21 @@ pub fn policy_record_from_parts(
     payload: &[u8],
     created_at_ms: i64,
 ) -> PersistenceResult<PolicyRecord> {
+    let raw_wrapper = RawPolicyRevisionPayload::decode(payload)
+        .map_err(|e| PersistenceError::Decode(format!("decode raw policy wrapper failed: {e}")))?;
     let wrapper = PolicyRevisionPayload::decode(payload)
         .map_err(|e| PersistenceError::Decode(format!("decode policy wrapper failed: {e}")))?;
-    let policy = wrapper
+    wrapper
+        .policy
+        .ok_or_else(|| PersistenceError::Decode("policy wrapper missing policy".to_string()))?;
+    let policy_payload = raw_wrapper
         .policy
         .ok_or_else(|| PersistenceError::Decode("policy wrapper missing policy".to_string()))?;
     Ok(PolicyRecord {
         id,
         sandbox_id,
         version,
-        policy_payload: policy.encode_to_vec(),
+        policy_payload,
         policy_hash: wrapper.hash,
         status,
         load_error: if wrapper.load_error.is_empty() {

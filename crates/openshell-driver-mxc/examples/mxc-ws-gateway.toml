@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# mxc-ws-gateway.toml - Gateway config for the WebSocket agent test.
+#
+# Used by run-ws-agent-test.ps1.  Fields that contain host-specific paths
+# (wxc_exec_path, share_dir, agent_cwd, agent_command, pc_relay_spawner_path)
+# are patched at test runtime by the script; the values below are
+# safe-to-commit placeholders.
+#
+# Layout:
+#   agent_command   = mxc-ws-agent.exe server
+#                     Binds WebSocket on 0.0.0.0:22000, echoes messages back.
+#                     No relay awareness -- launched the same way OpenClaw's
+#                     gateway is in mxc-openclaw-gateway.toml.
+#
+#   pc_relay_spawner_path / pc_relay_target_port
+#                     Wrap agent_command in openshell-supervisor-relay.exe
+#                     instead of launching it directly (see driver.rs's
+#                     launch handshake). This is what gives the driver a
+#                     control channel into the sandbox, which dynamic
+#                     forwarding depends on.
+#
+# Connectivity: entirely on-demand via `openshell forward service
+# --target-port 22000` (ForwardSink::open_dynamic_forward / the control
+# channel's "forward" op) -- there is no static/always-on bridge and no
+# port pre-declared in this config beyond pc_relay_target_port's own
+# startup liveness check.
+#
+# Shutdown sequence on `sandbox delete`:
+#   driver sends "shutdown" over the control channel (see driver.rs)
+#   openshell-supervisor-relay kills the server directly and exits
+#   driver also kills wxc-exec as a backstop regardless
+
+[openshell]
+version = 2
+
+[openshell.drivers.mxc]
+# Path to wxc-exec.exe.  Patched at runtime by run-ws-agent-test.ps1.
+# Leave commented for mock-mode smoke tests (pass -Mock to the script).
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+
+# One-shot AppContainer backend: genuinely default-deny at the OS level.
+backend = "process_container"
+
+# AppContainer capability required for the server to bind a TCP socket on
+# 0.0.0.0:22000.  "privateNetworkClientServer" allows the sandbox to act as
+# both a client and a server on private (home/work/loopback) networks.
+pc_capabilities = ["privateNetworkClientServer"]
+
+# process_container only: keep standard privilege level (not LPA).
+pc_least_privilege = false
+
+# Egress proxy for outbound TCP connectivity -- required for
+# openshell-supervisor-relay to dial out to the driver's on-demand relay
+# (see mxc-openclaw-gateway.toml, which uses the same pattern).
+egress_proxy      = true
+egress_proxy_addr = "127.0.0.1:18080"
+
+# Host folder mapped read-write into the AppContainer by the policy mapper.
+# Must contain mxc-ws-agent.exe and openshell-supervisor-relay.exe.
+# Patched at runtime by run-ws-agent-test.ps1.
+share_dir = "C:/work/openshell-mxc-ws"
+
+# Working directory inside the AppContainer.  Must match share_dir.
+# Patched at runtime by run-ws-agent-test.ps1.
+agent_cwd = "C:/work/openshell-mxc-ws"
+
+# The target application -- launched via the spawner wrapper below, not
+# directly.  Patched at runtime by run-ws-agent-test.ps1.
+agent_command = [
+  "C:/work/openshell-mxc-ws/mxc-ws-agent.exe",
+  "server",
+]
+
+# Launch agent_command via the generic openshell-supervisor-relay binary.
+# Patched at runtime by run-ws-agent-test.ps1.
+pc_relay_spawner_path = "C:/work/openshell-mxc-ws/openshell-supervisor-relay.exe"
+pc_relay_target_port  = 22000
+
+# Enable for verbose wxc-exec output during debugging.
+debug = true

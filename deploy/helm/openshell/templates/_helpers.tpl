@@ -104,6 +104,7 @@ defaults.
 */}}
 {{- define "openshell.gatewayClientCaEnabled" -}}
 {{- if .Values.server.disableTls -}}
+{{- else if not .Values.server.tls.enableMtls -}}
 {{- else if eq .Values.server.tls.clientCaSecretName "" -}}
 {{- else if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
 true
@@ -241,6 +242,13 @@ Returns a YAML list. Append extra SANs from values with range loops.
 {{- end }}
 
 {{/*
+Name of the ConfigMap holding the backend CA for BackendTLSPolicy validation.
+*/}}
+{{- define "openshell.backendCaConfigMapName" -}}
+{{- .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName | default (printf "%s-backend-ca" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
 Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}
@@ -250,6 +258,26 @@ database requires persistent per-pod storage.
 {{- fail "workload must be a map with kind and allowMultiReplicaStatefulSet fields." -}}
 {{- end -}}
 {{- default "statefulset" (get $workload "kind") | lower -}}
+{{- end }}
+
+{{/*
+Translate chart image pull policy values to the canonical gateway vocabulary.
+The Kubernetes spellings remain accepted so existing values files continue to
+work across the schema-v2 chart upgrade.
+*/}}
+{{- define "openshell.canonicalImagePullPolicy" -}}
+{{- $policy := printf "%v" . -}}
+{{- if eq $policy "Always" -}}
+always
+{{- else if eq $policy "IfNotPresent" -}}
+if_not_present
+{{- else if eq $policy "Never" -}}
+never
+{{- else if has $policy (list "always" "if_not_present" "never") -}}
+{{- $policy -}}
+{{- else -}}
+{{- fail (printf "image pull policy %q must be one of: always, if_not_present, never, Always, IfNotPresent, Never" $policy) -}}
+{{- end -}}
 {{- end }}
 
 {{/*

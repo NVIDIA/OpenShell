@@ -119,9 +119,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b8bf18823be844bb21721c7761a7c6315b09d2d6646b0a488deb4ad949bb0472";
+        "0632785d932b870c2a9d44650e8573053e7f463f0a803033649ff90078d433c4";
     const DURABLE_SCHEMA_SHA256: &str =
-        "97c23e5625d96cd602f32c46de9feb302d07f4d74080db26372e72b321a3992d";
+        "69fdc72cc033f37704e8aa4b089dc799990b52cb9cdd5c13decef67fb662177d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "9d5c40ec9820139c2fe0c9a9ce2098289c0b5c63c3e3ad6d16de558d504cdecc";
     // Synthetic payloads generated with the public declarations at v0.0.116,
@@ -549,7 +549,12 @@ mod tests {
         let policy_payload =
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())
                 .expect("legacy policy payload must decode");
-        assert!(policy_payload.policy.is_some());
+        assert!(
+            policy_payload
+                .policy
+                .as_ref()
+                .is_some_and(|policy| policy.ui.is_none())
+        );
         assert_eq!(policy_payload.hash, "sha256");
         assert_eq!(policy_payload.load_error, "none");
         assert_eq!(policy_payload.loaded_at_ms, 300);
