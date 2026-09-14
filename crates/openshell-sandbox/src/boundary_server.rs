@@ -134,6 +134,10 @@ mod linux {
         }
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
+        if nix::unistd::getpid().as_raw() == 1 {
+            crate::managed_children::start_orphan_reaper()
+                .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
+        }
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
