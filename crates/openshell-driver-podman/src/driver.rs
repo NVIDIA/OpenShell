@@ -1061,6 +1061,7 @@ impl PodmanComputeDriver {
                     let archives = crate::isolation::bootstrap_archives(
                         &sandbox.id,
                         &workload_id,
+                        &uuid::Uuid::new_v4().to_string(),
                         &identity,
                         child_env,
                         &launch_authentication,
@@ -1322,9 +1323,14 @@ impl PodmanComputeDriver {
     pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
+        generation_id: &str,
         encoded_authentication: &[u8],
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            generation_id.to_string(),
+        )
+        .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
         let launch_authentication = decode_launch_authentication(encoded_authentication)?;
         let container = self
             .find_container(sandbox_id)
@@ -1339,7 +1345,23 @@ impl PodmanComputeDriver {
                 .as_ref()
                 .is_ok_and(|inspect| inspect.state.running)
             {
-                return span_status.finish(Ok(()));
+                let archive = self
+                    .client
+                    .copy_from_container(
+                        &crate::isolation::supervisor_name(sandbox_id),
+                        crate::isolation::RESTART_METADATA_PATH,
+                    )
+                    .await?;
+                let bundle =
+                    extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
+                let metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
+                if metadata.generation == generation.as_str() {
+                    return span_status.finish(Ok(()));
+                }
+                return span_status.finish(Err(ComputeDriverError::Precondition(format!(
+                    "Podman sandbox is already running generation {}",
+                    metadata.generation
+                ))));
             }
             self.client.stop_container(&container.id, 0).await?;
             self.wait_for_container_stopped(sandbox_id, &container.id)
@@ -1377,6 +1399,7 @@ impl PodmanComputeDriver {
             let archives = crate::isolation::bootstrap_archives(
                 sandbox_id,
                 &container_id,
+                generation.as_str(),
                 &restart_metadata.workload_identity,
                 restart_metadata.child_env,
                 &launch_authentication,
@@ -2027,7 +2050,7 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", &authentication)
+            .start_sandbox("sandbox-1", "generation-1", &authentication)
             .await
             .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
@@ -2338,7 +2361,7 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", &authentication)
+            .start_sandbox("sandbox-1", "generation-1", &authentication)
             .with_subscriber(subscriber)
             .await
             .expect("start should succeed");
@@ -3349,6 +3372,7 @@ mod tests {
         )
         .unwrap();
         let bundle = serde_json::to_vec(&crate::isolation::RestartMetadata {
+            generation: "generation-1".to_string(),
             workload_identity: identity,
             child_env: HashMap::new(),
         })
