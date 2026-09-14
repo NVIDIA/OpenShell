@@ -312,6 +312,20 @@ helm upgrade --install openshell \
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
 
+## Pod Security
+
+The gateway workload and the PKI bootstrap hook satisfy the [Restricted Pod Security Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/), so the release itself installs into a namespace labeled `pod-security.kubernetes.io/enforce=restricted`.
+
+Sandbox pods do not. The sandbox agent container adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG` to enforce namespace isolation and network policy, and the supervisor runs as UID 0. These requirements exceed even the Baseline standard.
+
+`server.sandboxNamespace` defaults to the release namespace, so point it at a namespace that does not enforce Restricted and create that namespace first, because the chart does not create it:
+
+```shell
+kubectl create namespace openshell-sandboxes
+```
+
+On OpenShift, refer to [OpenShift](/kubernetes/openshift), which requires the `privileged` SCC for sandbox pods.
+
 ## Probes
 
 The gateway exposes `/healthz` for process liveness and `/readyz` for dependency-aware readiness on the health port. The Helm chart wires both into Kubernetes probes:

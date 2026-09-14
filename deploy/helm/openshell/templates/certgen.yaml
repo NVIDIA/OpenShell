@@ -88,10 +88,7 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -159,10 +156,7 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

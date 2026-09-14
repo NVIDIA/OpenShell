@@ -35,6 +35,59 @@ tests:
           content: "--jwt-only"
         documentIndex: 3
 
+  - it: renders a Restricted-compatible securityContext on the certgen container
+    template: templates/certgen.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.seccompProfile.type
+          value: RuntimeDefault
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value:
+            - ALL
+        documentIndex: 3
+      - notExists:
+          path: spec.template.spec.containers[0].securityContext.runAsUser
+        documentIndex: 3
+
+  - it: renders a Restricted-compatible securityContext on the backend CA hook
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      grpcRoute.backendTLSPolicy.enabled: true
+      server.tls.enableMtls: false
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-certgen-backend-ca
+        documentIndex: 4
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+        documentIndex: 4
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.seccompProfile.type
+          value: RuntimeDefault
+        documentIndex: 4
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+        documentIndex: 4
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value:
+            - ALL
+        documentIndex: 4
+
   - it: renders JWT-only certgen hook when cert-manager owns TLS
     template: templates/certgen.yaml
     set:
