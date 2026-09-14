@@ -9,6 +9,7 @@
 description = "Install TypeScript SDK dependencies"
 dir = "sdk/typescript"
 run = "npm ci"
+run_windows = "set npm_config_cpu=x64&& npm ci"
 hide = true
 
 ["sdk:ts:proto"]
@@ -16,6 +17,7 @@ description = "Generate TypeScript protobuf stubs for the SDK"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run gen"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-proto.ps1"
 
 # Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
 # buf ships only in the SDK's devDependencies today, so this depends on the
@@ -38,12 +40,14 @@ description = "Lint + format-check the TypeScript SDK (Biome, read-only)"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run lint"
+run_windows = ".\\node_modules\\@biomejs\\cli-win32-x64\\biome.exe ci ."
 
 ["sdk:ts:format"]
 description = "Format the TypeScript SDK and apply safe fixes (Biome, writes)"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run format"
+run_windows = ".\\node_modules\\@biomejs\\cli-win32-x64\\biome.exe check --write ."
 
 ["sdk:ts:build"]
 description = "Build the TypeScript SDK (emit dist/)"
@@ -53,9 +57,13 @@ run = "npm run build"
 
 ["sdk:ts:test"]
 description = "Run TypeScript SDK unit tests (Vitest, in-memory transport)"
-depends = ["sdk:ts:proto"]
+# On Windows ARM64, typescript-test.ps1 installs the native Rolldown binding
+# into node_modules. Keep type checking ahead of that mutation when the
+# aggregate `ci` task schedules `check` and `test` concurrently.
+depends = ["sdk:ts:typecheck"]
 dir = "sdk/typescript"
 run = "npm test"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-test.ps1"
 
 ["sdk:ts:ci"]
 description = "TypeScript SDK checks (proto lint, Biome lint, codegen, typecheck, test, build)"

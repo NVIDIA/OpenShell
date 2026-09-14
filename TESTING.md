@@ -48,6 +48,24 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### Native Windows validation
+
+Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
+Windows now checks tracked Cargo lockfiles through PowerShell rather than
+skipping them. The deterministic gateway parity task uses Git for Windows Bash,
+with temporary Python launchers confined to a unique checkout-owned directory.
+
+`mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
+(including ARM64 hosts running it under emulation), resolves the protobuf
+plugin through its Windows `.cmd` launcher, and installs the matching locked
+ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
+resolution; it must not upgrade unrelated test dependencies.
+
+`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
+where Go does not support it. Windows token-file tests explicitly skip POSIX
+mode-bit assertions; those skips do not establish Windows ACL protection.
+Use a checkout with LF text files when running Unix-shell fixture checks.
+
 ## Python Unit Tests
 
 Python unit tests use the `*_test.py` suffix convention (not `test_*` prefix)
