@@ -1468,14 +1468,15 @@ pub fn build_isolation_specs(
     workload.mounts.push(Mount {
         kind: "tmpfs".into(),
         source: "tmpfs".into(),
-        destination: openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.into(),
+        destination: openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT.into(),
         options: vec![
             "rw".into(),
+            "noexec".into(),
             "nosuid".into(),
             "nodev".into(),
-            format!("uid={}", input.identity.uid),
-            format!("gid={}", input.identity.gid),
-            "mode=0755".into(),
+            // Libpod's OCI `mounts` API rejects tmpfs uid/gid options. The
+            // unprivileged runtime creates the owned material subdirectory.
+            "mode=0777".into(),
             "size=1m".into(),
         ],
     });
@@ -1536,11 +1537,10 @@ pub fn build_isolation_specs(
             destination: destination.into(),
             options: vec![
                 "rw".into(),
+                "noexec".into(),
                 "nosuid".into(),
                 "nodev".into(),
-                format!("uid={}", input.identity.uid),
-                format!("gid={}", input.identity.gid),
-                "mode=0700".into(),
+                "mode=0777".into(),
                 "size=64m".into(),
             ],
         });
@@ -1755,19 +1755,13 @@ mod tests {
             .workload
             .mounts
             .iter()
-            .find(|mount| mount.destination == openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR)
+            .find(|mount| {
+                mount.destination == openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_ROOT
+            })
             .expect("workload supervisor CA mount");
         assert_eq!(supervisor_ca_mount.kind, "tmpfs");
         assert_eq!(supervisor_ca_mount.source, "tmpfs");
-        for option in [
-            "rw",
-            "nosuid",
-            "nodev",
-            "uid=1000",
-            "gid=1001",
-            "mode=0755",
-            "size=1m",
-        ] {
+        for option in ["rw", "noexec", "nosuid", "nodev", "mode=0777", "size=1m"] {
             assert!(supervisor_ca_mount.options.contains(&option.to_string()));
         }
         assert!(
