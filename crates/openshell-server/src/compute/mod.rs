@@ -2293,6 +2293,21 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
+        self.start_persisted_sandboxes_with_authentication(|_| Ok(Vec::new()), |_| {})
+            .await
+    }
+
+    /// Reconcile persisted running intent and provision fresh launch
+    /// authentication before a restored runtime reconnects.
+    pub async fn start_persisted_sandboxes_with_authentication<Authentication, Failed>(
+        &self,
+        launch_authentication_for: Authentication,
+        authentication_failed: Failed,
+    ) -> Result<(), String>
+    where
+        Authentication: Fn(&Sandbox) -> Result<Vec<u8>, String>,
+        Failed: Fn(&str),
+    {
         self.recover_persisted_lifecycle_transitions().await?;
         if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
@@ -2333,6 +2348,29 @@ impl ComputeRuntime {
                 sandbox_resource_version(&sandbox),
             )
             .into_string();
+            let launch_authentication = match launch_authentication_for(&sandbox) {
+                Ok(authentication) => authentication,
+                Err(err) => {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %err,
+                        "Failed to prepare sandbox authentication during gateway startup"
+                    );
+                    if !recoverable_error {
+                        self.mark_sandbox_error(
+                            &sandbox,
+                            "AuthenticationFailed",
+                            &format!(
+                                "Failed to prepare sandbox authentication during gateway startup: {err}"
+                            ),
+                        )
+                        .await;
+                    }
+                    failed += 1;
+                    continue;
+                }
+            };
             match self
                 .driver
                 .call(
@@ -2341,12 +2379,13 @@ impl ComputeRuntime {
                     |driver| {
                         let sandbox_id = sandbox_id.clone();
                         let sandbox_name = sandbox_name.clone();
+                        let launch_authentication = launch_authentication.clone();
                         async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
                                     sandbox_id,
                                     sandbox_name,
-                                    launch_authentication: Vec::new(),
+                                    launch_authentication,
                                     generation_id,
                                 }))
                                 .await
@@ -2374,6 +2413,7 @@ impl ComputeRuntime {
                     }
                 }
                 Err(err) if err.code() == Code::NotFound => {
+                    authentication_failed(sandbox.object_id());
                     // Backend resource is gone but the store still
                     // remembers the sandbox. Mark Error so the UI
                     // surfaces the inconsistency; the reconcile loop
@@ -2395,6 +2435,7 @@ impl ComputeRuntime {
                     missing += 1;
                 }
                 Err(err) => {
+                    authentication_failed(sandbox.object_id());
                     warn!(
                         sandbox_id = %sandbox.object_id(),
                         sandbox_name = %sandbox.object_name(),
@@ -5552,6 +5593,7 @@ mod tests {
         start_blocked: AtomicBool,
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
+        start_authentications: TestMutex<Vec<Vec<u8>>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         get_started: Notify,
         get_release: Semaphore,
@@ -5585,6 +5627,7 @@ mod tests {
                 start_blocked: AtomicBool::new(false),
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
+                start_authentications: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
@@ -5680,6 +5723,13 @@ mod tests {
             self.start_requests
                 .lock()
                 .expect("start requests lock poisoned")
+                .clone()
+        }
+
+        fn start_authentications(&self) -> Vec<Vec<u8>> {
+            self.start_authentications
+                .lock()
+                .expect("start authentications lock poisoned")
                 .clone()
         }
 
@@ -5828,6 +5878,10 @@ mod tests {
                 .lock()
                 .expect("start requests lock poisoned")
                 .push((request.sandbox_id, request.sandbox_name));
+            self.start_authentications
+                .lock()
+                .expect("start authentications lock poisoned")
+                .push(request.launch_authentication);
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             self.start_started.notify_one();
             if self.start_blocked.load(Ordering::SeqCst) {
@@ -10869,6 +10923,31 @@ mod tests {
                 "sb-unknown".to_string(),
                 "sb-unspecified".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_persisted_sandboxes_supplies_fresh_authentication() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+            .await
+            .unwrap();
+
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |sandbox| Ok(format!("authentication:{}", sandbox.object_id()).into_bytes()),
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver.start_authentications(),
+            vec![b"authentication:sb-1".to_vec()]
         );
     }
 

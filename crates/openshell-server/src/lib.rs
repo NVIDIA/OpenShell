@@ -51,7 +51,7 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{Config, Error, ObjectLabels, Result};
+use openshell_core::{Config, Error, ObjectId, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
@@ -814,7 +814,32 @@ pub(crate) async fn run_server(
     // driver reconciles persisted sandboxes. Serve them before starting that
     // reconciliation so policy fetch and supervisor-session registration
     // cannot deadlock gateway startup.
-    if let Err(err) = state.compute.start_persisted_sandboxes().await {
+    if let Err(err) = state
+        .compute
+        .start_persisted_sandboxes_with_authentication(
+            |sandbox| {
+                let Some(authority) = &state.sandbox_session_jwt_authority else {
+                    return Ok(Vec::new());
+                };
+                let authentication = authority
+                    .mint_launch(
+                        sandbox.object_id(),
+                        openshell_core::SandboxSessionId::new(),
+                        openshell_core::jwt::CredentialEpoch::new(1)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                state
+                    .sandbox_auth_sessions
+                    .activate(sandbox.object_id(), &authentication, authority)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_vec(&authentication)
+                    .map_err(|error| format!("encode launch authentication: {error}"))
+            },
+            |sandbox_id| state.sandbox_auth_sessions.deactivate(sandbox_id),
+        )
+        .await
+    {
         warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
