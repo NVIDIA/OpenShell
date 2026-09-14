@@ -148,7 +148,10 @@ def test_transparent_tcp_policy_denies_unauthorized_connections(
 
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as policy_sandbox:
-        result = policy_sandbox.exec_python(_tcp_connect_errno(), host, port)
+        result = policy_sandbox.exec_python(
+            _tcp_connect_errno(),
+            args=(host, port),
+        )
 
     assert result.exit_code == 0, result.stderr
     assert int(result.stdout.strip()) in {errno.EACCES, errno.EPERM}
