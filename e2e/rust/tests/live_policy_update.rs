@@ -603,7 +603,7 @@ async fn local_policy_override_is_rejected_before_gateway_managed_launch() {
 
     let (_image_context, image) = write_local_override_image().expect("write local override image");
     let gateway_policy = write_policy(&["example.com"]).expect("write gateway policy");
-    let name = format!("e2e-lcl-{:016x}", rand::random::<u64>());
+    let name = format!("lo-{:016x}", rand::random::<u64>());
     let mut guard = SandboxGuard::manage_existing(name.clone());
     let create = tokio::time::timeout(
         std::time::Duration::from_secs(120),
@@ -628,6 +628,12 @@ async fn local_policy_override_is_rejected_before_gateway_managed_launch() {
     assert!(
         !create.success,
         "local override must not activate: {}",
+        create.output
+    );
+
+    assert!(
+        create.output.contains(&format!("Created sandbox: {name}")),
+        "creation must reach provisioning, not fail argument validation: {}",
         create.output
     );
 
