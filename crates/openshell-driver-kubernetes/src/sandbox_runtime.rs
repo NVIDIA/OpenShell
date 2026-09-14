@@ -154,7 +154,7 @@ pub fn supervisor_pod(
     sandbox_name: &str,
     gateway_id: &str,
     supervisor_image: &str,
-    supervisor_pull_policy: &str,
+    supervisor_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     service_account_name: &str,
     control_uid: u32,
     control_gid: u32,
@@ -319,8 +319,8 @@ pub fn supervisor_pod(
         },
         "volumeMounts": volume_mounts,
     });
-    if !supervisor_pull_policy.is_empty() {
-        container["imagePullPolicy"] = serde_json::json!(supervisor_pull_policy);
+    if let Some(policy) = supervisor_pull_policy {
+        container["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
     }
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1",
@@ -516,7 +516,7 @@ mod tests {
             "demo",
             "gateway",
             "supervisor:latest",
-            "IfNotPresent",
+            Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             "sandbox-sa",
             1000,
             1000,
@@ -540,6 +540,7 @@ mod tests {
             None
         );
         let container = &pod_spec.containers[0];
+        assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
         assert_eq!(

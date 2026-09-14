@@ -212,7 +212,7 @@ data:
     supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
     {{- if .Values.sandboxRuntime.image.pullPolicy }}
-    sandbox_runtime_image_pull_policy = {{ .Values.sandboxRuntime.image.pullPolicy | quote }}
+    sandbox_runtime_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" .Values.sandboxRuntime.image.pullPolicy | quote }}
     {{- end }}
 
     [openshell.drivers.kubernetes.managed_ssh_ingress]
