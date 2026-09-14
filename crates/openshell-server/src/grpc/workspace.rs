@@ -451,6 +451,21 @@ pub(super) async fn handle_delete_workspace(
     }))
 }
 
+pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), Status> {
+    let role = WorkspaceRole::try_from(role).unwrap_or(WorkspaceRole::Unspecified);
+    if role == WorkspaceRole::Unspecified {
+        return Err(Status::invalid_argument(
+            "role must be USER or ADMIN, not UNSPECIFIED",
+        ));
+    }
+    if role == WorkspaceRole::Admin && grant != AuthGrant::PlatformAdmin {
+        return Err(Status::permission_denied(
+            "only platform admins can assign the workspace admin role",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_add_workspace_member(
     state: &Arc<ServerState>,
     request: Request<AddWorkspaceMemberRequest>,
@@ -474,17 +489,7 @@ pub(super) async fn handle_add_workspace_member(
         return Err(Status::invalid_argument("principal_subject is required"));
     }
 
-    let role = WorkspaceRole::try_from(req.role).unwrap_or(WorkspaceRole::Unspecified);
-    if role == WorkspaceRole::Unspecified {
-        return Err(Status::invalid_argument(
-            "role must be USER or ADMIN, not UNSPECIFIED",
-        ));
-    }
-    if role == WorkspaceRole::Admin && authz.grant != AuthGrant::PlatformAdmin {
-        return Err(Status::permission_denied(
-            "only platform admins can assign the workspace admin role",
-        ));
-    }
+    authorize_member_role(req.role, authz.grant)?;
 
     let count = state
         .store
@@ -655,6 +660,7 @@ mod tests {
         let resp = handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "new-ws".to_string(),
                 labels: HashMap::from([("env".to_string(), "test".to_string())]),
             }),
@@ -683,6 +689,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "dup-ws".to_string(),
                 labels: HashMap::new(),
             }),
@@ -693,6 +700,7 @@ mod tests {
         let err = handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "dup-ws".to_string(),
                 labels: HashMap::new(),
             }),
@@ -710,6 +718,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "fetch-me".to_string(),
                 labels: HashMap::from([("team".to_string(), "infra".to_string())]),
             }),
@@ -783,6 +792,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "ephemeral".to_string(),
                 labels: HashMap::new(),
             }),
@@ -808,6 +818,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "ephemeral".to_string(),
             }),
@@ -830,6 +841,7 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "ephemeral".to_string(),
             }),
@@ -850,6 +862,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "templated".to_string(),
                 labels: HashMap::new(),
             }),
@@ -875,6 +888,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "templated".to_string(),
             }),
@@ -901,6 +915,7 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "templated".to_string(),
             }),
@@ -921,6 +936,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "sessioned".to_string(),
                 labels: HashMap::new(),
             }),
@@ -949,6 +965,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "sessioned".to_string(),
             }),
@@ -970,6 +987,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "profiles-ws".to_string(),
                 labels: HashMap::new(),
             }),
@@ -995,6 +1013,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "profiles-ws".to_string(),
             }),
@@ -1021,6 +1040,7 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "profiles-ws".to_string(),
             }),
@@ -1041,6 +1061,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "default".to_string(),
             }),
@@ -1057,6 +1078,7 @@ mod tests {
         let resp = handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "default".to_string(),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -1073,6 +1095,7 @@ mod tests {
         handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "default".to_string(),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -1103,6 +1126,7 @@ mod tests {
         handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "default".to_string(),
                 principal_subject: "charlie@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -1114,6 +1138,7 @@ mod tests {
         let resp = handle_remove_workspace_member(
             &state,
             authed_request(RemoveWorkspaceMemberRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 workspace: "default".to_string(),
                 principal_subject: "charlie@example.com".to_string(),
@@ -1149,6 +1174,7 @@ mod tests {
         handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "default".to_string(),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -1160,6 +1186,7 @@ mod tests {
         let err = handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "default".to_string(),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -1178,6 +1205,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "cleanup-test".to_string(),
                 labels: HashMap::new(),
             }),
@@ -1188,6 +1216,7 @@ mod tests {
         handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "cleanup-test".to_string(),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -1199,6 +1228,7 @@ mod tests {
         handle_add_workspace_member(
             &state,
             authed_request(AddWorkspaceMemberRequest {
+                request_id: String::new(),
                 workspace: "cleanup-test".to_string(),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -1223,6 +1253,7 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "cleanup-test".to_string(),
             }),
@@ -1291,6 +1322,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "term-test".to_string(),
                 labels: HashMap::new(),
             }),
@@ -1316,6 +1348,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "term-test".to_string(),
             }),
@@ -1348,6 +1381,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "dying-ws".to_string(),
                 labels: HashMap::new(),
             }),
@@ -1374,6 +1408,7 @@ mod tests {
         let _ = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "dying-ws".to_string(),
             }),
@@ -1394,6 +1429,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "idempotent-ws".to_string(),
                 labels: HashMap::new(),
             }),
@@ -1420,6 +1456,7 @@ mod tests {
         let _ = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "idempotent-ws".to_string(),
             }),
@@ -1437,6 +1474,7 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "idempotent-ws".to_string(),
             }),
@@ -1457,6 +1495,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "cleanup-retry".to_string(),
                 labels: HashMap::new(),
             }),
@@ -1467,6 +1506,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "cleanup-retry".to_string(),
             }),
@@ -1490,6 +1530,7 @@ mod tests {
         let retry = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "cleanup-retry".to_string(),
             }),
@@ -1521,6 +1562,7 @@ mod tests {
         handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "labeled-ws".to_string(),
                 labels: labels.clone(),
             }),

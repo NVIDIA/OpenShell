@@ -1142,6 +1142,9 @@ message CreateSandboxTemplateRequest {
   SandboxWorkloadTemplate template = 1;
   // Explicit workspace for the template. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 message GetSandboxTemplateRequest {
@@ -1176,6 +1179,8 @@ message DeleteSandboxTemplateRequest {
   // Succeed with ALREADY_ABSENT if the target is missing. Authorization and
   // parent-workspace checks still apply.
   bool allow_missing = 4;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 5;
 }
 
 message SandboxTemplateResponse {
@@ -2991,6 +2996,8 @@ message CreateWorkspaceRequest {
   string name = 1;
   // Optional labels for the workspace (key-value metadata).
   map<string, string> labels = 2;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 3;
 }
 
 // Create workspace response.
@@ -3033,6 +3040,8 @@ message DeleteWorkspaceRequest {
   // Workspace name (canonical lookup key).
   string name = 1;
   bool allow_missing = 2;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 3;
 }
 
 // Delete workspace response.
@@ -3082,6 +3091,8 @@ message AddWorkspaceMemberRequest {
   string principal_subject = 2;
   // Role to assign.
   WorkspaceRole role = 3;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 4;
 }
 
 // Add workspace member response.
@@ -3096,6 +3107,8 @@ message RemoveWorkspaceMemberRequest {
   // OIDC subject claim identifying the principal to remove.
   string principal_subject = 2;
   bool allow_missing = 3;
+  // Optional nonzero UUID. Same ID and payload replay success for 24 hours.
+  string request_id = 4;
 }
 
 // Remove workspace member response.

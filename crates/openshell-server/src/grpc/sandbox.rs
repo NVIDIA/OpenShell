@@ -4796,6 +4796,7 @@ mod tests {
         let created = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4852,6 +4853,7 @@ mod tests {
         let deleted = handle_delete_sandbox_template(
             &state,
             authed_request(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "gpu-kata".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -4894,6 +4896,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(gpu),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4912,6 +4915,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(cpu),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4948,6 +4952,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template(" gpu-kata ")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4986,6 +4991,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -4999,6 +5005,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
@@ -5036,6 +5043,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5175,6 +5183,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("overflow")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5206,6 +5215,7 @@ mod tests {
                 handle_create_sandbox_template(
                     &state,
                     authed_request(CreateSandboxTemplateRequest {
+                        request_id: String::new(),
                         template: Some(test_workload_template(&format!("overflow-{index}"))),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
@@ -5306,6 +5316,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5410,6 +5421,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5461,6 +5473,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5536,6 +5549,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -6369,6 +6383,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
