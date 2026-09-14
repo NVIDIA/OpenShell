@@ -4,11 +4,9 @@
 //! Host-process TCP fixtures for e2e tests.
 //!
 //! [`HostSupportContainer`](super::container::HostSupportContainer) publishes
-//! the same shape of fixture through a container engine. VM sandboxes reach
-//! the host through gvproxy's `host.openshell.internal` alias and the VM e2e
-//! lane has no container runtime of its own, so this variant runs the fixture
-//! as a plain host process instead — keeping the lane free of a container
-//! dependency it does not otherwise need.
+//! the same shape of fixture through a container engine. The VM host supervisor
+//! reaches these fixtures directly, and the VM e2e lane has no container
+//! runtime of its own, so this variant runs the fixture as a plain host process.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -66,8 +64,7 @@ impl HostPythonFixture {
             log_path,
         };
         // Bind to 127.0.0.1 for the readiness probe even though the fixture
-        // listens on 0.0.0.0: the guest reaches it through gvproxy's NAT to
-        // the host loopback, so loopback reachability is what matters.
+        // listens on 0.0.0.0; the host supervisor dials it over loopback.
         wait_for_port("127.0.0.1", port, Duration::from_secs(60))
             .await
             .map_err(|err| {
