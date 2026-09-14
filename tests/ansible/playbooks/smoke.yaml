@@ -9,12 +9,22 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Install OpenShell conformance runner
+    - name: Create OpenShell conformance test directory
       become: true
-      ansible.builtin.copy:
-        src: "{{ openshell_conformance_binary }}"
-        dest: /usr/local/bin/openshell-conformance
-        mode: "0755"
+      ansible.builtin.file:
+        path: /var/lib/openshell-conformance/tests
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Install OpenShell conformance test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ openshell_conformance_test_bundle }}"
+        dest: /var/lib/openshell-conformance/tests
+        owner: tmachine
+        group: tmachine
 
     - name: Wait for OpenShell gateway
       ansible.builtin.wait_for:
@@ -33,14 +43,19 @@
           - --name
           - tmachine
 
-    - name: Run OpenShell smoke conformance test
+    - name: Run OpenShell smoke conformance archive
       ansible.builtin.command:
         argv:
-          - /usr/local/bin/openshell-conformance
+          - cargo-nextest
+          - nextest
           - run
-          - smoke
-          - --openshell-bin
-          - /usr/local/bin/openshell
+          - --archive-file
+          - /var/lib/openshell-conformance/tests/tests.tar.zst
+          - --workspace-remap
+          - /var/lib/openshell-conformance/tests
+          - --no-capture
+      environment:
+        OPENSHELL_BIN: /usr/local/bin/openshell
       register: conformance_result
       changed_when: false
       failed_when: false
