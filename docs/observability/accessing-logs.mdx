@@ -41,18 +41,22 @@ For durable log storage, use the log files inside the sandbox or enable [OCSF JS
 
 ## Loss Awareness and Resume
 
-The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries a monotonic `cursor`. Status snapshots and warnings carry cursor `0`.
+The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries an opaque `cursor` token. Status snapshots and warnings carry an empty cursor.
+
+Do not parse a cursor. The only supported operation is comparing two cursors observed on the same stream and keeping the greater one as the resume point. That comparison is a plain string comparison in any language.
 
 The gateway distinguishes recoverable from unrecoverable loss:
 
-- **Recoverable lag.** When a consumer falls behind and the gateway skips ahead in its buffer, the stream emits a warning event and keeps running. Clients see the gap as a jump in cursor values.
-- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status that reports the requested and earliest-available cursors. The client should restart observation and, if it needs the missing lines, read them from the log files inside the sandbox.
+- **Recoverable lag.** When a consumer falls behind and the gateway skips ahead in its buffer, the stream emits a warning event and keeps running. The warning is the signal that events were skipped.
+- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status. The client should restart observation and, if it needs the missing lines, read them from the log files inside the sandbox.
 
-Cursors are only meaningful within one cursor space. A gateway restart begins a new space numbered from 1, so a cursor held across the restart no longer refers to anything. The gateway rejects it with `OUT_OF_RANGE` instead of treating it as caught up.
+A cursor is bound to the cursor space that issued it. A gateway restart, teardown of the sandbox's buffers, or a reconnect that lands on a different gateway replica starts a new space, and cursors from the previous one no longer refer to anything. The gateway rejects them with `OUT_OF_RANGE` instead of treating them as caught up — which would silently suppress the new space's events. A malformed cursor is rejected with `INVALID_ARGUMENT`.
 
-On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in cursor order — then resumes live delivery. The handoff from replay to live delivery is exact: an event buffered while the stream was reopening is delivered once, never twice. It is not a guarantee that nothing was lost — a warning event or an `OUT_OF_RANGE` status still reports loss, both before and after a reconnect.
+`OUT_OF_RANGE` is terminal for that cursor. Restart the watch with an empty resume cursor; retrying the same one fails identically.
 
-Replay is emitted in cursor order. Live delivery merges the log and platform event sources by cursor before emitting, so events normally arrive in ascending cursor order. The gateway does not delay an event to wait for a lower cursor that has not been published yet, so a cursor can still arrive late under concurrent publication. Treat `cursor` as the ordering key rather than arrival order, and track the highest cursor seen as the resume point.
+On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in order — then resumes live delivery. The handoff from replay to live delivery is exact: an event buffered while the stream was reopening is delivered once, never twice. It is not a guarantee that nothing was lost — a warning event or an `OUT_OF_RANGE` status still reports loss, both before and after a reconnect.
+
+The gateway merges the log and platform event sources before emitting, so events normally arrive in ascending cursor order. That applies to the buffered tail you receive when the stream opens, to a replay after a resume, and to live delivery. The gateway does not delay an event to wait for a lower cursor that has not been published yet, so a cursor can still arrive late under concurrent publication. Track the highest cursor seen as the resume point rather than the last one received.
 
 ## Direct Filesystem Access
 
