@@ -607,6 +607,7 @@ impl OpenShellClient {
     /// call `exec_sandbox` directly.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
         let request = proto::ExecSandboxRequest {
+            request_id: String::new(),
             sandbox: name.to_string(),
             workspace_scope: Some(proto::workspace_selector("default")),
             command: cmd.to_vec(),
@@ -1185,6 +1186,7 @@ impl WorkspaceScopedClient {
     /// Run a command inside a sandbox and buffer stdout/stderr.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
         let request = proto::ExecSandboxRequest {
+            request_id: String::new(),
             sandbox: name.to_string(),
             workspace_scope: Some(proto::workspace_selector(&self.workspace)),
             command: cmd.to_vec(),

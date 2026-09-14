@@ -118,15 +118,12 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Carries both this branch's opaque watch cursor and the well-known time
-    // types from main. The cursor change adds `WatchSandboxRequest`
-    // `.resume_after_cursor` and `SandboxStreamEvent.cursor` as strings; both
-    // fields are unreleased, added on this branch, so no client depends on an
-    // earlier type. It adds no messages or enums and touches no stored type,
-    // which is why the durable and overlap fingerprints below are main's
-    // values unchanged.
+    // Carries this branch's exec request IDs together with main's opaque watch
+    // cursor and well-known time types. These unreleased public-only fields add
+    // no messages or enums and touch no stored type, so the durable and overlap
+    // fingerprints below remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "fd8a5cad432441be1fe8891332b56f52335c208cc7283dcd93e385e7ae66c6da";
+        "e9533b91b8ead17666c43b17ca5bca3bf84050346e4855e5e5a261cbb56a26bb";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

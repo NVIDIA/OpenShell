@@ -733,6 +733,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         format_version: 1,
         payload_hash: "unused".into(),
         workspace_id: None,
+        target_id: None,
         success: None,
         completed_at_ms: None,
     };

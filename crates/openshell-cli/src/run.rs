@@ -1897,6 +1897,7 @@ pub async fn sandbox_exec_grpc(
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
+            request_id: String::new(),
             sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
@@ -2300,6 +2301,7 @@ async fn sandbox_exec_interactive_grpc(
     input_tx
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                request_id: String::new(),
                 sandbox: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
