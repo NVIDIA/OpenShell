@@ -37,7 +37,10 @@ let
         machine = "ubuntu";
         setup = {
           use_galaxy = true;
-          playbooks = [ "ansible/playbooks/docker.yaml" ];
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/docker.yaml"
+          ];
         };
         install = {
           use_galaxy = false;
@@ -58,7 +61,10 @@ let
         machine = "fedora";
         setup = {
           use_galaxy = false;
-          playbooks = [ "ansible/playbooks/podman-rootful.yaml" ];
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/podman-rootful.yaml"
+          ];
         };
         install = {
           use_galaxy = false;
@@ -79,7 +85,10 @@ let
         machine = "fedora";
         setup = {
           use_galaxy = false;
-          playbooks = [ "ansible/playbooks/podman-rootless.yaml" ];
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/podman-rootless.yaml"
+          ];
         };
         install = {
           use_galaxy = false;
@@ -102,7 +111,7 @@ let
         name = "smoke";
         playbooks = [ "ansible/playbooks/smoke.yaml" ];
         inputs = {
-          openshell_conformance_binary = "../target/${muslTarget}/debug/openshell-conformance";
+          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
         };
       }
     ];
@@ -112,15 +121,14 @@ let
     name = "tmachine";
     runtimeInputs = [
       qemu
-      pkgs.git
       pkgs.ansible
+      pkgs.git
       pkgs.sshpass
     ];
     text = ''
       root=$(git rev-parse --show-toplevel)
       cd "$root/tests"
       export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
-
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };
