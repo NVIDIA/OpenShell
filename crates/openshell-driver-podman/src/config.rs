@@ -61,8 +61,8 @@ pub struct PodmanComputeConfig {
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
     /// OCI image containing the statically linked `openshell-sandbox` binary.
-    /// Mounted read-only into sandbox containers at /opt/openshell/bin
-    /// using Podman's `type=image` mount.
+    /// The driver extracts the binary from this image into a verified host
+    /// cache and mounts it read-only into each sandbox container.
     pub sandbox_runtime_image: String,
     /// OCI image containing the dynamically linked `openshell-supervisor` binary.
     pub supervisor_image: String,

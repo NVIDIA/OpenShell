@@ -799,8 +799,9 @@ impl PodmanComputeDriver {
         let (image, immutable_image_id, image_user, image_env) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                // The sandbox runtime is shipped in a standalone OCI image and
-                // mounted into workload containers via Podman's type=image mount.
+                // The sandbox runtime is shipped in a standalone OCI image.
+                // The driver extracts and verifies its binary before bind-mounting
+                // it into the workload container.
                 let sandbox_runtime_pull_policy =
                     runtime_image_pull_policy(&self.config.sandbox_runtime_image);
                 info!(
@@ -987,18 +988,17 @@ impl PodmanComputeDriver {
                         return Err(e);
                     }
                 };
-                let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref())
-                {
+                // Podman's image-volume support varies across libpod/runtime
+                // combinations. Always use the verified extraction cache so
+                // workload startup does not depend on type=image mounts.
+                let supervisor_bin_path =
                     match extract_sandbox_bin(&self.client, &runtime_config).await {
                         Ok(path) => Some(path),
                         Err(e) => {
                             cleanup_created().await;
                             return Err(e);
                         }
-                    }
-                } else {
-                    None
-                };
+                    };
 
                 let tls_secret_names = if self.config.tls_enabled() {
                     let names = container::tls_secret_names(&sandbox.id);
@@ -1774,6 +1774,9 @@ async fn extract_sandbox_bin(
 
     let cache_path = openshell_core::driver_utils::supervisor_cache_path("podman-sandbox", digest)
         .map_err(ComputeDriverError::Precondition)?;
+    // Unit tests use ordered Podman API stubs and intentionally exercise the
+    // extraction path on every create. Production reuses the immutable cache.
+    #[cfg(not(test))]
     if cache_path.is_file() {
         validate_linux_elf_binary(&cache_path).map_err(ComputeDriverError::Precondition)?;
         info!(
@@ -1834,13 +1837,6 @@ async fn extract_binary_from_container(
         .map_err(ComputeDriverError::Precondition)?;
     validate_linux_elf_binary(cache_path).map_err(ComputeDriverError::Precondition)?;
     Ok(cache_path.to_path_buf())
-}
-
-fn userns_needs_extraction(userns: Option<&str>) -> bool {
-    userns.is_some_and(|mode| {
-        let base = mode.split(':').next().unwrap_or(mode);
-        !base.eq_ignore_ascii_case("host")
-    })
 }
 
 fn podman_child_environment(
@@ -3444,6 +3440,22 @@ mod tests {
         )
     }
 
+    fn sandbox_binary_archive_response() -> StubResponse {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let payload = b"\x7fELF-test-sandbox";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("openshell-sandbox").unwrap();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, payload.as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+        StubResponse::new(StatusCode::OK, archive)
+    }
+
     fn create_setup_responses(proxy_secret: bool) -> Vec<StubResponse> {
         let mut responses = vec![
             StubResponse::new(StatusCode::OK, "{}"), // sandbox runtime pull
@@ -3462,6 +3474,12 @@ mod tests {
         if proxy_secret {
             responses.push(StubResponse::new(StatusCode::CREATED, "{}"));
         }
+        responses.extend([
+            image_response("sha256:sandbox-runtime"),
+            created_response("sandbox-runtime-extractor"),
+            sandbox_binary_archive_response(),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove extractor
+        ]);
         responses.push(StubResponse::new(StatusCode::CREATED, "{}")); // channel volume
         responses
     }
@@ -3705,19 +3723,6 @@ mod tests {
             )
         );
         let _ = fs::remove_file(socket_path);
-    }
-
-    #[test]
-    fn userns_needs_extraction_cases() {
-        assert!(!userns_needs_extraction(None));
-        assert!(!userns_needs_extraction(Some("host")));
-        assert!(!userns_needs_extraction(Some("Host")));
-        assert!(userns_needs_extraction(Some("auto")));
-        assert!(userns_needs_extraction(Some("auto:size=65536")));
-        assert!(userns_needs_extraction(Some("keep-id")));
-        assert!(userns_needs_extraction(Some("keep-id:uid=1000")));
-        assert!(userns_needs_extraction(Some("no-map")));
-        assert!(userns_needs_extraction(Some("private")));
     }
 
     #[test]
