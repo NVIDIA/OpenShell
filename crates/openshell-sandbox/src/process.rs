@@ -647,6 +647,8 @@ impl ProcessHandle {
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
+        let mut child_registry = managed_children::lock();
+        #[cfg(target_os = "linux")]
         let mut child = spawn_command_with_workload_launcher(launcher, cmd)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
@@ -656,7 +658,8 @@ impl ProcessHandle {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         let pid = child.id().unwrap_or(0);
-        let managed_child = managed_children::register(pid);
+        let managed_child = child_registry.register(pid);
+        drop(child_registry);
 
         let io = if let Some(master) = pty_master {
             ProcessIo::Pty(master)

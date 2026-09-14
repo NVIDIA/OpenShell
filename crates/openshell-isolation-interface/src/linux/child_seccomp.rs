@@ -91,10 +91,10 @@ impl ChildHardeningProgram {
 /// Build the same-UID workload self-protection program before `fork`.
 ///
 /// `sandbox_tgid` is the sandbox PID as visible from its workload namespace.
-/// The filter blocks all direct thread-targeting through `tkill`, and blocks
-/// process-directed operations that name the trusted sandbox leader. The
-/// ordinary workload listener must additionally mediate `kill` and
-/// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for those operations, so a
+/// The filter blocks thread-targeting operations that name the trusted sandbox
+/// leader and blocks process-directed operations with the same target. The
+/// ordinary workload listener additionally mediates `kill`, `tkill`, and
+/// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
@@ -125,7 +125,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_kcmp,
         libc::SYS_process_madvise,
         libc::SYS_process_mrelease,
-        libc::SYS_tkill,
         libc::SYS_unshare,
         libc::SYS_setns,
         libc::SYS_mount,
@@ -172,6 +171,7 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
 
     for (syscall, argument) in [
         (libc::SYS_kill, 0),
+        (libc::SYS_tkill, 0),
         (libc::SYS_tgkill, 0),
         (libc::SYS_rt_sigqueueinfo, 0),
         (libc::SYS_rt_tgsigqueueinfo, 0),

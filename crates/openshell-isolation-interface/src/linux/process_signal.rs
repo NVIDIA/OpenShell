@@ -81,6 +81,37 @@ pub fn mediate_process_signal(
     listener.respond_value(notification.id, 0)
 }
 
+/// Continue a positive-target `tkill` only when the target thread belongs to
+/// an untrusted workload process rather than the sandbox runtime itself.
+///
+/// Continuing preserves Linux's thread-directed signal semantics, including
+/// the cancellation signal used by musl. A target that exits between the
+/// ownership check and continuation can only be reused inside the same PID
+/// namespace; the static child filter still rejects the sandbox leader.
+pub fn mediate_thread_signal(
+    listener: &NotificationListener,
+    notification: Notification,
+    sandbox_tgid: u32,
+) -> io::Result<()> {
+    listener.validate_id(notification.id)?;
+    let target = scalar_int(notification.args[0]);
+    let signal = scalar_int(notification.args[1]);
+    if target <= 0 || !(0..=64).contains(&signal) {
+        return Err(io::Error::from_raw_os_error(if target <= 0 {
+            libc::EPERM
+        } else {
+            libc::EINVAL
+        }));
+    }
+    let target = u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
+    let target_group = thread_group_id(target)?;
+    if target_group == sandbox_tgid || target_group == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    listener.validate_id(notification.id)?;
+    listener.respond_continue(notification.id)
+}
+
 fn scalar_int(value: u64) -> i32 {
     let bytes = value.to_ne_bytes();
     #[cfg(target_endian = "little")]
@@ -94,14 +125,7 @@ fn retain_signal_target(tid: u32, sandbox_tgid: u32) -> io::Result<OwnedFd> {
     if sandbox_tgid == 0 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let status = std::fs::read_to_string(format!("/proc/{tid}/status"))?;
-    let target_group = status
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Tgid:")
-                .and_then(|value| value.trim().parse::<u32>().ok())
-        })
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))?;
+    let target_group = thread_group_id(tid)?;
     if target_group == sandbox_tgid || target_group == 0 {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
@@ -113,6 +137,23 @@ fn retain_signal_target(tid: u32, sandbox_tgid: u32) -> io::Result<OwnedFd> {
     let fd = i32::try_from(fd).map_err(|_| io::Error::other("pidfd does not fit RawFd"))?;
     // SAFETY: successful pidfd_open transferred this descriptor to the caller.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn thread_group_id(tid: u32) -> io::Result<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::from_raw_os_error(libc::ESRCH)
+        } else {
+            error
+        }
+    })?;
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Tgid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))
 }
 
 #[cfg(test)]

@@ -10,9 +10,11 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
 
 static MANAGED_CHILDREN: LazyLock<Mutex<HashMap<i32, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -91,16 +93,74 @@ pub fn is_managed(pid: i32) -> bool {
 ///
 /// Keeping the child as a zombie prevents PID/process-group reuse until the
 /// owner publishes terminal state and performs the final wait.
-pub fn wait_until_terminal(pid: u32) -> std::io::Result<()> {
+pub fn wait_until_terminal(pid: u32) -> io::Result<()> {
     use nix::sys::wait::{Id, WaitPidFlag, waitid};
     let pid = i32::try_from(pid)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "PID out of range"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID out of range"))?;
     waitid(
         Id::Pid(nix::unistd::Pid::from_raw(pid)),
         WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
     )
     .map(|_| ())
-    .map_err(std::io::Error::other)
+    .map_err(io::Error::other)
+}
+
+/// Start the background reaper used when `openshell-sandbox` owns PID 1.
+///
+/// Explicitly managed children remain owned by their normal waiters. Only
+/// unregistered children adopted from the workload process tree are reaped.
+pub fn start_orphan_reaper() -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-orphan-reaper".to_string())
+        .spawn(|| {
+            loop {
+                if let Err(error) = reap_unmanaged_children_once() {
+                    tracing::debug!(%error, "orphan reaper scan failed");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .map(|_| ())
+}
+
+fn reap_unmanaged_children_once() -> io::Result<usize> {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+    let children = direct_child_pids()?;
+    let registry = lock();
+    let mut reaped = 0;
+    for pid in children {
+        if registry.contains(pid) {
+            continue;
+        }
+        match waitpid(nix::unistd::Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive)
+            | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::ESRCH) => {}
+            Ok(_) => reaped += 1,
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
+    Ok(reaped)
+}
+
+fn direct_child_pids() -> io::Result<HashSet<i32>> {
+    let mut children = HashSet::new();
+    for task in std::fs::read_dir("/proc/self/task")? {
+        let task = task?;
+        let path = task.path().join("children");
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        children.extend(
+            contents
+                .split_ascii_whitespace()
+                .filter_map(|value| value.parse::<i32>().ok())
+                .filter(|pid| *pid > 0),
+        );
+    }
+    Ok(children)
 }
 
 #[cfg(test)]
@@ -118,5 +178,20 @@ mod tests {
 
         unregister(second);
         assert!(!is_managed(i32::try_from(pid).expect("test pid")));
+    }
+
+    #[test]
+    fn child_pid_parser_observes_a_live_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        assert!(
+            direct_child_pids()
+                .expect("read direct children")
+                .contains(&i32::try_from(child.id()).expect("child PID"))
+        );
+        child.kill().expect("kill child");
+        child.wait().expect("wait for child");
     }
 }

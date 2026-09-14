@@ -1367,11 +1367,12 @@ async fn handle_delete_sandbox_inner(
         .await?
         .name;
 
-    if let Ok(current) = sandbox_by_name(state, &workspace, &name).await {
-        state.sandbox_auth_sessions.deactivate(current.object_id());
-    }
+    let current = sandbox_by_name(state, &workspace, &name).await.ok();
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
+        if let Some(current) = current {
+            state.sandbox_auth_sessions.deactivate(current.object_id());
+        }
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
@@ -1418,8 +1419,8 @@ async fn handle_stop_sandbox_inner(
         .await?
         .name;
     let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    state.sandbox_auth_sessions.deactivate(current.object_id());
     let mut sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    state.sandbox_auth_sessions.deactivate(current.object_id());
     state
         .supervisor_sessions
         .project_endpoint_status(&mut sandbox);
