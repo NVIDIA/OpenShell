@@ -412,15 +412,16 @@ fi
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
-  additional_ca_artifact="${XDG_STATE_HOME}/openshell/network-supervisor/additional-ca.crt"
-  if [ ! -f "${additional_ca_artifact}" ]; then
-    echo "ERROR: expected normalized additional CA artifact was not created under XDG_STATE_HOME" >&2
+  additional_ca_artifact_dir="${XDG_STATE_HOME}/openshell/network-supervisor"
+  additional_ca_artifacts=("${additional_ca_artifact_dir}"/additional-ca-*.crt)
+  if [ "${#additional_ca_artifacts[@]}" -ne 1 ] || [ ! -f "${additional_ca_artifacts[0]}" ]; then
+    echo "ERROR: expected exactly one content-addressed additional CA artifact under XDG_STATE_HOME" >&2
     exit 1
   fi
   # Both paths exist after gateway initialization; plain `realpath` is
   # portable across GNU and BSD/macOS implementations.
   state_root="$(realpath "${XDG_STATE_HOME}")"
-  artifact_path="$(realpath "${additional_ca_artifact}")"
+  artifact_path="$(realpath "${additional_ca_artifacts[0]}")"
   case "${artifact_path}" in
     "${state_root}"/*) ;;
     *)

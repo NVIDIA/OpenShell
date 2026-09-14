@@ -4,10 +4,11 @@
 //! Driver-backed e2e coverage for the global network-supervisor additional CA.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::net::TcpListener;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::wait_for_healthy;
+use openshell_e2e::harness::cli::{run_cli, wait_for_healthy, wait_for_sandbox_phase};
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
@@ -20,8 +21,21 @@ const NETWORK_CA_PATH: &str = "/etc/openshell-tls/network-additional-ca.crt";
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 const GATEWAY_CA_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const READY_MARKER: &str = "additional-ca-e2e-ready";
+const LIFECYCLE_READY_MARKER: &str = "additional-ca-lifecycle-ready";
+const LIFECYCLE_DURABLE_MARKER: &str = "additional-ca-lifecycle-durable";
+const LIFECYCLE_DURABLE_PATH: &str = "/sandbox/additional-ca-lifecycle-marker";
 const NETWORK_CA_VOLUME: &str = "openshell-network-additional-ca";
-const UPSTREAM_HOSTNAME_VALIDATION_DIAGNOSTIC: &str = "upstream TLS hostname validation failed";
+
+struct PortForwardGuard {
+    child: Child,
+}
+
+impl Drop for PortForwardGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 fn driver() -> Result<&'static str, String> {
     match std::env::var("OPENSHELL_E2E_DRIVER").as_deref() {
@@ -169,17 +183,40 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     assert_network_ca_command(command.as_array().ok_or("command must be an array")?)
 }
 
-fn assert_network_ca_command(command: &[Value]) -> Result<(), String> {
-    let pairs = command
+fn network_ca_command_digest(command: &[Value]) -> Result<String, String> {
+    let bundle_pairs = command
         .windows(2)
         .filter(|pair| pair[0] == "--network-additional-ca-bundle")
         .collect::<Vec<_>>();
-    if pairs.len() != 1 || pairs[0][1] != NETWORK_CA_PATH {
+    let digest_pairs = command
+        .windows(2)
+        .filter(|pair| pair[0] == "--network-additional-ca-digest")
+        .collect::<Vec<_>>();
+    let digest = digest_pairs
+        .first()
+        .and_then(|pair| pair[1].as_str())
+        .unwrap_or_default();
+    let valid_digest = digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    });
+    if bundle_pairs.len() != 1
+        || bundle_pairs[0][1] != NETWORK_CA_PATH
+        || digest_pairs.len() != 1
+        || !valid_digest
+    {
         return Err(format!(
             "unexpected network CA command arguments: {command:#?}"
         ));
     }
-    Ok(())
+    Ok(digest.to_string())
+}
+
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+fn assert_network_ca_command(command: &[Value]) -> Result<(), String> {
+    network_ca_command_digest(command).map(|_| ())
 }
 
 fn kubectl_json(args: &[&str]) -> Result<Value, String> {
@@ -243,23 +280,44 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
             mounted[0]["name"]
         ));
     }
-    assert_network_ca_command(
+    let supervisor_digest = network_ca_command_digest(
         mounted[0]["command"]
             .as_array()
             .ok_or("supervisor command missing")?,
     )?;
-    for init in pod["spec"]["initContainers"]
+    let trust_init_containers = pod["spec"]["initContainers"]
         .as_array()
         .into_iter()
         .flatten()
-    {
-        if init["volumeMounts"].as_array().is_some_and(|mounts| {
-            mounts
-                .iter()
-                .any(|mount| mount["name"] == NETWORK_CA_VOLUME)
-        }) {
-            return Err("destination CA leaked into an init container".to_string());
+        .filter(|init| {
+            init["volumeMounts"].as_array().is_some_and(|mounts| {
+                mounts
+                    .iter()
+                    .any(|mount| mount["name"] == NETWORK_CA_VOLUME)
+            })
+        })
+        .collect::<Vec<_>>();
+    if expected_container == "openshell-network" {
+        let [network_init] = trust_init_containers.as_slice() else {
+            return Err(format!(
+                "expected trust only at the network-init boundary: {trust_init_containers:#?}"
+            ));
+        };
+        if network_init["name"] != "openshell-network-init" {
+            return Err(format!(
+                "destination CA mounted in unexpected init container: {network_init:#?}"
+            ));
         }
+        let init_digest = network_ca_command_digest(
+            network_init["command"]
+                .as_array()
+                .ok_or("network-init command missing")?,
+        )?;
+        if init_digest != supervisor_digest {
+            return Err("network-init and supervisor trust digests differ".to_string());
+        }
+    } else if !trust_init_containers.is_empty() {
+        return Err("destination CA leaked outside the network supervisor boundary".to_string());
     }
 
     let volume = pod["spec"]["volumes"]
@@ -284,6 +342,13 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         || config_map["data"]["ca.crt"].as_str().is_none()
     {
         return Err("managed destination CA ConfigMap metadata/data is incomplete".to_string());
+    }
+    let config_map_digest =
+        config_map["metadata"]["annotations"]["openshell.ai/network-additional-ca-generation"]
+            .as_str()
+            .ok_or("managed destination CA ConfigMap generation missing")?;
+    if supervisor_digest != config_map_digest {
+        return Err("supervisor digest does not match managed ConfigMap generation".to_string());
     }
     Ok(format!("{namespace}/{managed_name}/{pod_name}"))
 }
@@ -341,7 +406,15 @@ fn inspect_vm_overlay() -> Result<(), String> {
     let args = String::from_utf8(debugfs_read("/upper/opt/openshell/supervisor-args")?)
         .map_err(|error| format!("VM supervisor argument marker is not UTF-8: {error}"))?;
     let lines = args.lines().collect::<Vec<_>>();
-    if lines != ["--network-additional-ca-bundle", NETWORK_CA_PATH] {
+    let staged_digest = format!("sha256:{:x}", Sha256::digest(&staged));
+    if lines
+        != [
+            "--network-additional-ca-bundle",
+            NETWORK_CA_PATH,
+            "--network-additional-ca-digest",
+            &staged_digest,
+        ]
+    {
         return Err(format!(
             "unexpected VM supervisor argument marker: {lines:?}"
         ));
@@ -353,7 +426,7 @@ fn inspect_vm_overlay() -> Result<(), String> {
         .join("rootfs-console.log");
     let console = std::fs::read_to_string(&console)
         .map_err(|error| format!("read VM serial log: {error}"))?;
-    if !console.contains("supervisor arguments from driver: 2 entries") {
+    if !console.contains("supervisor arguments from driver: 4 entries") {
         return Err("VM serial log did not confirm driver-owned supervisor argv".to_string());
     }
     if console.contains("-----BEGIN CERTIFICATE-----") {
@@ -362,136 +435,64 @@ fn inspect_vm_overlay() -> Result<(), String> {
     Ok(())
 }
 
-fn supervisor_hostname_validation_seen(output: &str) -> bool {
-    output.contains(UPSTREAM_HOSTNAME_VALIDATION_DIAGNOSTIC)
-        && output.contains(MISMATCH_HOST)
-        && !output.contains("-----BEGIN CERTIFICATE-----")
-}
-
-#[cfg(feature = "e2e-vm")]
-fn vm_supervisor_output() -> Result<String, String> {
-    let state_dir = std::env::var("OPENSHELL_E2E_VM_STATE_DIR")
-        .map_err(|error| format!("VM state directory missing: {error}"))?;
-    let mut output = String::new();
-    for entry in std::fs::read_dir(std::path::Path::new(&state_dir).join("sandboxes"))
-        .map_err(|error| format!("read VM sandbox state: {error}"))?
-        .filter_map(Result::ok)
-    {
-        let console = entry.path().join("rootfs-console.log");
-        if console.is_file() {
-            output.push_str(
-                &std::fs::read_to_string(&console).map_err(|error| {
-                    format!("read VM serial log {}: {error}", console.display())
-                })?,
-            );
-        }
+fn local_staged_artifact() -> Result<std::path::PathBuf, String> {
+    let configured = std::path::PathBuf::from(
+        std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT")
+            .map_err(|error| format!("gateway-owned CA artifact location missing: {error}"))?,
+    );
+    if configured.is_file() {
+        return Ok(configured);
     }
-    Ok(output)
-}
-
-#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
-fn local_supervisor_output(driver: &str, sandbox_name: &str) -> Result<String, String> {
-    let container_engine = ContainerEngine::from_env().map_err(|error| error.clone())?;
-    let network = std::env::var("OPENSHELL_E2E_NETWORK_NAME")
-        .or_else(|_| std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME"))
-        .map_err(|error| format!("wrapper must export sandbox network: {error}"))?;
-    let output = engine_command(&container_engine)
-        .args(["ps", "-aq", "--filter"])
-        .arg(format!("network={network}"))
-        .output()
-        .map_err(|error| format!("run {driver} ps for supervisor diagnostic: {error}"))?;
-    let ids = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let [container_id] = ids.as_slice() else {
+    if !configured.is_dir() {
         return Err(format!(
-            "expected one {driver} container for {sandbox_name}, found {ids:?}"
+            "gateway-owned CA artifact location does not exist: {}",
+            configured.display()
+        ));
+    }
+
+    let mut artifacts = std::fs::read_dir(&configured)
+        .map_err(|error| {
+            format!(
+                "read gateway-owned CA artifact directory {}: {error}",
+                configured.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("additional-ca-") && name.ends_with(".crt")
+                })
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort();
+    let [artifact] = artifacts.as_slice() else {
+        return Err(format!(
+            "expected exactly one content-addressed CA artifact in {}, found {artifacts:?}",
+            configured.display()
         ));
     };
-    let output = engine_command(&container_engine)
-        .args(["logs", container_id])
-        .output()
-        .map_err(|error| format!("read {driver} supervisor log: {error}"))?;
-    Ok(format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    ))
+    Ok(artifact.clone())
 }
 
-fn kubernetes_supervisor_output(identity: &str) -> Result<String, String> {
-    let mut parts = identity.split('/');
-    let namespace = parts.next().ok_or("namespace missing")?;
-    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
-    let pod = parts.next().ok_or("pod name missing")?;
-    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &context,
-            "-n",
-            namespace,
-            "logs",
-            pod,
-            "--all-containers=true",
-        ])
-        .output()
-        .map_err(|error| format!("read Kubernetes supervisor log: {error}"))?;
-    Ok(format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    ))
+#[cfg(unix)]
+fn set_staged_artifact_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("set gateway-owned CA artifact permissions: {error}"))
 }
 
-fn assert_supervisor_rejected_hostname_mismatch(
-    driver: &str,
-    sandbox_name: &str,
-    kubernetes_identity: Option<&str>,
-) -> Result<(), String> {
-    // The workload's curl output only proves the client-to-supervisor MITM
-    // leg. Require the supervisor's explicit *upstream* hostname-validation
-    // diagnostic as well, so a direct fixture-leaf rejection cannot satisfy
-    // this test.
-    for _ in 0..30 {
-        let output = match driver {
-            "vm" => {
-                #[cfg(feature = "e2e-vm")]
-                {
-                    vm_supervisor_output()
-                }
-                #[cfg(not(feature = "e2e-vm"))]
-                {
-                    Err("VM test compiled without e2e-vm feature".to_string())
-                }
-            }
-            "docker" | "podman" => {
-                #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
-                {
-                    local_supervisor_output(driver, sandbox_name)
-                }
-                #[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
-                {
-                    Err("local-driver test compiled without its driver feature".to_string())
-                }
-            }
-            "kubernetes" => kubernetes_supervisor_output(
-                kubernetes_identity.ok_or("Kubernetes staging identity missing")?,
-            ),
-            other => return Err(format!("unsupported driver {other}")),
-        }?;
-        if supervisor_hostname_validation_seen(&output) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Err(format!(
-        "{driver} supervisor never reported upstream hostname validation for {MISMATCH_HOST}"
-    ))
+#[cfg(not(unix))]
+fn set_staged_artifact_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|error| format!("read gateway-owned CA artifact permissions: {error}"))?
+        .permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|error| format!("set gateway-owned CA artifact permissions: {error}"))
 }
 
 fn replace_staged_material(driver: &str, kubernetes_identity: Option<&str>) -> Result<(), String> {
@@ -501,127 +502,91 @@ fn replace_staged_material(driver: &str, kubernetes_identity: Option<&str>) -> R
         );
     }
 
-    let artifact = std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_ARTIFACT")
-        .map_err(|error| format!("gateway-owned CA artifact path missing: {error}"))?;
-    if !std::path::Path::new(&artifact).is_file() {
-        return Err(format!(
-            "gateway-owned CA artifact does not exist: {artifact}"
-        ));
-    }
+    let artifact = local_staged_artifact()?;
+    set_staged_artifact_mode(&artifact, 0o644)?;
     std::fs::write(&artifact, b"not-a-certificate\n")
-        .map_err(|error| format!("replace gateway-owned CA artifact: {error}"))
+        .map_err(|error| format!("replace gateway-owned CA artifact: {error}"))?;
+    set_staged_artifact_mode(&artifact, 0o444)
 }
 
-fn restart_kubernetes_sandbox_from_existing_resource(identity: &str) -> Result<String, String> {
-    let mut parts = identity.split('/');
-    let namespace = parts.next().ok_or("namespace missing")?;
-    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
-    let pod = parts.next().ok_or("pod name missing")?;
-    let previous = kubectl_json(&["-n", namespace, "get", "pod", pod, "-o", "json"])?;
-    let previous_uid = previous["metadata"]["uid"]
+fn restore_staged_material(driver: &str, kubernetes_identity: Option<&str>) -> Result<(), String> {
+    if driver == "kubernetes" {
+        return delete_kubernetes_config_map(
+            kubernetes_identity.ok_or("Kubernetes staging identity missing")?,
+        );
+    }
+
+    let source = std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_CERT")
+        .map_err(|error| format!("additional CA source path missing: {error}"))?;
+    let artifact = local_staged_artifact()?;
+    if !std::path::Path::new(&source).is_file() {
+        return Err(format!("additional CA source does not exist: {source}"));
+    }
+    set_staged_artifact_mode(&artifact, 0o644)?;
+    std::fs::copy(&source, &artifact)
+        .map_err(|error| format!("restore gateway-owned CA artifact from {source}: {error}"))?;
+    set_staged_artifact_mode(&artifact, 0o444)
+}
+
+async fn sandbox_id(sandbox_name: &str) -> String {
+    let (output, code) = run_cli(&["sandbox", "get", sandbox_name, "--output", "json"]).await;
+    assert_eq!(
+        code, 0,
+        "get lifecycle sandbox identity should succeed:\n{output}"
+    );
+    let sandbox: Value = serde_json::from_str(&output).unwrap_or_else(|error| {
+        panic!("parse lifecycle sandbox identity JSON: {error}; output={output}")
+    });
+    assert_eq!(
+        sandbox["name"].as_str(),
+        Some(sandbox_name),
+        "lifecycle sandbox name changed: {sandbox:#?}"
+    );
+    sandbox["id"]
         .as_str()
-        .ok_or("original pod UID missing")?
-        .to_string();
-    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
-    // Delete only the workload Pod. Its existing OpenShell Sandbox resource
-    // remains managed by the controller and recreates the Pod, avoiding a new
-    // driver `ensure`/server-side-apply request against our deliberately
-    // mutated ConfigMap.
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &context,
-            "-n",
-            namespace,
-            "delete",
-            "pod",
-            pod,
-            "--wait=false",
-        ])
-        .output()
-        .map_err(|error| format!("restart existing Kubernetes sandbox pod: {error}"))?;
-    if !output.status.success() {
+        .unwrap_or_else(|| panic!("lifecycle sandbox identity is missing: {sandbox:#?}"))
+        .to_string()
+}
+
+async fn assert_kubernetes_invalid_staged_material_fails_closed(
+    sandbox_name: &str,
+) -> Result<(), String> {
+    let (stop_output, stop_code) = run_cli(&["sandbox", "stop", sandbox_name]).await;
+    if stop_code != 0 {
         return Err(format!(
-            "restart existing Kubernetes sandbox pod failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "stop Kubernetes sandbox before trust validation failed: {stop_output}"
         ));
     }
-    Ok(previous_uid)
-}
 
-fn recreated_kubernetes_pod(identity: &str, previous_uid: &str) -> Result<String, String> {
-    let mut parts = identity.split('/');
-    let namespace = parts.next().ok_or("namespace missing")?;
-    let config_map = parts.next().ok_or("ConfigMap name missing")?;
-    let _previous_pod = parts.next().ok_or("pod name missing")?;
-    let pods = kubectl_json(&["-n", namespace, "get", "pods", "-o", "json"])?;
-    pods["items"]
-        .as_array()
-        .and_then(|items| {
-            items.iter().find_map(|pod| {
-                let uses_config_map = pod["spec"]["volumes"].as_array().is_some_and(|volumes| {
-                    volumes
-                        .iter()
-                        .any(|volume| volume["configMap"]["name"].as_str() == Some(config_map))
-                });
-                let uid = pod["metadata"]["uid"].as_str()?;
-                let name = pod["metadata"]["name"].as_str()?;
-                (uses_config_map && uid != previous_uid).then(|| name.to_string())
-            })
-        })
-        .ok_or_else(|| {
-            "distinct recreated pod using destination CA ConfigMap not found".to_string()
-        })
-}
-
-fn assert_kubernetes_invalid_staged_material_fails_closed(identity: &str) -> Result<(), String> {
-    let previous_uid = restart_kubernetes_sandbox_from_existing_resource(identity)?;
-    let mut parts = identity.split('/');
-    let namespace = parts.next().ok_or("namespace missing")?;
-    let _config_map = parts.next().ok_or("ConfigMap name missing")?;
-    let _previous_pod = parts.next().ok_or("pod name missing")?;
-    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
-
-    for _ in 0..120 {
-        if let Ok(pod) = recreated_kubernetes_pod(identity, &previous_uid) {
-            let output = Command::new("kubectl")
-                .args([
-                    "--context",
-                    &context,
-                    "-n",
-                    namespace,
-                    "logs",
-                    &pod,
-                    "--all-containers=true",
-                ])
-                .output()
-                .map_err(|error| format!("read restarted Kubernetes sandbox logs: {error}"))?;
-            let logs = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if logs.contains("additional destination CA bundle")
-                || logs.contains("invalid staged destination CA bundle")
-            {
-                if logs.contains("-----BEGIN CERTIFICATE-----")
-                    || logs.contains("-----BEGIN PRIVATE KEY-----")
-                {
-                    return Err(
-                        "Kubernetes supervisor validation log disclosed CA material".to_string()
-                    );
-                }
-                return Ok(());
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
+    // Ordinary stop/start is the supported reconciliation path. The driver
+    // must validate the equal-generation immutable ConfigMap before changing
+    // the Sandbox resource back to an operating state.
+    let (start_output, start_code) = run_cli(&["sandbox", "start", sandbox_name]).await;
+    if start_code == 0 {
+        return Err("Kubernetes sandbox start accepted replaced destination trust".to_string());
     }
-    Err(
-        "recreated Kubernetes sandbox lacked stable supervisor additional-CA validation evidence"
-            .to_string(),
-    )
+    let normalized_start_output = start_output
+        .lines()
+        .map(|line| line.trim().trim_start_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !normalized_start_output.contains("network additional CA ConfigMap")
+        || !(normalized_start_output.contains("unexpected trust generation")
+            || normalized_start_output
+                .contains("did not retain the exact gateway-normalized trust bundle")
+            || normalized_start_output.contains("is not immutable")
+            || normalized_start_output.contains("is not owned by this gateway"))
+    {
+        return Err(format!(
+            "Kubernetes sandbox start lacked stable additional-CA validation evidence: {start_output}"
+        ));
+    }
+    if start_output.contains("-----BEGIN CERTIFICATE-----")
+        || start_output.contains("-----BEGIN PRIVATE KEY-----")
+    {
+        return Err("Kubernetes start validation disclosed CA material".to_string());
+    }
+    Ok(())
 }
 
 async fn assert_invalid_staged_material_fails_closed(policy_path: &str) {
@@ -636,10 +601,22 @@ async fn assert_invalid_staged_material_fails_closed(policy_path: &str) {
         startup_error.contains("error phase") || startup_error.contains("failed"),
         "invalid staged trust did not fail sandbox startup: {startup_error}"
     );
+    // Miette wraps long CLI diagnostics and prefixes continuation lines with a
+    // box-drawing marker. Normalize that presentation before matching the
+    // driver's stable error text.
+    let normalized_startup_error = startup_error
+        .lines()
+        .map(|line| line.trim().trim_start_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        startup_error.contains("--network-additional-ca-bundle")
-            || startup_error.contains("additional destination CA bundle")
-            || startup_error.contains("invalid staged destination CA bundle"),
+        normalized_startup_error.contains("--network-additional-ca-bundle")
+            || normalized_startup_error.contains("additional destination CA bundle")
+            || normalized_startup_error.contains("invalid staged destination CA bundle")
+            || normalized_startup_error
+                .contains("network additional CA artifact verification failed")
+            || normalized_startup_error
+                .contains("does not match the gateway startup trust generation"),
         "invalid staged trust lacked stable supervisor additional-CA validation evidence: {startup_error}"
     );
     assert!(
@@ -678,8 +655,61 @@ fn remove_additional_ca_section(config: &str) -> Result<String, String> {
     Ok(format!("{}\n", output.join("\n")))
 }
 
-async fn remove_configuration_and_restart(driver: &str) -> Result<(), String> {
-    if driver == "kubernetes" {
+async fn restart_kubernetes_gateway_port_forward() -> Result<Option<PortForwardGuard>, String> {
+    // Depending on kubectl and rollout timing, a Service port-forward may
+    // survive and reconnect to the replacement pod. Keep it when the existing
+    // registered endpoint is already healthy.
+    if wait_for_healthy(Duration::from_secs(10)).await.is_ok() {
+        return Ok(None);
+    }
+
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
+    let namespace = std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE")
+        .map_err(|error| format!("Helm namespace missing: {error}"))?;
+    let local_port = std::env::var("OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT")
+        .map_err(|error| format!("Kubernetes gateway local port missing: {error}"))?
+        .parse::<u16>()
+        .map_err(|error| format!("Kubernetes gateway local port is invalid: {error}"))?;
+
+    // kubectl port-forward binds to one selected pod even when given a Service.
+    // A Helm rollout therefore terminates the wrapper-owned process. Wait for
+    // its local socket to be released, then restore the same endpoint already
+    // registered in the CLI configuration.
+    let mut released = false;
+    for _ in 0..30 {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", local_port)) {
+            drop(listener);
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !released {
+        return Err("previous Kubernetes gateway port-forward did not exit after rollout".into());
+    }
+
+    let child = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            &namespace,
+            "port-forward",
+            "svc/openshell",
+            &format!("{local_port}:8080"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("restart Kubernetes gateway port-forward: {error}"))?;
+    Ok(Some(PortForwardGuard { child }))
+}
+
+async fn remove_configuration_and_restart(
+    driver: &str,
+) -> Result<Option<PortForwardGuard>, String> {
+    let port_forward = if driver == "kubernetes" {
         let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
             .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
         let namespace = std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE")
@@ -713,6 +743,7 @@ async fn remove_configuration_and_restart(driver: &str) -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
+        restart_kubernetes_gateway_port_forward().await?
     } else {
         let config_path = std::env::var("OPENSHELL_E2E_GATEWAY_CONFIG")
             .map_err(|error| format!("gateway config path missing: {error}"))?;
@@ -726,36 +757,11 @@ async fn remove_configuration_and_restart(driver: &str) -> Result<(), String> {
             .ok_or_else(|| "managed gateway metadata disappeared".to_string())?;
         gateway.stop()?;
         gateway.start()?;
-    }
+        None
+    };
 
-    wait_for_healthy(Duration::from_secs(180)).await
-}
-
-async fn assert_removed_configuration_rejects_private_ca(policy_path: &str, matching_url: &str) {
-    const REMOVED_MARKER: &str = "additional-ca-removed-private-ca-rejected";
-    let script = format!(
-        r#"set -eu
-test ! -e '{NETWORK_CA_PATH}'
-set +e
-curl --fail --silent --show-error --max-time 30 '{matching_url}' >/tmp/removed.out 2>/tmp/removed.err
-removed_status=$?
-set -e
-if [ "$removed_status" -eq 0 ]; then
-  echo "private CA remained trusted after configuration removal" >&2
-  exit 1
-fi
-echo {REMOVED_MARKER}
-while true; do sleep 1; done"#
-    );
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--policy", policy_path],
-        &["sh", "-lc", &script],
-        REMOVED_MARKER,
-    )
-    .await
-    .expect("new sandbox rejects the removed private CA trust");
-    assert!(sandbox.create_output.contains(REMOVED_MARKER));
-    sandbox.cleanup().await;
+    wait_for_healthy(Duration::from_secs(180)).await?;
+    Ok(port_forward)
 }
 
 fn replace_kubernetes_config_map_with_invalid_material(identity: &str) -> Result<(), String> {
@@ -764,29 +770,125 @@ fn replace_kubernetes_config_map_with_invalid_material(identity: &str) -> Result
     let config_map = parts.next().ok_or("ConfigMap name missing")?;
     let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
         .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
-    let patch = r#"{"data":{"ca.crt":"not-a-certificate"}}"#;
+    let current = kubectl_json(&[
+        "--context",
+        &context,
+        "-n",
+        namespace,
+        "get",
+        "configmap",
+        config_map,
+        "-o",
+        "json",
+    ])?;
+    let replacement = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": config_map,
+            "namespace": namespace,
+            "labels": current["metadata"]["labels"].clone(),
+            "annotations": current["metadata"]["annotations"].clone(),
+        },
+        "immutable": true,
+        "data": {"ca.crt": "not-a-certificate\n"},
+    });
+    let mut child = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            namespace,
+            "replace",
+            "--force",
+            "-f",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("replace immutable destination CA ConfigMap: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("kubectl replacement stdin missing")?
+        .write_all(replacement.to_string().as_bytes())
+        .map_err(|error| format!("write replacement destination CA ConfigMap: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for destination CA ConfigMap replacement: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "replace immutable destination CA ConfigMap failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn delete_kubernetes_config_map(identity: &str) -> Result<(), String> {
+    let mut parts = identity.split('/');
+    let namespace = parts.next().ok_or("namespace missing")?;
+    let config_map = parts.next().ok_or("ConfigMap name missing")?;
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+        .map_err(|error| format!("active Kubernetes context missing: {error}"))?;
     let output = Command::new("kubectl")
         .args([
             "--context",
             &context,
             "-n",
             namespace,
-            "patch",
+            "delete",
             "configmap",
             config_map,
-            "--type=merge",
-            "-p",
-            patch,
+            "--wait=true",
         ])
         .output()
-        .map_err(|error| format!("patch destination CA ConfigMap: {error}"))?;
+        .map_err(|error| format!("delete invalid destination CA ConfigMap: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "patch destination CA ConfigMap failed: {}",
+            "delete invalid destination CA ConfigMap failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
+}
+
+fn hostname_validation_script(
+    matching_url: &str,
+    mismatch_url: &str,
+    mismatch_connect: &str,
+) -> String {
+    format!(
+        r#"set -eu
+response="$(curl --fail --silent --show-error --max-time 30 '{matching_url}')"
+test "$response" = '{{"additional_ca":"trusted"}}'
+set +e
+curl --fail --silent --show-error --verbose --max-time 15 --connect-to '{mismatch_connect}' '{mismatch_url}' >/tmp/mismatch.out 2>/tmp/mismatch.err
+mismatch_status=$?
+set -e
+# --connect-to proves the mismatch uses the same reachable fixture as the
+# matching request, while preserving the mismatch URL and TLS SNI. The
+# fixture's private CA is trusted, so curl status 60 must specifically be its
+# hostname-verification failure, not an untrusted issuer or routing error.
+if [ "$mismatch_status" -ne 60 ]; then
+  echo "hostname mismatch returned curl status $mismatch_status, expected 60" >&2
+  cat /tmp/mismatch.err >&2
+  exit 1
+fi
+if ! grep -Fq "no alternative certificate subject name matches target host name '{MISMATCH_HOST}'" /tmp/mismatch.err; then
+  echo "hostname mismatch did not report hostname verification failure" >&2
+  cat /tmp/mismatch.err >&2
+  exit 1
+fi
+curl --fail --silent --show-error --max-time 30 https://example.com/ >/dev/null
+echo matching-host-trusted
+echo hostname-mismatch-rejected
+echo public-root-trusted
+echo {READY_MARKER}
+while true; do sleep 1; done"#,
+    )
 }
 
 #[tokio::test]
@@ -801,34 +903,7 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     let matching_url = format!("https://host.openshell.internal:{port}/");
     let mismatch_url = format!("https://{MISMATCH_HOST}:{port}/");
     let mismatch_connect = format!("{MISMATCH_HOST}:{port}:host.openshell.internal:{port}");
-    let script = format!(
-        r#"set -eu
-response="$(curl --fail --silent --show-error --max-time 30 '{matching_url}')"
-test "$response" = '{{"additional_ca":"trusted"}}'
-set +e
-curl --fail --silent --show-error --verbose --max-time 15 --connect-to '{mismatch_connect}' '{mismatch_url}' >/tmp/mismatch.out 2>/tmp/mismatch.err
-mismatch_status=$?
-set -e
-# The client must successfully validate OpenShell's generated MITM leaf for
-# the requested hostname. A curl 60 here would only show that curl rejected a
-# fixture leaf; the supervisor-specific upstream diagnostic is asserted below.
-if [ "$mismatch_status" -eq 0 ] || [ "$mismatch_status" -eq 60 ]; then
-  echo "hostname mismatch returned curl status $mismatch_status; expected post-MITM upstream failure" >&2
-  cat /tmp/mismatch.err >&2
-  exit 1
-fi
-if ! grep -Fq 'SSL certificate verify ok' /tmp/mismatch.err; then
-  echo "hostname mismatch never completed TLS verification against the OpenShell MITM leaf" >&2
-  cat /tmp/mismatch.err >&2
-  exit 1
-fi
-curl --fail --silent --show-error --max-time 30 https://example.com/ >/dev/null
-echo matching-host-trusted
-echo hostname-mismatch-rejected
-echo public-root-trusted
-echo {READY_MARKER}
-while true; do sleep 1; done"#
-    );
+    let script = hostname_validation_script(&matching_url, &mismatch_url, &mismatch_connect);
 
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--policy", policy_path],
@@ -868,16 +943,9 @@ while true; do sleep 1; done"#
         }
     };
 
-    assert_supervisor_rejected_hostname_mismatch(
-        driver,
-        &sandbox.name,
-        kubernetes_identity.as_deref(),
-    )
-    .expect("supervisor rejected the upstream hostname mismatch after client MITM verification");
-
     replace_staged_material(driver, kubernetes_identity.as_deref())
         .expect("replace staged destination trust with invalid material");
-    if driver == "kubernetes" {
+    if driver == "kubernetes" || driver == "vm" {
         let output = sandbox
             .exec(&[
                 "curl",
@@ -889,27 +957,140 @@ while true; do sleep 1; done"#
                 &matching_url,
             ])
             .await
-            .expect("running supervisor retains startup trust until restart");
+            .expect("running supervisor retains startup trust after staged material changes");
         assert!(
             output.contains(r#"{"additional_ca":"trusted"}"#),
-            "running supervisor lost startup trust after ConfigMap update: {output}"
+            "running supervisor lost startup trust after staged material changed: {output}"
         );
     }
 
     if driver == "kubernetes" {
-        assert_kubernetes_invalid_staged_material_fails_closed(
-            kubernetes_identity
-                .as_deref()
-                .expect("Kubernetes staging identity must be present"),
+        assert_kubernetes_invalid_staged_material_fails_closed(&sandbox.name)
+            .await
+            .expect("stopped Kubernetes sandbox rejects invalid staged trust on start");
+    } else if driver == "vm" {
+        let mut retained_snapshot_sandbox = SandboxGuard::create_keep_with_args(
+            &["--policy", policy_path],
+            &["sh", "-lc", &script],
+            READY_MARKER,
         )
-        .expect("recreated existing Kubernetes sandbox rejects invalid staged trust");
+        .await
+        .expect("VM child uses its retained startup trust snapshot for later launches");
+        assert!(
+            retained_snapshot_sandbox
+                .create_output
+                .contains("matching-host-trusted")
+        );
+        retained_snapshot_sandbox.cleanup().await;
     } else {
         assert_invalid_staged_material_fails_closed(policy_path).await;
     }
 
+    // Remove the sandbox whose startup trust and staged material were mutated
+    // before restoring delivery. For Kubernetes, remove the deliberately
+    // replaced immutable map so the driver's ensure path can recreate the
+    // exact gateway startup snapshot for the next sandbox.
     sandbox.cleanup().await;
-    remove_configuration_and_restart(driver)
+    restore_staged_material(driver, kubernetes_identity.as_deref())
+        .expect("restore destination trust after invalid-material check");
+
+    // Use a neutral, long-running main process so stop/start is the only
+    // lifecycle transition. The exec calls below prove both destination trust
+    // and gateway-authenticated control traffic independently of that process.
+    let lifecycle_script = format!("echo {LIFECYCLE_READY_MARKER}; while true; do sleep 1; done");
+    let mut lifecycle_sandbox = SandboxGuard::create_keep_with_args(
+        &["--policy", policy_path],
+        &["sh", "-lc", &lifecycle_script],
+        LIFECYCLE_READY_MARKER,
+    )
+    .await
+    .expect("create lifecycle sandbox using restored destination CA");
+    let private_ca_output = lifecycle_sandbox
+        .exec(&[
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            &matching_url,
+        ])
+        .await
+        .expect("lifecycle sandbox trusts the private CA before removal");
+    assert!(
+        private_ca_output.contains(r#"{"additional_ca":"trusted"}"#),
+        "lifecycle sandbox did not trust private CA before removal: {private_ca_output}"
+    );
+    let durable_marker_output = lifecycle_sandbox
+        .exec(&[
+            "sh",
+            "-lc",
+            &format!(
+                "printf '%s\\n' '{LIFECYCLE_DURABLE_MARKER}' > {LIFECYCLE_DURABLE_PATH}; sync; cat {LIFECYCLE_DURABLE_PATH}"
+            ),
+        ])
+        .await
+        .expect("write durable lifecycle marker");
+    assert!(
+        durable_marker_output.contains(LIFECYCLE_DURABLE_MARKER),
+        "lifecycle sandbox did not write durable marker: {durable_marker_output}"
+    );
+    let lifecycle_id_before_removal = sandbox_id(&lifecycle_sandbox.name).await;
+
+    let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &lifecycle_sandbox.name]).await;
+    assert_eq!(
+        stop_code, 0,
+        "stop lifecycle sandbox should succeed:\n{stop_output}"
+    );
+    wait_for_sandbox_phase(&lifecycle_sandbox.name, "Stopped", Duration::from_secs(180))
+        .await
+        .expect("lifecycle sandbox should be stopped before removing configuration");
+
+    let _gateway_port_forward = remove_configuration_and_restart(driver)
         .await
         .expect("remove additional CA configuration and restart gateway");
-    assert_removed_configuration_rejects_private_ca(policy_path, &matching_url).await;
+
+    let (start_output, start_code) = run_cli(&["sandbox", "start", &lifecycle_sandbox.name]).await;
+    assert_eq!(
+        start_code, 0,
+        "start the same lifecycle sandbox should succeed:\n{start_output}"
+    );
+    wait_for_sandbox_phase(&lifecycle_sandbox.name, "Ready", Duration::from_secs(180))
+        .await
+        .expect("same lifecycle sandbox should become ready after configuration removal");
+    assert_eq!(
+        sandbox_id(&lifecycle_sandbox.name).await,
+        lifecycle_id_before_removal,
+        "stop/start after configuration removal must retain sandbox identity"
+    );
+
+    let removed_validation_script = format!(
+        r#"set -eu
+test "$(cat {LIFECYCLE_DURABLE_PATH})" = "{LIFECYCLE_DURABLE_MARKER}"
+test ! -e '{NETWORK_CA_PATH}'
+set +e
+curl --fail --silent --show-error --max-time 30 '{matching_url}' >/tmp/removed.out 2>/tmp/removed.err
+removed_status=$?
+set -e
+if [ "$removed_status" -eq 0 ]; then
+  echo "private CA remained trusted after configuration removal" >&2
+  exit 1
+fi
+echo gateway-authenticated-exec-works
+echo same-sandbox-private-ca-rejected"#
+    );
+    let removed_validation_output = lifecycle_sandbox
+        .exec(&["sh", "-lc", &removed_validation_script])
+        .await
+        .expect("gateway-authenticated exec should work after lifecycle restart");
+    assert!(
+        removed_validation_output.contains("gateway-authenticated-exec-works"),
+        "gateway-authenticated exec was not confirmed: {removed_validation_output}"
+    );
+    assert!(
+        removed_validation_output.contains("same-sandbox-private-ca-rejected"),
+        "same sandbox retained private CA after configuration removal: {removed_validation_output}"
+    );
+
+    lifecycle_sandbox.cleanup().await;
 }
