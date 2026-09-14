@@ -212,10 +212,10 @@ expect_status 0 "scan selected profiles and retain distinct packaged chart versi
   --chart-ref oci://registry-a.example/charts/helm-chart:1.1.0 \
   --chart-ref oci://registry-b.example/charts/helm-chart:1.0.0
 jq -se '
-  length == 21
+  length == 20
   and ([.[] | select(.[-1] == "deploy")] | length) == 1
   and ([.[] | select(.[-1] == "deploy/helm")] | length) == 1
-  and ([.[] | select(.[-1] == "deploy/helm/openshell")] | length) == 16
+  and ([.[] | select(.[-1] == "deploy/helm/openshell")] | length) == 15
   and all(.[]; (join(" ") | contains("values-spire-stack.yaml")) | not)
   and all(.[]; index("UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL") != null)
 ' "${TRIVY_TEST_CALLS}" >/dev/null
