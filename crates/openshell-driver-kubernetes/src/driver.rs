@@ -2135,7 +2135,7 @@ impl KubernetesComputeDriver {
         sandbox_api: &AgentSandboxApi,
         sandbox_cr: &DynamicObject,
         names: &SandboxRuntimeNames,
-        generation: &str,
+        _generation: &str,
         agent_uid: u32,
         agent_gid: u32,
         main_process_spec: &str,
@@ -2325,8 +2325,12 @@ impl KubernetesComputeDriver {
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox.id.clone(),
-            generation: generation.to_string(),
+            generation: launch_authentication
+                .supervisor
+                .runtime_generation
+                .to_string(),
             session_id,
+            session_rotation: launch_authentication.supervisor.session_rotation,
             gateway_id: launch_authentication.gateway_id,
             verification_keys,
             namespace_uid,
@@ -2461,7 +2465,7 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         cr_uid: &str,
         names: &SandboxRuntimeNames,
-        generation: &str,
+        _generation: &str,
         supervisor_uid: &str,
         agent_uid: u32,
         agent_gid: u32,
@@ -2558,8 +2562,12 @@ impl KubernetesComputeDriver {
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox_id.to_string(),
-            generation: generation.to_string(),
+            generation: launch_authentication
+                .supervisor
+                .runtime_generation
+                .to_string(),
             session_id,
+            session_rotation: launch_authentication.supervisor.session_rotation,
             gateway_id: launch_authentication.gateway_id.clone(),
             verification_keys,
             namespace_uid,
