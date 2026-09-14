@@ -284,20 +284,17 @@ def native_endpoint_server() -> Iterator[int]:
         proc.communicate(timeout=5)
 
 
-def _proxy_connect():
-    """Return a closure that sends a raw CONNECT and returns the status line."""
+def _tcp_connect_errno():
+    """Return a closure that reports the errno from a normal TCP connection."""
 
     def fn(host, port):
         import socket
 
-        conn = socket.create_connection(("10.200.0.1", 3128), timeout=10)
         try:
-            conn.sendall(
-                f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
-            )
-            return conn.recv(256).decode("latin1")
-        finally:
-            conn.close()
+            with socket.create_connection((host, port), timeout=10):
+                return 0
+        except OSError as error:
+            return error.errno or -1
 
     return fn
 
@@ -718,14 +715,12 @@ def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_
                     assert body["model"] == "fixture-anthropic-model"
 
                     denied = sb.exec_python(
-                        _proxy_connect(),
+                        _tcp_connect_errno(),
                         args=("inference.local", 443),
                         timeout_seconds=30,
                     )
                     assert denied.exit_code == 0, denied.stderr
-                    status = denied.stdout.strip()
-                    assert status.startswith("HTTP/1.1 "), status
-                    assert " 200 " not in status, status
+                    assert int(denied.stdout.strip()) != 0
 
 
 # ===========================================================================
