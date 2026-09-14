@@ -213,6 +213,22 @@ impl SandboxSessionJwtAuthority {
     }
 
     #[allow(clippy::result_large_err)]
+    pub fn mint_persisted_launch(
+        &self,
+        sandbox_id: &str,
+        lineage: &crate::auth::sandbox_session::PersistedSessionLineage,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch(
+            sandbox_id,
+            lineage.session_id,
+            lineage.runtime_generation.clone(),
+            lineage.session_rotation,
+            lineage.predecessor_session_id,
+            CredentialEpoch::new(1).map_err(|error| Status::internal(error.to_string()))?,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn mint_launch(
         &self,
         sandbox_id: &str,
