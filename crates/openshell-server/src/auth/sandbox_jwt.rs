@@ -40,8 +40,10 @@ use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
     AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
     SandboxLaunchAuthentication, SandboxSessionIdentity, SessionJwtIssuer, SessionJwtVerifier,
-    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+    SessionRotation, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    SystemJwtClock,
 };
+use openshell_core::sandbox_generation::SandboxGenerationId;
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -175,16 +177,58 @@ impl SandboxSessionJwtAuthority {
     }
 
     #[allow(clippy::result_large_err)]
+    pub fn mint_initial_launch(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        let runtime_generation = SandboxGenerationId::parse(uuid::Uuid::new_v4().to_string())
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.mint_launch(
+            sandbox_id,
+            SandboxSessionId::new(),
+            runtime_generation,
+            SessionRotation::new(1).map_err(|error| Status::internal(error.to_string()))?,
+            None,
+            CredentialEpoch::new(1).map_err(|error| Status::internal(error.to_string()))?,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn mint_successor_launch(
+        &self,
+        sandbox_id: &str,
+        current: &crate::auth::sandbox_session::PersistedSessionLineage,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch(
+            sandbox_id,
+            SandboxSessionId::new(),
+            current.runtime_generation.clone(),
+            current
+                .session_rotation
+                .successor()
+                .map_err(|error| Status::internal(error.to_string()))?,
+            Some(current.session_id),
+            CredentialEpoch::new(1).map_err(|error| Status::internal(error.to_string()))?,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn mint_launch(
         &self,
         sandbox_id: &str,
         session_id: SandboxSessionId,
+        runtime_generation: SandboxGenerationId,
+        session_rotation: SessionRotation,
+        predecessor_session_id: Option<SandboxSessionId>,
         credential_epoch: CredentialEpoch,
     ) -> Result<SandboxLaunchAuthentication, Status> {
         let identity = SandboxSessionIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
                 .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
             session_id,
+            runtime_generation: runtime_generation.clone(),
+            session_rotation,
+            predecessor_session_id,
         };
         let pair = self
             .issuer
@@ -196,6 +240,9 @@ impl SandboxSessionJwtAuthority {
         Ok(SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id,
+                runtime_generation,
+                session_rotation,
+                predecessor_session_id,
                 gateway_token: pair.gateway.token,
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
