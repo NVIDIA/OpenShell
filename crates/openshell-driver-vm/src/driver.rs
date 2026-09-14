@@ -1808,13 +1808,20 @@ impl VmDriver {
                             "read active VM sandbox generation: {error}"
                         ))
                     })?;
-            if active_generation.trim() == generation.as_str() {
+            if active_generation.trim() != generation.as_str() {
+                return Err(Status::failed_precondition(format!(
+                    "VM sandbox is already running generation {}",
+                    active_generation.trim()
+                )));
+            }
+            if launch_authentication.is_empty() {
                 return Ok(());
             }
-            return Err(Status::failed_precondition(format!(
-                "VM sandbox is already running generation {}",
-                active_generation.trim()
-            )));
+            // The gateway keeps launch sessions in memory. A non-empty bundle
+            // during startup recovery represents a new gateway session, so
+            // restart the VM before installing it rather than leaving the old
+            // supervisor connected with invalid credentials.
+            self.stop_sandbox(&record_id, sandbox_name).await?;
         }
 
         remove_runtime_generation_material(&state_dir)
