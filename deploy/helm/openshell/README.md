@@ -35,7 +35,8 @@ where Helm cannot discover cluster APIs.
 ## Install on Kubernetes
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 ## Install on OpenShift
@@ -48,6 +49,7 @@ oc create ns openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -107,6 +109,7 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
