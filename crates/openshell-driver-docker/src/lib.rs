@@ -1942,21 +1942,6 @@ impl DockerComputeDriver {
                 .map_err(|error| internal_status("remove orphan Docker channel volume", error))?;
         }
 
-        for sandbox in &sandboxes {
-            if sandbox.state == Some(ContainerSummaryStateEnum::RUNNING)
-                && let Err(error) = self.ensure_control_process_for_container(sandbox).await
-            {
-                warn!(
-                    sandbox_id = sandbox
-                        .labels
-                        .as_ref()
-                        .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-                        .map_or("unknown", String::as_str),
-                    %error,
-                    "Failed to restore Docker supervisor during startup reconciliation"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -2289,12 +2274,17 @@ impl DockerComputeDriver {
             .as_ref()
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
-        refresh_docker_boundary_authentication(
-            resolved_sandbox_id,
-            &self.config,
-            launch_authentication,
-        )
-        .await?;
+        // Normal starts rotate the launch-scoped credentials supplied by the
+        // gateway. Startup recovery deliberately sends no new credentials;
+        // retain the persisted bundle until the gateway can issue a refresh.
+        if !launch_authentication.is_empty() {
+            refresh_docker_boundary_authentication(
+                resolved_sandbox_id,
+                &self.config,
+                launch_authentication,
+            )
+            .await?;
+        }
         let Some(runtime_descriptor) =
             read_docker_runtime_descriptor(resolved_sandbox_id, &self.config).await?
         else {
