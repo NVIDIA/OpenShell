@@ -118,7 +118,6 @@ const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACK
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
-const SUPERVISOR_NETWORK_MODE: &str = "host";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
@@ -299,6 +298,7 @@ struct DockerDriverRuntimeConfig {
     default_image: String,
     image_pull_policy: ImagePullPolicy,
     sandbox_namespace: String,
+    network_name: String,
     gateway_route: DockerGatewayRoute,
     gateway_callback_bind_address: Option<SocketAddr>,
     stop_timeout_secs: u32,
@@ -960,6 +960,7 @@ impl DockerComputeDriver {
                 default_image: docker_config.default_image.clone(),
                 image_pull_policy: docker_config.image_pull_policy,
                 sandbox_namespace: docker_config.sandbox_label.clone(),
+                network_name,
                 gateway_route,
                 gateway_callback_bind_address,
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
@@ -4823,10 +4824,11 @@ async fn spawn_docker_control_process(
             start_interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
         }),
         host_config: Some(HostConfig {
-            // The supervisor is trusted infrastructure and originates all
-            // approved upstream connections. Keep it on the daemon host's
-            // network while the workload remains fenced by network=none.
-            network_mode: Some(SUPERVISOR_NETWORK_MODE.to_string()),
+            // The supervisor is trusted infrastructure and originates every
+            // approved upstream connection. The driver-owned bridge provides
+            // Docker DNS and service discovery while the workload remains
+            // fenced by network=none.
+            network_mode: Some(config.network_name.clone()),
             mounts: Some(supervisor_mounts),
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: None,

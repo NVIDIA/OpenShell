@@ -35,7 +35,9 @@ mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
-bypassed. Only the trusted supervisor companion uses the daemon host network.
+bypassed. Only the trusted supervisor companion joins the driver-owned bridge,
+where it originates approved egress and can resolve other services on that
+network.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
@@ -71,7 +73,7 @@ LSM decisions remain authoritative.
 | `cap_drop = ALL`, no `cap_add`, no-new-privileges | Prevents either container from acquiring Linux capabilities. |
 | Docker default seccomp and AppArmor profiles | Retains runtime hardening; startup confirmation fails closed if nested seccomp notification is unavailable. |
 | `network_mode = none` on the workload | Removes direct external routes. |
-| `network_mode = host` on the supervisor | Lets the trusted supervisor originate approved gateway and upstream connections through the daemon host network. |
+| Driver-owned bridge on the supervisor | Lets the trusted supervisor originate approved gateway and upstream connections and use Docker service discovery. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
 | Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
