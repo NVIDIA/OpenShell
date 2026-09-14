@@ -2265,11 +2265,44 @@ impl DockerComputeDriver {
             None
         };
         drop(inspected);
+        let resolved_sandbox_id = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .map_or(sandbox_id, String::as_str);
         if !container_state_needs_start(state) {
             verify_docker_start_generation(sandbox_id, &self.config, generation).await?;
-            self.ensure_control_process_for_container(&container)
-                .await?;
-            return Ok(true);
+            if launch_authentication.is_empty() {
+                self.ensure_control_process_for_container(&container)
+                    .await?;
+                return Ok(true);
+            }
+
+            // Gateway restart creates a fresh in-memory launch session. Both
+            // sides of the authenticated channel must restart with that
+            // bundle; otherwise they keep retrying credentials the new
+            // gateway intentionally does not recognize.
+            self.stop_control_process(resolved_sandbox_id).await;
+            self.docker
+                .stop_container(
+                    &target,
+                    Some(
+                        StopContainerOptionsBuilder::default()
+                            .t(docker_stop_timeout_secs(self.config.stop_timeout_secs))
+                            .build(),
+                    ),
+                )
+                .await
+                .or_else(|error| {
+                    if is_not_modified_error(&error) {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| {
+                    internal_status("stop Docker sandbox for authentication rotation", error)
+                })?;
         }
 
         // Fence a poll that observed this stopped run but has not published it
@@ -2278,20 +2311,13 @@ impl DockerComputeDriver {
         self.lifecycle_event_fences
             .record_previous_exit(sandbox_id, previous_finished_at.as_deref());
 
-        let resolved_sandbox_id = container
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-            .map_or(sandbox_id, String::as_str);
         write_docker_boundary_file(
             &docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?
                 .join(START_GENERATION_FILE),
             generation.as_str().as_bytes(),
         )
         .await?;
-        // Normal starts rotate the launch-scoped credentials supplied by the
-        // gateway. Startup recovery deliberately sends no new credentials;
-        // retain the persisted bundle until the gateway can issue a refresh.
+        // Rotate launch-scoped credentials before either process starts.
         if !launch_authentication.is_empty() {
             refresh_docker_boundary_authentication(
                 resolved_sandbox_id,
