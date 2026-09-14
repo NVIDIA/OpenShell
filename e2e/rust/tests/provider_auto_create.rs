@@ -90,7 +90,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     let policy = tempfile::NamedTempFile::new().expect("create provider test policy");
     std::fs::write(
         policy.path(),
-        r#"version: 1
+        r"version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /etc, /proc]
@@ -101,7 +101,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 network_policies: {}
-"#,
+",
     )
     .expect("write provider test policy");
 
