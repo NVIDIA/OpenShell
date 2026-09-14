@@ -55,7 +55,6 @@ impl SandboxProtocolPrincipal {
 pub struct SandboxProtocolAuthenticator {
     verifier: SessionJwtVerifier,
     expected_sandbox_id: SandboxId,
-    expected_session_id: SandboxSessionId,
 }
 
 impl std::fmt::Debug for SandboxProtocolAuthenticator {
@@ -64,22 +63,16 @@ impl std::fmt::Debug for SandboxProtocolAuthenticator {
             .debug_struct("SandboxProtocolAuthenticator")
             .field("verifier", &self.verifier)
             .field("expected_sandbox_id", &self.expected_sandbox_id)
-            .field("expected_session_id", &self.expected_session_id)
             .finish()
     }
 }
 
 impl SandboxProtocolAuthenticator {
     #[must_use]
-    pub const fn new(
-        verifier: SessionJwtVerifier,
-        expected_sandbox_id: SandboxId,
-        expected_session_id: SandboxSessionId,
-    ) -> Self {
+    pub const fn new(verifier: SessionJwtVerifier, expected_sandbox_id: SandboxId) -> Self {
         Self {
             verifier,
             expected_sandbox_id,
-            expected_session_id,
         }
     }
 
@@ -104,9 +97,6 @@ impl SandboxProtocolAuthenticator {
         if session.sandbox_id != self.expected_sandbox_id {
             return Err(SandboxAuthError::WrongSandbox);
         }
-        if session.session_id != self.expected_session_id {
-            return Err(SandboxAuthError::WrongSession);
-        }
         Ok(SandboxProtocolPrincipal {
             connection_id,
             session,
@@ -125,6 +115,8 @@ struct ConnectionState {
     active: Option<ActiveConnection>,
     pending: Option<ActiveConnection>,
     highest_epoch: Option<CredentialEpoch>,
+    session_id: Option<SandboxSessionId>,
+    retired_sessions: std::collections::HashSet<SandboxSessionId>,
     supervisor_instance_id: Option<crate::boundary_protocol::SupervisorInstanceId>,
     terminal: bool,
 }
@@ -155,6 +147,27 @@ impl SandboxConnectionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.terminal {
             return Err(SandboxAuthError::TerminalSession);
+        }
+        let session_id = principal.session.session_id;
+        if state.retired_sessions.contains(&session_id) {
+            return Err(SandboxAuthError::WrongSession);
+        }
+        match state.session_id {
+            Some(expected) if expected == session_id => {}
+            Some(expected) => {
+                // A gateway replacement mints a new launch session. It may
+                // take over only after the previous physical connection has
+                // gone away, so an authenticated rekey never displaces a live
+                // supervisor before confirmation.
+                if state.active.is_some() || state.pending.is_some() {
+                    return Err(SandboxAuthError::WrongSession);
+                }
+                state.retired_sessions.insert(expected);
+                state.session_id = Some(session_id);
+                state.supervisor_instance_id = None;
+                state.highest_epoch = None;
+            }
+            None => state.session_id = Some(session_id),
         }
         match state.supervisor_instance_id {
             Some(expected) if expected != supervisor_instance_id => {
@@ -353,11 +366,20 @@ mod tests {
         SandboxProtocolAuthenticator,
         openshell_core::jwt::MintedSessionToken,
     ) {
+        fixture_for_session(epoch, SandboxSessionId::new())
+    }
+
+    fn fixture_for_session(
+        epoch: u64,
+        session_id: SandboxSessionId,
+    ) -> (
+        SandboxProtocolAuthenticator,
+        openshell_core::jwt::MintedSessionToken,
+    ) {
         let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate key");
         let public_key_pem = key.public_key_pem().into_bytes();
         let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
         let sandbox_id = SandboxId::parse("sandbox-a").expect("sandbox ID");
-        let session_id = SandboxSessionId::new();
         let issuer = SessionJwtIssuer::from_ed25519_pem(
             key.serialize_pem().as_bytes(),
             "current",
@@ -387,7 +409,7 @@ mod tests {
             .expect("token pair")
             .sandbox;
         (
-            SandboxProtocolAuthenticator::new(verifier, sandbox_id, session_id),
+            SandboxProtocolAuthenticator::new(verifier, sandbox_id),
             token,
         )
     }
@@ -480,12 +502,13 @@ mod tests {
 
     #[test]
     fn replacement_does_not_displace_active_connection_before_confirm() {
-        let (first_authenticator, first_token) = fixture(1);
+        let session_id = SandboxSessionId::new();
+        let (first_authenticator, first_token) = fixture_for_session(1, session_id);
         let first_id = SandboxConnectionId::new();
         let first = first_authenticator
             .authenticate(first_id, &metadata(first_token.token.expose_secret()))
             .expect("first principal");
-        let (replacement_authenticator, replacement_token) = fixture(2);
+        let (replacement_authenticator, replacement_token) = fixture_for_session(2, session_id);
         let replacement_id = SandboxConnectionId::new();
         let replacement = replacement_authenticator
             .authenticate(
@@ -517,5 +540,46 @@ mod tests {
         registry
             .require_active(&replacement)
             .expect("replacement became active");
+    }
+
+    #[test]
+    fn new_gateway_session_rekeys_after_the_old_connection_disconnects() {
+        let (first_authenticator, first_token) = fixture(1);
+        let first_id = SandboxConnectionId::new();
+        let first = first_authenticator
+            .authenticate(first_id, &metadata(first_token.token.expose_secret()))
+            .expect("first principal");
+        let registry = SandboxConnectionRegistry::default();
+        let first_instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        registry
+            .attach(&first, first_instance)
+            .expect("attach first");
+        registry.confirm(&first).expect("confirm first");
+
+        let (replacement_authenticator, replacement_token) = fixture(1);
+        let replacement_id = SandboxConnectionId::new();
+        let replacement = replacement_authenticator
+            .authenticate(
+                replacement_id,
+                &metadata(replacement_token.token.expose_secret()),
+            )
+            .expect("replacement principal");
+        let replacement_instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        assert_eq!(
+            registry.attach(&replacement, replacement_instance),
+            Err(SandboxAuthError::WrongSession)
+        );
+
+        assert!(registry.disconnect(first_id));
+        assert_eq!(
+            registry.attach(&replacement, replacement_instance),
+            Ok(None)
+        );
+        registry.confirm(&replacement).expect("confirm replacement");
+        assert!(registry.disconnect(replacement_id));
+        assert_eq!(
+            registry.attach(&first, first_instance),
+            Err(SandboxAuthError::WrongSession)
+        );
     }
 }
