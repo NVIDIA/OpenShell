@@ -83,7 +83,6 @@ use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::sync::mpsc::UnboundedSender;
-#[cfg(any(target_os = "linux", test))]
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
@@ -5545,7 +5544,7 @@ network_policies:
                 pending_acceptance: !pending_snapshot,
             };
             let result = timeout(
-                Duration::from_secs(120),
+                Duration::from_mins(2),
                 load_policy_with_gateway(
                     Some("sandbox-id".to_string()),
                     Some("sandbox".to_string()),
