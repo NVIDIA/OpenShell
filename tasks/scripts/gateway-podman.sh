@@ -17,6 +17,8 @@
 #   OPENSHELL_PODMAN_GATEWAY_NAME=my-podman-gateway mise run gateway:podman
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:podman
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:podman
+#   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:podman
+#   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:podman
 
 set -euo pipefail
 
@@ -69,27 +71,30 @@ require_podman_service() {
   fi
 }
 
-ensure_podman_supervisor_image() {
-  local supervisor_image=$1
+ensure_podman_runtime_image() {
+  local image=$1
+  local configured_image=$2
+  local build_target=$3
+  local role=$4
 
-  if [[ -n "${OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
-    if podman image exists "${supervisor_image}" >/dev/null 2>&1; then
+  if [[ -n "${configured_image}" ]]; then
+    if podman image exists "${image}" >/dev/null 2>&1; then
       return
     fi
-    echo "ERROR: supervisor image '${supervisor_image}' not found locally." >&2
-    echo "       Build it with Podman or unset OPENSHELL_SUPERVISOR_IMAGE to build openshell/supervisor:dev." >&2
+    echo "ERROR: ${role} image '${image}' not found locally." >&2
+    echo "       Build it with Podman or unset its image override to build the local :dev image." >&2
     exit 1
   fi
 
   # Always run the build pipeline for the default development image so source
-  # changes cannot leave the fixed :dev tag pointing at a stale supervisor.
+  # changes cannot leave the fixed :dev tag pointing at a stale runtime.
   # Cargo and BuildKit caches keep unchanged rebuilds incremental.
-  echo "Refreshing Podman supervisor sideload image (${supervisor_image})..."
+  echo "Refreshing Podman ${role} image (${image})..."
   require_mise
-  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor
+  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run "build:docker:${build_target}"
 
-  if ! podman image exists "${supervisor_image}" >/dev/null 2>&1; then
-    echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2
+  if ! podman image exists "${image}" >/dev/null 2>&1; then
+    echo "ERROR: expected ${role} image '${image}' after build" >&2
     exit 1
   fi
 }
@@ -166,7 +171,17 @@ if port_is_in_use "${PORT}"; then
 fi
 
 SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
-ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
+SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
+ensure_podman_runtime_image \
+  "${SUPERVISOR_IMAGE}" \
+  "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
+  supervisor \
+  supervisor
+ensure_podman_runtime_image \
+  "${SANDBOX_RUNTIME_IMAGE}" \
+  "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
+  sandbox \
+  "sandbox runtime"
 export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 
 echo "Building openshell-gateway..."
@@ -213,6 +228,7 @@ ttl_secs = 3600
 [openshell.drivers.podman]
 default_image = "${SANDBOX_IMAGE}"
 supervisor_image = "${SUPERVISOR_IMAGE}"
+sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 # Local development requires supervisor mount setup that Podman's runtime
 # profile may deny. Production configs preserve Podman's default when omitted.

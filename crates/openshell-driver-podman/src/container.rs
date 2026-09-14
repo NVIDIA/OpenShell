@@ -1473,7 +1473,7 @@ pub fn build_isolation_specs(
     workload.volumes.push(NamedVolume {
         name: channel.clone(),
         dest: crate::isolation::CHANNEL_ROOT.into(),
-        options: vec!["rw".into(), "nocopy".into(), "z".into()],
+        options: vec!["rw".into(), "z".into()],
     });
 
     supervisor.name = crate::isolation::supervisor_name(&input.sandbox.id);
@@ -1522,7 +1522,7 @@ pub fn build_isolation_specs(
     supervisor.volumes = vec![NamedVolume {
         name: channel,
         dest: crate::isolation::CHANNEL_ROOT.into(),
-        options: vec!["ro".into(), "nocopy".into(), "z".into()],
+        options: vec!["ro".into(), "z".into()],
     }];
     supervisor.mounts.retain(|mount| {
         trusted_mount(&mount.destination)
@@ -1791,8 +1791,15 @@ mod tests {
         assert_eq!(specs.supervisor.secrets[0].source, "jwt");
         assert_eq!(specs.supervisor.secrets[0].uid, 1000);
         assert_eq!(specs.supervisor.volumes.len(), 1);
+        assert!(specs.workload.volumes[0].options.contains(&"rw".into()));
+        assert!(!specs.workload.volumes[0].options.contains(&"nocopy".into()));
         assert!(specs.supervisor.volumes[0].options.contains(&"ro".into()));
         assert!(specs.supervisor.volumes[0].options.contains(&"z".into()));
+        assert!(
+            !specs.supervisor.volumes[0]
+                .options
+                .contains(&"nocopy".into())
+        );
         assert_eq!(specs.supervisor.entrypoint, vec!["/openshell-supervisor"]);
     }
 
