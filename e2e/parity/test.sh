@@ -213,6 +213,7 @@ if external:
             "external_driver_proxy": False,
             "external_driver_app_armor": False,
             "external_driver_environment": {
+                "XDG_DATA_HOME": f"/tmp/{variant}-driver-data",
                 "OPENSHELL_COMPUTE_DRIVER_SOCKET": driver_socket,
                 "OPENSHELL_PODMAN_SOCKET": podman_socket,
                 "OPENSHELL_SANDBOX_IMAGE": sandbox_runtime,
