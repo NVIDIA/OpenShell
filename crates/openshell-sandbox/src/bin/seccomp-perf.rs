@@ -3,12 +3,17 @@
 
 //! Microbenchmark entry point for the production seccomp network broker.
 
+#[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 
+#[cfg(target_os = "linux")]
 use clap::builder::{PossibleValue, PossibleValuesParser};
+#[cfg(target_os = "linux")]
 use clap::{Parser, Subcommand, ValueEnum as _};
+#[cfg(target_os = "linux")]
 use openshell_sandbox::perf::{BenchmarkOptions, Layer, Protocol};
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
 #[command(
     about = "Measure native and seccomp-filtered socket performance",
@@ -33,6 +38,7 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(target_os = "linux")]
 fn protocol_value_parser() -> PossibleValuesParser {
     let mut values = vec![PossibleValue::new("all")];
     values.extend(
@@ -43,6 +49,7 @@ fn protocol_value_parser() -> PossibleValuesParser {
     PossibleValuesParser::new(values)
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(hide = true)]
@@ -62,6 +69,7 @@ enum Command {
     },
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Some(Command::Worker {
@@ -97,4 +105,9 @@ fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&report)?);
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("the seccomp performance harness requires Linux")
 }
