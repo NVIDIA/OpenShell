@@ -44,6 +44,7 @@ mod session {
     use zeroize::Zeroizing;
 
     use crate::SandboxSessionId;
+    use crate::sandbox_generation::SandboxGenerationId;
 
     pub const GATEWAY_SESSION_JWT_TYPE: &str = "openshell-gateway-session+jwt";
     pub const SANDBOX_SESSION_JWT_TYPE: &str = "openshell-sandbox-session+jwt";
@@ -101,6 +102,32 @@ mod session {
         }
     }
 
+    /// Monotonic identity for a supervisor replacement within one runtime generation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct SessionRotation(u64);
+
+    impl SessionRotation {
+        pub fn new(value: u64) -> Result<Self, SessionJwtError> {
+            if value == 0 {
+                return Err(SessionJwtError::InvalidSessionRotation);
+            }
+            Ok(Self(value))
+        }
+
+        #[must_use]
+        pub const fn get(self) -> u64 {
+            self.0
+        }
+
+        pub fn successor(self) -> Result<Self, SessionJwtError> {
+            self.0
+                .checked_add(1)
+                .ok_or(SessionJwtError::SessionRotationOverflow)
+                .and_then(Self::new)
+        }
+    }
+
     /// The only component authorized by either sandbox-session token profile.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum SessionComponent {
@@ -143,6 +170,10 @@ mod session {
         jti: String,
         sandbox_id: SandboxId,
         session_id: SandboxSessionId,
+        runtime_generation: SandboxGenerationId,
+        session_rotation: SessionRotation,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predecessor_session_id: Option<SandboxSessionId>,
         component: SessionComponent,
         #[serde(skip_serializing_if = "Option::is_none")]
         credential_epoch: Option<CredentialEpoch>,
@@ -153,6 +184,9 @@ mod session {
     pub struct SandboxSessionIdentity {
         pub sandbox_id: SandboxId,
         pub session_id: SandboxSessionId,
+        pub runtime_generation: SandboxGenerationId,
+        pub session_rotation: SessionRotation,
+        pub predecessor_session_id: Option<SandboxSessionId>,
     }
 
     /// A JWT whose contents are deliberately omitted from `Debug` output and
@@ -205,6 +239,9 @@ mod session {
     #[serde(deny_unknown_fields)]
     pub struct SupervisorAuthBundle {
         pub session_id: SandboxSessionId,
+        pub runtime_generation: SandboxGenerationId,
+        pub session_rotation: SessionRotation,
+        pub predecessor_session_id: Option<SandboxSessionId>,
         pub gateway_token: SecretJwt,
         pub gateway_expires_at: i64,
         pub sandbox_token: SecretJwt,
@@ -268,6 +305,12 @@ mod session {
             if self.gateway_expires_at <= 0 || self.sandbox_expires_at <= 0 {
                 return Err(SessionJwtError::InvalidLifetime);
             }
+            SandboxGenerationId::parse(self.runtime_generation.to_string())
+                .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
+            SessionRotation::new(self.session_rotation.get())?;
+            if (self.session_rotation.get() == 1) != self.predecessor_session_id.is_none() {
+                return Err(SessionJwtError::InvalidSessionLineage);
+            }
             Ok(())
         }
 
@@ -285,6 +328,9 @@ mod session {
             formatter
                 .debug_struct("SupervisorAuthBundle")
                 .field("session_id", &self.session_id)
+                .field("runtime_generation", &self.runtime_generation)
+                .field("session_rotation", &self.session_rotation)
+                .field("predecessor_session_id", &self.predecessor_session_id)
                 .field("gateway_token", &"[REDACTED]")
                 .field("gateway_expires_at", &self.gateway_expires_at)
                 .field("sandbox_token", &"[REDACTED]")
@@ -527,6 +573,9 @@ mod session {
                 jti: token_id.to_string(),
                 sandbox_id: identity.sandbox_id.clone(),
                 session_id: identity.session_id,
+                runtime_generation: identity.runtime_generation.clone(),
+                session_rotation: identity.session_rotation,
+                predecessor_session_id: identity.predecessor_session_id,
                 component: SessionComponent::OpenShellSupervisor,
                 credential_epoch,
             };
@@ -574,6 +623,9 @@ mod session {
     pub struct AuthenticatedSandboxSession {
         pub sandbox_id: SandboxId,
         pub session_id: SandboxSessionId,
+        pub runtime_generation: SandboxGenerationId,
+        pub session_rotation: SessionRotation,
+        pub predecessor_session_id: Option<SandboxSessionId>,
         pub credential_epoch: Option<CredentialEpoch>,
         pub token_id: Uuid,
         pub issued_at: i64,
@@ -651,6 +703,12 @@ mod session {
             if claims.credential_epoch.is_some() != expected_epoch {
                 return Err(SessionJwtError::ProfileMismatch);
             }
+            SandboxGenerationId::parse(claims.runtime_generation.to_string())
+                .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
+            SessionRotation::new(claims.session_rotation.get())?;
+            if (claims.session_rotation.get() == 1) != claims.predecessor_session_id.is_none() {
+                return Err(SessionJwtError::InvalidSessionLineage);
+            }
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
             if claims.exp <= claims.iat {
                 return Err(SessionJwtError::InvalidLifetime);
@@ -670,6 +728,9 @@ mod session {
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
                 session_id: claims.session_id,
+                runtime_generation: claims.runtime_generation,
+                session_rotation: claims.session_rotation,
+                predecessor_session_id: claims.predecessor_session_id,
                 credential_epoch: claims.credential_epoch,
                 token_id,
                 issued_at: claims.iat,
@@ -688,6 +749,14 @@ mod session {
         InvalidCredentialEpoch,
         #[error("credential epoch does not advance the active credential")]
         StaleCredentialEpoch,
+        #[error("session rotation must be positive")]
+        InvalidSessionRotation,
+        #[error("session rotation overflow")]
+        SessionRotationOverflow,
+        #[error("sandbox session lineage is missing")]
+        MissingSessionLineage,
+        #[error("sandbox session lineage is invalid")]
+        InvalidSessionLineage,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -826,6 +895,7 @@ mod tests {
 
         use super::super::session::*;
         use crate::SandboxSessionId;
+        use crate::sandbox_generation::SandboxGenerationId;
 
         #[derive(Debug)]
         struct FixedClock(i64);
@@ -870,6 +940,10 @@ mod tests {
             let identity = SandboxSessionIdentity {
                 sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
                 session_id: SandboxSessionId::new(),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                session_rotation: SessionRotation::new(1).expect("session rotation"),
+                predecessor_session_id: None,
             };
             (issuer, gateway, sandbox, identity)
         }
@@ -920,6 +994,9 @@ mod tests {
                 .expect("token pair");
             let bundle = SupervisorAuthBundle {
                 session_id: identity.session_id,
+                runtime_generation: identity.runtime_generation.clone(),
+                session_rotation: identity.session_rotation,
+                predecessor_session_id: identity.predecessor_session_id,
                 gateway_token: pair.gateway.token,
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,

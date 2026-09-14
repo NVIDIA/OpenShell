@@ -7,6 +7,7 @@ mod auth_rpc;
 pub mod policy;
 pub mod provider;
 mod sandbox;
+pub use sandbox::mint_and_persist_successor;
 mod service;
 mod validation;
 pub mod workspace;

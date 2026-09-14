@@ -380,11 +380,7 @@ mod tests {
             .expect("session authority"),
         );
         let authentication = authority
-            .mint_launch(
-                "sandbox-a",
-                openshell_core::SandboxSessionId::new(),
-                openshell_core::jwt::CredentialEpoch::new(1).expect("epoch"),
-            )
+            .mint_initial_launch("sandbox-a")
             .expect("launch authentication");
         state
             .sandbox_auth_sessions

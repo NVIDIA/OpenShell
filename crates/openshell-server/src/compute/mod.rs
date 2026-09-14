@@ -44,6 +44,7 @@ use openshell_core::{ObjectLabels, ObjectWorkspace};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2293,19 +2294,24 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(|_| Ok(Vec::new()), |_| {})
+        self.start_persisted_sandboxes_with_authentication(|_| async { Ok(Vec::new()) }, |_| {})
             .await
     }
 
     /// Reconcile persisted running intent and provision fresh launch
     /// authentication before a restored runtime reconnects.
-    pub async fn start_persisted_sandboxes_with_authentication<Authentication, Failed>(
+    pub async fn start_persisted_sandboxes_with_authentication<
+        Authentication,
+        AuthenticationFuture,
+        Failed,
+    >(
         &self,
         launch_authentication_for: Authentication,
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> Result<Vec<u8>, String>,
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
         Failed: Fn(&str),
     {
         self.recover_persisted_lifecycle_transitions().await?;
@@ -2348,7 +2354,7 @@ impl ComputeRuntime {
                 sandbox_resource_version(&sandbox),
             )
             .into_string();
-            let launch_authentication = match launch_authentication_for(&sandbox) {
+            let launch_authentication = match launch_authentication_for(&sandbox).await {
                 Ok(authentication) => authentication,
                 Err(err) => {
                     warn!(
@@ -10980,7 +10986,10 @@ mod tests {
 
         runtime
             .start_persisted_sandboxes_with_authentication(
-                |sandbox| Ok(format!("authentication:{}", sandbox.object_id()).into_bytes()),
+                |sandbox| {
+                    let sandbox_id = sandbox.object_id().to_string();
+                    async move { Ok(format!("authentication:{sandbox_id}").into_bytes()) }
+                },
                 |_| {},
             )
             .await
