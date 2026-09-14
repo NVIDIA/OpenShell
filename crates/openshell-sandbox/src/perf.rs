@@ -6,9 +6,9 @@
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use clap::ValueEnum;
@@ -147,6 +147,9 @@ struct Fixture {
     target: SocketAddr,
 }
 
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Fixture {
     fn start(protocol: Protocol, _broker: Option<&NetworkBroker>) -> io::Result<Self> {
         match protocol {
@@ -195,27 +198,57 @@ pub fn run_worker(
     concurrency: usize,
     payload_bytes: usize,
 ) -> anyhow::Result<BenchmarkReport> {
-    let barrier = Arc::new(Barrier::new(concurrency + 1));
+    let preparation_deadline = Instant::now() + START_TIMEOUT;
     let (sender, receiver) = mpsc::channel();
     let mut threads = Vec::with_capacity(concurrency);
+    let mut starters = Vec::with_capacity(concurrency);
+    let mut readiness = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
-        let barrier = Arc::clone(&barrier);
         let sender = sender.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        starters.push(start_tx);
+        readiness.push(ready_rx);
         threads.push(thread::spawn(move || {
             let result = worker_loop(
-                protocol,
-                target,
-                iterations,
-                warmup,
-                payload_bytes,
-                &barrier,
+                WorkerOptions {
+                    protocol,
+                    target,
+                    iterations,
+                    warmup,
+                    payload_bytes,
+                    preparation_deadline,
+                },
+                start_rx,
+                ready_tx,
             );
             let _ = sender.send(result);
         }));
     }
     drop(sender);
-    barrier.wait();
+    let preparation = readiness.into_iter().try_for_each(|ready| {
+        ready
+            .recv_timeout(preparation_deadline.saturating_duration_since(Instant::now()))
+            .context("benchmark worker did not finish preparation")?
+            .map_err(anyhow::Error::msg)
+    });
+    if let Err(error) = preparation {
+        // Releasing the senders wakes workers that completed preparation while
+        // a peer failed, so every thread can be joined without hanging.
+        drop(starters);
+        for worker in threads {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("worker panicked"))?;
+        }
+        return Err(error);
+    }
     let started = Instant::now();
+    for starter in starters {
+        starter
+            .send(())
+            .context("benchmark worker exited before measurement")?;
+    }
     let mut samples = Vec::new();
     for result in receiver {
         samples.extend(result?);
@@ -276,27 +309,59 @@ impl Protocol {
     }
 }
 
-fn worker_loop(
+#[derive(Clone, Copy)]
+struct WorkerOptions {
     protocol: Protocol,
     target: SocketAddr,
     iterations: u64,
     warmup: u64,
     payload_bytes: usize,
-    barrier: &Barrier,
+    preparation_deadline: Instant,
+}
+
+fn worker_loop(
+    options: WorkerOptions,
+    start: mpsc::Receiver<()>,
+    ready: mpsc::Sender<Result<(), String>>,
 ) -> anyhow::Result<Vec<u64>> {
-    let payload = vec![0x5a; payload_bytes];
-    let mut tcp = if matches!(protocol, Protocol::TcpStream) {
-        let stream = TcpStream::connect(target)?;
-        let _ = stream.set_nodelay(true);
-        Some(stream)
-    } else {
-        None
+    let WorkerOptions {
+        protocol,
+        target,
+        iterations,
+        warmup,
+        payload_bytes,
+        preparation_deadline,
+    } = options;
+    let prepared = (|| -> anyhow::Result<_> {
+        let payload = vec![0x5a; payload_bytes];
+        let mut tcp = if matches!(protocol, Protocol::TcpStream) {
+            Some(connect(target)?)
+        } else {
+            None
+        };
+        let mut response = vec![0_u8; payload_bytes];
+        for _ in 0..warmup {
+            if Instant::now() >= preparation_deadline {
+                bail!("benchmark warmup exceeded preparation deadline");
+            }
+            one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
+        }
+        Ok((payload, response, tcp))
+    })();
+    let (payload, mut response, mut tcp) = match prepared {
+        Ok(prepared) => {
+            ready
+                .send(Ok(()))
+                .context("benchmark coordinator exited during preparation")?;
+            prepared
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let _ = ready.send(Err(message));
+            return Err(error);
+        }
     };
-    let mut response = vec![0_u8; payload_bytes];
-    for _ in 0..warmup {
-        one_operation(protocol, target, &payload, &mut response, tcp.as_mut())?;
-    }
-    barrier.wait();
+    start.recv().context("benchmark measurement cancelled")?;
     let mut samples = Vec::with_capacity(usize::try_from(iterations).unwrap_or(0));
     for _ in 0..iterations {
         let started = Instant::now();
@@ -315,8 +380,7 @@ fn one_operation(
 ) -> io::Result<()> {
     match protocol {
         Protocol::TcpConnect => {
-            let stream = TcpStream::connect(target)?;
-            let _ = stream.set_nodelay(true);
+            connect(target)?;
         }
         Protocol::TcpStream => {
             let stream = tcp.expect("TCP stream initialized");
@@ -325,6 +389,14 @@ fn one_operation(
         }
     }
     Ok(())
+}
+
+fn connect(target: SocketAddr) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&target, OPERATION_TIMEOUT)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(OPERATION_TIMEOUT))?;
+    stream.set_write_timeout(Some(OPERATION_TIMEOUT))?;
+    Ok(stream)
 }
 
 fn percentile(samples: &[u64], percentile: usize) -> u64 {
@@ -359,5 +431,14 @@ mod tests {
     fn tcp_stream_counts_request_and_echo_bytes() {
         let throughput = throughput_mbit_per_second(Protocol::TcpStream, 1_000, 64, 1.0);
         assert!((throughput - 1.024).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn preparation_failure_does_not_wait_for_other_workers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        drop(listener);
+
+        assert!(run_worker(Protocol::TcpStream, address, 1, 1, 2, 8).is_err());
     }
 }
