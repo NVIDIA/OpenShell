@@ -43,7 +43,7 @@ WORKFLOWS: list[str] = [
     "branch-e2e.yml",
     "build-cli-binaries.yml",
     "build-gateway-binaries.yml",
-    "build-sandbox-binaries.yml",
+    "build-runtime-binaries.yml",
     "ci-image.yml",
     "docker-build.yml",
     "e2e-docker-test.yml",
@@ -63,7 +63,7 @@ WORKFLOWS: list[str] = [
 REUSABLE_WORKFLOWS: set[str] = {
     "build-cli-binaries.yml",
     "build-gateway-binaries.yml",
-    "build-sandbox-binaries.yml",
+    "build-runtime-binaries.yml",
     "docker-build.yml",
     "e2e-docker-test.yml",
     "e2e-podman-test.yml",
