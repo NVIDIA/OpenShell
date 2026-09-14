@@ -330,6 +330,10 @@ helm upgrade --install openshell \
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
 
+## Pod Security
+
+The gateway workload and the PKI bootstrap hooks satisfy the [Restricted Pod Security Standard](https://kubernetes.io/docs/concepts/security/pod-security-standards/), so the release installs into a namespace labeled `pod-security.kubernetes.io/enforce=restricted`.
+
 ## Probes
 
 The gateway exposes `/healthz` for process liveness and `/readyz` for dependency-aware readiness on the health port. The Helm chart wires both into Kubernetes probes:
