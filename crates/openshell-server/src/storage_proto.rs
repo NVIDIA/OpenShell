@@ -119,7 +119,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "26a2882f1fc82741f4821da90fb9674c9b5d66991760398a93a90354b7349d83";
+        "b72f0a2073911cb88ad86349a5dc640d908756ad3ae9cc5c4b54efd216a5c518";
     const DURABLE_SCHEMA_SHA256: &str =
         "568ec5637c504726b40a616d286457f41b5be2f4761872c749313e1ee16b5c85";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -410,6 +410,51 @@ mod tests {
     }
 
     #[test]
+    fn deletion_responses_reserve_legacy_booleans() {
+        let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        for (name, legacy) in [
+            ("DeleteSandboxTemplateResponse", "deleted"),
+            ("DeleteSandboxResponse", "deleted"),
+            ("DeleteServiceResponse", "deleted"),
+            ("DeleteProviderResponse", "deleted"),
+            ("DeleteProviderRefreshResponse", "deleted"),
+            ("DeleteProviderProfileResponse", "deleted"),
+            ("DeleteWorkspaceResponse", "deleted"),
+            ("RemoveWorkspaceMemberResponse", "removed"),
+            ("RevokeSshSessionResponse", "revoked"),
+        ] {
+            let message = public
+                .file
+                .iter()
+                .filter(|file| file.package.as_deref() == Some("openshell.v1"))
+                .flat_map(|file| &file.message_type)
+                .find(|message| message.name.as_deref() == Some(name))
+                .unwrap();
+            assert!(message.reserved_name.iter().any(|name| name == legacy));
+            assert!(
+                message
+                    .reserved_range
+                    .iter()
+                    .any(|range| range.start == Some(1) && range.end == Some(2))
+            );
+            let outcome = message
+                .field
+                .iter()
+                .find(|field| field.name.as_deref() == Some("outcome"))
+                .unwrap();
+            assert_eq!(outcome.number, Some(2));
+            assert_eq!(
+                outcome.type_name.as_deref(),
+                Some(".openshell.v1.DeletionOutcome")
+            );
+        }
+        let legacy = openshell_core::proto::DeleteSandboxResponse::decode(&[8, 1][..]).unwrap();
+        assert_eq!(legacy.outcome, 0);
+        let unknown = openshell_core::proto::DeleteSandboxResponse::decode(&[16, 99][..]).unwrap();
+        assert_eq!(unknown.outcome, 99);
+    }
+
+    #[test]
     fn public_and_durable_schema_inventories_are_complete() {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
@@ -490,7 +535,7 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (282, 13)
+            (282, 14)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),

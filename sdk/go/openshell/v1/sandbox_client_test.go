@@ -33,6 +33,8 @@ type mockSandboxServer struct {
 	listPages          [][]*pb.Sandbox
 	listRequests       []*pb.ListSandboxesRequest
 	deleteErr          error
+	deleteResponse     *pb.DeleteSandboxResponse
+	deleteRequest      *pb.DeleteSandboxRequest
 	attachErr          error
 	detachErr          error
 	listProvErr        error
@@ -131,6 +133,10 @@ func (s *mockSandboxServer) ListSandboxes(_ context.Context, req *pb.ListSandbox
 func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandboxRequest) (*pb.DeleteSandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deleteRequest = req
+	if s.deleteResponse != nil {
+		return s.deleteResponse, nil
+	}
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
@@ -139,7 +145,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
 	}
 	delete(s.sandboxes, req.GetName())
-	return &pb.DeleteSandboxResponse{Deleted: true}, nil
+	return &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
@@ -502,10 +508,24 @@ func TestSandboxDelete(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "deleteme")
+	_, err := client.Delete(context.Background(), "default", "deleteme")
 
 	require.NoError(t, err)
 	assert.Empty(t, mock.sandboxes["deleteme"])
+}
+
+func TestSandboxDelete_OutcomesAndOptions(t *testing.T) {
+	for _, outcome := range []int32{0, 1, 2, 3, 99} {
+		mock := newMockSandboxServer()
+		mock.deleteResponse = &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome(outcome), SandboxId: "original-id"}
+		client, cleanup := setupSandboxTest(t, mock)
+		t.Cleanup(cleanup)
+		result, err := client.Delete(context.Background(), "default", "sandbox", DeleteOptions{AllowMissing: true})
+		require.NoError(t, err)
+		assert.Equal(t, DeletionOutcome(outcome), result.Outcome)
+		assert.Equal(t, "original-id", result.SandboxID)
+		assert.True(t, mock.deleteRequest.GetAllowMissing())
+	}
 }
 
 func TestSandboxDelete_NotFound(t *testing.T) {
@@ -513,7 +533,7 @@ func TestSandboxDelete_NotFound(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "nonexistent")
+	_, err := client.Delete(context.Background(), "default", "nonexistent")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))

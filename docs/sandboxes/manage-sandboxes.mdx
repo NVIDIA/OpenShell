@@ -736,6 +736,12 @@ longer need its retained state.
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
 
+The command can return while cleanup is pending. `deletion accepted` means the
+gateway started deletion; inspect the sandbox until it disappears if your next
+step requires completion. An already-absent sandbox is a successful no-op, but
+missing workspaces and authorization failures remain errors. SDK callers can
+inspect [typed deletion outcomes](/reference/api-errors#deletion-outcomes).
+
 ```shell
 openshell sandbox delete my-sandbox
 ```

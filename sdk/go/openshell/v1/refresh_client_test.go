@@ -113,10 +113,13 @@ func (s *mockRefreshServer) DeleteProviderRefresh(_ context.Context, req *pb.Del
 	key := refreshKey(req.GetProvider(), req.GetCredentialKey())
 	_, ok := s.statuses[key]
 	if !ok {
-		return &pb.DeleteProviderRefreshResponse{Deleted: false}, nil
+		if !req.AllowMissing {
+			return nil, status.Error(codes.NotFound, "refresh configuration not found")
+		}
+		return &pb.DeleteProviderRefreshResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_ALREADY_ABSENT}, nil
 	}
 	delete(s.statuses, key)
-	return &pb.DeleteProviderRefreshResponse{Deleted: true}, nil
+	return &pb.DeleteProviderRefreshResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 // --- Test setup ---
@@ -353,7 +356,7 @@ func TestRefreshDelete(t *testing.T) {
 	deleted, err := client.Delete(context.Background(), "default", "openai", "api-key")
 
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	// Verify it's gone
 	statuses, err := client.GetStatus(context.Background(), "default", "openai", "api-key")
@@ -366,10 +369,10 @@ func TestRefreshDelete_NotConfigured(t *testing.T) {
 	client, cleanup := setupRefreshTest(t, mock)
 	defer cleanup()
 
-	deleted, err := client.Delete(context.Background(), "default", "openai", "nonexistent")
+	deleted, err := client.Delete(context.Background(), "default", "openai", "nonexistent", DeleteOptions{AllowMissing: true})
 
 	require.NoError(t, err)
-	assert.False(t, deleted)
+	assert.Equal(t, DeletionAlreadyAbsent, deleted.Outcome)
 }
 
 func TestRefreshDelete_Error(t *testing.T) {
@@ -380,7 +383,7 @@ func TestRefreshDelete_Error(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "openai", "key")
 
-	assert.False(t, deleted)
+	assert.Nil(t, deleted)
 	require.Error(t, err)
 }
 
@@ -417,7 +420,7 @@ func TestRefreshLifecycle(t *testing.T) {
 	// 4. Delete
 	deleted, err := client.Delete(ctx, "default", "openai", "api-key")
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	// 5. Verify removed
 	statuses, err = client.GetStatus(ctx, "default", "openai", "api-key")

@@ -87,7 +87,7 @@ sb, err = client.Sandboxes().WaitReady(ctx, "default", "my-sandbox")
 assert.Equal(t, types.SandboxReady, sb.Status.Phase)
 
 // Delete removes the sandbox
-err = client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+_, err = client.Sandboxes().Delete(ctx, "default", "my-sandbox")
 assert.NoError(t, err)
 
 // Get after delete returns NotFound

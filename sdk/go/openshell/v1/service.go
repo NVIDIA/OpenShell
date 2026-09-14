@@ -18,5 +18,5 @@ type ServiceInterface interface {
 	Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error)
 	List(workspace, sandboxName string, opts ...ListOptions) (*Pager[*ServiceEndpoint], error)
 	ListAll(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error)
-	Delete(ctx context.Context, workspace, sandboxName, serviceName string) error
+	Delete(ctx context.Context, workspace, sandboxName, serviceName string, opts ...DeleteOptions) (*DeletionResult, error)
 }

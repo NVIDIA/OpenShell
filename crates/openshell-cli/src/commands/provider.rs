@@ -670,6 +670,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
 ) -> Result<()> {
     match client
         .delete_provider(DeleteProviderRequest {
+            allow_missing: true,
             name: provider_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
@@ -1693,6 +1694,7 @@ pub async fn provider_profile_delete(
     for id in ids {
         let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
+                allow_missing: true,
                 id: id.clone(),
                 workspace: workspace.to_string(),
             })
@@ -1708,7 +1710,7 @@ pub async fn provider_profile_delete(
                 continue;
             }
         };
-        if response.deleted {
+        if crate::run::deletion_completed(response.outcome)? {
             println!("{} Deleted provider profile {id}", "✓".green().bold());
         } else {
             println!("{} Provider profile {id} not found", "!".yellow());
@@ -1874,6 +1876,7 @@ pub async fn provider_refresh_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_provider_refresh(DeleteProviderRefreshRequest {
+            allow_missing: true,
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1882,7 +1885,7 @@ pub async fn provider_refresh_delete(
         .into_diagnostic()?
         .into_inner();
 
-    if response.deleted {
+    if crate::run::deletion_completed(response.outcome)? {
         println!(
             "{} Deleted refresh config for {} {}",
             "✓".green().bold(),
@@ -2364,6 +2367,7 @@ pub async fn provider_delete(
     for name in names {
         let response = match client
             .delete_provider(DeleteProviderRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
@@ -2379,7 +2383,7 @@ pub async fn provider_delete(
                 continue;
             }
         };
-        if response.into_inner().deleted {
+        if crate::run::deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted provider {name}", "✓".green().bold());
         } else {
             println!("{} Provider {name} not found", "!".yellow());

@@ -815,11 +815,21 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest {
+        allow_missing: true,
         name: sandbox_name,
         workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
     };
     match app.client.delete_sandbox(req).await {
-        Ok(_) => {
+        Ok(response) => {
+            use openshell_core::proto::DeletionOutcome;
+            app.status_text = match response.into_inner().outcome() {
+                DeletionOutcome::Completed => "sandbox deleted".into(),
+                DeletionOutcome::Accepted => "sandbox deletion accepted; cleanup is pending".into(),
+                DeletionOutcome::AlreadyAbsent => "sandbox already deleted".into(),
+                DeletionOutcome::Unspecified => {
+                    "delete failed: unsupported deletion outcome".into()
+                }
+            };
             app.cancel_log_stream();
             app.screen = Screen::Dashboard;
             app.focus = Focus::Sandboxes;
@@ -1904,12 +1914,21 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::DeleteProviderRequest {
+            allow_missing: true,
             name,
             workspace_scope: Some(named_workspace_scope(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
-                let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
+                let outcome = resp.into_inner().outcome();
+                let result = match outcome {
+                    openshell_core::proto::DeletionOutcome::Completed => Ok(true),
+                    openshell_core::proto::DeletionOutcome::AlreadyAbsent => Ok(false),
+                    _ => {
+                        Err("gateway returned an unsupported provider deletion outcome".to_string())
+                    }
+                };
+                let _ = tx.send(Event::ProviderDeleteResult(result));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Err(e.message().to_string())));

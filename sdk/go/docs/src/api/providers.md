@@ -89,7 +89,7 @@ fmt.Println("Updated provider:", updated.Name)
 Remove a provider by name.
 
 ```go
-err := client.Providers().Delete(ctx, "default", "my-openai")
+deletion, err := client.Providers().Delete(ctx, "default", "my-openai")
 if err != nil {
     log.Fatal(err)
 }
