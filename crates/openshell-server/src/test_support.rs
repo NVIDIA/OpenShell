@@ -114,6 +114,10 @@ pub enum FakeComputeDriverCall {
         sandbox_name: String,
         isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
         launch_authentication: Vec<u8>,
+        /// The optional durable provisioning snapshot supplied by newer
+        /// gateways. Keeping it in the fake makes compatibility and
+        /// reconciliation tests able to verify the start contract.
+        sandbox: Option<DriverSandbox>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -428,6 +432,7 @@ impl ComputeDriver for FakeComputeDriver {
                 sandbox_name: request.name,
                 isolation_backend: request.isolation_backend,
                 launch_authentication: request.launch_authentication,
+                sandbox: request.sandbox,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))
