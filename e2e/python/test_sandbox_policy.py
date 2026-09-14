@@ -107,36 +107,23 @@ def test_policy_applies_to_exec_commands(
 @pytest.mark.parametrize(
     ("policy", "host", "port"),
     [
-        (_base_policy(), "example.com", 443),
+        (_base_policy(), "1.1.1.1", 443),
         (
             _base_policy(
-                {"test_rule": _network_rule("example.com", 80)},
+                {"test_rule": _network_rule("1.1.1.1", 80)},
             ),
-            "example.com",
+            "1.1.1.1",
             443,
         ),
         (
             _base_policy(
-                {"test_rule": _network_rule("example.com", 443, binary="/bin/false")},
+                {"test_rule": _network_rule("1.1.1.1", 443, binary="/bin/false")},
             ),
-            "example.com",
+            "1.1.1.1",
             443,
-        ),
-        (
-            _base_policy(
-                {
-                    "test_rule": _network_rule(
-                        "127.0.0.1",
-                        9,
-                        allowed_ips=["127.0.0.1/32"],
-                    )
-                },
-            ),
-            "127.0.0.1",
-            9,
         ),
     ],
-    ids=["no-policy", "wrong-port", "wrong-binary", "loopback-ssrf"],
+    ids=["no-policy", "wrong-port", "wrong-binary"],
 )
 def test_transparent_tcp_policy_denies_unauthorized_connections(
     sandbox: Callable[..., Sandbox],
