@@ -164,7 +164,10 @@ pub fn bootstrap_archives(
         network_mode: "none".into(),
         unexpected_networks: Vec::new(),
     };
-    let generation = generation.to_string();
+    let runtime_generation = launch_authentication
+        .supervisor
+        .runtime_generation
+        .to_string();
     let verification_keys = launch_authentication
         .verification_keys
         .iter()
@@ -179,8 +182,9 @@ pub fn bootstrap_archives(
         .collect::<Result<Vec<_>, _>>()?;
     let config = BoundaryConfig {
         boundary_id: sandbox_id.into(),
-        generation: generation.clone(),
+        generation: runtime_generation.clone(),
         session_id,
+        session_rotation: launch_authentication.supervisor.session_rotation,
         gateway_id: launch_authentication.gateway_id.clone(),
         verification_keys,
         listener: BoundaryListener::Unix {
@@ -198,7 +202,7 @@ pub fn bootstrap_archives(
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),
-        generation: generation.clone(),
+        generation: runtime_generation,
         session_id,
         transport: SandboxTransport::Unix {
             socket_path: PathBuf::from(SOCKET_PATH),
@@ -239,7 +243,7 @@ pub fn bootstrap_archives(
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
     let restart_metadata = RestartMetadata {
-        generation,
+        generation: generation.to_string(),
         workload_identity: identity.clone(),
         child_env,
     };
@@ -326,6 +330,12 @@ mod tests {
         SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id: openshell_core::SandboxSessionId::new(),
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .unwrap(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+                predecessor_session_id: None,
                 gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
