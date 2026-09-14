@@ -143,6 +143,8 @@ deploy:
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
           supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
           supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
+          sandboxRuntime.image.repository: '{{.IMAGE_REPO_openshell_sandbox}}'
+          sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
 profiles:
   - name: credential-driver-kubernetes-secrets
     patches:
