@@ -134,6 +134,7 @@ pub struct BootstrapArchives {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestartMetadata {
+    pub(crate) generation: String,
     pub(crate) workload_identity: ResolvedWorkloadIdentity,
     pub(crate) child_env: HashMap<String, String>,
 }
@@ -143,6 +144,7 @@ pub struct RestartMetadata {
 pub fn bootstrap_archives(
     sandbox_id: &str,
     container_id: &str,
+    generation: &str,
     identity: &ResolvedWorkloadIdentity,
     child_env: HashMap<String, String>,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
@@ -162,7 +164,7 @@ pub fn bootstrap_archives(
         network_mode: "none".into(),
         unexpected_networks: Vec::new(),
     };
-    let generation = uuid::Uuid::new_v4().to_string();
+    let generation = generation.to_string();
     let verification_keys = launch_authentication
         .verification_keys
         .iter()
@@ -196,7 +198,7 @@ pub fn bootstrap_archives(
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),
-        generation,
+        generation: generation.clone(),
         session_id,
         transport: SandboxTransport::Unix {
             socket_path: PathBuf::from(SOCKET_PATH),
@@ -237,6 +239,7 @@ pub fn bootstrap_archives(
         &serde_json::to_vec(&launch_authentication.supervisor).map_err(invalid)?,
     )?;
     let restart_metadata = RestartMetadata {
+        generation,
         workload_identity: identity.clone(),
         child_env,
     };
@@ -386,6 +389,7 @@ mod tests {
         let archives = bootstrap_archives(
             "sandbox",
             "container",
+            "generation-1",
             &identity,
             child_env.clone(),
             &authentication,
