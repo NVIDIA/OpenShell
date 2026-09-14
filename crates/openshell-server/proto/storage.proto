@@ -89,6 +89,25 @@ message StoredConfigComponentObservation {
   string sanitized_error = 9;
 }
 
+// Durable, non-secret progress for a sandbox-scoped desired-state mutation.
+// The target_* fields let a recovery worker bind the exact effective snapshot
+// revision after the desired-state transaction commits.
+message StoredConfigUpdateOperation {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  openshell.v1.ConfigUpdateOperation operation = 2;
+  uint32 target_policy_version = 3;
+  uint64 target_settings_revision = 4;
+  openshell.v1.SandboxPhase initial_phase = 5;
+  string idempotency_key = 6;
+  uint32 attempt_count = 7;
+  int64 next_attempt_at_ms = 8;
+  uint32 response_policy_version = 9;
+  string response_policy_hash = 10;
+  uint64 response_settings_revision = 11;
+  bool response_deleted = 12;
+  map<string, string> response_annotations = 13;
+}
+
 // Stored payload for a policy revision row in the generic objects table.
 message PolicyRevisionPayload {
   // Serialized policy contents.

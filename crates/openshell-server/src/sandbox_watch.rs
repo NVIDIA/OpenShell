@@ -16,13 +16,16 @@ use tonic::Status;
 #[derive(Debug, Clone)]
 pub struct SandboxWatchBus {
     inner: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
+    all: broadcast::Sender<String>,
 }
 
 impl SandboxWatchBus {
     #[must_use]
     pub fn new() -> Self {
+        let (all, _rx) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            all,
         }
     }
 
@@ -42,11 +45,17 @@ impl SandboxWatchBus {
     pub fn notify(&self, sandbox_id: &str) {
         let tx = self.sender_for(sandbox_id);
         let _ = tx.send(());
+        let _ = self.all.send(sandbox_id.to_string());
     }
 
     /// Subscribe to sandbox updates.
     pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<()> {
         self.sender_for(sandbox_id).subscribe()
+    }
+
+    /// Subscribe to sandbox ids whose persisted state changed.
+    pub fn subscribe_all(&self) -> broadcast::Receiver<String> {
+        self.all.subscribe()
     }
 
     /// Remove the bus entry for the given sandbox id.
@@ -113,5 +122,13 @@ mod tests {
         let bus = SandboxWatchBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn sandbox_watch_bus_global_subscription_receives_changed_id() {
+        let bus = SandboxWatchBus::new();
+        let mut rx = bus.subscribe_all();
+        bus.notify("sb-global");
+        assert_eq!(rx.try_recv().unwrap(), "sb-global");
     }
 }

@@ -239,13 +239,6 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
-    async fn get_sandbox_provider_environment(
-        &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderEnvironmentResponse>, Status>
-    {
-        Err(Status::unimplemented("unused"))
-    }
     async fn create_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSshSessionRequest>,
@@ -391,6 +384,17 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::DeleteProviderResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
     async fn update_config(
         &self,
         _: tonic::Request<openshell_core::proto::UpdateConfigRequest>,

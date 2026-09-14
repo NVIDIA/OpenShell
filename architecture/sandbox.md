@@ -478,19 +478,14 @@ quickly.
 
 ## Supervisor Configuration Delivery
 
-The current gateway and supervisor use internal supervisor protocol revision 2.
-The gateway accepts Stage 1 revision 1 supervisors through the polling
-compatibility path. Peers built before the handshake report revision zero and
-remain accepted for one release with a warning and counter because sandboxes
-keep their supervisor binary until they are recreated. The gateway includes a
+The current gateway and supervisor use internal supervisor protocol revision 3.
+This revision is release-matched: both peers reject every other revision. The gateway includes a
 configuration bootstrap when it accepts a `ConnectSupervisor` session and can
 send complete component replacements on the same stream after policy, settings,
 or provider state changes.
-Revision 2 supervisors require a complete bootstrap. The gateway uses the same
+Supervisors require a complete bootstrap. The gateway uses the same
 bounded 45-second construction window as other snapshot builds and rejects the
-connection when construction fails. Revision 1 compatibility sessions retain
-the optional one-second bootstrap budget and use polling when it expires.
-The revision 2 supervisor opens the stream and consumes the bootstrap before it
+connection when construction fails. The supervisor opens the stream and consumes the bootstrap before it
 constructs gateway-owned policy, provider state, networking, or the workload.
 It reports bootstrap results after those components, the workload, and relay
 endpoints are ready.
@@ -533,8 +528,9 @@ revisions suppress unchanged delivery, while failed or timed-out delivery is
 retried from current database state. Reconnect discards session delivery state
 and starts with a fresh bootstrap.
 
-Revision 2 does not poll configuration fetch APIs. Polling remains available
-only to revision 1 and revision 0 supervisors during the mixed-version rollout.
+Supervisors do not poll configuration fetch APIs. Provider credentials arrive
+only through the encrypted bootstrap or live stream, and the obsolete
+supervisor-only provider-environment fetch RPC no longer exists.
 The gateway serializes construction per sandbox and component, and coalesces
 repeated mutations into the latest full snapshot. An enqueue result means only
 that the local stream queue accepted the message. A bounded scope fanout scheduler
@@ -544,8 +540,24 @@ builds. Fanout waits for worker capacity before admitting each recipient, so a
 fleet-wide change cannot create a fleet-sized task backlog or saturate the store
 and credential backends. Snapshot construction has a deadline that starts once
 a build holds a permit, and the gateway rejects encoded stream messages that
-approach the transport decoder limit. Durable apply operations and final polling
-removal remain separate follow-up work.
+approach the transport decoder limit.
+
+Sandbox-scoped `UpdateConfig` commits the desired policy or settings record and
+a non-secret update operation in one database transaction. The operation target
+is the exact `(policy_version, settings_revision)` tuple. `COMMIT_ONLY` returns
+after that commit; `WAIT_FOR_APPLY` durably waits for `applied`, `inactive`,
+`failed`, `superseded`, or `cancelled`. A client timeout does not roll back the
+mutation or cancel the operation, and the operation ID is returned in error
+metadata for later lookup. Stopped or completed sandboxes finish as `inactive`;
+session absence alone never does. A background reconciler reads pending
+operations in bounded due batches. It claims retry ownership, groups work by
+sandbox, and admits each requested component to the existing bounded delivery
+queue at most once for that sandbox. The delivery worker builds the latest
+sandbox snapshot once, records its exact revision on every matching pending
+operation, then sends that same snapshot. It skips the send if revision
+association fails. Local sandbox-state notifications run the same scoped
+reconciliation path immediately. The periodic database query remains the
+recovery path when another gateway owns the waiter or a notification is missed.
 
 ## Policy Revision Acknowledgement
 
@@ -561,8 +573,7 @@ policy structure.
 Image-specific policy discovery and baseline enrichment can require one initial
 gateway synchronization. The supervisor commits that repair before runtime
 initialization, discards the mutation response, and reconnects so it installs
-only the fresh authoritative stream bootstrap. Compatibility supervisors retain
-the earlier enrichment and first-poll reconciliation path.
+only the fresh authoritative stream bootstrap.
 
 A newer sandbox-scoped revision can carry the same non-empty effective policy
 hash as the currently loaded revision, for example when provenance changes
@@ -573,23 +584,22 @@ reconciliation succeeds. Global policies, local overrides, equal or older
 versions, and different hashes do not use this shortcut. Success telemetry is
 emitted only after the gateway accepts the resulting loaded-status report.
 
-Revision 2 policy status is recorded from the correlated stream result. The
-retained reporting RPC uses the same domain helper for compatibility
-supervisors. Retryable legacy status delivery uses a FIFO background worker so
-status endpoint outages do not block enforcement.
+Current policy status is recorded from the correlated stream result. The
+retained reporting RPC exists for startup construction failures and uses the
+same exact-revision domain helper.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
 not use the sandbox revision API and produce no acknowledgement. When explicit
-local Rego and data files are configured, the supervisor continues polling the
-gateway for settings and provider refreshes only on the compatibility path; a
-revision 2 supervisor receives those components on the stream and never
-replaces the local OPA engine with a gateway policy revision.
+local Rego and data files are configured, the supervisor still receives
+settings and provider refreshes on the stream but never replaces the local OPA
+engine with a gateway policy revision.
 
 ## Failure Behavior
 
-- If a compatibility configuration poll fails, the sandbox keeps its
-  last-known-good policy.
+- If stream delivery or application fails, owner and operation reconciliation
+  republish the latest complete desired state while the sandbox retains its
+  last-known-good policy according to the configured failure mode.
 - If a live policy or middleware-registry update is invalid, the supervisor
   rejects the combined update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`

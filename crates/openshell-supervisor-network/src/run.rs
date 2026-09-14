@@ -151,7 +151,7 @@ pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    /// Policy-local route context: shared with the orchestrator's policy poll
+    /// Policy-local route context: shared with the orchestrator's stream configuration loop
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
     pub policy_local_ctx: Arc<PolicyLocalContext>,
@@ -197,7 +197,7 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
-    // Build the policy-local route context. The orchestrator's policy poll
+    // Build the policy-local route context. The orchestrator's stream configuration loop
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(

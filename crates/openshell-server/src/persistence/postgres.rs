@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicSandboxProjection, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord,
+    PersistenceError, PersistenceResult, PolicyRecord, WriteCondition, WriteResult,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -28,6 +28,118 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+
+async fn insert_update_operation_postgres(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    record: &crate::storage_proto::StoredConfigUpdateOperation,
+    now_ms: i64,
+) -> PersistenceResult<()> {
+    let metadata = record
+        .metadata
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Encode("update operation metadata missing".to_string()))?;
+    let operation = record
+        .operation
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Encode("update operation payload missing".to_string()))?;
+    let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+        .unwrap_or_default();
+    sqlx::query(
+        r"
+INSERT INTO objects (
+    object_type, id, name, workspace, scope, version, status, payload,
+    created_at_ms, updated_at_ms, labels, resource_version, next_attempt_at_ms
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, '{}'::jsonb, 1, $10)
+",
+    )
+    .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+    .bind(&metadata.id)
+    .bind(&metadata.name)
+    .bind(&metadata.workspace)
+    .bind(&operation.sandbox_id)
+    .bind(Option::<i64>::None)
+    .bind(state.as_str_name())
+    .bind(record.encode_to_vec())
+    .bind(now_ms)
+    .bind(record.next_attempt_at_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| map_db_error(&error))?;
+    Ok(())
+}
+
+async fn lock_sandbox_config_fence(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    sandbox_id: &str,
+) -> PersistenceResult<()> {
+    sqlx::query(
+        "INSERT INTO sandbox_config_fences (sandbox_id) VALUES ($1) ON CONFLICT DO NOTHING",
+    )
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| map_db_error(&error))?;
+    sqlx::query("SELECT sandbox_id FROM sandbox_config_fences WHERE sandbox_id = $1 FOR UPDATE")
+        .bind(sandbox_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+    Ok(())
+}
+
+async fn operation_with_current_policy_target(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    record: &crate::storage_proto::StoredConfigUpdateOperation,
+) -> PersistenceResult<crate::storage_proto::StoredConfigUpdateOperation> {
+    let sandbox_id = record
+        .operation
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Encode("update operation payload missing".to_string()))?
+        .sandbox_id
+        .as_str();
+    let version: Option<i64> = sqlx::query_scalar(
+        "SELECT version FROM objects WHERE object_type = $1 AND scope = $2 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(POLICY_OBJECT_TYPE)
+    .bind(sandbox_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| map_db_error(&error))?;
+    let mut record = record.clone();
+    record.target_policy_version =
+        version.map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX));
+    Ok(record)
+}
+
+async fn operation_with_current_settings_target(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    record: &crate::storage_proto::StoredConfigUpdateOperation,
+    workspace: &str,
+    sandbox_name: &str,
+) -> PersistenceResult<crate::storage_proto::StoredConfigUpdateOperation> {
+    let payload: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT payload FROM objects WHERE object_type = $1 AND workspace = $2 AND name = $3",
+    )
+    .bind(crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE)
+    .bind(workspace)
+    .bind(sandbox_name)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| map_db_error(&error))?;
+    let revision = payload
+        .as_deref()
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .transpose()
+        .map_err(|error| {
+            PersistenceError::Decode(format!("decode settings payload failed: {error}"))
+        })?
+        .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let mut record = record.clone();
+    record.target_settings_revision = revision;
+    Ok(record)
+}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
@@ -227,6 +339,237 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                 })
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_if_with_operation(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        condition: WriteCondition,
+        operation_record: &crate::storage_proto::StoredConfigUpdateOperation,
+        sandbox_projection: Option<&AtomicSandboxProjection<'_>>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| map_db_error(&error))?;
+        let sandbox_id = operation_record
+            .operation
+            .as_ref()
+            .ok_or_else(|| {
+                PersistenceError::Encode("update operation payload missing".to_string())
+            })?
+            .sandbox_id
+            .clone();
+        lock_sandbox_config_fence(&mut tx, &sandbox_id).await?;
+        let operation_record =
+            operation_with_current_policy_target(&mut tx, operation_record).await?;
+        let row = match condition {
+            WriteCondition::MustCreate => sqlx::query(
+                r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+            )
+            .bind(object_type)
+            .bind(id)
+            .bind(name)
+            .bind(workspace)
+            .bind(payload)
+            .bind(now_ms)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| map_db_error(&error))?,
+            WriteCondition::MatchResourceVersion(expected) => sqlx::query(
+                r"
+UPDATE objects
+SET payload = $4, updated_at_ms = $5, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+            )
+            .bind(object_type)
+            .bind(id)
+            .bind(i64::try_from(expected).unwrap_or(i64::MAX))
+            .bind(payload)
+            .bind(now_ms)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| map_db_error(&error))?
+            .ok_or(PersistenceError::Conflict {
+                current_resource_version: None,
+            })?,
+            WriteCondition::Unconditional => {
+                return Err(PersistenceError::Config(
+                    "atomic settings operation requires a CAS condition".to_string(),
+                ));
+            }
+        };
+        if let Some(projection) = sandbox_projection {
+            let result = sqlx::query(
+                r"
+UPDATE objects
+SET payload = $2, updated_at_ms = $3, resource_version = resource_version + 1
+WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4
+",
+            )
+            .bind(projection.sandbox_id)
+            .bind(projection.payload)
+            .bind(now_ms)
+            .bind(i64::try_from(projection.expected_resource_version).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| map_db_error(&error))?;
+            if result.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: None,
+                });
+            }
+        }
+        insert_update_operation_postgres(&mut tx, &operation_record, now_ms).await?;
+        tx.commit().await.map_err(|error| map_db_error(&error))?;
+        let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+        Ok(WriteResult {
+            resource_version: resource_version.max(1).cast_unsigned(),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        })
+    }
+
+    pub async fn update_config_operation_cas(
+        &self,
+        record: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<Option<u64>> {
+        let metadata = record.metadata.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation metadata missing".to_string())
+        })?;
+        let operation = record.operation.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation payload missing".to_string())
+        })?;
+        let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+            .unwrap_or_default();
+        let row = sqlx::query(
+            r"
+UPDATE objects
+SET payload = $4, status = $5, next_attempt_at_ms = $6,
+    updated_at_ms = $7, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version
+",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(&metadata.id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .bind(record.encode_to_vec())
+        .bind(state.as_str_name())
+        .bind(record.next_attempt_at_ms)
+        .bind(current_time_ms())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(row.map(|row| {
+            let version: i64 = row.get("resource_version");
+            version.max(1).cast_unsigned()
+        }))
+    }
+
+    pub async fn repair_config_operation_projection(
+        &self,
+        record: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        let metadata = record.metadata.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation metadata missing".to_string())
+        })?;
+        let operation = record.operation.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation payload missing".to_string())
+        })?;
+        let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+            .unwrap_or_default();
+        let result = sqlx::query(
+            r"
+UPDATE objects
+SET scope = $4, status = $5, next_attempt_at_ms = $6
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(&metadata.id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .bind(&operation.sandbox_id)
+        .bind(state.as_str_name())
+        .bind(record.next_attempt_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_pending_config_operations_for_scope(
+        &self,
+        scope: &str,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms,
+       labels, resource_version
+FROM objects
+WHERE object_type = $1 AND status = $2 AND scope = $3
+ORDER BY created_at_ms ASC, id ASC
+",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(openshell_core::proto::ConfigUpdateOperationState::Pending.as_str_name())
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
+    pub async fn list_due_config_update_operations(
+        &self,
+        now_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms,
+       labels, resource_version
+FROM objects
+WHERE object_type = $1 AND status = $2 AND next_attempt_at_ms <= $3
+ORDER BY next_attempt_at_ms ASC, id ASC
+LIMIT $4
+",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(openshell_core::proto::ConfigUpdateOperationState::Pending.as_str_name())
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
+    pub async fn count_pending_config_update_operations(&self) -> PersistenceResult<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objects WHERE object_type = $1 AND status = $2",
+        )
+        .bind(crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
+        .bind(openshell_core::proto::ConfigUpdateOperationState::Pending.as_str_name())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| map_db_error(&error))?;
+        Ok(count.max(0).cast_unsigned())
     }
 
     pub async fn delete_if(
@@ -1002,6 +1345,8 @@ ON CONFLICT DO NOTHING
         let wrapped_payload = policy_payload_from_record(&record)?;
         let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
 
+        lock_sandbox_config_fence(&mut tx, &write.sandbox_id).await?;
+
         let row = sqlx::query(
             r"
 SELECT payload, resource_version
@@ -1068,6 +1413,21 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
         .execute(&mut *tx)
         .await
         .map_err(|e| map_db_error(&e))?;
+
+        if let Some(operation_record) = write.operation.as_ref() {
+            let sandbox_name = sandbox
+                .metadata
+                .as_ref()
+                .map_or("", |metadata| metadata.name.as_str());
+            let operation_record = operation_with_current_settings_target(
+                &mut tx,
+                operation_record,
+                &write.workspace,
+                sandbox_name,
+            )
+            .await?;
+            insert_update_operation_postgres(&mut tx, &operation_record, now_ms).await?;
+        }
 
         sqlx::query(
             r"
