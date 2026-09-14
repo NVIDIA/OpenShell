@@ -14,6 +14,7 @@ Usage:
 Options:
   --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
   --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
+  --provision NAME    Apply a post-artifact system provisioner; repeatable
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
                       its host mode; repeatable
@@ -21,7 +22,7 @@ Options:
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
   --keep              Keep the disposable disk and logs after shutdown
-  --list              List distros and configurations
+  --list              List distros, configurations, and provisioners
   -h, --help          Show this help
 
 With no COMMAND, the runner opens an interactive SSH session.
@@ -31,6 +32,7 @@ EOF
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
@@ -70,6 +72,7 @@ requested_ssh_port=
 keep=0
 list=0
 configurations=()
+provisions=()
 packages=()
 copies=()
 forward_ports=()
@@ -85,6 +88,11 @@ while [ "$#" -gt 0 ]; do
 	--with)
 		require_value "$@"
 		configurations+=("$2")
+		shift 2
+		;;
+	--provision)
+		require_value "$@"
+		provisions+=("$2")
 		shift 2
 		;;
 	--install)
@@ -145,6 +153,12 @@ if [ "${list}" -eq 1 ]; then
 		[ -f "${entry}" ] || continue
 		printf '  %s\n' "${entry##*/}"
 	done
+	echo "Provisions:"
+	for entry in "${OPENSHELL_TEST_GUEST_PROVISIONERS}"/*; do
+		if [ -d "${entry}" ]; then
+			printf '  %s\n' "${entry##*/}"
+		fi
+	done
 	exit 0
 fi
 
@@ -166,6 +180,13 @@ fi
 		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
+		exit 2
+	fi
+done
+for item in "${provisions[@]}"; do
+	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
+		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi
 done
@@ -587,6 +608,7 @@ host_key_checking = False
 inventory = ${ansible_inventory}
 interpreter_python = /usr/bin/python3
 retry_files_enabled = False
+roles_path = ${OPENSHELL_TEST_GUEST_PROVISIONERS}
 
 [ssh_connection]
 ssh_args = -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
@@ -656,6 +678,25 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 		"rm -rf -- '${artifact_staging_dir}'"
 	report_timing "artifact transfer" "${phase_started_at}"
+fi
+
+if [ "${#provisions[@]}" -gt 0 ]; then
+	phase_started_at=${SECONDS}
+	provision_playbook=${run_dir}/provisioners.yml
+	{
+		echo "---"
+		echo "- name: Apply requested system provisioners"
+		echo "  hosts: test_vm"
+		echo "  gather_facts: false"
+		echo "  roles:"
+		for item in "${provisions[@]}"; do
+			echo "    - ${item}"
+		done
+	} >"${provision_playbook}"
+	echo "==> Applying provisioners: ${provisions[*]}"
+	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
+		ansible-playbook "${provision_playbook}"
+	report_timing "system provisioning" "${phase_started_at}"
 fi
 
 # Configuration may change the test user's groups. Close the SSH control

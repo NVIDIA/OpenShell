@@ -1,0 +1,31 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Check OpenShell Snap CLI version
+  ansible.builtin.command:
+    cmd: openshell --version
+  changed_when: false
+
+- name: Check OpenShell Snap services
+  become: true
+  ansible.builtin.command:
+    cmd: snap services openshell
+  changed_when: false
+
+- name: Register local OpenShell Snap gateway
+  ansible.builtin.command:
+    cmd: openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+
+- name: Select local OpenShell Snap gateway
+  ansible.builtin.command:
+    cmd: openshell gateway select snap-docker
+
+- name: Wait for local OpenShell Snap gateway status
+  ansible.builtin.command:
+    cmd: openshell status
+  register: openshell_snap_gateway_status
+  changed_when: false
+  retries: "{{ openshell_snap_ready_retries }}"
+  delay: 1
+  until: openshell_snap_gateway_status.rc == 0

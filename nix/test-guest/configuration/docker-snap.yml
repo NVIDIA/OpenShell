@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Docker delivered by Snap is deliberately separate from the host-package
+# Docker configuration. It models the interface expected by the OpenShell Snap.
+- name: Configure Docker Snap
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate Docker Snap support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          Docker Snap is currently configured only for Ubuntu test guests,
+          not {{ ansible_facts.distribution }}.
+
+    - name: Verify snapd is available
+      ansible.builtin.command:
+        cmd: snap wait system seed.loaded
+      changed_when: false
+
+    - name: Check whether Docker Snap is installed
+      ansible.builtin.command:
+        cmd: snap list docker
+      register: docker_snap
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker Snap
+      ansible.builtin.command:
+        cmd: snap install docker
+      when: docker_snap.rc != 0
+
+    - name: Wait for Docker Snap API
+      ansible.builtin.command:
+        cmd: /snap/bin/docker info
+      register: docker_snap_info
+      changed_when: false
+      retries: 30
+      delay: 1
+      until: docker_snap_info.rc == 0

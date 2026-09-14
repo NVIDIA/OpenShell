@@ -57,24 +57,30 @@ nix/test-guest/
 - `cache-seal.sh` removes per-instance state and zeroes free space inside a prepared guest before capture.
 - `distros/*.nix` define the immutable base-image catalog. Each record pins and exports the image URL and hash and declares the expected OS ID, version, and package family.
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
-- `README.md` documents the supported combinations and developer interface.
+- `README.md` documents the developer interface and known configuration constraints.
 
 The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-guest` and `test-guest-cache` apps. Debian artifact creation remains outside the guest harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
 
-## Supported configurations
+## Discover guests and configurations
 
-| Distro | Docker | Rootless Podman | SELinux | Package format |
-| --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | No | No | `.deb` |
-| Ubuntu 26.04 | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | No | Yes | `.rpm` |
-| Fedora 44 | No | Yes | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | No | Yes | `.rpm` |
+Query the generated catalogs for the available distro, configuration, and
+provisioner names:
+
+```shell
+nix run .#test-guest -- --list
+```
+
+Catalog membership records availability, not compatibility between every
+possible combination. Configurations remain independent, run in command-line
+order, validate their own platform requirements, and fail early when the
+selected guest is incompatible. Keep important constraints next to the
+relevant configuration instead of maintaining a definitive compatibility
+matrix.
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
-local Snap lifecycle experiments. It does not install Docker, because the Snap
-gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
-interface rather than the host-package Docker configuration.
+local Snap lifecycle experiments. Add `docker-snap` after `snapd` to install
+the Docker **Snap** and model the `docker:docker-daemon` interface used by the
+OpenShell Snap. This is separate from the host-package Docker configuration.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -83,12 +89,6 @@ installs the subordinate-ID utilities and rootless storage and network helpers.
 Both configurations verify rootless mode and the `pasta` network helper
 required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
 does not provide that helper.
-
-List the available distros and configurations:
-
-```shell
-nix run .#test-guest -- --list
-```
 
 ## Open an interactive VM
 
@@ -242,27 +242,26 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-## Reproduce Snap gateway startup
+## Verify Snap gateway status
 
-The gateway Snap must be native to the guest architecture. Copy an existing
-Snap artifact and the reproduction script into a prepared Ubuntu guest, then
-run the script as root. It follows the Release Canary ordering exactly: install
-the Snap, connect Docker/log/system interfaces, and immediately query the
-gateway. On each failure it prints snapd and gateway journals.
+The candidate Snap must be native to the guest architecture. The `openshell-snap`
+provisioner installs it, connects the Docker/log/system interfaces, registers the
+local gateway, and waits for `openshell status`, matching the Release Canary
+validation flow.
 
 ```shell
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
   --with snapd \
+  --with docker-snap \
   --keep \
-  --copy ./openshell_*.snap:/tmp/openshell.snap \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
+  --copy ./openshell_*.snap:/var/lib/openshell-conformance/candidate/openshell.snap \
+  --provision openshell-snap \
+  -- true
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown. The final `30` accepts automatic
-recovery for up to 30 seconds; omit it to require the canary's immediate check.
+runner prints their location after shutdown.
 
 
 The destination must be an absolute guest path. Copied files are installed with mode `0755`.
@@ -271,7 +270,8 @@ The destination must be an absolute guest path. Copied files are installed with 
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
+--with NAME         Apply docker, docker-snap, podman-rootless, selinux, or snapd; repeatable
+--provision NAME    Apply a post-artifact system provisioner; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;
                     repeatable
