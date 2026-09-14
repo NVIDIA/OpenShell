@@ -43,6 +43,10 @@ use crate::boundary_protocol::{
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Initial attachment may include runtime image pulls and trusted bootstrap
+/// work before the boundary begins listening. Keep this aligned with the
+/// driver bootstrap grace period rather than the normal operation timeout.
+const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// How long one control call keeps retrying boundary connect attempts. Boot-time
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
@@ -989,8 +993,13 @@ impl BoundaryClient {
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
+        let timeout = if remember_attach {
+            ATTACH_REQUEST_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
         let envelope = Self::prepare_request(request)?;
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tokio::time::timeout(timeout, async {
             loop {
                 match self.exchange_envelope(&envelope).await {
                     Ok(response) => {
