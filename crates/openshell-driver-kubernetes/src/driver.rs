@@ -1861,20 +1861,21 @@ impl KubernetesComputeDriver {
         namespace: &str,
         names: &SandboxRuntimeNames,
     ) -> Result<(), KubernetesDriverError> {
-        let mut policy =
-            workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port)
-                .workload_policy;
-        let labels = policy.metadata.labels.get_or_insert_default();
-        labels.insert(
-            LABEL_MANAGED_BY.to_string(),
-            LABEL_MANAGED_BY_VALUE.to_string(),
-        );
-        labels.insert(
-            "openshell.ai/component".to_string(),
-            "sandbox-workload-fence".to_string(),
-        );
+        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        create_or_validate_sandbox_runtime_fence(&policies, &policy).await
+        for (mut policy, component) in [
+            (fence.workload_policy, "sandbox-workload-fence"),
+            (fence.supervisor_policy, "sandbox-supervisor-egress"),
+        ] {
+            let labels = policy.metadata.labels.get_or_insert_default();
+            labels.insert(
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            );
+            labels.insert("openshell.ai/component".to_string(), component.to_string());
+            create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
+        }
+        Ok(())
     }
 
     async fn wait_for_bootstrap_workload_pod(
@@ -4773,7 +4774,12 @@ async fn sandbox_runtime_control_availability(
         KUBE_API_TIMEOUT,
         policies.get_opt(&names.workload_policy),
     ));
-    let (supervisor, service, fence) = tokio::join!(supervisor, service, fence);
+    let supervisor_fence = Box::pin(tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        policies.get_opt(&names.supervisor_policy),
+    ));
+    let (supervisor, service, fence, supervisor_fence) =
+        tokio::join!(supervisor, service, fence, supervisor_fence);
     let control = match supervisor {
         Ok(Ok(Some(pod))) => sandbox_runtime_control_availability_from_pod(&pod),
         Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
@@ -4823,9 +4829,25 @@ async fn sandbox_runtime_control_availability(
             SandboxRuntimeControlAvailability::Unknown
         }
     };
-    if [control, service, fence].contains(&SandboxRuntimeControlAvailability::Unavailable) {
+    let supervisor_fence = match supervisor_fence {
+        Ok(Ok(Some(_))) => SandboxRuntimeControlAvailability::Available,
+        Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
+        Ok(Err(error)) => {
+            warn!(sandbox_id, %error, "could not determine sandbox-runtime supervisor fence availability");
+            SandboxRuntimeControlAvailability::Unknown
+        }
+        Err(_) => {
+            warn!(
+                sandbox_id,
+                "timed out checking sandbox-runtime supervisor fence availability"
+            );
+            SandboxRuntimeControlAvailability::Unknown
+        }
+    };
+    let dependencies = [control, service, fence, supervisor_fence];
+    if dependencies.contains(&SandboxRuntimeControlAvailability::Unavailable) {
         SandboxRuntimeControlAvailability::Unavailable
-    } else if [control, service, fence].contains(&SandboxRuntimeControlAvailability::Unknown) {
+    } else if dependencies.contains(&SandboxRuntimeControlAvailability::Unknown) {
         SandboxRuntimeControlAvailability::Unknown
     } else {
         SandboxRuntimeControlAvailability::Available
