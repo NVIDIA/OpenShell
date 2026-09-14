@@ -447,11 +447,14 @@ where
 
             let context = gateway_interceptor_context(req.extensions());
             let principal = req.extensions().get::<Principal>().cloned();
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
             let mut body = match collect_intercepted_grpc_body(body).await {
                 Ok(body) => body,
                 Err(status) => return Ok(status.into_http()),
             };
+            // Retain only in memory. evaluate_request below validates the single
+            // uncompressed frame before this extension reaches typed dispatch.
+            let original_body = body.clone();
             if let Some(state) = state.as_ref() {
                 body =
                     match hydrate_update_provider_identity(&path, body, state, principal.as_ref())
@@ -467,6 +470,12 @@ where
                 Err(status) => return Ok(status.into_http()),
             };
 
+            parts
+                .extensions
+                .insert(crate::grpc::mutation_replay::OriginalMutation(
+                    original_body[GRPC_FRAME_HEADER_LEN..].to_vec(),
+                ));
+
             let req = Request::from_parts(
                 parts,
                 boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
@@ -474,6 +483,10 @@ where
             let response = inner.ready().await?.call(req).await?;
 
             if grpc_status_from_response(&response) != "0"
+                || response
+                    .headers()
+                    .get("openshell-replayed")
+                    .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
                 return Ok(response);
@@ -1844,6 +1857,196 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap();
         assert_eq!(collected.to_bytes(), committed_body);
         interceptor_task.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct ReplayTestInterceptor {
+        modifications: Arc<AtomicUsize>,
+        validations: Arc<AtomicUsize>,
+        observations: Arc<AtomicUsize>,
+        deny: Arc<std::sync::atomic::AtomicBool>,
+        name: Arc<Mutex<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for ReplayTestInterceptor {
+        async fn describe(
+            &self,
+            request: tonic::Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            let mut manifest = PostCommitTestInterceptor
+                .describe(request)
+                .await?
+                .into_inner();
+            manifest.bindings.push(InterceptorBinding {
+                id: "validate-create".into(),
+                selector: manifest.bindings[0].selector.clone(),
+                phases: vec![
+                    GatewayInterceptorPhase::ModifyOperation.into(),
+                    GatewayInterceptorPhase::Validate.into(),
+                ],
+                failure_policy: "fail_closed".into(),
+            });
+            Ok(tonic::Response::new(manifest))
+        }
+
+        async fn evaluate(
+            &self,
+            request: tonic::Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            use openshell_core::proto::gateway_interceptor::v1::{
+                JsonPatch, interceptor_evaluation::Phase,
+            };
+            let mut result = InterceptorResult {
+                allowed: true,
+                ..Default::default()
+            };
+            match request.into_inner().phase.unwrap() {
+                Phase::ModifyOperation(_) => {
+                    self.modifications.fetch_add(1, Ordering::SeqCst);
+                    result.patches.push(JsonPatch {
+                        op: "replace".into(),
+                        path: "/name".into(),
+                        value: Some(prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(
+                                self.name.lock().unwrap().clone(),
+                            )),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                Phase::Validate(_) => {
+                    self.validations.fetch_add(1, Ordering::SeqCst);
+                    result.allowed = !self.deny.load(Ordering::SeqCst);
+                    result.reason = "current policy denies creation".into();
+                    result.status_code = "PERMISSION_DENIED".into();
+                }
+                Phase::PostCommit(_) => {
+                    self.observations.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Ok(tonic::Response::new(result))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            request: tonic::Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
+            PostCommitTestInterceptor
+                .snapshot_provider_profiles(request)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_replay_revalidates_interceptors_and_observes_commit_once() {
+        use openshell_core::proto::{
+            SandboxResponse, SandboxSpec, open_shell_server::OpenShellServer,
+        };
+        let interceptor = ReplayTestInterceptor::default();
+        *interceptor.name.lock().unwrap() = "intercepted-create".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = interceptor.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "post-commit-test".into(),
+            grpc_endpoint: format!("http://{address}"),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("key");
+        std::fs::write(&key, b"test-only-private-key").unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+            Some(openshell_core::config::GatewayJwtConfig {
+                signing_key_path: key,
+                public_key_path: directory.path().join("public"),
+                kid_path: directory.path().join("kid"),
+                gateway_id: "test".into(),
+                ttl_secs: None,
+            });
+        let inner = OpenShellServer::new(OpenShellService::new(state.clone()));
+        let mut service = GatewayInterceptorGrpcService::new(inner, runtime, Some(state));
+        let input = CreateSandboxRequest {
+            name: "client-original".into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let request = || {
+            let principal = crate::grpc::test_support::authed_request(())
+                .extensions()
+                .get::<Principal>()
+                .unwrap()
+                .clone();
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/CreateSandbox")
+                .header("content-type", "application/grpc")
+                .header("openshell-replayed", "true")
+                .extension(principal)
+                .body(boxed_body_from_bytes(grpc_frame(&input.encode_to_vec())))
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert!(!first.headers().contains_key("openshell-replayed"));
+        let first = first.into_body().collect().await.unwrap();
+        assert_eq!(first.trailers().unwrap().get("grpc-status").unwrap(), "0");
+        let first = decode_unary_grpc_message::<SandboxResponse>(&first.to_bytes()).unwrap();
+        assert_eq!(
+            first
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .name,
+            "intercepted-create"
+        );
+        let replay = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(replay.headers().get("openshell-replayed").unwrap(), "true");
+        let replay = replay.into_body().collect().await.unwrap();
+        assert_eq!(
+            decode_unary_grpc_message::<SandboxResponse>(&replay.to_bytes()).unwrap(),
+            first
+        );
+        assert_eq!(interceptor.modifications.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        interceptor.deny.store(true, Ordering::SeqCst);
+        let denied = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(denied.headers().get("grpc-status").unwrap(), "7");
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 3);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[test]

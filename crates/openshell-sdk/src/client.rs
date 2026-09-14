@@ -356,6 +356,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
@@ -374,6 +375,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -388,6 +390,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -938,6 +941,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
@@ -957,6 +961,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
@@ -972,6 +977,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
@@ -1155,6 +1161,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             environment,
             template,
@@ -1186,6 +1193,7 @@ fn create_sandbox_from_template_request(
         policy,
     } = spec;
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             providers,
             command,

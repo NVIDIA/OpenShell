@@ -1134,6 +1134,9 @@ message CreateSandboxRequest {
   string workload_template_name = 7;
   // Explicit workspace for the sandbox. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 8;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 9;
 }
 
 message CreateSandboxTemplateRequest {
@@ -1279,6 +1282,9 @@ message AttachSandboxProviderRequest {
   uint64 expected_resource_version = 3;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 // Detach provider from sandbox request.
@@ -1296,6 +1302,9 @@ message DetachSandboxProviderRequest {
   uint64 expected_resource_version = 3;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 // Delete sandbox request.
@@ -1309,6 +1318,9 @@ message DeleteSandboxRequest {
   // Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
   // asynchronous cleanup and does not suppress authorization or parent errors.
   bool allow_missing = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 // Stop sandbox request.
@@ -1319,6 +1331,9 @@ message StopSandboxRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 // Start sandbox request.
@@ -1329,6 +1344,9 @@ message StartSandboxRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 // Sandbox response.
@@ -1426,6 +1444,9 @@ message ExposeServiceRequest {
   bool domain = 4;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 7;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -1474,6 +1495,9 @@ message DeleteServiceRequest {
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   bool allow_missing = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 // Response for deleting an exposed sandbox service endpoint.
@@ -1720,6 +1744,9 @@ message CreateProviderRequest {
   openshell.datamodel.v1.Provider provider = 1;
   // Explicit workspace for the provider. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 // Get provider request.
@@ -1755,6 +1782,9 @@ message UpdateProviderRequest {
   map<string, int64> credential_expires_at_ms = 2;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 // Delete provider request.
@@ -1765,6 +1795,9 @@ message DeleteProviderRequest {
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   bool allow_missing = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 // Provider response.
@@ -2001,6 +2034,9 @@ message ConfigureProviderRefreshRequest {
   optional int64 expires_at_ms = 6;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 8;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 9;
 }
 
 message ConfigureProviderRefreshResponse {
@@ -2014,6 +2050,9 @@ message RotateProviderCredentialRequest {
   string credential_key = 2;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 message RotateProviderCredentialResponse {
@@ -2028,6 +2067,9 @@ message DeleteProviderRefreshRequest {
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   bool allow_missing = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 message DeleteProviderRefreshResponse {
@@ -2091,6 +2133,9 @@ message ImportProviderProfilesRequest {
   // Workspace scope. When set, profiles are workspace-scoped (Workspace Admin).
   // When empty, profiles are platform-scoped (Platform Admin).
   string workspace = 2;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 3;
 }
 
 // Import custom provider profiles response.
@@ -2113,6 +2158,9 @@ message UpdateProviderProfilesRequest {
   // Workspace scope. When set, targets workspace-scoped profile. When empty,
   // targets platform-scoped profile.
   string workspace = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 // Update one custom provider profile response.
@@ -2150,6 +2198,9 @@ message DeleteProviderProfileRequest {
   // targets platform-scoped profile.
   string workspace = 2;
   bool allow_missing = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 // Delete custom provider profile response.
@@ -2281,6 +2332,9 @@ message UpdateConfigRequest {
   // Explicit workspace scope for sandbox-scoped updates. Omit only when
   // `global` is true; the all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 11;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 12;
 }
 
 message PolicyMergeOperation {
@@ -2852,6 +2906,9 @@ message ApproveDraftChunkRequest {
   string review_token = 4;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 message ApproveDraftChunkResponse {
@@ -2873,6 +2930,9 @@ message RejectDraftChunkRequest {
   string reason = 3;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 message RejectDraftChunkResponse {}
@@ -2895,6 +2955,9 @@ message ApproveAllDraftChunksRequest {
   repeated DraftChunkApproval approvals = 4;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -2921,6 +2984,9 @@ message EditDraftChunkRequest {
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 6;
 }
 
 message EditDraftChunkResponse {}
@@ -2935,6 +3001,9 @@ message UndoDraftChunkRequest {
   string chunk_id = 2;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 5;
 }
 
 message UndoDraftChunkResponse {
@@ -2952,6 +3021,9 @@ message ClearDraftChunksRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; see the API errors and retries reference.
+  string request_id = 4;
 }
 
 message ClearDraftChunksResponse {

@@ -23,7 +23,7 @@ fn create(name: &str) -> CreateWorkspaceRequest {
     }
 }
 
-fn reason(status: &Status) -> String {
+pub(super) fn reason(status: &Status) -> String {
     assert!(status.get_error_details().retry_info().is_none());
     status
         .get_error_details()
@@ -33,7 +33,7 @@ fn reason(status: &Status) -> String {
         .clone()
 }
 
-async fn state_for(store: Store) -> Arc<ServerState> {
+pub(super) async fn state_for(store: Store) -> Arc<ServerState> {
     let store = Arc::new(store);
     crate::ensure_default_workspace(&store).await.unwrap();
     let compute = crate::compute::new_test_runtime(store.clone()).await;
@@ -170,6 +170,7 @@ async fn exercise_backend(url: &str) {
         "REQUEST_REPLAY_UNAVAILABLE"
     );
     exercise_expiry_and_uncertainty(&restarted).await;
+    ordinary::tests::exercise_protected_backend(url).await;
 }
 
 #[tokio::test]
@@ -487,8 +488,8 @@ impl Mutation for ControlledCreate {
         }
         Ok(response)
     }
-    fn capture(response: &Self::Output) -> Result<Success, Status> {
-        resource_success(response.workspace.as_ref())
+    fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
+        resource_success(response.get_ref().workspace.as_ref())
     }
     async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
         Ok(CreateWorkspaceResponse {
@@ -543,6 +544,7 @@ async fn quota_fails_closed_but_replays_and_expired_success_cleanup_still_work()
         .unwrap()
         .remove(0);
     let pending = Admission {
+        protection: None,
         format_version: 1,
         payload_hash: "unused".into(),
         workspace_id: None,
