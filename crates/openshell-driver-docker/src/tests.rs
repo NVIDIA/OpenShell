@@ -3525,3 +3525,43 @@ fn concurrent_container_removal_is_idempotent() {
     assert!(is_removal_in_progress_error(&removing));
     assert!(!is_removal_in_progress_error(&other_conflict));
 }
+
+#[tokio::test]
+async fn missing_start_generation_is_adopted() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let path = directory.path().join(START_GENERATION_FILE);
+    let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        "generation-one".to_string(),
+    )
+    .expect("valid generation");
+
+    adopt_or_verify_docker_start_generation_path(&path, &generation)
+        .await
+        .expect("adopt missing marker");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read adopted marker"),
+        generation.as_str()
+    );
+    adopt_or_verify_docker_start_generation_path(&path, &generation)
+        .await
+        .expect("accept adopted generation");
+}
+
+#[tokio::test]
+async fn different_start_generation_is_rejected() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let path = directory.path().join(START_GENERATION_FILE);
+    fs::write(&path, "generation-one").expect("write active marker");
+    let requested = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        "generation-two".to_string(),
+    )
+    .expect("valid generation");
+
+    let error = adopt_or_verify_docker_start_generation_path(&path, &requested)
+        .await
+        .expect_err("reject a different generation");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("generation-one"));
+}

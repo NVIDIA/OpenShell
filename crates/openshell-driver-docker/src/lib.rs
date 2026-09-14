@@ -77,6 +77,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -2271,38 +2272,28 @@ impl DockerComputeDriver {
             .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
             .map_or(sandbox_id, String::as_str);
         if !container_state_needs_start(state) {
-            verify_docker_start_generation(sandbox_id, &self.config, generation).await?;
+            adopt_or_verify_docker_start_generation(resolved_sandbox_id, &self.config, generation)
+                .await?;
             if launch_authentication.is_empty() {
                 self.ensure_control_process_for_container(&container)
                     .await?;
                 return Ok(true);
             }
 
-            // Gateway restart creates a fresh in-memory launch session. Both
-            // sides of the authenticated channel must restart with that
-            // bundle; otherwise they keep retrying credentials the new
-            // gateway intentionally does not recognize.
+            // A gateway restart creates a fresh supervisor session. Rotate
+            // only the supervisor-facing credentials: the running sandbox
+            // keeps its TLS identity and process tree, then accepts the new
+            // gateway-signed session after the old supervisor disconnects.
             self.stop_control_process(resolved_sandbox_id).await;
-            self.docker
-                .stop_container(
-                    &target,
-                    Some(
-                        StopContainerOptionsBuilder::default()
-                            .t(docker_stop_timeout_secs(self.config.stop_timeout_secs))
-                            .build(),
-                    ),
-                )
-                .await
-                .or_else(|error| {
-                    if is_not_modified_error(&error) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| {
-                    internal_status("stop Docker sandbox for authentication rotation", error)
-                })?;
+            refresh_docker_supervisor_authentication(
+                resolved_sandbox_id,
+                &self.config,
+                launch_authentication,
+            )
+            .await?;
+            self.ensure_control_process_for_container(&container)
+                .await?;
+            return Ok(true);
         }
 
         // Fence a poll that observed this stopped run but has not published it
@@ -2393,7 +2384,8 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => return Ok(false),
             Err(err) => return Err(internal_status("start docker sandbox container", err)),
         }
-        verify_docker_start_generation(resolved_sandbox_id, &self.config, generation).await?;
+        adopt_or_verify_docker_start_generation(resolved_sandbox_id, &self.config, generation)
+            .await?;
         self.ensure_control_process_for_container(&container)
             .await?;
         Ok(true)
@@ -4102,18 +4094,82 @@ async fn write_docker_boundary_file(path: &Path, contents: &[u8]) -> Result<(), 
     })
 }
 
-async fn verify_docker_start_generation(
+async fn adopt_or_verify_docker_start_generation(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
     requested: &openshell_core::sandbox_generation::SandboxGenerationId,
 ) -> Result<(), Status> {
     let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(START_GENERATION_FILE);
-    let active = tokio::fs::read_to_string(&path).await.map_err(|error| {
-        Status::failed_precondition(format!(
-            "read active Docker sandbox generation {}: {error}",
-            path.display()
-        ))
-    })?;
+    adopt_or_verify_docker_start_generation_path(&path, requested).await
+}
+
+async fn adopt_or_verify_docker_start_generation_path(
+    path: &Path,
+    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+) -> Result<(), Status> {
+    let active = match tokio::fs::read_to_string(&path).await {
+        Ok(active) => active,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut marker = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(marker) => marker,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let active = tokio::fs::read_to_string(&path).await.map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "read concurrently adopted Docker sandbox generation {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    return verify_docker_start_generation_value(&active, requested);
+                }
+                Err(error) => {
+                    return Err(Status::failed_precondition(format!(
+                        "adopt active Docker sandbox generation {}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            marker
+                .write_all(requested.as_str().as_bytes())
+                .await
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "write adopted Docker sandbox generation {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            marker.flush().await.map_err(|error| {
+                Status::internal(format!(
+                    "flush adopted Docker sandbox generation {}: {error}",
+                    path.display()
+                ))
+            })?;
+            openshell_core::paths::set_file_owner_only(path).map_err(|error| {
+                Status::internal(format!(
+                    "restrict adopted Docker sandbox generation {}: {error}",
+                    path.display()
+                ))
+            })?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(Status::failed_precondition(format!(
+                "read active Docker sandbox generation {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    verify_docker_start_generation_value(&active, requested)
+}
+
+fn verify_docker_start_generation_value(
+    active: &str,
+    requested: &openshell_core::sandbox_generation::SandboxGenerationId,
+) -> Result<(), Status> {
     if active.trim() == requested.as_str() {
         return Ok(());
     }
@@ -4566,6 +4622,37 @@ async fn refresh_docker_boundary_authentication(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
+    write_docker_boundary_file(
+        &directory.join(RUNTIME_DESCRIPTOR_FILE),
+        &descriptor.payload,
+    )
+    .await?;
+    write_docker_boundary_file(
+        &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
+        &supervisor_auth,
+    )
+    .await
+}
+
+async fn refresh_docker_supervisor_authentication(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+    encoded_authentication: &[u8],
+) -> Result<(), Status> {
+    let authentication = decode_docker_launch_authentication(encoded_authentication)?;
+    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
+    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
+    else {
+        return Err(Status::failed_precondition(
+            "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
+        ));
+    };
+    runtime_descriptor.session_id = authentication.supervisor.session_id;
+    let descriptor = runtime_descriptor
+        .backend_descriptor()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
+        .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
     write_docker_boundary_file(
         &directory.join(RUNTIME_DESCRIPTOR_FILE),
         &descriptor.payload,
