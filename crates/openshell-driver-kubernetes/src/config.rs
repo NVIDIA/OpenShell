@@ -10,6 +10,45 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 
+/// Image pull policies accepted by the Kubernetes API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KubernetesImagePullPolicy {
+    #[serde(alias = "Always")]
+    Always,
+    #[serde(alias = "IfNotPresent")]
+    IfNotPresent,
+    #[serde(alias = "Never")]
+    Never,
+}
+
+impl KubernetesImagePullPolicy {
+    /// Return the spelling required by Kubernetes Pod specs.
+    #[must_use]
+    pub const fn as_kubernetes_str(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::IfNotPresent => "IfNotPresent",
+            Self::Never => "Never",
+        }
+    }
+}
+
+impl FromStr for KubernetesImagePullPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "always" | "Always" => Ok(Self::Always),
+            "if_not_present" | "IfNotPresent" => Ok(Self::IfNotPresent),
+            "never" | "Never" => Ok(Self::Never),
+            other => Err(format!(
+                "invalid Kubernetes image pull policy '{other}'; expected always, if_not_present, or never"
+            )),
+        }
+    }
+}
+
 /// Default gateway identity used in managed-mode namespace naming.
 pub const DEFAULT_GATEWAY_ID: &str = "openshell";
 
@@ -137,7 +176,8 @@ pub struct KubernetesComputeConfig {
     /// audience-bound projected token accepted by the bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
-    pub image_pull_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
     pub image_pull_secrets: Vec<String>,
     /// Managed-mode SSH ingress isolation. When enabled, the driver creates a
@@ -147,13 +187,15 @@ pub struct KubernetesComputeConfig {
     /// Image that provides the trusted `openshell-sandbox` bootstrap binary.
     pub sandbox_runtime_image: String,
     /// Kubernetes `imagePullPolicy` for the sandbox runtime image.
-    /// Empty string delegates to the Kubernetes default.
-    pub sandbox_runtime_image_pull_policy: String,
+    /// When omitted, Kubernetes selects its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Image that provides the trusted `openshell-supervisor` control binary.
     pub supervisor_image: String,
     /// Kubernetes `imagePullPolicy` for the supervisor image.
-    /// Empty string delegates to the Kubernetes default.
-    pub supervisor_image_pull_policy: String,
+    /// When omitted, Kubernetes selects its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Cross-pod sandbox/supervisor settings.
     pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
@@ -262,13 +304,13 @@ impl Default for KubernetesComputeConfig {
             // specs and Kubernetes applies its own default (Always for `latest`,
             // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
             // is Podman vocabulary and is not a valid Kubernetes value.
-            image_pull_policy: String::new(),
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
             sandbox_runtime_image: config::default_sandbox_runtime_image(),
-            sandbox_runtime_image_pull_policy: String::new(),
+            sandbox_runtime_image_pull_policy: None,
             supervisor_image: config::default_supervisor_image(),
-            supervisor_image_pull_policy: String::new(),
+            supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
             https_proxy: None,
             no_proxy: None,
@@ -714,6 +756,51 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn image_pull_policy_accepts_config_and_kubernetes_spellings() {
+        for (value, expected) in [
+            ("always", KubernetesImagePullPolicy::Always),
+            ("Always", KubernetesImagePullPolicy::Always),
+            ("if_not_present", KubernetesImagePullPolicy::IfNotPresent),
+            ("IfNotPresent", KubernetesImagePullPolicy::IfNotPresent),
+            ("never", KubernetesImagePullPolicy::Never),
+            ("Never", KubernetesImagePullPolicy::Never),
+        ] {
+            assert_eq!(value.parse(), Ok(expected));
+        }
+        assert!("newer".parse::<KubernetesImagePullPolicy>().is_err());
+        assert!("sometimes".parse::<KubernetesImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn image_pull_policy_fields_reject_unsupported_values() {
+        for field in [
+            "image_pull_policy",
+            "sandbox_runtime_image_pull_policy",
+            "supervisor_image_pull_policy",
+        ] {
+            let input = format!("{field} = \"sometimes\"");
+            assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn published_kubernetes_example_is_valid_toml() {
+        let docs = include_str!("../../../docs/reference/gateway-config.mdx");
+        let section = docs
+            .split_once("### Kubernetes")
+            .expect("Kubernetes documentation section")
+            .1;
+        let example = section
+            .split_once("```toml")
+            .expect("Kubernetes TOML fence")
+            .1
+            .split_once("```")
+            .expect("closed Kubernetes TOML fence")
+            .0;
+        toml::from_str::<toml::Value>(example).expect("valid Kubernetes gateway TOML example");
+    }
 
     #[test]
     fn default_workspace_storage_size_is_2gi() {

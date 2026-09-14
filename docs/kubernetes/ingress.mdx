@@ -57,6 +57,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
   --set grpcRoute.gateway.className=eg
@@ -113,6 +114,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
   --set grpcRoute.gateway.className=eg \

@@ -85,7 +85,8 @@ Install from the OCI registry on GHCR. Replace `<version>` with the chart versio
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
-  --namespace openshell
+  --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 To use the latest development build instead of a stable release:
@@ -94,7 +95,8 @@ To use the latest development build instead of a stable release:
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
-  --namespace openshell
+  --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
@@ -109,6 +111,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workspaceResources.enabled=false \
   --set server.sandboxNamespace=app-a
 
@@ -214,6 +217,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --values my-values.yaml
 ```
 
@@ -296,6 +300,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set serviceAccount.create=false \
   --set serviceAccount.name=my-existing-sa
 ```

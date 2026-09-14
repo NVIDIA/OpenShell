@@ -1687,10 +1687,10 @@ impl KubernetesComputeDriver {
         let log_level = openshell_core::driver_utils::sandbox_log_level(sandbox, "info");
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
-            image_pull_policy: &self.config.image_pull_policy,
+            image_pull_policy: self.config.image_pull_policy,
             image_pull_secrets: &self.config.image_pull_secrets,
             sandbox_runtime_image: &self.config.sandbox_runtime_image,
-            sandbox_runtime_image_pull_policy: &self.config.sandbox_runtime_image_pull_policy,
+            sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             enable_user_namespaces: self.config.enable_user_namespaces,
@@ -2162,7 +2162,7 @@ impl KubernetesComputeDriver {
                     &sandbox.name,
                     &self.config.gateway_id,
                     &self.config.supervisor_image,
-                    &self.config.supervisor_image_pull_policy,
+                    self.config.supervisor_image_pull_policy,
                     &self.config.service_account_name,
                     agent_uid,
                     agent_gid,
@@ -2806,7 +2806,7 @@ impl KubernetesComputeDriver {
                     &sandbox_name,
                     &self.config.gateway_id,
                     &self.config.supervisor_image,
-                    &self.config.supervisor_image_pull_policy,
+                    self.config.supervisor_image_pull_policy,
                     &self.config.service_account_name,
                     agent_uid,
                     agent_gid,
@@ -5020,8 +5020,8 @@ fn apply_supervisor_sandbox_runtime_boundary(
             {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
         ]
     });
-    if !params.sandbox_runtime_image_pull_policy.is_empty() {
-        bootstrap["imagePullPolicy"] = serde_json::json!(params.sandbox_runtime_image_pull_policy);
+    if let Some(policy) = params.sandbox_runtime_image_pull_policy {
+        bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
     }
     init_containers.push(bootstrap);
 
@@ -5127,7 +5127,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
-    image_pull_policy: &str,
+    image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     sandbox_gid: Option<u32>,
     workspace_owner: Option<(u32, u32)>,
 ) {
@@ -5238,8 +5238,8 @@ fn apply_workspace_persistence(
                 }]
             })
         };
-        if !image_pull_policy.is_empty() {
-            init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+        if let Some(policy) = image_pull_policy {
+            init_spec["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
         }
         init_containers.push(init_spec);
     }
@@ -5286,10 +5286,10 @@ fn default_workspace_volume_claim_templates(
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
-    image_pull_policy: &'a str,
+    image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     image_pull_secrets: &'a [String],
     sandbox_runtime_image: &'a str,
-    sandbox_runtime_image_pull_policy: &'a str,
+    sandbox_runtime_image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     enable_user_namespaces: bool,
@@ -5310,10 +5310,10 @@ impl Default for SandboxPodParams<'_> {
     fn default() -> Self {
         Self {
             default_image: "",
-            image_pull_policy: "",
+            image_pull_policy: None,
             image_pull_secrets: &[],
             sandbox_runtime_image: "",
-            sandbox_runtime_image_pull_policy: "",
+            sandbox_runtime_image_pull_policy: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             enable_user_namespaces: false,
@@ -5584,10 +5584,10 @@ fn sandbox_template_to_k8s_with_validated_config(
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
-        if !params.image_pull_policy.is_empty() {
+        if let Some(policy) = params.image_pull_policy {
             container.insert(
                 "imagePullPolicy".to_string(),
-                serde_json::json!(params.image_pull_policy),
+                serde_json::json!(policy.as_kubernetes_str()),
             );
         }
     }
@@ -7880,7 +7880,10 @@ mod tests {
     #[test]
     fn sandbox_runtime_renders_credential_free_boundary_workload() {
         let params = SandboxPodParams {
+            default_image: "agent:latest",
+            image_pull_policy: Some(crate::KubernetesImagePullPolicy::Always),
             sandbox_runtime_image: "sandbox-runtime-image:latest",
+            sandbox_runtime_image_pull_policy: Some(crate::KubernetesImagePullPolicy::Never),
             sandbox_id: "sandbox-123",
             sandbox_uid: 1500,
             sandbox_gid: 1500,
@@ -7894,6 +7897,7 @@ mod tests {
             &params,
         );
         let agent = &pod_template["spec"]["containers"][0];
+        assert_eq!(agent["imagePullPolicy"], "Always");
 
         assert_eq!(
             agent["command"],
@@ -7932,6 +7936,7 @@ mod tests {
             .find(|container| container["name"] == "openshell-sandbox-bootstrap")
             .unwrap();
         assert_eq!(sandbox_bootstrap["image"], "sandbox-runtime-image:latest");
+        assert_eq!(sandbox_bootstrap["imagePullPolicy"], "Never");
         let workspace_init = pod_template["spec"]["initContainers"]
             .as_array()
             .unwrap()
@@ -7946,6 +7951,7 @@ mod tests {
             ])
         );
         assert_eq!(workspace_init["securityContext"]["runAsUser"], 1500);
+        assert_eq!(workspace_init["imagePullPolicy"], "Always");
         assert_eq!(
             workspace_init["securityContext"]["capabilities"],
             serde_json::json!({"drop": ["ALL"]})
@@ -8368,7 +8374,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "openshell/sandbox:latest",
-            "IfNotPresent",
+            Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             Some(1000), // sandbox_gid
             None,
         );
@@ -8428,7 +8434,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "my-custom-image:v2",
-            "IfNotPresent",
+            Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             Some(1000),
             None,
         );
@@ -8453,7 +8459,13 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", Some(1000), None);
+        apply_workspace_persistence(
+            &mut pod_template,
+            "img:latest",
+            Some(crate::KubernetesImagePullPolicy::Always),
+            Some(1000),
+            None,
+        );
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
