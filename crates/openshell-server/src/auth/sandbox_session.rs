@@ -4,15 +4,84 @@
 //! Authoritative launch-scoped sandbox authentication state.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionJwtError,
+    CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionJwtError, SessionRotation,
 };
+use openshell_core::sandbox_generation::SandboxGenerationId;
 use uuid::Uuid;
 
 use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
+
+pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
+pub const SESSION_ID_ANNOTATION: &str = "internal.openshell.ai/session-id";
+pub const SESSION_ROTATION_ANNOTATION: &str = "internal.openshell.ai/session-rotation";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedSessionLineage {
+    pub runtime_generation: SandboxGenerationId,
+    pub session_id: SandboxSessionId,
+    pub session_rotation: SessionRotation,
+}
+
+impl PersistedSessionLineage {
+    pub fn from_authentication(authentication: &SandboxLaunchAuthentication) -> Self {
+        Self {
+            runtime_generation: authentication.supervisor.runtime_generation.clone(),
+            session_id: authentication.supervisor.session_id,
+            session_rotation: authentication.supervisor.session_rotation,
+        }
+    }
+
+    pub fn read(annotations: &HashMap<String, String>) -> Result<Self, SessionJwtError> {
+        let runtime_generation = annotations
+            .get(RUNTIME_GENERATION_ANNOTATION)
+            .ok_or(SessionJwtError::MissingSessionLineage)
+            .and_then(|value| {
+                SandboxGenerationId::parse(value.clone())
+                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
+            })?;
+        let session_id = annotations
+            .get(SESSION_ID_ANNOTATION)
+            .ok_or(SessionJwtError::MissingSessionLineage)
+            .and_then(|value| {
+                SandboxSessionId::from_str(value)
+                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
+            })?;
+        let session_rotation = annotations
+            .get(SESSION_ROTATION_ANNOTATION)
+            .ok_or(SessionJwtError::MissingSessionLineage)
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
+            })
+            .and_then(SessionRotation::new)?;
+        Ok(Self {
+            runtime_generation,
+            session_id,
+            session_rotation,
+        })
+    }
+
+    pub fn write(&self, annotations: &mut HashMap<String, String>) {
+        annotations.insert(
+            RUNTIME_GENERATION_ANNOTATION.to_string(),
+            self.runtime_generation.to_string(),
+        );
+        annotations.insert(
+            SESSION_ID_ANNOTATION.to_string(),
+            self.session_id.to_string(),
+        );
+        annotations.insert(
+            SESSION_ROTATION_ANNOTATION.to_string(),
+            self.session_rotation.get().to_string(),
+        );
+    }
+}
 
 #[derive(Clone)]
 struct RefreshResult {
@@ -23,6 +92,9 @@ struct RefreshResult {
 #[derive(Clone)]
 struct ActiveSession {
     session_id: SandboxSessionId,
+    runtime_generation: SandboxGenerationId,
+    session_rotation: SessionRotation,
+    predecessor_session_id: Option<SandboxSessionId>,
     credential_epoch: CredentialEpoch,
     current_gateway_token_id: Uuid,
     active: bool,
@@ -64,7 +136,12 @@ impl SandboxSessionRegistry {
             .get(principal.sandbox_id.as_str())
             .filter(|session| session.active)
             .ok_or_else(|| tonic::Status::failed_precondition("sandbox session is not active"))?;
-        if principal.session_id != session.session_id || principal.credential_epoch.is_some() {
+        if principal.session_id != session.session_id
+            || principal.runtime_generation != session.runtime_generation
+            || principal.session_rotation != session.session_rotation
+            || principal.predecessor_session_id != session.predecessor_session_id
+            || principal.credential_epoch.is_some()
+        {
             return Err(tonic::Status::unauthenticated(
                 "gateway session does not match the active sandbox generation",
             ));
@@ -94,6 +171,9 @@ impl SandboxSessionRegistry {
             .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())
             .map_err(|_| SessionJwtError::InvalidToken)?;
         if principal.session_id != authentication.supervisor.session_id
+            || principal.runtime_generation != authentication.supervisor.runtime_generation
+            || principal.session_rotation != authentication.supervisor.session_rotation
+            || principal.predecessor_session_id != authentication.supervisor.predecessor_session_id
             || principal.credential_epoch.is_some()
         {
             return Err(SessionJwtError::ProfileMismatch);
@@ -105,6 +185,9 @@ impl SandboxSessionRegistry {
                 sandbox_id.to_string(),
                 ActiveSession {
                     session_id: authentication.supervisor.session_id,
+                    runtime_generation: authentication.supervisor.runtime_generation.clone(),
+                    session_rotation: authentication.supervisor.session_rotation,
+                    predecessor_session_id: authentication.supervisor.predecessor_session_id,
                     credential_epoch: authentication.supervisor.credential_epoch,
                     current_gateway_token_id: principal.token_id,
                     active: true,
@@ -180,7 +263,14 @@ impl SandboxSessionRegistry {
             .checked_add(1)
             .and_then(|value| CredentialEpoch::new(value).ok())
             .ok_or_else(|| tonic::Status::internal("sandbox credential epoch overflow"))?;
-        let authentication = authority.mint_launch(sandbox_id, session.session_id, next_epoch)?;
+        let authentication = authority.mint_launch(
+            sandbox_id,
+            session.session_id,
+            session.runtime_generation.clone(),
+            session.session_rotation,
+            session.predecessor_session_id,
+            next_epoch,
+        )?;
         let next_principal = authority
             .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())?;
         session.credential_epoch = next_epoch;
@@ -215,11 +305,7 @@ mod tests {
         .expect("session authority");
         let registry = SandboxSessionRegistry::default();
         let authentication = authority
-            .mint_launch(
-                "sandbox-a",
-                SandboxSessionId::new(),
-                CredentialEpoch::new(1).expect("credential epoch"),
-            )
+            .mint_initial_launch("sandbox-a")
             .expect("launch authentication");
         registry
             .activate("sandbox-a", &authentication, &authority)

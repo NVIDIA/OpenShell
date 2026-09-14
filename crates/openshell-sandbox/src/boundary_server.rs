@@ -1318,6 +1318,11 @@ mod linux {
         ) -> Result<Self, String> {
             let sandbox_id = SandboxId::parse(config.boundary_id.clone())
                 .map_err(|error| format!("validate sandbox ID: {error}"))?;
+            let runtime_generation =
+                openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    config.generation.clone(),
+                )
+                .map_err(|error| format!("validate sandbox runtime generation: {error}"))?;
             let verifier = SessionJwtVerifier::new(
                 &config.gateway_id,
                 SessionTokenProfile::Sandbox,
@@ -1332,8 +1337,15 @@ mod linux {
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
             Ok(Self {
-                authenticator: SandboxProtocolAuthenticator::new(verifier, sandbox_id),
-                connections: SandboxConnectionRegistry::default(),
+                authenticator: SandboxProtocolAuthenticator::new(
+                    verifier,
+                    sandbox_id,
+                    runtime_generation,
+                ),
+                connections: SandboxConnectionRegistry::new(
+                    config.session_id,
+                    config.session_rotation,
+                ),
                 connection_shutdowns: Mutex::new(std::collections::HashMap::new()),
                 config,
                 process_runtime,
@@ -3361,6 +3373,14 @@ mod linux {
                     &SandboxSessionIdentity {
                         sandbox_id: SandboxId::parse(sandbox_id).expect("test sandbox ID"),
                         session_id: test_session_id(),
+                        runtime_generation:
+                            openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                                "generation-1",
+                            )
+                            .expect("runtime generation"),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
+                        predecessor_session_id: None,
                     },
                     CredentialEpoch::new(1).expect("test credential epoch"),
                 )
@@ -3434,6 +3454,8 @@ mod linux {
                 boundary_id: "sandbox-1".to_string(),
                 generation: "generation-1".to_string(),
                 session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
                 gateway_id: "test-gateway".to_string(),
                 verification_keys: vec![verification_key.clone()],
                 listener: BoundaryListenerConfig::Vsock {
@@ -3571,6 +3593,8 @@ mod linux {
                         boundary_id: "availability".to_string(),
                         generation: "generation-1".to_string(),
                         session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
                         gateway_id: "test-gateway".to_string(),
                         verification_keys: vec![verification_key],
                         listener: BoundaryListenerConfig::TlsTcp {
@@ -4063,6 +4087,8 @@ mod linux {
                 boundary_id: "sandbox-1".to_string(),
                 generation: "generation-1".to_string(),
                 session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
                 gateway_id: "test-gateway".to_string(),
                 verification_keys: vec![test_verification_key()],
                 listener: BoundaryListenerConfig::Vsock {
@@ -4089,6 +4115,8 @@ mod linux {
                 boundary_id: "sandbox-1".to_string(),
                 generation: "generation-1".to_string(),
                 session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
                 gateway_id: "test-gateway".to_string(),
                 verification_keys: vec![test_verification_key()],
                 listener: BoundaryListenerConfig::Vsock {
@@ -4130,8 +4158,10 @@ mod linux {
                 BoundaryRuntime::new(
                     BoundaryConfig {
                         boundary_id: "sandbox-multiplexed".to_string(),
-                        generation: "generation-multiplexed".to_string(),
+                        generation: "generation-1".to_string(),
                         session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
                         gateway_id: "test-gateway".to_string(),
                         verification_keys: vec![verification_key],
                         listener: BoundaryListenerConfig::TlsTcp {
@@ -4304,6 +4334,8 @@ mod linux {
                         boundary_id: "sandbox-reconnect".to_string(),
                         generation: "generation-reconnect".to_string(),
                         session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
                         gateway_id: "test-gateway".to_string(),
                         verification_keys: vec![test_verification_key()],
                         listener: BoundaryListenerConfig::TlsTcp {
@@ -4574,6 +4606,8 @@ mod linux {
                         boundary_id: "sandbox-retained".to_string(),
                         generation: "generation-retained".to_string(),
                         session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
                         gateway_id: "test-gateway".to_string(),
                         verification_keys: vec![test_verification_key()],
                         listener: BoundaryListenerConfig::TlsTcp {

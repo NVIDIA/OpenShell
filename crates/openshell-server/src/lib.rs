@@ -826,23 +826,22 @@ pub(crate) async fn run_server(
         .compute
         .start_persisted_sandboxes_with_authentication(
             |sandbox| {
-                let Some(authority) = &state.sandbox_session_jwt_authority else {
-                    return Ok(Vec::new());
-                };
-                let authentication = authority
-                    .mint_launch(
-                        sandbox.object_id(),
-                        openshell_core::SandboxSessionId::new(),
-                        openshell_core::jwt::CredentialEpoch::new(1)
-                            .map_err(|error| error.to_string())?,
-                    )
-                    .map_err(|error| error.to_string())?;
-                state
-                    .sandbox_auth_sessions
-                    .activate(sandbox.object_id(), &authentication, authority)
-                    .map_err(|error| error.to_string())?;
-                serde_json::to_vec(&authentication)
-                    .map_err(|error| format!("encode launch authentication: {error}"))
+                let state = state.clone();
+                let sandbox = sandbox.clone();
+                async move {
+                    let Some(authority) = &state.sandbox_session_jwt_authority else {
+                        return Ok(Vec::new());
+                    };
+                    let authentication = grpc::mint_and_persist_successor(&state, &sandbox)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .sandbox_auth_sessions
+                        .activate(sandbox.object_id(), &authentication, authority)
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_vec(&authentication)
+                        .map_err(|error| format!("encode launch authentication: {error}"))
+                }
             },
             |sandbox_id| state.sandbox_auth_sessions.deactivate(sandbox_id),
         )

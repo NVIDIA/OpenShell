@@ -500,12 +500,13 @@ async fn handle_create_sandbox_inner(
         })?;
 
     let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
-        let authentication = authority.mint_launch(
-            &id,
-            openshell_core::SandboxSessionId::new(),
-            openshell_core::jwt::CredentialEpoch::new(1)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        )?;
+        let authentication = authority.mint_initial_launch(&id)?;
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(
+                &authentication,
+            )
+            .write(&mut metadata.annotations);
+        }
         state
             .sandbox_auth_sessions
             .activate(&id, &authentication, authority)
@@ -1477,12 +1478,7 @@ async fn handle_start_sandbox_inner(
         serde_json::to_vec(&authentication)
             .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
     } else if let Some(authority) = &state.sandbox_session_jwt_authority {
-        let authentication = authority.mint_launch(
-            current.object_id(),
-            openshell_core::SandboxSessionId::new(),
-            openshell_core::jwt::CredentialEpoch::new(1)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        )?;
+        let authentication = mint_and_persist_successor(state, &current).await?;
         state
             .sandbox_auth_sessions
             .activate(current.object_id(), &authentication, authority)
@@ -1503,6 +1499,40 @@ async fn handle_start_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+pub async fn mint_and_persist_successor(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    let authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox session authority is unavailable"))?;
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let current =
+        crate::auth::sandbox_session::PersistedSessionLineage::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let authentication = authority.mint_successor_launch(sandbox.object_id(), &current)?;
+    let next =
+        crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(&authentication);
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            sandbox.object_id(),
+            metadata.resource_version,
+            |updated| {
+                if let Some(metadata) = updated.metadata.as_mut() {
+                    next.write(&mut metadata.annotations);
+                }
+            },
+        )
+        .await
+        .map_err(|error| Status::aborted(format!("persist sandbox session successor: {error}")))?;
+    Ok(authentication)
 }
 
 async fn sandbox_by_name(
