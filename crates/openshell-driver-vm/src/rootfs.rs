@@ -345,6 +345,13 @@ pub fn write_rootfs_image_file(
     result
 }
 
+pub fn remove_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<(), String> {
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
+    run_debugfs(image_path, &format!("rm {quoted_guest_path}"))
+}
+
 pub fn set_rootfs_image_file_mode(
     image_path: &Path,
     guest_path: &str,

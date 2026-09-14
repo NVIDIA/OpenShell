@@ -13,9 +13,10 @@ use crate::lifecycle::{
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
-    recover_rootfs_image, sandbox_guest_init_path, sandbox_guest_runtime_identity,
-    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
-    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
+    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
+    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
+    validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -74,6 +75,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -162,6 +165,7 @@ const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
 const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
+const HOST_BOUNDARY_GENERATION_FILE: &str = "boundary-generation";
 /// The backend this driver admits. VM-specific placement remains inside the
 /// opaque runtime descriptor.
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -556,6 +560,7 @@ fn host_control_openshell_endpoint(endpoint: &str) -> Result<(String, Option<Str
 struct VmProcess {
     child: Child,
     supervisor: Child,
+    supervisor_liveness: Option<fs::File>,
     deleting: bool,
 }
 
@@ -810,7 +815,7 @@ impl VmDriver {
         runtime_descriptor: &SandboxRuntimeDescriptor,
         auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
         sandbox_owner: SandboxOwnerIdentity,
-    ) -> Result<Child, Status> {
+    ) -> Result<(Child, Option<fs::File>), Status> {
         let supervisor_binary = self.host_supervisor_binary().await?;
         let (openshell_endpoint, gateway_tls_server_name) =
             host_control_openshell_endpoint(&self.config.grpc_endpoint)
@@ -920,19 +925,54 @@ impl VmDriver {
                 .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
                 .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
+        let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
+            Status::internal(format!("create supervisor parent-liveness pipe: {error}"))
+        })?;
+        #[cfg(unix)]
+        for fd in [&liveness_read, &liveness_write] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .map_err(|error| {
+                Status::internal(format!(
+                    "protect supervisor parent-liveness descriptor: {error}"
+                ))
+            })?;
+        }
+        #[cfg(unix)]
+        let liveness_read_fd = liveness_read.as_raw_fd();
+        #[cfg(unix)]
+        command
+            .arg("--parent-liveness-fd")
+            .arg(liveness_read_fd.to_string());
+        #[cfg(unix)]
         unsafe {
-            command.pre_exec(|| {
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-                    .map_err(|error| std::io::Error::other(error.to_string()))
+            command.pre_exec(move || {
+                nix::fcntl::fcntl(
+                    liveness_read_fd,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(std::io::Error::other)?;
+                #[cfg(target_os = "linux")]
+                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::other)?;
+                Ok(())
             });
         }
-        command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             Status::internal(format!(
                 "start host supervisor '{}': {error}",
                 supervisor_binary.display()
             ))
-        })
+        })?;
+        #[cfg(unix)]
+        {
+            drop(liveness_read);
+            Ok((child, Some(fs::File::from(liveness_write))))
+        }
+        #[cfg(not(unix))]
+        Ok((child, None))
     }
 
     #[must_use]
@@ -1454,6 +1494,12 @@ impl VmDriver {
             &channel_tls,
         )
         .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
+        write_private_file(
+            &state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            boundary_generation.as_bytes().to_vec(),
+        )
+        .await
+        .map_err(|error| Status::internal(format!("persist VM boundary generation: {error}")))?;
         let runtime_descriptor = provisioning.runtime_descriptor;
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
@@ -1544,7 +1590,7 @@ impl VmDriver {
             launcher_pid = child.id().unwrap_or(0),
                 "vm driver: launcher spawned"
         );
-        let supervisor = match self
+        let (supervisor, supervisor_liveness) = match self
             .spawn_host_supervisor(
                 &sandbox,
                 &state_dir,
@@ -1572,6 +1618,7 @@ impl VmDriver {
         let process = Arc::new(Mutex::new(VmProcess {
             child,
             supervisor,
+            supervisor_liveness,
             deleting: false,
         }));
 
@@ -1683,6 +1730,13 @@ impl VmDriver {
                 .await
                 .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
         }
+        remove_runtime_generation_material(&state_dir)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "remove stopped VM authentication material: {error}"
+                ))
+            })?;
         self.lifecycle_extensions
             .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
             .await;
@@ -1703,7 +1757,12 @@ impl VmDriver {
         Ok(())
     }
 
-    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        launch_authentication: Vec<u8>,
+    ) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
@@ -1727,10 +1786,40 @@ impl VmDriver {
             return Ok(());
         }
 
-        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+        remove_runtime_generation_material(&state_dir)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "remove previous VM authentication material: {error}"
+                ))
+            })?;
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
             .await
             .map_err(|err| {
                 Status::internal(format!("read sandbox start metadata failed: {err}"))
+            })?;
+        let authentication = serde_json::from_slice::<
+            openshell_core::jwt::SandboxLaunchAuthentication,
+        >(&launch_authentication)
+        .map_err(|error| {
+            Status::failed_precondition(format!("decode VM sandbox launch authentication: {error}"))
+        })?;
+        authentication.validate().map_err(|error| {
+            Status::failed_precondition(format!(
+                "validate VM sandbox launch authentication: {error}"
+            ))
+        })?;
+        let spec = sandbox
+            .spec
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("persisted VM sandbox spec is missing"))?;
+        spec.launch_authentication = launch_authentication;
+        write_sandbox_request(&state_dir, &sandbox)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "persist refreshed VM launch authentication: {error}"
+                ))
             })?;
         let stopped_record = self
             .registry
@@ -4188,8 +4277,12 @@ impl ComputeDriver for VmDriver {
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
-            .await?;
+        self.start_sandbox(
+            &request.sandbox_id,
+            &request.sandbox_name,
+            request.launch_authentication,
+        )
+        .await?;
         Ok(Response::new(StartSandboxResponse {}))
     }
 
@@ -5928,11 +6021,22 @@ async fn read_persisted_image_identity(state_dir: &Path) -> Result<String, std::
 
 async fn write_sandbox_request(state_dir: &Path, sandbox: &Sandbox) -> Result<(), std::io::Error> {
     restrict_owner_only_dir(state_dir).await?;
-    write_private_file(
-        &state_dir.join(SANDBOX_REQUEST_FILE),
-        sandbox.encode_to_vec(),
-    )
-    .await
+    let destination = state_dir.join(SANDBOX_REQUEST_FILE);
+    let sequence = IMAGE_CACHE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = state_dir.join(format!(
+        ".{SANDBOX_REQUEST_FILE}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    if let Err(error) = write_private_file(&temporary, sandbox.encode_to_vec()).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, destination).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn read_sandbox_request(path: &Path) -> Result<Sandbox, std::io::Error> {
@@ -5948,6 +6052,47 @@ async fn read_sandbox_request(path: &Path) -> Result<Sandbox, std::io::Error> {
 async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<(), std::io::Error> {
     tokio::fs::write(path, bytes).await?;
     restrict_owner_read_write(path).await
+}
+
+async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), String> {
+    let generation_path = state_dir.join(HOST_BOUNDARY_GENERATION_FILE);
+    let generation = match tokio::fs::read_to_string(&generation_path).await {
+        Ok(generation) => generation.trim().to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read boundary generation marker: {error}")),
+    };
+    if !generation.is_empty() {
+        let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
+        let generation_for_cleanup = generation.clone();
+        tokio::task::spawn_blocking(move || {
+            let tls = guest_boundary_tls_paths(&generation_for_cleanup);
+            for guest_path in [
+                PathBuf::from(guest_boundary_config_path(&generation_for_cleanup)),
+                tls.certificate_chain_path,
+                tls.private_key_path,
+            ] {
+                remove_rootfs_image_file(
+                    &overlay,
+                    &overlay_upper_path(&guest_path.to_string_lossy()),
+                )?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| format!("guest authentication cleanup task failed: {error}"))??;
+    }
+    for path in [
+        state_dir.join(HOST_AUTH_BUNDLE_FILE),
+        state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE),
+        generation_path,
+    ] {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove {}: {error}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -6476,6 +6621,7 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
 }
 
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
+    process.supervisor_liveness.take();
     let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
@@ -8329,6 +8475,10 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-stopped".to_string(),
             name: "stopped".to_string(),
+            spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("old").0,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
@@ -8350,8 +8500,9 @@ mod tests {
             },
         );
 
+        let (fresh_authentication, fresh_session) = test_launch_authentication("fresh");
         let err = driver
-            .start_sandbox(&sandbox.id, &sandbox.name)
+            .start_sandbox(&sandbox.id, &sandbox.name, fresh_authentication)
             .await
             .expect_err("start without an image should fail");
 
@@ -8374,6 +8525,49 @@ mod tests {
             .expect("stopped condition");
         assert_eq!(condition.r#type, "Stopped");
         assert_eq!(condition.status, "True");
+        let persisted = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .expect("persisted sandbox request");
+        let persisted_authentication =
+            serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
+                &persisted
+                    .spec
+                    .expect("persisted sandbox spec")
+                    .launch_authentication,
+            )
+            .expect("persisted launch authentication");
+        assert_eq!(
+            persisted_authentication.supervisor.session_id,
+            fresh_session
+        );
+    }
+
+    fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
+        use openshell_core::jwt::{
+            CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
+            SupervisorAuthBundle,
+        };
+
+        let session_id = openshell_core::SandboxSessionId::new();
+        let authentication = SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id,
+                gateway_token: SecretJwt::parse(format!("gateway-{label}")).expect("gateway token"),
+                gateway_expires_at: 1,
+                sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
+                sandbox_expires_at: 1,
+                credential_epoch: CredentialEpoch::new(1).expect("credential epoch"),
+            },
+            gateway_id: "gateway-a".to_string(),
+            verification_keys: vec![SessionVerificationKey {
+                key_id: "key-a".to_string(),
+                public_key_pem: b"public-key".to_vec(),
+            }],
+        };
+        (
+            serde_json::to_vec(&authentication).expect("encode launch authentication"),
+            session_id,
+        )
     }
 
     #[test]
@@ -9034,6 +9228,7 @@ mod tests {
             record.process = Some(Arc::new(Mutex::new(VmProcess {
                 child: spawn_exited_child(),
                 supervisor: spawn_exited_child(),
+                supervisor_liveness: None,
                 deleting: false,
             })));
         }
@@ -9475,6 +9670,7 @@ mod tests {
         let process = Arc::new(Mutex::new(VmProcess {
             child,
             supervisor: spawn_exited_child(),
+            supervisor_liveness: None,
             deleting: false,
         }));
 
