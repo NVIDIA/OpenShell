@@ -1268,7 +1268,19 @@ impl VmDriver {
         let image_disk = image_plan.image_disk;
         let owner_source_disk = image_disk.as_ref().unwrap_or(&root_disk).clone();
         let overlay_disk = disk_paths.overlay_disk;
-        let boundary_generation = random_boundary_token();
+        let boundary_generation =
+            match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
+                Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
+                Ok(_) => random_boundary_token(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    random_boundary_token()
+                }
+                Err(error) => {
+                    return Err(Status::internal(format!(
+                        "read VM boundary generation: {error}"
+                    )));
+                }
+            };
         let launch_authentication = sandbox
             .spec
             .as_ref()
@@ -1761,11 +1773,16 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        generation_id: &str,
         launch_authentication: Vec<u8>,
     ) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
+        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            generation_id.to_string(),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let (record_id, state_dir, already_running) = {
             let registry = self.registry.lock().await;
             let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
@@ -1783,7 +1800,21 @@ impl VmDriver {
             )
         };
         if already_running {
-            return Ok(());
+            let active_generation =
+                tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
+                    .await
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "read active VM sandbox generation: {error}"
+                        ))
+                    })?;
+            if active_generation.trim() == generation.as_str() {
+                return Ok(());
+            }
+            return Err(Status::failed_precondition(format!(
+                "VM sandbox is already running generation {}",
+                active_generation.trim()
+            )));
         }
 
         remove_runtime_generation_material(&state_dir)
@@ -1793,6 +1824,12 @@ impl VmDriver {
                     "remove previous VM authentication material: {error}"
                 ))
             })?;
+        write_private_file(
+            &state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            generation.as_str().as_bytes().to_vec(),
+        )
+        .await
+        .map_err(|error| Status::internal(format!("persist VM start generation: {error}")))?;
         let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
             .await
             .map_err(|err| {
@@ -4280,6 +4317,7 @@ impl ComputeDriver for VmDriver {
         self.start_sandbox(
             &request.sandbox_id,
             &request.sandbox_name,
+            &request.generation_id,
             request.launch_authentication,
         )
         .await?;
@@ -8502,7 +8540,12 @@ mod tests {
 
         let (fresh_authentication, fresh_session) = test_launch_authentication("fresh");
         let err = driver
-            .start_sandbox(&sandbox.id, &sandbox.name, fresh_authentication)
+            .start_sandbox(
+                &sandbox.id,
+                &sandbox.name,
+                "g0000000000000001",
+                fresh_authentication,
+            )
             .await
             .expect_err("start without an image should fail");
 
