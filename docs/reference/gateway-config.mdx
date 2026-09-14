@@ -104,25 +104,58 @@ This setting is separate from all other trust domains:
   gateway-side connections.
 
 The in-process Docker and Podman drivers mount a gateway-owned artifact at
-`/etc/openshell-tls/network-additional-ca.crt`. The Kubernetes driver creates a
-managed ConfigMap containing `ca.crt` in each target namespace and mounts it
-only into the combined supervisor or network sidecar. The VM driver writes the
-same path into each sandbox overlay. Every driver passes
-`--network-additional-ca-bundle` as an operator-controlled supervisor argument.
+`/etc/openshell-tls/network-additional-ca.crt`. The Kubernetes driver creates an
+immutable, content-addressed managed ConfigMap containing `ca.crt` in each
+target namespace and mounts it only at the combined or sidecar network-supervisor
+boundary. The VM driver writes the same path into each sandbox overlay. Every
+driver passes the protected bundle path and its gateway-issued SHA-256 digest to
+the supervisor. Before any network setup, the supervisor canonicalizes the
+mounted PEM and rejects bytes that do not match that expected generation.
 Remote and custom compute drivers reject this setting because the compute-driver
 protocol does not carry the normalized material.
 
-There is no hot reload. Restart the gateway after changing a source file, then
-recreate or restart affected sandboxes. Running supervisors retain the trust
-loaded at their startup. Removing the table and restarting returns new
-sandboxes to default destination trust.
+### Lifecycle and certificate rollover
+
+This is **global gateway configuration**, not a per-sandbox setting. Source
+files (or the Helm source ConfigMap) are read and normalized **only when the
+gateway starts**. Updating a source file or ConfigMap alone has no effect:
+OpenShell does not watch or hot-reload those sources, and it does not
+automatically restart sandbox consumers. A running supervisor retains the
+startup trust bundle it already loaded.
+
+To apply any addition, removal, or source update, the operator must:
+
+1. Update the source files or source ConfigMap.
+2. Restart or redeploy the gateway so it reads and normalizes the new source.
+3. Explicitly stop and then start **every affected sandbox**.
+
+Stop/start retains the sandbox identity and its supported durable workspace; it
+does not create a replacement sandbox. The restarted supervisor consumes the
+bundle staged from the restarted gateway's snapshot. Source normalization,
+driver delivery/reconciliation, and supervisor validation failures fail closed:
+they do not silently fall back to a previous or default trust bundle.
+
+Use this sequence for a non-disruptive private-CA rollover:
+
+1. Configure both the old and new roots.
+2. Restart or redeploy the gateway, then stop/start every affected sandbox.
+3. Rotate destination certificates to chain to the new root.
+4. Remove the old root, then repeat the gateway restart/redeploy and
+   stop/start sequence for every affected sandbox.
 
 For Helm, create an operator-owned ConfigMap with a `ca.crt` key and set
 `supervisor.network.additionalCaConfigMapName`. The chart mounts the source at
 `/etc/openshell-tls/network-additional-ca-source/ca.crt`, renders that path in
-the global table, and grants the Kubernetes driver ConfigMap apply permissions
-for the selected workspace mode. Updating only the source ConfigMap does not
-trigger the gateway workload checksum, so restart the gateway explicitly.
+the global table, and grants the Kubernetes driver ConfigMap `get` and `create`
+permissions for the selected workspace mode. These permissions cover the shared
+sandbox namespace in shared mode and are cluster-wide through the existing
+ClusterRoleBinding in managed and operator modes. Kubernetes RBAC cannot limit
+`create` by resource name or limit `get` to the digest-bearing name prefix. The
+chart does not grant ConfigMap `list`, `watch`, `patch`, `update`, or `delete`
+for this feature. Use a dedicated gateway service account and namespace-scoped
+bindings when this read boundary matters. Updating only the source ConfigMap
+does not trigger the gateway workload checksum, so explicitly restart or
+redeploy the gateway and then stop/start every affected sandbox.
 
 ## Migrate to schema version 2
 
