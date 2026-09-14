@@ -25,9 +25,10 @@ use crate::auth::workspace_authz::{
     require_platform_admin, selected_workspace_name,
 };
 use crate::pagination::Pagination;
+#[cfg(test)]
+use crate::persistence::ObjectType;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
-    PolicyRecord, Store,
+    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace, PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
@@ -2448,14 +2449,8 @@ async fn persist_existing_policy_projection(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-            let startup_blocked = sandbox
-                .status
-                .as_ref()
-                .and_then(|status| status.configuration_admission.as_ref())
-                .is_some_and(|admission| {
-                    admission.state
-                        != i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
-                });
+            let startup_blocked =
+                crate::policy_store::permits_initial_static_policy_repair(sandbox);
             if let Some(policy) = backfill_policy.as_ref()
                 && let Some(spec) = sandbox.spec.as_mut()
                 && (spec.policy.is_none() || startup_blocked)
@@ -3922,14 +3917,7 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    let startup_blocked = sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.configuration_admission.as_ref())
-        .is_some_and(|admission| {
-            admission.state
-                != i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
-        });
+    let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
     let should_backfill_policy = if startup_blocked && !sandbox_caller {
         // No child has consumed static restrictions yet. A complete replacement
         // must be able to repair every field before the first activation.
@@ -4366,12 +4354,14 @@ pub(super) async fn handle_report_sandbox_configuration(
         && current.map_or("", |current| current.instance_id.as_str())
             != request.get_ref().expected_instance_id
     {
-        return Err(Status::aborted("supervisor registration fence has changed"));
+        return Err(Status::failed_precondition(
+            "supervisor registration fence has changed",
+        ));
     }
     if reported != ConfigurationAdmissionState::Pending
         && current.is_none_or(|current| current.instance_id != admission.instance_id)
     {
-        return Err(Status::aborted(
+        return Err(Status::failed_precondition(
             "supervisor configuration instance has changed",
         ));
     }
@@ -4432,6 +4422,13 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .status
                 .get_or_insert_with(Default::default)
                 .configuration_admission = Some(admission.clone());
+            if reported == ConfigurationAdmissionState::Accepted {
+                sandbox
+                    .status
+                    .as_mut()
+                    .expect("status initialized")
+                    .configuration_activated = Some(true);
+            }
             crate::compute::apply_configuration_readiness(sandbox);
         })
         .await
@@ -7613,8 +7610,9 @@ mod tests {
             Code::Aborted,
             "a delayed rejection must not mark the accepted current generation invalid"
         );
+        let restart_instance = uuid::Uuid::new_v4().to_string();
         let mut restart = report(SandboxConfigurationAdmission {
-            instance_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: restart_instance.clone(),
             state: Admission::Pending.into(),
             ..Default::default()
         });
@@ -7634,16 +7632,54 @@ mod tests {
             .await
             .unwrap_err()
             .code(),
-            Code::Aborted,
+            Code::FailedPrecondition,
             "delayed old Pending must not reclaim registration"
         );
         assert_eq!(
-            handle_report_sandbox_configuration(&state, report(accepted))
+            handle_report_sandbox_configuration(&state, report(accepted.clone()))
                 .await
                 .unwrap_err()
                 .code(),
-            Code::Aborted
+            Code::FailedPrecondition
         );
+        for admission_state in [Admission::Pending, Admission::Rejected] {
+            if admission_state == Admission::Rejected {
+                let mut rejected = accepted.clone();
+                rejected.instance_id = restart_instance.clone();
+                rejected.state = Admission::Rejected.into();
+                handle_report_sandbox_configuration(&state, report(rejected))
+                    .await
+                    .unwrap();
+            }
+            let persisted = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                persisted.status.as_ref().unwrap().configuration_activated,
+                Some(true)
+            );
+            assert!(!crate::policy_store::permits_initial_static_policy_repair(
+                &persisted
+            ));
+            let mut replacement = persisted.spec.as_ref().unwrap().policy.clone().unwrap();
+            replacement.filesystem.as_mut().unwrap().read_only.clear();
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(replacement),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains("filesystem"), "{error}");
+        }
     }
 
     #[test]
@@ -7668,6 +7704,7 @@ mod tests {
             vec!["work-github".to_string()],
         );
         sandbox.spec.as_mut().unwrap().policy = None;
+        sandbox.status.as_mut().unwrap().configuration_activated = Some(false);
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -7698,6 +7735,7 @@ mod tests {
             with_sandbox(
                 Request::new(UpdateConfigRequest {
                     name: "image-admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     policy: Some(image),
                     ..Default::default()
                 }),
@@ -7726,6 +7764,7 @@ mod tests {
             &state,
             with_user(Request::new(UpdateConfigRequest {
                 name: "image-admission".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 policy: Some(openshell_policy::restrictive_default_policy()),
                 ..Default::default()
             })),

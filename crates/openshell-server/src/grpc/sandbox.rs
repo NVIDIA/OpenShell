@@ -482,6 +482,11 @@ async fn handle_create_sandbox_inner(
         state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
         ..Default::default()
     });
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .configuration_activated = Some(false);
     crate::compute::apply_configuration_readiness(&mut sandbox);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)

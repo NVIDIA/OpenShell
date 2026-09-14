@@ -176,6 +176,9 @@ See [policy validation and repair](https://docs.nvidia.com/openshell/latest/sand
 In sidecar topology, the process supervisor sends image-policy discovery over
 the authenticated control socket and waits for an accepted bootstrap. A process
 container waiting there can be expected during repair, rather than a crash loop.
+A missing process-sidecar connection times out during discovery. Permanent
+gateway errors and exhausted transient retries terminate startup; inspect those
+errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 

@@ -2329,6 +2329,8 @@ type SandboxStatus struct {
 	EndpointStatuses []*EndpointStatus `protobuf:"bytes,10,rep,name=endpoint_statuses,json=endpointStatuses,proto3" json:"endpoint_statuses,omitempty"`
 	// Independent of infrastructure phase; retained across driver observations.
 	ConfigurationAdmission *SandboxConfigurationAdmission `protobuf:"bytes,11,opt,name=configuration_admission,json=configurationAdmission,proto3" json:"configuration_admission,omitempty"`
+	// Durable first-acceptance marker. Absent on legacy records; never reset by restart.
+	ConfigurationActivated *bool `protobuf:"varint,12,opt,name=configuration_activated,json=configurationActivated,proto3,oneof" json:"configuration_activated,omitempty"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -2438,6 +2440,13 @@ func (x *SandboxStatus) GetConfigurationAdmission() *SandboxConfigurationAdmissi
 		return x.ConfigurationAdmission
 	}
 	return nil
+}
+
+func (x *SandboxStatus) GetConfigurationActivated() bool {
+	if x != nil && x.ConfigurationActivated != nil {
+		return *x.ConfigurationActivated
+	}
+	return false
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -15059,7 +15068,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"b\n" +
 	"!SandboxWorkloadTemplateProvenance\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
-	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xcb\x04\n" +
+	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xa5\x05\n" +
 	"\rSandboxStatus\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
@@ -15075,9 +15084,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\texit_code\x18\t \x01(\x05H\x00R\bexitCode\x88\x01\x01\x12I\n" +
 	"\x11endpoint_statuses\x18\n" +
 	" \x03(\v2\x1c.openshell.v1.EndpointStatusR\x10endpointStatuses\x12d\n" +
-	"\x17configuration_admission\x18\v \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionR\x16configurationAdmissionB\f\n" +
+	"\x17configuration_admission\x18\v \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionR\x16configurationAdmission\x12<\n" +
+	"\x17configuration_activated\x18\f \x01(\bH\x01R\x16configurationActivated\x88\x01\x01B\f\n" +
 	"\n" +
-	"_exit_code\"\xa2\x01\n" +
+	"_exit_codeB\x1a\n" +
+	"\x18_configuration_activated\"\xa2\x01\n" +
 	"\x10SandboxCondition\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x16\n" +

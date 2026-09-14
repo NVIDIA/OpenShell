@@ -191,6 +191,18 @@ pub struct ServerHandle {
 
 impl ServerHandle {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub async fn discover_policy(&mut self, timeout: Duration) -> Result<ImagePolicyDiscovery> {
+        let receiver = self
+            .take_discovered_policy_receiver()
+            .ok_or_else(|| miette::miette!("sidecar image policy discovery already consumed"))?;
+        tokio::time::timeout(timeout, receiver)
+            .await
+            .map_err(|_| {
+                miette::miette!("timed out waiting for process sidecar image policy discovery")
+            })?
+            .map_err(|_| miette::miette!("sidecar image policy discovery channel closed"))
+    }
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn take_discovered_policy_receiver(
         &mut self,
     ) -> Option<oneshot::Receiver<ImagePolicyDiscovery>> {
@@ -967,6 +979,23 @@ mod tests {
             uid: nix::unistd::Uid::current().as_raw(),
             gid: nix::unistd::Gid::current().as_raw(),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_sidecar_without_a_client_times_out_during_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let mut server = spawn_pending_server(&socket, current_peer()).unwrap();
+        let error = server
+            .discover_policy(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for process sidecar")
+        );
+        assert!(!*server.publisher.admitted.borrow());
     }
 
     #[tokio::test]

@@ -179,10 +179,8 @@ pub async fn run_sandbox(
     let image_policy_discovery = if let Some(server) = pending_sidecar_server.as_mut() {
         Some(
             server
-                .take_discovered_policy_receiver()
-                .expect("new sidecar server owns discovery receiver")
-                .await
-                .map_err(|_| miette::miette!("sidecar image policy discovery channel closed"))?,
+                .discover_policy(Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS))
+                .await?,
         )
     } else {
         None
@@ -2636,35 +2634,29 @@ async fn load_policy_with_gateway(
         let instance_id = uuid::Uuid::new_v4().to_string();
         // Capture the previous instance once. Registration retries must never
         // rebase this fence and displace a newer supervisor instance.
-        let registration_snapshot = loop {
-            match gateway.snapshot(id).await {
-                Ok(snapshot) => break snapshot,
-                Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
-            }
-        };
-        loop {
-            if gateway
-                .report(
-                    id,
-                    &instance_id,
-                    Some(&registration_snapshot),
-                    ConfigurationAdmissionState::Pending,
-                    "",
-                )
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+        let registration_snapshot =
+            grpc_retry("Startup configuration fetch", || gateway.snapshot(id)).await?;
+        grpc_retry("Supervisor registration", || {
+            gateway.report(
+                id,
+                &instance_id,
+                Some(&registration_snapshot),
+                ConfigurationAdmissionState::Pending,
+                "",
+            )
+        })
+        .await?;
         let discovery = image_discovery.unwrap_or_else(discover_image_policy);
+        let mut reconciliation_attempts = 0u32;
         loop {
-            let Ok(mut snapshot) = gateway.snapshot(id).await else {
-                let _ = gateway.report(id, &instance_id, None, ConfigurationAdmissionState::Rejected, "Effective configuration is unavailable; inspect sandbox policy and providers").await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            };
+            if reconciliation_attempts == 5 {
+                return Err(miette::miette!(
+                    "Startup configuration did not stabilize after 5 attempts"
+                ));
+            }
+            reconciliation_attempts += 1;
+            let mut snapshot =
+                grpc_retry("Startup configuration fetch", || gateway.snapshot(id)).await?;
 
             if snapshot.policy.is_none() && !snapshot.configuration_error.is_empty() {
                 reject_startup_configuration(
@@ -2675,7 +2667,8 @@ async fn load_policy_with_gateway(
                     &snapshot,
                     &snapshot.configuration_error,
                 )
-                .await;
+                .await?;
+                reconciliation_attempts = 0;
                 continue;
             }
 
@@ -2699,7 +2692,8 @@ async fn load_policy_with_gateway(
                         openshell_policy::restrictive_default_policy()
                     }
                     sidecar_control::ImagePolicyDiscovery::Invalid => {
-                        reject_startup_configuration(gateway, endpoint, id, &instance_id, &snapshot, "Image policy is invalid; replace the sandbox policy to repair configuration").await;
+                        reject_startup_configuration(gateway, endpoint, id, &instance_id, &snapshot, "Image policy is invalid; replace the sandbox policy to repair configuration").await?;
+                        reconciliation_attempts = 0;
                         continue;
                     }
                 };
@@ -2717,15 +2711,18 @@ async fn load_policy_with_gateway(
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
                 let ws = snapshot.workspace.clone();
-                snapshot = if let Ok(snapshot) = gateway.sync(id, sandbox, &discovered, &ws).await {
-                    snapshot
-                } else {
-                    reject_startup_configuration(gateway, endpoint, id, &instance_id, &snapshot, "Image policy synchronization failed; replace the sandbox policy to repair configuration").await;
-                    continue;
-                };
+                snapshot = grpc_retry("Image policy synchronization", || {
+                    gateway.sync(id, sandbox, &discovered, &ws)
+                })
+                .await?;
                 if let Some(policy) = snapshot.policy.clone() {
                     policy
                 } else {
+                    if snapshot.configuration_error.is_empty() {
+                        return Err(miette::miette!(
+                            "Gateway returned no effective policy after image discovery"
+                        ));
+                    }
                     reject_startup_configuration(
                         gateway,
                         endpoint,
@@ -2734,16 +2731,11 @@ async fn load_policy_with_gateway(
                         &snapshot,
                         "Effective policy is unavailable after image discovery",
                     )
-                    .await;
+                    .await?;
+                    reconciliation_attempts = 0;
                     continue;
                 }
             };
-
-            // True only while `snapshot` describes the exact policy that will be
-            // constructed below. If enrichment cannot be synced and re-fetched,
-            // the policy remains enforceable but cannot be acknowledged by
-            // inferred structural equality.
-            let mut policy_bound_to_snapshot = true;
 
             // Ensure baseline filesystem paths are present for proxy-mode
             // sandboxes.  If the policy was enriched, sync the updated version
@@ -2752,35 +2744,22 @@ async fn load_policy_with_gateway(
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
             if let Some(sync_policy) = sync_policy {
                 if let Some(sandbox_name) = sandbox.as_deref() {
-                    match gateway
-                        .sync(id, sandbox_name, &sync_policy, &snapshot.workspace)
-                        .await
-                    {
-                        Ok(canonical) => {
-                            if let Some(policy) = canonical.policy.clone() {
-                                proto_policy = policy;
-                                snapshot = canonical;
-                            } else {
-                                policy_bound_to_snapshot = false;
-                                warn!(
-                                    "Gateway returned no policy after enrichment sync; initial revision will be reconciled"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            policy_bound_to_snapshot = false;
-                            warn!(
-                                error = %e,
-                                "Failed to sync enriched policy back to gateway; initial revision will be reconciled"
-                            );
-                        }
-                    }
+                    let canonical = grpc_retry("Enriched policy synchronization", || {
+                        gateway.sync(id, sandbox_name, &sync_policy, &snapshot.workspace)
+                    })
+                    .await?;
+                    proto_policy = canonical.policy.clone().ok_or_else(|| {
+                        miette::miette!("Gateway returned no effective policy after enrichment")
+                    })?;
+                    snapshot = canonical;
                 } else {
-                    policy_bound_to_snapshot = false;
+                    return Err(miette::miette!(
+                        "Cannot sync enriched policy: sandbox name is unavailable"
+                    ));
                 }
             }
 
-            let loaded_policy_revision = policy_bound_to_snapshot.then(|| {
+            let loaded_policy_revision = Some({
                 let mut revision = LoadedPolicyRevision::from_snapshot(&snapshot);
                 revision.admission_instance_id = Some(instance_id.clone());
                 revision
@@ -2794,7 +2773,7 @@ async fn load_policy_with_gateway(
             // engine is rebuilt with the real PID for symlink resolution.
             info!("Creating OPA engine from proto policy data");
             let has_last_valid_policy = true;
-            if !snapshot.configuration_admitted || !policy_bound_to_snapshot {
+            if !snapshot.configuration_admitted {
                 reject_startup_configuration(
                     gateway,
                     endpoint,
@@ -2807,21 +2786,17 @@ async fn load_policy_with_gateway(
                         &snapshot.configuration_error
                     },
                 )
-                .await;
+                .await?;
+                reconciliation_attempts = 0;
                 continue;
             }
-            let Ok(provider) = gateway.provider(id).await else {
-                reject_startup_configuration(
-                    gateway,
-                    endpoint,
-                    id,
-                    &instance_id,
-                    &snapshot,
-                    "Provider environment is unavailable",
-                )
-                .await;
+            let provider =
+                grpc_retry("Startup provider environment", || gateway.provider(id)).await?;
+            if provider.provider_env_revision != snapshot.provider_env_revision {
+                tokio::time::sleep(Duration::from_secs(1u64 << reconciliation_attempts.min(2)))
+                    .await;
                 continue;
-            };
+            }
             let (engine, policy, captured_provider_credentials) =
                 match prepare_startup_configuration(&snapshot, &proto_policy, provider) {
                     Ok(prepared) => prepared,
@@ -2841,7 +2816,8 @@ async fn load_policy_with_gateway(
                             &snapshot,
                             "Policy or provider environment failed runtime validation",
                         )
-                        .await;
+                        .await?;
+                        reconciliation_attempts = 0;
                         continue;
                     }
                 };
@@ -2913,7 +2889,7 @@ async fn load_policy_with_gateway(
             // The gateway compares the entire tuple again. A concurrent repair or
             // provider rotation invalidates this candidate before any workload
             // identity, child environment or services are captured.
-            if gateway
+            if let Err(error) = gateway
                 .report(
                     id,
                     &instance_id,
@@ -2922,9 +2898,12 @@ async fn load_policy_with_gateway(
                     "",
                 )
                 .await
-                .is_err()
             {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !is_retryable_error(&error) {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_secs(1u64 << reconciliation_attempts.min(2)))
+                    .await;
                 continue;
             }
             return Ok((
@@ -3024,16 +3003,17 @@ async fn reject_startup_configuration(
     instance_id: &str,
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
     error: &str,
-) {
-    let _ = gateway
-        .report(
+) -> Result<()> {
+    grpc_retry("Startup rejection report", || {
+        gateway.report(
             sandbox_id,
             instance_id,
             Some(snapshot),
             openshell_core::proto::ConfigurationAdmissionState::Rejected,
             error,
         )
-        .await;
+    })
+    .await?;
     // Fixed, bounded diagnostics deliberately omit the candidate and credentials.
     ocsf_emit!(
         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -3044,6 +3024,7 @@ async fn reject_startup_configuration(
             .build()
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5458,6 +5439,8 @@ network_policies:
         desired: Arc<std::sync::Mutex<openshell_core::grpc_client::SettingsPollResult>>,
         reports: UnboundedSender<openshell_core::proto::ConfigurationAdmissionState>,
         reject_next_accept: Arc<AtomicBool>,
+        snapshot_error: Option<tonic::Code>,
+        report_error: Option<tonic::Code>,
     }
 
     #[tonic::async_trait]
@@ -5466,6 +5449,11 @@ network_policies:
             &self,
             _id: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            if let Some(code) = self.snapshot_error {
+                return Err(openshell_core::grpc_client::grpc_status_error(
+                    tonic::Status::new(code, "snapshot unavailable"),
+                ));
+            }
             Ok(self.desired.lock().unwrap().clone())
         }
         async fn provider(
@@ -5494,6 +5482,11 @@ network_policies:
             _error: &str,
         ) -> Result<()> {
             use openshell_core::proto::ConfigurationAdmissionState;
+            if let Some(code) = self.report_error {
+                return Err(openshell_core::grpc_client::grpc_status_error(
+                    tonic::Status::new(code, "registration fence changed"),
+                ));
+            }
             self.reports.send(state).unwrap();
             if state == ConfigurationAdmissionState::Accepted {
                 if self.reject_next_accept.swap(false, Ordering::SeqCst) {
@@ -5511,6 +5504,77 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn startup_transient_gateway_errors_exhaust_retry_budget() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<()> = timeout(
+            Duration::from_secs(15),
+            grpc_retry("Startup configuration fetch", || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(openshell_core::grpc_client::grpc_status_error(
+                        tonic::Status::unavailable("gateway down"),
+                    ))
+                }
+            }),
+        )
+        .await
+        .expect("transient failure must have a bounded retry budget");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("failed after 5 attempts")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn startup_returns_permanent_gateway_errors_without_waiting_for_policy_repair() {
+        for (snapshot_error, report_error) in [
+            (Some(tonic::Code::PermissionDenied), None),
+            (Some(tonic::Code::NotFound), None),
+            (None, Some(tonic::Code::FailedPrecondition)),
+        ] {
+            let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = TestStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    None,
+                    1,
+                    openshell_core::proto::PolicySource::Sandbox,
+                ))),
+                reports,
+                reject_next_accept: Arc::new(AtomicBool::new(false)),
+                snapshot_error,
+                report_error,
+            };
+            let result = timeout(
+                Duration::from_secs(1),
+                load_policy_with_gateway(
+                    Some("sandbox-id".to_string()),
+                    Some("sandbox".to_string()),
+                    Some("http://unused.invalid".to_string()),
+                    None,
+                    None,
+                    &openshell_extension_core::ExtensionCredentialStore::new(),
+                    Some(sidecar_control::ImagePolicyDiscovery::Missing),
+                    &gateway,
+                ),
+            )
+            .await
+            .expect("permanent errors must terminate startup");
+            let Err(error) = result else {
+                panic!("startup unexpectedly succeeded")
+            };
+            assert!(!is_retryable_error(&error));
+            assert!(error.to_string().contains(if report_error.is_some() {
+                "registration fence changed"
+            } else {
+                "snapshot unavailable"
+            }));
+        }
+    }
+
+    #[tokio::test]
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
@@ -5522,6 +5586,8 @@ network_policies:
             desired: Arc::new(std::sync::Mutex::new(rejected)),
             reports,
             reject_next_accept: Arc::new(AtomicBool::new(true)),
+            snapshot_error: None,
+            report_error: None,
         };
         let active_gateway = gateway.clone();
         let handle = tokio::spawn(async move {

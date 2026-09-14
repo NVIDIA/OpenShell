@@ -438,7 +438,9 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload
-has not started, so static fields can also be replaced during this repair.
+has not started on its first activation, so static fields can also be replaced
+during this initial repair. A previously activated sandbox retains static-field
+restrictions while restart admission is pending or rejected.
 After validation succeeds, the supervisor completes startup. Follow the
 published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
 and confirm current replacement/detach syntax with installed CLI help.
