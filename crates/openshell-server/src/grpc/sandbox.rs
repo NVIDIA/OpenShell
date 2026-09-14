@@ -504,6 +504,7 @@ async fn handle_create_sandbox_inner(
         if let Some(metadata) = sandbox.metadata.as_mut() {
             crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(
                 &authentication,
+                false,
             )
             .write(&mut metadata.annotations);
         }
@@ -1449,29 +1450,41 @@ async fn handle_start_sandbox_inner(
         .await?
         .name;
     let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    let launch_authentication = if current.phase() == SandboxPhase::Ready as i32 {
-        Vec::new()
-    } else if let Some(authentication) = state
-        .sandbox_auth_sessions
-        .authentication(current.object_id())
-    {
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else if let Some(authority) = &state.sandbox_session_jwt_authority {
-        let authentication = mint_and_persist_successor(state, &current).await?;
-        state
+    let (launch_authentication, pending_successor) =
+        if current.phase() == SandboxPhase::Ready as i32 {
+            (Vec::new(), false)
+        } else if let Some(authentication) = state
             .sandbox_auth_sessions
-            .activate(current.object_id(), &authentication, authority)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else {
-        Vec::new()
-    };
+            .authentication(current.object_id())
+        {
+            (
+                serde_json::to_vec(&authentication).map_err(|error| {
+                    Status::internal(format!("encode launch authentication: {error}"))
+                })?,
+                false,
+            )
+        } else if let Some(authority) = &state.sandbox_session_jwt_authority {
+            let authentication = mint_and_persist_successor(state, &current).await?;
+            state
+                .sandbox_auth_sessions
+                .activate(current.object_id(), &authentication, authority)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            (
+                serde_json::to_vec(&authentication).map_err(|error| {
+                    Status::internal(format!("encode launch authentication: {error}"))
+                })?,
+                true,
+            )
+        } else {
+            (Vec::new(), false)
+        };
     let sandbox = state
         .compute
         .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
         .await?;
+    if pending_successor {
+        mark_session_successor_committed(state, sandbox.object_id()).await?;
+    }
     info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -1493,9 +1506,15 @@ pub async fn mint_and_persist_successor(
     let current =
         crate::auth::sandbox_session::PersistedSessionLineage::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let authentication = authority.mint_successor_launch(sandbox.object_id(), &current)?;
-    let next =
-        crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(&authentication);
+    let authentication = if current.pending {
+        authority.mint_persisted_launch(sandbox.object_id(), &current)?
+    } else {
+        authority.mint_successor_launch(sandbox.object_id(), &current)?
+    };
+    let next = crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(
+        &authentication,
+        true,
+    );
     state
         .store
         .update_message_cas::<Sandbox, _>(
@@ -1510,6 +1529,25 @@ pub async fn mint_and_persist_successor(
         .await
         .map_err(|error| Status::aborted(format!("persist sandbox session successor: {error}")))?;
     Ok(authentication)
+}
+
+pub async fn mark_session_successor_committed(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.insert(
+                    crate::auth::sandbox_session::SESSION_PENDING_ANNOTATION.to_string(),
+                    false.to_string(),
+                );
+            }
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| Status::aborted(format!("commit sandbox session successor: {error}")))
 }
 
 async fn sandbox_by_name(
