@@ -50,7 +50,7 @@ rules:
       - watch
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "delete", "get"]
+    verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]
