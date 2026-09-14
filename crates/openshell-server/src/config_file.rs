@@ -745,6 +745,8 @@ client_ca_path = "/etc/openshell/certs/client-ca.pem"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com/realms/openshell"
 audience = "openshell-cli"
+jwks_allowed_origins = ["https://keys.example.com"]
+dangerously_allow_insecure_http = false
 
 [openshell.drivers.kubernetes]
 namespace = "agents"
@@ -768,7 +770,12 @@ namespace = "agents"
             Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
         );
         assert!(gw.tls.is_some());
-        assert!(gw.oidc.is_some());
+        let oidc = gw.oidc.as_ref().expect("OIDC config parses");
+        assert!(!oidc.dangerously_allow_insecure_http);
+        assert_eq!(
+            oidc.jwks_allowed_origins,
+            ["https://keys.example.com".to_string()]
+        );
         assert_eq!(
             gw.credential_drivers.as_deref(),
             Some(&["kubernetes-secrets".to_string()][..])

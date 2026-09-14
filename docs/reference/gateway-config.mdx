@@ -213,13 +213,15 @@ endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
 
 [openshell.gateway.oidc]
-issuer        = "https://idp.example.com/realms/openshell"
-audience      = "openshell-cli"
-jwks_ttl_secs = 3600 # Must be greater than zero.
-roles_claim   = "realm_access.roles"
-admin_role    = "openshell-admin"
-user_role     = "openshell-user"
-scopes_claim  = ""
+issuer                           = "https://idp.example.com/realms/openshell"
+audience                         = "openshell-cli"
+jwks_ttl_secs                    = 3600 # Must be greater than zero.
+jwks_allowed_origins             = ["https://keys.example.com"] # Default: issuer origin only.
+dangerously_allow_insecure_http = false # Development-only numeric-loopback escape hatch.
+roles_claim                      = "realm_access.roles"
+admin_role                       = "openshell-admin"
+user_role                        = "openshell-user"
+scopes_claim                     = ""
 
 [[openshell.gateway.interceptors]]
 name               = "quota"

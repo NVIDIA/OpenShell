@@ -118,9 +118,11 @@ data:
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]
-    issuer        = {{ .Values.server.oidc.issuer | quote }}
-    audience      = {{ .Values.server.oidc.audience | quote }}
-    jwks_ttl_secs = {{ .Values.server.oidc.jwksTtl }}
+    issuer                           = {{ .Values.server.oidc.issuer | quote }}
+    dangerously_allow_insecure_http = {{ .Values.server.oidc.dangerouslyAllowInsecureHttp }}
+    jwks_allowed_origins             = {{ .Values.server.oidc.jwksAllowedOrigins | toJson }}
+    audience                         = {{ .Values.server.oidc.audience | quote }}
+    jwks_ttl_secs                    = {{ .Values.server.oidc.jwksTtl }}
     {{- if .Values.server.oidc.rolesClaim }}
     roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
     {{- end }}

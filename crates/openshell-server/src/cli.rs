@@ -162,6 +162,24 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
+    /// Development only: permit OIDC metadata and JWKS over HTTP when the
+    /// endpoint uses a numeric loopback address.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    oidc_dangerously_allow_insecure_http: bool,
+
+    /// Additional HTTPS origins allowed to serve the issuer's JWKS.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_JWKS_ALLOWED_ORIGINS",
+        value_delimiter = ','
+    )]
+    oidc_jwks_allowed_origins: Vec<String>,
+
     /// Enable mTLS client certificate authentication for local single-user gateways.
     ///
     /// When unset, this defaults on for drivers registered as local
@@ -535,6 +553,8 @@ fn prepare_server_config_with_drivers(
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
+            dangerously_allow_insecure_http: args.oidc_dangerously_allow_insecure_http,
+            jwks_allowed_origins: args.oidc_jwks_allowed_origins.clone(),
             audience: args.oidc_audience.clone(),
             jwks_ttl_secs: args.oidc_jwks_ttl,
             roles_claim: args.oidc_roles_claim.clone(),
@@ -1095,6 +1115,15 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     if let Some(oidc) = &file.oidc {
         if args.oidc_issuer.is_none() && arg_defaulted(matches, "oidc_issuer") {
             args.oidc_issuer = Some(oidc.issuer.clone());
+        }
+        if arg_defaulted(matches, "oidc_dangerously_allow_insecure_http") {
+            args.oidc_dangerously_allow_insecure_http = oidc.dangerously_allow_insecure_http;
+        }
+        if args.oidc_jwks_allowed_origins.is_empty()
+            && arg_defaulted(matches, "oidc_jwks_allowed_origins")
+        {
+            args.oidc_jwks_allowed_origins
+                .clone_from(&oidc.jwks_allowed_origins);
         }
         if arg_defaulted(matches, "oidc_audience") {
             args.oidc_audience.clone_from(&oidc.audience);
@@ -2827,6 +2856,8 @@ compute_driver = "podman"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g1 = EnvVarGuard::remove("OPENSHELL_OIDC_ISSUER");
         let _g2 = EnvVarGuard::remove("OPENSHELL_OIDC_AUDIENCE");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_OIDC_JWKS_ALLOWED_ORIGINS");
 
         let (mut args, matches) =
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
@@ -2835,12 +2866,19 @@ compute_driver = "podman"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com"
 audience = "openshell-cli"
+dangerously_allow_insecure_http = true
+jwks_allowed_origins = ["https://keys.example.com"]
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_audience, "openshell-cli");
+        assert!(args.oidc_dangerously_allow_insecure_http);
+        assert_eq!(
+            args.oidc_jwks_allowed_origins,
+            ["https://keys.example.com".to_string()]
+        );
     }
 
     #[test]

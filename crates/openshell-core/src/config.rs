@@ -319,8 +319,20 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
-    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
+    /// addresses. This is a development-only escape hatch and never permits
+    /// cleartext requests to hostnames or non-loopback addresses.
+    #[serde(default)]
+    pub dangerously_allow_insecure_http: bool,
+
+    /// Additional origins from which JWKS may be loaded. Entries must be
+    /// origins such as `https://www.googleapis.com`, without a path, query,
+    /// credentials, or fragment. The issuer origin is always allowed.
+    #[serde(default)]
+    pub jwks_allowed_origins: Vec<String>,
 
     /// Expected audience (`aud`) claim. Typically the OIDC client ID.
     pub audience: String,
