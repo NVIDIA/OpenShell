@@ -207,10 +207,11 @@ impl ComputeDriver for ComputeDriverService {
                     if request.sandbox_id.is_empty() {
                         return Err(Status::invalid_argument("sandbox_id is required"));
                     }
-                    Box::pin(
-                        self.driver
-                            .start_sandbox(&request.sandbox_id, &request.launch_authentication),
-                    )
+                    Box::pin(self.driver.start_sandbox(
+                        &request.sandbox_id,
+                        &request.generation_id,
+                        &request.launch_authentication,
+                    ))
                     .await
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))

@@ -87,6 +87,10 @@ const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: &str =
     "openshell.ai/sandbox-runtime-bootstrap-started-at-ms";
 const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: &str =
     "openshell.ai/sandbox-runtime-bootstrap-operation";
+const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: &str =
+    "openshell.ai/sandbox-runtime-bootstrap-phase";
+const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: &str =
+    "openshell.ai/sandbox-runtime-bootstrap-session";
 const ANNOTATION_SANDBOX_RUNTIME_GENERATION: &str = "openshell.ai/sandbox-runtime-generation";
 const ANNOTATION_SANDBOX_RUNTIME_READINESS: &str = "openshell.ai/sandbox-runtime-readiness";
 const ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: &str = "openshell.ai/sandbox-runtime-workload-uid";
@@ -99,6 +103,32 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: &str =
     "openshell.ai/sandbox-runtime-network-policy-version";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxRuntimeBootstrapPhase {
+    Preparing,
+    Released,
+    RollingBack,
+}
+
+impl SandboxRuntimeBootstrapPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Released => "released",
+            Self::RollingBack => "rolling-back",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "preparing" => Some(Self::Preparing),
+            "released" => Some(Self::Released),
+            "rolling-back" => Some(Self::RollingBack),
+            _ => None,
+        }
+    }
+}
 
 fn boundary_service_authority(
     namespace: &str,
@@ -1732,6 +1762,10 @@ impl KubernetesComputeDriver {
             "create".to_string(),
         );
         annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+            SandboxRuntimeBootstrapPhase::Preparing.as_str().to_string(),
+        );
+        annotations.insert(
             ANNOTATION_SANDBOX_RUNTIME_GENERATION.to_string(),
             generation.clone(),
         );
@@ -2397,6 +2431,10 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?;
+        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
+            sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
+        })
+        .await?;
         spawn_sandbox_runtime_bootstrap_completion(
             pods.clone(),
             sandbox_api.api.clone(),
@@ -2626,6 +2664,10 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?;
+        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
+            sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
+        })
+        .await?;
         spawn_sandbox_runtime_bootstrap_completion(
             pods,
             sandbox_api.api.clone(),
@@ -2694,6 +2736,12 @@ impl KubernetesComputeDriver {
             if stop_is_complete {
                 self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
                     .await?;
+                patch_dynamic_object_with_resource_version_retry(
+                    &agent_sandbox_api.api,
+                    &kube_name,
+                    sandbox_runtime_rollback_completion_patch,
+                )
+                .await?;
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -2720,12 +2768,16 @@ impl KubernetesComputeDriver {
     pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
+        generation_id: &str,
         launch_authentication: &[u8],
     ) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let result =
-            Box::pin(self.start_sandbox_runtime_generation(sandbox_id, launch_authentication))
-                .await;
+        let result = Box::pin(self.start_sandbox_runtime_generation(
+            sandbox_id,
+            generation_id,
+            launch_authentication,
+        ))
+        .await;
         span_status.finish(result)
     }
 
@@ -2733,8 +2785,13 @@ impl KubernetesComputeDriver {
     async fn start_sandbox_runtime_generation(
         &self,
         sandbox_id: &str,
+        encoded_generation: &str,
         encoded_authentication: &[u8],
     ) -> Result<(), KubernetesDriverError> {
+        let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            encoded_generation.to_string(),
+        )
+        .map_err(|error| KubernetesDriverError::InvalidArgument(error.to_string()))?;
         let launch_authentication = decode_launch_authentication(encoded_authentication)?;
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
@@ -2747,12 +2804,48 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::from_kube)?
             .items;
-        let object = objects.pop().ok_or(KubernetesDriverError::NotFound)?;
+        let mut object = objects.pop().ok_or(KubernetesDriverError::NotFound)?;
         if sandbox_runtime_bootstrap_in_progress(&object) {
-            return Err(KubernetesDriverError::Precondition(
-                "sandbox bootstrap has not completed; wait for reconciliation or recreate the sandbox"
-                    .to_string(),
-            ));
+            let phase = sandbox_runtime_bootstrap_phase(&object);
+            if phase != Some(SandboxRuntimeBootstrapPhase::RollingBack)
+                && sandbox_runtime_bootstrap_operation(&object) != Some("restart")
+            {
+                return Err(KubernetesDriverError::Precondition(
+                    "initial sandbox bootstrap has not completed; wait for reconciliation"
+                        .to_string(),
+                ));
+            }
+            if sandbox_runtime_generation(&object) == Some(generation.as_str())
+                && sandbox_runtime_bootstrap_phase(&object)
+                    == Some(SandboxRuntimeBootstrapPhase::Released)
+            {
+                let namespace = object
+                    .metadata
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(&self.config.namespace);
+                if sandbox_runtime_control_availability(&self.client, namespace, sandbox_id).await
+                    == SandboxRuntimeControlAvailability::Available
+                    && sandbox_runtime_runtime_is_ready(&object)
+                {
+                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
+                        .await;
+                    return Ok(());
+                }
+            }
+
+            // A retry adopts the durable generation identity, but reconstructs
+            // its resources from a clean suspended state. This is safe even
+            // after gateway replacement because launch credentials stay in
+            // memory and are supplied again by the caller.
+            self.stop_sandbox_inner(sandbox_id).await?;
+            let mut refreshed = lookup_api
+                .api
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?
+                .items;
+            object = refreshed.pop().ok_or(KubernetesDriverError::NotFound)?;
         }
         let namespace = object
             .metadata
@@ -2782,8 +2875,7 @@ impl KubernetesComputeDriver {
             ));
         }
 
-        let generation = random_sandbox_runtime_token();
-        let names = SandboxRuntimeNames::for_generation(sandbox_id, &generation);
+        let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
@@ -2869,38 +2961,57 @@ impl KubernetesComputeDriver {
                 )
             })?;
         sandbox_secret["secretName"] = serde_json::json!(names.sandbox_secret);
-        patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
-            let mut running_patch =
-                sandbox_operating_state_patch(&sandbox_api.resource.version, version, true);
-            running_patch["metadata"]["annotations"] = serde_json::json!({
-                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
-                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
-                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
-                ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation,
-                ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-            });
-            running_patch["spec"]["podTemplate"]["spec"]["volumes"] =
-                serde_json::Value::Array(volumes.clone());
-            running_patch
-        })
-        .await?;
+        let restart = async {
+            patch_dynamic_object_with_resource_version_retry(
+                &sandbox_api.api,
+                cr_name,
+                |version| {
+                    let mut running_patch =
+                        sandbox_operating_state_patch(&sandbox_api.resource.version, version, true);
+                    running_patch["metadata"]["annotations"] = serde_json::json!({
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Preparing.as_str(),
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
+                        ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
+                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
+                    });
+                    running_patch["spec"]["podTemplate"]["spec"]["volumes"] =
+                        serde_json::Value::Array(volumes.clone());
+                    running_patch
+                },
+            )
+            .await?;
 
-        let child_env = child_environment_from_sandbox_object(&object);
-        self.install_sandbox_runtime_generation(
-            &namespace,
-            cr_name,
-            &sandbox_api,
-            sandbox_id,
-            cr_uid,
-            &names,
-            &generation,
-            &supervisor_uid,
-            agent_uid,
-            agent_gid,
-            child_env,
-            &launch_authentication,
-        )
-        .await
+            let child_env = child_environment_from_sandbox_object(&object);
+            self.install_sandbox_runtime_generation(
+                &namespace,
+                cr_name,
+                &sandbox_api,
+                sandbox_id,
+                cr_uid,
+                &names,
+                generation.as_str(),
+                &supervisor_uid,
+                agent_uid,
+                agent_gid,
+                child_env,
+                &launch_authentication,
+            )
+            .await
+        }
+        .await;
+
+        if let Err(error) = restart {
+            if let Err(rollback_error) = self.stop_sandbox_inner(sandbox_id).await {
+                return Err(KubernetesDriverError::Message(format!(
+                    "restart failed: {error}; rollback remains pending: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn patch_sandbox_operating_state(
@@ -3272,6 +3383,19 @@ impl KubernetesComputeDriver {
                 .as_deref()
                 .unwrap_or(&self.config.namespace);
             let cr_name = object.metadata.name.as_deref().unwrap_or_default();
+            if sandbox_runtime_bootstrap_phase(&object)
+                == Some(SandboxRuntimeBootstrapPhase::RollingBack)
+            {
+                self.reconcile_sandbox_runtime_rollback(
+                    &lookup_api,
+                    &object,
+                    &sandbox_id,
+                    namespace,
+                    cr_name,
+                )
+                .await;
+                continue;
+            }
             let names = SandboxRuntimeNames::new(&sandbox_id);
             let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
             match self.create_sandbox_runtime_fence(namespace, &names).await {
@@ -3393,6 +3517,60 @@ impl KubernetesComputeDriver {
         }
     }
 
+    async fn reconcile_sandbox_runtime_rollback(
+        &self,
+        lookup_api: &AgentSandboxApi,
+        object: &DynamicObject,
+        sandbox_id: &str,
+        namespace: &str,
+        cr_name: &str,
+    ) {
+        let pod_name = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .map_or(cr_name, String::as_str);
+        let pod_api = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
+        match kubernetes_sandbox_pod_is_gone(&pod_api, pod_name, deadline).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                debug!(sandbox_id, %error, "could not verify sandbox-runtime rollback; reconciliation will retry");
+                return;
+            }
+        }
+        if let Err(error) = self
+            .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
+            .await
+        {
+            warn!(sandbox_id, %error, "could not finish sandbox-runtime rollback cleanup");
+            return;
+        }
+        let Some(resource_version) = object.metadata.resource_version.as_deref() else {
+            return;
+        };
+        let api =
+            Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
+        let patch = sandbox_runtime_rollback_completion_patch(resource_version);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.api
+                .patch(cr_name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                debug!(sandbox_id, %error, "sandbox-runtime rollback completion raced; reconciliation will retry");
+            }
+            Err(_) => {
+                warn!(sandbox_id, "timed out completing sandbox-runtime rollback");
+            }
+        }
+    }
+
     async fn publish_sandbox_runtime_readiness_transition(
         &self,
         lookup_api: &AgentSandboxApi,
@@ -3462,14 +3640,13 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_operating_state_patch(
+        let patch = sandbox_runtime_rollback_patch(
             &lookup_api.resource.version,
             object
                 .metadata
                 .resource_version
                 .as_deref()
                 .unwrap_or_default(),
-            false,
         );
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -3805,6 +3982,8 @@ fn sandbox_runtime_bootstrap_completion_patch(resource_version: &str) -> serde_j
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "ready",
             }
         }
@@ -3930,6 +4109,38 @@ fn sandbox_runtime_bootstrap_operation(object: &DynamicObject) -> Option<&str> {
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION))
         .map(String::as_str)
+}
+
+fn sandbox_runtime_bootstrap_phase(object: &DynamicObject) -> Option<SandboxRuntimeBootstrapPhase> {
+    object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE))
+        .and_then(|value| SandboxRuntimeBootstrapPhase::parse(value))
+}
+
+fn sandbox_runtime_generation(object: &DynamicObject) -> Option<&str> {
+    object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_GENERATION))
+        .map(String::as_str)
+}
+
+fn sandbox_runtime_bootstrap_phase_patch(
+    resource_version: &str,
+    phase: SandboxRuntimeBootstrapPhase,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: phase.as_str(),
+            }
+        }
+    })
 }
 
 fn sandbox_runtime_bootstrap_is_stale(
@@ -6223,19 +6434,7 @@ fn sandbox_operating_state_patch(
                 "spec": {"operatingMode": "Running"}
             })
         } else {
-            serde_json::json!({
-                "metadata": {
-                    "resourceVersion": resource_version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: serde_json::Value::Null,
-                    },
-                },
-                "spec": {"operatingMode": "Suspended"}
-            })
+            sandbox_runtime_rollback_patch(api_version, resource_version)
         }
     } else {
         if running {
@@ -6244,21 +6443,51 @@ fn sandbox_operating_state_patch(
                 "spec": {"replicas": 1}
             })
         } else {
-            serde_json::json!({
-                "metadata": {
-                    "resourceVersion": resource_version,
-                    "annotations": {
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: serde_json::Value::Null,
-                    },
-                },
-                "spec": {"replicas": 0}
-            })
+            sandbox_runtime_rollback_patch(api_version, resource_version)
         }
     }
+}
+
+fn sandbox_runtime_rollback_patch(api_version: &str, resource_version: &str) -> serde_json::Value {
+    let desired_state = if api_version == SANDBOX_VERSION_V1BETA1 {
+        serde_json::json!({"operatingMode": "Suspended"})
+    } else {
+        serde_json::json!({"replicas": 0})
+    };
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::RollingBack.as_str(),
+                ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+            },
+        },
+        "spec": desired_state,
+    })
+}
+
+fn sandbox_runtime_rollback_completion_patch(resource_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_GENERATION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+            },
+        }
+    })
 }
 
 fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
@@ -7098,7 +7327,11 @@ mod tests {
         assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
         assert_eq!(
             beta_stop["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
-            serde_json::Value::Null
+            "true"
+        );
+        assert_eq!(
+            beta_stop["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::RollingBack.as_str()
         );
         assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
         assert!(beta_stop["spec"].get("replicas").is_none());
@@ -9635,9 +9868,56 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION],
+            serde_json::Value::Null
+        );
+        assert_eq!(
             patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_READINESS],
             "ready"
         );
+    }
+
+    #[test]
+    fn sandbox_runtime_rollback_is_durable_until_cleanup_completes() {
+        let rollback = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1BETA1, "42");
+        assert_eq!(rollback["metadata"]["resourceVersion"], "42");
+        assert_eq!(
+            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
+            "true"
+        );
+        assert_eq!(
+            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION],
+            "stop"
+        );
+        assert_eq!(
+            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+        );
+        assert_eq!(rollback["spec"]["operatingMode"], "Suspended");
+
+        let complete = sandbox_runtime_rollback_completion_patch("43");
+        assert_eq!(complete["metadata"]["resourceVersion"], "43");
+        for annotation in [
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING,
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT,
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION,
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE,
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION,
+            ANNOTATION_SANDBOX_RUNTIME_GENERATION,
+            ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID,
+            ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID,
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID,
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION,
+        ] {
+            assert_eq!(
+                complete["metadata"]["annotations"][annotation],
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
