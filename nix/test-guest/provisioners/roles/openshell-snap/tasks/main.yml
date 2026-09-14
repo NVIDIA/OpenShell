@@ -34,6 +34,16 @@
   changed_when: true
   failed_when: false
 
+- name: Check for temporary OpenShell Snap bootstrap gateway
+  become: true
+  ansible.builtin.stat:
+    path: "{{ openshell_snap_package_bootstrap_gateway_bin }}"
+  register: openshell_snap_package_bootstrap_gateway_bin_stat
+
+- name: Apply temporary OpenShell Snap package bootstrap workaround
+  ansible.builtin.include_tasks: package-bootstrap-workaround.yml
+  when: openshell_snap_package_bootstrap_gateway_bin_stat.stat.exists
+
 - name: Install candidate OpenShell Snap
   become: true
   ansible.builtin.command:
