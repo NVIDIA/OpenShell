@@ -121,6 +121,9 @@ securityContext:
     # -- Linux capabilities dropped from the gateway container.
     drop:
       - ALL
+  seccompProfile:
+    # -- Seccomp profile applied to the gateway container.
+    type: RuntimeDefault
 
 service:
   # -- Kubernetes Service type for the gateway.
@@ -476,6 +479,20 @@ pkiInitJob:
   # see "TLS error: Secret is not supplied by SDS" when connecting to the gateway,
   # check if the TLS secret exists and run `helm upgrade` to create the ConfigMap.
   failOnTimeout: true
+  # Leave runAsUser unset so the OpenShift restricted-v2 SCC can assign the
+  # namespace UID.
+  securityContext:
+    # -- Require the certgen hook container to run as a non-root user.
+    runAsNonRoot: true
+    # -- Whether the certgen hook container can gain additional privileges.
+    allowPrivilegeEscalation: false
+    capabilities:
+      # -- Linux capabilities dropped from the certgen hook container.
+      drop:
+        - ALL
+    seccompProfile:
+      # -- Seccomp profile applied to the certgen hook container.
+      type: RuntimeDefault
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.

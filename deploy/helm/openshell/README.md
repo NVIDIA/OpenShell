@@ -211,6 +211,10 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
+| pkiInitJob.securityContext.allowPrivilegeEscalation | bool | `false` | Whether the certgen hook container can gain additional privileges. |
+| pkiInitJob.securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the certgen hook container. |
+| pkiInitJob.securityContext.runAsNonRoot | bool | `true` | Require the certgen hook container to run as a non-root user. |
+| pkiInitJob.securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the certgen hook container. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
@@ -241,6 +245,7 @@ discovery endpoint or its TLS CA.
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
+| securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
 | server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace | bool | `false` | Deprecated compatibility field. Credential storage no longer supports user-authored namespace references. |
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
