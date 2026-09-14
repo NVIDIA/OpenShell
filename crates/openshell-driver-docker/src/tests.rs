@@ -633,9 +633,11 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
-    Box::pin(DockerComputeDriver::start_sandbox(&driver, "", "", &[]).with_subscriber(subscriber))
-        .await
-        .expect_err("missing identifier should fail");
+    Box::pin(
+        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[]).with_subscriber(subscriber),
+    )
+    .await
+    .expect_err("missing identifier should fail");
     provider.force_flush().unwrap();
 
     let spans = exporter.get_finished_spans().unwrap();
