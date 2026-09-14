@@ -45,6 +45,44 @@ impl std::fmt::Debug for SandboxSessionRegistry {
 }
 
 impl SandboxSessionRegistry {
+    /// Authorize a cryptographically verified gateway-profile session token.
+    ///
+    /// Ordinary supervisor RPCs accept only the currently active token. The
+    /// refresh RPC may replay the immediately consumed token so a lost refresh
+    /// response can be retried without extending any older credential.
+    #[allow(clippy::result_large_err)]
+    pub fn authorize(
+        &self,
+        principal: &openshell_core::jwt::AuthenticatedSandboxSession,
+        allow_last_refresh: bool,
+    ) -> Result<(), tonic::Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = sessions
+            .get(principal.sandbox_id.as_str())
+            .filter(|session| session.active)
+            .ok_or_else(|| tonic::Status::failed_precondition("sandbox session is not active"))?;
+        if principal.session_id != session.session_id || principal.credential_epoch.is_some() {
+            return Err(tonic::Status::unauthenticated(
+                "gateway session does not match the active sandbox generation",
+            ));
+        }
+        let current = principal.token_id == session.current_gateway_token_id;
+        let retry = allow_last_refresh
+            && session
+                .last_refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.consumed_token_id == principal.token_id);
+        if !current && !retry {
+            return Err(tonic::Status::unauthenticated(
+                "gateway session token has been replaced",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn activate(
         &self,
         sandbox_id: &str,
@@ -153,5 +191,66 @@ impl SandboxSessionRegistry {
             authentication: authentication.clone(),
         });
         Ok(authentication)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use openshell_bootstrap::jwt::generate_jwt_key;
+
+    use super::*;
+
+    #[test]
+    fn authorization_tracks_active_token_and_refresh_retry() {
+        let key = generate_jwt_key().expect("JWT key");
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            key.signing_key_pem.as_bytes(),
+            key.public_key_pem.as_bytes(),
+            key.kid,
+            "gateway-a",
+            Duration::from_hours(1),
+        )
+        .expect("session authority");
+        let registry = SandboxSessionRegistry::default();
+        let authentication = authority
+            .mint_launch(
+                "sandbox-a",
+                SandboxSessionId::new(),
+                CredentialEpoch::new(1).expect("credential epoch"),
+            )
+            .expect("launch authentication");
+        registry
+            .activate("sandbox-a", &authentication, &authority)
+            .expect("activate session");
+
+        let original = authority
+            .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())
+            .expect("original principal");
+        registry
+            .authorize(&original, false)
+            .expect("current token is authorized");
+
+        let refreshed = registry
+            .refresh(
+                "sandbox-a",
+                &authentication.supervisor.gateway_token,
+                &authority,
+            )
+            .expect("refresh session");
+        assert!(registry.authorize(&original, false).is_err());
+        registry
+            .authorize(&original, true)
+            .expect("immediately consumed token can retry refresh");
+        let current = authority
+            .verify_gateway_token(refreshed.supervisor.gateway_token.expose_secret())
+            .expect("refreshed principal");
+        registry
+            .authorize(&current, false)
+            .expect("refreshed token is authorized");
+
+        registry.deactivate("sandbox-a");
+        assert!(registry.authorize(&current, false).is_err());
     }
 }

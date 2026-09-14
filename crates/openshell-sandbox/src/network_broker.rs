@@ -522,6 +522,13 @@ fn dispatch_notification(
             std::process::id(),
         );
     }
+    if syscall == libc::SYS_tkill {
+        return openshell_isolation_interface::linux::process_signal::mediate_thread_signal(
+            &listener,
+            notification,
+            std::process::id(),
+        );
+    }
     if syscall == libc::SYS_socket {
         return create_socket(&registry, &listener, notification);
     }
