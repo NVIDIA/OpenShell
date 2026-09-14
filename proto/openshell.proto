@@ -1342,9 +1342,7 @@ message DeleteSandboxResponse {
 
 // Create SSH session request.
 message CreateSshSessionRequest {
-  reserved 1;
-  reserved "sandbox_id";
-  string sandbox = 2;
+  string sandbox = 1;
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
@@ -1481,9 +1479,7 @@ message RevokeSshSessionResponse {
 
 // Execute command request.
 message ExecSandboxRequest {
-  reserved 1;
-  reserved "sandbox_id";
-
+  string sandbox = 1;
   // Command and arguments.
   repeated string command = 2;
 
@@ -1514,7 +1510,6 @@ message ExecSandboxRequest {
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
-  string sandbox = 11;
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 12;
 }
 
@@ -1544,9 +1539,7 @@ message ExecSandboxEvent {
 
 // Initial frame for one TCP forward stream.
 message TcpForwardInit {
-  reserved 1;
-  reserved "sandbox_id";
-  string sandbox = 2;
+  string sandbox = 1;
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Optional service identifier for audit/correlation.
   string service_id = 4;
@@ -2398,8 +2391,9 @@ enum PolicyStatus {
 
 // Get sandbox logs request (one-shot fetch).
 message GetSandboxLogsRequest {
-  reserved 1, 6;
-  reserved "sandbox_id", "workspace";
+  reserved 6;
+  reserved "workspace";
+  string sandbox = 1;
   // Maximum number of log lines to return. 0 means use default (2000).
   uint32 lines = 2;
   // Only include logs with timestamp >= this value (ms since epoch). 0 means no filter.
@@ -2408,7 +2402,6 @@ message GetSandboxLogsRequest {
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string min_level = 5;
-  string sandbox = 8;
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 7;
 }
 

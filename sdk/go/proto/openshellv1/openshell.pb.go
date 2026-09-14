@@ -3872,7 +3872,7 @@ func (x *DeleteSandboxResponse) GetDeleted() bool {
 // Create SSH session request.
 type CreateSshSessionRequest struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
-	Sandbox        string                         `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Sandbox        string                         `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -4649,7 +4649,8 @@ func (x *RevokeSshSessionResponse) GetRevoked() bool {
 
 // Execute command request.
 type ExecSandboxRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Command and arguments.
 	Command []string `protobuf:"bytes,2,rep,name=command,proto3" json:"command,omitempty"`
 	// Optional working directory.
@@ -4672,7 +4673,6 @@ type ExecSandboxRequest struct {
 	// sourced by them) are applied. When true, the command runs without those
 	// files (`bash -c`), for automation that needs predictable startup behavior.
 	NoLoginShell   bool                           `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
-	Sandbox        string                         `protobuf:"bytes,11,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,12,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -4706,6 +4706,13 @@ func (x *ExecSandboxRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ExecSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ExecSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{67}
+}
+
+func (x *ExecSandboxRequest) GetSandbox() string {
+	if x != nil {
+		return x.Sandbox
+	}
+	return ""
 }
 
 func (x *ExecSandboxRequest) GetCommand() []string {
@@ -4769,13 +4776,6 @@ func (x *ExecSandboxRequest) GetNoLoginShell() bool {
 		return x.NoLoginShell
 	}
 	return false
-}
-
-func (x *ExecSandboxRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
-	}
-	return ""
 }
 
 func (x *ExecSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
@@ -5022,7 +5022,7 @@ func (*ExecSandboxEvent_Exit) isExecSandboxEvent_Payload() {}
 // Initial frame for one TCP forward stream.
 type TcpForwardInit struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
-	Sandbox        string                         `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Sandbox        string                         `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	// Optional service identifier for audit/correlation.
 	ServiceId string `protobuf:"bytes,4,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
@@ -10138,7 +10138,8 @@ func (x *SandboxPolicyRevision) GetProvenance() map[string]string {
 
 // Get sandbox logs request (one-shot fetch).
 type GetSandboxLogsRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Maximum number of log lines to return. 0 means use default (2000).
 	Lines uint32 `protobuf:"varint,2,opt,name=lines,proto3" json:"lines,omitempty"`
 	// Only include logs with timestamp >= this value (ms since epoch). 0 means no filter.
@@ -10147,7 +10148,6 @@ type GetSandboxLogsRequest struct {
 	Sources []string `protobuf:"bytes,4,rep,name=sources,proto3" json:"sources,omitempty"`
 	// Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
 	MinLevel       string                         `protobuf:"bytes,5,opt,name=min_level,json=minLevel,proto3" json:"min_level,omitempty"`
-	Sandbox        string                         `protobuf:"bytes,8,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,7,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -10183,6 +10183,13 @@ func (*GetSandboxLogsRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{143}
 }
 
+func (x *GetSandboxLogsRequest) GetSandbox() string {
+	if x != nil {
+		return x.Sandbox
+	}
+	return ""
+}
+
 func (x *GetSandboxLogsRequest) GetLines() uint32 {
 	if x != nil {
 		return x.Lines
@@ -10207,13 +10214,6 @@ func (x *GetSandboxLogsRequest) GetSources() []string {
 func (x *GetSandboxLogsRequest) GetMinLevel() string {
 	if x != nil {
 		return x.MinLevel
-	}
-	return ""
-}
-
-func (x *GetSandboxLogsRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
 	}
 	return ""
 }
@@ -14540,11 +14540,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\x12\x1a\n" +
 	"\bdetached\x18\x02 \x01(\bR\bdetached\"1\n" +
 	"\x15DeleteSandboxResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x99\x01\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x87\x01\n" +
 	"\x17CreateSshSessionRequest\x12\x18\n" +
-	"\asandbox\x18\x02 \x01(\tR\asandbox\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02R\n" +
-	"sandbox_id\"\x98\x02\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12R\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"\x98\x02\n" +
 	"\x18CreateSshSessionResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1a\n" +
@@ -14595,8 +14594,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x17RevokeSshSessionRequest\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\"4\n" +
 	"\x18RevokeSshSessionResponse\x12\x18\n" +
-	"\arevoked\x18\x01 \x01(\bR\arevoked\"\xfc\x03\n" +
+	"\arevoked\x18\x01 \x01(\bR\arevoked\"\xea\x03\n" +
 	"\x12ExecSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
 	"\acommand\x18\x02 \x03(\tR\acommand\x12\x18\n" +
 	"\aworkdir\x18\x03 \x01(\tR\aworkdir\x12S\n" +
 	"\venvironment\x18\x04 \x03(\v21.openshell.v1.ExecSandboxRequest.EnvironmentEntryR\venvironment\x12'\n" +
@@ -14606,13 +14606,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04cols\x18\b \x01(\rR\x04cols\x12\x12\n" +
 	"\x04rows\x18\t \x01(\rR\x04rows\x12$\n" +
 	"\x0eno_login_shell\x18\n" +
-	" \x01(\bR\fnoLoginShell\x12\x18\n" +
-	"\asandbox\x18\v \x01(\tR\asandbox\x12R\n" +
+	" \x01(\bR\fnoLoginShell\x12R\n" +
 	"\x0fworkspace_scope\x18\f \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\n" +
-	"sandbox_id\"'\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"'\n" +
 	"\x11ExecSandboxStdout\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"'\n" +
 	"\x11ExecSandboxStderr\x12\x12\n" +
@@ -14623,17 +14621,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06stdout\x18\x01 \x01(\v2\x1f.openshell.v1.ExecSandboxStdoutH\x00R\x06stdout\x129\n" +
 	"\x06stderr\x18\x02 \x01(\v2\x1f.openshell.v1.ExecSandboxStderrH\x00R\x06stderr\x123\n" +
 	"\x04exit\x18\x03 \x01(\v2\x1d.openshell.v1.ExecSandboxExitH\x00R\x04exitB\t\n" +
-	"\apayload\"\xd4\x02\n" +
+	"\apayload\"\xc2\x02\n" +
 	"\x0eTcpForwardInit\x12\x18\n" +
-	"\asandbox\x18\x02 \x01(\tR\asandbox\x12R\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
 	"\n" +
 	"service_id\x18\x04 \x01(\tR\tserviceId\x120\n" +
 	"\x03ssh\x18\x05 \x01(\v2\x1c.openshell.v1.SshRelayTargetH\x00R\x03ssh\x120\n" +
 	"\x03tcp\x18\x06 \x01(\v2\x1c.openshell.v1.TcpRelayTargetH\x00R\x03tcp\x125\n" +
 	"\x13authorization_token\x18\a \x01(\tB\x04\x88\xb5\x18\x01R\x12authorizationTokenB\b\n" +
-	"\x06targetJ\x04\b\x01\x10\x02R\n" +
-	"sandbox_id\"f\n" +
+	"\x06target\"f\n" +
 	"\x0fTcpForwardFrame\x122\n" +
 	"\x04init\x18\x01 \x01(\v2\x1c.openshell.v1.TcpForwardInitH\x00R\x04init\x12\x14\n" +
 	"\x04data\x18\x02 \x01(\fH\x00R\x04dataB\t\n" +
@@ -15040,15 +15037,14 @@ const file_openshell_proto_rawDesc = "" +
 	"provenance\x1a=\n" +
 	"\x0fProvenanceEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x90\x02\n" +
-	"\x15GetSandboxLogsRequest\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfe\x01\n" +
+	"\x15GetSandboxLogsRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x14\n" +
 	"\x05lines\x18\x02 \x01(\rR\x05lines\x12\x19\n" +
 	"\bsince_ms\x18\x03 \x01(\x03R\asinceMs\x12\x18\n" +
 	"\asources\x18\x04 \x03(\tR\asources\x12\x1b\n" +
-	"\tmin_level\x18\x05 \x01(\tR\bminLevel\x12\x18\n" +
-	"\asandbox\x18\b \x01(\tR\asandbox\x12R\n" +
-	"\x0fworkspace_scope\x18\a \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02J\x04\b\x06\x10\aR\n" +
-	"sandbox_idR\tworkspace\"i\n" +
+	"\tmin_level\x18\x05 \x01(\tR\bminLevel\x12R\n" +
+	"\x0fworkspace_scope\x18\a \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x06\x10\aR\tworkspace\"i\n" +
 	"\x16PushSandboxLogsRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x120\n" +

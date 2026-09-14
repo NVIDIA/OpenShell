@@ -176,7 +176,7 @@ e2e_write_gateway_jwt_config() {
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
   # Local Docker/Podman e2e gateways exercise the single-player default:
   # sandbox JWTs identify the supervisor and do not expire.
-  printf 'ttl_secs = 0\n\n'
+  printf '\n'
 }
 
 e2e_write_gateway_mtls_auth_config() {

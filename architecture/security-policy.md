@@ -293,21 +293,23 @@ After any successful policy write, pending chunks already covered by the new
 live effective policy are rejected as redundant. This keeps the review inbox
 aligned with what the sandbox currently enforces.
 
-Endpoint and binary advisor markers are provenance, not authorization or
-connection metadata. Provider- or user-authored declarations carry explicit
-provenance; `policy.local` declarations carry advisor provenance. A difference
-in endpoint provenance alone is compatible during effective-policy ambiguity
-validation. When identical endpoint or binary identities merge, an explicit
-declaration dominates an advisor declaration. Proposal coverage likewise
-ignores provenance so an approved overlay converges when an existing explicit
-declaration already supplies the same identity.
+Endpoint advisor markers are provenance, not authorization or connection
+metadata. Provider- or user-authored endpoints carry explicit provenance;
+`policy.local` endpoints carry advisor provenance. A difference in endpoint
+provenance alone is compatible during effective-policy ambiguity validation.
+When identical endpoints merge, an explicit declaration dominates an advisor
+declaration. Proposal coverage likewise ignores provenance so an approved
+overlay converges when an existing explicit declaration already supplies the
+same identity.
 
 This compatibility does not weaken SSRF classification. Exact-host trust
-requires one matching rule to contain both an exact explicit endpoint and an
-explicit binary identity. An advisor-only endpoint or binary cannot assemble
-that trust from unrelated rules. A provider rule may independently establish
-trust for its own explicit endpoint and binary pair, but an advisor overlay
-does not broaden that pair to a different binary.
+requires one matching rule to contain both an exact explicit endpoint and a
+matching binary identity. An advisor endpoint cannot assemble that trust from
+an unrelated explicit endpoint. When the advisor observes a new binary for an
+existing explicit endpoint contract, canonicalization keeps the observation in
+a separate rule whose endpoint retains advisor provenance. A provider or user
+rule may independently establish trust for its own explicit endpoint and binary
+pair, but an advisor overlay does not broaden that pair to a different binary.
 
 ### Security-notes gate
 

@@ -740,7 +740,7 @@ fn validate_service_config(config: &GatewayInterceptorConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_interceptor_configs(configs: &[GatewayInterceptorConfig]) -> Result<()> {
+pub fn validate_interceptor_configs(configs: &[GatewayInterceptorConfig]) -> Result<()> {
     let mut names = BTreeSet::new();
     for config in configs {
         validate_service_config(config)?;

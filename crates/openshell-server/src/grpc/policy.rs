@@ -111,6 +111,89 @@ const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
+// Private wire-only compatibility types for policy history written before
+// 0.1.0. Public generated bindings intentionally reserve NetworkBinary tag 2,
+// but stored policies still need its former advisor-provenance value migrated
+// before the unknown field is discarded.
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredNetworkBinary {
+    #[prost(string, tag = "1")]
+    path: String,
+    #[prost(bool, tag = "2")]
+    advisor_proposed: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredNetworkPolicyRule {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(message, repeated, tag = "2")]
+    endpoints: Vec<NetworkEndpoint>,
+    #[prost(message, repeated, tag = "3")]
+    binaries: Vec<LegacyStoredNetworkBinary>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredSandboxPolicy {
+    #[prost(map = "string, message", tag = "5")]
+    network_policies: HashMap<String, LegacyStoredNetworkPolicyRule>,
+}
+
+fn decode_stored_policy(payload: &[u8]) -> Result<ProtoSandboxPolicy, prost::DecodeError> {
+    let mut policy = ProtoSandboxPolicy::decode(payload)?;
+    let legacy = LegacyStoredSandboxPolicy::decode(payload)?;
+
+    for (rule_key, legacy_rule) in legacy.network_policies {
+        let advisor_paths = legacy_rule
+            .binaries
+            .into_iter()
+            .filter(|binary| binary.advisor_proposed)
+            .map(|binary| binary.path)
+            .collect::<HashSet<_>>();
+        if advisor_paths.is_empty() {
+            continue;
+        }
+
+        let Some(mut explicit_rule) = policy.network_policies.remove(&rule_key) else {
+            continue;
+        };
+        let mut advisor_rule = explicit_rule.clone();
+        advisor_rule
+            .binaries
+            .retain(|binary| advisor_paths.contains(&binary.path));
+        explicit_rule
+            .binaries
+            .retain(|binary| !advisor_paths.contains(&binary.path));
+        if advisor_rule.binaries.is_empty() {
+            policy.network_policies.insert(rule_key, explicit_rule);
+            continue;
+        }
+        for endpoint in &mut advisor_rule.endpoints {
+            endpoint.advisor_proposed = true;
+        }
+
+        if explicit_rule.binaries.is_empty() {
+            policy.network_policies.insert(rule_key, advisor_rule);
+            continue;
+        }
+
+        policy
+            .network_policies
+            .insert(rule_key.clone(), explicit_rule);
+        let key_base = format!("{rule_key}__legacy_advisor");
+        let mut advisor_key = key_base.clone();
+        let mut suffix = 2_u32;
+        while policy.network_policies.contains_key(&advisor_key) {
+            advisor_key = format!("{key_base}_{suffix}");
+            suffix += 1;
+        }
+        advisor_rule.name.clone_from(&advisor_key);
+        policy.network_policies.insert(advisor_key, advisor_rule);
+    }
+
+    Ok(policy)
+}
+
 fn emit_sandbox_policy_update_success() {
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::SandboxPolicy,
@@ -624,6 +707,24 @@ fn compute_failed_proposal_evaluation_hash(
     hex::encode(hasher.finalize())
 }
 
+fn available_proposal_rule_name(
+    base_policy: &ProtoSandboxPolicy,
+    current_effective_policy: &ProtoSandboxPolicy,
+    requested_rule_name: &str,
+) -> String {
+    let mut candidate = requested_rule_name.to_string();
+    let mut suffix = 2_u32;
+    while base_policy.network_policies.contains_key(&candidate)
+        || current_effective_policy
+            .network_policies
+            .contains_key(&candidate)
+    {
+        candidate = format!("{requested_rule_name}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_proposal_candidate(
     base_policy: &ProtoSandboxPolicy,
@@ -635,15 +736,30 @@ fn evaluate_proposal_candidate(
     validation_context: PolicyMergeValidationContext<'_>,
     reuse_validation_result: Option<&str>,
 ) -> ProposalEvaluation {
+    // The gateway owns advisor provenance. Do not rely on a supervisor or an
+    // agent-authored proposal to set this internal marker correctly: every
+    // proposed endpoint must remain ineligible for exact-host private-address
+    // trust until an explicit declaration or allowed_ips grants that trust.
+    let mut proposed_rule = proposed_rule.clone();
+    for endpoint in &mut proposed_rule.endpoints {
+        endpoint.advisor_proposed = true;
+    }
+
     let canonical = if analysis_mode == "mechanistic" {
         canonicalize_advisor_add_rule(
             base_policy,
             current_effective_policy,
             requested_rule_name,
-            proposed_rule,
+            &proposed_rule,
         )
     } else {
-        Ok((requested_rule_name.to_string(), proposed_rule.clone()))
+        let rule_name = available_proposal_rule_name(
+            base_policy,
+            current_effective_policy,
+            requested_rule_name,
+        );
+        proposed_rule.name.clone_from(&rule_name);
+        Ok((rule_name, proposed_rule.clone()))
     };
     let (rule_name, rule) = match canonical {
         Ok(value) => value,
@@ -657,7 +773,7 @@ fn evaluate_proposal_candidate(
                 validation_result: String::new(),
                 review_token: compute_failed_proposal_evaluation_hash(
                     requested_rule_name,
-                    proposed_rule,
+                    &proposed_rule,
                     current_effective_policy,
                     &application_error,
                 ),
@@ -5735,7 +5851,7 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
 fn canonical_policy_record_identity(
     record: &PolicyRecord,
 ) -> Result<(ProtoSandboxPolicy, String), Status> {
-    let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+    let decoded = decode_stored_policy(record.policy_payload.as_slice())
         .map_err(|error| Status::internal(format!("decode policy revision failed: {error}")))?;
     let policy = validate_and_canonicalize_stored_policy(decoded, STORED_POLICY_SOURCE_HISTORY)?;
     let hash = deterministic_policy_hash(&policy);
@@ -6899,7 +7015,7 @@ fn decode_policy_from_global_settings(
 
     let raw = hex::decode(encoded)
         .map_err(|e| Status::internal(format!("global policy decode failed: {e}")))?;
-    let policy = ProtoSandboxPolicy::decode(raw.as_slice())
+    let policy = decode_stored_policy(raw.as_slice())
         .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
     validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_GLOBAL).map(Some)
 }
@@ -7020,6 +7136,166 @@ mod tests {
                 },
             }));
         request
+    }
+
+    #[test]
+    fn stored_policy_decode_migrates_legacy_provenance_and_preserves_unknown_fields() {
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkBinary {
+            #[prost(string, tag = "1")]
+            path: String,
+            #[prost(bool, tag = "2")]
+            advisor_proposed: bool,
+            #[prost(string, tag = "99")]
+            future_metadata: String,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkPolicyRule {
+            #[prost(string, tag = "1")]
+            name: String,
+            #[prost(message, repeated, tag = "2")]
+            endpoints: Vec<NetworkEndpoint>,
+            #[prost(message, repeated, tag = "3")]
+            binaries: Vec<FutureStoredNetworkBinary>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredSandboxPolicy {
+            #[prost(map = "string, message", tag = "5")]
+            network_policies: HashMap<String, FutureStoredNetworkPolicyRule>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyStoredPolicyRevisionPayload {
+            #[prost(message, optional, tag = "1")]
+            policy: Option<FutureStoredSandboxPolicy>,
+        }
+
+        let legacy = FutureStoredSandboxPolicy {
+            network_policies: HashMap::from([(
+                "cargo_registry".to_string(),
+                FutureStoredNetworkPolicyRule {
+                    name: "cargo-registry".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "index.crates.io".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![
+                        FutureStoredNetworkBinary {
+                            path: "/usr/bin/cargo".to_string(),
+                            advisor_proposed: false,
+                            future_metadata: "keep-explicit".to_string(),
+                        },
+                        FutureStoredNetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            advisor_proposed: true,
+                            future_metadata: "keep-advisor".to_string(),
+                        },
+                    ],
+                },
+            )]),
+        };
+
+        let wrapped = LegacyStoredPolicyRevisionPayload {
+            policy: Some(legacy),
+        }
+        .encode_to_vec();
+        let record = crate::policy_store::policy_record_from_parts(
+            "revision-1".to_string(),
+            "sandbox-1".to_string(),
+            1,
+            "loaded".to_string(),
+            &wrapped,
+            1,
+        )
+        .unwrap();
+        let rewrapped = crate::policy_store::policy_payload_from_record(&record).unwrap();
+        let future_payload = LegacyStoredPolicyRevisionPayload::decode(rewrapped.as_slice())
+            .expect("rewrapped policy should retain unknown nested fields");
+        let future_rule = &future_payload.policy.unwrap().network_policies["cargo_registry"];
+        assert!(!future_rule.binaries[0].advisor_proposed);
+        assert_eq!(future_rule.binaries[0].future_metadata, "keep-explicit");
+        assert!(future_rule.binaries[1].advisor_proposed);
+        assert_eq!(future_rule.binaries[1].future_metadata, "keep-advisor");
+
+        let record = crate::policy_store::policy_record_from_parts(
+            "revision-2".to_string(),
+            "sandbox-1".to_string(),
+            1,
+            "loaded".to_string(),
+            &rewrapped,
+            1,
+        )
+        .unwrap();
+        let decoded = decode_stored_policy(&record.policy_payload).unwrap();
+        let explicit = &decoded.network_policies["cargo_registry"];
+        assert_eq!(explicit.binaries[0].path, "/usr/bin/cargo");
+        assert!(!explicit.endpoints[0].advisor_proposed);
+
+        let advisor = &decoded.network_policies["cargo_registry__legacy_advisor"];
+        assert_eq!(advisor.binaries[0].path, "/usr/bin/curl");
+        assert!(advisor.endpoints[0].advisor_proposed);
+
+        let round_tripped = decode_stored_policy(&decoded.encode_to_vec()).unwrap();
+        assert_eq!(round_tripped, decoded);
+    }
+
+    #[test]
+    fn agent_authored_candidate_avoids_explicit_rule_name_collision() {
+        let mut base = ProtoSandboxPolicy::default();
+        base.network_policies.insert(
+            "allow_index_crates_io_443".to_string(),
+            NetworkPolicyRule {
+                name: "explicit-index".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "index.crates.io".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/cargo".to_string(),
+                }],
+            },
+        );
+        let proposal = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }],
+        };
+
+        let evaluation = evaluate_proposal_candidate(
+            &base,
+            &base,
+            "allow_index_crates_io_443",
+            &proposal,
+            "agent_authored",
+            &CredentialSet::default(),
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+            },
+            None,
+        );
+
+        assert!(evaluation.application_error.is_empty());
+        assert_eq!(evaluation.rule_name, "allow_index_crates_io_443_2");
+        assert!(evaluation.rule.endpoints[0].advisor_proposed);
+        let candidate = evaluation.candidate_effective_policy.unwrap();
+        assert_eq!(
+            candidate.network_policies["allow_index_crates_io_443"].binaries[0].path,
+            "/usr/bin/cargo"
+        );
+        assert!(
+            candidate.network_policies["allow_index_crates_io_443_2"].endpoints[0].advisor_proposed
+        );
     }
 
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
@@ -9501,7 +9777,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -9624,7 +9899,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn provider_policy_layers_include_custom_provider_profiles() {
         let store = test_store().await;
         store
@@ -9669,7 +9943,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/custom".to_string(),
-                        harness: true,
                     }],
                     inference_capable: false,
                     discovery: None,
@@ -9693,7 +9966,7 @@ mod tests {
         assert_eq!(layers[0].rule.endpoints[0].allowed_ips, vec!["10.0.0.0/24"]);
         assert!(layers[0].rule.endpoints[0].allow_encoded_slash);
         assert_eq!(layers[0].rule.endpoints[0].path, "/v1");
-        assert!(layers[0].rule.binaries[0].harness);
+        assert_eq!(layers[0].rule.binaries[0].path, "/usr/bin/custom");
     }
 
     #[tokio::test]
@@ -12214,7 +12487,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn custom_imported_profile_policy_and_env_follow_attach_detach_lifecycle() {
         use crate::grpc::provider::handle_import_provider_profiles;
         use crate::grpc::sandbox::{
@@ -12263,7 +12535,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/custom".to_string(),
-                            harness: true,
                         }],
                         inference_capable: false,
                         discovery: None,
@@ -12631,7 +12902,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: binary.to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -12653,6 +12923,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let proposed_rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice()).unwrap();
+            assert!(
+                proposed_rule.endpoints[0].advisor_proposed,
+                "the gateway must stamp advisor endpoint provenance"
+            );
             chunk.validation_result = format!("prover: cached sentinel {index}");
             assert!(
                 state
@@ -12697,6 +12972,12 @@ mod tests {
         let policy = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
         assert!(policy.network_policies.contains_key("alpha"));
         assert!(policy.network_policies.contains_key("beta"));
+        assert!(
+            policy
+                .network_policies
+                .values()
+                .all(|rule| rule.endpoints[0].advisor_proposed)
+        );
         for (index, chunk) in chunks.iter().enumerate() {
             let stored = state
                 .store
@@ -12748,7 +13029,6 @@ mod tests {
                             }],
                             binaries: vec![NetworkBinary {
                                 path: "/usr/bin/curl".to_string(),
-                                ..Default::default()
                             }],
                         }),
                         ..Default::default()
@@ -12768,7 +13048,6 @@ mod tests {
                             }],
                             binaries: vec![NetworkBinary {
                                 path: "/usr/bin/wget".to_string(),
-                                ..Default::default()
                             }],
                         }),
                         ..Default::default()
@@ -12890,7 +13169,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 },
             },
@@ -12905,7 +13183,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/wget".to_string(),
-                        ..Default::default()
                     }],
                 },
             },
@@ -12972,7 +13249,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -13082,7 +13358,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit = handle_submit_policy_analysis(
@@ -13200,7 +13475,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let mut chunk = pending_draft_chunk("legacy-private", sandbox_id);
@@ -13275,7 +13549,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -13340,7 +13613,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let first = handle_submit_policy_analysis(
@@ -13507,7 +13779,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -13760,7 +14031,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -13885,7 +14155,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -13997,7 +14266,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let mechanistic_submit = handle_submit_policy_analysis(
@@ -14077,7 +14345,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let agent_submit = handle_submit_policy_analysis(
@@ -14210,7 +14477,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -14279,7 +14545,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/cargo".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -14304,14 +14569,9 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
-        let mut advisor_binary = NetworkBinary {
+        let advisor_binary = NetworkBinary {
             path: "/usr/bin/curl".to_string(),
-            ..Default::default()
         };
-        #[allow(deprecated)]
-        {
-            advisor_binary.harness = true;
-        }
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
@@ -14448,7 +14708,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -14522,7 +14781,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -14577,7 +14835,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/wget".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -14656,7 +14913,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit = handle_submit_policy_analysis(
@@ -14760,7 +15016,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -14866,7 +15121,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -14965,7 +15219,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15055,7 +15308,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15149,7 +15401,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15246,7 +15497,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15339,7 +15589,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15404,7 +15653,6 @@ mod tests {
                 endpoints: vec![endpoint],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
@@ -15487,7 +15735,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -15610,7 +15857,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15712,7 +15958,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15803,7 +16048,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -15897,7 +16141,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                     inference_capable: false,
                     discovery: None,
@@ -15938,7 +16181,6 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
-        #[allow(deprecated)]
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -15961,7 +16203,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                harness: true,
             }],
         };
 
@@ -16145,7 +16386,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let step1 = handle_submit_policy_analysis(
@@ -16186,7 +16426,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let step2 = handle_submit_policy_analysis(
@@ -16323,7 +16562,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -16440,7 +16678,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit_one = || {
@@ -16560,7 +16797,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit_one = || {
@@ -16828,7 +17064,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -16986,7 +17221,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -17205,7 +17439,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -17233,7 +17466,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -17261,7 +17493,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -17288,7 +17519,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -17358,7 +17588,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 },
             ))
@@ -17387,7 +17616,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -17461,7 +17689,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 },
             ))
@@ -17490,7 +17717,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -18447,7 +18673,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             }
         }

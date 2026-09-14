@@ -94,3 +94,104 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use prost::Message;
+
+    use super::SandboxPolicy;
+
+    // SandboxPolicy payload encoded by the pre-0.1.0 schema with
+    // NetworkBinary.harness=true. Keep this fixed fixture to prove that the
+    // current schema continues to accept the former durable wire format.
+    const LEGACY_SANDBOX_POLICY_WITH_HARNESS: &[u8] = &[
+        0x2a, 0x1d, 0x0a, 0x06, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x12, 0x13, 0x1a, 0x11, 0x0a,
+        0x0d, 0x2f, 0x75, 0x73, 0x72, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x63, 0x75, 0x72, 0x6c, 0x10,
+        0x01,
+    ];
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkBinary {
+        #[prost(string, tag = "1")]
+        path: String,
+        #[prost(bool, tag = "2")]
+        harness: bool,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkPolicyRule {
+        #[prost(message, repeated, tag = "3")]
+        binaries: Vec<LegacyNetworkBinary>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxPolicy {
+        #[prost(map = "string, message", tag = "5")]
+        network_policies: HashMap<String, LegacyNetworkPolicyRule>,
+    }
+
+    #[test]
+    fn sandbox_policy_ignores_removed_network_binary_harness_wire_field() {
+        let legacy = LegacySandboxPolicy {
+            network_policies: HashMap::from([(
+                "legacy".to_string(),
+                LegacyNetworkPolicyRule {
+                    binaries: vec![LegacyNetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        harness: true,
+                    }],
+                },
+            )]),
+        };
+
+        assert_eq!(legacy.encode_to_vec(), LEGACY_SANDBOX_POLICY_WITH_HARNESS);
+
+        let decoded = SandboxPolicy::decode(LEGACY_SANDBOX_POLICY_WITH_HARNESS)
+            .expect("legacy policy fixture should decode");
+        assert_eq!(
+            decoded.network_policies["legacy"].binaries[0].path,
+            "/usr/bin/curl"
+        );
+
+        let round_tripped =
+            LegacySandboxPolicy::decode(decoded.encode_to_vec().as_slice()).unwrap();
+        assert!(!round_tripped.network_policies["legacy"].binaries[0].harness);
+    }
+
+    #[test]
+    fn network_binary_reserves_removed_harness_name_and_tag() {
+        let descriptor = prost_types::FileDescriptorSet::decode(crate::FILE_DESCRIPTOR_SET)
+            .expect("descriptor set should decode");
+        let network_binary = descriptor
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("openshell.sandbox.v1"))
+            .and_then(|file| {
+                file.message_type
+                    .iter()
+                    .find(|message| message.name.as_deref() == Some("NetworkBinary"))
+            })
+            .expect("NetworkBinary descriptor should exist");
+
+        assert!(
+            network_binary
+                .field
+                .iter()
+                .all(|field| field.name.as_deref() != Some("harness"))
+        );
+        assert!(
+            network_binary
+                .reserved_range
+                .iter()
+                .any(|range| range.start == Some(2) && range.end == Some(3))
+        );
+        assert!(
+            network_binary
+                .reserved_name
+                .iter()
+                .any(|name| name == "harness")
+        );
+    }
+}

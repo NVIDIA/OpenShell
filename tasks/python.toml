@@ -60,5 +60,6 @@ hide = true
 
 ["python:proto"]
 description = "Generate Python protobuf stubs from .proto files"
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0" }
 run = "uv run --frozen python tasks/scripts/generate_python_proto.py"
 hide = true

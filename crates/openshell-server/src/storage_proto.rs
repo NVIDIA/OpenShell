@@ -111,7 +111,6 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{Sandbox, ServiceEndpoint};
     use prost::Message;
     use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorSet};
     use sha2::{Digest, Sha256};
@@ -120,9 +119,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8ddde6ce644b153aa91f515a417eaeaa37521030d490bc045e1543c4d571c12c";
+        "ee6f37067c5c0ce72cef5ea241e9fee59a5f9bfb993cfd4f97c5f04b9d7650ab";
     const DURABLE_SCHEMA_SHA256: &str =
-        "05322f3c82030b30387ff6829e3c7fef1ecc39de7a588d8ee549f44814367fa3";
+        "54a83fc7ecc9f39672090fbdc08c4ad5b298d22c80d19d63a648db2cc9a706b3";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
     // Synthetic payloads generated with the public declarations at v0.0.116,
@@ -137,11 +136,6 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
-    // Payloads written before the public sandbox reference fields were renamed
-    // from `sandbox_name` to `sandbox`. The field numbers and wire types did not
-    // change, so current decoders must preserve their values without migration.
-    const PRE_SANDBOX_REFERENCE_RENAME_SANDBOX: &str = "0a2c0a116c65676163792d73616e64626f782d6964120e6c65676163792d73616e64626f783a0764656661756c741a100a0e6c65676163792d73616e64626f78";
-    const PRE_SANDBOX_REFERENCE_RENAME_SERVICE_ENDPOINT: &str = "0a210a116c65676163792d736572766963652d696412037765623a0764656661756c7412116c65676163792d73616e64626f782d69641a0e6c65676163792d73616e64626f78220377656228903f";
     const STORAGE_MESSAGE_NAMES: [&str; 7] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
@@ -517,23 +511,6 @@ mod tests {
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {
         hex::decode(encoded).expect("checked-in legacy fixture must be valid hex")
-    }
-
-    #[test]
-    fn pre_sandbox_reference_rename_payloads_decode_without_migration() {
-        let sandbox =
-            Sandbox::decode(legacy_bytes(PRE_SANDBOX_REFERENCE_RENAME_SANDBOX).as_slice())
-                .expect("sandbox payload from before the field rename must decode");
-        assert_eq!(
-            sandbox.status.expect("sandbox status").sandbox,
-            "legacy-sandbox"
-        );
-
-        let endpoint = ServiceEndpoint::decode(
-            legacy_bytes(PRE_SANDBOX_REFERENCE_RENAME_SERVICE_ENDPOINT).as_slice(),
-        )
-        .expect("service endpoint payload from before the field rename must decode");
-        assert_eq!(endpoint.sandbox, "legacy-sandbox");
     }
 
     #[test]

@@ -253,6 +253,26 @@ database requires persistent per-pod storage.
 {{- end }}
 
 {{/*
+Translate chart image pull policy values to the canonical gateway vocabulary.
+The Kubernetes spellings remain accepted so existing values files continue to
+work across the schema-v2 chart upgrade.
+*/}}
+{{- define "openshell.canonicalImagePullPolicy" -}}
+{{- $policy := printf "%v" . -}}
+{{- if eq $policy "Always" -}}
+always
+{{- else if eq $policy "IfNotPresent" -}}
+if_not_present
+{{- else if eq $policy "Never" -}}
+never
+{{- else if has $policy (list "always" "if_not_present" "never") -}}
+{{- $policy -}}
+{{- else -}}
+{{- fail (printf "image pull policy %q must be one of: always, if_not_present, never, Always, IfNotPresent, Never" $policy) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}

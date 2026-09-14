@@ -87,13 +87,11 @@ if your gateway cache directory differs):
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["podman"]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+compute_driver = "podman"
 disable_tls = true
-supervisor_image = "localhost/openshell/supervisor:dev"
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -106,7 +104,10 @@ gateway_id = "podman-dev"
 ttl_secs = 3600
 
 [openshell.drivers.podman]
-image_pull_policy = "missing"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+supervisor_image = "localhost/openshell/supervisor:dev"
+image_pull_policy = "if_not_present"
+health_check_interval_secs = 10
 ```
 
 If the JWT key files do not exist yet, run `mise run gateway` once to generate
@@ -118,7 +119,7 @@ Start the gateway:
 eval "$(aws configure export-credentials --format env)"
 ./target/debug/openshell-gateway \
   --config .cache/gateway-podman/gateway.toml \
-  --port 18080 --log-level info --drivers podman --disable-tls \
+  --port 18080 --log-level info --compute-driver podman --disable-tls \
   --db-url "sqlite:.cache/gateway-podman/gateway.db?mode=rwc"
 ```
 

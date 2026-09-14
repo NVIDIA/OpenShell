@@ -1440,12 +1440,8 @@ func (x *L7QueryMatcher) GetAny() []string {
 
 // A binary identity for network policy matching.
 type NetworkBinary struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Path  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	// Deprecated: the harness concept has been removed. This field is ignored.
-	//
-	// Deprecated: Marked as deprecated in sandbox.proto.
-	Harness       bool `protobuf:"varint,2,opt,name=harness,proto3" json:"harness,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1487,18 +1483,10 @@ func (x *NetworkBinary) GetPath() string {
 	return ""
 }
 
-// Deprecated: Marked as deprecated in sandbox.proto.
-func (x *NetworkBinary) GetHarness() bool {
-	if x != nil {
-		return x.Harness
-	}
-	return false
-}
-
 // Request to get sandbox settings by sandbox name.
 type GetSandboxConfigRequest struct {
 	state          protoimpl.MessageState         `protogen:"open.v1"`
-	Sandbox        string                         `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Sandbox        string                         `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -2204,14 +2192,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"6\n" +
 	"\x0eL7QueryMatcher\x12\x12\n" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
-	"\x03any\x18\x02 \x03(\tR\x03any\"A\n" +
+	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1c\n" +
-	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"\x99\x01\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\x87\x01\n" +
 	"\x17GetSandboxConfigRequest\x12\x18\n" +
-	"\asandbox\x18\x02 \x01(\tR\asandbox\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02R\n" +
-	"sandbox_id\"\x19\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12R\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
 	"\x18GetGatewayConfigResponse\x12X\n" +
 	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +

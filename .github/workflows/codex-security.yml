@@ -23,6 +23,14 @@ on:
         required: false
         default: false
         type: boolean
+      fail-on-findings:
+        description: Fail on HIGH/CRITICAL security findings
+        default: false
+        type: boolean
+      upload_sarif:
+        description: Upload results to Code Scanning when called from a manual workflow
+        default: true
+        type: boolean
     outputs:
       base_sha:
         description: Previous stable commit, empty for a full bootstrap scan
@@ -230,6 +238,7 @@ jobs:
             --output "$SARIF_FILE"
 
       - name: Summarize findings
+        id: findings
         env:
           BASE_TAG: ${{ steps.range.outputs.base_tag }}
           CANDIDATE_TAG: ${{ steps.range.outputs.candidate_tag }}
@@ -237,9 +246,17 @@ jobs:
           SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
           SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
           TRAIN: ${{ steps.range.outputs.train }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
         run: |
           set -euo pipefail
-          finding_count=$(jq '[.runs[]?.results[]?] | length' "$SARIF_FILE")
+          finding_count=$(jq '[.runs[].results[]] | length' "$SARIF_FILE")
+          high_count=$(jq '
+            [ .runs[].results[]
+              | select(all(.suppressions[]?; .status != "accepted"))
+              | select(.properties.severity | ascii_downcase | IN("high", "critical"))
+            ] | length
+          ' "$SARIF_FILE")
+          echo "high_count=$high_count" >> "$GITHUB_OUTPUT"
           {
             echo "### Codex Security release qualification"
             echo
@@ -254,8 +271,9 @@ jobs:
             fi
             echo "- Coverage: complete"
             echo "- Findings: $finding_count"
+            echo "- HIGH/CRITICAL: $high_count"
             echo
-            echo "Findings are informational during the observation phase."
+            echo "Fail on HIGH/CRITICAL: $FAIL_ON_FINDINGS"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF to Code Scanning
@@ -267,8 +285,22 @@ jobs:
           sha: ${{ steps.range.outputs.candidate_sha }}
           category: ${{ steps.range.outputs.category }}
 
+      - name: Enforce HIGH/CRITICAL threshold
+        if: ${{ !cancelled() && steps.findings.outcome == 'success' }}
+        env:
+          HIGH_COUNT: ${{ steps.findings.outputs.high_count }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+        run: |
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+              echo "::error::Codex reported $HIGH_COUNT HIGH/CRITICAL findings."
+              exit 1
+            fi
+            echo "::warning::Codex reported $HIGH_COUNT HIGH/CRITICAL findings; enforcement is disabled."
+          fi
+
   result:
-    name: OpenShell / Codex Security (informational)
+    name: ${{ inputs.fail-on-findings && 'OpenShell / Codex Security' || 'OpenShell / Codex Security (informational)' }}
     if: ${{ always() }}
     needs: analyze
     runs-on: ubuntu-latest
@@ -283,4 +315,4 @@ jobs:
             echo "::error::Codex Security release qualification did not complete successfully."
             exit 1
           fi
-          echo "Codex Security completed; findings remain informational."
+          echo "Codex Security completed and the configured finding threshold passed."
