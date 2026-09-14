@@ -10,13 +10,15 @@
 #
 # VM/MicroVM is intentionally explicit-only because it requires runtime setup.
 # Use either:
-#   OPENSHELL_DRIVERS=vm mise run gateway
+#   OPENSHELL_COMPUTE_DRIVER=vm mise run gateway
 #   mise run gateway:vm
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+# shellcheck source=tasks/scripts/gateway-pull-policy.sh
+source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
+GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 
 usage() {
   cat <<'EOF'
@@ -33,7 +35,7 @@ Options:
   -h, --help       Show this help.
 
 Environment:
-  OPENSHELL_DRIVERS       Driver override used by openshell-gateway.
+  OPENSHELL_COMPUTE_DRIVER       Driver override used by openshell-gateway.
   OPENSHELL_GATEWAY_NAME  Gateway name for delegated or Kubernetes runs.
   OPENSHELL_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1,
                           or ::1 for Podman Machine on macOS.
@@ -104,7 +106,7 @@ detect_driver() {
   fi
 
   echo "ERROR: no compute driver detected." >&2
-  echo "       Start Podman or Docker, run inside Kubernetes, or set OPENSHELL_DRIVERS." >&2
+  echo "       Start Podman or Docker, run inside Kubernetes, or set OPENSHELL_COMPUTE_DRIVER." >&2
   exit 2
 }
 
@@ -171,17 +173,17 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -n "${explicit_driver}" && -n "${OPENSHELL_DRIVERS:-}" ]]; then
-  echo "ERROR: use either --driver or OPENSHELL_DRIVERS, not both" >&2
+if [[ -n "${explicit_driver}" && -n "${OPENSHELL_COMPUTE_DRIVER:-}" ]]; then
+  echo "ERROR: use either --driver or OPENSHELL_COMPUTE_DRIVER, not both" >&2
   exit 2
 fi
 
-if [[ -z "${explicit_driver}" && -n "${OPENSHELL_DRIVERS:-}" ]]; then
-  if [[ "${OPENSHELL_DRIVERS}" == *,* ]]; then
-    echo "ERROR: mise run gateway supports one driver; got OPENSHELL_DRIVERS=${OPENSHELL_DRIVERS}" >&2
+if [[ -z "${explicit_driver}" && -n "${OPENSHELL_COMPUTE_DRIVER:-}" ]]; then
+  if [[ "${OPENSHELL_COMPUTE_DRIVER}" == *,* ]]; then
+    echo "ERROR: mise run gateway supports one driver; got OPENSHELL_COMPUTE_DRIVER=${OPENSHELL_COMPUTE_DRIVER}" >&2
     exit 2
   fi
-  explicit_driver="$(normalize_driver "${OPENSHELL_DRIVERS}")"
+  explicit_driver="$(normalize_driver "${OPENSHELL_COMPUTE_DRIVER}")"
 fi
 
 DRIVER="${explicit_driver:-$(detect_driver)}"
@@ -206,7 +208,7 @@ GATEWAY_NAME="${OPENSHELL_GATEWAY_NAME:-${DRIVER}-dev}"
 STATE_DIR="${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-${DRIVER}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-${DRIVER}-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
@@ -253,12 +255,11 @@ fi
 
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["${DRIVER}"]
-default_image = "${SANDBOX_IMAGE}"
+compute_driver = "${DRIVER}"
 disable_tls = true
 
 [openshell.gateway.otlp]
@@ -279,6 +280,7 @@ cat >>"${CONFIG_PATH}" <<EOF
 
 [openshell.drivers.kubernetes]
 namespace = "${SANDBOX_NAMESPACE}"
+default_image = "${SANDBOX_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 EOF
 if [[ -n "${GRPC_ENDPOINT}" ]]; then
@@ -303,6 +305,6 @@ exec "${GATEWAY_BIN}" \
   --bind-address "${PRIMARY_BIND_IP}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
-  --drivers "${DRIVER}" \
+  --compute-driver "${DRIVER}" \
   --disable-tls \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

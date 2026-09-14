@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MXC gateway config for the ETW -> OCSF audit-trail example.
+#
+# Goal: exercise the in-process ETW consumer (Plane A) end-to-end so that
+# creating a sandbox produces a full OCSF audit trail — Application Lifecycle
+# [6002], Device Config State Change [5019], Process Activity [1007] and
+# Detection Finding [2004] — written to a durable JSONL log, just like the Linux
+# OCSF pipeline.
+#
+# run-ocsf-audit.ps1 patches wxc_exec_path, backend, and etw_audit into a
+# disposable copy of this file. Workload command and cwd are sandbox-scoped and
+# passed separately through --driver-config-json.
+
+[openshell.drivers.mxc]
+# Path to wxc-exec.exe on the box (patched by the run script; default is the
+# location observed on the MXC test boxes).
+wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+
+# One-shot AppContainer. This is the backend whose Sandboxing ETW the consumer
+# captures. (isolation_session is "dark" — it emits no provider events.)
+backend = "process_container"
+
+default_configuration_id = "composable"
+
+debug = false
+
+# Turn ON the Plane-A ETW -> OCSF audit consumer. This is the core of the example.
+etw_audit = true

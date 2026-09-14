@@ -105,18 +105,15 @@ func (c *fakeSandboxTemplateClient) Get(_ context.Context, workspace, name strin
 	return c.store.Get(workspace, name)
 }
 
-func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+func (c *fakeSandboxTemplateClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.SandboxWorkloadTemplate], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	var options v1.ListOptions
 	if len(opts) > 0 {
 		options = opts[0]
-		if options.Limit < 0 {
-			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if options.Offset < 0 {
-			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "offset must not be negative"}
+		if options.PageSize < 0 {
+			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "page size must not be negative"}
 		}
 	}
 	var templates []*types.SandboxWorkloadTemplate
@@ -130,7 +127,15 @@ func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, op
 	if err != nil {
 		return nil, err
 	}
-	return paginateSandboxWorkloadTemplates(templates, options), nil
+	return newSlicePager(templates, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxTemplateClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string) (bool, error) {
@@ -238,20 +243,6 @@ func compareSandboxWorkloadTemplatesForList(a, b *types.SandboxWorkloadTemplate)
 		return 1
 	}
 	return 0
-}
-
-func paginateSandboxWorkloadTemplates(
-	templates []*types.SandboxWorkloadTemplate,
-	options v1.ListOptions,
-) []*types.SandboxWorkloadTemplate {
-	if options.Offset >= len(templates) {
-		return templates[:0]
-	}
-	templates = templates[options.Offset:]
-	if options.Limit > 0 && options.Limit < len(templates) {
-		return templates[:options.Limit]
-	}
-	return templates
 }
 
 func isDNS1123Label(name string) bool {

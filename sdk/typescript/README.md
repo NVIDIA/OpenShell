@@ -186,13 +186,24 @@ const sandbox = await client.sandbox.createFromTemplate({
 })
 
 await client.sandboxTemplates.get('python', { workspace: 'default' })
-await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
+await client.sandboxTemplates.listAll({ workspace: 'default', pageSize: 100 })
 await client.sandboxTemplates.delete('python', { workspace: 'default' })
 ```
 
-Use `allWorkspaces: true` on `list()` for a platform-admin view. The SDK clears
-the workspace field in that request because the gateway treats `workspace` and
-`allWorkspaces` as mutually exclusive.
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The
+discriminated option type makes `workspace` and `allWorkspaces` mutually
+exclusive. Omitting both options explicitly selects the `default` workspace.
+List methods follow continuation tokens through a lazy `Pager`; each advance
+fetches one RPC page. Use `listAll()` only
+when you want to exhaust the collection. `pageSize` controls one request and
+`pageToken` resumes a saved traversal.
+
+```ts
+const pages = client.sandbox.list({ workspace: 'default', pageSize: 100 })
+for await (const page of pages) {
+  for (const sandbox of page.items) console.log(sandbox.name)
+}
+```
 
 ## Surface and roadmap
 
@@ -212,14 +223,24 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 `client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
+import { create } from '@bufbuild/protobuf'
 import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
 import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
 
 const client = await OpenShellClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
-const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+const defaultWorkspace = create(WorkspaceSelectorSchema, {
+  selection: { case: 'workspace', value: 'default' },
+})
+const status = await client.raw.getSandboxPolicyStatus({
+  name: 'my-sandbox',
+  version: 0,
+  global: false,
+  workspaceScope: defaultWorkspace,
+})
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.

@@ -59,7 +59,7 @@ pub async fn sandbox_provider_list(
     let response = client
         .list_sandbox_providers(ListSandboxProvidersRequest {
             sandbox_name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -91,7 +91,7 @@ pub async fn sandbox_provider_attach(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -106,7 +106,7 @@ pub async fn sandbox_provider_attach(
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -147,7 +147,7 @@ pub async fn sandbox_provider_detach(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -162,7 +162,7 @@ pub async fn sandbox_provider_detach(
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -298,19 +298,18 @@ pub async fn ensure_required_providers(
     let mut known_names: HashSet<String> = HashSet::new();
     let mut type_to_name: HashMap<String, String> = HashMap::new();
     {
-        let mut offset = 0_u32;
-        let limit = 100_u32;
+        let mut page_token = String::new();
         loop {
             let response = client
                 .list_providers(ListProvidersRequest {
-                    limit,
-                    offset,
-                    workspace: workspace.to_string(),
-                    all_workspaces: false,
+                    page_size: 100,
+                    page_token,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
                 })
                 .await
                 .into_diagnostic()?;
-            let providers = response.into_inner().providers;
+            let response = response.into_inner();
+            let providers = response.providers;
             for provider in &providers {
                 known_names.insert(provider.object_name().to_string());
                 if !provider.r#type.is_empty() {
@@ -320,10 +319,10 @@ pub async fn ensure_required_providers(
                         .or_insert_with(|| provider.object_name().to_string());
                 }
             }
-            if providers.len() < limit as usize {
+            if response.next_page_token.is_empty() {
                 break;
             }
-            offset = offset.saturating_add(limit);
+            page_token = response.next_page_token;
         }
     }
 
@@ -490,7 +489,7 @@ async fn auto_create_provider(
                 profile_workspace: workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         };
 
         let response = client.create_provider(request).await.map_err(|status| {
@@ -538,7 +537,7 @@ async fn auto_create_provider(
                     profile_workspace: workspace.to_string(),
                     credential_handles: HashMap::new(),
                 }),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             };
 
             match client.create_provider(request).await {
@@ -672,7 +671,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     match client
         .delete_provider(DeleteProviderRequest {
             name: provider_name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -1119,7 +1118,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -1149,7 +1148,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     "refresh_token".to_string(),
                 ],
                 expires_at_ms: None,
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
@@ -1167,7 +1166,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
             .rotate_provider_credential(RotateProviderCredentialRequest {
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key,
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
@@ -1208,7 +1207,7 @@ pub async fn provider_get(
     let response = client
         .get_provider(GetProviderRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -1326,8 +1325,8 @@ fn provider_credential_keys(provider: &Provider) -> Vec<String> {
 #[allow(clippy::too_many_arguments)]
 pub async fn provider_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -1337,23 +1336,31 @@ pub async fn provider_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_providers(ListProvidersRequest {
-            limit,
-            offset,
-            workspace: if all_workspaces {
-                String::new()
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let providers = response.providers;
 
     // Handle structured output formats (json, yaml)
-    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "providers",
+        &providers,
+        &next_page_token,
+        provider_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if providers.is_empty() {
         if !names_only {
@@ -1446,15 +1453,24 @@ pub async fn provider_list_profiles(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .list_provider_profiles(ListProviderProfilesRequest {
-            limit: 100,
-            offset: 0,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-    let mut profiles = response.into_inner().profiles;
+    let mut page_token = String::new();
+    let mut profiles = Vec::new();
+    loop {
+        let response = client
+            .list_provider_profiles(ListProviderProfilesRequest {
+                page_size: 100,
+                page_token,
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        profiles.extend(response.profiles);
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        page_token = response.next_page_token;
+    }
     profiles.sort_by(|left, right| {
         left.category
             .cmp(&right.category)
@@ -1713,7 +1729,7 @@ pub async fn provider_refresh_status(
         .get_provider_refresh_status(GetProviderRefreshStatusRequest {
             provider: name.to_string(),
             credential_key: credential_key.unwrap_or_default().to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -1794,7 +1810,7 @@ pub async fn provider_refresh_config(
             material,
             secret_material_keys,
             expires_at_ms: input.credential_expires_at_ms,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -1823,7 +1839,7 @@ pub async fn provider_rotate(
         .rotate_provider_credential(RotateProviderCredentialRequest {
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -1860,7 +1876,7 @@ pub async fn provider_refresh_delete(
         .delete_provider_refresh(DeleteProviderRefreshRequest {
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?
@@ -2236,7 +2252,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let existing = match client
         .get_provider(GetProviderRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -2319,7 +2335,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                 credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
@@ -2349,7 +2365,7 @@ pub async fn provider_delete(
         let response = match client
             .delete_provider(DeleteProviderRequest {
                 name: name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {

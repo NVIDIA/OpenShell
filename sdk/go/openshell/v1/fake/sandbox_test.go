@@ -192,7 +192,7 @@ func TestSandbox_List_Empty(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	list, err := sc.List(ctx, "default")
+	list, err := sc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Empty(t, list)
 }
@@ -204,7 +204,7 @@ func TestSandbox_List(t *testing.T) {
 	_, _ = sc.Create(ctx, "default", "sb-1", &types.SandboxSpec{}, nil)
 	_, _ = sc.Create(ctx, "default", "sb-2", &types.SandboxSpec{}, nil)
 
-	list, err := sc.List(ctx, "default")
+	list, err := sc.ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Len(t, list, 2)
 }
@@ -567,7 +567,7 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 				name := fmt.Sprintf("sb-%d-%d", id, j)
 				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{LogLevel: "info"}, nil)
 				_, _ = sc.Get(ctx, "default", name)
-				_, _ = sc.List(ctx, "default")
+				_, _ = sc.ListAll(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
 				_ = sc.Delete(ctx, "default", name)
 			}

@@ -32,6 +32,8 @@ struct ProviderCredentialStateInner {
     non_secret_environment_keys: HashSet<String>,
     static_credential_bindings: HashMap<String, CompiledStaticCredentialBinding>,
     known_static_credential_keys: HashSet<String>,
+    body_inventory_available: bool,
+    known_body_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
 }
 
@@ -97,13 +99,15 @@ impl ProviderCredentialState {
 
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
-                current: snapshot,
+                current: snapshot.clone(),
                 generations,
                 current_resolver,
                 combined_resolver,
                 suppressed_keys: HashSet::new(),
                 non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
+                body_inventory_available: true,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
             })),
@@ -149,13 +153,15 @@ impl ProviderCredentialState {
 
         Ok(Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
-                current: snapshot,
+                current: snapshot.clone(),
                 generations,
                 current_resolver,
                 combined_resolver,
                 suppressed_keys: HashSet::new(),
                 non_secret_environment_keys: non_secret_environment_keys.into_iter().collect(),
                 static_credential_bindings,
+                body_inventory_available: true,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys,
                 static_credential_identity_epochs,
             })),
@@ -179,13 +185,15 @@ impl ProviderCredentialState {
 
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
-                current: snapshot,
+                current: snapshot.clone(),
                 generations: VecDeque::new(),
                 current_resolver: None,
                 combined_resolver: None,
                 suppressed_keys: HashSet::new(),
                 non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
+                body_inventory_available: false,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
             })),
@@ -224,6 +232,7 @@ impl ProviderCredentialState {
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
+        inner.body_inventory_available = false;
         inner.current.child_env.len()
     }
 
@@ -269,6 +278,23 @@ impl ProviderCredentialState {
         port: u16,
         path: &str,
     ) -> (Option<Arc<SecretResolver>>, u64) {
+        let (resolver, _, revision) =
+            self.resolver_and_body_classifier_for_endpoint(host, port, path);
+        (resolver, revision)
+    }
+
+    /// Obtain value resolution and body classification from the same revision.
+    #[must_use]
+    pub fn resolver_and_body_classifier_for_endpoint(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> (
+        Option<Arc<SecretResolver>>,
+        Option<Arc<crate::secrets::body::BodyCredentialClassifier>>,
+        u64,
+    ) {
         let request_path = path.split_once('?').map_or(path, |(path, _)| path);
         let request_path = crate::secrets::redact_target_for_policy(request_path);
         let normalized_host = host.to_ascii_lowercase();
@@ -282,7 +308,7 @@ impl ProviderCredentialState {
             // Binding authorization must not depend on real credential
             // material. Malformed placeholder syntax cannot be normalized
             // safely, so expose no endpoint-scoped resolver.
-            return (None, revision);
+            return (None, None, revision);
         };
         let allowed: HashSet<String> = inner
             .static_credential_bindings
@@ -294,6 +320,28 @@ impl ProviderCredentialState {
             })
             .map(|(key, _)| key.clone())
             .collect();
+        let classifier = inner.body_inventory_available.then(|| {
+            Arc::new(crate::secrets::body::BodyCredentialClassifier::new(
+                inner.combined_resolver.as_deref(),
+                inner
+                    .known_body_keys
+                    .union(&inner.known_static_credential_keys)
+                    .cloned()
+                    .collect(),
+                inner.static_credential_bindings.keys().cloned().collect(),
+                inner
+                    .static_credential_identity_epochs
+                    .iter()
+                    .filter(|(key, epoch)| {
+                        inner
+                            .static_credential_bindings
+                            .get(*key)
+                            .is_some_and(|binding| binding.credential_identity == epoch.identity)
+                    })
+                    .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
+                    .collect(),
+            ))
+        });
         let resolver = inner.combined_resolver.as_ref().map(|resolver| {
             let revision_fallback_allowed_revisions = inner
                 .static_credential_identity_epochs
@@ -313,7 +361,7 @@ impl ProviderCredentialState {
                 revision_fallback_allowed_revisions,
             ))
         });
-        (resolver, revision)
+        (resolver, classifier, revision)
     }
 
     #[must_use]
@@ -483,6 +531,9 @@ impl ProviderCredentialState {
             child_env,
             dynamic_credentials,
         });
+        inner.body_inventory_available = true;
+        let body_keys = inner.current.child_env.keys().cloned().collect::<Vec<_>>();
+        inner.known_body_keys.extend(body_keys);
         inner.current_resolver = current_resolver.map(Arc::new);
 
         if let Some(resolver) = generation_resolver {
@@ -545,6 +596,9 @@ impl ProviderCredentialState {
             child_env,
             dynamic_credentials,
         });
+        inner.body_inventory_available = true;
+        let body_keys = inner.current.child_env.keys().cloned().collect::<Vec<_>>();
+        inner.known_body_keys.extend(body_keys);
         inner.current_resolver = current_resolver.map(Arc::new);
         if static_credential_identities(&inner.static_credential_bindings)
             != static_credential_identities(&static_credential_bindings)
@@ -606,6 +660,7 @@ impl ProviderCredentialState {
         inner.combined_resolver = None;
         inner.non_secret_environment_keys.clear();
         inner.static_credential_bindings.clear();
+        inner.body_inventory_available = false;
     }
 }
 
@@ -798,6 +853,161 @@ fn merge_resolvers(
 mod tests {
     use super::*;
     use crate::google_cloud;
+
+    #[test]
+    fn body_classification_distinguishes_literal_foreign_bound_and_revoked() {
+        use crate::secrets::body::BodyCredentialError;
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([("API_KEY".into(), "test-secret".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                binding("api.github.com", 443, "/allowed/**"),
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let token = state.snapshot().child_env["API_KEY"].clone();
+        for (host, port, path) in [
+            ("api.openai.com", 443, "/v1/responses"),
+            ("api.github.com", 443, "/allowed/foo"),
+            ("api.github.com", 444, "/allowed/foo"),
+            ("api.github.com", 443, "/other"),
+        ] {
+            let (_, classifier, _) =
+                state.resolver_and_body_classifier_for_endpoint(host, port, path);
+            let classifier = classifier.unwrap();
+            assert_eq!(classifier.check(&token), Ok(()));
+            assert_eq!(
+                classifier.check("sk-OPENSHELL-RESOLVE-ENV-v42_API_KEY"),
+                Ok(())
+            );
+            assert_eq!(classifier.check("openshell:resolve:env:KEY"), Ok(()));
+            assert_eq!(classifier.check("sk-OPENSHELL-RESOLVE-ENV-KEY"), Ok(()));
+            assert_eq!(
+                classifier.check("openshell:resolve:env:v999_API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+            assert_eq!(
+                classifier.check("openshell:resolve:env:API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+            assert_eq!(
+                classifier.check("openshell:resolve:env:sbroken_API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+        }
+        let (_, classifier, _) =
+            state.resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo");
+        assert_eq!(classifier.unwrap().check(&token), Ok(()));
+        assert_eq!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo")
+                .1
+                .unwrap()
+                .check("sk-OPENSHELL-RESOLVE-ENV-v42_API_KEY"),
+            Ok(())
+        );
+        state.revoke_static_provider_environment(43);
+        assert!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+                .1
+                .is_none()
+        );
+        state
+            .install_bound_environment(
+                44,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            )
+            .unwrap();
+        let classifier = state
+            .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+            .1
+            .unwrap();
+        assert_eq!(
+            classifier.check(&token),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+        assert_eq!(classifier.check("openshell:resolve:env:KEY"), Ok(()));
+    }
+
+    #[test]
+    fn body_classification_rejects_expired_invalid_and_replaced_credentials() {
+        use crate::secrets::body::BodyCredentialError;
+        for (value, expires) in [("secret", 1), ("bad\r\nvalue", 0)] {
+            let state = ProviderCredentialState::from_bound_environment(
+                42,
+                HashMap::from([("API_KEY".into(), value.into())]),
+                HashMap::from([("API_KEY".into(), expires)]),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.github.com", 443, "/**"))]),
+                vec![],
+            )
+            .unwrap();
+            let token = state.snapshot().child_env["API_KEY"].clone();
+            for host in ["api.openai.com", "api.github.com"] {
+                let classifier = state
+                    .resolver_and_body_classifier_for_endpoint(host, 443, "/")
+                    .1
+                    .unwrap();
+                assert_eq!(
+                    classifier.check(&token),
+                    Err(BodyCredentialError::KnownUnavailable)
+                );
+            }
+        }
+        let handle = "a".repeat(64);
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([("API_KEY".into(), "secret".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                stable_binding("api.github.com", 443, "/**", &handle),
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let token = state.snapshot().child_env["API_KEY"].clone();
+        let classifier = state
+            .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+            .1
+            .unwrap();
+        assert_eq!(classifier.check(&token), Ok(()));
+        assert_eq!(
+            classifier.check(&token.replace(&handle, &"b".repeat(64))),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+        state
+            .install_bound_environment(
+                43,
+                HashMap::from([("API_KEY".into(), "new-secret".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".into(),
+                    stable_binding("api.github.com", 443, "/**", &"b".repeat(64)),
+                )]),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+                .1
+                .unwrap()
+                .check(&token),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+    }
 
     fn binding(host: &str, port: u32, path: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {

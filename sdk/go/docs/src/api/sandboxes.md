@@ -57,17 +57,26 @@ fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 
 ## List
 
-Lists sandboxes with optional pagination and label filtering.
+`List` constructs a lazy pager; `NextPage` fetches one page at a time.
+`PageSize` controls each request, and `ListAll` explicitly exhausts the pager.
 
 ```go
 // List all sandboxes
-sandboxes, err := client.Sandboxes().List(ctx, "default")
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default")
 
-// With pagination and label filtering
-sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
-    Limit:         10,
-    Offset:        0,
+// Process one page at a time
+pages, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 10})
+page, err := pages.NextPage(ctx)
+
+// With a page size and label filtering
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default", v1.ListOptions{
+    PageSize:      10,
     LabelSelector: "team=platform",
+})
+
+// Platform Admin only: list across all workspaces
+allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
 })
 ```
 

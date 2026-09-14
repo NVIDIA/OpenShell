@@ -24,7 +24,7 @@ use openshell_core::proto::{
     SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
-    ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
+    ActivityId, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder, OcsfEvent,
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -55,7 +55,7 @@ fn ocsf_gateway_endpoint(endpoint: &str) -> Endpoint {
 }
 
 fn session_established_event(
-    ctx: &SandboxContext,
+    ctx: &EventContext,
     endpoint: &str,
     session_id: &str,
     heartbeat_secs: u32,
@@ -71,7 +71,7 @@ fn session_established_event(
         .build()
 }
 
-fn session_closed_event(ctx: &SandboxContext, endpoint: &str, sandbox_id: &str) -> OcsfEvent {
+fn session_closed_event(ctx: &EventContext, endpoint: &str, sandbox_id: &str) -> OcsfEvent {
     NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Close)
         .severity(SeverityId::Informational)
@@ -82,7 +82,7 @@ fn session_closed_event(ctx: &SandboxContext, endpoint: &str, sandbox_id: &str) 
 }
 
 fn session_failed_event(
-    ctx: &SandboxContext,
+    ctx: &EventContext,
     endpoint: &str,
     attempt: u64,
     error: &str,
@@ -139,7 +139,7 @@ fn relay_target_message(
 }
 
 fn relay_open_event(
-    ctx: &SandboxContext,
+    ctx: &EventContext,
     open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
 ) -> OcsfEvent {
@@ -157,7 +157,7 @@ fn relay_open_event(
 }
 
 fn relay_closed_event(
-    ctx: &SandboxContext,
+    ctx: &EventContext,
     open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
 ) -> OcsfEvent {
@@ -175,7 +175,7 @@ fn relay_closed_event(
 }
 
 fn relay_failed_event(
-    ctx: &SandboxContext,
+    ctx: &EventContext,
     open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
     error: &str,
@@ -196,11 +196,7 @@ fn relay_failed_event(
     builder.build()
 }
 
-fn relay_close_from_gateway_event(
-    ctx: &SandboxContext,
-    channel_id: &str,
-    reason: &str,
-) -> OcsfEvent {
+fn relay_close_from_gateway_event(ctx: &EventContext, channel_id: &str, reason: &str) -> OcsfEvent {
     NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Close)
         .severity(SeverityId::Informational)
@@ -895,8 +891,8 @@ mod target_tests {
 mod ocsf_event_tests {
     use super::*;
 
-    fn ctx() -> SandboxContext {
-        SandboxContext {
+    fn ctx() -> EventContext {
+        EventContext {
             sandbox_id: "sbx-1".into(),
             sandbox_name: "sandbox".into(),
             container_image: "img".into(),

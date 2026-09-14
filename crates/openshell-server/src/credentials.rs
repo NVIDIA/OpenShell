@@ -30,7 +30,7 @@ use openshell_core::proto::credentials::v1::{
     GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
     ResolvedCredential, StoreCredentialRequest, credential_driver_client::CredentialDriverClient,
 };
-use openshell_core::proto::{CredentialHandle, Provider, StoredRefreshMaterialDeletion};
+use openshell_core::proto::{CredentialHandle, Provider};
 use openshell_core::{Config, Error, Result as CoreResult};
 use openshell_driver_db_credstore::{
     CredentialObjectWrite, DbCredstoreCredentialDriver, DbCredstoreObjectStore,
@@ -51,6 +51,7 @@ use tower::service_fn;
 use tracing::warn;
 
 use crate::persistence::{PersistenceError, Store, WriteCondition};
+use crate::storage_proto::StoredRefreshMaterialDeletion;
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;

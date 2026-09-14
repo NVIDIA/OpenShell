@@ -76,6 +76,31 @@ if err != nil {
 fmt.Println(string(result.Stdout))
 ```
 
+### Pagination
+
+List methods return a lazy pager without issuing a request. `NextPage` fetches
+one page with the supplied context, while `ListAll` explicitly exhausts every
+page. `PageSize` is a per-request maximum and `PageToken` resumes a prior query.
+
+```go
+pager, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 100})
+if err != nil {
+    log.Fatal(err)
+}
+for {
+    page, err := pager.NextPage(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if page == nil {
+        break
+    }
+    for _, sandbox := range page.Items {
+        fmt.Println(sandbox.Name)
+    }
+}
+```
+
 ### With automatic token refresh
 
 For OIDC gateways, use `RefreshableToken` to wrap any `oauth2.TokenSource` with

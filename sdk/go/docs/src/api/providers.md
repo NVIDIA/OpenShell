@@ -42,11 +42,12 @@ fmt.Println("Provider type:", provider.Type)
 
 ## List
 
-List all registered providers, with optional pagination.
+`List` returns a lazy pager over registered providers. `ListAll` follows every
+continuation token; `PageSize` controls each request.
 
 ```go
 // List all providers
-providers, err := client.Providers().List(ctx, "default")
+providers, err := client.Providers().ListAll(ctx, "default")
 if err != nil {
     log.Fatal(err)
 }
@@ -54,10 +55,14 @@ for _, p := range providers {
     fmt.Println(p.Name, p.Type)
 }
 
-// With pagination
-providers, err = client.Providers().List(ctx, "default", v1.ListOptions{
-    Limit:  10,
-    Offset: 0,
+// With a smaller page size
+providers, err = client.Providers().ListAll(ctx, "default", v1.ListOptions{
+    PageSize: 10,
+})
+
+// Platform Admin only: list across all workspaces
+allProviders, err := client.Providers().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
 })
 ```
 

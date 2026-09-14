@@ -877,13 +877,13 @@ enum ProviderCommands {
     /// List providers.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Maximum number of providers to return.
+        /// Maximum number of providers to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Offset into the provider list.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// Print only provider names, one per line.
         #[arg(long, conflicts_with = "output")]
@@ -1440,13 +1440,13 @@ enum SandboxCommands {
     /// List sandboxes.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Maximum number of sandboxes to return.
+        /// Maximum number of sandboxes to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Offset into the sandbox list.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// Print only sandbox ids (one per line).
         #[arg(long, conflicts_with_all = ["names", "output"])]
@@ -1744,13 +1744,13 @@ enum SandboxTemplateCommands {
     /// List sandbox workload templates.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Maximum number of templates to return.
+        /// Maximum number of templates to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Offset into the template list.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// Filter templates by labels, e.g. env=prod,team=runtime.
         #[arg(long)]
@@ -1958,9 +1958,13 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Maximum number of revisions to return.
+        /// Maximum number of revisions to return in this page.
         #[arg(long, default_value_t = 20)]
-        limit: u32,
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// List global policy revisions.
         #[arg(long)]
@@ -2128,13 +2132,13 @@ enum ServiceCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         sandbox: Option<String>,
 
-        /// Maximum number of endpoints to return.
+        /// Maximum number of endpoints to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Number of endpoints to skip.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// List services across all workspaces (overrides --workspace).
         #[arg(long)]
@@ -2193,13 +2197,13 @@ enum WorkspaceCommands {
     /// List workspaces.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Maximum number of workspaces to return.
+        /// Maximum number of workspaces to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Offset into the workspace list.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// Filter by label selector (e.g. "env=staging").
         #[arg(long)]
@@ -2260,13 +2264,13 @@ enum WorkspaceMemberCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
         workspace: String,
 
-        /// Maximum number of members to return.
+        /// Maximum number of members to return in this page.
         #[arg(long, default_value_t = 100)]
-        limit: u32,
+        page_size: i32,
 
-        /// Offset into the member list.
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
@@ -2665,16 +2669,16 @@ async fn run_async() -> Result<()> {
                 }
                 ServiceCommands::List {
                     sandbox,
-                    limit,
-                    offset,
+                    page_size,
+                    page_token,
                     all_workspaces,
                     output,
                 } => {
                     run::service_list(
                         &ctx.endpoint,
                         sandbox.as_deref(),
-                        limit,
-                        offset,
+                        page_size,
+                        &page_token,
                         &cli.workspace,
                         all_workspaces,
                         output.as_str(),
@@ -2839,14 +2843,16 @@ async fn run_async() -> Result<()> {
                 }
                 PolicyCommands::List {
                     name,
-                    limit,
+                    page_size,
+                    page_token,
                     global,
                     output,
                 } => {
                     if global {
                         run::sandbox_policy_list_global(
                             &ctx.endpoint,
-                            limit,
+                            page_size,
+                            &page_token,
                             output.as_str(),
                             &cli.workspace,
                             &tls,
@@ -2857,7 +2863,8 @@ async fn run_async() -> Result<()> {
                         run::sandbox_policy_list(
                             &ctx.endpoint,
                             &name,
-                            limit,
+                            page_size,
+                            &page_token,
                             output.as_str(),
                             &cli.workspace,
                             &tls,
@@ -3232,8 +3239,8 @@ async fn run_async() -> Result<()> {
                             .await?;
                         }
                         SandboxCommands::List {
-                            limit,
-                            offset,
+                            page_size,
+                            page_token,
                             ids,
                             names,
                             selector,
@@ -3242,8 +3249,8 @@ async fn run_async() -> Result<()> {
                         } => {
                             run::sandbox_list(
                                 endpoint,
-                                limit,
-                                offset,
+                                page_size,
+                                &page_token,
                                 ids,
                                 names,
                                 selector.as_deref(),
@@ -3423,8 +3430,8 @@ async fn run_async() -> Result<()> {
                                 .await?;
                             }
                             SandboxTemplateCommands::List {
-                                limit,
-                                offset,
+                                page_size,
+                                page_token,
                                 label_selector,
                                 names,
                                 output,
@@ -3432,8 +3439,8 @@ async fn run_async() -> Result<()> {
                             } => {
                                 run::sandbox_template_list(
                                     endpoint,
-                                    limit,
-                                    offset,
+                                    page_size,
+                                    &page_token,
                                     label_selector.as_deref(),
                                     names,
                                     output.as_str(),
@@ -3477,15 +3484,15 @@ async fn run_async() -> Result<()> {
                     run::workspace_get(endpoint, &name, &tls).await?;
                 }
                 WorkspaceCommands::List {
-                    limit,
-                    offset,
+                    page_size,
+                    page_token,
                     label_selector,
                     output,
                 } => {
                     run::workspace_list(
                         endpoint,
-                        limit,
-                        offset,
+                        page_size,
+                        &page_token,
                         label_selector.as_deref().unwrap_or(""),
                         output.as_str(),
                         &tls,
@@ -3509,15 +3516,15 @@ async fn run_async() -> Result<()> {
                     }
                     WorkspaceMemberCommands::List {
                         workspace,
-                        limit,
-                        offset,
+                        page_size,
+                        page_token,
                         output,
                     } => {
                         run::workspace_member_list(
                             endpoint,
                             &workspace,
-                            limit,
-                            offset,
+                            page_size,
+                            &page_token,
                             output.as_str(),
                             &tls,
                         )
@@ -3642,16 +3649,16 @@ async fn run_async() -> Result<()> {
                     run::provider_get(endpoint, &name, &cli.workspace, &tls).await?;
                 }
                 ProviderCommands::List {
-                    limit,
-                    offset,
+                    page_size,
+                    page_token,
                     names,
                     output,
                     all_workspaces,
                 } => {
                     run::provider_list(
                         endpoint,
-                        limit,
-                        offset,
+                        page_size,
+                        &page_token,
                         names,
                         output.as_str(),
                         &cli.workspace,
@@ -5742,10 +5749,10 @@ mod tests {
             "--all-workspaces",
             "--label-selector",
             "team=runtime",
-            "--limit",
+            "--page-size",
             "25",
-            "--offset",
-            "5",
+            "--page-token",
+            "next-template-page",
         ])
         .expect("sandbox template list should parse");
 
@@ -5753,8 +5760,8 @@ mod tests {
             Some(Commands::Sandbox {
                 command:
                     Some(SandboxCommands::Template(SandboxTemplateCommands::List {
-                        limit,
-                        offset,
+                        page_size,
+                        page_token,
                         label_selector,
                         names,
                         all_workspaces,
@@ -5762,8 +5769,8 @@ mod tests {
                     })),
                 ..
             }) => {
-                assert_eq!(limit, 25);
-                assert_eq!(offset, 5);
+                assert_eq!(page_size, 25);
+                assert_eq!(page_token, "next-template-page");
                 assert_eq!(label_selector.as_deref(), Some("team=runtime"));
                 assert!(names);
                 assert!(all_workspaces);
@@ -6014,10 +6021,10 @@ mod tests {
             "service",
             "list",
             "my-sandbox",
-            "--limit",
+            "--page-size",
             "10",
-            "--offset",
-            "2",
+            "--page-token",
+            "next-service-page",
         ])
         .expect("service list should parse optional sandbox and paging");
 
@@ -6026,14 +6033,14 @@ mod tests {
                 command:
                     Some(ServiceCommands::List {
                         sandbox,
-                        limit,
-                        offset,
+                        page_size,
+                        page_token,
                         ..
                     }),
             }) => {
                 assert_eq!(sandbox.as_deref(), Some("my-sandbox"));
-                assert_eq!(limit, 10);
-                assert_eq!(offset, 2);
+                assert_eq!(page_size, 10);
+                assert_eq!(page_token, "next-service-page");
             }
             other => panic!("expected service list command, got: {other:?}"),
         }
@@ -6046,14 +6053,14 @@ mod tests {
                 command:
                     Some(ServiceCommands::List {
                         sandbox,
-                        limit,
-                        offset,
+                        page_size,
+                        page_token,
                         ..
                     }),
             }) => {
                 assert_eq!(sandbox, None);
-                assert_eq!(limit, 100);
-                assert_eq!(offset, 0);
+                assert_eq!(page_size, 100);
+                assert!(page_token.is_empty());
             }
             other => panic!("expected service list command, got: {other:?}"),
         }

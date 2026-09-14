@@ -38,7 +38,7 @@ use openshell_core::PolicyValidationFailureMode;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId,
+    DetectionFindingBuilder, DispositionId, EventContext, FindingInfo, OcsfEvent, SeverityId,
     StateId, StatusId, ocsf_emit,
 };
 
@@ -142,7 +142,7 @@ pub async fn run_sandbox(
             |s| s.trim().to_string(),
         );
 
-        if !openshell_ocsf::ctx::set_ctx(SandboxContext {
+        if !openshell_ocsf::ctx::set_ctx(EventContext {
             sandbox_id: sandbox_id.clone().unwrap_or_default(),
             sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
             container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),

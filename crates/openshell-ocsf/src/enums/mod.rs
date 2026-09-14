@@ -6,6 +6,7 @@
 mod action;
 mod activity;
 mod auth;
+mod device_type;
 mod disposition;
 mod http_method;
 mod launch;
@@ -16,6 +17,7 @@ mod status;
 pub use action::ActionId;
 pub use activity::ActivityId;
 pub use auth::AuthTypeId;
+pub use device_type::DeviceTypeId;
 pub use disposition::DispositionId;
 pub use http_method::HttpMethod;
 pub use launch::LaunchTypeId;

@@ -51,7 +51,7 @@ pub enum SidecarExitReport {
     },
 }
 
-fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
+fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
     openshell_ocsf::ctx::ctx()
 }
 

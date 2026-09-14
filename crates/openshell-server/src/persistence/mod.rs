@@ -6,7 +6,7 @@
 mod postgres;
 mod sqlite;
 
-pub use openshell_core::proto::{
+pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
 
@@ -45,6 +45,8 @@ pub enum PersistenceError {
     Decode(String),
     #[error("encode error: {0}")]
     Encode(String),
+    #[error("pagination error: {0}")]
+    Pagination(String),
     #[error("unique violation{constraint_msg}")]
     UniqueViolation {
         constraint: Option<String>,
@@ -109,9 +111,8 @@ pub struct ObjectRecord {
 
 /// Stable position in the global object-listing order.
 ///
-/// Keyset consumers must use the matching store method for the order encoded
-/// here: workspace-scoped lists use `created_at_ms`, `name`, and `id`; global
-/// lists additionally include `workspace`.
+/// Keyset consumers must use the matching store method for the total
+/// `(created_at_ms, name, workspace, id)` order encoded here.
 #[derive(Debug, Clone)]
 pub struct ObjectCursor {
     pub created_at_ms: i64,
@@ -130,6 +131,44 @@ impl From<&ObjectRecord> for ObjectCursor {
         }
     }
 }
+
+/// Filters supported by the shared object-store keyset pager.
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectListQuery<'a> {
+    Workspace(&'a str),
+    AllWorkspaces,
+    Scope(&'a str),
+    WorkspaceSelector {
+        workspace: &'a str,
+        label_selector: &'a str,
+    },
+    AllWorkspacesSelector(&'a str),
+    Membership {
+        member_type: &'a str,
+        member_name: &'a str,
+    },
+    MembershipSelector {
+        member_type: &'a str,
+        member_name: &'a str,
+        label_selector: &'a str,
+    },
+}
+
+/// One keyset page of raw object records.
+#[derive(Debug)]
+pub struct ObjectPage {
+    pub records: Vec<ObjectRecord>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+/// One keyset page of decoded protobuf messages.
+#[derive(Debug)]
+pub struct MessagePage<T> {
+    pub messages: Vec<T>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+const FULL_SCAN_PAGE_SIZE: u32 = 1000;
 
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
@@ -162,8 +201,9 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-// Import object metadata accessor traits from openshell-core
-// (implementations for all proto types are in openshell-core::metadata)
+// Import object metadata accessor traits from openshell-core. Implementations
+// for public resource types live there; private storage types implement them
+// in crate::storage_proto.
 pub use openshell_core::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
@@ -616,6 +656,109 @@ impl Store {
         limit: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         store_dispatch_traced!(self.list_by_type_after(object_type, after, limit))
+    }
+
+    /// Return one keyset page for an explicit query shape.
+    ///
+    /// The page is ordered by the immutable total key
+    /// `(created_at_ms, name, workspace, id)`. `next_cursor` is present only
+    /// when another page exists.
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<ObjectPage> {
+        if page_size == 0 {
+            return Err(PersistenceError::Pagination(
+                "page size must be greater than zero".into(),
+            ));
+        }
+        let fetch_size = page_size.checked_add(1).ok_or_else(|| {
+            PersistenceError::Pagination("page size overflow while probing next page".into())
+        })?;
+        let mut records = match self {
+            Self::Postgres(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+        }?;
+        let has_more = records.len()
+            > usize::try_from(page_size)
+                .map_err(|_| PersistenceError::Pagination("page size does not fit usize".into()))?;
+        if has_more {
+            records.truncate(usize::try_from(page_size).map_err(|_| {
+                PersistenceError::Pagination("page size does not fit usize".into())
+            })?);
+        }
+        let next_cursor = if has_more {
+            records.last().map(ObjectCursor::from)
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    /// Return one decoded keyset page and hydrate every resource version.
+    pub async fn list_message_page<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<MessagePage<T>> {
+        let page = self
+            .list_object_page(T::object_type(), query, after, page_size)
+            .await?;
+        Ok(MessagePage {
+            messages: page
+                .records
+                .into_iter()
+                .map(decode_record)
+                .collect::<PersistenceResult<Vec<T>>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// Exhaust every keyset page and return all matching raw records.
+    pub async fn collect_records(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_object_page(object_type, query, cursor.as_ref(), FULL_SCAN_PAGE_SIZE)
+                .await?;
+            records.extend(page.records);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(records);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    /// Exhaust every keyset page and return all matching decoded messages.
+    ///
+    /// Database and protobuf decode failures abort the operation; no partial
+    /// result is returned.
+    pub async fn collect_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<T>> {
+        let records = self.collect_records(T::object_type(), query).await?;
+        records.into_iter().map(decode_record).collect()
     }
 
     /// List objects by type and application-owned scope.

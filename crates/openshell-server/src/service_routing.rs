@@ -13,9 +13,9 @@ use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
 use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
-    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, HttpActivityBuilder,
-    HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OCSF_TARGET, OcsfEvent,
-    SandboxContext, SeverityId, StateId, StatusId, Url as OcsfUrl,
+    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
+    HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
+    OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -760,8 +760,8 @@ fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
     );
 }
 
-fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
-    SandboxContext {
+fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "openshell/gateway".to_string(),

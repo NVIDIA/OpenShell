@@ -542,7 +542,7 @@ Return to Step 2. Continue monitoring logs and refining the policy until all req
 View all revisions to understand how the policy evolved:
 
 ```bash
-openshell policy list dev --limit 50
+openshell policy list dev --page-size 50
 openshell policy list dev --output json
 ```
 

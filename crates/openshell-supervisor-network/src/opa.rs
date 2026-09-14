@@ -13,7 +13,7 @@ use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
-use openshell_policy::L7ConfigStanza;
+use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -446,6 +446,7 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
         inject_runtime_policy_data(&mut data, require_binary_identity);
+        normalize_endpoint_protocols(&mut data);
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
@@ -1387,6 +1388,7 @@ fn preprocess_yaml_data(
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_endpoint_protocols(&mut data);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
     normalize_endpoint_ports(&mut data);
@@ -1434,6 +1436,57 @@ fn preprocess_yaml_data(
     emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+}
+
+/// Canonicalize recognized protocol spellings before L7 validation or Rego use.
+///
+/// Rust parses protocol names case-insensitively, while Rego compares stable
+/// wire keys. Publishing one canonical spelling keeps rule validation, typed
+/// routing, and authorization on the same protocol branch.
+fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for policy in policies.values_mut() {
+        let Some(endpoints) = policy
+            .get_mut("endpoints")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for endpoint in endpoints {
+            let Some(endpoint) = endpoint.as_object_mut() else {
+                continue;
+            };
+            let Some(protocol) = endpoint.get("protocol").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let canonical = if protocol.eq_ignore_ascii_case("tcp") {
+                Some("tcp")
+            } else {
+                PolicyL7Protocol::parse(protocol).map(|protocol| match protocol {
+                    PolicyL7Protocol::Rest => "rest",
+                    PolicyL7Protocol::Websocket => "websocket",
+                    PolicyL7Protocol::Graphql => "graphql",
+                    PolicyL7Protocol::Sql => "sql",
+                    PolicyL7Protocol::JsonRpc => "json-rpc",
+                    PolicyL7Protocol::Mcp => "mcp",
+                })
+            };
+            if let Some(canonical) = canonical {
+                endpoint.insert(
+                    "protocol".to_string(),
+                    serde_json::Value::String(canonical.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Normalize endpoint port/ports in JSON data.
@@ -1547,6 +1600,9 @@ fn normalize_l7_config_alias(
     };
     if config.is_null() {
         ep.remove(key);
+        if stanza == L7ConfigStanza::Mcp {
+            errors.push(format!("{loc}.{key}: mcp config must be an object"));
+        }
         return;
     }
     match openshell_policy::l7_config_alias_runtime_fields(stanza, config) {
@@ -2132,17 +2188,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .binaries
                 .iter()
                 .flat_map(|b| {
-                    // The deprecated harness bit is ignored by policy YAML, but
-                    // advisor-generated proposals use it as internal provenance.
-                    #[allow(deprecated)]
-                    let advisor_proposed = b.harness;
-                    let binary_entry = |path: &str| {
-                        let mut entry = serde_json::json!({"path": path});
-                        if advisor_proposed {
-                            entry["advisor_proposed"] = true.into();
-                        }
-                        entry
-                    };
+                    let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
                     match resolve_binary_in_container(&b.path, entrypoint_pid) {
                         BinaryResolution::Resolved(resolved) => {
@@ -2284,7 +2330,6 @@ mod tests {
                 ],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2299,7 +2344,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/glab".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2343,7 +2387,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3396,7 +3439,6 @@ process:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3934,7 +3976,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4006,7 +4047,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4083,7 +4123,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5026,6 +5065,198 @@ network_policies:
         );
     }
 
+    const PROTOCOL_NAME_CASES: [(&str, &str); 7] = [
+        ("tcp", "TcP"),
+        ("rest", "ReSt"),
+        ("websocket", "WeBsOcKeT"),
+        ("graphql", "GrApHqL"),
+        ("sql", "SqL"),
+        ("json-rpc", "JsOn-RpC"),
+        ("mcp", "McP"),
+    ];
+
+    fn assert_loaded_protocol_name(engine: &OpaEngine, authored: &str, canonical: &str) {
+        // Inspect stored data before typed parsing, which accepts mixed case and
+        // would otherwise hide a missing normalization step in either loader.
+        let data = engine.engine.lock().expect("OPA engine lock").get_data();
+        assert_eq!(
+            data["network_policies"]["protocol_names"]["endpoints"][0]["protocol"],
+            regorus::Value::from(canonical),
+            "stored protocol for {authored}"
+        );
+
+        let input = NetworkInput {
+            host: "protocol.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("endpoint query");
+        if canonical == "tcp" {
+            // TCP remains an L4 endpoint; canonical spelling must not opt it
+            // into request inspection or change its network-level allowance.
+            assert!(config.is_none(), "TCP must not return L7 configuration");
+            assert!(matches!(
+                engine
+                    .evaluate_network_action(&input)
+                    .expect("network query"),
+                NetworkAction::Allow { .. }
+            ));
+        } else {
+            let config = config.expect("L7 endpoint configuration");
+            assert_eq!(
+                config["protocol"],
+                regorus::Value::from(canonical),
+                "published endpoint protocol for {authored}"
+            );
+            crate::l7::parse_l7_config(&config).expect("valid typed L7 configuration");
+        }
+    }
+
+    #[test]
+    fn protocol_names_yaml_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let fields = match canonical {
+                "tcp" => "",
+                "rest" | "websocket" => {
+                    "enforcement: enforce\n        rules: [{allow: {method: GET, path: /status}}]"
+                }
+                "graphql" => {
+                    "enforcement: enforce\n        rules: [{allow: {operation_type: query, fields: [viewer]}}]"
+                }
+                // SQL inspection supports audit mode, not enforce mode.
+                "sql" => "enforcement: audit\n        rules: [{allow: {command: SELECT}}]",
+                "json-rpc" => "enforcement: enforce\n        rules: [{allow: {method: status}}]",
+                "mcp" => "enforcement: enforce\n        rules: [{allow: {method: tools/list}}]",
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let yaml = format!(
+                    r#"
+network_policies:
+  protocol_names:
+    name: protocol_names
+    endpoints:
+      - host: protocol.example.com
+        port: 443
+        protocol: {authored}
+        {fields}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+                );
+                let engine = OpaEngine::from_strings(TEST_POLICY, &yaml)
+                    .unwrap_or_else(|error| panic!("valid YAML protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_proto_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let allow = match canonical {
+                "tcp" => None,
+                "rest" | "websocket" => Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/status".into(),
+                    ..Default::default()
+                }),
+                "graphql" => Some(L7Allow {
+                    operation_type: "query".into(),
+                    fields: vec!["viewer".into()],
+                    ..Default::default()
+                }),
+                "sql" => Some(L7Allow {
+                    command: "SELECT".into(),
+                    ..Default::default()
+                }),
+                "json-rpc" | "mcp" => Some(L7Allow {
+                    method: if canonical == "mcp" {
+                        "tools/list"
+                    } else {
+                        "status"
+                    }
+                    .into(),
+                    ..Default::default()
+                }),
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let mut policy = openshell_policy::restrictive_default_policy();
+                policy.network_policies.insert(
+                    "protocol_names".into(),
+                    NetworkPolicyRule {
+                        name: "protocol_names".into(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "protocol.example.com".into(),
+                            port: 443,
+                            protocol: authored.clone(),
+                            // TCP has no L7 settings; SQL only supports audit.
+                            enforcement: match canonical {
+                                "tcp" => "",
+                                "sql" => "audit",
+                                _ => "enforce",
+                            }
+                            .into(),
+                            rules: allow
+                                .clone()
+                                .map(|allow| L7Rule { allow: Some(allow) })
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".into(),
+                        }],
+                    },
+                );
+                let engine = OpaEngine::from_proto(&policy)
+                    .unwrap_or_else(|error| panic!("valid protobuf protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_normalization_preserves_other_data_and_is_idempotent() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "first": {
+                    "endpoints": [
+                        {"protocol": "ReSt", "path": "/KeepCase", "host": "KeepCase.example"},
+                        {"protocol": "FutureProtocol"},
+                        {"protocol": ""},
+                        {"protocol": null},
+                        {"protocol": 42},
+                        {"host": "no-protocol.example"}
+                    ]
+                },
+                "second": {"endpoints": [{"protocol": "JsOn-RpC"}]}
+            }
+        });
+        let mut expected = data.clone();
+        expected["network_policies"]["first"]["endpoints"][0]["protocol"] = "rest".into();
+        expected["network_policies"]["second"]["endpoints"][0]["protocol"] = "json-rpc".into();
+
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "only recognized protocol names may change");
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "normalization must be idempotent");
+    }
+
     #[test]
     fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
         let data = r#"
@@ -5057,7 +5288,55 @@ network_policies:
             .expect("expected MCP endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
 
+        let config_json: serde_json::Value = serde_json::from_str(
+            &config
+                .to_json_str()
+                .expect("endpoint config must serialize as JSON"),
+        )
+        .expect("endpoint config must be valid JSON");
+        assert_eq!(
+            config_json["protocol"],
+            serde_json::json!("mcp"),
+            "OPA data must use the canonical protocol key"
+        );
         assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/list")
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/call")
+        ));
+    }
+
+    #[test]
+    fn yaml_load_rejects_rest_shaped_rules_on_mixed_case_mcp_protocol() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: POST
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("mixed-case MCP must not bypass MCP rule validation");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mcp L7 rules must use method/tool, not path/query"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5129,6 +5408,40 @@ network_policies:
     }
 
     #[test]
+    fn yaml_load_rejects_null_mcp_config_before_defaulting() {
+        for mcp_fields in [
+            "mcp: null",
+            "mcp: null\n        mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        {mcp_fields}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("null MCP config must reject activation");
+            };
+            assert!(
+                error.to_string().contains("mcp config must be an object"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn yaml_load_rejects_mcp_versions_on_non_mcp_protocols() {
         for mcp_fields in [
             "mcp:\n          versions: [\"2025-11-25\"]",
@@ -5182,7 +5495,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5240,7 +5552,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5299,7 +5610,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5360,7 +5670,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/aws".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5420,7 +5729,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5551,7 +5859,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5566,7 +5873,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5607,6 +5913,13 @@ network_policies:
                 .query_endpoint_config(&input)
                 .expect("query endpoint config")
                 .expect("expected MCP endpoint config");
+            let config_json: serde_json::Value = serde_json::from_str(
+                &config
+                    .to_json_str()
+                    .expect("endpoint config must serialize as JSON"),
+            )
+            .expect("endpoint config must be valid JSON");
+            assert_eq!(config_json["protocol"], serde_json::json!("mcp"));
             let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
             assert_eq!(
                 l7.mcp_versions,
@@ -6793,64 +7106,6 @@ network_policies:
     }
 
     #[test]
-    fn exact_declared_endpoint_host_false_for_advisor_proposed_binary() {
-        let mut network_policies = std::collections::HashMap::new();
-        let mut proposal_binary = NetworkBinary {
-            path: "/usr/bin/curl".to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            proposal_binary.harness = true;
-        }
-        network_policies.insert(
-            "allow_mcp_internal_corp_example_com_8443".to_string(),
-            NetworkPolicyRule {
-                name: "allow_mcp_internal_corp_example_com_8443".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "mcp-internal.corp.example.com".to_string(),
-                    port: 8443,
-                    ..Default::default()
-                }],
-                binaries: vec![proposal_binary],
-            },
-        );
-        let proto = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(ProtoFs {
-                include_workdir: true,
-                read_only: vec![],
-                read_write: vec![],
-            }),
-            landlock: Some(openshell_core::proto::LandlockPolicy {
-                compatibility: "best_effort".to_string(),
-            }),
-            process: Some(ProtoProc {
-                run_as_user: "sandbox".to_string(),
-                run_as_group: "sandbox".to_string(),
-            }),
-            network_policies,
-            network_middlewares: std::collections::HashMap::default(),
-        };
-        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
-        let input = NetworkInput {
-            host: "mcp-internal.corp.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "advisor proposal should still allow at OPA L4"
-        );
-        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
-    }
-
-    #[test]
     fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -6866,7 +7121,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -6937,7 +7191,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7168,7 +7421,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8145,7 +8397,6 @@ network_policies:
                     .iter()
                     .map(|p| NetworkBinary {
                         path: p.to_str().unwrap().to_string(),
-                        ..Default::default()
                     })
                     .collect(),
             },
@@ -8205,7 +8456,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8279,7 +8529,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8486,7 +8735,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8777,10 +9025,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -8855,10 +9100,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {

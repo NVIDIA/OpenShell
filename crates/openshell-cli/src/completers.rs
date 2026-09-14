@@ -36,11 +36,12 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
         let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_sandboxes(ListSandboxesRequest {
-                limit: 200,
-                offset: 0,
+                page_size: 200,
+                page_token: String::new(),
                 label_selector: String::new(),
-                workspace: workspace_from_args(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace_from_args(),
+                )),
             })
             .await
             .ok()?;
@@ -62,10 +63,11 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
         let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_providers(ListProvidersRequest {
-                limit: 200,
-                offset: 0,
-                workspace: workspace_from_args(),
-                all_workspaces: false,
+                page_size: 200,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace_from_args(),
+                )),
             })
             .await
             .ok()?;
@@ -87,8 +89,8 @@ pub fn complete_workspace_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
         let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_workspaces(ListWorkspacesRequest {
-                limit: 200,
-                offset: 0,
+                page_size: 200,
+                page_token: String::new(),
                 label_selector: String::new(),
             })
             .await

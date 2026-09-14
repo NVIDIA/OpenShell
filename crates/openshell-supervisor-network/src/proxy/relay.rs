@@ -82,6 +82,7 @@ pub(super) fn http_context(
         secret_resolver,
         provider_credentials,
         provider_credential_revision: None,
+        body_classifier: None,
         activity_tx,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -353,6 +354,7 @@ mod tests {
             secret_resolver: None,
             provider_credentials: None,
             provider_credential_revision: None,
+            body_classifier: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,

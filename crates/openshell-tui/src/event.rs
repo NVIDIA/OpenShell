@@ -20,6 +20,10 @@ pub enum Event {
     Resize(u16, u16),
     /// A batch of log lines from the streaming log task.
     LogLines(Vec<LogLine>),
+    /// Completed workspace/provider/sandbox list refresh from a background task.
+    ListRefreshCompleted(crate::ListRefreshResult),
+    /// Completed per-sandbox draft-count refresh from a background task.
+    DraftCountsRefreshCompleted(crate::DraftCountsRefreshResult),
     /// Result of a create sandbox request: `Ok((name, workspace))` or `Err(message)`.
     CreateResult(Result<(String, String), String>),
     /// Result of creating a provider on the gateway: `Ok(name)` or `Err(message)`.

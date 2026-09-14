@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
-use openshell_core::proto::{ProviderProfile, StoredProviderProfile};
+use openshell_core::proto::ProviderProfile;
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
@@ -23,7 +23,8 @@ use sha2::{Digest, Sha256};
 use tonic::Status;
 use tracing::debug;
 
-use crate::persistence::{ObjectType, Store};
+use crate::persistence::{ObjectListQuery, ObjectType, Store};
+use crate::storage_proto::StoredProviderProfile;
 
 const BUILTIN_SOURCE_ID: &str = "builtin";
 const USER_SOURCE_ID: &str = "user";
@@ -129,8 +130,10 @@ impl ProviderProfileSource for UserProviderProfileSource {
         let mut hasher = Sha256::new();
         hasher.update(b"openshell-user-provider-profile-source-v1");
 
-        let platform_stored: Vec<StoredProviderProfile> =
-            store.list_messages("", 10_000, 0).await.map_err(|e| {
+        let platform_stored: Vec<StoredProviderProfile> = store
+            .collect_messages(ObjectListQuery::Workspace(""))
+            .await
+            .map_err(|e| {
                 Status::internal(format!("list platform provider profiles failed: {e}"))
             })?;
         for stored in platform_stored {
@@ -149,7 +152,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
 
         if !workspace.is_empty() {
             let ws_stored: Vec<StoredProviderProfile> = store
-                .list_messages(workspace, 10_000, 0)
+                .collect_messages(ObjectListQuery::Workspace(workspace))
                 .await
                 .map_err(|e| {
                     Status::internal(format!("list workspace provider profiles failed: {e}"))

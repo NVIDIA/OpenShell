@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ocsf-audit.yaml — sandbox policy for the MXC ETW -> OCSF audit-trail example.
+#
+# Minimal filesystem policy granting the workload folder read-write; everything
+# else is default-deny. run-ocsf-audit.ps1 copies this policy into the result
+# bundle and replaces the default grant with -ShareDir for that run.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/work/openshell-mxc-demo"

@@ -9,7 +9,10 @@
 //! and workspace-level role.
 
 use super::principal::Principal;
-use openshell_core::proto::WorkspaceRole as ProtoWorkspaceRole;
+use openshell_core::proto::{
+    WorkspaceRole as ProtoWorkspaceRole, WorkspaceSelector,
+    workspace_selector::Selection as WorkspaceSelection,
+};
 use tonic::Status;
 
 use crate::persistence::Store;
@@ -39,7 +42,7 @@ impl MinWorkspaceRole {
 /// Result of a successful workspace authorization check.
 #[derive(Debug)]
 pub struct AuthorizedWorkspace {
-    /// Resolved workspace name (empty string normalized to `"default"`).
+    /// Explicit workspace name selected by the caller.
     pub workspace: String,
     /// How the caller was authorized.
     pub grant: AuthGrant,
@@ -54,6 +57,75 @@ pub enum AuthGrant {
     Member(ProtoWorkspaceRole),
     /// Caller is a sandbox principal — scoped by JWT, no membership check.
     Sandbox,
+}
+
+/// Authorized scope for a request that supports one workspace or all workspaces.
+#[derive(Debug)]
+pub enum AuthorizedWorkspaceScope {
+    /// One explicitly named workspace.
+    Workspace(AuthorizedWorkspace),
+    /// All workspaces, authorized for a platform administrator.
+    AllWorkspaces,
+}
+
+/// Authorize the required named selector on a single-workspace request.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_workspace_selector(
+    store: &Store,
+    admin_role: &str,
+    principal: &Principal,
+    selector: Option<&WorkspaceSelector>,
+    min_role: MinWorkspaceRole,
+) -> Result<AuthorizedWorkspace, Status> {
+    let workspace = selected_workspace_name(selector)?;
+    authorize_workspace(store, admin_role, principal, workspace, min_role).await
+}
+
+/// Authorize a selector on a request that explicitly supports all workspaces.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_list_workspace_selector(
+    store: &Store,
+    admin_role: &str,
+    principal: &Principal,
+    selector: Option<&WorkspaceSelector>,
+    min_role: MinWorkspaceRole,
+) -> Result<AuthorizedWorkspaceScope, Status> {
+    match selected_workspace(selector)? {
+        WorkspaceSelection::Workspace(workspace) => {
+            authorize_workspace(store, admin_role, principal, workspace, min_role)
+                .await
+                .map(AuthorizedWorkspaceScope::Workspace)
+        }
+        WorkspaceSelection::AllWorkspaces(_) => {
+            require_platform_admin(admin_role, principal)?;
+            Ok(AuthorizedWorkspaceScope::AllWorkspaces)
+        }
+    }
+}
+
+/// Return the explicitly selected workspace name, rejecting missing, empty,
+/// or all-workspaces selections.
+#[allow(clippy::result_large_err)]
+pub fn selected_workspace_name(selector: Option<&WorkspaceSelector>) -> Result<&str, Status> {
+    match selected_workspace(selector)? {
+        WorkspaceSelection::Workspace(workspace) => Ok(workspace),
+        WorkspaceSelection::AllWorkspaces(_) => Err(Status::invalid_argument(
+            "all_workspaces is not supported by this request",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn selected_workspace(selector: Option<&WorkspaceSelector>) -> Result<&WorkspaceSelection, Status> {
+    let selection = selector
+        .and_then(|selector| selector.selection.as_ref())
+        .ok_or_else(|| Status::invalid_argument("workspace_scope is required"))?;
+
+    if let WorkspaceSelection::Workspace(workspace) = selection {
+        crate::grpc::workspace::validate_workspace_name(workspace)?;
+    }
+
+    Ok(selection)
 }
 
 /// Authorize a workspace-scoped operation for a user principal.
@@ -72,7 +144,7 @@ pub async fn authorize_workspace(
     workspace: &str,
     min_role: MinWorkspaceRole,
 ) -> Result<AuthorizedWorkspace, Status> {
-    let workspace = normalize_workspace(workspace);
+    let workspace = workspace.to_string();
 
     match principal {
         Principal::User(user) => {
@@ -183,14 +255,6 @@ fn role_satisfies(member_role: ProtoWorkspaceRole, min_role: MinWorkspaceRole) -
             ProtoWorkspaceRole::User | ProtoWorkspaceRole::Admin
         ),
         MinWorkspaceRole::Admin => member_role == ProtoWorkspaceRole::Admin,
-    }
-}
-
-fn normalize_workspace(workspace: &str) -> String {
-    if workspace.is_empty() {
-        "default".to_string()
-    } else {
-        workspace.to_string()
     }
 }
 
@@ -401,20 +465,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_workspace_normalizes_to_default() {
+    async fn empty_named_selector_is_rejected() {
         let store = test_store().await;
         add_member(&store, "default", "user-d", ProtoWorkspaceRole::User).await;
         let principal = user_principal("user-d", &["openshell-user"]);
-        let result = authorize_workspace(
+        let result = authorize_workspace_selector(
             &store,
             "openshell-admin",
             &principal,
-            "",
+            Some(&openshell_core::proto::workspace_selector("")),
             MinWorkspaceRole::User,
         )
         .await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().workspace, "default");
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "workspace name is required");
+    }
+
+    #[test]
+    fn missing_and_unset_selectors_are_rejected() {
+        let missing = selected_workspace_name(None).unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+        assert_eq!(missing.message(), "workspace_scope is required");
+
+        let unset = selected_workspace_name(Some(&WorkspaceSelector::default())).unwrap_err();
+        assert_eq!(unset.code(), tonic::Code::InvalidArgument);
+        assert_eq!(unset.message(), "workspace_scope is required");
+    }
+
+    #[test]
+    fn all_workspaces_is_rejected_for_single_workspace_requests() {
+        let err = selected_workspace_name(Some(&openshell_core::proto::all_workspaces_selector()))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "all_workspaces is not supported by this request"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_workspaces_requires_platform_admin() {
+        let store = test_store().await;
+        let selector = openshell_core::proto::all_workspaces_selector();
+        let principal = user_principal("workspace-user", &["openshell-user"]);
+        let err = authorize_list_workspace_selector(
+            &store,
+            "openshell-admin",
+            &principal,
+            Some(&selector),
+            MinWorkspaceRole::User,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let admin = user_principal("platform-admin", &["openshell-admin"]);
+        let authorized = authorize_list_workspace_selector(
+            &store,
+            "openshell-admin",
+            &admin,
+            Some(&selector),
+            MinWorkspaceRole::User,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            authorized,
+            AuthorizedWorkspaceScope::AllWorkspaces
+        ));
     }
 
     #[tokio::test]

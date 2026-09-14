@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "secrets_body.rs"]
+pub mod body;
+
 use crate::time::now_ms;
 use base64::Engine as _;
 use std::collections::{HashMap, HashSet};

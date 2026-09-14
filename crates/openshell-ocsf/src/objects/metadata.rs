@@ -18,7 +18,7 @@ pub struct Metadata {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
 
-    /// Unique event source identifier (sandbox ID).
+    /// Unique event identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
 

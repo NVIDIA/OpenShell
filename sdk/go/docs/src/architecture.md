@@ -76,7 +76,7 @@ exec := client.Exec()
 Some sub-clients have their own sub-clients. `ProviderInterface` exposes `Profiles()` and `Refresh()`:
 
 ```go
-profiles, err := client.Providers().Profiles().List(ctx, "default")
+profiles, err := client.Providers().Profiles().ListAll(ctx, "default")
 status, err := client.Providers().Refresh().GetStatus(ctx, "default", "openai", "api-key")
 ```
 

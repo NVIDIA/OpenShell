@@ -22,7 +22,7 @@
 #       - "host.openshell.internal:host-gateway"
 
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 # Bind to loopback only.  The Docker driver adds an extra listener on the
@@ -30,7 +30,7 @@ version = 1
 bind_address        = "127.0.0.1:8080"
 health_bind_address = "127.0.0.1:8081"
 log_level           = "info"
-compute_drivers     = ["docker"]
+compute_driver      = "docker"
 disable_tls         = true
 
 [openshell.drivers.docker]
@@ -40,12 +40,15 @@ default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # first start.  The binary is cached to XDG_DATA_HOME and reused on restart.
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 # Only pull images that are not already cached locally.
-image_pull_policy = "IfNotPresent"
-# Prefix applied to sandbox container names.
-sandbox_namespace = "openshell"
+image_pull_policy = "if_not_present"
+# Value assigned to the openshell.sandbox_namespace label on sandbox containers.
+sandbox_label     = "openshell"
 # Address sandbox containers use to call back to the gateway.
 # The Docker driver replaces the host with host.openshell.internal and the
 # port with the gateway's own bind port (8080).  Only the scheme survives.
 # The gateway must be published on port 8080 on the Docker host so that
 # host.openshell.internal:8080 resolves to the gateway container.
 grpc_endpoint     = "http://host.openshell.internal:8080"
+# Explicit supervisor-compatible Docker default. Set RuntimeDefault or
+# Localhost/<profile> only when the daemon host has AppArmor available.
+app_armor_profile = "Unconfined"

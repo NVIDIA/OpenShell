@@ -82,7 +82,7 @@ if ! docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! openshell sandbox list --limit 1 >/dev/null 2>&1; then
+if ! openshell sandbox list --page-size 1 >/dev/null 2>&1; then
     printf 'The configured OpenShell gateway is not reachable.\n' >&2
     printf 'Start or select a Docker-backed gateway and try again.\n' >&2
     exit 1

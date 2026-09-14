@@ -90,12 +90,24 @@ func (c *fakeWorkspaceClient) Get(_ context.Context, name string) (*types.Worksp
 	return c.workspaceStore.Get("", name)
 }
 
-// List returns all workspaces. ListOptions are accepted for interface compatibility but filtering is not implemented.
-func (c *fakeWorkspaceClient) List(_ context.Context, _ ...v1.ListOptions) ([]*types.Workspace, error) {
+// List returns a lazy pager over workspaces.
+func (c *fakeWorkspaceClient) List(opts ...v1.ListOptions) (*v1.Pager[*types.Workspace], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return c.workspaceStore.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(c.workspaceStore.ListAll(), options.PageSize, options.PageToken)
+}
+
+func (c *fakeWorkspaceClient) ListAll(ctx context.Context, opts ...v1.ListOptions) ([]*types.Workspace, error) {
+	pager, err := c.List(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // Delete removes a workspace. Unlike the sandbox fake (which treats delete as
@@ -161,12 +173,24 @@ func (c *fakeWorkspaceClient) RemoveMember(_ context.Context, workspace, princip
 }
 
 // ListMembers returns all members for the workspace. ListOptions are accepted for interface compatibility but filtering is not implemented.
-func (c *fakeWorkspaceClient) ListMembers(_ context.Context, workspace string, _ ...v1.ListOptions) ([]*types.WorkspaceMember, error) {
+func (c *fakeWorkspaceClient) ListMembers(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.WorkspaceMember], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	if workspace == "" {
 		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
-	return c.memberStore.List(workspace), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(c.memberStore.List(workspace), options.PageSize, options.PageToken)
+}
+
+func (c *fakeWorkspaceClient) ListAllMembers(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.WorkspaceMember, error) {
+	pager, err := c.ListMembers(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }

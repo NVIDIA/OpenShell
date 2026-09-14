@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
-    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
+    map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -625,6 +626,103 @@ LIMIT $2 OFFSET $3
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        let mut sql = QueryBuilder::<Postgres>::new(
+            "SELECT o.object_type, o.id, o.name, o.workspace, o.payload, \
+             o.created_at_ms, o.updated_at_ms, o.labels, o.resource_version \
+             FROM objects o WHERE o.object_type = ",
+        );
+        sql.push_bind(object_type);
+
+        match query {
+            ObjectListQuery::Workspace(workspace) => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+            }
+            ObjectListQuery::AllWorkspaces => {}
+            ObjectListQuery::Scope(scope) => {
+                sql.push(" AND o.scope = ").push_bind(scope);
+            }
+            ObjectListQuery::WorkspaceSelector {
+                workspace,
+                label_selector,
+            } => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(" AND o.workspace = ")
+                    .push_bind(workspace)
+                    .push(" AND o.labels @> ")
+                    .push_bind(labels);
+            }
+            ObjectListQuery::AllWorkspacesSelector(label_selector) => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(" AND o.labels @> ").push_bind(labels);
+            }
+            ObjectListQuery::Membership {
+                member_type,
+                member_name,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+            }
+            ObjectListQuery::MembershipSelector {
+                member_type,
+                member_name,
+                label_selector,
+            } => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(") AND o.labels @> ")
+                .push_bind(labels);
+            }
+        }
+
+        if let Some(cursor) = after {
+            sql.push(" AND (o.created_at_ms, COALESCE(o.name, ''), o.workspace, o.id) > (")
+                .push_bind(cursor.created_at_ms)
+                .push(", ")
+                .push_bind(&cursor.name)
+                .push(", ")
+                .push_bind(&cursor.workspace)
+                .push(", ")
+                .push_bind(&cursor.id)
+                .push(")");
+        }
+        sql.push(
+            " ORDER BY o.created_at_ms ASC, COALESCE(o.name, '') ASC, \
+             o.workspace ASC, o.id ASC LIMIT ",
+        )
+        .push_bind(i64::from(limit));
+
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
     pub async fn list_with_membership(
         &self,
         object_type: &str,
@@ -1031,6 +1129,32 @@ LIMIT $3 OFFSET $4
         .bind(sandbox_id)
         .bind(i64::from(limit))
         .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        rows.into_iter().map(row_to_policy_record).collect()
+    }
+
+    pub async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT id, scope, version, status, payload, created_at_ms
+FROM objects
+WHERE object_type = $1 AND scope = $2 AND ($3::BIGINT IS NULL OR version < $3)
+ORDER BY version DESC
+LIMIT $4
+",
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(sandbox_id)
+        .bind(before_version)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

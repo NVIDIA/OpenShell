@@ -149,7 +149,12 @@ func (m *mockSandboxResolver) Get(_ context.Context, _, name string) (*Sandbox, 
 	return sb, nil
 }
 
-func (m *mockSandboxResolver) List(_ context.Context, _ string, _ ...ListOptions) ([]*Sandbox, error) {
+func (m *mockSandboxResolver) List(_ string, _ ...ListOptions) (*Pager[*Sandbox], error) {
+	return NewPager("", func(_ context.Context, _ string) (*Page[*Sandbox], error) {
+		return &Page[*Sandbox]{Items: make([]*Sandbox, 0)}, nil
+	}), nil
+}
+func (m *mockSandboxResolver) ListAll(_ context.Context, _ string, _ ...ListOptions) ([]*Sandbox, error) {
 	return nil, nil
 }
 func (m *mockSandboxResolver) Delete(_ context.Context, _, _ string) error { return nil }

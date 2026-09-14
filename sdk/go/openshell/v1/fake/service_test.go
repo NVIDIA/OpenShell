@@ -31,7 +31,7 @@ func TestFakeService_Get_ReturnsUnimplemented(t *testing.T) {
 
 func TestFakeService_List_ReturnsUnimplemented(t *testing.T) {
 	c := newFakeServiceClient(func() bool { return false })
-	_, err := c.List(context.Background(), "default", "sb1")
+	_, err := c.ListAll(context.Background(), "default", "sb1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnimplemented(err))
 }
@@ -59,7 +59,7 @@ func TestFakeService_Get_ClosedReturnsUnavailable(t *testing.T) {
 
 func TestFakeService_List_ClosedReturnsUnavailable(t *testing.T) {
 	c := newFakeServiceClient(func() bool { return true })
-	_, err := c.List(context.Background(), "default", "sb1")
+	_, err := c.ListAll(context.Background(), "default", "sb1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

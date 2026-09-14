@@ -64,7 +64,7 @@ def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
 def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
     for _ in range(60):
         try:
-            sandbox_client.list_ids(workspace="default", limit=1)
+            sandbox_client.list_ids(workspace="default", page_size=1)
             return
         except grpc.RpcError as exc:
             details = exc.details() or ""

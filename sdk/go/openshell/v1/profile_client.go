@@ -19,31 +19,35 @@ func newProfileClient(conn grpc.ClientConnInterface) *profileClient {
 	return &profileClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (p *profileClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
-	req := &pb.ListProviderProfilesRequest{
-		Workspace: workspace,
-	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := p.client.ListProviderProfiles(ctx, req)
+func (p *profileClient) List(workspace string, opts ...ListOptions) (*Pager[*ProviderProfile], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken string
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ProviderProfile], error) {
+		req := &pb.ListProviderProfilesRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
+		resp, err := p.client.ListProviderProfiles(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
+		for _, profile := range resp.GetProfiles() {
+			profiles = append(profiles, converter.ProviderProfileFromProto(profile))
+		}
+		return &Page[*ProviderProfile]{Items: profiles, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
-	for _, pp := range resp.GetProfiles() {
-		profiles = append(profiles, converter.ProviderProfileFromProto(pp))
+func (p *profileClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return profiles, nil
+	return pager.All(ctx)
 }
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {

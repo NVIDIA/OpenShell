@@ -18,6 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::{StreamExt, stream};
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
@@ -28,6 +29,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tonic::Code;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use app::{App, Focus, GatewayEntry, LogLine, Screen};
@@ -36,9 +38,54 @@ use event::{Event, EventHandler};
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
-const PROVIDER_PROFILE_PAGE_SIZE: u32 = 100;
+const PROVIDER_PROFILE_PAGE_SIZE: i32 = 100;
+const DRAFT_COUNT_REFRESH_CONCURRENCY: usize = 16;
 
 type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
+type TuiClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
+
+#[derive(Debug)]
+pub(crate) struct ListRefreshResult {
+    generation: u64,
+    gateway_name: String,
+    workspace: String,
+    all_workspaces: bool,
+    workspaces: Result<Vec<String>, String>,
+    providers: Result<ProviderListRefresh, String>,
+    sandboxes: Result<Vec<openshell_core::proto::Sandbox>, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DraftCountsRefreshResult {
+    generation: u64,
+    gateway_name: String,
+    workspace: String,
+    all_workspaces: bool,
+    sandboxes: Vec<(String, String)>,
+    counts: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ProviderListRefresh {
+    providers: Vec<openshell_core::proto::Provider>,
+    profiles: ProviderProfileCache,
+    workspace_profiles: Vec<openshell_core::proto::ProviderProfile>,
+}
+
+fn named_workspace_scope(workspace: impl Into<String>) -> openshell_core::proto::WorkspaceSelector {
+    openshell_core::proto::workspace_selector(workspace)
+}
+
+fn list_workspace_scope(
+    workspace: impl Into<String>,
+    all_workspaces: bool,
+) -> openshell_core::proto::WorkspaceSelector {
+    if all_workspaces {
+        openshell_core::proto::all_workspaces_selector()
+    } else {
+        openshell_core::proto::workspace_selector(workspace)
+    }
+}
 
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
@@ -81,7 +128,9 @@ pub async fn run(
     let mut events = EventHandler::new(Duration::from_secs(2));
 
     refresh_gateway_list(&mut app);
-    refresh_data(&mut app).await;
+    refresh_health(&mut app).await;
+    refresh_global_settings(&mut app).await;
+    spawn_list_refresh(&mut app, events.sender());
 
     while app.running {
         terminal
@@ -93,7 +142,7 @@ pub async fn run(
                 app.handle_key(key);
                 // Handle async actions triggered by key presses.
                 if app.pending_gateway_switch.is_some() {
-                    handle_gateway_switch(&mut app).await;
+                    handle_gateway_switch(&mut app, events.sender()).await;
                 }
                 if app.pending_log_fetch {
                     app.pending_log_fetch = false;
@@ -101,7 +150,7 @@ pub async fn run(
                 }
                 if app.pending_sandbox_delete {
                     app.pending_sandbox_delete = false;
-                    handle_sandbox_delete(&mut app).await;
+                    handle_sandbox_delete(&mut app, events.sender()).await;
                 }
                 if app.pending_create_sandbox {
                     app.pending_create_sandbox = false;
@@ -168,9 +217,16 @@ pub async fn run(
                 }
                 if app.pending_workspace_refresh {
                     app.pending_workspace_refresh = false;
-                    refresh_providers(&mut app).await;
-                    refresh_sandboxes(&mut app).await;
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
                 }
+            }
+            Some(Event::ListRefreshCompleted(result)) => {
+                apply_list_refresh(&mut app, result);
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
+            }
+            Some(Event::DraftCountsRefreshCompleted(result)) => {
+                apply_sandbox_draft_counts_refresh(&mut app, result);
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -209,7 +265,8 @@ pub async fn run(
                 Ok(name) => {
                     app.update_provider_form = None;
                     app.status_text = format!("Updated provider: {name}");
-                    refresh_providers(&mut app).await;
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
                 }
                 Err(msg) => {
                     if let Some(form) = app.update_provider_form.as_mut() {
@@ -220,7 +277,8 @@ pub async fn run(
             Some(Event::ProviderDeleteResult(result)) => match result {
                 Ok(true) => {
                     app.status_text = "Provider deleted.".to_string();
-                    refresh_providers(&mut app).await;
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
                 }
                 Ok(false) => {
                     app.status_text = "Provider not found.".to_string();
@@ -240,7 +298,8 @@ pub async fn run(
                 }
                 // Refresh draft chunks + counts immediately after any action.
                 refresh_draft_chunks(&mut app).await;
-                refresh_sandbox_draft_counts(&mut app).await;
+                app.cancel_draft_counts_refresh();
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
             }
             Some(Event::GlobalSettingsFetched(result)) => match result {
                 Ok((settings, revision)) => {
@@ -325,10 +384,12 @@ pub async fn run(
                 }
 
                 refresh_gateway_list(&mut app);
-                refresh_data(&mut app).await;
+                refresh_health(&mut app).await;
+                refresh_global_settings(&mut app).await;
+                spawn_list_refresh(&mut app, events.sender());
 
                 // Refresh per-sandbox draft counts for badges (dashboard + detail).
-                refresh_sandbox_draft_counts(&mut app).await;
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
 
                 // Auto-refresh sandbox detail (policy, settings, drafts) on
                 // every tick when viewing a sandbox.  The gRPC call is
@@ -371,7 +432,6 @@ pub async fn run(
                                     format!(" (forwarding port(s) {list})")
                                 };
                                 app.status_text = format!("Created sandbox: {name}{port_info}");
-                                refresh_sandboxes(&mut app).await;
 
                                 // If a command was specified, suspend TUI and exec it.
                                 if !command.is_empty() {
@@ -385,6 +445,8 @@ pub async fn run(
                                     )
                                     .await?;
                                 }
+                                app.cancel_list_refresh();
+                                spawn_list_refresh(&mut app, events.sender());
                             }
                             Some(Err(msg)) => {
                                 if let Some(form) = app.create_form.as_mut() {
@@ -416,7 +478,8 @@ pub async fn run(
                             Some(Ok(name)) => {
                                 app.create_provider_form = None;
                                 app.status_text = format!("Created provider: {name}");
-                                refresh_providers(&mut app).await;
+                                app.cancel_list_refresh();
+                                spawn_list_refresh(&mut app, events.sender());
                             }
                             Some(Err(msg)) => {
                                 if let Some(form) = app.create_provider_form.as_mut() {
@@ -484,7 +547,7 @@ fn refresh_gateway_list(app: &mut App) {
 }
 
 /// Handle a pending gateway switch requested by the user.
-async fn handle_gateway_switch(app: &mut App) {
+async fn handle_gateway_switch(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let Some(name) = app.pending_gateway_switch.take() else {
         return;
     };
@@ -501,7 +564,9 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            refresh_data(app).await;
+            refresh_health(app).await;
+            refresh_global_settings(app).await;
+            spawn_list_refresh(app, tx);
         }
         Err(e) => {
             app.status_text = format!("switch failed: {e}");
@@ -648,7 +713,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             since_ms: 0,
             sources: vec![],
             min_level: String::new(),
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
@@ -732,7 +797,7 @@ fn proto_to_log_line(log: openshell_core::proto::SandboxLogLine) -> LogLine {
 }
 
 /// Delete the currently selected sandbox.
-async fn handle_sandbox_delete(app: &mut App) {
+async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
         None => return,
@@ -751,14 +816,15 @@ async fn handle_sandbox_delete(app: &mut App) {
 
     let req = openshell_core::proto::DeleteSandboxRequest {
         name: sandbox_name,
-        workspace: app.selected_sandbox_workspace(),
+        workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
     };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
             app.cancel_log_stream();
             app.screen = Screen::Dashboard;
             app.focus = Focus::Sandboxes;
-            refresh_sandboxes(app).await;
+            app.cancel_list_refresh();
+            spawn_list_refresh(app, tx);
         }
         Err(e) => {
             app.status_text = format!("delete failed: {}", e.message());
@@ -784,7 +850,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     let req = openshell_core::proto::GetSandboxRequest {
         name: sandbox_name.clone(),
-        workspace: app.selected_sandbox_workspace(),
+        workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
     };
 
     // Step 1: Fetch sandbox metadata (providers, sandbox ID).
@@ -870,7 +936,7 @@ async fn handle_shell_connect(
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.clone(),
-            workspace: app.selected_sandbox_workspace(),
+            workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -962,6 +1028,7 @@ async fn handle_shell_connect(
 
     // Step 6: Cancel log stream and pause event handler before suspending.
     app.cancel_log_stream();
+    app.cancel_list_refresh();
     events.pause();
     // Wait for the reader task to finish its current poll cycle (tick_rate = 2s max).
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1006,6 +1073,7 @@ async fn handle_shell_connect(
         .into_diagnostic()?;
     events.discard_pending();
     events.resume();
+    spawn_list_refresh(app, events.sender());
 
     Ok(())
 }
@@ -1027,7 +1095,7 @@ async fn handle_exec_command(
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(named_workspace_scope(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -1125,6 +1193,7 @@ async fn handle_exec_command(
 
     // Step 4: Suspend TUI.
     app.cancel_log_stream();
+    app.cancel_list_refresh();
     events.pause();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1164,6 +1233,7 @@ async fn handle_exec_command(
     terminal.clear().into_diagnostic()?;
     events.discard_pending();
     events.resume();
+    spawn_list_refresh(app, events.sender());
 
     Ok(())
 }
@@ -1403,7 +1473,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             }),
             labels: HashMap::new(),
             annotations: HashMap::new(),
-            workspace: workspace.clone(),
+            workspace_scope: Some(named_workspace_scope(&workspace)),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
         };
@@ -1446,7 +1516,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
                 let req = openshell_core::proto::GetSandboxRequest {
                     name: sandbox_name.clone(),
-                    workspace: workspace.clone(),
+                    workspace_scope: Some(named_workspace_scope(&workspace)),
                 };
                 // Retry on transient errors.
                 if let Ok(resp) = client.get_sandbox(req).await
@@ -1490,9 +1560,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 /// This is called from within the create-sandbox task so the pacman animation
 /// keeps running while forwards are being established.
 async fn start_port_forwards(
-    client: &mut OpenShellClient<
-        tonic::service::interceptor::InterceptedService<Channel, EdgeAuthInterceptor>,
-    >,
+    client: &mut TuiClient,
     endpoint: &str,
     gateway_name: &str,
     sandbox_name: &str,
@@ -1688,7 +1756,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     profile_workspace: workspace.clone(),
                     credential_handles: HashMap::default(),
                 }),
-                workspace: workspace.clone(),
+                workspace_scope: Some(named_workspace_scope(&workspace)),
             };
 
             match client.create_provider(req).await {
@@ -1729,7 +1797,10 @@ fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::GetProviderRequest { name, workspace };
+        let req = openshell_core::proto::GetProviderRequest {
+            name,
+            workspace_scope: Some(named_workspace_scope(workspace)),
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
             Ok(Ok(resp)) => {
                 if let Some(provider) = resp.into_inner().provider {
@@ -1803,7 +1874,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 credential_handles: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1832,7 +1903,10 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::DeleteProviderRequest { name, workspace };
+        let req = openshell_core::proto::DeleteProviderRequest {
+            name,
+            workspace_scope: Some(named_workspace_scope(workspace)),
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
@@ -1875,7 +1949,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         let req = openshell_core::proto::ApproveDraftChunkRequest {
             name,
             chunk_id,
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
             review_token,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
@@ -1921,7 +1995,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
             name,
             chunk_id,
             reason: String::new(),
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
             Ok(Ok(_)) => {
@@ -1970,7 +2044,7 @@ fn spawn_draft_approve_all(
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
             approvals,
         };
         match tokio::time::timeout(
@@ -2016,34 +2090,98 @@ fn format_draft_approve_all_result(
 // Data refresh
 // ---------------------------------------------------------------------------
 
-async fn refresh_data(app: &mut App) {
-    refresh_health(app).await;
-    refresh_global_settings(app).await;
-    refresh_workspaces(app).await;
-    refresh_providers(app).await;
-    refresh_sandboxes(app).await;
+fn spawn_list_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    if let Some(handle) = app.list_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
+        }
+        app.list_refresh_handle.take();
+    }
+
+    app.list_refresh_generation = app.list_refresh_generation.wrapping_add(1);
+    let generation = app.list_refresh_generation;
+    let gateway_name = app.gateway_name.clone();
+    let refresh_workspace = app.current_workspace.clone();
+    let all_workspaces = app.all_workspaces;
+    let client = app.client.clone();
+    let handle = tokio::spawn(async move {
+        let (workspaces, providers, sandboxes) = tokio::join!(
+            fetch_workspaces(client.clone()),
+            fetch_providers(client.clone(), refresh_workspace.clone(), all_workspaces),
+            fetch_sandboxes(client, refresh_workspace.clone(), all_workspaces),
+        );
+        let _ = tx.send(Event::ListRefreshCompleted(ListRefreshResult {
+            generation,
+            gateway_name,
+            workspace: refresh_workspace,
+            all_workspaces,
+            workspaces,
+            providers,
+            sandboxes,
+        }));
+    });
+    app.list_refresh_handle = Some(handle);
 }
 
-async fn refresh_workspaces(app: &mut App) {
-    let req = openshell_core::proto::ListWorkspacesRequest {
-        limit: 100,
-        offset: 0,
-        label_selector: String::new(),
-    };
-    match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
-        Ok(Ok(resp)) => {
-            app.workspace_names = resp
-                .into_inner()
-                .workspaces
-                .into_iter()
-                .filter_map(|w| w.metadata.map(|m| m.name))
-                .collect();
-        }
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to list workspaces: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "list workspaces timed out".to_string();
+fn apply_list_refresh(app: &mut App, result: ListRefreshResult) {
+    if result.generation != app.list_refresh_generation {
+        return;
+    }
+    app.list_refresh_handle.take();
+    if result.gateway_name != app.gateway_name {
+        return;
+    }
+    if result.workspace != app.current_workspace {
+        return;
+    }
+    if result.all_workspaces != app.all_workspaces {
+        return;
+    }
+    app.cancel_draft_counts_refresh();
+
+    match result.workspaces {
+        Ok(workspaces) => app.workspace_names = workspaces,
+        Err(message) => app.status_text = message,
+    }
+    match result.providers {
+        Ok(providers) => apply_provider_refresh(app, providers),
+        Err(message) => app.status_text = message,
+    }
+    match result.sandboxes {
+        Ok(sandboxes) => apply_sandbox_refresh(app, sandboxes),
+        Err(message) => app.status_text = message,
+    }
+}
+
+async fn fetch_workspaces(mut client: TuiClient) -> std::result::Result<Vec<String>, String> {
+    let mut workspace_names = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = openshell_core::proto::ListWorkspacesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.list_workspaces(req)).await {
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                workspace_names.extend(
+                    response
+                        .workspaces
+                        .into_iter()
+                        .filter_map(|workspace| workspace.metadata.map(|metadata| metadata.name)),
+                );
+                if response.next_page_token.is_empty() {
+                    return Ok(workspace_names);
+                }
+                page_token = response.next_page_token;
+            }
+            Ok(Err(e)) => {
+                return Err(format!("failed to list workspaces: {}", e.message()));
+            }
+            Err(_) => {
+                return Err("list workspaces timed out".to_string());
+            }
         }
     }
 }
@@ -2090,30 +2228,36 @@ fn cached_provider_profile(
         .cloned()
 }
 
-async fn refresh_providers(app: &mut App) {
-    let req = openshell_core::proto::ListProvidersRequest {
-        limit: 100,
-        offset: 0,
-        workspace: if app.all_workspaces {
-            String::new()
-        } else {
-            app.current_workspace.clone()
-        },
-        all_workspaces: app.all_workspaces,
-    };
-    let response =
-        match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
-            Ok(Ok(resp)) => resp.into_inner(),
+async fn fetch_providers(
+    mut client: TuiClient,
+    current_workspace: String,
+    all_workspaces: bool,
+) -> std::result::Result<ProviderListRefresh, String> {
+    let mut providers = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = openshell_core::proto::ListProvidersRequest {
+            page_size: 100,
+            page_token,
+            workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.list_providers(req)).await {
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                providers.extend(response.providers);
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = response.next_page_token;
+            }
             Ok(Err(e)) => {
-                app.status_text = format!("failed to list providers: {}", e.message());
-                return;
+                return Err(format!("failed to list providers: {}", e.message()));
             }
             Err(_) => {
-                app.status_text = "list providers timed out".to_string();
-                return;
+                return Err("list providers timed out".to_string());
             }
-        };
-    let providers = response.providers;
+        }
+    }
 
     let mut workspaces: std::collections::HashSet<String> = providers
         .iter()
@@ -2122,21 +2266,21 @@ async fn refresh_providers(app: &mut App) {
         // turn that missing context into a platform-scoped profile request.
         .filter(|workspace| !workspace.is_empty())
         .collect();
-    if !app.all_workspaces {
-        workspaces.insert(app.current_workspace.clone());
+    if !all_workspaces {
+        workspaces.insert(current_workspace.clone());
     }
     let mut profiles = HashMap::new();
-    app.provider_profiles.clear();
+    let mut workspace_profiles = Vec::new();
     for ws in &workspaces {
-        let client = app.client.clone();
+        let client = client.clone();
         let workspace = ws.clone();
-        if let Some(listed) = collect_provider_profile_pages(move |offset| {
+        if let Some(listed) = collect_provider_profile_pages(move |page_token| {
             let mut client = client.clone();
             let workspace = workspace.clone();
             async move {
                 let req = openshell_core::proto::ListProviderProfilesRequest {
-                    limit: PROVIDER_PROFILE_PAGE_SIZE,
-                    offset,
+                    page_size: PROVIDER_PROFILE_PAGE_SIZE,
+                    page_token,
                     workspace,
                 };
                 match tokio::time::timeout(
@@ -2145,21 +2289,39 @@ async fn refresh_providers(app: &mut App) {
                 )
                 .await
                 {
-                    Ok(Ok(response)) => Some(response.into_inner().profiles),
+                    Ok(Ok(response)) => {
+                        let response = response.into_inner();
+                        Some((response.profiles, response.next_page_token))
+                    }
                     _ => None,
                 }
             }
         })
         .await
         {
-            if !app.all_workspaces && ws == &app.current_workspace {
-                app.provider_profiles.clone_from(&listed);
+            if !all_workspaces && ws == &current_workspace {
+                workspace_profiles.clone_from(&listed);
             }
             for profile in listed {
                 cache_provider_profile(&mut profiles, ws, profile);
             }
         }
     }
+
+    Ok(ProviderListRefresh {
+        providers,
+        profiles,
+        workspace_profiles,
+    })
+}
+
+fn apply_provider_refresh(app: &mut App, refresh: ProviderListRefresh) {
+    let ProviderListRefresh {
+        providers,
+        profiles,
+        workspace_profiles,
+    } = refresh;
+    app.provider_profiles = workspace_profiles;
     app.sync_create_provider_types();
 
     app.provider_count = providers.len();
@@ -2199,19 +2361,18 @@ async fn collect_provider_profile_pages<F, Fut>(
     mut fetch_page: F,
 ) -> Option<Vec<openshell_core::proto::ProviderProfile>>
 where
-    F: FnMut(u32) -> Fut,
-    Fut: Future<Output = Option<Vec<openshell_core::proto::ProviderProfile>>>,
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Option<(Vec<openshell_core::proto::ProviderProfile>, String)>>,
 {
     let mut profiles = Vec::new();
-    let mut offset = 0;
+    let mut page_token = String::new();
     loop {
-        let page = fetch_page(offset).await?;
-        let page_len = page.len();
+        let (page, next_page_token) = fetch_page(page_token).await?;
         profiles.extend(page);
-        if page_len < PROVIDER_PROFILE_PAGE_SIZE as usize {
+        if next_page_token.is_empty() {
             return Some(profiles);
         }
-        offset = offset.saturating_add(PROVIDER_PROFILE_PAGE_SIZE);
+        page_token = next_page_token;
     }
 }
 
@@ -2244,10 +2405,10 @@ async fn refresh_global_settings(app: &mut App) {
     // Check for an active global policy only while the caller can read it.
     let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
         name: String::new(),
-        limit: 1,
-        offset: 0,
+        page_size: 1,
+        page_token: String::new(),
         global: true,
-        workspace: String::new(),
+        workspace_scope: None,
     };
     match tokio::time::timeout(
         Duration::from_secs(5),
@@ -2327,7 +2488,6 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
             global: true,
-            workspace: String::new(),
             ..Default::default()
         };
 
@@ -2361,7 +2521,6 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_key: key,
             delete_setting: true,
             global: true,
-            workspace: String::new(),
             ..Default::default()
         };
 
@@ -2429,7 +2588,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             name,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
             ..Default::default()
         };
 
@@ -2467,7 +2626,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             name,
             setting_key: key,
             delete_setting: true,
-            workspace,
+            workspace_scope: Some(named_workspace_scope(workspace)),
             ..Default::default()
         };
 
@@ -2506,112 +2665,123 @@ async fn refresh_health(app: &mut App) {
     }
 }
 
-async fn refresh_sandboxes(app: &mut App) {
-    let req = openshell_core::proto::ListSandboxesRequest {
-        limit: 100,
-        offset: 0,
-        label_selector: String::new(),
-        workspace: if app.all_workspaces {
-            String::new()
-        } else {
-            app.current_workspace.clone()
-        },
-        all_workspaces: app.all_workspaces,
-    };
-    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to list sandboxes: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "list sandboxes timed out".to_string();
-        }
-        Ok(Ok(resp)) => {
-            let sandboxes = resp.into_inner().sandboxes;
-            app.sandbox_count = sandboxes.len();
-            app.sandbox_ids = sandboxes
-                .iter()
-                .map(|s| s.object_id().to_string())
-                .collect();
-            app.sandbox_names = sandboxes
-                .iter()
-                .map(|s| s.object_name().to_string())
-                .collect();
-            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
-            app.sandbox_images = sandboxes
-                .iter()
-                .map(|s| {
-                    s.spec
-                        .as_ref()
-                        .and_then(|spec| spec.template.as_ref())
-                        .map(|t| t.image.as_str())
-                        .filter(|img| !img.is_empty())
-                        .unwrap_or("-")
-                        .to_string()
-                })
-                .collect();
-            app.sandbox_ages = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
-                })
-                .collect();
-            app.sandbox_created = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
-                })
-                .collect();
-
-            app.sandbox_policy_versions = sandboxes
-                .iter()
-                .map(openshell_core::proto::Sandbox::current_policy_version)
-                .collect();
-
-            // Build NOTES column from active port forwards.
-            let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
-            app.sandbox_notes = sandboxes
-                .iter()
-                .map(|s| {
-                    let name = s.object_name();
-                    openshell_core::forward::build_sandbox_notes(name, &forwards)
-                })
-                .collect();
-
-            // Build LABELS column from metadata.
-            app.sandbox_labels = sandboxes
-                .iter()
-                .map(|s| {
-                    s.object_labels()
-                        .as_ref()
-                        .map(app::format_labels)
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            app.sandbox_annotations = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map(|metadata| app::format_annotations(&metadata.annotations))
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            app.sandbox_workspaces = sandboxes
-                .iter()
-                .map(|s| s.object_workspace().to_string())
-                .collect();
-
-            if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
-                app.sandbox_selected = app.sandbox_count - 1;
+async fn fetch_sandboxes(
+    mut client: TuiClient,
+    current_workspace: String,
+    all_workspaces: bool,
+) -> std::result::Result<Vec<openshell_core::proto::Sandbox>, String> {
+    let mut page_token = String::new();
+    let mut sandboxes = Vec::new();
+    loop {
+        let req = openshell_core::proto::ListSandboxesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+            workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), client.list_sandboxes(req)).await;
+        match result {
+            Ok(Err(e)) => {
+                return Err(format!("failed to list sandboxes: {}", e.message()));
+            }
+            Err(_) => {
+                return Err("list sandboxes timed out".to_string());
+            }
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                sandboxes.extend(response.sandboxes);
+                if response.next_page_token.is_empty() {
+                    return Ok(sandboxes);
+                }
+                page_token = response.next_page_token;
             }
         }
+    }
+}
+
+fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sandbox>) {
+    app.sandbox_count = sandboxes.len();
+    app.sandbox_ids = sandboxes
+        .iter()
+        .map(|s| s.object_id().to_string())
+        .collect();
+    app.sandbox_names = sandboxes
+        .iter()
+        .map(|s| s.object_name().to_string())
+        .collect();
+    app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_images = sandboxes
+        .iter()
+        .map(|s| {
+            s.spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .map(|t| t.image.as_str())
+                .filter(|img| !img.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        })
+        .collect();
+    app.sandbox_ages = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
+        })
+        .collect();
+    app.sandbox_created = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
+        })
+        .collect();
+
+    app.sandbox_policy_versions = sandboxes
+        .iter()
+        .map(openshell_core::proto::Sandbox::current_policy_version)
+        .collect();
+
+    // Build NOTES column from active port forwards.
+    let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
+    app.sandbox_notes = sandboxes
+        .iter()
+        .map(|s| {
+            let name = s.object_name();
+            openshell_core::forward::build_sandbox_notes(name, &forwards)
+        })
+        .collect();
+
+    // Build LABELS column from metadata.
+    app.sandbox_labels = sandboxes
+        .iter()
+        .map(|s| {
+            s.object_labels()
+                .as_ref()
+                .map(app::format_labels)
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_annotations = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map(|metadata| app::format_annotations(&metadata.annotations))
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_workspaces = sandboxes
+        .iter()
+        .map(|s| s.object_workspace().to_string())
+        .collect();
+
+    if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
+        app.sandbox_selected = app.sandbox_count - 1;
     }
 }
 
@@ -2665,7 +2835,7 @@ async fn refresh_draft_chunks(app: &mut App) {
     let req = openshell_core::proto::GetDraftPolicyRequest {
         name: sandbox_name,
         status_filter: String::new(),
-        workspace: app.selected_sandbox_workspace(),
+        workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
     };
 
     if let Ok(Ok(resp)) =
@@ -2680,31 +2850,127 @@ async fn refresh_draft_chunks(app: &mut App) {
     }
 }
 
-/// Fetch the count of pending draft recommendations for every sandbox.
-///
-/// This runs on the Dashboard tick so the sandbox list can show notification
-/// badges without entering the sandbox detail view.
-async fn refresh_sandbox_draft_counts(app: &mut App) {
-    let names: Vec<String> = app.sandbox_names.clone();
-    let workspaces: Vec<String> = app.sandbox_workspaces.clone();
-    let mut counts = vec![0usize; names.len()];
-    for (i, name) in names.iter().enumerate() {
-        let ws = workspaces
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| app.current_workspace.clone());
-        let req = openshell_core::proto::GetDraftPolicyRequest {
-            name: name.clone(),
-            status_filter: "pending".to_string(),
-            workspace: ws,
-        };
-        if let Ok(Ok(resp)) =
-            tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
-        {
-            counts[i] = resp.into_inner().chunks.len();
+/// Start a bounded, non-overlapping background refresh of pending draft counts.
+fn spawn_sandbox_draft_counts_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    if let Some(handle) = app.draft_counts_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
         }
+        app.draft_counts_refresh_handle.take();
     }
-    app.sandbox_draft_counts = counts;
+
+    let sandboxes: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if sandboxes.is_empty() {
+        app.sandbox_draft_counts.clear();
+        return;
+    }
+
+    app.draft_counts_refresh_generation = app.draft_counts_refresh_generation.wrapping_add(1);
+    let generation = app.draft_counts_refresh_generation;
+    let gateway_name = app.gateway_name.clone();
+    let workspace = app.current_workspace.clone();
+    let all_workspaces = app.all_workspaces;
+    let client = app.client.clone();
+    let refresh_sandboxes = sandboxes.clone();
+    let handle = tokio::spawn(async move {
+        let counts = fetch_sandbox_draft_counts(client, refresh_sandboxes).await;
+        let _ = tx.send(Event::DraftCountsRefreshCompleted(
+            DraftCountsRefreshResult {
+                generation,
+                gateway_name,
+                workspace,
+                all_workspaces,
+                sandboxes,
+                counts,
+            },
+        ));
+    });
+    app.draft_counts_refresh_handle = Some(handle);
+}
+
+async fn fetch_sandbox_draft_counts(
+    client: TuiClient,
+    sandboxes: Vec<(String, String)>,
+) -> Vec<usize> {
+    let count = sandboxes.len();
+    let results = stream::iter(sandboxes.into_iter().enumerate().map(
+        |(index, (name, workspace))| {
+            let mut client = client.clone();
+            async move {
+                let req = openshell_core::proto::GetDraftPolicyRequest {
+                    name,
+                    status_filter: "pending".to_string(),
+                    workspace_scope: Some(named_workspace_scope(workspace)),
+                };
+                let count = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.get_draft_policy(req),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => resp.into_inner().chunks.len(),
+                    _ => 0,
+                };
+                (index, count)
+            }
+        },
+    ))
+    .buffer_unordered(DRAFT_COUNT_REFRESH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut counts = vec![0; count];
+    for (index, value) in results {
+        counts[index] = value;
+    }
+    counts
+}
+
+fn apply_sandbox_draft_counts_refresh(app: &mut App, result: DraftCountsRefreshResult) {
+    if result.generation != app.draft_counts_refresh_generation {
+        return;
+    }
+    app.draft_counts_refresh_handle.take();
+    if (
+        result.gateway_name.as_str(),
+        result.workspace.as_str(),
+        result.all_workspaces,
+    ) != (
+        app.gateway_name.as_str(),
+        app.current_workspace.as_str(),
+        app.all_workspaces,
+    ) {
+        return;
+    }
+    let current: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if result.sandboxes == current {
+        app.sandbox_draft_counts = result.counts;
+    }
 }
 
 fn phase_label(phase: i32) -> String {
@@ -2881,29 +3147,31 @@ mod provider_profile_pagination_tests {
 
     #[tokio::test]
     async fn profile_fetch_continues_until_page_two_is_collected() {
-        let requested_offsets = Arc::new(Mutex::new(Vec::new()));
-        let offsets = Arc::clone(&requested_offsets);
+        let requested_tokens = Arc::new(Mutex::new(Vec::new()));
+        let tokens = Arc::clone(&requested_tokens);
 
-        let profiles = collect_provider_profile_pages(move |offset| {
-            let offsets = Arc::clone(&offsets);
+        let profiles = collect_provider_profile_pages(move |page_token| {
+            let tokens = Arc::clone(&tokens);
             async move {
-                offsets.lock().unwrap().push(offset);
-                match offset {
-                    0 => Some(
+                tokens.lock().unwrap().push(page_token.clone());
+                match page_token.as_str() {
+                    "" => Some((
                         (0..PROVIDER_PROFILE_PAGE_SIZE)
                             .map(|index| openshell_core::proto::ProviderProfile {
                                 id: format!("profile-{index}"),
                                 ..Default::default()
                             })
                             .collect(),
-                    ),
-                    PROVIDER_PROFILE_PAGE_SIZE => {
-                        Some(vec![openshell_core::proto::ProviderProfile {
+                        "next".to_string(),
+                    )),
+                    "next" => Some((
+                        vec![openshell_core::proto::ProviderProfile {
                             id: "page-two-profile".to_string(),
                             ..Default::default()
-                        }])
-                    }
-                    _ => panic!("unexpected profile page offset {offset}"),
+                        }],
+                        String::new(),
+                    )),
+                    _ => panic!("unexpected profile page token {page_token}"),
                 }
             }
         })
@@ -2911,8 +3179,8 @@ mod provider_profile_pagination_tests {
         .expect("all pages should load");
 
         assert_eq!(
-            *requested_offsets.lock().unwrap(),
-            vec![0, PROVIDER_PROFILE_PAGE_SIZE]
+            *requested_tokens.lock().unwrap(),
+            vec![String::new(), "next".to_string()]
         );
         assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
         assert_eq!(profiles.last().unwrap().id, "page-two-profile");

@@ -21,9 +21,9 @@ func newRefreshClient(conn grpc.ClientConnInterface) *refreshClient {
 
 func (r *refreshClient) GetStatus(ctx context.Context, workspace, provider, credentialKey string) ([]*RefreshStatus, error) {
 	resp, err := r.client.GetProviderRefreshStatus(ctx, &pb.GetProviderRefreshStatusRequest{
-		Provider:      provider,
-		CredentialKey: credentialKey,
-		Workspace:     workspace,
+		Provider:       provider,
+		CredentialKey:  credentialKey,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -38,7 +38,7 @@ func (r *refreshClient) GetStatus(ctx context.Context, workspace, provider, cred
 
 func (r *refreshClient) Configure(ctx context.Context, workspace string, config *RefreshConfig) (*RefreshStatus, error) {
 	req := converter.RefreshConfigToProto(config)
-	req.Workspace = workspace
+	req.WorkspaceScope = namedWorkspaceScope(workspace)
 	resp, err := r.client.ConfigureProviderRefresh(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -48,9 +48,9 @@ func (r *refreshClient) Configure(ctx context.Context, workspace string, config 
 
 func (r *refreshClient) Rotate(ctx context.Context, workspace, provider, credentialKey string) (*RefreshStatus, error) {
 	resp, err := r.client.RotateProviderCredential(ctx, &pb.RotateProviderCredentialRequest{
-		Provider:      provider,
-		CredentialKey: credentialKey,
-		Workspace:     workspace,
+		Provider:       provider,
+		CredentialKey:  credentialKey,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -60,9 +60,9 @@ func (r *refreshClient) Rotate(ctx context.Context, workspace, provider, credent
 
 func (r *refreshClient) Delete(ctx context.Context, workspace, provider, credentialKey string) (bool, error) {
 	resp, err := r.client.DeleteProviderRefresh(ctx, &pb.DeleteProviderRefreshRequest{
-		Provider:      provider,
-		CredentialKey: credentialKey,
-		Workspace:     workspace,
+		Provider:       provider,
+		CredentialKey:  credentialKey,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return false, converter.FromGRPCError(err)

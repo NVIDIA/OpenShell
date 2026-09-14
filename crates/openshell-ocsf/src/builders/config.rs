@@ -3,14 +3,14 @@
 
 //! Builder for Device Config State Change [5019] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{SecurityLevelId, SeverityId, StateId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DeviceConfigStateChangeEvent, OcsfEvent};
 
 /// Builder for Device Config State Change [5019] events.
 pub struct ConfigStateChangeBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     severity: SeverityId,
     status: Option<StatusId>,
     state_id: Option<StateId>,
@@ -23,7 +23,7 @@ pub struct ConfigStateChangeBuilder<'a> {
 
 impl<'a> ConfigStateChangeBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext) -> Self {
+    pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
             severity: SeverityId::Informational,

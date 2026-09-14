@@ -1,0 +1,101 @@
+schema_v2_step11_deterministic_attestation_version=1
+variant=baseline
+source_commit=74960ebfaeec4673885089ed995fad902459749f
+source_tree_clean=true
+cargo_target_scope=checkout-local
+rustc_wrapper=disabled
+cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+rustc 1.95.0 (59807616e 2026-04-14)
+
+=== suite:server-lib ===
+command=cargo test -q -p openshell-server --lib 
+--- output ---
+
+running 1463 tests
+....................................................................................... 87/1463
+....................................................................................... 174/1463
+...............................................................................i....... 261/1463
+......................i................................................................ 348/1463
+..............................................................................i........ 435/1463
+....................................................................................... 522/1463
+....................................................................................... 609/1463
+....................................................................................... 696/1463
+....................................................................................... 783/1463
+......................................................................................i 870/1463
+....................................................................................... 957/1463
+....................................................................................... 1044/1463
+....................................................................................... 1131/1463
+................................................................................i...... 1218/1463
+.........................................ii............................................ 1305/1463
+...............................i....................................................... 1392/1463
+.......................................................................
+test result: ok. 1455 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 9.13s
+
+--- exit_status:0 ---
+
+=== suite:gateway-interceptors ===
+command=cargo test -q -p openshell-gateway-interceptors 
+--- output ---
+
+running 49 tests
+.................................................
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- exit_status:0 ---
+
+=== suite:supervisor-middleware ===
+command=cargo test -q -p openshell-supervisor-middleware 
+--- output ---
+
+running 85 tests
+.....................................................................................
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- exit_status:0 ---
+
+=== suite:otel-test-support ===
+command=cargo test -q -p openshell-otel-test-support 
+--- output ---
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- exit_status:0 ---
+
+=== suite:multiplex-tls-integration ===
+command=cargo test -q -p openshell-server --test multiplex_tls_integration 
+--- output ---
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+--- exit_status:0 ---
+
+=== suite:edge-tunnel-auth ===
+command=cargo test -q -p openshell-server --test edge_tunnel_auth 
+--- output ---
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+--- exit_status:0 ---
+
+attestation_complete=true

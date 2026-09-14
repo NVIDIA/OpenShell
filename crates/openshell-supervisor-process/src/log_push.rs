@@ -317,13 +317,13 @@ impl tracing::field::Visit for LogVisitor {
 mod tests {
     use super::*;
     use openshell_ocsf::{
-        ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SandboxContext,
+        ActionId, ActivityId, DispositionId, Endpoint, EventContext, NetworkActivityBuilder,
         SeverityId, StatusId, ocsf_emit,
     };
     use tracing_subscriber::layer::SubscriberExt;
 
-    fn ocsf_ctx() -> SandboxContext {
-        SandboxContext {
+    fn ocsf_ctx() -> EventContext {
+        EventContext {
             sandbox_id: "sb-test".to_string(),
             sandbox_name: "test-sandbox".to_string(),
             container_image: "openshell/sandbox:test".to_string(),

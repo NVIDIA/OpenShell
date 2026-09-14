@@ -33,13 +33,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
+# VM currently has no image-pull-policy setting in its driver configuration; unlike
+# Docker, Podman, and Kubernetes launch paths it intentionally does not normalize this input.
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
@@ -336,11 +340,11 @@ chmod 700 "${VM_DRIVER_STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = ${DISABLE_TLS}
 
 [openshell.gateway.auth]
@@ -359,6 +363,31 @@ grpc_endpoint = "${GRPC_ENDPOINT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${VM_DRIVER_STATE_DIR}"
 EOF
+
+# VM proxy settings become protected supervisor argv inside the guest. The
+# auth file content is copied into a 0600 overlay file by the driver and is
+# never printed by this task.
+if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_UPSTREAM_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_NO_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT+x}" ]]; then
+  printf 'provider_spiffe_workload_api_tcp_endpoint = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP+x}" ]]; then
+  printf 'provider_spiffe_allow_guest_tcp = %s\n' "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP}" >>"${CONFIG_PATH}"
+fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
@@ -385,7 +414,7 @@ GATEWAY_ARGS=(
   --config "${CONFIG_PATH}"
   --port "${PORT}"
   --log-level "${LOG_LEVEL}"
-  --drivers vm
+  --compute-driver vm
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
 

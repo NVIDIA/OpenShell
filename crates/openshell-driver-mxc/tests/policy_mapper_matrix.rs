@@ -766,11 +766,9 @@ fn b_binaries_error_per_binary() {
             binaries: vec![
                 NetworkBinary {
                     path: "/usr/bin/curl".into(),
-                    ..Default::default()
                 },
                 NetworkBinary {
                     path: "/usr/bin/wget".into(),
-                    ..Default::default()
                 },
             ],
         },
@@ -1248,7 +1246,6 @@ fn handled_fields_inventory() {
                     endpoints: vec![full_ep, single_port_ep],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".into(),
-                        ..Default::default()
                     }],
                 },
             );

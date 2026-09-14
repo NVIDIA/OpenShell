@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Windows MSVC build-only tasks. These intentionally live outside the default
-# Linux/macOS `ci` task so the established Linux build path remains unchanged.
+# Windows MSVC validation and build tasks. These intentionally live outside
+# the Linux/macOS task definitions so each hosted workflow has an explicit
+# platform-native entry point.
 
 ["windows:check"]
 description = "Check Windows x64 and ARM64 MSVC targets"
@@ -18,6 +19,16 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Check Windows ARM64 MSVC target"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check aarch64-pc-windows-msvc"
+
+["windows:lint:x64"]
+description = "Lint Windows x64 MSVC workspace targets with Clippy"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint x86_64-pc-windows-msvc"
+
+["windows:lint:arm64"]
+description = "Lint Windows ARM64 MSVC workspace targets with Clippy"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint aarch64-pc-windows-msvc"
 
 ["windows:build"]
 description = "Build Windows x64 and ARM64 release binaries"
@@ -35,14 +46,14 @@ run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 build aarch64-pc-windows-msvc"
 
 ["windows:test:x64"]
-description = "Run Windows x64 MSVC workspace tests"
+description = "Run Windows x64 MSVC workspace tests with the CI nextest profile and server test support"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
-run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test x86_64-pc-windows-msvc"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit x86_64-pc-windows-msvc"
 
 ["windows:test:arm64"]
-description = "Run Windows ARM64 MSVC workspace tests on a native ARM64 host"
+description = "Run Windows ARM64 MSVC workspace tests with the CI nextest profile and server test support on a native ARM64 host"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
-run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test aarch64-pc-windows-msvc"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit aarch64-pc-windows-msvc"
 
 ["windows:test:unsupported:x64"]
 description = "Run focused Windows unsupported compute-driver contract tests"

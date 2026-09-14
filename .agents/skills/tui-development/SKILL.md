@@ -170,13 +170,15 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces).
+**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection.
 
-**Providers**: Fetched via `ListProviders` on each tick. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
+**Providers**: Fetched via `ListProviders` in the background collection-refresh task. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`. Follow each list RPC's `next_page_token` until empty.
 
 **Settings**: Global settings are fetched via `GetGatewayConfig` on each tick. Sandbox settings are fetched alongside the sandbox policy via `GetSandboxConfig` and refreshed on each tick when viewing a sandbox.
 
-**Workspaces**: The workspace list is fetched via `ListWorkspaces` on each tick.
+**Workspaces**: The workspace list is fetched via `ListWorkspaces` in the background collection-refresh task, following `next_page_token` until empty.
+
+Only one collection-refresh task may run at a time. Workspace and gateway changes abort the active task, and refresh results carry their gateway/workspace context so stale results are discarded.
 
 ### Never block the event loop
 
@@ -411,9 +413,9 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 | File | Purpose |
 | --- | --- |
 | `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_data`, `refresh_providers`, `refresh_global_settings`, `refresh_workspaces`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
+| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, background collection refresh (`spawn_list_refresh`), gRPC calls (`refresh_global_settings`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
 | `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
-| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `ListRefreshCompleted`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
 | `crates/openshell-tui/src/clipboard.rs` | Clipboard copy support for log lines |
 | `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar` (with workspace display), `draw_nav_bar`, `draw_command_bar`, screen routing, shared setting-edit overlay, modal helpers |
@@ -469,14 +471,20 @@ Proto types come from `openshell-core` which generates them from `OUT_DIR` via `
 
 ```rust
 use openshell_core::proto::openshell_client::OpenShellClient;
-use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
+use openshell_core::proto::{
+    all_workspaces_selector, workspace_selector, GetSandboxLogsRequest,
+    ListSandboxesRequest, ...
+};
 ```
 
 ### Proto field gotchas
 
 - `DeleteSandboxRequest` uses the `name` field (not `id`):
   ```rust
-  let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+  let req = openshell_core::proto::DeleteSandboxRequest {
+      name: sandbox_name,
+      workspace_scope: Some(workspace_selector(workspace)),
+  };
   ```
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
@@ -490,12 +498,27 @@ use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
   };
   ```
 - `SandboxLogLine` proto fields: `sandbox_id`, `timestamp_ms`, `level`, `target`, `message`, `source`, `fields` (HashMap<String, String>).
-- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64), `sources` (Vec<String>), `min_level` (String), `workspace` (String).
-- `ListSandboxesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String), `workspace` (String), `all_workspaces` (bool).
-- `ListProvidersRequest` fields: `limit` (i64), `offset` (i64), `workspace` (String), `all_workspaces` (bool).
-- `ListWorkspacesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String).
-- `UpdateConfigRequest` fields: `name` (String, sandbox name or empty for global), `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), `workspace`.
-- Most resource requests include a `workspace` field that scopes the operation to the current workspace.
+- Workspace-scoped request fields use `workspace_scope: Option<WorkspaceSelector>`.
+  Select one workspace with `Some(workspace_selector(name))`. List requests that
+  explicitly support cross-workspace access also accept
+  `Some(all_workspaces_selector())`; do not use that marker on other requests.
+- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64),
+  `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
+- `ListSandboxesRequest` fields: `page_size` (i32), `page_token` (String),
+  `label_selector` (String), `workspace_scope`.
+- `ListProvidersRequest` fields: `page_size` (i32), `page_token` (String),
+  `workspace_scope`.
+- `ListWorkspacesRequest` fields: `page_size` (i32), `page_token` (String),
+  `label_selector` (String).
+- Paginated list responses return `next_page_token`. Continue with the same
+  request parameters and that token until it is empty; changing filters or
+  scope invalidates the token.
+- `UpdateConfigRequest` fields include `name` (String, sandbox name or empty for
+  global), `setting_key`, `setting_value`, `delete_setting` (bool), `global`
+  (bool), and `workspace_scope`. Sandbox-scoped updates require a named selector;
+  gateway-global updates must leave `workspace_scope` as `None`.
+- Most resource requests require an explicit named `workspace_scope`, including
+  the `default` workspace. An omitted selector is not an implicit default.
 
 ### gRPC timeouts
 
@@ -525,7 +548,7 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 4. On success:
    - `app.client` is replaced with a new intercepted client
    - `reset_sandbox_state()` clears all sandbox/log/draft/policy data
-   - `refresh_data()` runs the full capability refresh sequence: `refresh_health` → `refresh_global_settings` → `refresh_workspaces` → `refresh_providers` → `refresh_sandboxes`
+   - health and global settings are refreshed, then `spawn_list_refresh()` starts the cancellable workspace/provider/sandbox refresh task
 5. On failure: `status_text` shows the error
 
 ### Initial startup lifecycle
@@ -533,13 +556,13 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 On launch, before the event loop starts:
 
 1. `refresh_gateway_list()` — discover gateways from disk
-2. `refresh_data()` — full refresh (health, global settings, workspaces, providers, sandboxes)
+2. Refresh health and global settings, then start `spawn_list_refresh()` for workspaces, providers, and sandboxes
 
 ### Workspace switching lifecycle
 
 1. User presses `[w]` on the providers or sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
 2. `pending_workspace_refresh = true` is set, cursor indices are reset
-3. Event loop calls `refresh_providers()` and `refresh_sandboxes()` with the new workspace scope
+3. Event loop cancels any in-flight collection refresh and starts `spawn_list_refresh()` with the new workspace scope
 
 ### Settings CRUD lifecycle (global and sandbox)
 

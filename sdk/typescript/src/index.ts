@@ -18,6 +18,7 @@ export type {
   Health,
   HealthStatus,
   ListOptions,
+  Page,
   PolicySourceName,
   ProviderChange,
   ProviderChangeOptions,
@@ -43,8 +44,9 @@ export type {
   SshSession,
   UpdateConfigResult,
   WaitOptions,
+  WorkspaceListScope,
 } from './client.js';
-export { errorCode, OpenShellClient, SandboxClient, SandboxTemplateClient } from './client.js';
+export { errorCode, OpenShellClient, Pager, SandboxClient, SandboxTemplateClient } from './client.js';
 export type { SdkErrorCode } from './errors.js';
 export { SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';

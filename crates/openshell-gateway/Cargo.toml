@@ -26,6 +26,7 @@ tokio = { workspace = true }
 openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
+openshell-policy = { path = "../openshell-policy", optional = true }
 hyper-util = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -40,9 +41,18 @@ openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]
 in-tree-compute-drivers = [
-    "dep:openshell-driver-docker",
-    "dep:openshell-driver-kubernetes",
-    "dep:openshell-driver-podman",
+    "compute-driver-docker",
+    "compute-driver-kubernetes",
+    "compute-driver-podman",
+    "compute-driver-vm",
+    "compute-driver-mxc",
+]
+compute-driver-mxc = ["dep:openshell-driver-mxc"]
+compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
+compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
+compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]
+compute-driver-vm = [
+    "dep:openshell-policy",
     "dep:openshell-otel",
     "dep:hyper-util",
     "dep:nix",
@@ -51,7 +61,6 @@ in-tree-compute-drivers = [
     "dep:tonic",
     "dep:tower",
     "dep:tracing",
-    "dep:openshell-driver-mxc",
 ]
 telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## Convenience alias: every default feature except `telemetry`. Build a
@@ -70,3 +79,4 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+toml = { workspace = true }
