@@ -2870,6 +2870,18 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::from_kube)?
             .is_some()
         {
+            if !encoded_authentication.is_empty() {
+                // Gateway restart creates a fresh in-memory launch session.
+                // Recreate both Pods so neither side retains credentials for
+                // the gateway instance that was replaced.
+                self.stop_sandbox_inner(sandbox_id).await?;
+                return Box::pin(self.start_sandbox_runtime_generation(
+                    sandbox_id,
+                    encoded_generation,
+                    encoded_authentication,
+                ))
+                .await;
+            }
             return Err(KubernetesDriverError::Precondition(
                 "cannot rotate a running workload Pod; stop the sandbox first".to_string(),
             ));
