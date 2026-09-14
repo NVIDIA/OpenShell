@@ -843,6 +843,18 @@ pub(crate) async fn run_server(
                         .map_err(|error| format!("encode launch authentication: {error}"))
                 }
             },
+            |sandbox_id| {
+                let state = state.clone();
+                let sandbox_id = sandbox_id.to_string();
+                async move {
+                    if state.sandbox_session_jwt_authority.is_none() {
+                        return Ok(());
+                    }
+                    grpc::mark_session_successor_committed(&state, &sandbox_id)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
             |sandbox_id| state.sandbox_auth_sessions.deactivate(sandbox_id),
         )
         .await

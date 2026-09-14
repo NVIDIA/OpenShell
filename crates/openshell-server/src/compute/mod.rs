@@ -2294,8 +2294,12 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(|_| async { Ok(Vec::new()) }, |_| {})
-            .await
+        self.start_persisted_sandboxes_with_authentication(
+            |_| async { Ok(Vec::new()) },
+            |_| async { Ok(()) },
+            |_| {},
+        )
+        .await
     }
 
     /// Reconcile persisted running intent and provision fresh launch
@@ -2303,15 +2307,20 @@ impl ComputeRuntime {
     pub async fn start_persisted_sandboxes_with_authentication<
         Authentication,
         AuthenticationFuture,
+        Committed,
+        CommittedFuture,
         Failed,
     >(
         &self,
         launch_authentication_for: Authentication,
+        authentication_committed: Committed,
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
         Authentication: Fn(&Sandbox) -> AuthenticationFuture,
         AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
+        Committed: Fn(&str) -> CommittedFuture,
+        CommittedFuture: Future<Output = Result<(), String>>,
         Failed: Fn(&str),
     {
         self.recover_persisted_lifecycle_transitions().await?;
@@ -2401,6 +2410,13 @@ impl ComputeRuntime {
                 .await
             {
                 Ok(_) => {
+                    if let Err(err) = authentication_committed(sandbox.object_id()).await {
+                        warn!(
+                            sandbox_id = %sandbox.object_id(),
+                            error = %err,
+                            "Failed to commit sandbox authentication successor; it will be retried"
+                        );
+                    }
                     let did_recover = if recoverable_error {
                         self.clear_recoverable_error(&sandbox).await
                     } else {
@@ -10990,6 +11006,7 @@ mod tests {
                     let sandbox_id = sandbox.object_id().to_string();
                     async move { Ok(format!("authentication:{sandbox_id}").into_bytes()) }
                 },
+                |_| async { Ok(()) },
                 |_| {},
             )
             .await

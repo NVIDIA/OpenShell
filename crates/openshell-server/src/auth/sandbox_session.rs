@@ -19,20 +19,29 @@ use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
 pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
 pub const SESSION_ID_ANNOTATION: &str = "internal.openshell.ai/session-id";
 pub const SESSION_ROTATION_ANNOTATION: &str = "internal.openshell.ai/session-rotation";
+pub const PREDECESSOR_SESSION_ID_ANNOTATION: &str = "internal.openshell.ai/predecessor-session-id";
+pub const SESSION_PENDING_ANNOTATION: &str = "internal.openshell.ai/session-pending";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedSessionLineage {
     pub runtime_generation: SandboxGenerationId,
     pub session_id: SandboxSessionId,
     pub session_rotation: SessionRotation,
+    pub predecessor_session_id: Option<SandboxSessionId>,
+    pub pending: bool,
 }
 
 impl PersistedSessionLineage {
-    pub fn from_authentication(authentication: &SandboxLaunchAuthentication) -> Self {
+    pub fn from_authentication(
+        authentication: &SandboxLaunchAuthentication,
+        pending: bool,
+    ) -> Self {
         Self {
             runtime_generation: authentication.supervisor.runtime_generation.clone(),
             session_id: authentication.supervisor.session_id,
             session_rotation: authentication.supervisor.session_rotation,
+            predecessor_session_id: authentication.supervisor.predecessor_session_id,
+            pending,
         }
     }
 
@@ -60,10 +69,27 @@ impl PersistedSessionLineage {
                     .map_err(|_| SessionJwtError::InvalidSessionLineage)
             })
             .and_then(SessionRotation::new)?;
+        let predecessor_session_id = annotations
+            .get(PREDECESSOR_SESSION_ID_ANNOTATION)
+            .map(|value| {
+                SandboxSessionId::from_str(value)
+                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
+            })
+            .transpose()?;
+        let pending = annotations
+            .get(SESSION_PENDING_ANNOTATION)
+            .ok_or(SessionJwtError::MissingSessionLineage)?
+            .parse::<bool>()
+            .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
+        if (session_rotation.get() == 1) != predecessor_session_id.is_none() {
+            return Err(SessionJwtError::InvalidSessionLineage);
+        }
         Ok(Self {
             runtime_generation,
             session_id,
             session_rotation,
+            predecessor_session_id,
+            pending,
         })
     }
 
@@ -79,6 +105,21 @@ impl PersistedSessionLineage {
         annotations.insert(
             SESSION_ROTATION_ANNOTATION.to_string(),
             self.session_rotation.get().to_string(),
+        );
+        match self.predecessor_session_id {
+            Some(predecessor) => {
+                annotations.insert(
+                    PREDECESSOR_SESSION_ID_ANNOTATION.to_string(),
+                    predecessor.to_string(),
+                );
+            }
+            None => {
+                annotations.remove(PREDECESSOR_SESSION_ID_ANNOTATION);
+            }
+        }
+        annotations.insert(
+            SESSION_PENDING_ANNOTATION.to_string(),
+            self.pending.to_string(),
         );
     }
 }

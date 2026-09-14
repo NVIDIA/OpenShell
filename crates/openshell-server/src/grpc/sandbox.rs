@@ -504,6 +504,7 @@ async fn handle_create_sandbox_inner(
         if let Some(metadata) = sandbox.metadata.as_mut() {
             crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(
                 &authentication,
+                false,
             )
             .write(&mut metadata.annotations);
         }
@@ -535,7 +536,7 @@ async fn handle_create_sandbox_inner(
         })
         .transpose()?;
 
-    let mut sandbox = state
+    let sandbox = state
         .compute
         .create_sandbox_authenticated(
             sandbox,
@@ -544,9 +545,6 @@ async fn handle_create_sandbox_inner(
             await_main_process_attachment,
         )
         .await?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     info!(
         sandbox_id = %id,
@@ -714,10 +712,7 @@ pub(super) async fn handle_get_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
-    let mut sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
+    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -768,17 +763,12 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
-    let mut page = state
+    let page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
-    // Project only the selected page so observation authority cannot change
-    // the store's ordering or continuation cursor.
-    for sandbox in &mut page.messages {
-        state.supervisor_sessions.project_endpoint_status(sandbox);
-    }
     Ok(Response::new(ListSandboxesResponse {
         sandboxes: page.messages,
         next_page_token,
@@ -1186,7 +1176,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached = Arc::new(AtomicBool::new(false));
     let attached_clone = attached.clone();
 
-    let mut sandbox = state
+    let sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1208,9 +1198,6 @@ pub(super) async fn handle_attach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     let attached = attached.load(Ordering::Relaxed);
 
@@ -1288,7 +1275,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached = Arc::new(AtomicBool::new(false));
     let detached_clone = detached.clone();
 
-    let mut sandbox = state
+    let sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1310,9 +1297,6 @@ pub(super) async fn handle_detach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     let detached = detached.load(Ordering::Relaxed);
 
@@ -1420,11 +1404,8 @@ async fn handle_stop_sandbox_inner(
         .await?
         .name;
     let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    let mut sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
     state.sandbox_auth_sessions.deactivate(current.object_id());
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -1469,29 +1450,41 @@ async fn handle_start_sandbox_inner(
         .await?
         .name;
     let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    let launch_authentication = if current.phase() == SandboxPhase::Ready as i32 {
-        Vec::new()
-    } else if let Some(authentication) = state
-        .sandbox_auth_sessions
-        .authentication(current.object_id())
-    {
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else if let Some(authority) = &state.sandbox_session_jwt_authority {
-        let authentication = mint_and_persist_successor(state, &current).await?;
-        state
+    let (launch_authentication, pending_successor) =
+        if current.phase() == SandboxPhase::Ready as i32 {
+            (Vec::new(), false)
+        } else if let Some(authentication) = state
             .sandbox_auth_sessions
-            .activate(current.object_id(), &authentication, authority)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else {
-        Vec::new()
-    };
+            .authentication(current.object_id())
+        {
+            (
+                serde_json::to_vec(&authentication).map_err(|error| {
+                    Status::internal(format!("encode launch authentication: {error}"))
+                })?,
+                false,
+            )
+        } else if let Some(authority) = &state.sandbox_session_jwt_authority {
+            let authentication = mint_and_persist_successor(state, &current).await?;
+            state
+                .sandbox_auth_sessions
+                .activate(current.object_id(), &authentication, authority)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            (
+                serde_json::to_vec(&authentication).map_err(|error| {
+                    Status::internal(format!("encode launch authentication: {error}"))
+                })?,
+                true,
+            )
+        } else {
+            (Vec::new(), false)
+        };
     let mut sandbox = state
         .compute
         .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
         .await?;
+    if pending_successor {
+        mark_session_successor_committed(state, sandbox.object_id()).await?;
+    }
     state
         .supervisor_sessions
         .project_endpoint_status(&mut sandbox);
@@ -1516,9 +1509,15 @@ pub async fn mint_and_persist_successor(
     let current =
         crate::auth::sandbox_session::PersistedSessionLineage::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let authentication = authority.mint_successor_launch(sandbox.object_id(), &current)?;
-    let next =
-        crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(&authentication);
+    let authentication = if current.pending {
+        authority.mint_persisted_launch(sandbox.object_id(), &current)?
+    } else {
+        authority.mint_successor_launch(sandbox.object_id(), &current)?
+    };
+    let next = crate::auth::sandbox_session::PersistedSessionLineage::from_authentication(
+        &authentication,
+        true,
+    );
     state
         .store
         .update_message_cas::<Sandbox, _>(
@@ -1533,6 +1532,25 @@ pub async fn mint_and_persist_successor(
         .await
         .map_err(|error| Status::aborted(format!("persist sandbox session successor: {error}")))?;
     Ok(authentication)
+}
+
+pub async fn mark_session_successor_committed(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.insert(
+                    crate::auth::sandbox_session::SESSION_PENDING_ANNOTATION.to_string(),
+                    false.to_string(),
+                );
+            }
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| Status::aborted(format!("commit sandbox session successor: {error}")))
 }
 
 async fn sandbox_by_name(
@@ -1668,10 +1686,7 @@ pub(super) async fn handle_watch_sandbox(
 
             // Re-read the snapshot now that we have subscriptions active.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                Ok(Some(mut sandbox)) => {
-                    state
-                        .supervisor_sessions
-                        .project_endpoint_status(&mut sandbox);
+                Ok(Some(sandbox)) => {
                     state.sandbox_index.update_from_sandbox(&sandbox);
                     let _ = tx
                         .send(Ok(SandboxStreamEvent {
@@ -1753,10 +1768,7 @@ pub(super) async fn handle_watch_sandbox(
                         match res {
                             Ok(()) => {
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                    Ok(Some(mut sandbox)) => {
-                                        state
-                                            .supervisor_sessions
-                                            .project_endpoint_status(&mut sandbox);
+                                    Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
                                         if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
@@ -6434,110 +6446,6 @@ mod tests {
         assert_eq!(
             final_sandbox.metadata.as_ref().unwrap().resource_version,
             initial_version + 1
-        );
-    }
-
-    #[tokio::test]
-    async fn list_sandboxes_projects_endpoint_status_across_pages() {
-        use openshell_core::proto::{EndpointResult, EndpointStatus};
-
-        let state = test_server_state().await;
-        let endpoint = EndpointStatus {
-            endpoint_id: "endpoint:v1:tools".to_string(),
-            host: "tools.example.com".to_string(),
-            ports: vec![443],
-            path: "/mcp".to_string(),
-            last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-15T01:00:00.000Z".to_string(),
-        };
-        for name in ["alpha", "beta", "gamma"] {
-            let mut sandbox = test_sandbox(name, Vec::new());
-            sandbox
-                .status
-                .as_mut()
-                .expect("sandbox status")
-                .endpoint_statuses = vec![endpoint.clone()];
-            state.store.put_message(&sandbox).await.unwrap();
-        }
-
-        // Only alpha has a live observation authority; the other persisted
-        // results must be reset in responses, including on the second page.
-        let (session_tx, _session_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        state.supervisor_sessions.register(
-            "sandbox-alpha".to_string(),
-            "session-alpha".to_string(),
-            session_tx,
-            shutdown_tx,
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .initialize_endpoint_status_authority("sandbox-alpha", "session-alpha")
-        );
-
-        let request = ListSandboxesRequest {
-            page_size: 2,
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-            ..Default::default()
-        };
-        let first_page = handle_list_sandboxes(&state, authed_request(request.clone()))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            first_page
-                .sandboxes
-                .iter()
-                .map(ObjectName::object_name)
-                .collect::<Vec<_>>(),
-            ["alpha", "beta"]
-        );
-        assert!(!first_page.next_page_token.is_empty());
-        let second_page = handle_list_sandboxes(
-            &state,
-            authed_request(ListSandboxesRequest {
-                page_token: first_page.next_page_token,
-                ..request
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(second_page.sandboxes.len(), 1);
-        assert_eq!(second_page.sandboxes[0].object_name(), "gamma");
-        assert!(second_page.next_page_token.is_empty());
-
-        let unknown = EndpointStatus {
-            last_result: EndpointResult::NoObservedExchange as i32,
-            last_reported_at: String::new(),
-            ..endpoint.clone()
-        };
-        for (sandbox, expected_endpoint) in [
-            (&first_page.sandboxes[0], &endpoint),
-            (&first_page.sandboxes[1], &unknown),
-            (&second_page.sandboxes[0], &unknown),
-        ] {
-            let status = sandbox.status.as_ref().expect("sandbox status");
-            assert_eq!(status.phase, SandboxPhase::Ready as i32);
-            assert_eq!(
-                status.endpoint_statuses.as_slice(),
-                std::slice::from_ref(expected_endpoint)
-            );
-        }
-        // Read-time projection must not erase persisted reports.
-        let persisted = state
-            .store
-            .get_message::<Sandbox>("sandbox-gamma")
-            .await
-            .unwrap()
-            .expect("persisted sandbox");
-        assert_eq!(
-            persisted
-                .status
-                .expect("persisted status")
-                .endpoint_statuses,
-            [endpoint]
         );
     }
 
