@@ -238,13 +238,33 @@ pub fn run_worker(
         capability_scope: protocol.capability_scope().to_string(),
         elapsed_ms: seconds * 1_000.0,
         operations_per_second: operations as f64 / seconds,
-        throughput_mbit_per_second: operations as f64 * payload_bytes as f64 * 8.0
-            / seconds
-            / 1_000_000.0,
+        throughput_mbit_per_second: throughput_mbit_per_second(
+            protocol,
+            operations,
+            payload_bytes,
+            seconds,
+        ),
         latency_ns_p50: percentile(&samples, 50),
         latency_ns_p95: percentile(&samples, 95),
         latency_ns_p99: percentile(&samples, 99),
     })
+}
+
+/// Report application bytes transferred by the measured operation. A TCP
+/// stream operation writes one payload and reads its echo, so both directions
+/// count. A connect-only operation transfers no application payload.
+#[allow(clippy::cast_precision_loss)]
+fn throughput_mbit_per_second(
+    protocol: Protocol,
+    operations: u64,
+    payload_bytes: usize,
+    seconds: f64,
+) -> f64 {
+    let bytes_per_operation = match protocol {
+        Protocol::TcpConnect => 0,
+        Protocol::TcpStream => payload_bytes.saturating_mul(2),
+    };
+    operations as f64 * bytes_per_operation as f64 * 8.0 / seconds / 1_000_000.0
 }
 
 impl Protocol {
@@ -325,5 +345,19 @@ mod tests {
         assert_eq!(percentile(&samples, 50), 50);
         assert_eq!(percentile(&samples, 95), 95);
         assert_eq!(percentile(&samples, 99), 99);
+    }
+
+    #[test]
+    fn tcp_connect_never_reports_payload_throughput() {
+        let small_payload = throughput_mbit_per_second(Protocol::TcpConnect, 1_000, 64, 1.0);
+        let large_payload = throughput_mbit_per_second(Protocol::TcpConnect, 1_000, 65_507, 1.0);
+        assert!(small_payload.abs() < f64::EPSILON);
+        assert!(large_payload.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tcp_stream_counts_request_and_echo_bytes() {
+        let throughput = throughput_mbit_per_second(Protocol::TcpStream, 1_000, 64, 1.0);
+        assert!((throughput - 1.024).abs() < f64::EPSILON);
     }
 }
