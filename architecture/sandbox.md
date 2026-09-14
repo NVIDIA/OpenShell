@@ -473,6 +473,52 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Supervisor Configuration Delivery
+
+The gateway and supervisor must implement the same internal supervisor protocol
+revision. Peers built before the handshake existed report revision zero and are
+accepted for one release with a warning and a counter, because sandboxes keep
+their supervisor binary until they are recreated. The gateway includes a configuration bootstrap when it accepts a
+`ConnectSupervisor` session and can send complete component replacements on the
+same stream after policy, settings, or provider state changes.
+While polling remains authoritative, optional bootstrap construction has a
+one-second budget. The gateway accepts the session without a bootstrap when
+that budget expires, so slow credential backends do not block relay reconnects.
+These payloads describe the latest effective state rather than
+the mutation that produced it. The gateway assigns ordering sequences within
+each session and component, while each snapshot retains its own content
+revision.
+
+Bootstrap components are independent read projections, not one atomic database
+snapshot. The sandbox configuration carries the provider-environment revision
+it was built against. The gateway retries bootstrap construction when that
+revision does not match the provider snapshot. Later component updates and
+polling repair changes committed while the other projections were being built.
+
+Configuration delivery goes through a gateway-owned routing boundary rather
+than exposing local supervisor channels to mutation handlers. The current
+implementation routes only to a supervisor connected to the same gateway
+process. The asynchronous router contract can resolve a remote owner later
+without changing publishers. Provider payloads can contain
+credentials, so the gateway does not persist or render complete stream
+messages in logs.
+
+The supervisor currently parses and ignores stream-delivered configuration.
+Polling remains the only path that changes runtime state and repairs dropped or
+unavailable delivery. The gateway serializes construction per sandbox and
+component, and coalesces repeated mutations into the latest full snapshot. An
+enqueue result means only that the local stream queue accepted the message. A
+bounded scope fanout scheduler coalesces repeated workspace and global changes,
+and semaphores sized from the database pool bound delivery workers and snapshot
+builds. Fanout waits for worker capacity before admitting each recipient, so a
+fleet-wide change cannot create a fleet-sized task backlog or saturate the store
+and credential backends. Snapshot construction has a deadline that starts once
+a build holds a permit, and the gateway rejects encoded stream messages that
+approach the transport decoder limit. A later migration will apply these
+payloads directly and acknowledge their exact revisions before removing
+supervisor polling. At that point, the gateway will require a valid bootstrap
+before marking a session ready.
+
 ## Policy Revision Acknowledgement
 
 When the supervisor loads a sandbox-scoped policy from the gateway, it retains

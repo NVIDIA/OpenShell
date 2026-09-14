@@ -234,9 +234,10 @@ type OpenShellClient interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Peers must report the same exact protocol_revision during the
+	// handshake. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
@@ -1224,9 +1225,10 @@ type OpenShellServer interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Peers must report the same exact protocol_revision during the
+	// handshake. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)

@@ -1175,6 +1175,14 @@ pub(super) async fn handle_attach_sandbox_provider(
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
+    if attached {
+        crate::config_delivery::publish_sandbox_components(
+            state,
+            &sandbox_id,
+            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+        );
+        state.sandbox_watch_bus.notify(&sandbox_id);
+    }
 
     info!(
         sandbox_name = %request.sandbox_name,
@@ -1274,6 +1282,14 @@ pub(super) async fn handle_detach_sandbox_provider(
         .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
 
     let detached = detached.load(Ordering::Relaxed);
+    if detached {
+        crate::config_delivery::publish_sandbox_components(
+            state,
+            &sandbox_id,
+            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+        );
+        state.sandbox_watch_bus.notify(&sandbox_id);
+    }
 
     info!(
         sandbox_name = %request.sandbox_name,

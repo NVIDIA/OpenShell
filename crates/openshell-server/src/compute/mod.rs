@@ -989,6 +989,18 @@ impl ComputeRuntime {
                 }
             })?;
 
+        if let Err(status) = Box::pin(crate::grpc::policy::initialize_policy_history(
+            self.store.as_ref(),
+            &sandbox,
+            crate::grpc::policy::InitialPolicyHistoryStatus::Pending,
+        ))
+        .await
+        {
+            let _ = self.store.delete(Sandbox::object_type(), &sandbox_id).await;
+            self.sandbox_index.remove_sandbox(&sandbox_id);
+            return Err(status);
+        }
+
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -1028,6 +1040,10 @@ impl ComputeRuntime {
             Err(status) if status.code() == Code::AlreadyExists => {
                 let _ = self
                     .store
+                    .delete_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id())
+                    .await;
+                let _ = self
+                    .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
                     .await;
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
@@ -1036,12 +1052,20 @@ impl ComputeRuntime {
             Err(status) if status.code() == Code::FailedPrecondition => {
                 let _ = self
                     .store
+                    .delete_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id())
+                    .await;
+                let _ = self
+                    .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
                     .await;
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
             }
             Err(err) => {
+                let _ = self
+                    .store
+                    .delete_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id())
+                    .await;
                 let _ = self
                     .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
@@ -4938,6 +4962,7 @@ pub async fn new_test_runtime_with_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy_store::PolicyStoreExt;
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
@@ -11238,6 +11263,36 @@ mod tests {
             1,
             "database should have resource_version: 1 after create"
         );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_persists_initial_policy_revision() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record(
+            "sb-initial-policy",
+            "initial-policy",
+            SandboxPhase::Provisioning,
+        );
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        });
+
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+
+        let revision = runtime
+            .store
+            .get_latest_policy("sb-initial-policy")
+            .await
+            .unwrap()
+            .expect("initial policy revision");
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            revision.policy_hash,
+            crate::grpc::policy::deterministic_policy_hash(&policy)
+        );
+        assert_eq!(revision.status, "pending");
     }
 
     #[tokio::test]
