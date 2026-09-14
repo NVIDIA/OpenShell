@@ -42,6 +42,7 @@ pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
+pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 
 pub struct ProxyCaMaterial {
     pub certificate_pem: String,
@@ -75,6 +76,7 @@ pub struct SandboxRuntimeNames {
     pub boundary_service: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
+    pub supervisor_policy: String,
 }
 
 impl SandboxRuntimeNames {
@@ -87,6 +89,7 @@ impl SandboxRuntimeNames {
             boundary_service: format!("os-boundary-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
+            supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
         }
     }
 
@@ -121,6 +124,7 @@ pub fn workload_fence(
     KubernetesSandboxRuntimeNetworkFenceSpec {
         namespace: namespace.to_string(),
         policy_name: names.workload_policy.clone(),
+        supervisor_policy_name: names.supervisor_policy.clone(),
         boundary_port,
     }
     .provision()
