@@ -18,6 +18,7 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
 tonic-prost = { workspace = true }
+tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }

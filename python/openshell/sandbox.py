@@ -28,6 +28,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
+from .errors import _error_mapping_channel
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -618,7 +619,9 @@ class SandboxClient:
                 self._channel,
                 _BearerAuthInterceptor(provider),
             )
-        self._stub = openshell_pb2_grpc.OpenShellStub(self._channel)
+        self._stub = openshell_pb2_grpc.OpenShellStub(
+            _error_mapping_channel(self._channel)
+        )
 
     @classmethod
     def from_active_cluster(
@@ -1175,7 +1178,7 @@ class SandboxTemplateClient:
     """gRPC client for reusable sandbox template lifecycle operations."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
-        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._stub = openshell_pb2_grpc.OpenShellStub(_error_mapping_channel(channel))
         self._timeout = timeout
 
     @classmethod
@@ -1355,7 +1358,7 @@ class WorkspaceClient:
     """gRPC client for workspace lifecycle operations."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
-        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._stub = openshell_pb2_grpc.OpenShellStub(_error_mapping_channel(channel))
         self._timeout = timeout
 
     @classmethod
