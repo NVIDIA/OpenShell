@@ -14,8 +14,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use k8s_openapi::api::networking::v1::{
-    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
-    NetworkPolicySpec,
+    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+    NetworkPolicyPort, NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -47,6 +47,7 @@ const SUPERVISOR_ROLE: &str = "supervisor";
 pub struct KubernetesSandboxRuntimeNetworkFenceSpec {
     pub namespace: String,
     pub policy_name: String,
+    pub supervisor_policy_name: String,
     pub boundary_port: u16,
 }
 
@@ -55,6 +56,7 @@ pub struct KubernetesSandboxRuntimeNetworkFence {
     pub workload_labels: BTreeMap<String, String>,
     pub control_labels: BTreeMap<String, String>,
     pub workload_policy: NetworkPolicy,
+    pub supervisor_policy: NetworkPolicy,
 }
 
 impl KubernetesSandboxRuntimeNetworkFenceSpec {
@@ -72,7 +74,7 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
         let workload_policy = NetworkPolicy {
             metadata: ObjectMeta {
                 name: Some(self.policy_name),
-                namespace: Some(self.namespace),
+                namespace: Some(self.namespace.clone()),
                 ..Default::default()
             },
             spec: Some(NetworkPolicySpec {
@@ -106,10 +108,31 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
             }),
         };
 
+        // Namespace-wide default-deny policies are additive with this rule.
+        // Select only OpenShell supervisor pods and explicitly allow their
+        // policy-approved DNS and upstream connections.
+        let supervisor_policy = NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some(self.supervisor_policy_name),
+                namespace: Some(self.namespace),
+                ..Default::default()
+            },
+            spec: Some(NetworkPolicySpec {
+                pod_selector: LabelSelector {
+                    match_labels: Some(control_labels.clone()),
+                    ..Default::default()
+                },
+                policy_types: Some(vec!["Egress".to_string()]),
+                egress: Some(vec![NetworkPolicyEgressRule::default()]),
+                ..Default::default()
+            }),
+        };
+
         KubernetesSandboxRuntimeNetworkFence {
             workload_labels,
             control_labels,
             workload_policy,
+            supervisor_policy,
         }
     }
 }
@@ -336,6 +359,7 @@ mod tests {
         let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
+            supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
             boundary_port: 5500,
         }
         .provision();
@@ -357,6 +381,7 @@ mod tests {
         let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
+            supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
             boundary_port: 5500,
         }
         .provision();
@@ -387,5 +412,30 @@ mod tests {
             .expect("rule has one port");
         assert_eq!(port.protocol.as_deref(), Some("TCP"));
         assert_eq!(port.port, Some(IntOrString::Int(5500)));
+    }
+
+    #[test]
+    fn network_fence_keeps_supervisor_egress_available() {
+        let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
+            namespace: "sandbox-ns".to_string(),
+            policy_name: "openshell-sandbox-workloads".to_string(),
+            supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
+            boundary_port: 5500,
+        }
+        .provision();
+
+        let policy_spec = fence
+            .supervisor_policy
+            .spec
+            .expect("supervisor policy has a spec");
+        assert_eq!(policy_spec.policy_types, Some(vec!["Egress".to_string()]));
+        assert_eq!(
+            policy_spec.pod_selector.match_labels,
+            Some(fence.control_labels)
+        );
+        assert_eq!(
+            policy_spec.egress,
+            Some(vec![NetworkPolicyEgressRule::default()])
+        );
     }
 }
