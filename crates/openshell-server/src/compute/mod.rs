@@ -2877,7 +2877,7 @@ impl ComputeRuntime {
                                 ),
                             ),
                             // Placeholder: platform_event_bus.publish() stamps the cursor.
-                            cursor: 0,
+                            cursor: String::new(),
                         },
                     );
                 }

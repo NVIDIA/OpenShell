@@ -39,11 +39,14 @@ pub enum ServiceStatus {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WatchEvent {
-    /// A server/supervisor log line. Carries a resume cursor.
-    Log { line: LogLine, cursor: u64 },
-    /// A platform event. Carries a resume cursor.
-    Event { event: PlatformEvent, cursor: u64 },
-    /// Recoverable loss — the stream continues. No cursor (0).
+    /// A server/supervisor log line. Carries an opaque resume cursor.
+    Log { line: LogLine, cursor: String },
+    /// A platform event. Carries an opaque resume cursor.
+    Event {
+        event: PlatformEvent,
+        cursor: String,
+    },
+    /// Recoverable loss — the stream continues. No cursor (empty).
     Warning { message: String },
 }
 
@@ -54,7 +57,12 @@ pub struct WatchOptions {
     pub follow_events: bool,
     pub log_sources: Vec<String>,
     pub log_min_level: Option<String>,
-    pub resume_after_cursor: u64,
+    /// Opaque cursor to resume after. Empty starts from the tail.
+    ///
+    /// Use a cursor taken from a [`WatchEvent`] of a previous watch on the same
+    /// sandbox. Do not construct or parse one: the encoding is not part of the
+    /// gateway's contract.
+    pub resume_after_cursor: String,
     pub log_tail_lines: u32,
     pub event_tail: u32,
 }

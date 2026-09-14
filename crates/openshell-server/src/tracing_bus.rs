@@ -12,6 +12,9 @@ use tokio::sync::broadcast;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use uuid::Uuid;
+
+use crate::watch_cursor::WatchCursor;
 
 /// Bus that publishes server log lines keyed by sandbox id.
 #[derive(Debug, Clone)]
@@ -26,10 +29,22 @@ struct Inner {
     per_id: HashMap<String, PerSandbox>,
 }
 
+/// A buffered or broadcast stream event paired with its raw sequence number.
+///
+/// The wire `SandboxStreamEvent.cursor` is an opaque token; ordering decisions
+/// must not depend on its encoding. Carrying the seq alongside keeps every
+/// comparison on the watch path numeric, so no consumer parses the token to
+/// decide whether an event has already been delivered.
+#[derive(Debug, Clone)]
+pub(crate) struct CursoredEvent {
+    pub(crate) seq: u64,
+    pub(crate) event: SandboxStreamEvent,
+}
+
 #[derive(Debug, Clone)]
 struct PerSandbox {
-    sender: broadcast::Sender<SandboxStreamEvent>,
-    tail: VecDeque<(u64, SandboxStreamEvent)>,
+    sender: broadcast::Sender<CursoredEvent>,
+    tail: VecDeque<CursoredEvent>,
     /// Highest seq this bus has evicted from `tail`. 0 = nothing trimmed.
     ///
     /// Under the shared cursor space each bus's tail is non-contiguous in the
@@ -57,6 +72,28 @@ pub struct ResumeGap {
     pub oldest_available: u64,
 }
 
+/// One sandbox's cursor space: an identity plus its running sequence.
+///
+/// The epoch is what makes a cursor verifiable. Sequence numbers restart at 1
+/// whenever a space is recreated, so a bare number from a previous space can
+/// look like a valid position in the current one. Minting a fresh epoch with
+/// the entry means every reset produces a distinguishable space, and a resume
+/// cursor can be checked against the identity that issued it rather than
+/// against a plausible range.
+#[derive(Debug, Clone)]
+struct CursorSpace {
+    epoch: Uuid,
+    next: u64,
+}
+
+/// Identity and extent of a sandbox's current cursor space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorSpaceInfo {
+    pub(crate) epoch: Uuid,
+    /// Highest sequence issued so far. `0` means nothing published yet.
+    pub(crate) highest_seq: u64,
+}
+
 /// Per-sandbox monotonic sequence allocator.
 ///
 /// Shared across the resumable buses (`TracingLogBus`, `PlatformEventBus`) so
@@ -65,7 +102,7 @@ pub struct ResumeGap {
 /// reconnects, which is what a single `resume_after_cursor` needs.
 #[derive(Debug, Clone, Default)]
 struct SeqAllocator {
-    inner: Arc<Mutex<HashMap<String, u64>>>,
+    inner: Arc<Mutex<HashMap<String, CursorSpace>>>,
 }
 
 impl SeqAllocator {
@@ -79,39 +116,50 @@ impl SeqAllocator {
     ///
     /// The lock order is always allocator -> bus map. No path takes a bus map
     /// lock and then reaches for the allocator, so the nesting cannot deadlock.
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, CursorSpace>> {
         self.inner.lock().expect("seq allocator lock poisoned")
     }
 
-    /// Take the next sequence number for this sandbox from a locked space.
+    /// Take the next `(epoch, seq)` for this sandbox from a locked space.
     ///
-    /// Seq starts at 1 so the proto default `resume_after_cursor` (0) means
-    /// "from the beginning" without skipping event 1.
-    fn next_locked(counters: &mut HashMap<String, u64>, sandbox_id: &str) -> u64 {
-        let counter = counters.entry(sandbox_id.to_string()).or_insert(1);
-        let seq = *counter;
-        *counter += 1;
-        seq
+    /// Seq starts at 1 so an empty `resume_after_cursor` means "from the
+    /// beginning" without skipping event 1.
+    ///
+    /// The epoch is minted on the vacant path only — once per cursor space, not
+    /// once per publish — so generating it under the allocator lock costs
+    /// nothing on the hot path.
+    fn next_locked(spaces: &mut HashMap<String, CursorSpace>, sandbox_id: &str) -> (Uuid, u64) {
+        let space = spaces
+            .entry(sandbox_id.to_string())
+            .or_insert_with(|| CursorSpace {
+                epoch: Uuid::new_v4(),
+                next: 1,
+            });
+        let seq = space.next;
+        space.next += 1;
+        (space.epoch, seq)
     }
 
-    /// Highest cursor handed out for this sandbox, or `0` when none is.
+    /// Identity and extent of this sandbox's space, or `None` when no event has
+    /// been published into it.
     ///
-    /// Bounds the current cursor space. A resume cursor above this belongs to a
-    /// previous space (gateway restart, or the sandbox's buses were removed and
-    /// recreated), because the counter restarts at 1 with no memory of the
-    /// cursors it already issued.
-    fn highest_allocated(&self, sandbox_id: &str) -> u64 {
-        self.lock()
-            .get(sandbox_id)
-            .map_or(0, |next| next.saturating_sub(1))
+    /// A resume cursor is validated against this: a different epoch means the
+    /// cursor belongs to a space that no longer exists, and `None` means there
+    /// is no space to resume into at all. An empty `tail_after` result is not
+    /// on its own proof that a cursor is still valid.
+    fn space(&self, sandbox_id: &str) -> Option<CursorSpaceInfo> {
+        self.lock().get(sandbox_id).map(|space| CursorSpaceInfo {
+            epoch: space.epoch,
+            highest_seq: space.next.saturating_sub(1),
+        })
     }
 }
 
 fn tail_after_impl(
-    tail: &VecDeque<(u64, SandboxStreamEvent)>,
+    tail: &VecDeque<CursoredEvent>,
     last_trimmed_seq: u64,
     after_seq: u64,
-) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+) -> Result<Vec<CursoredEvent>, ResumeGap> {
     // Gap iff this bus dropped an event the client still needs, i.e. the
     // highest seq we evicted is newer than the client's position. Judged only
     // on this bus's own evictions — the other bus owns the seqs missing here.
@@ -125,10 +173,10 @@ fn tail_after_impl(
     // Skippable events (seq <= after_seq) are the oldest, at the front, so a
     // take-while would stop before reaching the wanted ones. Filter the whole
     // tail instead; order is preserved and caught-up yields an empty vec.
-    let res: Vec<SandboxStreamEvent> = tail
+    let res: Vec<CursoredEvent> = tail
         .iter()
-        .filter(|(seq, _)| *seq > after_seq)
-        .map(|(_, event)| event.clone())
+        .filter(|cursored| cursored.seq > after_seq)
+        .cloned()
         .collect();
 
     Ok(res)
@@ -162,7 +210,7 @@ impl TracingLogBus {
         }
     }
 
-    fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
+    fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<CursoredEvent> {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner
             .per_id
@@ -172,7 +220,7 @@ impl TracingLogBus {
             .clone()
     }
 
-    pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<SandboxStreamEvent> {
+    pub(crate) fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<CursoredEvent> {
         self.sender_for(sandbox_id).subscribe()
     }
 
@@ -187,51 +235,50 @@ impl TracingLogBus {
     /// on its own: a publisher that had already allocated a cursor would insert
     /// it into a recreated entry after the maps were cleared, and the next
     /// publisher would restart at 1 behind it.
+    ///
+    /// Dropping the allocator entry retires the epoch with it, so the next
+    /// publish mints a new one. Cursors handed out before this call are
+    /// therefore rejected on resume rather than mistaken for positions in the
+    /// replacement space. Both broadcast senders are dropped here too, so a
+    /// stream that was live across the reset ends rather than silently
+    /// continuing into a different space.
     pub fn remove(&self, sandbox_id: &str) {
-        let mut counters = self.seq.lock();
+        let mut spaces = self.seq.lock();
         {
             let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
             inner.per_id.remove(sandbox_id);
         }
-        // Takes only the platform bus map lock; never reaches for `counters`.
+        // Takes only the platform bus map lock; never reaches for `spaces`.
         self.platform_event_bus.remove(sandbox_id);
-        counters.remove(sandbox_id);
+        spaces.remove(sandbox_id);
     }
 
-    pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
+    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner
             .per_id
             .get(sandbox_id)
-            .map(|d| {
-                d.tail
-                    .iter()
-                    .rev()
-                    .take(max)
-                    .map(|(_seq, event)| event.clone())
-                    .collect::<Vec<_>>()
-            })
+            .map(|d| d.tail.iter().rev().take(max).cloned().collect::<Vec<_>>())
             .unwrap_or_default()
             .into_iter()
             .rev()
-            .collect::<Vec<SandboxStreamEvent>>()
+            .collect::<Vec<CursoredEvent>>()
     }
 
-    /// Highest cursor issued in the current cursor space for this sandbox.
+    /// Identity and extent of this sandbox's current cursor space.
     ///
-    /// `0` means nothing has been published yet. Callers resuming from a client
-    /// cursor use this to tell "caught up" apart from "cursor belongs to a
-    /// cursor space that no longer exists": an empty `tail_after` result is not
-    /// on its own proof that the cursor is still valid.
-    pub fn highest_cursor(&self, sandbox_id: &str) -> u64 {
-        self.seq.highest_allocated(sandbox_id)
+    /// `None` means nothing has been published for the sandbox, so there is no
+    /// space to resume into. Takes only the allocator lock, never the bus map,
+    /// so it cannot invert the documented allocator -> bus map order.
+    pub(crate) fn cursor_space(&self, sandbox_id: &str) -> Option<CursorSpaceInfo> {
+        self.seq.space(sandbox_id)
     }
 
-    pub fn tail_after(
+    pub(crate) fn tail_after(
         &self,
         sandbox_id: &str,
         after_seq: u64,
-    ) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.get(sandbox_id).map_or_else(
             || Ok(Vec::new()),
@@ -249,8 +296,9 @@ impl TracingLogBus {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log.clone(),
             )),
-            // Placeholder: publish() stamps the real cursor from next_seq.
-            cursor: 0,
+            // Placeholder: publish() stamps the real cursor from the sandbox
+            // cursor space.
+            cursor: String::new(),
         };
         self.publish(&log.sandbox_id, evt, Self::DEFAULT_TAIL);
     }
@@ -262,9 +310,9 @@ impl TracingLogBus {
         // Hold the cursor space across the tail insert so a teardown cannot
         // reset the counter between allocation and insertion. Lock order is
         // allocator -> bus map, matching `remove`.
-        let mut counters = self.seq.lock();
-        let seq = SeqAllocator::next_locked(&mut counters, sandbox_id);
-        event.cursor = seq;
+        let mut spaces = self.seq.lock();
+        let (epoch, seq) = SeqAllocator::next_locked(&mut spaces, sandbox_id);
+        event.cursor = WatchCursor::new(epoch, seq).encode();
 
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         let per = inner
@@ -272,11 +320,12 @@ impl TracingLogBus {
             .entry(sandbox_id.to_string())
             .or_insert_with(PerSandbox::new);
 
-        let _ = per.sender.send(event.clone());
-        per.tail.push_back((seq, event));
+        let cursored = CursoredEvent { seq, event };
+        let _ = per.sender.send(cursored.clone());
+        per.tail.push_back(cursored);
         while per.tail.len() > tail_cap {
-            if let Some((trimmed, _)) = per.tail.pop_front() {
-                per.last_trimmed_seq = trimmed;
+            if let Some(trimmed) = per.tail.pop_front() {
+                per.last_trimmed_seq = trimmed.seq;
             }
         }
     }
@@ -318,8 +367,9 @@ where
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log,
             )),
-            // Placeholder: publish() stamps the real cursor from next_seq.
-            cursor: 0,
+            // Placeholder: publish() stamps the real cursor from the sandbox
+            // cursor space.
+            cursor: String::new(),
         };
         self.bus.publish(&sandbox_id, evt, self.default_tail);
     }
@@ -373,32 +423,45 @@ mod tests {
         }
     }
 
+    /// Fixed epoch for hand-built events, so encoded cursors are deterministic.
+    fn test_epoch() -> Uuid {
+        Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("valid uuid")
+    }
+
     /// Build a stream event carrying `seq` in its cursor for assertion.
     fn stream_event(seq: u64) -> SandboxStreamEvent {
         SandboxStreamEvent {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 make_log_event("sb", &seq.to_string()),
             )),
-            cursor: seq,
+            cursor: WatchCursor::new(test_epoch(), seq).encode(),
+        }
+    }
+
+    /// Build a buffered event stamped at `seq`.
+    fn cursored(seq: u64) -> CursoredEvent {
+        CursoredEvent {
+            seq,
+            event: stream_event(seq),
         }
     }
 
     /// Build a contiguous tail with seqs `lo..=hi`.
-    fn tail_of(lo: u64, hi: u64) -> VecDeque<(u64, SandboxStreamEvent)> {
-        (lo..=hi).map(|s| (s, stream_event(s))).collect()
+    fn tail_of(lo: u64, hi: u64) -> VecDeque<CursoredEvent> {
+        (lo..=hi).map(cursored).collect()
     }
 
-    /// Extract cursors from a run of events, in order.
-    fn cursors(events: &[SandboxStreamEvent]) -> Vec<u64> {
-        events.iter().map(|e| e.cursor).collect()
+    /// Extract seqs from a run of buffered events, in order.
+    fn cursors(events: &[CursoredEvent]) -> Vec<u64> {
+        events.iter().map(|c| c.seq).collect()
     }
 
     #[test]
     fn tail_after_impl_empty_tail_returns_empty() {
         let tail = VecDeque::new();
         // Nothing trimmed (last_trimmed_seq = 0): any cursor is serviceable.
-        assert_eq!(tail_after_impl(&tail, 0, 0).unwrap(), Vec::new());
-        assert_eq!(tail_after_impl(&tail, 0, 42).unwrap(), Vec::new());
+        assert!(tail_after_impl(&tail, 0, 0).unwrap().is_empty());
+        assert!(tail_after_impl(&tail, 0, 42).unwrap().is_empty());
     }
 
     #[test]
@@ -419,7 +482,7 @@ mod tests {
     fn tail_after_impl_caught_up_returns_empty() {
         let tail = tail_of(1, 5);
         // Cursor at the newest seq: nothing newer, but not a gap.
-        assert_eq!(tail_after_impl(&tail, 0, 5).expect("ok"), Vec::new());
+        assert!(tail_after_impl(&tail, 0, 5).expect("ok").is_empty());
     }
 
     #[test]
@@ -427,7 +490,7 @@ mod tests {
         let tail = tail_of(1, 5);
         // Cursor beyond newest (client claims to have seen more than exists):
         // still serviceable, just nothing to send.
-        assert_eq!(tail_after_impl(&tail, 0, 99).expect("ok"), Vec::new());
+        assert!(tail_after_impl(&tail, 0, 99).expect("ok").is_empty());
     }
 
     #[test]
@@ -459,10 +522,7 @@ mod tests {
         // Simulate the shared cursor space: this bus only owns seqs 2 and 4
         // (the other bus owns 1 and 3), and never trimmed. Resuming from 0 must
         // not report a gap just because seq 1 is absent here.
-        let tail: VecDeque<(u64, SandboxStreamEvent)> =
-            [(2, stream_event(2)), (4, stream_event(4))]
-                .into_iter()
-                .collect();
+        let tail: VecDeque<CursoredEvent> = [cursored(2), cursored(4)].into_iter().collect();
         let events = tail_after_impl(&tail, 0, 0).expect("no gap");
         assert_eq!(cursors(&events), vec![2, 4]);
     }
@@ -481,7 +541,7 @@ mod tests {
         );
         assert_eq!(cursors(&bus.tail_after(sandbox_id, 2).unwrap()), vec![3]);
         // Unknown sandbox: no entry, nothing buffered, no gap.
-        assert_eq!(bus.tail_after("nope", 5).unwrap(), Vec::new());
+        assert!(bus.tail_after("nope", 5).unwrap().is_empty());
     }
 
     #[test]
@@ -540,12 +600,87 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_publish_and_remove_keeps_cursors_monotonic() {
-        // Teardown resets the shared allocator while both buses can still
-        // accept a publish. Unless the whole sequence is atomic against
-        // publication, a publisher that allocated before the reset inserts its
-        // old cursor into a recreated entry, and the next publisher restarts at
-        // 1 behind it -- leaving a tail whose cursors go backwards.
+    fn cursor_space_is_absent_until_first_publish() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-epoch-lazy";
+
+        assert_eq!(bus.cursor_space(sandbox_id), None);
+
+        // Subscribing must not mint a space. `sender_for` touches only the bus
+        // map, never the allocator -- and the watch handler subscribes before
+        // it validates the resume cursor. If a subscription could manufacture
+        // an epoch, a client resuming against a torn-down sandbox would create
+        // the very space its stale cursor is then checked against.
+        let _log_rx = bus.subscribe(sandbox_id);
+        let _platform_rx = bus.platform_event_bus.subscribe(sandbox_id);
+        assert_eq!(bus.cursor_space(sandbox_id), None);
+
+        bus.publish_external(make_log_event(sandbox_id, "first"));
+        let space = bus.cursor_space(sandbox_id).expect("space after publish");
+        assert_eq!(space.highest_seq, 1);
+    }
+
+    #[test]
+    fn publish_after_remove_starts_a_new_epoch() {
+        // The defect this whole mechanism exists for: teardown restarts seqs at
+        // 1, so a cursor from before the reset is numerically indistinguishable
+        // from a position in the new space. A fresh epoch makes it distinct.
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-epoch-reset";
+
+        bus.publish_external(make_log_event(sandbox_id, "a"));
+        bus.publish_external(make_log_event(sandbox_id, "b"));
+        let before = bus.cursor_space(sandbox_id).expect("space exists");
+        assert_eq!(before.highest_seq, 2);
+
+        bus.remove(sandbox_id);
+        assert_eq!(bus.cursor_space(sandbox_id), None);
+
+        bus.publish_external(make_log_event(sandbox_id, "c"));
+        let after = bus.cursor_space(sandbox_id).expect("space recreated");
+
+        assert_ne!(before.epoch, after.epoch, "teardown must retire the epoch");
+        // Seq alone cannot tell the spaces apart -- that is the point.
+        assert_eq!(after.highest_seq, 1);
+    }
+
+    #[test]
+    fn log_and_platform_publishes_share_one_epoch() {
+        // Both buses draw from one allocator, so a cursor observed on either
+        // resumes both. Separate epochs would make a merged resume impossible.
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-epoch-shared";
+
+        bus.publish_external(make_log_event(sandbox_id, "a"));
+        let after_log = bus.cursor_space(sandbox_id).expect("space exists");
+
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0));
+        let after_platform = bus.cursor_space(sandbox_id).expect("space exists");
+
+        assert_eq!(after_log.epoch, after_platform.epoch);
+        assert_eq!(after_platform.highest_seq, 2);
+
+        let log_cursor = &bus.tail(sandbox_id, 10)[0].event.cursor;
+        let platform_cursor = &bus.platform_event_bus.tail(sandbox_id, 10)[0].event.cursor;
+        assert_eq!(
+            WatchCursor::parse(log_cursor).expect("valid").epoch,
+            WatchCursor::parse(platform_cursor).expect("valid").epoch,
+        );
+    }
+
+    #[test]
+    fn concurrent_publish_and_remove_keeps_cursors_in_one_ascending_space() {
+        // Teardown retires the cursor space while both buses can still accept a
+        // publish. Unless the whole sequence is atomic against publication, a
+        // publisher that allocated before the reset inserts its old cursor into
+        // a recreated entry, and the next publisher restarts at 1 behind it --
+        // leaving a tail whose cursors go backwards, or worse, one that mixes
+        // two epochs.
+        //
+        // Both halves matter. Resume validation trusts that every cursor in a
+        // tail belongs to the epoch `cursor_space` reports, so a mixed tail
+        // would let a cursor pass the epoch check and still address the wrong
+        // events.
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-race";
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -571,14 +706,16 @@ mod tests {
         // stamped from a cursor space that no longer existed when it landed.
         for _ in 0..20_000 {
             bus.remove(sandbox_id);
-            let cursors: Vec<u64> = bus
+            let observed: Vec<WatchCursor> = bus
                 .tail(sandbox_id, usize::MAX)
                 .iter()
-                .map(|e| e.cursor)
+                .map(|c| WatchCursor::parse(&c.event.cursor).expect("bus stamps valid cursors"))
                 .collect();
             assert!(
-                cursors.windows(2).all(|w| w[0] < w[1]),
-                "tail cursors must stay strictly ascending, got {cursors:?}"
+                observed
+                    .windows(2)
+                    .all(|w| w[0].epoch == w[1].epoch && w[0].seq < w[1].seq),
+                "tail must stay in one epoch with strictly ascending seqs, got {observed:?}"
             );
         }
 
@@ -604,7 +741,7 @@ mod tests {
         // New publish should reach the new subscriber
         bus.publish_external(make_log_event(sandbox_id, "new message"));
         let evt = rx.try_recv().expect("should receive new event");
-        assert!(evt.payload.is_some());
+        assert!(evt.event.payload.is_some());
     }
 
     #[test]
@@ -647,7 +784,7 @@ mod tests {
         // Publish an event
         let evt = SandboxStreamEvent {
             payload: None,
-            cursor: 0,
+            cursor: String::new(),
         };
         bus.publish(sandbox_id, evt);
         assert!(rx.try_recv().is_ok());
@@ -674,7 +811,7 @@ mod tests {
         let mut new_rx = bus.subscribe(sandbox_id);
         let evt = SandboxStreamEvent {
             payload: None,
-            cursor: 0,
+            cursor: String::new(),
         };
         bus.publish(sandbox_id, evt);
         assert!(new_rx.try_recv().is_ok());
@@ -705,7 +842,7 @@ mod tests {
                     message: format!("Message {i}"),
                     metadata: HashMap::new(),
                 })),
-                cursor: 0,
+                cursor: String::new(),
             };
             bus.publish(sandbox_id, evt);
         }
@@ -715,8 +852,8 @@ mod tests {
         assert_eq!(events.len(), 5);
 
         // Verify order (oldest first)
-        for (i, evt) in events.iter().enumerate() {
-            if let Some(sandbox_stream_event::Payload::Event(ref e)) = evt.payload {
+        for (i, cursored) in events.iter().enumerate() {
+            if let Some(sandbox_stream_event::Payload::Event(ref e)) = cursored.event.payload {
                 assert_eq!(e.reason, format!("Event{i}"));
             } else {
                 panic!("expected Event payload");
@@ -726,10 +863,10 @@ mod tests {
         // Tail with smaller max should return most recent events
         let events = bus.tail(sandbox_id, 2);
         assert_eq!(events.len(), 2);
-        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].payload {
+        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].event.payload {
             assert_eq!(e.reason, "Event3");
         }
-        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[1].payload {
+        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[1].event.payload {
             assert_eq!(e.reason, "Event4");
         }
     }
@@ -748,7 +885,7 @@ mod tests {
 
         let evt = SandboxStreamEvent {
             payload: None,
-            cursor: 0,
+            cursor: String::new(),
         };
         bus.publish(sandbox_id, evt);
         assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
@@ -783,7 +920,7 @@ impl PlatformEventBus {
         }
     }
 
-    fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
+    fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<CursoredEvent> {
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
             .per_id
@@ -793,7 +930,7 @@ impl PlatformEventBus {
             .clone()
     }
 
-    pub(crate) fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<SandboxStreamEvent> {
+    pub(crate) fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<CursoredEvent> {
         self.sender_for(sandbox_id).subscribe()
     }
 
@@ -801,9 +938,9 @@ impl PlatformEventBus {
         // Hold the cursor space across the tail insert (same allocator -> map
         // lock order as `TracingLogBus::publish`), so teardown cannot reset the
         // counter underneath an in-flight publish.
-        let mut counters = self.seq.lock();
-        let seq = SeqAllocator::next_locked(&mut counters, sandbox_id);
-        event.cursor = seq;
+        let mut spaces = self.seq.lock();
+        let (epoch, seq) = SeqAllocator::next_locked(&mut spaces, sandbox_id);
+        event.cursor = WatchCursor::new(epoch, seq).encode();
 
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
         let per = inner
@@ -811,29 +948,23 @@ impl PlatformEventBus {
             .entry(sandbox_id.to_string())
             .or_insert_with(PerSandbox::new);
 
-        let _ = per.sender.send(event.clone());
-        per.tail.push_back((seq, event));
+        let cursored = CursoredEvent { seq, event };
+        let _ = per.sender.send(cursored.clone());
+        per.tail.push_back(cursored);
         while per.tail.len() > Self::DEFAULT_TAIL {
-            if let Some((trimmed, _)) = per.tail.pop_front() {
-                per.last_trimmed_seq = trimmed;
+            if let Some(trimmed) = per.tail.pop_front() {
+                per.last_trimmed_seq = trimmed.seq;
             }
         }
     }
 
     /// Return buffered platform events for replay to late subscribers.
-    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
+    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
             .per_id
             .get(sandbox_id)
-            .map(|d| {
-                d.tail
-                    .iter()
-                    .rev()
-                    .take(max)
-                    .map(|(_seq, event)| event.clone())
-                    .collect::<Vec<_>>()
-            })
+            .map(|d| d.tail.iter().rev().take(max).cloned().collect::<Vec<_>>())
             .unwrap_or_default()
             .into_iter()
             .rev()
@@ -844,7 +975,7 @@ impl PlatformEventBus {
         &self,
         sandbox_id: &str,
         after_seq: u64,
-    ) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner.per_id.get(sandbox_id).map_or_else(
             || Ok(Vec::new()),

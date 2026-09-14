@@ -1608,20 +1608,24 @@ message WatchSandboxRequest {
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
 
-  // Resume streaming after this cursor. 0 means no cursor resume: the server
-  // falls back to tail-limited replay controlled by log_tail_lines and
-  // event_tail. When greater than zero, set it to the highest
-  // `SandboxStreamEvent.cursor` already processed; the server replays only log
-  // and platform events after it, merged in cursor order, before resuming live
-  // delivery. If the requested cursor has already been trimmed from the
-  // server's buffer, the resume is unrecoverable and the stream terminates with
-  // OUT_OF_RANGE (see SandboxStreamWarning for the recoverable case).
+  // Resume streaming after this cursor. Empty means no cursor resume: the
+  // server falls back to tail-limited replay controlled by log_tail_lines and
+  // event_tail. Otherwise set it to the highest `SandboxStreamEvent.cursor`
+  // already processed; the server replays only log and platform events after
+  // it, merged in cursor order, before resuming live delivery. If the requested
+  // cursor has already been trimmed from the server's buffer, the resume is
+  // unrecoverable and the stream terminates with OUT_OF_RANGE (see
+  // SandboxStreamWarning for the recoverable case).
   //
-  // Cursors are only meaningful within one cursor space. A gateway restart, or
-  // teardown of the sandbox's buffers, starts a new space numbered from 1. A
-  // cursor above everything the current space has issued is rejected with
-  // OUT_OF_RANGE rather than silently suppressing live events beneath it.
-  uint64 resume_after_cursor = 11;
+  // A cursor is bound to the cursor space that issued it. A gateway restart,
+  // teardown of the sandbox's buffers, or a reconnect to a different gateway
+  // replica starts a new space, and cursors from the previous one are rejected
+  // with OUT_OF_RANGE rather than silently suppressing live events beneath
+  // them. OUT_OF_RANGE is terminal for that cursor: restart the watch with an
+  // empty resume_after_cursor, because retrying the same token fails
+  // identically. A cursor this server could not have issued is rejected with
+  // INVALID_ARGUMENT.
+  string resume_after_cursor = 11;
 }
 
 // One event in a sandbox watch stream.
@@ -1635,16 +1639,23 @@ message SandboxStreamEvent {
     PlatformEvent event = 3;
     // Recoverable warning from the server, e.g. messages dropped because a
     // broadcast receiver lagged. The stream continues after this warning; the
-    // client can detect the gap from cursor discontinuity.
+    // client can detect the gap from the warning itself.
     SandboxStreamWarning warning = 4;
     // Draft policy update notification.
     DraftPolicyUpdate draft_policy_update = 5;
   }
-  // Monotonic per-sandbox position shared across the resumable log and platform
-  // event sources. Pass the highest observed value as
+  // Opaque position in this sandbox's cursor space, shared across the resumable
+  // log and platform event sources. Empty for non-resumable events (status
+  // snapshots, warnings).
+  //
+  // Do not parse this token; its encoding is not part of the contract. The only
+  // supported operation is comparing two non-empty cursors observed on the same
+  // stream and keeping the greater one, then passing it as
   // WatchSandboxRequest.resume_after_cursor to resume without loss or
-  // duplication. 0 for non-resumable events (status snapshots, warnings).
-  uint64 cursor = 6;
+  // duplication. That comparison is a plain byte-wise string comparison. It is
+  // well defined only within one stream: a stream never spans two cursor
+  // spaces, because a reset ends it.
+  string cursor = 6;
 }
 
 // Log line correlated to a sandbox.
@@ -1663,8 +1674,9 @@ message SandboxLogLine {
 
 // Recoverable loss notification on a watch stream. Emitted when the server
 // skips ahead after a broadcast lag instead of terminating; the stream keeps
-// running. Unrecoverable loss (a trimmed resume cursor) is reported as an
-// OUT_OF_RANGE stream status, not this message.
+// running. Cursors are opaque, so this message is the only signal that events
+// were skipped. Unrecoverable loss (a trimmed or foreign resume cursor) is
+// reported as an OUT_OF_RANGE stream status, not this message.
 message SandboxStreamWarning {
   string message = 1;
 }

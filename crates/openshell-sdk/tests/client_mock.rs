@@ -111,7 +111,19 @@ fn sandbox_with_phase_ws(
     }
 }
 
-fn log_event(cursor: u64, msg: &str) -> proto::SandboxStreamEvent {
+/// Encode the wire cursor for `seq`, spelled out rather than built with the
+/// server's encoder.
+///
+/// The SDK treats cursors as opaque, so nothing in this crate can produce one.
+/// Writing the format by hand also pins it independently: the padding is what
+/// makes the SDK's byte-wise high-water comparison agree with sequence order,
+/// and a server-side change that dropped it would have to break this literal
+/// before it could break a client.
+fn test_cursor(seq: u64) -> String {
+    format!("v1:11111111-1111-4111-8111-111111111111:{seq:020}")
+}
+
+fn log_event(seq: u64, msg: &str) -> proto::SandboxStreamEvent {
     proto::SandboxStreamEvent {
         payload: Some(proto::sandbox_stream_event::Payload::Log(
             proto::SandboxLogLine {
@@ -124,7 +136,7 @@ fn log_event(cursor: u64, msg: &str) -> proto::SandboxStreamEvent {
                 fields: HashMap::new(),
             },
         )),
-        cursor,
+        cursor: test_cursor(seq),
     }
 }
 
@@ -135,7 +147,7 @@ fn warning_event(msg: &str) -> proto::SandboxStreamEvent {
                 message: msg.into(),
             },
         )),
-        cursor: 0,
+        cursor: String::new(),
     }
 }
 
@@ -1708,7 +1720,7 @@ async fn watch_logs_forwards_logs_and_warnings() {
 
     match stream.next().await.unwrap().unwrap() {
         WatchEvent::Log { line, cursor } => {
-            assert_eq!(cursor, 1);
+            assert_eq!(cursor, test_cursor(1));
             assert_eq!(line.message, "a");
         }
         e => panic!("expected log, got {e:?}"),
@@ -1718,10 +1730,10 @@ async fn watch_logs_forwards_logs_and_warnings() {
         stream.next().await.unwrap().unwrap(),
         WatchEvent::Warning { .. }
     ));
-    assert!(matches!(
-        stream.next().await.unwrap().unwrap(),
-        WatchEvent::Log { cursor: 2, .. }
-    ));
+    match stream.next().await.unwrap().unwrap() {
+        WatchEvent::Log { cursor, .. } => assert_eq!(cursor, test_cursor(2)),
+        e => panic!("expected log, got {e:?}"),
+    }
     assert!(stream.next().await.is_none());
 }
 
@@ -1748,15 +1760,16 @@ async fn watch_logs_resumes_after_reconnect() {
     tokio::pin!(stream);
     for want in [1u64, 2, 3] {
         assert!(
-            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == want)
+            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == test_cursor(want))
         );
     }
     assert!(stream.next().await.is_none());
 
     let reqs = state.last_watch_requests.lock().await;
     assert_eq!(reqs.len(), 2);
-    assert_eq!(reqs[0].resume_after_cursor, 0);
-    assert_eq!(reqs[1].resume_after_cursor, 2); // resumed from highest delivered
+    assert_eq!(reqs[0].resume_after_cursor, "");
+    // Resumed from the highest delivered cursor, forwarded verbatim.
+    assert_eq!(reqs[1].resume_after_cursor, test_cursor(2));
 }
 
 #[tokio::test]
@@ -1785,7 +1798,7 @@ async fn watch_logs_resumes_from_highest_cursor_when_arrival_is_unordered() {
     tokio::pin!(stream);
     for want in [3u64, 1, 4] {
         assert!(
-            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == want)
+            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == test_cursor(want))
         );
     }
     assert!(stream.next().await.is_none());
@@ -1794,7 +1807,45 @@ async fn watch_logs_resumes_from_highest_cursor_when_arrival_is_unordered() {
     assert_eq!(reqs.len(), 2);
     // Cursor 1 arrived last but must not rewind the resume point to 1, which
     // would make the gateway replay cursors 2 and 3 all over again.
-    assert_eq!(reqs[1].resume_after_cursor, 3);
+    assert_eq!(reqs[1].resume_after_cursor, test_cursor(3));
+}
+
+#[tokio::test]
+async fn watch_logs_resume_cursor_is_padded_high_water() {
+    // The high-water mark is a byte-wise string comparison on an opaque token,
+    // so it is only correct while the sequence segment is a fixed width. Seq 9
+    // then seq 10 is the case that catches an unpadded encoding: "...:9" sorts
+    // above "...:10", so the resume point would rewind to 9 and the gateway
+    // would replay an event the client already has.
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![
+            WatchDial {
+                events: vec![log_event(9, "i"), log_event(10, "j")],
+                end: DialEnd::Err(tonic::Code::Unavailable),
+            },
+            WatchDial {
+                events: vec![],
+                end: DialEnd::Clean,
+            },
+        ],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    for want in [9u64, 10] {
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == test_cursor(want))
+        );
+    }
+    assert!(stream.next().await.is_none());
+
+    let reqs = state.last_watch_requests.lock().await;
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].resume_after_cursor, test_cursor(10));
 }
 
 #[tokio::test]
@@ -1849,14 +1900,14 @@ async fn watch_logs_retries_initial_dial_failure() {
     tokio::pin!(stream);
     assert!(matches!(
         stream.next().await.unwrap().unwrap(),
-        WatchEvent::Log { cursor: 1, .. }
+        WatchEvent::Log { ref cursor, .. } if *cursor == test_cursor(1)
     ));
     assert!(stream.next().await.is_none());
 
     let reqs = state.last_watch_requests.lock().await;
     assert_eq!(reqs.len(), 2); // dialed twice: failed, then reconnected
-    assert_eq!(reqs[0].resume_after_cursor, 0);
-    assert_eq!(reqs[1].resume_after_cursor, 0); // nothing delivered yet on retry
+    assert_eq!(reqs[0].resume_after_cursor, "");
+    assert_eq!(reqs[1].resume_after_cursor, ""); // nothing delivered yet on retry
 }
 
 #[tokio::test]
@@ -1876,11 +1927,14 @@ async fn watch_logs_gap_terminates_out_of_range() {
     tokio::pin!(stream);
     assert!(matches!(
         stream.next().await.unwrap().unwrap(),
-        WatchEvent::Log { cursor: 1, .. }
+        WatchEvent::Log { ref cursor, .. } if *cursor == test_cursor(1)
     ));
     let err = stream.next().await.unwrap().unwrap_err();
     assert_eq!(err.code(), "out_of_range");
     assert!(stream.next().await.is_none());
 
-    assert_eq!(state.last_watch_requests.lock().await.len(), 1); // no redial
+    // No redial. OUT_OF_RANGE is terminal for every cause the gateway uses it
+    // for -- a trimmed cursor or one from a retired cursor space -- because
+    // reconnecting would silently paper over events that are already lost.
+    assert_eq!(state.last_watch_requests.lock().await.len(), 1);
 }

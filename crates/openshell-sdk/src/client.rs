@@ -517,9 +517,17 @@ impl OpenShellClient {
     /// Watch a sandbox's logs and platform events with loss-aware resume.
     ///
     /// Reconnects transparently on transient stream errors, resuming from the
-    /// highest cursor already delivered. A trimmed resume cursor ends the stream
-    /// with [`SdkError::OutOfRange`]; a recoverable server lag surfaces as
+    /// highest cursor already delivered. A recoverable server lag surfaces as
     /// [`WatchEvent::Warning`] and the stream continues.
+    ///
+    /// [`SdkError::OutOfRange`] is terminal and deliberately not retried: it
+    /// means the resume point is gone (trimmed from the buffer, or issued by a
+    /// cursor space the gateway no longer has), so events between it and now
+    /// are unrecoverable. Auto-restarting from scratch would hide that loss,
+    /// which is exactly what this API exists to surface. Callers who accept the
+    /// gap can start a new watch with an empty
+    /// [`WatchOptions::resume_after_cursor`]; retrying the same cursor fails
+    /// identically.
     pub fn watch_logs(
         &self,
         name: &str,
@@ -558,7 +566,7 @@ impl OpenShellClient {
                     event_tail: opts.event_tail,
                     log_sources: opts.log_sources.clone(),
                     log_min_level: opts.log_min_level.clone().unwrap_or_default(),
-                    resume_after_cursor: cursor,
+                    resume_after_cursor: cursor.clone(),
                     ..Default::default()
                 };
                 // Apply the same reconnect policy to the initial dial: `unary`
@@ -1018,9 +1026,17 @@ impl WorkspaceScopedClient {
     /// Watch a sandbox's logs and platform events with loss-aware resume.
     ///
     /// Reconnects transparently on transient stream errors, resuming from the
-    /// highest cursor already delivered. A trimmed resume cursor ends the stream
-    /// with [`SdkError::OutOfRange`]; a recoverable server lag surfaces as
+    /// highest cursor already delivered. A recoverable server lag surfaces as
     /// [`WatchEvent::Warning`] and the stream continues.
+    ///
+    /// [`SdkError::OutOfRange`] is terminal and deliberately not retried: it
+    /// means the resume point is gone (trimmed from the buffer, or issued by a
+    /// cursor space the gateway no longer has), so events between it and now
+    /// are unrecoverable. Auto-restarting from scratch would hide that loss,
+    /// which is exactly what this API exists to surface. Callers who accept the
+    /// gap can start a new watch with an empty
+    /// [`WatchOptions::resume_after_cursor`]; retrying the same cursor fails
+    /// identically.
     pub fn watch_logs(
         &self,
         name: &str,
@@ -1191,17 +1207,27 @@ fn map_status(status: tonic::Status) -> SdkError {
 /// order can differ from cursor order. Taking the max keeps the resume point
 /// monotonic; assigning directly would let a later lower-cursor event rewind it
 /// and replay already-delivered events after a reconnect.
-fn convert_event(event: proto::SandboxStreamEvent, cursor: &mut u64) -> Option<WatchEvent> {
+///
+/// The comparison is a plain byte-wise string compare on an opaque token. That
+/// is the one operation the gateway permits on a cursor, and it is well defined
+/// here because both cursors come from the same stream: the encoding is fixed
+/// width within a cursor space, and a stream never spans two spaces (a reset
+/// ends it). Never parse the token — its layout is not part of the contract.
+fn convert_event(event: proto::SandboxStreamEvent, cursor: &mut String) -> Option<WatchEvent> {
     match event.payload? {
         proto::sandbox_stream_event::Payload::Log(line) => {
-            *cursor = (*cursor).max(event.cursor);
+            if event.cursor > *cursor {
+                cursor.clone_from(&event.cursor);
+            }
             Some(WatchEvent::Log {
                 line: line.into(),
                 cursor: event.cursor,
             })
         }
         proto::sandbox_stream_event::Payload::Event(platform) => {
-            *cursor = (*cursor).max(event.cursor);
+            if event.cursor > *cursor {
+                cursor.clone_from(&event.cursor);
+            }
             Some(WatchEvent::Event {
                 event: platform.into(),
                 cursor: event.cursor,

@@ -286,32 +286,69 @@ names, creation timestamps, and labels. Crate-level details live in
 
 `WatchSandbox` merges three per-sandbox sources into one client stream: status
 snapshots, server/sandbox logs, and platform events. Logs and platform events
-are resumable; a shared per-sandbox counter stamps each with a monotonic
-`cursor`. Cursor-ordered delivery is guaranteed for the replay phase: on
-resume the buffered events from both sources are sorted by cursor before
-emission. Live events carry cursors and are monotonic within each source, but
-the two sources are read independently, so a client should order across sources
-by `cursor` rather than by arrival. Status snapshots and warnings are re-read on
-demand and carry `cursor = 0`.
+are resumable; a shared per-sandbox allocator stamps each with a `cursor`.
+Cursor-ordered delivery is guaranteed for the replay phase: on resume the
+buffered events from both sources are sorted before emission. Live events are
+monotonic within each source, but the two sources are read independently, so a
+client should order across sources by `cursor` rather than by arrival. Status
+snapshots and warnings are re-read on demand and carry an empty cursor.
+
+#### Cursor spaces
+
+A sandbox's cursors live in a **cursor space**: a `{epoch, seq}` pair, where the
+epoch is a UUID minted on the first publish and `seq` counts from 1. The epoch
+is dropped by `TracingLogBus::remove`, so a teardown — or a gateway restart —
+retires the space, and the next publish mints a new one. A sequence number alone
+cannot distinguish a caught-up client from one holding a cursor out of a space
+that no longer exists, because the replacement space reuses the same numbers;
+the epoch answers *which counter issued this*, which is the question resume
+validation actually has to ask. Behind multiple replicas the same rule makes a
+reconnect to a different replica fail loudly rather than return the wrong
+events.
+
+On the wire a cursor is an opaque, fixed-width token. Clients may only compare
+two cursors from one stream and keep the greater; the encoding zero-pads `seq`
+so that byte-wise comparison matches sequence order, which is what lets every
+SDK track a high-water mark without parsing. A stream only ever observes one
+epoch — a reset closes both resumable broadcast receivers, ending the stream
+rather than switching spaces mid-flight — so that comparison is always well
+defined where clients are allowed to use it. The gateway does not rely on it:
+server-side ordering runs on the raw `u64` seq carried alongside each event in
+`CursoredEvent`, never on the token.
 
 The gateway holds a bounded in-memory tail per sandbox. Loss is reported with
 two distinct, documented behaviors:
 
 - **Recoverable lag** — a broadcast receiver falls behind and the server skips
-  ahead. The stream emits a `SandboxStreamWarning` event and continues; the
-  client sees the gap as a cursor discontinuity.
-- **Unrecoverable gap** — a reconnect requests `resume_after_cursor` below the
-  oldest buffered cursor (the tail has been trimmed past it). The server sends a
-  snapshot, then terminates the stream with `OUT_OF_RANGE` carrying the
-  requested and earliest-available cursors so the client can restart cleanly.
+  ahead. The stream emits a `SandboxStreamWarning` event and continues. Since
+  cursors are opaque, the warning is the client's only signal.
+- **Unrecoverable gap** — the server sends a snapshot, then terminates with
+  `OUT_OF_RANGE`. Three cases reach it: the tail was trimmed past the requested
+  cursor, the cursor's epoch does not match the sandbox's current space, or no
+  space exists because nothing has been published since teardown. The status
+  tells the client to restart with an empty cursor; retrying the same token
+  fails identically. A token the gateway could not have issued is rejected
+  earlier, as `INVALID_ARGUMENT` on the call itself.
 
-On resume the server replays only events after the client's cursor from both
-resumable sources, merged in cursor order, before entering live delivery. The
-broadcast receivers are subscribed before replay, so an event buffered during
+Both resumable sources draw from one cursor space, so the server merges them by
+seq before emitting rather than draining each in turn: on resume it replays only
+events after the client's cursor, and without one it replays each bus's retained
+tail. Either way the batch leaves in ascending cursor order. The two tails are
+bounded independently (`log_tail_lines` and `event_tail`), so merging orders
+whatever each bus kept; it does not align their depths.
+
+The broadcast receivers are subscribed before replay, so an event buffered during
 initialization could appear in both replay and the live receiver; the producer
-tracks the highest replayed cursor and suppresses live events at or below it, so
-each event is delivered once. Clients track the highest observed `cursor` and
-pass it as `resume_after_cursor` on reconnect.
+tracks the highest replayed seq and suppresses live events at or below it, so
+each event is delivered once. That mark is per source. The two tails are read at
+different instants and bounded independently, so one shared mark would let the
+deeper source censor the shallower one — with `event_tail` unset the mark rises
+to the newest buffered log while no platform event is replayed at all, and
+platform events published during initialization are discarded as duplicates of a
+replay that never ran. Subscribing never mints a cursor space, so a
+resume against a torn-down sandbox cannot create the space its stale cursor is
+then checked against. Clients track the highest observed `cursor` and pass it as
+`resume_after_cursor` on reconnect.
 
 ## Persistence
 

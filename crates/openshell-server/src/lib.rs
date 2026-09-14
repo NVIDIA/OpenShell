@@ -44,6 +44,7 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+mod watch_cursor;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
