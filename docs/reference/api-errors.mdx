@@ -31,6 +31,9 @@ Recognized gateway reasons include the following.
 | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
 | `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
 | `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+| `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
+| `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
+| `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original workspace or created resource no longer exists at its recorded version. The gateway does not execute the request again. |
 
 ## Status and retry guidance
 
@@ -84,6 +87,60 @@ status fields; use `..` when destructuring variants that do not need those field
 Go and TypeScript add typed detail fields to their existing error types.
 
 No SDK automatically retries a mutation as a result of decoding these details.
+
+## Durable request admission
+
+Six unary RPCs accept an optional `request_id` in their protobuf requests.
+
+| Resource | RPCs |
+|---|---|
+| Workspace | `CreateWorkspace`, `DeleteWorkspace` |
+| Workspace member | `AddWorkspaceMember`, `RemoveWorkspaceMember` |
+| Sandbox template | `CreateSandboxTemplate`, `DeleteSandboxTemplate` |
+
+Use a nonzero, hyphenated UUID of exactly 36 characters. Uppercase and lowercase
+forms identify the same request. An empty ID preserves the existing behavior
+without deduplication. This ID is separate from transport correlation metadata.
+The gateway scopes it to the authenticated identity provider, OIDC issuer,
+subject, RPC method, and requested workspace. Use the same identity, scope, ID,
+and payload when checking an admitted attempt. Map ordering does not affect the
+payload fingerprint; changed values or protobuf message presence do.
+
+The gateway durably admits one owner before executing the mutation. Concurrent
+duplicates either replay its confirmed success or return
+`REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
+admitted work. An error, interrupted process, or failed success-record write
+leaves the admission unresolved. No gateway replica takes over that admission,
+even after restart or after 24 hours. Status codes alone do not prove that the
+attempt had no effects.
+
+Successful results have a 24-hour replay window, measured from durable completion.
+A successful replay includes `openshell-replayed: true` response metadata and
+does not extend the window. After it expires, the same ID can admit a new
+execution. Do not retry an old operation after that window without reconciling
+its effects. Unresolved admissions never expire.
+
+Every replay checks current authorization, including membership and permission
+to assign workspace administrators. Create replays load the original resource
+by its UUID and require its recorded resource version. Deletion or modification
+of that resource makes replay unavailable, even within 24 hours. A replacement
+workspace also makes workspace-scoped replay unavailable. Delete replays return
+the recorded outcome without deleting a same-name replacement.
+
+Replay rows contain fingerprints, resource references, and deletion outcomes,
+not copies of template contents or credential-bearing responses. Each caller can
+hold at most 1,000 durable admissions. At capacity, the gateway removes expired
+successes; if no space remains, it rejects new admissions with
+`RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
+require operator investigation; there is no automatic reset or takeover API.
+The gateway also limits detached admission workers to 64 per process and these
+request messages to 4 MiB.
+
+Supply IDs through generated/raw RPC clients. Curated SDK request-ID helpers and
+automatic retry policies are not part of this contract yet. Other mutations,
+including sandbox creation, provider writes, exec, SSH sessions, and rootfs
+staging, do not gain deduplication from this feature. Check gateway compatibility
+before relying on IDs; older protobuf servers can silently ignore unknown fields.
 
 ## Deletion outcomes
 

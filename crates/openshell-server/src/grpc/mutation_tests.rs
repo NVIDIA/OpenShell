@@ -169,6 +169,7 @@ async fn allow_missing_does_not_hide_missing_parents_or_invalid_requests() {
     let err = workspace::handle_remove_workspace_member(
         &state,
         authed_request(RemoveWorkspaceMemberRequest {
+            request_id: String::new(),
             workspace: "missing-parent".into(),
             principal_subject: "missing".into(),
             allow_missing: true,

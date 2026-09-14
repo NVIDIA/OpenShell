@@ -62,6 +62,22 @@ transport status, metadata, and unknown details alongside decoded fields.
 SDK deletion waits recognize missing-resource status through typed error wrappers
 without suppressing other failures.
 
+Workspace lifecycle, membership, and sandbox-template mutations explicitly opt
+into durable request admission when the client supplies a UUID. Typed adapters
+check current authorization before looking up a caller/method/workspace-scoped
+key. The payload fingerprint excludes that UUID and canonicalizes protobuf maps.
+An atomic, quota-checked insert chooses one executor; owned execution survives
+client cancellation. Success is persisted before acknowledgment. Errors or
+interruption leave permanent unresolved claims, never stealable leases.
+
+Admission rows live outside user workspace namespaces and are bounded per caller.
+Successes expire after 24 hours; cleanup uses the unique admission incarnation
+and version so an old cleaner cannot delete a new attempt. Replay stores only
+resource UUID/version references or deletion outcomes. It checks the original
+workspace identity and current authorization, and never substitutes a same-name
+resource. Intercepted mutations and credential capabilities require separate
+adapters; this mechanism does not replay streams or repeat interceptor observers.
+
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
 clients present a certificate signed by the local deployment CA, and the
@@ -391,7 +407,8 @@ Missing targets return `NOT_FOUND` unless `allow_missing` explicitly requests
 failures remain errors. Already-revoked sessions complete without another write
 after current authorization. The removed response booleans are reserved by name
 and number; this coordinated pre-1.0 API change does not alter durable schemas.
-It does not add request deduplication or identity preconditions for later retries.
+The outcome alone does not provide request deduplication. The six opted-in
+workspace/template methods require a request UUID for the admission contract.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
@@ -441,6 +458,11 @@ and labels from protobuf metadata traits before encoding the full message into
 populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
+
+Mutation admission uses a private, version-tagged JSON envelope in the same
+object store. Its identity namespace stays stable across format changes, and an
+unknown format fails closed. It contains no public response payloads and is not
+part of the protobuf storage closure.
 
 Each sandbox policy revision stores the complete provenance annotation map
 supplied with that update. The revision payload is the authoritative immutable

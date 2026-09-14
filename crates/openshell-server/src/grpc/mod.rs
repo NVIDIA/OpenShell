@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod mutation_replay;
 pub mod policy;
 pub mod provider;
 mod sandbox;
@@ -303,7 +304,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxTemplateRequest>,
     ) -> Result<Response<SandboxTemplateResponse>, Status> {
-        sandbox::handle_create_sandbox_template(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_sandbox_template(
@@ -324,7 +325,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxTemplateRequest>,
     ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
-        sandbox::handle_delete_sandbox_template(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn list_sandbox_providers(
@@ -754,7 +755,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateWorkspaceRequest>,
     ) -> Result<Response<CreateWorkspaceResponse>, Status> {
-        workspace::handle_create_workspace(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_workspace(
@@ -775,21 +776,21 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        workspace::handle_delete_workspace(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn add_workspace_member(
         &self,
         request: Request<AddWorkspaceMemberRequest>,
     ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
-        workspace::handle_add_workspace_member(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn remove_workspace_member(
         &self,
         request: Request<RemoveWorkspaceMemberRequest>,
     ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
-        workspace::handle_remove_workspace_member(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn list_workspace_members(

@@ -2685,6 +2685,7 @@ pub async fn sandbox_template_create(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .create_sandbox_template(CreateSandboxTemplateRequest {
+            request_id: String::new(),
             template: Some(SandboxWorkloadTemplate {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2872,6 +2873,7 @@ pub async fn sandbox_template_delete(
     for name in names {
         let response = client
             .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -3827,6 +3829,7 @@ pub async fn workspace_create(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .create_workspace(CreateWorkspaceRequest {
+            request_id: String::new(),
             name: name.to_string(),
             labels,
         })
@@ -3981,6 +3984,7 @@ pub async fn workspace_delete(server: &str, names: &[String], tls: &TlsOptions) 
     for name in names {
         let response = client
             .delete_workspace(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: name.clone(),
             })
@@ -4018,6 +4022,7 @@ pub async fn workspace_member_add(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .add_workspace_member(AddWorkspaceMemberRequest {
+            request_id: String::new(),
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
             role: role_val.into(),
@@ -4052,6 +4057,7 @@ pub async fn workspace_member_remove(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
+            request_id: String::new(),
             allow_missing: true,
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
