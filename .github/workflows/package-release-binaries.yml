@@ -39,9 +39,15 @@ jobs:
             package: gateway-binary-macos
           - artifact: openshell-sandbox-x86_64-unknown-linux-musl
             binary: openshell-sandbox
-            package: supervisor-binary-linux-amd64
+            package: sandbox-binary-linux-amd64
           - artifact: openshell-sandbox-aarch64-unknown-linux-musl
             binary: openshell-sandbox
+            package: sandbox-binary-linux-arm64
+          - artifact: openshell-supervisor-x86_64-unknown-linux-gnu
+            binary: openshell-supervisor
+            package: supervisor-binary-linux-amd64
+          - artifact: openshell-supervisor-aarch64-unknown-linux-gnu
+            binary: openshell-supervisor
             package: supervisor-binary-linux-arm64
           - artifact: openshell-driver-vm-x86_64-unknown-linux-gnu
             binary: openshell-driver-vm

@@ -28,11 +28,6 @@ jobs:
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
-      run_docker_e2e: ${{ steps.labels.outputs.run_docker_e2e }}
-      run_podman_e2e: ${{ steps.labels.outputs.run_podman_e2e }}
-      run_vm_e2e: ${{ steps.labels.outputs.run_vm_e2e }}
-      run_kubernetes_e2e: ${{ steps.labels.outputs.run_kubernetes_e2e }}
-      allowed_skipped_core_jobs: ${{ steps.labels.outputs.allowed_skipped_core_jobs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: gate
@@ -74,45 +69,12 @@ jobs:
             run_any_e2e=false
           fi
 
-          run_docker_e2e="$run_core_e2e"
-          run_podman_e2e="$run_core_e2e"
-          run_vm_e2e="$run_core_e2e"
-          run_kubernetes_e2e="$run_core_e2e"
-          allowed_skipped_core_jobs=""
-
-          # The RFC 0012 stack deliberately introduces the split runtime before
-          # migrating each driver. At those intermediate layers, run only the
-          # drivers whose isolation adapter is present. Before and after the
-          # stack this resolves to the complete legacy or migrated driver set.
-          if [ "$run_core_e2e" = "true" ] && [ -f crates/openshell-supervisor/Cargo.toml ]; then
-            if [ ! -f crates/openshell-driver-docker/src/isolation.rs ]; then
-              run_docker_e2e=false
-              allowed_skipped_core_jobs="docker-e2e,docker-external-driver-e2e"
-            fi
-            if [ ! -f crates/openshell-driver-podman/src/isolation.rs ]; then
-              run_podman_e2e=false
-              allowed_skipped_core_jobs="${allowed_skipped_core_jobs:+$allowed_skipped_core_jobs,}podman-e2e,podman-external-driver-e2e"
-            fi
-            if [ ! -f crates/openshell-driver-vm/src/isolation/mod.rs ]; then
-              run_vm_e2e=false
-              allowed_skipped_core_jobs="${allowed_skipped_core_jobs:+$allowed_skipped_core_jobs,}vm-e2e,vm-external-driver-e2e"
-            fi
-            if [ ! -f crates/openshell-driver-kubernetes/src/isolation.rs ]; then
-              run_kubernetes_e2e=false
-              allowed_skipped_core_jobs="${allowed_skipped_core_jobs:+$allowed_skipped_core_jobs,}kubernetes-e2e,kubernetes-external-driver-e2e,kubernetes-workspace-managed-e2e,kubernetes-workspace-operator-e2e"
-            fi
-          fi
           {
             echo "run_core_e2e=$run_core_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
             echo "run_any_e2e=$run_any_e2e"
-            echo "run_docker_e2e=$run_docker_e2e"
-            echo "run_podman_e2e=$run_podman_e2e"
-            echo "run_vm_e2e=$run_vm_e2e"
-            echo "run_kubernetes_e2e=$run_kubernetes_e2e"
-            echo "allowed_skipped_core_jobs=$allowed_skipped_core_jobs"
           } >> "$GITHUB_OUTPUT"
 
   version:
@@ -166,11 +128,11 @@ jobs:
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
-  build-sandbox:
+  build-runtimes:
     needs: version
     permissions:
       contents: read
-    uses: ./.github/workflows/build-sandbox-binaries.yml
+    uses: ./.github/workflows/build-runtime-binaries.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
@@ -250,7 +212,7 @@ jobs:
     secrets: inherit
 
   build-vm-driver:
-    needs: [pr_metadata, version, build-sandbox]
+    needs: [pr_metadata, version, build-runtimes]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
@@ -277,7 +239,7 @@ jobs:
     secrets: inherit
 
   build-sandbox-image:
-    needs: [pr_metadata, build-sandbox]
+    needs: [pr_metadata, build-runtimes]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
@@ -290,7 +252,7 @@ jobs:
     secrets: inherit
 
   build-supervisor-image:
-    needs: [pr_metadata, build-sandbox]
+    needs: [pr_metadata, build-runtimes]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
@@ -304,7 +266,7 @@ jobs:
 
   docker-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_docker_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -317,7 +279,7 @@ jobs:
 
   podman-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_podman_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -329,7 +291,7 @@ jobs:
 
   vm-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-vm-driver]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_vm_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -340,7 +302,7 @@ jobs:
 
   docker-external-driver-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-docker, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_docker_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -357,7 +319,7 @@ jobs:
 
   podman-external-driver-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-podman, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_podman_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -373,7 +335,7 @@ jobs:
 
   vm-external-driver-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-vm-driver]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_vm_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -399,17 +361,15 @@ jobs:
 
   kubernetes-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
-            extra_helm_values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
-            extra_helm_values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
     permissions:
       actions: read
       contents: read
@@ -419,12 +379,11 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
-      extra-helm-values: ${{ matrix.extra_helm_values }}
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -434,12 +393,11 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
-      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-external-driver-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-kubernetes, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -452,12 +410,11 @@ jobs:
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-kubernetes
       cluster-images: sandbox supervisor
-      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-operator-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
@@ -467,7 +424,6 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
-      extra-helm-values: deploy/helm/openshell/ci/values-sandbox-runtime.yaml
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-ha-e2e:
@@ -511,7 +467,6 @@ jobs:
       - uses: ./.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
-          allowed-skipped-jobs: ${{ needs.pr_metadata.outputs.allowed_skipped_core_jobs }}
 
   gpu-e2e-result:
     name: GPU E2E result

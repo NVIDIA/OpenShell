@@ -20,6 +20,7 @@ defaults:
     shell: bash
 
 env:
+  OPENSHELL_VERSION: dev
   OPENSHELL_TELEMETRY_ENABLED: "false"
 
 jobs:
@@ -36,8 +37,13 @@ jobs:
 
       - name: Install and check status
         run: |
+          set -euo pipefail
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
   ubuntu:
     name: Ubuntu Docker
@@ -59,8 +65,13 @@ jobs:
 
       - name: Install and check status
         run: |
+          set -euo pipefail
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
   fedora:
     name: Fedora RPM
@@ -140,7 +151,9 @@ jobs:
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            OPENSHELL_VERSION="$OPENSHELL_VERSION" \
             OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
+            CANARY_SANDBOX="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
             bash -s <<'EOF'
           set -euo pipefail
@@ -150,6 +163,9 @@ jobs:
           podman info
           curl -LsSf "${INSTALL_SH_URL}" | sh
           openshell status
+          openshell sandbox create --name "$CANARY_SANDBOX" --detach
+          openshell sandbox exec --name "$CANARY_SANDBOX" --no-tty -- true
+          openshell sandbox delete "$CANARY_SANDBOX"
           EOF
 
       - name: Stop Fedora systemd container
@@ -215,6 +231,14 @@ jobs:
           done
           echo "Gateway did not become ready within 30 seconds" >&2
           exit 1
+
+      - name: Create and exercise a sandbox
+        run: |
+          set -euo pipefail
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
       - name: Collect Snap diagnostics
         if: failure()
@@ -309,6 +333,10 @@ jobs:
           set -euo pipefail
           openshell gateway add http://127.0.0.1:8080 --local --name "$KIND_GATEWAY_NAME"
           openshell status
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
       - name: Diagnostics on failure
         if: failure()
