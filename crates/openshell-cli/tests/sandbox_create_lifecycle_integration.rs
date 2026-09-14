@@ -299,7 +299,9 @@ impl OpenShell for TestOpenShell {
             .await
             .push(request.into_inner());
         Ok(Response::new(
-            openshell_core::proto::DeleteSandboxTemplateResponse { deleted: true },
+            openshell_core::proto::DeleteSandboxTemplateResponse {
+                outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+            },
         ))
     }
 
@@ -338,7 +340,10 @@ impl OpenShell for TestOpenShell {
         if let Some(message) = delete_failure {
             return Err(Status::internal(message));
         }
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -565,7 +570,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Ok(Response::new(DeleteProviderResponse { deleted: true }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     type WatchSandboxStream =

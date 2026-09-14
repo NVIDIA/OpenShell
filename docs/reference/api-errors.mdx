@@ -79,3 +79,64 @@ status fields; use `..` when destructuring variants that do not need those field
 Go and TypeScript add typed detail fields to their existing error types.
 
 No SDK automatically retries a mutation as a result of decoding these details.
+
+## Deletion outcomes
+
+Delete, membership-removal, and SSH-revocation RPCs return a typed outcome.
+Transport success alone does not establish completion.
+
+| Outcome | Meaning |
+|---|---|
+| `COMPLETED` | The gateway resource was removed, or the existing SSH session is revoked. Downstream platform garbage collection may still be finishing. |
+| `ACCEPTED` | Sandbox deletion started, but the gateway sandbox record still exists. Observe its removal before assuming completion. |
+| `ALREADY_ABSENT` | The target was missing when resolved, and the request set `allow_missing=true`. |
+| `UNSPECIFIED` or an unknown value | Completion is not established. Check gateway and SDK compatibility. |
+
+Requests default to `allow_missing=false`: an initially missing target returns
+`NOT_FOUND`. Set it to `true` for cleanup that allows an absent target. This flag
+does not suppress missing parents, authorization failures, invalid requests,
+failed preconditions, or backend errors. Re-revoking an existing revoked session
+returns `COMPLETED` after authorization without changing its resource version.
+
+`DeleteSandbox` also returns the original `sandbox_id` when it found a target.
+For an accepted deletion, poll or watch that identity. A same-name sandbox with a
+different ID is not the sandbox being deleted. Cancellation or a disconnected
+client does not stop the gateway's already-started deletion worker.
+
+`allow_missing` is not request deduplication. A later request by name can delete
+a newly created resource with that name. Do not blindly repeat a timed-out
+deletion when names might be reused.
+
+### SDK migration for deletion
+
+Upgrade gateways and clients together. This pre-1.0 change removes the boolean
+response fields, reserving their names and wire numbers. New clients reading an
+old response see `UNSPECIFIED`; they must not interpret it as completion.
+
+| RPC | Removed field | Replacement |
+|---|---|---|
+| `DeleteSandboxTemplate` | `deleted` | `outcome` |
+| `DeleteSandbox` | `deleted` | `outcome`, `sandbox_id` |
+| `DeleteService` | `deleted` | `outcome` |
+| `DeleteProvider` | `deleted` | `outcome` |
+| `DeleteProviderRefresh` | `deleted` | `outcome` |
+| `DeleteProviderProfile` | `deleted` | `outcome` |
+| `DeleteWorkspace` | `deleted` | `outcome` |
+| `RemoveWorkspaceMember` | `removed` | `outcome` |
+| `RevokeSshSession` | `revoked` | `outcome` |
+
+These RPCs use a typed result rather than `Empty` because callers must
+distinguish absence, asynchronous acceptance, and completion.
+
+Curated SDK methods return `DeletionResult` instead of a boolean or no result.
+Rust accepts `DeleteOptions { allow_missing: true }`; Python accepts the keyword
+`allow_missing=True`; TypeScript accepts `{ allowMissing: true }`; Go accepts an
+optional `DeleteOptions{AllowMissing: true}` and returns `(result, error)`.
+Go and Python preserve unknown numeric outcomes, Rust uses `Unknown(i32)`, and
+TypeScript returns `outcome: 'unknown'` with `rawOutcome`.
+
+Other mutation responses remain unchanged: provider attach/detach also return
+the resulting sandbox, profile import/update return resources and diagnostics,
+and config updates return version/application information. Their supplementary
+booleans are not the sole result. Internal compute-driver and supervisor
+contracts are separate from this public API migration.

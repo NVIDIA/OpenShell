@@ -271,7 +271,18 @@ struct SandboxDeleteTarget {
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeleteSandboxResult {
     pub sandbox_id: String,
-    pub deleted: bool,
+    pub outcome: openshell_core::proto::DeletionOutcome,
+}
+
+#[cfg(test)]
+impl DeleteSandboxResult {
+    fn acknowledged(&self) -> bool {
+        matches!(
+            self.outcome,
+            openshell_core::proto::DeletionOutcome::Completed
+                | openshell_core::proto::DeletionOutcome::Accepted
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1529,6 +1540,16 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_allow_missing(workspace, name, false)
+            .await
+    }
+
+    pub(crate) async fn delete_sandbox_allow_missing(
+        &self,
+        workspace: &str,
+        name: &str,
+        allow_missing: bool,
+    ) -> Result<DeleteSandboxResult, Status> {
         // Resolve and acquire both request-side locks before spawning the
         // owned worker. Cancellation while any of these awaits is pending is
         // harmless because no mutation or detached work has started.
@@ -1536,8 +1557,16 @@ impl ComputeRuntime {
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
             .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+        let Some(candidate) = candidate else {
+            if allow_missing {
+                return Ok(DeleteSandboxResult {
+                    sandbox_id: String::new(),
+                    outcome: openshell_core::proto::DeletionOutcome::AlreadyAbsent,
+                });
+            }
+            return Err(Status::not_found("sandbox not found"));
+        };
         let target = SandboxDeleteTarget {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
@@ -1586,7 +1615,7 @@ impl ComputeRuntime {
             self.cleanup_removed_sandbox_state(&target.sandbox_id);
             return Ok(DeleteSandboxResult {
                 sandbox_id: target.sandbox_id,
-                deleted: true,
+                outcome: openshell_core::proto::DeletionOutcome::Completed,
             });
         };
         if current.object_name() != target.sandbox_name {
@@ -1605,7 +1634,7 @@ impl ComputeRuntime {
             BeginDelete::AlreadyDeleting => {
                 return Ok(DeleteSandboxResult {
                     sandbox_id: target.sandbox_id,
-                    deleted: true,
+                    outcome: openshell_core::proto::DeletionOutcome::Accepted,
                 });
             }
             BeginDelete::Started(transition) => *transition,
@@ -1638,20 +1667,30 @@ impl ComputeRuntime {
         match result {
             Ok(response) => {
                 let deleted = response.into_inner().deleted;
-                if deleted {
+                let completed = if deleted {
                     self.cleanup_local_state_if_sandbox_absent(&delete_guard, &target.sandbox_id)
-                        .await?;
-                } else if !self
-                    .remove_deleting_sandbox_record(&delete_guard, &target.sandbox_id)
-                    .await
-                {
-                    return Err(Status::internal(
-                        "compute resource was absent, but gateway cleanup did not complete",
-                    ));
-                }
+                        .await?
+                } else {
+                    if !self
+                        .remove_deleting_sandbox_record(&delete_guard, &target.sandbox_id)
+                        .await
+                    {
+                        return Err(Status::internal(
+                            "compute resource was absent, but gateway cleanup did not complete",
+                        ));
+                    }
+                    true
+                };
+                // A driver's acknowledgement is not proof that asynchronous
+                // cleanup finished. Inspect the captured UUID, never the name:
+                // another sandbox may already have reused it.
                 Ok(DeleteSandboxResult {
                     sandbox_id: target.sandbox_id,
-                    deleted,
+                    outcome: if completed {
+                        openshell_core::proto::DeletionOutcome::Completed
+                    } else {
+                        openshell_core::proto::DeletionOutcome::Accepted
+                    },
                 })
             }
             Err(err) => {
@@ -3521,7 +3560,7 @@ impl ComputeRuntime {
         &self,
         delete_guard: &SandboxLifecycleGuard,
         sandbox_id: &str,
-    ) -> Result<(), Status> {
+    ) -> Result<bool, Status> {
         let _guard = self.lock_global_for_lifecycle(delete_guard).await;
         let record = self
             .store
@@ -3531,7 +3570,7 @@ impl ComputeRuntime {
         if record.is_none() {
             self.cleanup_removed_sandbox_state(sandbox_id);
         }
-        Ok(())
+        Ok(record.is_none())
     }
 
     fn cleanup_removed_sandbox_state(&self, sandbox_id: &str) {
@@ -8182,7 +8221,7 @@ mod tests {
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
         stop_watch_loop(shutdown_tx, watch_handle).await;
     }
@@ -8215,7 +8254,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(1), second)
@@ -8223,7 +8262,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
         assert_eq!(driver.delete_calls(), 1);
     }
@@ -8273,13 +8312,14 @@ mod tests {
         driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
         driver.release_delete();
 
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), second)
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second)
                 .await
                 .expect("second delete did not finish")
                 .unwrap()
                 .unwrap()
-                .deleted
+                .outcome,
+            openshell_core::proto::DeletionOutcome::Completed
         );
         assert_eq!(driver.delete_calls(), 2);
         assert!(
@@ -8385,7 +8425,7 @@ mod tests {
         runtime.store.put_message(&replacement).await.unwrap();
         drop(delete_guard);
 
-        assert!(delete.await.unwrap().unwrap().deleted);
+        assert!(delete.await.unwrap().unwrap().acknowledged());
         assert_eq!(driver.delete_calls(), 0);
         assert!(
             runtime
@@ -8485,12 +8525,13 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        assert!(
-            !runtime
+        assert_eq!(
+            runtime
                 .delete_sandbox("default", "sandbox-a")
                 .await
                 .unwrap()
-                .deleted
+                .outcome,
+            openshell_core::proto::DeletionOutcome::Completed
         );
         assert!(
             runtime
@@ -8549,7 +8590,10 @@ mod tests {
             .unwrap();
 
         driver.release_delete();
-        assert!(!delete.await.unwrap().unwrap().deleted);
+        assert_eq!(
+            delete.await.unwrap().unwrap().outcome,
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert!(
             runtime
                 .store
@@ -8606,19 +8650,24 @@ mod tests {
     #[tokio::test]
     async fn accepted_driver_delete_leaves_removal_to_watcher() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime(driver).await;
+        let runtime = test_runtime(driver.clone()).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
-        assert!(
-            runtime
+        for _ in 0..2 {
+            let result = runtime
                 .delete_sandbox("default", "sandbox-a")
                 .await
-                .unwrap()
-                .deleted
-        );
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                openshell_core::proto::DeletionOutcome::Accepted
+            );
+            assert_eq!(result.sandbox_id, "sb-1");
+        }
+        assert_eq!(driver.delete_calls(), 1);
 
         let stored = runtime
             .store
@@ -8821,7 +8870,7 @@ mod tests {
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
         assert!(
@@ -8865,13 +8914,14 @@ mod tests {
         remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
         driver.release_delete();
 
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), delete)
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), delete)
                 .await
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
-                .deleted
+                .outcome,
+            openshell_core::proto::DeletionOutcome::Completed
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
         assert!(
@@ -9164,7 +9214,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
         assert!(
             runtime
@@ -11146,7 +11196,7 @@ mod tests {
                 .delete_sandbox("default", "uds-sandbox")
                 .await
                 .unwrap()
-                .deleted
+                .acknowledged()
         );
 
         let calls = driver.calls();

@@ -85,8 +85,15 @@ allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
 Deletes a sandbox by name.
 
 ```go
-err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox", v1.DeleteOptions{AllowMissing: true})
 ```
+
+Missing targets return `NotFound` unless `AllowMissing` is true. Inspect
+`deletion.Outcome`: `DeletionAccepted` means cleanup is pending, while
+`DeletionCompleted` and `DeletionAlreadyAbsent` establish logical completion.
+Unknown values do not establish completion. `deletion.SandboxID` identifies the
+original sandbox; do not confuse a same-name replacement with that target.
+Allowing absence does not make a retry safe if names can be reused.
 
 ## AttachProvider
 

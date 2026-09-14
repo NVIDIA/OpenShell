@@ -958,7 +958,9 @@ pub(super) async fn handle_delete_sandbox_template(
         )
         .await
         .map_err(|e| Status::internal(format!("delete sandbox template failed: {e}")))?;
-    Ok(Response::new(DeleteSandboxTemplateResponse { deleted }))
+    Ok(Response::new(DeleteSandboxTemplateResponse {
+        outcome: super::deletion_outcome(deleted, req.allow_missing, "sandbox template")?,
+    }))
 }
 
 fn validate_sandbox_workload_template(template: &SandboxWorkloadTemplate) -> Result<(), Status> {
@@ -1294,7 +1296,7 @@ pub(super) async fn handle_delete_sandbox(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let result = handle_delete_sandbox_inner(state, request).await;
     let outcome = match &result {
-        Ok(response) if response.get_ref().deleted => TelemetryOutcome::Success,
+        Ok(_) => TelemetryOutcome::Success,
         _ => TelemetryOutcome::Failure,
     };
     openshell_core::telemetry::emit_lifecycle(
@@ -1327,13 +1329,17 @@ async fn handle_delete_sandbox_inner(
         .await?
         .name;
 
-    let result = state.compute.delete_sandbox(&workspace, &name).await?;
-    if result.deleted {
+    let result = state
+        .compute
+        .delete_sandbox_allow_missing(&workspace, &name, req.allow_missing)
+        .await?;
+    if !result.sandbox_id.is_empty() {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse {
-        deleted: result.deleted,
+        outcome: result.outcome.into(),
+        sandbox_id: result.sandbox_id,
     }))
 }
 
@@ -2365,7 +2371,8 @@ pub(super) async fn handle_revoke_ssh_session(
     request: Request<RevokeSshSessionRequest>,
 ) -> Result<Response<RevokeSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let token = request.into_inner().token;
+    let req = request.into_inner();
+    let token = req.token;
     if token.is_empty() {
         return Err(Status::invalid_argument("token is required"));
     }
@@ -2377,7 +2384,9 @@ pub(super) async fn handle_revoke_ssh_session(
         .map_err(|e| Status::internal(format!("fetch ssh session failed: {e}")))?;
 
     let Some(mut session) = session else {
-        return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
+        return Ok(Response::new(RevokeSshSessionResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "ssh session")?,
+        }));
     };
     authorize_sandbox_workspace(
         &state.store,
@@ -2394,6 +2403,12 @@ pub(super) async fn handle_revoke_ssh_session(
             e
         }
     })?;
+
+    if session.revoked {
+        return Ok(Response::new(RevokeSshSessionResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }));
+    }
 
     let resource_version = session
         .metadata
@@ -2426,7 +2441,9 @@ pub(super) async fn handle_revoke_ssh_session(
         .await
         .map_err(|e| super::persistence_error_to_status(e, "revoke ssh session"))?;
 
-    Ok(Response::new(RevokeSshSessionResponse { revoked: true }))
+    Ok(Response::new(RevokeSshSessionResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3616,6 +3633,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
+                    allow_missing: false,
                     name: "reused-name".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -3643,7 +3661,10 @@ mod tests {
         drop(global_guard);
 
         let response = delete.await.unwrap().unwrap().into_inner();
-        assert!(response.deleted);
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert!(
             state
                 .store
@@ -4831,6 +4852,7 @@ mod tests {
         let deleted = handle_delete_sandbox_template(
             &state,
             authed_request(DeleteSandboxTemplateRequest {
+                allow_missing: false,
                 name: "gpu-kata".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4840,7 +4862,10 @@ mod tests {
         .await
         .expect("template delete should succeed")
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let missing = handle_get_sandbox_template(
             &state,
@@ -5957,7 +5982,10 @@ mod tests {
         let handle1 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state1,
-                authed_request(RevokeSshSessionRequest { token: token1 }),
+                authed_request(RevokeSshSessionRequest {
+                    allow_missing: false,
+                    token: token1,
+                }),
             )
             .await
         });
@@ -5967,7 +5995,10 @@ mod tests {
         let handle2 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state2,
-                authed_request(RevokeSshSessionRequest { token: token2 }),
+                authed_request(RevokeSshSessionRequest {
+                    allow_missing: false,
+                    token: token2,
+                }),
             )
             .await
         });
@@ -5978,7 +6009,11 @@ mod tests {
         // One should succeed, one may fail with ABORTED due to CAS conflict
         let successes = [&result1, &result2]
             .iter()
-            .filter(|r| r.is_ok() && r.as_ref().unwrap().get_ref().revoked)
+            .filter(|r| {
+                r.is_ok()
+                    && r.as_ref().unwrap().get_ref().outcome()
+                        == openshell_core::proto::DeletionOutcome::Completed
+            })
             .count();
 
         // At least one should succeed in revoking
@@ -6650,6 +6685,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
             }),
@@ -6772,6 +6808,7 @@ mod tests {
         handle_revoke_ssh_session(
             &state,
             authed_request(RevokeSshSessionRequest {
+                allow_missing: false,
                 token: token.clone(),
             }),
         )

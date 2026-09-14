@@ -1173,6 +1173,9 @@ message DeleteSandboxTemplateRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Succeed with ALREADY_ABSENT if the target is missing. Authorization and
+  // parent-workspace checks still apply.
+  bool allow_missing = 4;
 }
 
 message SandboxTemplateResponse {
@@ -1186,7 +1189,9 @@ message ListSandboxTemplatesResponse {
 }
 
 message DeleteSandboxTemplateResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // Request a gateway-owned staging slot for a local rootfs tar archive.
@@ -1296,6 +1301,9 @@ message DeleteSandboxRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
+  // asynchronous cleanup and does not suppress authorization or parent errors.
+  bool allow_missing = 4;
 }
 
 // Stop sandbox request.
@@ -1351,7 +1359,12 @@ message DetachSandboxProviderResponse {
 
 // Delete sandbox response.
 message DeleteSandboxResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
+  // Immutable identity of the targeted sandbox, empty for ALREADY_ABSENT.
+  // A same-name replacement is not part of this deletion.
+  string sandbox_id = 3;
 }
 
 // Create SSH session request.
@@ -1455,12 +1468,14 @@ message DeleteServiceRequest {
   string service = 2;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  bool allow_missing = 5;
 }
 
 // Response for deleting an exposed sandbox service endpoint.
 message DeleteServiceResponse {
-  // True when an endpoint existed and was deleted.
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // Persisted sandbox service endpoint.
@@ -1489,12 +1504,16 @@ message ServiceEndpointResponse {
 message RevokeSshSessionRequest {
   // Session token to revoke.
   string token = 1 [(openshell.options.v1.secret) = true];
+  // A missing token is NOT_FOUND unless this is true. Revoking an existing,
+  // already-revoked session succeeds with COMPLETED.
+  bool allow_missing = 2;
 }
 
 // Revoke SSH session response.
 message RevokeSshSessionResponse {
-  // True when a session was revoked.
-  bool revoked = 1;
+  reserved 1;
+  reserved "revoked";
+  DeletionOutcome outcome = 2;
 }
 
 // Execute command request.
@@ -1740,6 +1759,7 @@ message DeleteProviderRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  bool allow_missing = 4;
 }
 
 // Provider response.
@@ -2002,10 +2022,13 @@ message DeleteProviderRefreshRequest {
   string credential_key = 2;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+  bool allow_missing = 5;
 }
 
 message DeleteProviderRefreshResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // Stable provider profile categories used by clients for grouping and filtering.
@@ -2110,7 +2133,9 @@ message LintProviderProfilesResponse {
 
 // Delete provider response.
 message DeleteProviderResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // Delete custom provider profile request.
@@ -2119,11 +2144,14 @@ message DeleteProviderProfileRequest {
   // Workspace scope. When set, targets workspace-scoped profile. When empty,
   // targets platform-scoped profile.
   string workspace = 2;
+  bool allow_missing = 3;
 }
 
 // Delete custom provider profile response.
 message DeleteProviderProfileResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // Get sandbox provider environment request.
@@ -3004,11 +3032,14 @@ message ListWorkspacesResponse {
 message DeleteWorkspaceRequest {
   // Workspace name (canonical lookup key).
   string name = 1;
+  bool allow_missing = 2;
 }
 
 // Delete workspace response.
 message DeleteWorkspaceResponse {
-  bool deleted = 1;
+  reserved 1;
+  reserved "deleted";
+  DeletionOutcome outcome = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -3064,11 +3095,32 @@ message RemoveWorkspaceMemberRequest {
   string workspace = 1;
   // OIDC subject claim identifying the principal to remove.
   string principal_subject = 2;
+  bool allow_missing = 3;
 }
 
 // Remove workspace member response.
 message RemoveWorkspaceMemberResponse {
-  bool removed = 1;
+  reserved 1;
+  reserved "removed";
+  DeletionOutcome outcome = 2;
+}
+
+// Result of a public delete, membership removal, or session revocation.
+// Default requests return NOT_FOUND for a missing target. With allow_missing,
+// only a missing target becomes ALREADY_ABSENT; parent lookup, authorization,
+// validation, precondition, and backend errors retain their normal status.
+// These results describe the targeted resource, not a same-name replacement.
+enum DeletionOutcome {
+  // No outcome was supplied. Never infer completion from this value.
+  DELETION_OUTCOME_UNSPECIFIED = 0;
+  // The targeted gateway resource is removed (or the SSH session is revoked).
+  // Downstream platform garbage collection may still be finishing.
+  DELETION_OUTCOME_COMPLETED = 1;
+  // Sandbox deletion is accepted but its gateway record still exists.
+  // Observe the targeted sandbox ID until it disappears for completion.
+  DELETION_OUTCOME_ACCEPTED = 2;
+  // The target did not exist and allow_missing was true.
+  DELETION_OUTCOME_ALREADY_ABSENT = 3;
 }
 
 // List workspace members request.

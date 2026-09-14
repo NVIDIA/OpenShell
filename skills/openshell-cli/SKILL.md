@@ -406,6 +406,11 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
 
+`deletion accepted` means cleanup is still pending. Inspect the sandbox until
+it disappears before assuming completion. An already-absent sandbox succeeds;
+missing workspaces and authorization failures remain errors. Do not blindly
+retry by name if another process might have recreated that name.
+
 ### Stop and start sandboxes
 
 Use stop to halt compute while retaining the sandbox and its persistent

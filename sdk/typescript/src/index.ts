@@ -5,6 +5,9 @@
 //
 export type {
   ConnectOptions,
+  DeleteOptions,
+  DeletionOutcome,
+  DeletionResult,
   EffectiveSettingView,
   ExecExitEvent,
   ExecInteractiveOptions,

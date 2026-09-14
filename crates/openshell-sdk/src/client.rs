@@ -16,8 +16,9 @@ use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
+    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadTemplate, WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -273,17 +274,25 @@ impl OpenShellClient {
     }
 
     /// Delete a reusable sandbox template by name from the default workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name.
@@ -339,21 +348,23 @@ impl OpenShellClient {
 
     /// Delete a sandbox by name.
     ///
-    /// Returns `true` when the gateway acknowledges the deletion, `false`
-    /// when it was already absent. The sandbox may still be in
-    /// [`SandboxPhase::Deleting`] when this returns — pair with
-    /// [`OpenShellClient::wait_deleted`] when you need a terminal guarantee.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    /// An accepted outcome is not completion. The result identifies the original
+    /// sandbox; a same-name replacement is not part of this operation.
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name.
@@ -553,16 +564,24 @@ impl OpenShellClient {
     }
 
     /// Delete a workspace by name.
-    pub async fn delete_workspace(&self, name: &str) -> Result<bool> {
+    pub async fn delete_workspace(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteWorkspaceRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                 };
                 async move { grpc.delete_workspace(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr to the end.
@@ -831,18 +850,26 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a reusable sandbox template by name in this workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name in this workspace.
@@ -900,18 +927,22 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a sandbox by name in this workspace.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name in this workspace.
