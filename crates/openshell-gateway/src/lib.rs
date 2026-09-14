@@ -326,9 +326,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             context.gateway_bind_address(),
             context.gateway_log_level(),
             &config,
-            context
-                .network_trust_bundle()
-                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -377,9 +375,7 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         );
         let driver = openshell_driver_podman::PodmanComputeDriver::new(
             config,
-            context
-                .network_trust_bundle()
-                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -466,9 +462,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             context.gateway_name(),
             &config,
             context.otlp_config(),
-            context
-                .network_trust_bundle()
-                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
+            context.network_trust_bundle(),
         )
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
