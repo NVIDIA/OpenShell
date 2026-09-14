@@ -91,6 +91,19 @@ const RESUME_SPACE_GONE: &str = "resume_after_cursor belongs to a cursor space t
 const RESUME_CURSOR_AHEAD: &str = "resume_after_cursor is ahead of every cursor this sandbox has \
      issued. Restart the watch with an empty resume_after_cursor.";
 
+/// Whether `sandbox_id`'s cursor space is still the one that issued `epoch`.
+///
+/// A teardown retires the space and the next publish mints a replacement that
+/// renumbers from 1, so a surviving epoch is the only proof that a seq validated
+/// earlier still addresses the same numbering. Absent counts as changed: there
+/// is nothing left for the cursor to point into.
+fn cursor_space_is(state: &ServerState, sandbox_id: &str, epoch: uuid::Uuid) -> bool {
+    state
+        .tracing_log_bus
+        .cursor_space(sandbox_id)
+        .is_some_and(|space| space.epoch == epoch)
+}
+
 #[derive(Debug)]
 pub struct WatchSandboxStream {
     receiver: ReceiverStream<Result<SandboxStreamEvent, Status>>,
@@ -1700,6 +1713,24 @@ pub(super) async fn handle_watch_sandbox(
                 } else {
                     None
                 };
+
+                // Re-check the epoch now that both tails are in hand. The check
+                // above and each `tail_after` take their locks independently, so
+                // a teardown plus a republish can retire the validated space and
+                // install a replacement in between. The reads would then have
+                // applied the old space's seq to the new space's buffers, and
+                // `tail_after` -- which only knows numbers -- would report no gap
+                // while skipping every replacement event at or below it. The
+                // second look is cheap and runs before anything is emitted, so a
+                // space that moved under us ends the stream instead of serving a
+                // truncated replay.
+                //
+                // Ordering is unchanged: this takes only the allocator lock and
+                // releases it, never held across a bus lock.
+                if !cursor_space_is(&state, &sandbox_id, resume.epoch) {
+                    let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
+                    return;
+                }
 
                 // Gap check FIRST (borrows), before the merge moves the vecs.
                 for replay in [&log_replay, &platform_replay] {
@@ -4184,6 +4215,45 @@ mod tests {
 
         // Stream ends after the terminal status.
         assert!(stream.next().await.is_none());
+    }
+
+    /// The guard behind the producer's post-replay epoch re-check.
+    ///
+    /// Validation and the two `tail_after` reads take their locks separately, so
+    /// a teardown plus a republish can swap the space in between and leave the
+    /// reads applying an old seq to a replacement's buffers -- `tail_after` only
+    /// compares numbers, so it reports no gap while skipping every replacement
+    /// event at or below that seq. The producer re-checks the epoch once both
+    /// tails are in hand and before emitting anything; this pins what that check
+    /// must answer.
+    ///
+    /// The interleaving itself is not reachable from a test: the producer runs
+    /// validation, both reads, and the re-check with no await in between, so
+    /// there is nothing to suspend it on.
+    #[tokio::test]
+    async fn cursor_space_is_rejects_a_replacement_space() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("respace", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1);
+        let original = state.tracing_log_bus.cursor_space(&id).unwrap().epoch;
+        assert!(cursor_space_is(&state, &id, original));
+
+        // Teardown alone leaves no space to point into.
+        state.tracing_log_bus.remove(&id);
+        assert!(state.tracing_log_bus.cursor_space(&id).is_none());
+        assert!(!cursor_space_is(&state, &id, original));
+
+        // The republish installs a replacement renumbered from 1. Its seqs
+        // overlap the retired space's, so only the epoch separates them.
+        seed_log_lines(&state, &id, 1);
+        let replacement = state.tracing_log_bus.cursor_space(&id).unwrap();
+        assert_ne!(replacement.epoch, original);
+        assert_eq!(replacement.highest_seq, 1);
+        assert!(!cursor_space_is(&state, &id, original));
+        assert!(cursor_space_is(&state, &id, replacement.epoch));
     }
 
     #[tokio::test]

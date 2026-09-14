@@ -374,6 +374,14 @@ resume against a torn-down sandbox cannot create the space its stale cursor is
 then checked against. Clients track the highest observed `cursor` and pass it as
 `resume_after_cursor` on reconnect.
 
+The epoch is validated twice on resume: once before reading the tails and again
+once both are in hand, before anything is emitted. The check and each read take
+their locks separately, so a teardown plus a republish can retire the validated
+space and install a replacement in between; the reads would then apply the old
+space's seq to the replacement's buffers, and a trimmed-range check that only
+compares numbers would report no gap while skipping the replacement's lower
+events. The second look ends the stream with `OUT_OF_RANGE` instead.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store
