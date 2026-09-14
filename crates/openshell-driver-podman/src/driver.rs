@@ -1355,13 +1355,18 @@ impl PodmanComputeDriver {
                 let bundle =
                     extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
                 let metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
-                if metadata.generation == generation.as_str() {
+                if metadata.generation == generation.as_str() && encoded_authentication.is_empty() {
                     return span_status.finish(Ok(()));
                 }
-                return span_status.finish(Err(ComputeDriverError::Precondition(format!(
-                    "Podman sandbox is already running generation {}",
-                    metadata.generation
-                ))));
+                if metadata.generation != generation.as_str() {
+                    return span_status.finish(Err(ComputeDriverError::Precondition(format!(
+                        "Podman sandbox is already running generation {}",
+                        metadata.generation
+                    ))));
+                }
+                // A non-empty bundle for the same generation comes from
+                // gateway startup recovery. Restart both containers so the
+                // in-memory launch session changes atomically on both sides.
             }
             self.client.stop_container(&container.id, 0).await?;
             self.wait_for_container_stopped(sandbox_id, &container.id)
