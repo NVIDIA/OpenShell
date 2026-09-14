@@ -4393,8 +4393,12 @@ async fn prepare_docker_boundary_files(
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
     let provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
-        generation: random_boundary_token(),
+        generation: launch_authentication
+            .supervisor
+            .runtime_generation
+            .to_string(),
         session_id,
+        session_rotation: launch_authentication.supervisor.session_rotation,
         gateway_id: launch_authentication.gateway_id,
         verification_keys,
         container_id: container_id.to_string(),
@@ -4591,6 +4595,8 @@ async fn refresh_docker_boundary_authentication(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("rotate Docker boundary TLS: {error}")))?;
     boundary_config.session_id = session_id;
+    boundary_config.generation = authentication.supervisor.runtime_generation.to_string();
+    boundary_config.session_rotation = authentication.supervisor.session_rotation;
     boundary_config.gateway_id = authentication.gateway_id;
     boundary_config.verification_keys =
         gateway_verification_keys(&authentication.verification_keys)?;
@@ -5307,14 +5313,6 @@ fn cleanup_docker_boundary_state_by_id(sandbox_id: &str, config: &DockerDriverRu
             "Failed to remove Docker boundary state directory"
         );
     }
-}
-
-fn random_boundary_token() -> String {
-    let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
-        write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    token
 }
 
 fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
