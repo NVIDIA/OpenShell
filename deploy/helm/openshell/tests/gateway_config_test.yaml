@@ -294,7 +294,7 @@ tests:
           pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/openshell/sandbox:sandbox-build"'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'sandbox_runtime_image_pull_policy\s*=\s*"Always"'
+          pattern: 'sandbox_runtime_image_pull_policy\s*=\s*"always"'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'

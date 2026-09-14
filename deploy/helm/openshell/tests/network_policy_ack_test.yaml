@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: NetworkPolicy enforcement acknowledgement
+templates:
+  - templates/network-policy-ack.yaml
+tests:
+  - it: rejects an install without operator acknowledgement
+    set:
+      supervisor.sandboxRuntime.networkPolicyEnforced: false
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.sandboxRuntime.networkPolicyEnforced must be true after you verify that the cluster CNI enforces ingress and egress NetworkPolicy in every sandbox namespace
+
+  - it: accepts an acknowledged CNI
+    set:
+      supervisor.sandboxRuntime.networkPolicyEnforced: true
+    asserts:
+      - hasDocuments:
+          count: 0
