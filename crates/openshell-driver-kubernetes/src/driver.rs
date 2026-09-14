@@ -13,7 +13,8 @@ use crate::isolation::{
 };
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH,
-    SandboxRuntimeNames, boundary_service, generate_proxy_ca_material, sandbox_bootstrap_secret,
+    SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT, SandboxRuntimeNames, boundary_service,
+    generate_proxy_ca_material, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
@@ -2186,7 +2187,8 @@ impl KubernetesComputeDriver {
                             .as_str(),
                     ),
                     dependent_owner.clone(),
-                ),
+                )
+                .map_err(KubernetesDriverError::Message)?,
             )
             .await
             .map_err(KubernetesDriverError::from_kube)?;
@@ -2645,7 +2647,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let result = self.stop_sandbox_inner(sandbox_id).await;
+        let result = Box::pin(self.stop_sandbox_inner(sandbox_id)).await;
         span_status.finish(result)
     }
 
@@ -2835,7 +2837,8 @@ impl KubernetesComputeDriver {
                         &sandbox_api.resource.api_version,
                         false,
                     ),
-                ),
+                )
+                .map_err(KubernetesDriverError::Message)?,
             )
             .await
             .map_err(KubernetesDriverError::from_kube)?;
@@ -2981,39 +2984,75 @@ impl KubernetesComputeDriver {
     ) -> Result<(), KubernetesDriverError> {
         let names = SandboxRuntimeNames::new(sandbox_id);
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
-        let Some(pod) = pods
+        if let Some(pod) = pods
             .get_opt(&names.supervisor_pod)
             .await
             .map_err(KubernetesDriverError::from_kube)?
-        else {
-            return Ok(());
-        };
-        pods.delete(
-            &names.supervisor_pod,
-            &DeleteParams::foreground().preconditions(Preconditions {
-                uid: pod.metadata.uid,
-                resource_version: None,
-            }),
-        )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?;
-        let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
-        loop {
-            if pods
-                .get_opt(&names.supervisor_pod)
-                .await
-                .map_err(KubernetesDriverError::from_kube)?
-                .is_none()
-            {
-                return Ok(());
+        {
+            pods.delete(
+                &names.supervisor_pod,
+                &DeleteParams::foreground().preconditions(Preconditions {
+                    uid: pod.metadata.uid,
+                    resource_version: None,
+                }),
+            )
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+            let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
+            loop {
+                if pods
+                    .get_opt(&names.supervisor_pod)
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?
+                    .is_none()
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(KubernetesDriverError::Message(
+                        "timed out waiting for supervisor Pod deletion".to_string(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(KubernetesDriverError::Message(
-                    "timed out waiting for supervisor Pod deletion".to_string(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace)
+            .await
+    }
+
+    async fn delete_sandbox_runtime_generation_secrets(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
+        for component in [SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT] {
+            let selector =
+                format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component={component}");
+            let items = secrets
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            for secret in items {
+                let Some(name) = secret.metadata.name else {
+                    continue;
+                };
+                match secrets
+                    .delete(
+                        &name,
+                        &DeleteParams::default().preconditions(Preconditions {
+                            uid: secret.metadata.uid,
+                            resource_version: None,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
+                    Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tracing::instrument(

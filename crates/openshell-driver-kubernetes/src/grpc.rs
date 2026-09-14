@@ -256,10 +256,12 @@ impl ComputeDriver for ComputeDriverService {
             let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
             Ok::<ComputeDriverWatchStream, Status>(Box::pin(stream))
         };
-        self.rpc_tracer
-            .trace_stream(openshell_otel::rpc::WATCH_SANDBOXES, create_stream)
-            .await
-            .map(Response::new)
+        Box::pin(
+            self.rpc_tracer
+                .trace_stream(openshell_otel::rpc::WATCH_SANDBOXES, create_stream),
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn ensure_workspace(
