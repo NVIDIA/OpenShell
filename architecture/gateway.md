@@ -468,6 +468,12 @@ credential storage for defense in depth. Multi-replica deployments can use that
 default with a shared database and shared key-encryption key, or opt into an
 external backend such as Vault or Kubernetes Secrets.
 
+The Vault credential driver requires HTTPS for every non-loopback backend,
+never follows HTTP redirects, and keeps standard certificate hostname
+verification enabled. Operators can add private Vault trust roots with a PEM
+CA bundle; the driver does not replace platform roots or expose a certificate
+verification bypass.
+
 Sandbox workload templates are workspace-scoped gateway resources. Workspace
 admins create and delete them; workspace users can read and list them. A
 template owns reusable workload intent: image, environment, CPU and memory

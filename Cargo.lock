@@ -4230,6 +4230,7 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -4237,10 +4238,12 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wiremock",
 ]
 

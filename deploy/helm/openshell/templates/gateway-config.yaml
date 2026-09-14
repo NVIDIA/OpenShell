@@ -240,6 +240,9 @@ data:
 
     [openshell.credential_drivers.vault]
     address = {{ .Values.server.credentialDrivers.vault.address | quote }}
+    {{- if .Values.server.credentialDrivers.vault.caConfigMapName }}
+    ca_bundle = "/etc/openshell-tls/vault-ca/ca.crt"
+    {{- end }}
     mount = {{ .Values.server.credentialDrivers.vault.mount | quote }}
     kv_version = {{ .Values.server.credentialDrivers.vault.kvVersion | quote }}
     auth_method = {{ .Values.server.credentialDrivers.vault.authMethod | quote }}

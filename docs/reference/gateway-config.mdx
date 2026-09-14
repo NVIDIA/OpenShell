@@ -441,7 +441,8 @@ For Vault instead:
 credential_drivers = ["vault"]
 
 [openshell.credential_drivers.vault]
-address = "http://vault.vault.svc.cluster.local:8200"
+address = "https://vault.vault.svc.cluster.local:8200"
+ca_bundle = "/etc/openshell/vault/ca.pem"
 mount = "secret"
 kv_version = "2"
 auth_method = "kubernetes"
@@ -461,7 +462,9 @@ server:
 
 For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius.
 
-For `vault`, `address` points at the Vault service, `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
+For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
+
+For Helm deployments, set `server.credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and renders `ca_bundle` automatically.
 
 Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles. Before OpenShell 0.1.0, OpenShell does not automatically migrate inline refresh material or credential handles between drivers. Reconfigure refresh grants after an upgrade. Before changing credential drivers, remove affected credentials while the original driver is still available, then select the new driver and create them again. Do not run mixed gateway versions against the same refresh records.
 
@@ -492,7 +495,8 @@ transport = "uds"
 socket_path = "/run/openshell/credential-drivers/vault.sock"
 command = "/usr/libexec/openshell/openshell-driver-vault"
 args = [
-  "--address", "http://vault.vault.svc.cluster.local:8200",
+  "--address", "https://vault.vault.svc.cluster.local:8200",
+  "--ca-bundle", "/etc/openshell/vault/ca.pem",
   "--auth-method", "kubernetes",
   "--role", "openshell-gateway",
 ]

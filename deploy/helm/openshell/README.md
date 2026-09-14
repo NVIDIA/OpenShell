@@ -244,8 +244,9 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
 | server.credentialDrivers.kubernetesSecrets.namespace | string | `""` | Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace. A dedicated namespace is RECOMMENDED to isolate OpenShell-managed Secrets from other workloads. |
 | server.credentialDrivers.kubernetesSecrets.rbac.create | bool | `true` | Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets. |
-| server.credentialDrivers.vault.address | string | `""` | Vault service base URL, for example http://vault.vault.svc.cluster.local:8200. |
+| server.credentialDrivers.vault.address | string | `""` | Vault service base URL. Non-loopback endpoints must use HTTPS, for example https://vault.vault.svc.cluster.local:8200. |
 | server.credentialDrivers.vault.authMethod | string | `"kubernetes"` | Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation. |
+| server.credentialDrivers.vault.caConfigMapName | string | `""` | ConfigMap containing the private Vault CA certificate bundle in the ca.crt key. Leave empty to use platform trust roots. |
 | server.credentialDrivers.vault.enabled | bool | `false` | Enable the in-tree Vault credential driver. |
 | server.credentialDrivers.vault.kubernetesAuthMount | string | `"kubernetes"` | Vault Kubernetes auth mount. |
 | server.credentialDrivers.vault.kvVersion | string | `"2"` | Default KV engine version. Use "1" or "2". |
