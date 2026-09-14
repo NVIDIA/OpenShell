@@ -7,8 +7,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::{Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{
+    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, KeyToPath,
+    LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
+    ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
@@ -128,25 +134,30 @@ pub fn boundary_service(
     boundary_port: u16,
     owner: OwnerReference,
 ) -> Service {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": names.boundary_service,
-            "namespace": namespace,
-            "ownerReferences": [owner],
-            "labels": common_labels(sandbox_id, "boundary-service"),
+    Service {
+        metadata: ObjectMeta {
+            name: Some(names.boundary_service.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, "boundary-service")),
+            ..Default::default()
         },
-        "spec": {
-            "selector": pair_labels(sandbox_id, "workload"),
-            "ports": [{"name": "boundary", "protocol": "TCP", "port": boundary_port, "targetPort": boundary_port}],
-        }
-    }))
-    .expect("boundary Service renderer must produce a valid object")
+        spec: Some(ServiceSpec {
+            selector: Some(pair_labels(sandbox_id, "workload")),
+            ports: Some(vec![ServicePort {
+                name: Some("boundary".to_string()),
+                protocol: Some("TCP".to_string()),
+                port: i32::from(boundary_port),
+                target_port: Some(IntOrString::Int(i32::from(boundary_port))),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
-#[must_use]
 pub fn supervisor_pod(
     namespace: &str,
     names: &SandboxRuntimeNames,
@@ -171,7 +182,7 @@ pub fn supervisor_pod(
     proxy_connect_by_hostname: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
-) -> Pod {
+) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
         env_var(
@@ -208,16 +219,30 @@ pub fn supervisor_pod(
         ),
     ];
     let mut volume_mounts = vec![
-        serde_json::json!({"name": "bootstrap", "mountPath": "/.openshell/supervisor", "readOnly": true}),
-        serde_json::json!({"name": "sa-token", "mountPath": "/var/run/secrets/openshell", "readOnly": true}),
-        serde_json::json!({"name": "run", "mountPath": "/run/openshell"}),
-        serde_json::json!({"name": "logs", "mountPath": "/var/log"}),
+        volume_mount("bootstrap", "/.openshell/supervisor", true),
+        volume_mount("sa-token", "/var/run/secrets/openshell", true),
+        volume_mount("run", "/run/openshell", false),
+        volume_mount("logs", "/var/log", false),
     ];
     let mut volumes = vec![
-        serde_json::json!({"name": "bootstrap", "secret": {"secretName": names.supervisor_secret, "defaultMode": 0o440}}),
-        serde_json::json!({"name": "sa-token", "projected": {"sources": [{"serviceAccountToken": {"audience": "openshell-gateway", "expirationSeconds": sa_token_ttl_secs, "path": "token"}}], "defaultMode": 0o440}}),
-        serde_json::json!({"name": "run", "emptyDir": {}}),
-        serde_json::json!({"name": "logs", "emptyDir": {}}),
+        secret_volume("bootstrap", &names.supervisor_secret, None),
+        Volume {
+            name: "sa-token".to_string(),
+            projected: Some(ProjectedVolumeSource {
+                default_mode: Some(0o440),
+                sources: Some(vec![VolumeProjection {
+                    service_account_token: Some(ServiceAccountTokenProjection {
+                        audience: Some("openshell-gateway".to_string()),
+                        expiration_seconds: Some(sa_token_ttl_secs),
+                        path: "token".to_string(),
+                    }),
+                    ..Default::default()
+                }]),
+            }),
+            ..Default::default()
+        },
+        empty_dir_volume("run"),
+        empty_dir_volume("logs"),
     ];
     if !client_tls_secret_name.is_empty() {
         environment.extend([
@@ -231,8 +256,12 @@ pub fn supervisor_pod(
                 "/var/run/secrets/openshell-tls/tls.key",
             ),
         ]);
-        volume_mounts.push(serde_json::json!({"name": "client-tls", "mountPath": "/var/run/secrets/openshell-tls", "readOnly": true}));
-        volumes.push(serde_json::json!({"name": "client-tls", "secret": {"secretName": client_tls_secret_name, "defaultMode": 0o440}}));
+        volume_mounts.push(volume_mount(
+            "client-tls",
+            "/var/run/secrets/openshell-tls",
+            true,
+        ));
+        volumes.push(secret_volume("client-tls", client_tls_secret_name, None));
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
@@ -265,83 +294,124 @@ pub fn supervisor_pod(
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
-        volume_mounts.push(serde_json::json!({
-            "name": "upstream-proxy-auth",
-            "mountPath": auth_path.parent().and_then(Path::to_str).expect("auth path has parent"),
-            "readOnly": true
-        }));
-        volumes.push(serde_json::json!({
-            "name": "upstream-proxy-auth",
-            "secret": {"secretName": secret_name, "defaultMode": 0o440, "items": [{
-                "key": secret_key,
-                "path": auth_path.file_name().and_then(|name| name.to_str()).expect("auth path has file name")
-            }]}
-        }));
+        let mount_path = auth_path
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| "upstream proxy authentication path has no UTF-8 parent".to_string())?;
+        let item_path = auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                "upstream proxy authentication path has no UTF-8 file name".to_string()
+            })?;
+        volume_mounts.push(volume_mount("upstream-proxy-auth", mount_path, true));
+        volumes.push(secret_volume(
+            "upstream-proxy-auth",
+            secret_name,
+            Some(KeyToPath {
+                key: secret_key.to_string(),
+                path: item_path.to_string(),
+                ..Default::default()
+            }),
+        ));
     }
     if let Some(socket_path) = provider_spiffe_socket_path {
         environment.push(env_var(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
             socket_path,
         ));
-        volume_mounts.push(serde_json::json!({
-            "name": "spiffe-workload-api",
-            "mountPath": Path::new(socket_path).parent().and_then(Path::to_str).expect("SPIFFE socket has parent"),
-            "readOnly": true
-        }));
-        volumes.push(serde_json::json!({
-            "name": "spiffe-workload-api",
-            "csi": {"driver": "csi.spiffe.io", "readOnly": true}
-        }));
+        let mount_path = Path::new(socket_path)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| "SPIFFE socket path has no UTF-8 parent".to_string())?;
+        volume_mounts.push(volume_mount("spiffe-workload-api", mount_path, true));
+        volumes.push(Volume {
+            name: "spiffe-workload-api".to_string(),
+            csi: Some(CSIVolumeSource {
+                driver: "csi.spiffe.io".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
     }
-    let mut container = serde_json::json!({
-        "name": "supervisor",
-        "image": supervisor_image,
-        "command": command,
-        "terminationMessagePolicy": "FallbackToLogsOnError",
-        "env": environment,
-        "readinessProbe": {
-            "exec": {"command": [
-                "/openshell-supervisor",
-                "health",
-                "--socket",
-                CONTROL_HEALTH_SOCKET_PATH
-            ]},
-            "periodSeconds": 1,
-            "failureThreshold": 3
-        },
-        "securityContext": {
-            "runAsUser": control_uid,
-            "runAsGroup": control_gid,
-            "runAsNonRoot": true,
-            "readOnlyRootFilesystem": true,
-            "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]}
-        },
-        "volumeMounts": volume_mounts,
-    });
+    let mut container = Container {
+        name: "supervisor".to_string(),
+        image: Some(supervisor_image.to_string()),
+        command: Some(command),
+        termination_message_policy: Some("FallbackToLogsOnError".to_string()),
+        env: Some(environment),
+        readiness_probe: Some(Probe {
+            exec: Some(ExecAction {
+                command: Some(vec![
+                    "/openshell-supervisor".to_string(),
+                    "health".to_string(),
+                    "--socket".to_string(),
+                    CONTROL_HEALTH_SOCKET_PATH.to_string(),
+                ]),
+            }),
+            period_seconds: Some(1),
+            failure_threshold: Some(3),
+            ..Default::default()
+        }),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(i64::from(control_uid)),
+            run_as_group: Some(i64::from(control_gid)),
+            run_as_non_root: Some(true),
+            read_only_root_filesystem: Some(true),
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        volume_mounts: Some(volume_mounts),
+        ..Default::default()
+    };
     if let Some(policy) = supervisor_pull_policy {
-        container["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+        container.image_pull_policy = Some(policy.as_kubernetes_str().to_string());
     }
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": names.supervisor_pod, "namespace": namespace, "ownerReferences": [owner], "labels": labels, "annotations": {"openshell.ai/sandbox-id": sandbox_id}},
-        "spec": {
-            "serviceAccountName": service_account_name,
-            "imagePullSecrets": image_pull_secrets.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
-            "automountServiceAccountToken": false,
-            "schedulingGates": [{"name": "openshell.ai/bootstrap"}],
-            "securityContext": {
-                "fsGroup": control_gid,
-                "fsGroupChangePolicy": "OnRootMismatch",
-                "seccompProfile": {"type": "RuntimeDefault"}
-            },
-            "restartPolicy": "Never",
-            "containers": [container],
-            "volumes": volumes
-        }
-    }))
-    .expect("supervisor Pod renderer must produce a valid object")
+    Ok(Pod {
+        metadata: ObjectMeta {
+            name: Some(names.supervisor_pod.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(labels),
+            annotations: Some(BTreeMap::from([(
+                "openshell.ai/sandbox-id".to_string(),
+                sandbox_id.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            service_account_name: Some(service_account_name.to_string()),
+            image_pull_secrets: Some(
+                image_pull_secrets
+                    .iter()
+                    .map(|name| LocalObjectReference { name: name.clone() })
+                    .collect(),
+            ),
+            automount_service_account_token: Some(false),
+            scheduling_gates: Some(vec![PodSchedulingGate {
+                name: "openshell.ai/bootstrap".to_string(),
+            }]),
+            security_context: Some(PodSecurityContext {
+                fs_group: Some(i64::from(control_gid)),
+                fs_group_change_policy: Some("OnRootMismatch".to_string()),
+                seccomp_profile: Some(k8s_openapi::api::core::v1::SeccompProfile {
+                    type_: "RuntimeDefault".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            restart_policy: Some("Never".to_string()),
+            containers: vec![container],
+            volumes: Some(volumes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,8 +549,42 @@ fn control_labels(sandbox_id: &str, gateway_id: &str) -> BTreeMap<String, String
     labels
 }
 
-fn env_var(name: &str, value: &str) -> serde_json::Value {
-    serde_json::json!({"name": name, "value": value})
+fn env_var(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        ..Default::default()
+    }
+}
+
+fn volume_mount(name: &str, mount_path: &str, read_only: bool) -> VolumeMount {
+    VolumeMount {
+        name: name.to_string(),
+        mount_path: mount_path.to_string(),
+        read_only: read_only.then_some(true),
+        ..Default::default()
+    }
+}
+
+fn secret_volume(name: &str, secret_name: &str, item: Option<KeyToPath>) -> Volume {
+    Volume {
+        name: name.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(secret_name.to_string()),
+            default_mode: Some(0o440),
+            items: item.map(|item| vec![item]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn empty_dir_volume(name: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -533,10 +637,15 @@ mod tests {
             false,
             None,
             owner(),
-        );
-        let pod_spec = pod.spec.as_ref().unwrap();
+        )
+        .expect("render supervisor Pod");
+        let pod_spec = pod.spec.as_ref().expect("Pod spec");
         assert_eq!(
-            pod.metadata.owner_references.as_ref().unwrap()[0].controller,
+            pod.metadata
+                .owner_references
+                .as_ref()
+                .expect("owner references")[0]
+                .controller,
             None
         );
         let container = &pod_spec.containers[0];
@@ -552,23 +661,39 @@ mod tests {
             Some("openshell.ai/bootstrap")
         );
         assert_eq!(
-            pod_spec.image_pull_secrets.as_ref().unwrap()[0]
+            pod_spec
+                .image_pull_secrets
+                .as_ref()
+                .expect("image pull secrets")[0]
                 .name
                 .as_str(),
             "registry-credentials"
         );
-        let pod_security =
-            serde_json::to_value(pod_spec.security_context.as_ref().unwrap()).unwrap();
-        assert_eq!(pod_security["fsGroup"], 1000);
-        assert_eq!(pod_security["seccompProfile"]["type"], "RuntimeDefault");
-        let container_security =
-            serde_json::to_value(container.security_context.as_ref().unwrap()).unwrap();
-        assert_eq!(container_security["runAsUser"], 1000);
-        assert_eq!(container_security["runAsNonRoot"], true);
-        assert_eq!(container_security["readOnlyRootFilesystem"], true);
+        let pod_security = pod_spec
+            .security_context
+            .as_ref()
+            .expect("Pod security context");
+        assert_eq!(pod_security.fs_group, Some(1000));
         assert_eq!(
-            container_security["capabilities"]["drop"],
-            serde_json::json!(["ALL"])
+            pod_security
+                .seccomp_profile
+                .as_ref()
+                .map(|profile| profile.type_.as_str()),
+            Some("RuntimeDefault")
+        );
+        let container_security = container
+            .security_context
+            .as_ref()
+            .expect("container security context");
+        assert_eq!(container_security.run_as_user, Some(1000));
+        assert_eq!(container_security.run_as_non_root, Some(true));
+        assert_eq!(container_security.read_only_root_filesystem, Some(true));
+        assert_eq!(
+            container_security
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.drop.as_ref()),
+            Some(&vec!["ALL".to_string()])
         );
         assert_eq!(
             container
