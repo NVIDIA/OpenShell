@@ -151,6 +151,7 @@ pub(crate) enum ProxyIdentityMode {
     /// unavailable. MXC uses this on Windows: every connection redirected to
     /// the per-sandbox listener is evaluated as the configured sandbox agent
     /// identity.
+    #[cfg(any(not(target_os = "linux"), test))]
     Static {
         binary_path: PathBuf,
         binary_sha256: String,
@@ -169,6 +170,7 @@ impl ProxyIdentityMode {
         }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Result<Self> {
         let binary_path = path.into();
         let binary_sha256 = crate::procfs::file_sha256(&binary_path)?;
@@ -184,6 +186,7 @@ impl ProxyIdentityMode {
             Self::Procfs { entrypoint_pid, .. } => {
                 entrypoint_pid.load(std::sync::atomic::Ordering::Acquire)
             }
+            #[cfg(any(not(target_os = "linux"), test))]
             Self::Static { .. } => 0,
         }
     }
@@ -2698,11 +2701,14 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
 }
 
 fn authorize_egress_intent(
-    _connection: crate::procfs::WorkloadProxyTcpConnection,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_mode: &ProxyIdentityMode,
     intent: EgressIntent,
 ) -> EgressDecision {
+    #[cfg(not(target_os = "linux"))]
+    let _ = &connection;
+
     if !crate::opa::network_binary_identity_required() {
         return evaluate_endpoint_only_opa(engine, intent);
     }
@@ -2713,12 +2719,13 @@ fn authorize_egress_intent(
             identity_cache,
             entrypoint_pid,
         } => authorize_egress_intent_procfs(
-            _connection,
+            connection,
             engine,
             identity_cache,
             entrypoint_pid,
             intent,
         ),
+        #[cfg(any(not(target_os = "linux"), test))]
         ProxyIdentityMode::Static {
             binary_path,
             binary_sha256,
@@ -2731,13 +2738,13 @@ fn authorize_egress_intent(
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
             };
-            match engine.evaluate_network_action_with_generation(&input) {
-                Ok((action, generation)) => EgressDecision {
+            match engine.authorize_egress(&input) {
+                Ok(authorization) => EgressDecision {
                     intent,
-                    action,
-                    policy_generation: generation,
+                    action: authorization.action.clone(),
+                    policy_generation: authorization.generation,
                     identity: ProcessIdentityEvidence::Available,
-                    endpoint: EndpointDecision::default(),
+                    endpoint: EndpointDecision::from_authorization(&authorization),
                     binary: Some(binary_path.clone()),
                     binary_pid: None,
                     ancestors: Vec::new(),
@@ -6974,10 +6981,7 @@ network_policies:
                         port: 443,
                         ..Default::default()
                     }],
-                    binaries: vec![NetworkBinary {
-                        path: binary_path,
-                        ..Default::default()
-                    }],
+                    binaries: vec![NetworkBinary { path: binary_path }],
                 },
             )]),
             ..Default::default()

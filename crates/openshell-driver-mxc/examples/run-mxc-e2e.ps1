@@ -437,7 +437,7 @@ try {
     Set-Content -Path (Join-Path $roSrc "seed.txt") -Value "read-only seed" -Encoding UTF8
     Ok "DemoDir=$DemoDir  roSrc=$roSrc  denyProbe=$denyProbe"
 
-    $env:OPENSHELL_DRIVERS       = "mxc"
+    $env:OPENSHELL_COMPUTE_DRIVER = "mxc"
     $env:OPENSHELL_MXC_SHARE_DIR = $DemoDir
 
     # --- Scenario definitions -------------------------------------------------
