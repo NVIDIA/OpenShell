@@ -21,12 +21,14 @@ use super::config::{
     add_backend_specific_config, default_enforcement_mode, filesystem_default_deny_message,
 };
 use super::loss::{LossItem, add_loss};
+use crate::mxc::MXC_SCHEMA_VERSION;
 
 /// Options controlling the generated MXC config. Fields not relevant to the
 /// coarse map (e.g. `proxy_redirect`) are reserved for the governed-egress split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
-    /// MXC schema version written into `version`.
+    /// MXC schema version written into coarse-map output. The governed-egress
+    /// split uses the driver's MXC 0.8 schema.
     pub mxc_version: String,
     /// MXC containment backend.
     pub containment: String,
@@ -70,16 +72,15 @@ pub struct MxcMappingResult {
     pub loss: Vec<LossItem>,
 }
 
-/// Result of the governed-egress split: the MXC config carries filesystem grants and a
-/// proxy redirect; the full network policy is returned unchanged for the
-/// `OpenShell` CONNECT proxy to enforce.
+/// Result of the lossless split: the MXC config carries filesystem grants and
+/// loopback-only network access; the full network policy is returned unchanged
+/// for the `OpenShell` CONNECT proxy to enforce.
 #[derive(Clone, Debug)]
 pub struct SplitPolicyResult {
-    /// MXC `ContainerConfig` with filesystem grants and `network.proxy` redirect.
+    /// MXC `ContainerConfig` with filesystem grants and loopback-only egress.
     ///
-    /// Direct egress is blocked at the MXC layer. Unsupported host-list fields
-    /// are omitted; all outbound connections flow through the proxy, which
-    /// enforces the full `OpenShell` network policy.
+    /// Direct Internet egress is denied at the MXC layer. Proxy-aware clients
+    /// use the host proxy, which enforces the full `OpenShell` network policy.
     pub mxc_config: Value,
     /// Full `OpenShell` network policy preserved verbatim for the host CONNECT
     /// proxy. Only `network_policies` is populated; the proxy does not enforce
@@ -100,13 +101,12 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
 /// Governed-egress split: map filesystem + containment to MXC, delegate network to the
 /// `OpenShell` CONNECT proxy.
 ///
-/// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
-/// `opts.proxy_redirect` and omits unsupported host-list fields. Direct egress
-/// is blocked at the MXC layer and all outbound connections flow through the
-/// proxy. [`SplitPolicyResult::proxy_policy`] carries the original
-/// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
-/// loss items are generated for those rules. Network middleware is rejected
-/// until the host proxy can receive the gateway middleware service registry.
+/// The returned [`SplitPolicyResult::mxc_config`] allows only `127.0.0.1/32`
+/// egress and denies direct Internet access at the MXC layer. The driver injects
+/// `HTTP_PROXY`/`HTTPS_PROXY` for proxy-aware clients.
+/// [`SplitPolicyResult::proxy_policy`] carries the original
+/// `network_policies` verbatim. Network middleware remains rejected until the
+/// host proxy can receive the gateway middleware service registry.
 ///
 /// Returns `None` if `opts.proxy_redirect` is not set. Use [`map_to_mxc`]
 /// for the standalone coarse path when no proxy is in the loop.
@@ -153,11 +153,11 @@ fn build_split_mxc_config(
             "containment",
             "error",
             &format!(
-                "`network.proxy` is not supported on `{}`; governed egress requires processcontainer until MXC M1 lands.",
+                "MXC loopback-only proxy access is not supported on `{}`; governed egress requires processcontainer.",
                 opts.containment
             ),
             "governed egress proxy redirect",
-            "The generated MXC config omits network.proxy for this backend.",
+            "The generated MXC config cannot enable loopback-only proxy access for this backend.",
         );
     }
     if !policy.network_policies.is_empty() {
@@ -187,34 +187,34 @@ fn build_split_mxc_config(
         );
     }
 
-    // Direct egress is blocked; all outbound flows through the OpenShell proxy.
-    // Released wxc-exec rejects allowedHosts and blockedHosts as unsupported,
-    // even when empty, so the proxy path omits both fields.
-    //
-    // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
-    // {"host": ..., "port": ...} and every other shape is rejected — verified
-    // empirically against the real wxc-exec 0.6.0-alpha binary via --dry-run.
+    // Direct Internet egress is denied. Proxy-aware clients can reach only the
+    // OpenShell proxy (and other host loopback listeners) through 127.0.0.1.
     if proxy_supported && proxy_addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
         add_loss(
             items,
-            "network.proxy",
+            "proxy_redirect",
             "error",
             &format!(
-                "MXC schema 0.6.0-alpha can only express a localhost port \
-                 ({{\"localhost\": N}}); non-127.0.0.1 redirect address \
-                 {proxy_addr} is not representable."
+                "MXC governed egress requires the unpackaged OpenShell host \
+                 proxy to use 127.0.0.1; redirect address {proxy_addr} is not supported."
             ),
             "per-sandbox egress attribution",
-            "The redirect cannot be emitted; use a 127.0.0.1:PORT address.",
+            "The proxy environment cannot be emitted safely; use a 127.0.0.1:PORT address.",
         );
     }
-    let mut network = json!({ "defaultPolicy": "block" });
-    if proxy_supported && proxy_addr.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
-        network["proxy"] = json!({ "localhost": proxy_addr.port() });
-    }
+    let network = json!({
+        "egress": {
+            "default": "deny",
+            "allow": [{"to": [{"cidr": "127.0.0.1/32"}]}],
+        },
+        "ingress": {
+            "default": "allow",
+            "hostLoopback": "allow",
+        },
+    });
 
     let mut config = json!({
-        "version": opts.mxc_version,
+        "version": MXC_SCHEMA_VERSION,
         "containerId": opts.container_id,
         "containment": opts.containment,
         "lifecycle": {

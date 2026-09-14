@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# openclaw-gateway.yaml - Sandbox policy for the openclaw gateway running in a ProcessContainer.
+#
+# node.js (openclaw) needs:
+#   - Read-write access to share_dir (C:/openshell-openclaw) for node.exe,
+#     the openclaw install, home/temp dirs, and log files -- granted
+#     explicitly below via read_write, since the policy is the only source
+#     of filesystem grants (the driver no longer adds gateway-configured
+#     host paths on its own). This AppContainer configuration has no other
+#     read-only grants, so everything the sandboxed process touches
+#     (including its own Node.js runtime and the OpenClaw package) must
+#     live under share_dir; see run-openclaw-forward-test.ps1's staging
+#     step. run-openclaw-forward-test.ps1 patches this path (alongside the
+#     TOML's share_dir) when -ShareDir overrides the default below.
+#   - TCP socket binding on port 18889 (loopback) — governed by pc_capabilities.
+#   - Outbound TCP through the egress proxy — governed by egress_proxy in the TOML.
+#   - Win32k syscall access (ui.allow_graphical_ui) even though it never
+#     opens a real window: Node.js touches user32/gdi32 during its own
+#     startup and dies with STATUS_DLL_INIT_FAILED under the Win32k
+#     lockdown that applies by default when a policy has no `ui:` section,
+#     confirmed empirically against mxc-release-binaries-v0.8.0.
+#
+# The network policy is enforced by the OpenShell host CONNECT proxy. MXC's
+# default-deny egress independently blocks direct Internet bypass attempts.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/openshell-openclaw"
+
+ui:
+  allow_graphical_ui: true
+  clipboard: none
+  allow_input_injection: false
+
+network_policies:
+  qualification_allowed:
+    name: qualification-allowed
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: tcp
+    binaries:
+      # The harness replaces the default share root when -ShareDir is set.
+      - path: "C:/openshell-openclaw/node.exe"

@@ -12,7 +12,7 @@ Use this page to apply and iterate policy changes on running sandboxes. For a fu
 
 ## Policy Structure
 
-A policy has static sections `filesystem_policy`, `landlock`, `process`, and `ui` that are locked at sandbox creation, and dynamic `network_policies` and `network_middlewares` sections that are hot-reloadable on a running sandbox.
+A policy has static sections `filesystem_policy`, `landlock`, `process`, and `ui` that are locked at sandbox creation. `network_policies` and `network_middlewares` are dynamic schema sections, but live updates work only on compute drivers that support runtime policy reload. MXC rejects live policy replacement and merge updates, so recreate the sandbox there.
 
 ```yaml wordWrap showLineNumbers={false}
 version: 1

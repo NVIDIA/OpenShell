@@ -17,6 +17,7 @@ Windows MSVC for the supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
+- `openshell-supervisor-relay.exe` (Windows-only MXC workload relay)
 
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
@@ -153,9 +154,17 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
-mise run --skip-tools windows:test:mxc-real:x64
-mise run --skip-tools windows:test:mxc-real:arm64
 ```
+
+The two `windows:test:mxc-real:*` tasks are host-specific and mutually
+exclusive on a single host (each rejects the other architecture -- see the
+table below): run `windows:test:mxc-real:x64` on an x64 host, or
+`windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
+subsystem -- run the one matching your host architecture, not both, and not
+neither. Both are skip-safe (they print a SKIP reason and exit 0 when
+`wxc-exec` or the matching backend isn't available), so running the
+arch-appropriate task is always safe even without real MXC hardware. Neither
+is part of `windows:ci`'s ordered contract, so invoke it explicitly.
 
 For full validation, detect the Windows host architecture first and choose the
 native lane dynamically:
@@ -165,12 +174,14 @@ $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 switch ($arch.ToString()) {
     "X64" {
         mise run --skip-tools windows:ci
+        mise run --skip-tools windows:test:mxc-real:x64
     }
     "Arm64" {
         mise run --skip-tools windows:check:arm64
         mise run --skip-tools windows:build:arm64
         mise run --skip-tools windows:test:arm64
         mise run --skip-tools windows:test:unsupported:arm64
+        mise run --skip-tools windows:test:mxc-real:arm64
         mise run --skip-tools windows:artifacts
     }
     default {

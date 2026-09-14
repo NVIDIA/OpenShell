@@ -4170,6 +4170,7 @@ dependencies = [
 name = "openshell-driver-mxc"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "base64",
  "futures",
  "noyalib",
@@ -4177,6 +4178,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-network",
+ "rand 0.9.4",
  "rustls",
  "serde",
  "serde_json",
@@ -4184,6 +4186,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.26.2",
  "tonic",
  "tracing",
  "uuid",
@@ -4714,6 +4717,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "openshell-supervisor-relay"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
 ]
 
 [[package]]

@@ -4,15 +4,16 @@
 //! Host-side proxy startup for compute drivers that do not run the Linux
 //! in-sandbox supervisor.
 //!
-//! MXC uses this on Windows: MXC's `network.proxy` redirects sandbox egress to a
-//! per-sandbox loopback listener in the gateway process, and this module starts
-//! the existing OpenShell CONNECT proxy against the trimmed network-only
+//! MXC uses this on Windows: the driver injects proxy environment variables
+//! pointing to a per-sandbox loopback listener in the gateway process. This
+//! module starts the existing `OpenShell` CONNECT proxy against the trimmed network-only
 //! `SandboxPolicy`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use miette::Result;
 use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
@@ -33,7 +34,28 @@ use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::{ProxyHandle, ProxyIdentityMode};
 
-/// Configuration for a host-side OpenShell CONNECT proxy.
+/// Ephemeral credential required from a sandbox before the host proxy will
+/// evaluate or forward its request.
+///
+/// The expected header value is intentionally private and this type does not
+/// implement `Debug`, preventing accidental credential disclosure in logs.
+#[derive(Clone)]
+pub struct HostProxyClientAuth {
+    expected_proxy_authorization: Arc<str>,
+}
+
+impl HostProxyClientAuth {
+    #[must_use]
+    pub fn basic(username: &str, password: &str) -> Self {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{username}:{password}").as_bytes());
+        Self {
+            expected_proxy_authorization: Arc::from(format!("Basic {encoded}")),
+        }
+    }
+}
+
+/// Configuration for a host-side `OpenShell` CONNECT proxy.
 pub struct HostProxyConfig {
     /// Exact socket the compute driver will redirect sandbox egress to.
     pub bind_addr: SocketAddr,
@@ -43,6 +65,9 @@ pub struct HostProxyConfig {
     /// socket-owning sandbox process. Policy binaries must match this path for
     /// L4/L7 allow rules to pass.
     pub binary_path: PathBuf,
+    /// Per-sandbox client authentication. Host-side MXC proxies must set this
+    /// so another sandbox cannot borrow this proxy's identity and policy.
+    pub client_auth: HostProxyClientAuth,
     pub sandbox_id: Option<String>,
     pub sandbox_name: Option<String>,
     pub openshell_endpoint: Option<String>,
@@ -190,11 +215,15 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             (None, None, None)
         }
     };
+    let identity_mode = ProxyIdentityMode::static_binary_with_client_auth(
+        config.binary_path,
+        Some(config.client_auth.expected_proxy_authorization),
+    )?;
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
         Some(config.bind_addr),
         engine,
-        Arc::new(ProxyIdentityMode::static_binary(config.binary_path)?),
+        Arc::new(identity_mode),
         tls_state,
         config.provider_credentials,
         Some(policy_local_ctx.clone()),
@@ -234,6 +263,7 @@ mod tests {
                 ..Default::default()
             },
             binary_path,
+            client_auth: HostProxyClientAuth::basic("openshell", "test-secret"),
             sandbox_id: Some("sandbox-123".to_string()),
             sandbox_name: Some("agent-box".to_string()),
             openshell_endpoint: None,
@@ -242,6 +272,45 @@ mod tests {
             denial_tx: None,
             activity_tx: None,
         }
+    }
+
+    async fn proxy_request(addr: SocketAddr, headers: &[&str]) -> String {
+        let mut request = String::from(
+            "GET http://policy.local/v1/policy/current HTTP/1.1\r\nHost: policy.local\r\n",
+        );
+        for header in headers {
+            request.push_str(header);
+            request.push_str("\r\n");
+        }
+        request.push_str("Connection: close\r\n\r\n");
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    async fn proxy_connect_request(addr: SocketAddr, headers: &[&str]) -> String {
+        let mut request =
+            String::from("CONNECT example.invalid:443 HTTP/1.1\r\nHost: example.invalid:443\r\n");
+        for header in headers {
+            request.push_str(header);
+            request.push_str("\r\n");
+        }
+        request.push_str("Connection: close\r\n\r\n");
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(response).unwrap()
     }
 
     #[tokio::test]
@@ -322,24 +391,9 @@ mod tests {
                 .contains("BEGIN CERTIFICATE")
         );
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(
-                b"GET http://policy.local/v1/policy/current HTTP/1.1\r\n\
-                  Host: policy.local\r\n\
-                  Connection: close\r\n\
-                  \r\n",
-            )
-            .await
-            .unwrap();
-
-        let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let response = String::from_utf8(response).unwrap();
+        let auth = HostProxyClientAuth::basic("openshell", "test-secret");
+        let header = format!("Proxy-Authorization: {}", auth.expected_proxy_authorization);
+        let response = proxy_request(addr, &[&header]).await;
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
             "unexpected response: {response}"
@@ -353,6 +407,70 @@ mod tests {
                 .unwrap_or_default()
                 .contains("version: 1"),
             "unexpected policy payload: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_sandbox_credentials_reject_missing_wrong_cross_and_duplicate_auth() {
+        let binary = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(binary.path(), b"agent").unwrap();
+
+        let auth_a = HostProxyClientAuth::basic("openshell", "sandbox-a-secret");
+        let auth_b = HostProxyClientAuth::basic("openshell", "sandbox-b-secret");
+        // Node's EnvHttpProxyAgent currently emits the field name in lower
+        // case; HTTP field names are case-insensitive.
+        let header_a = format!(
+            "proxy-authorization: {}",
+            auth_a.expected_proxy_authorization
+        );
+        let header_b = format!(
+            "Proxy-Authorization: {}",
+            auth_b.expected_proxy_authorization
+        );
+
+        let mut config_a = test_config(([127, 0, 0, 1], 0).into(), binary.path().to_path_buf());
+        config_a.client_auth = auth_a;
+        let proxy_a = start_host_proxy(config_a).await.unwrap();
+
+        let mut config_b = test_config(([127, 0, 0, 1], 0).into(), binary.path().to_path_buf());
+        config_b.client_auth = auth_b;
+        let proxy_b = start_host_proxy(config_b).await.unwrap();
+
+        let addr_a = proxy_a.http_addr().unwrap();
+        let addr_b = proxy_b.http_addr().unwrap();
+        assert!(proxy_request(addr_a, &[]).await.starts_with("HTTP/1.1 407"));
+        assert!(
+            proxy_request(addr_a, &[&header_b])
+                .await
+                .starts_with("HTTP/1.1 407"),
+            "sandbox B credential must not authenticate to sandbox A proxy"
+        );
+        assert!(
+            proxy_request(addr_a, &[&header_a, &header_a])
+                .await
+                .starts_with("HTTP/1.1 407"),
+            "duplicate credentials must fail closed"
+        );
+        assert!(
+            proxy_request(addr_a, &[&header_a])
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            proxy_request(addr_b, &[&header_b])
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            proxy_connect_request(addr_a, &[&header_b])
+                .await
+                .starts_with("HTTP/1.1 407")
+        );
+        assert!(
+            proxy_connect_request(addr_a, &[&header_a])
+                .await
+                .starts_with("HTTP/1.1 403"),
+            "valid credentials must pass the auth gate and reach deny-by-default policy evaluation"
         );
     }
 }

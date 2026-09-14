@@ -390,18 +390,18 @@ fn a_split_network_verbatim_and_version_preserved() {
     );
 }
 
-/// split path: mxc_config["network"]["proxy"]["localhost"] == port (new schema).
+/// Split path emits MXC 0.8 loopback-only governed-egress fields.
 #[test]
-fn a_split_proxy_localhost_port() {
+fn a_split_proxy_uses_loopback_only_08_fields() {
     let policy = SandboxPolicy::default();
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
+    assert!(result.mxc_config.get("runtimeConfig").is_none());
+    assert_eq!(result.mxc_config["version"], "0.8.0-alpha");
+    assert_eq!(result.mxc_config["network"]["egress"]["default"], "deny");
     assert_eq!(
-        result.mxc_config["network"]["proxy"]["localhost"], 18080,
-        "split must emit network.proxy.localhost == port"
+        result.mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "127.0.0.1/32"
     );
-    // Released wxc-exec rejects host-list fields, even when empty.
-    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
-    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
 }
 
 // ─── QUADRANT B: OpenShell features MXC cannot express ──────────────────────
@@ -1030,13 +1030,16 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
         },
     );
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
-    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
-    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
-    // But proxy redirect is present.
     assert_eq!(
-        result.mxc_config["network"]["proxy"]["localhost"], 18080,
-        "split must emit network.proxy.localhost"
+        result.mxc_config["network"]["egress"]["default"], "deny",
+        "split path must deny direct egress even with network rules"
     );
+    // The only MXC-level egress allowance is host loopback.
+    assert_eq!(
+        result.mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "127.0.0.1/32"
+    );
+    assert!(result.mxc_config.get("runtimeConfig").is_none());
 }
 
 #[test]

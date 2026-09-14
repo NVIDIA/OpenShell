@@ -4,8 +4,11 @@
 //! MXC compute backend: lifecycle logic, in-memory registry, exec-in-driver,
 //! and self-reported readiness.
 
+use crate::control_channel::ControlChannel;
 use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, MappedConfig, PolicyMapper};
+use crate::relay;
+use base64::Engine as _;
 use futures::Stream;
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::proto::SandboxPolicy;
@@ -19,11 +22,12 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Child;
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
@@ -65,6 +69,7 @@ impl MxcBackend {
 /// environment variables / CLI flags via the standard gateway precedence chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Independent, existing gateway TOML options.
 pub struct MxcComputeConfig {
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
@@ -74,12 +79,74 @@ pub struct MxcComputeConfig {
     pub pc_least_privilege: bool,
     /// `processContainer` only: `AppContainer` capabilities to grant.
     pub pc_capabilities: Vec<String>,
+    /// `processContainer` only: inject a network section with
+    /// `defaultPolicy: "allow"` so the `AppContainer` has unrestricted outbound
+    /// TCP access.  Required when `pc_capabilities` alone is insufficient to
+    /// enable network access in the target wxc-exec build.
+    pub pc_network_allow: bool,
+    /// `processContainer` only: include `"allowLocalNetwork": true` in the
+    /// MXC network section.  Required for node.js (and other runtimes that
+    /// need loopback during DLL initialization) to start inside a
+    /// processcontainer.
+    pub pc_allow_local_network: bool,
+    /// `processContainer` only: when `true`, start with an EMPTY process env
+    /// (not even `MINIMAL_WINDOWS_BOOTSTRAP_ENV`) instead of the safe
+    /// default -- only the entries in `agent_env` are passed to the process.
+    /// Use for agents like Node.js that fail with `STATUS_DLL_INIT_FAILED`
+    /// when unrecognised host env vars are present; the caller is then
+    /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`COMSPEC`/
+    /// `LOCALAPPDATA` themselves via `agent_env` if the agent needs them
+    /// (`CreateProcessW` itself won't succeed without `LOCALAPPDATA` at
+    /// least -- see `MINIMAL_WINDOWS_BOOTSTRAP_ENV`).
+    ///
+    /// Three tiers overall, safest first: this flag (`agent_env` only) ->
+    /// the default (`MINIMAL_WINDOWS_BOOTSTRAP_ENV` + `agent_env`) ->
+    /// `pc_inherit_full_env` (the gateway's entire host env + `agent_env`,
+    /// explicit unsafe opt-in).
+    pub pc_minimal_env: bool,
+    /// `processContainer` only: when `true`, seed the process env from the
+    /// gateway host's ENTIRE environment instead of the safe
+    /// `MINIMAL_WINDOWS_BOOTSTRAP_ENV` default. This hands whatever the
+    /// gateway process itself happens to have in its environment --
+    /// including host secrets unrelated to this sandbox, e.g. API keys or
+    /// tokens picked up from the operator's shell -- to whatever untrusted
+    /// code `agent_command` runs inside the sandbox. Explicit, unsafe
+    /// opt-in only; ignored when `pc_minimal_env` is also set (that flag
+    /// wins). See `pc_minimal_env` for the full tier breakdown.
+    pub pc_inherit_full_env: bool,
+    /// `processContainer` only: path to a generic spawn+relay-bridge binary
+    /// (see the `openshell-supervisor-relay` crate). When non-empty (and
+    /// `pc_relay_target_port != 0`), the driver launches this binary instead
+    /// of `agent_command` directly, sending the real `agent_command` / env
+    /// over the control channel once the spawner announces readiness (the
+    /// "launch" handshake) rather than writing them to `share_dir`. This
+    /// decouples the relay-bridging logic from the target application (e.g.
+    /// `OpenClaw`) entirely — the target needs no awareness of the relay
+    /// protocol. It's also what gives the driver a control channel into the
+    /// sandbox at all, which `ForwardSink::open_dynamic_forward` (dynamic
+    /// `openshell forward service` bridging) depends on regardless of any
+    /// particular port being pre-declared.
+    pub pc_relay_spawner_path: String,
+    /// `processContainer` only: the TCP port `agent_command`'s target process
+    /// binds, which `pc_relay_spawner_path` bridges to the gateway relay.
+    /// Ignored unless `pc_relay_spawner_path` is set. `0` disables spawner
+    /// wrapping (default) — `agent_command` runs directly as before.
+    pub pc_relay_target_port: u16,
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
-    /// Enable Pattern-C governed egress. When true, MXC receives filesystem
-    /// grants plus a `network.proxy` redirect and the host CONNECT proxy
-    /// receives the trimmed network-only policy.
+    /// Legacy gateway-wide workload command. New callers should use
+    /// `template.driver_config.mxc.command`.
+    pub agent_command: Vec<String>,
+    /// Legacy gateway-wide workload directory.
+    pub agent_cwd: String,
+    /// Legacy gateway-host environment passthrough entries.
+    pub agent_env: Vec<String>,
+    /// Legacy default working directory used when `agent_cwd` is empty.
+    pub share_dir: String,
+    /// Enable Pattern-C governed egress. When true, MXC permits loopback-only
+    /// egress, the driver injects proxy environment variables, and the host
+    /// CONNECT proxy receives the full network policy.
     pub egress_proxy: bool,
     /// Loopback `IP:PORT` seed for MXC `network.proxy` while governed egress is
     /// enabled. The driver preserves the loopback IP and allocates a unique
@@ -101,7 +168,17 @@ impl Default for MxcComputeConfig {
             backend: MxcBackend::default(),
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
+            pc_network_allow: false,
+            pc_relay_spawner_path: String::new(),
+            pc_relay_target_port: 0,
+            pc_allow_local_network: false,
+            pc_minimal_env: false,
+            pc_inherit_full_env: false,
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
+            agent_command: Vec::new(),
+            agent_cwd: String::new(),
+            agent_env: Vec::new(),
+            share_dir: String::new(),
             egress_proxy: false,
             egress_proxy_addr: String::new(),
 
@@ -136,13 +213,49 @@ struct SandboxEntry {
     iso_sandbox_id: Option<String>,
     isolation_stopped: bool,
     phase_state: PhaseState,
-    /// Serializes stop/delete with provisioning and process launch.
+    /// Serializes stop/delete with provisioning and process launch: taken as
+    /// an owned guard (`startup_guard`) in `create_sandbox` before the entry
+    /// is published, and only released once `run_lifecycle` has installed
+    /// `exec_child`/`shutdown_tx`/`terminated_rx`/`control_channel` (or
+    /// failed). `stop_sandbox`/`delete_sandbox` block on this same gate
+    /// before touching any of those fields, so a stop/delete arriving while
+    /// a sandbox is still starting can't race a launch that hasn't finished
+    /// wiring the kill/shutdown machinery yet.
     lifecycle_gate: Arc<Mutex<()>>,
-    monitor_cancel: Option<watch::Sender<bool>>,
-    monitor_task: Option<JoinHandle<()>>,
+    exec_child: Option<Child>,
+    /// Fires when `delete_sandbox` is called on a `ProcessContainer` sandbox so
+    /// `monitor_exec` can kill the `wxc-exec` child and release all resources
+    /// (including ports bound inside the `AppContainer`) before the entry is
+    /// removed from the registry.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Set to `true` (from `monitor_exec`) once the `wxc-exec` child has
+    /// genuinely exited -- whether that's a natural exit or the forced kill
+    /// triggered via `shutdown_tx` above. Lets `stop_sandbox`/`delete_sandbox`
+    /// await *confirmed* termination (bounded by a timeout) instead of firing
+    /// the kill signal and immediately reporting success regardless of
+    /// whether the process actually died.
+    ///
+    /// A `watch::Receiver` rather than a `oneshot::Receiver` deliberately:
+    /// it's `.clone()`d (never `.take()`n) by callers, so it survives a
+    /// caller that times out and retries -- unlike a consumed oneshot, the
+    /// retry can still observe the same underlying completion instead of
+    /// silently skipping the wait because the field looks empty.
+    terminated_rx: Option<watch::Receiver<bool>>,
+    /// Path to the shutdown signal file written by `delete_sandbox` so
+    /// `mxc-ws-agent.rs` (set directly as `agent_command`, no control
+    /// channel) can detect a deletion and exit cleanly. Only set for that
+    /// case -- when spawner wrapping is active, `delete_sandbox` sends a
+    /// `"shutdown"` control-channel request to `openshell-supervisor-relay`
+    /// instead, so this stays `None`.
+    signal_file: Option<PathBuf>,
     trimmed_policy: Option<SandboxPolicy>,
     proxy_addr: Option<SocketAddr>,
     host_proxy: Option<openshell_supervisor_network::host::HostProxyHandle>,
+    /// JSON request/response control channel over the spawner's inherited
+    /// stdin/stdout (see `control_channel.rs`). Only present when spawner
+    /// wrapping is active (`pc_relay_spawner_path` configured); dropped on
+    /// delete, which closes the child's stdin.
+    control_channel: Option<Arc<ControlChannel>>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -232,21 +345,29 @@ impl std::fmt::Debug for MxcComputeBackend {
     }
 }
 
-fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
+fn sandbox_config(
+    sandbox: &DriverSandbox,
+    legacy: &MxcComputeConfig,
+) -> Result<MxcSandboxConfig, tonic::Status> {
     let config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .ok_or_else(|| {
-            tonic::Status::invalid_argument(
-                "mxc requires template.driver_config.mxc with a non-empty command array",
-            )
-        })?;
-    let config: MxcSandboxConfig =
+        .and_then(|template| template.driver_config.as_ref());
+    let config = if let Some(config) = config {
         serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
             tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+        })?
+    } else {
+        MxcSandboxConfig {
+            command: legacy.agent_command.clone(),
+            cwd: if legacy.agent_cwd.is_empty() {
+                legacy.share_dir.clone()
+            } else {
+                legacy.agent_cwd.clone()
+            },
+        }
+    };
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
             "mxc driver_config.command must contain a non-empty executable",
@@ -255,24 +376,13 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
     Ok(config)
 }
 
-// Minimum non-secret Windows environment needed by CreateProcessW and the
-// AppContainer DACL fallback before the workload runtime starts.
-const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
-    ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
-
-fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
-    // Released wxc-exec ProcessContainer builds start from the explicit
-    // process environment. Seed only the non-secret Windows bootstrap values;
-    // copying the gateway's full environment would leak unrelated host secrets
-    // into untrusted sandbox workloads.
-    let mut environment = MINIMAL_WINDOWS_BOOTSTRAP_ENV
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_string(), value))
-        })
-        .collect::<HashMap<_, _>>();
+fn sandbox_environment(sandbox: &DriverSandbox, legacy: &MxcComputeConfig) -> Vec<String> {
+    let mut environment = HashMap::new();
+    for entry in resolve_agent_env(&legacy.agent_env) {
+        if let Some((key, value)) = entry.split_once('=') {
+            environment.insert(key.to_string(), value.to_string());
+        }
+    }
     if let Some(spec) = sandbox.spec.as_ref() {
         if let Some(template) = spec.template.as_ref() {
             environment.extend(template.environment.clone());
@@ -285,6 +395,20 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
         .collect::<Vec<_>>();
     environment.sort_unstable();
     environment
+}
+
+fn resolve_agent_env(entries: &[String]) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.contains('=') {
+            resolved.push(entry.clone());
+        } else if let Ok(value) = std::env::var(entry) {
+            resolved.push(format!("{entry}={value}"));
+        } else {
+            warn!(var = %entry, "agent_env passthrough variable not set; skipping");
+        }
+    }
+    resolved
 }
 
 /// Merge provider-owned child environment values into MXC `process.env`.
@@ -368,7 +492,7 @@ fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr
     }
     if config.backend == MxcBackend::IsolationSession {
         return Err(tonic::Status::invalid_argument(
-            "mxc governed egress requires process_container; network.proxy is not supported on isolation_session until MXC M1 lands",
+            "mxc governed egress requires process_container; isolation_session cannot enforce the loopback-only proxy path",
         ));
     }
     let raw = config.egress_proxy_addr.trim();
@@ -384,7 +508,7 @@ fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr
     })?;
     if addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
         return Err(tonic::Status::invalid_argument(format!(
-            "mxc egress_proxy_addr must be 127.0.0.1:PORT because MXC 0.6.0-alpha can encode only a localhost proxy port (got {})",
+            "mxc egress_proxy_addr must be 127.0.0.1:PORT because the sandbox reaches the unpackaged OpenShell host proxy over loopback (got {})",
             addr.ip()
         )));
     }
@@ -399,6 +523,195 @@ fn allocate_sandbox_proxy_addr(
     Ok((addr, reservation))
 }
 
+/// Minimum Windows environment variables required just for `CreateProcessW`
+/// / `AppContainer`-DACL process creation to succeed at all -- independent of
+/// whatever runtime `agent_command` happens to be. Confirmed empirically:
+/// without `LOCALAPPDATA` specifically, `CreateProcessW` itself fails with
+/// `ERROR_ENVVAR_NOT_FOUND` (Win32 203) under the appcontainer-dacl fallback
+/// tier, before the agent binary is ever reached -- a Windows `AppContainer`
+/// requirement, not specific to Node.js or any other agent. None of these
+/// are secrets, so resolving them from the gateway host is safe; this is
+/// the default baseline `agent_env` layers on top of. See `pc_minimal_env`
+/// / `pc_inherit_full_env` on `MxcComputeConfig` for the other two tiers.
+const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
+    ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
+
+fn host_proxy_binary_path(config: &MxcSandboxConfig) -> PathBuf {
+    config
+        .command
+        .first()
+        .filter(|command| !command.trim().is_empty())
+        .map_or_else(|| PathBuf::from("mxc-agent"), PathBuf::from)
+}
+
+const TLS_ENV_KEYS: [&str; 6] = [
+    "NODE_EXTRA_CA_CERTS",
+    "DENO_CERT",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
+
+/// Replace client trust overrides with the proxy's public CA paths.
+/// Curated `ProcessContainers` receive copies staged under the authorized share,
+/// rather than paths inside the host proxy's private temporary directory.
+fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBuf)>) {
+    let Some((ca_cert_path, combined_bundle_path)) = ca_paths else {
+        return;
+    };
+    env.retain(|entry| {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+        !TLS_ENV_KEYS
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+    });
+    let ca_cert_path = ca_cert_path.display().to_string();
+    let combined_bundle_path = combined_bundle_path.display().to_string();
+    env.extend([
+        format!("NODE_EXTRA_CA_CERTS={ca_cert_path}"),
+        format!("DENO_CERT={ca_cert_path}"),
+        format!("SSL_CERT_FILE={combined_bundle_path}"),
+        format!("REQUESTS_CA_BUNDLE={combined_bundle_path}"),
+        format!("CURL_CA_BUNDLE={combined_bundle_path}"),
+        format!("GIT_SSL_CAINFO={combined_bundle_path}"),
+    ]);
+}
+
+fn stage_tls_ca_files(
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+    share_dir: &str,
+    sandbox_id: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    let Some((ca_cert_path, combined_bundle_path)) = ca_paths else {
+        return Ok(None);
+    };
+    if share_dir.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "share_dir must be set when staging proxy CA files",
+        ));
+    }
+    if sandbox_id.is_empty()
+        || !sandbox_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox_id must be a non-empty alphanumeric, hyphen or underscore component",
+        ));
+    }
+    let target_dir = PathBuf::from(share_dir)
+        .join(".openshell-proxy")
+        .join(sandbox_id);
+    std::fs::create_dir_all(&target_dir)?;
+    let staged_ca = target_dir.join("openshell-ca.pem");
+    let staged_bundle = target_dir.join("ca-bundle.pem");
+    std::fs::copy(ca_cert_path, &staged_ca)?;
+    std::fs::copy(combined_bundle_path, &staged_bundle)?;
+    Ok(Some((staged_ca, staged_bundle)))
+}
+
+/// PROTOTYPE (2026-09-10): env-var-based governed egress, as an alternative
+/// to MXC's own `network.proxy`/`runtimeConfig.networkProxy` transparent
+/// redirect (both confirmed broken for this driver's use case -- see
+/// `network_json()` in mxc.rs for the elevation/loopback-block history).
+/// `HTTP_PROXY`/`HTTPS_PROXY` are honored voluntarily by well-behaved HTTP
+/// clients (curl, most language HTTP libraries, Node fetch, git, etc.), not
+/// enforced by the OS -- but paired with the sandbox's own default-deny
+/// egress (only 127.0.0.1 allowed, see `network_json()`), that's actually
+/// sufficient: compliant agents route through the host CONNECT proxy this
+/// way, and anything that ignores these vars and tries to connect directly
+/// just hits the WFP deny-by-default wall instead of silently bypassing
+/// governance. Lowercase forms included too since some tools (e.g. curl)
+/// prefer them, and both are common in the wild.
+const PROXY_ENV_KEYS: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+const SANDBOX_PROXY_USERNAME: &str = "openshell";
+
+struct SandboxProxyAuth {
+    password: String,
+}
+
+impl SandboxProxyAuth {
+    fn generate() -> Self {
+        let random: [u8; 32] = rand::random();
+        Self {
+            password: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random),
+        }
+    }
+
+    fn proxy_url(&self, addr: SocketAddr) -> String {
+        format!("http://{SANDBOX_PROXY_USERNAME}:{}@{addr}", self.password)
+    }
+
+    fn host_client_auth(&self) -> openshell_supervisor_network::host::HostProxyClientAuth {
+        openshell_supervisor_network::host::HostProxyClientAuth::basic(
+            SANDBOX_PROXY_USERNAME,
+            &self.password,
+        )
+    }
+}
+
+fn append_proxy_env_vars(
+    env: &mut Vec<String>,
+    proxy_addr: Option<SocketAddr>,
+    proxy_auth: Option<&SandboxProxyAuth>,
+) {
+    let (Some(addr), Some(proxy_auth)) = (proxy_addr, proxy_auth) else {
+        return;
+    };
+    env.retain(|entry| {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+        !PROXY_ENV_KEYS
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+    });
+    let proxy_url = proxy_auth.proxy_url(addr);
+    env.extend([
+        format!("HTTP_PROXY={proxy_url}"),
+        format!("http_proxy={proxy_url}"),
+        format!("HTTPS_PROXY={proxy_url}"),
+        format!("https_proxy={proxy_url}"),
+        "NO_PROXY=".to_string(),
+        "no_proxy=".to_string(),
+    ]);
+}
+
+/// Not called: the release wxc-exec (`BaseContainer` dispatcher) requires
+/// write-DAC permission on every path in `readonlyPaths` to set up
+/// `AppContainer` ACLs, and adding the TLS CA cert temp directory here
+/// causes it to fail with a DACL error (empirically confirmed) -- the CA
+/// cert paths are available to the agent via TLS env vars instead (see
+/// `append_tls_env_vars`). Kept for a future build where that DACL
+/// requirement no longer applies.
+#[allow(dead_code)]
+fn append_tls_readonly_grant(
+    readonly_paths: &mut Vec<String>,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+) {
+    let Some((ca_cert_path, _)) = ca_paths else {
+        return;
+    };
+    let Some(dir) = ca_cert_path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let dir = dir.display().to_string();
+    if !readonly_paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&dir))
+    {
+        readonly_paths.push(dir);
+    }
+}
 fn encode_windows_command_line(args: &[String]) -> String {
     args.iter()
         .map(|arg| quote_windows_argument(arg))
@@ -432,47 +745,6 @@ fn quote_windows_argument(arg: &str) -> String {
     quoted.push('"');
     quoted
 }
-fn host_proxy_binary_path(config: &MxcSandboxConfig) -> PathBuf {
-    config
-        .command
-        .first()
-        .filter(|command| !command.trim().is_empty())
-        .map_or_else(|| PathBuf::from("mxc-agent"), PathBuf::from)
-}
-
-const TLS_ENV_KEYS: [&str; 6] = [
-    "NODE_EXTRA_CA_CERTS",
-    "DENO_CERT",
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",
-];
-
-fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBuf)>) {
-    let Some((ca_cert_path, combined_bundle_path)) = ca_paths else {
-        return;
-    };
-
-    env.retain(|entry| {
-        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
-        !TLS_ENV_KEYS
-            .iter()
-            .any(|candidate| key.eq_ignore_ascii_case(candidate))
-    });
-
-    let ca_cert_path = ca_cert_path.display().to_string();
-    let combined_bundle_path = combined_bundle_path.display().to_string();
-    env.extend([
-        format!("NODE_EXTRA_CA_CERTS={ca_cert_path}"),
-        format!("DENO_CERT={ca_cert_path}"),
-        format!("SSL_CERT_FILE={combined_bundle_path}"),
-        format!("REQUESTS_CA_BUNDLE={combined_bundle_path}"),
-        format!("CURL_CA_BUNDLE={combined_bundle_path}"),
-        format!("GIT_SSL_CAINFO={combined_bundle_path}"),
-    ]);
-}
-
 fn append_tls_readwrite_grant(
     readwrite_paths: &mut Vec<String>,
     ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -530,6 +802,18 @@ impl MxcComputeBackend {
         }
     }
 
+    /// Returns a cheap, cloneable handle exposing MXC's dynamic port-forward
+    /// capability, so the gateway's `ComputeRuntime` can grab it (before
+    /// `self` is consumed into `Arc<dyn ComputeDriver>`) and call it directly
+    /// from `handle_forward_tcp` for sandboxes with no `ConnectSupervisor`
+    /// session -- MXC has no supervisor at all, so that path is otherwise
+    /// permanently dead for it.
+    pub fn forward_sink(&self) -> ForwardSink {
+        ForwardSink {
+            registry: self.registry.clone(),
+        }
+    }
+
     /// Return the in-process create-time provider credential side channel.
     pub fn provider_credentials_sink(
         &self,
@@ -560,7 +844,7 @@ impl MxcComputeBackend {
         }
     }
 
-    fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+    fn validate_sandbox_fields(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),
@@ -580,7 +864,7 @@ impl MxcComputeBackend {
                 ));
             }
         }
-        sandbox_config(sandbox)?;
+        sandbox_config(sandbox, &self.config)?;
         Ok(())
     }
 
@@ -603,7 +887,7 @@ impl MxcComputeBackend {
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
-        Self::validate_sandbox_fields(sandbox)?;
+        self.validate_sandbox_fields(sandbox)?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         let egress_addr = configured_egress_addr(&self.config)?;
         self.map_sandbox_policy(&sandbox.id, policy, egress_addr)?;
@@ -634,8 +918,8 @@ impl MxcComputeBackend {
             .remove(&sandbox_id);
         validate_provider_child_env_keys(provider_credentials.as_ref())?;
 
-        Self::validate_sandbox_fields(sandbox)?;
-        let sandbox_config = sandbox_config(sandbox)?;
+        self.validate_sandbox_fields(sandbox)?;
+        let sandbox_config = sandbox_config(sandbox, &self.config)?;
         let (egress_addr, reserved_proxy_listener) = match configured_egress_addr(&self.config)? {
             Some(configured_addr) => {
                 let (addr, reservation) = allocate_sandbox_proxy_addr(configured_addr).map_err(
@@ -709,11 +993,14 @@ impl MxcComputeBackend {
                     isolation_stopped: false,
                     phase_state: PhaseState::Starting,
                     lifecycle_gate,
-                    monitor_cancel: None,
-                    monitor_task: None,
-                    trimmed_policy: None,
-                    proxy_addr: None,
+                    exec_child: None,
+                    shutdown_tx: None,
+                    terminated_rx: None,
+                    signal_file: None,
+                    trimmed_policy: mapped.trimmed_policy.clone(),
+                    proxy_addr: mapped.proxy_addr,
                     host_proxy: None,
+                    control_channel: None,
                 },
             );
         }
@@ -755,8 +1042,19 @@ impl MxcComputeBackend {
             (entry.sandbox.id.clone(), entry.lifecycle_gate.clone())
         };
 
+        // Blocks until any in-flight create_sandbox/run_lifecycle has either
+        // finished wiring shutdown_tx/control_channel or failed -- closes the
+        // race where a stop arriving mid-startup would otherwise find both
+        // `None` and silently no-op (see the `lifecycle_gate` field doc).
         let _lifecycle_guard = lifecycle_gate.lock().await;
-        let (iso_id, mut isolation_stopped, cancel, monitor_task) = {
+        let (
+            iso_id,
+            mut isolation_stopped,
+            shutdown_tx,
+            terminated_rx,
+            control_channel,
+            host_proxy,
+        ) = {
             let mut registry = self.registry.lock().await;
             let entry = registry.get_mut(&sandbox_id).ok_or_else(|| {
                 tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
@@ -764,25 +1062,76 @@ impl MxcComputeBackend {
             (
                 entry.iso_sandbox_id.clone(),
                 entry.isolation_stopped,
-                entry.monitor_cancel.take(),
-                entry.monitor_task.take(),
+                // Only ProcessContainer entries have these; isolation_session
+                // relies on invoker.stop() below instead. .take() the kill
+                // signal so a concurrent stop can't double-fire it, but
+                // .clone() terminated_rx (a watch::Receiver, not a oneshot)
+                // and the control channel (an Arc) -- both need to survive a
+                // caller that times out below and retries: a fresh clone of
+                // the same watch::Receiver still observes the SAME
+                // underlying completion, whereas .take()-ing it would make a
+                // retry silently skip the wait (see the matching fix in
+                // delete_sandbox and MR !98's review thread on this).
+                entry.shutdown_tx.take(),
+                entry.terminated_rx.clone(),
+                entry.control_channel.clone(),
+                entry.host_proxy.take(),
             )
         };
-        if let Some(cancel) = cancel {
-            let _ = cancel.send(true);
-        }
-        if let Some(task) = monitor_task {
-            task.await.map_err(|error| {
-                tonic::Status::internal(format!("mxc process monitor failed: {error}"))
-            })?;
-        }
-        if let Some(ref iso_id) = iso_id
-            && !isolation_stopped
-        {
-            self.invoker.stop(iso_id).await.map_err(|error| {
-                tonic::Status::internal(format!("wxc-exec stop failed: {error}"))
-            })?;
-            isolation_stopped = true;
+        drop(host_proxy);
+
+        if let Some(ref iso_id) = iso_id {
+            if !isolation_stopped {
+                self.invoker.stop(iso_id).await.map_err(|error| {
+                    tonic::Status::internal(format!("wxc-exec stop failed: {error}"))
+                })?;
+                isolation_stopped = true;
+            }
+        } else {
+            // ProcessContainer has no persistent iso id -- the sandbox IS
+            // the one-shot wxc-exec process, so without this block stop had
+            // nothing to act on and just relabeled the sandbox Stopped while
+            // wxc-exec (and everything inside the AppContainer) kept
+            // running. Ask nicely first over the control channel (bounded
+            // by request()'s own 3s timeout, same as delete_sandbox), then
+            // trigger the shutdown_tx kill backstop.
+            if let Some(channel) = control_channel {
+                match channel
+                    .request(
+                        "shutdown",
+                        serde_json::Value::Null,
+                        std::time::Duration::from_secs(3),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(sandbox = %sandbox_name, "control-channel shutdown acknowledged");
+                    }
+                    Err(e) => {
+                        warn!(sandbox = %sandbox_name, "control-channel shutdown failed: {e}");
+                    }
+                }
+            }
+            if let Some(tx) = shutdown_tx {
+                let _ = tx.send(());
+            }
+            // Await *confirmed* termination via terminated_rx -- not just
+            // firing the kill signal and reporting success regardless --
+            // before this returns Ok. This runs whenever terminated_rx is
+            // present, independent of whether THIS call sent the kill
+            // signal above: shutdown_tx is None either because the process
+            // already exited naturally, or because an earlier (possibly
+            // timed-out) stop/delete attempt already sent it -- either way,
+            // this call still needs to observe genuine completion, not
+            // assume it.
+            if let Some(mut rx) = terminated_rx
+                && !wait_for_termination(&mut rx).await
+            {
+                warn!(sandbox = %sandbox_name, "timed out waiting for ProcessContainer termination on stop");
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "sandbox {sandbox_name} did not terminate within the stop timeout"
+                )));
+            }
         }
 
         let mut registry = self.registry.lock().await;
@@ -825,8 +1174,17 @@ impl MxcComputeBackend {
             entry.lifecycle_gate.clone()
         };
 
+        // See stop_sandbox's matching comment on lifecycle_gate.
         let _lifecycle_guard = lifecycle_gate.lock().await;
-        let (iso_id, isolation_stopped, cancel, monitor_task) = {
+        let (
+            iso_id,
+            isolation_stopped,
+            shutdown_tx,
+            terminated_rx,
+            signal_file,
+            control_channel,
+            host_proxy,
+        ) = {
             let mut registry = self.registry.lock().await;
             let Some(entry) = registry.get_mut(sandbox_id) else {
                 return Ok(false);
@@ -834,18 +1192,17 @@ impl MxcComputeBackend {
             (
                 entry.iso_sandbox_id.clone(),
                 entry.isolation_stopped,
-                entry.monitor_cancel.take(),
-                entry.monitor_task.take(),
+                entry.shutdown_tx.take(),
+                // .clone(), not .take() -- see stop_sandbox's matching
+                // comment: a watch::Receiver survives a caller that times
+                // out and retries, unlike a consumed oneshot.
+                entry.terminated_rx.clone(),
+                entry.signal_file.take(),
+                entry.control_channel.take(),
+                entry.host_proxy.take(),
             )
         };
-        if let Some(cancel) = cancel {
-            let _ = cancel.send(true);
-        }
-        if let Some(task) = monitor_task {
-            task.await.map_err(|error| {
-                tonic::Status::internal(format!("mxc process monitor failed: {error}"))
-            })?;
-        }
+        drop(host_proxy);
         if let Some(ref iso_id) = iso_id {
             if !isolation_stopped {
                 self.invoker.stop(iso_id).await.map_err(|error| {
@@ -861,6 +1218,75 @@ impl MxcComputeBackend {
             self.invoker.deprovision(iso_id).await.map_err(|error| {
                 tonic::Status::internal(format!("wxc-exec deprovision failed: {error}"))
             })?;
+        } else {
+            // Prefer telling the spawner directly over the control channel
+            // (a "shutdown" request -- see the launch handshake) so it can
+            // proactively kill its target and exit before the AppContainer
+            // teardown below, since that teardown alone can leave sandboxed
+            // processes running well past this call returning. Awaited
+            // (bounded by request()'s own 3s timeout) rather than
+            // fire-and-forget: a detached task races the shutdown_tx
+            // backstop below instead of being superseded by it, so the
+            // graceful path can lose to its own fallback. The backstop
+            // still always runs afterward regardless of outcome here --
+            // this only orders "ask nicely" before "force it". Only
+            // present when the driver launched openshell-supervisor-relay
+            // (spawner wrapping); mxc-ws-agent.rs (no control channel)
+            // still uses the older signal-file mechanism.
+            if let Some(channel) = control_channel {
+                match channel
+                    .request(
+                        "shutdown",
+                        serde_json::Value::Null,
+                        std::time::Duration::from_secs(3),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(sandbox = %sandbox_name, "control-channel shutdown acknowledged");
+                    }
+                    Err(e) => {
+                        warn!(sandbox = %sandbox_name, "control-channel shutdown failed: {e}");
+                    }
+                }
+            }
+            // Write the shutdown signal file so the spawner inside the
+            // AppContainer detects deletion and exits cleanly, freeing ports
+            // and child processes even if MXC does not cascade-kill them when
+            // wxc-exec is terminated. Only set for mxc-ws-agent.rs (no
+            // control channel) -- see above.
+            if let Some(ref path) = signal_file
+                && let Err(e) = std::fs::write(path, b"")
+            {
+                warn!(sandbox = %sandbox_name, path = %path.display(), error = %e,
+                          "failed to write ProcessContainer shutdown signal file");
+            }
+            // Signal monitor_exec to kill wxc-exec as a backstop.
+            if let Some(tx) = shutdown_tx {
+                let _ = tx.send(());
+            }
+            // Await *confirmed* termination via terminated_rx -- not just
+            // firing the signal and reporting success regardless -- before
+            // this removes the registry entry and returns Ok(true). Without
+            // this, delete_sandbox could report success while the
+            // ProcessContainer (and whatever it launched) is still alive,
+            // retaining ports and file locks (see stop_sandbox's matching
+            // comment). Runs whenever terminated_rx is present, independent
+            // of whether THIS call sent the kill signal above -- shutdown_tx
+            // is None either because the process already exited naturally,
+            // or because an earlier (possibly timed-out) stop/delete attempt
+            // already sent it. A retry must still confirm genuine
+            // completion via the persisted watch value rather than assuming
+            // it, or it can remove the registry entry and report success
+            // while the process is still alive (MR !98 review thread).
+            if let Some(mut rx) = terminated_rx
+                && !wait_for_termination(&mut rx).await
+            {
+                warn!(sandbox = %sandbox_name, "timed out waiting for ProcessContainer termination on delete");
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "sandbox {sandbox_name} did not terminate within the delete timeout"
+                )));
+            }
         }
 
         let mut registry = self.registry.lock().await;
@@ -921,6 +1347,91 @@ impl MxcComputeBackend {
     }
 }
 
+// ── Dynamic port forwarding ───────────────────────────────────────────────────
+//
+// Closes the `openshell forward service` gap for MXC: `handle_forward_tcp`
+// normally requires a live `ConnectSupervisor` session, which MXC's
+// exec-in-driver design never registers (no in-sandbox supervisor process
+// exists). This gives the gateway an alternate path straight into a running
+// sandbox's control channel instead, bypassing that requirement entirely.
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenDynamicForwardError {
+    #[error("sandbox {0} not found")]
+    SandboxNotFound(String),
+    #[error(
+        "sandbox {0} has no control channel (not launched via a relay spawner, or not yet Ready)"
+    )]
+    NoControlChannel(String),
+    #[error("failed to bind ephemeral relay listener: {0}")]
+    RelayBind(#[source] std::io::Error),
+    #[error("control channel request failed: {0}")]
+    ControlChannel(#[from] crate::control_channel::ControlChannelError),
+    #[error("sandbox rejected forward request: {0}")]
+    Rejected(String),
+}
+
+/// Cheap, cloneable handle exposing MXC's dynamic port-forward capability —
+/// see `MxcComputeBackend::forward_sink`.
+#[derive(Clone)]
+pub struct ForwardSink {
+    registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
+}
+
+impl ForwardSink {
+    /// Open a new, independent relay bridge to `target_port` inside the
+    /// given sandbox's `AppContainer`, on demand (not pre-declared in the
+    /// gateway TOML). Returns the ephemeral relay's address — reachable
+    /// directly by the gateway process itself, no `AppContainer` boundary on
+    /// that leg — a per-forward auth nonce the caller MUST send as the first
+    /// bytes on its own connection to that address (see `relay.rs` module
+    /// docs: the relay is host-interface-bound, so another reachable process
+    /// could otherwise race to connect first and hijack the forward), and a
+    /// [`relay::RelayHandle`] the caller must hold for as long as the
+    /// forward should stay open, then `.stop()` (or just drop) to tear it
+    /// down.
+    ///
+    /// Target host is always `127.0.0.1` inside the `AppContainer` (matching
+    /// `TcpRelayTarget`'s existing loopback-only restriction at the gRPC
+    /// layer), so there's no separate `target_host` parameter to thread
+    /// through — the sandbox-side `forward` op only ever dials loopback.
+    pub async fn open_dynamic_forward(
+        &self,
+        sandbox_id: &str,
+        target_port: u16,
+    ) -> Result<(SocketAddr, [u8; relay::NONCE_LEN], relay::RelayHandle), OpenDynamicForwardError>
+    {
+        let (control_channel, sandbox_name) = {
+            let reg = self.registry.lock().await;
+            let entry = reg
+                .get(sandbox_id)
+                .ok_or_else(|| OpenDynamicForwardError::SandboxNotFound(sandbox_id.to_string()))?;
+            let channel = entry
+                .control_channel
+                .clone()
+                .ok_or_else(|| OpenDynamicForwardError::NoControlChannel(sandbox_id.to_string()))?;
+            (channel, entry.sandbox.name.clone())
+        };
+
+        // Fresh per forward -- see relay.rs module docs for why this matters
+        // on a host-interface listener.
+        let nonce: [u8; relay::NONCE_LEN] = rand::random();
+
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (relay_handle, relay_addr) = relay::start_control_channel_relay(
+            bind_addr,
+            sandbox_name,
+            nonce,
+            control_channel,
+            target_port,
+        )
+        .await
+        .map_err(OpenDynamicForwardError::RelayBind)?;
+
+        Ok((relay_addr, nonce, relay_handle))
+    }
+}
+
 // ── Lifecycle task ────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -935,14 +1446,16 @@ async fn run_lifecycle(
     mapped: MappedConfig,
     provider_credentials: Option<ProviderCredentialState>,
     mut reserved_proxy_listener: Option<std::net::TcpListener>,
-    _startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    startup_guard: tokio::sync::OwnedMutexGuard<()>,
 ) {
     let sandbox_id = sandbox.id.clone();
     let sandbox_name = sandbox.name.clone();
-    let trimmed_policy = mapped.trimmed_policy.clone();
     let proxy_addr = mapped.proxy_addr;
+    let proxy_auth = proxy_addr.map(|_| SandboxProxyAuth::generate());
+    let trimmed_policy = mapped.trimmed_policy.clone();
     let host_proxy = if !invoker.is_mock()
-        && let (Some(addr), Some(proxy_policy)) = (proxy_addr, trimmed_policy.clone())
+        && let (Some(addr), Some(proxy_policy), Some(proxy_auth)) =
+            (proxy_addr, trimmed_policy.clone(), proxy_auth.as_ref())
     {
         drop(reserved_proxy_listener.take());
         match openshell_supervisor_network::host::start_host_proxy(
@@ -950,6 +1463,7 @@ async fn run_lifecycle(
                 bind_addr: addr,
                 policy: proxy_policy,
                 binary_path: host_proxy_binary_path(&sandbox_config),
+                client_auth: proxy_auth.host_client_auth(),
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),
                 openshell_endpoint: None,
@@ -977,8 +1491,31 @@ async fn run_lifecycle(
     } else {
         None
     };
-    let host_proxy_ca_paths = host_proxy.as_ref().and_then(|proxy| proxy.ca_file_paths());
-    drop(reserved_proxy_listener.take());
+    let host_proxy_ca_paths = host_proxy
+        .as_ref()
+        .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
+    // A curated ProcessContainer cannot read the host's private temp folder.
+    // Stage only the public CA material beneath share_dir, whose AppContainer
+    // DACL is already granted by the policy, so HTTPS clients can authenticate
+    // the OpenShell inspection proxy without broadening filesystem access.
+    let agent_proxy_ca_paths = if config.pc_minimal_env && host_proxy_ca_paths.is_some() {
+        match stage_tls_ca_files(host_proxy_ca_paths.as_ref(), &config.share_dir, &sandbox_id) {
+            Ok(paths) => paths,
+            Err(error) => {
+                set_failed(
+                    &registry,
+                    &watch_tx,
+                    &sandbox,
+                    &sandbox_id,
+                    &format!("failed to stage MXC egress proxy CA files: {error}"),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        host_proxy_ca_paths.clone()
+    };
     if let Some(addr) = proxy_addr {
         {
             let mut registry = registry.lock().await;
@@ -995,14 +1532,10 @@ async fn run_lifecycle(
         ));
     }
 
-    // Released wxc-exec BaseContainer builds cannot provision the generated
-    // TLS directory as a read-only share because that path fails its WRITE_DAC
-    // setup. Grant the sandbox-unique directory read-write instead so the
-    // AppContainer can actually read the injected trust paths. The directory
-    // contains only public CA certificates; the CA private key remains in the
-    // host proxy's in-memory TLS state.
     let mut readwrite_paths = mapped.readwrite_paths;
-    append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
+    if !config.pc_minimal_env {
+        append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
+    }
     let readonly_paths = mapped.readonly_paths;
     let ui = mapped.ui;
     let filesystem = MxcFilesystem {
@@ -1013,19 +1546,86 @@ async fn run_lifecycle(
         denied_paths: Vec::new(),
     };
     let command_line = encode_windows_command_line(&sandbox_config.command);
-    let mut environment = sandbox_environment(&sandbox);
-    append_provider_child_env(&mut environment, provider_credentials.as_ref());
-    append_tls_env_vars(&mut environment, host_proxy_ca_paths.as_ref());
-    info!(sandbox = %sandbox_name, count = environment.len(), "MXC process env vars");
+    // ProcessContainer starts with a completely blank environment — no PATH,
+    // no SystemRoot, nothing. Three tiers of base env, safest first (see
+    // `pc_minimal_env` / `pc_inherit_full_env` field docs for the full
+    // rationale) -- then layer sandbox_environment's output (static
+    // agent_env passthrough merged with any per-request environment from
+    // the CreateSandbox spec) on top, and finally layer TLS CA vars when an
+    // egress proxy is active. Skip internal Windows drive-letter variables
+    // (keys starting with '=') in the full-inherit tier.
+    let mut env_map: HashMap<String, String> = if config.pc_minimal_env {
+        HashMap::new()
+    } else if config.pc_inherit_full_env {
+        std::env::vars()
+            .filter(|(k, _)| !k.is_empty() && !k.starts_with('='))
+            .collect()
+    } else {
+        MINIMAL_WINDOWS_BOOTSTRAP_ENV
+            .iter()
+            .filter_map(|&key| std::env::var(key).ok().map(|v| (key.to_string(), v)))
+            .collect()
+    };
+
+    for entry in sandbox_environment(&sandbox, &config) {
+        if let Some(pos) = entry.find('=') {
+            env_map.insert(entry[..pos].to_string(), entry[pos + 1..].to_string());
+        }
+    }
+
+    let mut env: Vec<String> = env_map
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    append_provider_child_env(&mut env, provider_credentials.as_ref());
+    // Layer proxy configuration for every env tier. Curated ProcessContainers
+    // use the staged CA copies above; other tiers use the original paths.
+    append_tls_env_vars(&mut env, agent_proxy_ca_paths.as_ref());
+    append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
+    env.sort(); // deterministic order for logging / debugging
+    info!(sandbox = %sandbox_name, count = env.len(), "MXC process env vars");
+
+    // When spawner wrapping is configured, launch openshell-supervisor-relay
+    // instead of agent_command directly. The real command/env are sent over
+    // the control channel once the spawner announces readiness (see the
+    // "launch" handshake below) rather than written to share_dir as
+    // agent-cmd.txt/agent-env.txt -- this keeps command/env (which can carry
+    // secrets, e.g. OPENCLAW_GATEWAY_TOKEN) off disk entirely and eliminates
+    // the file-staleness/namespace-mismatch bug class that existed when they
+    // were file-based. `agent_command`'s target application (e.g. OpenClaw)
+    // stays entirely unaware of the relay protocol either way.
+    let spawner_wrapping_active =
+        !config.pc_relay_spawner_path.is_empty() && config.pc_relay_target_port != 0;
+    let effective_command_line = if spawner_wrapping_active {
+        // Quoted: pc_relay_spawner_path is a filesystem path and may contain
+        // spaces (e.g. under "Program Files"); unquoted, wxc-exec would
+        // parse the executable path incorrectly and the launch would fail
+        // before the control-channel handshake ever starts.
+        format!(
+            "\"{}\" {}",
+            config.pc_relay_spawner_path, config.pc_relay_target_port
+        )
+    } else {
+        command_line.clone()
+    };
+
+    // Downstream logging/ETW attribution should reflect what's actually
+    // launched (openshell-supervisor-relay, when wrapping is active), not
+    // the original agent_command -- shadow command_line with the effective
+    // value.
+    let command_line = effective_command_line;
     let process = MxcProcess {
         command_line: command_line.clone(),
         cwd: sandbox_config.cwd,
-        env: environment,
+        // Cloned: the launch handshake below (spawner_wrapping_active case)
+        // needs its own copy of `env` to send over the control channel.
+        env: env.clone(),
         timeout: 0,
     };
     let network = proxy_addr.map(|addr| MxcNetwork {
         default_policy: "block".into(),
         proxy: Some(addr),
+        allow_local_network: false,
     });
 
     let child = match config.backend {
@@ -1088,13 +1688,47 @@ async fn run_lifecycle(
                 least_privilege: config.pc_least_privilege,
                 capabilities: config.pc_capabilities.clone(),
             };
+            // Build the effective network config:
+            // - egress_proxy: use the proxy-based network (already in `network`)
+            // - pc_network_allow: inject allow-all (fallback for builds without capability support)
+            // - pc_allow_local_network: block-default but with allowLocalNetwork=true so
+            //   intra-container loopback works and the spawner can reach the relay on the
+            //   host's route-selected private interface without a full egress proxy.
+            let effective_network = if network.is_none()
+                && (config.pc_allow_local_network || config.pc_network_allow)
+            {
+                // Both flags apply to the same no-proxy startup case and
+                // aren't mutually exclusive -- honor both instead of letting
+                // pc_allow_local_network's branch silently force
+                // default_policy back to "block" and drop pc_network_allow's
+                // unrestricted-egress intent.
+                Some(MxcNetwork {
+                    default_policy: if config.pc_network_allow {
+                        "allow".into()
+                    } else {
+                        "block".into()
+                    },
+                    proxy: None,
+                    allow_local_network: config.pc_allow_local_network,
+                })
+            } else {
+                // `network` is Some here (egress_proxy configured). Preserve
+                // config.pc_allow_local_network instead of unconditionally
+                // clearing it -- MxcNetwork already carries both `proxy` and
+                // `allow_local_network` together, so a proxy and local-network
+                // access aren't mutually exclusive.
+                network.map(|mut n| {
+                    n.allow_local_network = config.pc_allow_local_network;
+                    n
+                })
+            };
             match invoker
                 .run_oneshot(
                     &sandbox_id,
                     filesystem,
                     process_container,
                     process,
-                    network,
+                    effective_network,
                     ui,
                 )
                 .await
@@ -1116,6 +1750,405 @@ async fn run_lifecycle(
     };
     info!(sandbox = %sandbox_name, command = %command_line, backend = ?config.backend, "MXC agent launched");
 
+    // Stream wxc-exec's stdout/stderr into the gateway log as it runs, so the
+    // agent's live output is visible in the gateway console instead of sitting
+    // unread in the OS pipe until the process exits.
+    let mut child = child;
+
+    // Control channel: correlate JSON responses in the stdout stream with
+    // pending requests sent over stdin (see control_channel.rs). Only
+    // meaningful when the process on the other end is
+    // openshell-supervisor-relay (spawner wrapping active) -- an arbitrary
+    // agent_command target wouldn't understand this protocol, so stdin is
+    // left untouched (and unpiped expectations unaffected) otherwise.
+    let control_channel: Option<Arc<ControlChannel>> = if spawner_wrapping_active {
+        if let Some(stdin) = child.stdin.take() {
+            Some(Arc::new(ControlChannel::new(stdin)))
+        } else {
+            // wxc-exec didn't give us a piped stdin even though spawner
+            // wrapping was requested. Without a control channel,
+            // openshell-supervisor-relay would wait forever for a
+            // "launch" request that can never arrive -- a silent hang,
+            // not a failure. Fail the sandbox now instead.
+            let err = "wxc-exec stdin is not piped; control-channel launch cannot proceed";
+            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, err).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return;
+        }
+    } else {
+        // No control channel on the direct-agent path. Both spawn_exec and
+        // run_oneshot now always pipe stdin (needed for the control-channel
+        // case above), so without this the write end stays open inside
+        // `child` for the sandbox's full lifetime -- any workload that
+        // reads stdin until EOF would then block forever, since EOF never
+        // arrives. Drop it so stdin readers see EOF immediately instead.
+        drop(child.stdin.take());
+        None
+    };
+    let pending_responses = control_channel.as_ref().map(|c| c.pending_handle());
+    // Startup-ready signal from the spawner (see control_channel.rs's
+    // try_route_ready). Fired once, before the "launch" handshake below.
+    // Carries Err(reason) instead of firing at all when the spawner's
+    // reported protocol_version doesn't match what this driver requires --
+    // see try_route_ready's doc comment.
+    let (ready_slot, ready_rx) = if spawner_wrapping_active {
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        (Some(Arc::new(Mutex::new(Some(tx)))), Some(rx))
+    } else {
+        (None, None)
+    };
+    // Target-ready signal from the spawner (see control_channel.rs's
+    // try_route_target_ready) -- fired once the target is actually running
+    // and its configured port is accepting connections, distinct from the
+    // "launch" response below (which only confirms the command/env
+    // arrived). Awaited after "launch" succeeds and before publishing
+    // Ready=True, so Ready can't be reported while the target is still
+    // unreachable. Always Ok(()) when it fires (no version gate on this
+    // event -- see try_route_target_ready).
+    let (target_ready_slot, target_ready_rx) = if spawner_wrapping_active {
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        (Some(Arc::new(Mutex::new(Some(tx)))), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    if let Some(stdout) = child.stdout.take() {
+        let sandbox_name_out = sandbox_name.clone();
+        let ready_slot = ready_slot.clone();
+        let target_ready_slot = target_ready_slot.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let routed_ready = match &ready_slot {
+                            Some(slot) => ControlChannel::try_route_ready(slot, &line).await,
+                            None => false,
+                        };
+                        let routed_target_ready = match &target_ready_slot {
+                            Some(slot) => ControlChannel::try_route_target_ready(slot, &line).await,
+                            None => false,
+                        };
+                        let routed = routed_ready
+                            || routed_target_ready
+                            || match &pending_responses {
+                                Some(pending) => {
+                                    ControlChannel::try_route_response(pending, &line).await
+                                }
+                                None => false,
+                            };
+                        if !routed {
+                            info!(sandbox = %sandbox_name_out, "wxc-exec stdout: {line}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(sandbox = %sandbox_name_out, "wxc-exec stdout read error: {e}");
+                        break;
+                    }
+                }
+            }
+            // Stdout is gone (EOF or read error): no control-channel response
+            // will ever arrive again. Fail any still-pending requests now
+            // instead of leaving them to time out individually.
+            if let Some(pending) = &pending_responses {
+                ControlChannel::fail_all_pending(pending).await;
+            }
+        });
+    }
+    // Drop this scope's Arc clones now that the stdout task holds its own:
+    // if the spawner exits before ever sending "ready"/"target_ready", the
+    // stdout task's clone is the only thing keeping the
+    // Mutex<Option<Sender>> alive, so its loop ending (EOF) drops the last
+    // reference -- which drops the still-`Some` Sender and makes
+    // ready_rx/target_ready_rx below observe a dropped sender immediately
+    // instead of waiting out the full timeout.
+    drop(ready_slot);
+    drop(target_ready_slot);
+    if let Some(stderr) = child.stderr.take() {
+        let sandbox_name_err = sandbox_name.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => warn!(sandbox = %sandbox_name_err, "wxc-exec stderr: {line}"),
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(sandbox = %sandbox_name_err, "wxc-exec stderr read error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    // Publish a cancellable handle (exec_child, and for ProcessContainer
+    // shutdown_tx/terminated_rx too) and release the startup gate now,
+    // rather than holding it until the target-readiness wait below (up to
+    // ~430s worst case: 120s ready + 310s target_ready) completes or times
+    // out. stop_sandbox/delete_sandbox block on lifecycle_gate before doing
+    // anything else, so holding it this long meant a stop/delete arriving
+    // while a target is slow to (or never does) come up had no way to
+    // interrupt that wait -- it just queued up behind it. See also imp.rs's
+    // matching fix: openshell-supervisor-relay now races its own
+    // port-readiness wait against a "shutdown" request instead of only
+    // observing shutdown once that wait finishes.
+    let shutdown_rx = {
+        let mut reg = registry.lock().await;
+        let Some(entry) = reg.get_mut(&sandbox_id) else {
+            // The sandbox was deleted between agent launch and now. `delete`
+            // already tore down the *previous* process entry, but `child`
+            // here was spawned after that -- it was never registered, so
+            // nothing else will kill it. `tokio::process::Child` does not
+            // kill-on-drop, so without this the wxc-exec process (and its
+            // AppContainer) would keep running past `delete` reporting
+            // success.
+            drop(reg);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return;
+        };
+
+        // Seed ETW attribution while holding the registry lock so a concurrent
+        // `delete` cannot remove the sandbox after we register (which would leave
+        // a stale key). The `wxc-exec` pid we just spawned is the collision-proof
+        // anchor that ties the `Sandboxing` provider's events back to this
+        // `sandbox_id` while the exact process generation is alive. Command
+        // text is never an attribution key.
+        if config.etw_audit
+            && let Some(pid) = child.id()
+        {
+            match crate::etw_consumer::child_process_start_key(&child) {
+                Ok(process_start_key) => {
+                    if let Ok(mut idx) = attribution.lock() {
+                        idx.register_launch(&sandbox_id, &sandbox_name, pid, process_start_key);
+                    }
+                }
+                Err(error) => {
+                    warn!(sandbox = %sandbox_name, pid, error,
+                        "failed to obtain wxc-exec process generation key; ETW attribution disabled for this launch");
+                }
+            }
+        }
+
+        entry.exec_child = Some(child);
+        entry.control_channel.clone_from(&control_channel);
+
+        // For ProcessContainer, wire a kill channel so stop_sandbox/
+        // delete_sandbox can terminate the wxc-exec process and cause the
+        // AppContainer (and all in-sandbox processes, including long-lived
+        // servers) to be torn down, as a backstop regardless of how shutdown
+        // is signaled below. `terminated_rx` is the other half of the pair
+        // `monitor_exec` uses to report back once the process has actually
+        // exited, so callers can await confirmed termination instead of
+        // just firing the kill and hoping.
+        if matches!(config.backend, MxcBackend::ProcessContainer) {
+            let (tx, rx) = oneshot::channel::<()>();
+            let (done_tx, done_rx) = watch::channel(false);
+            entry.shutdown_tx = Some(tx);
+            entry.terminated_rx = Some(done_rx);
+            // The generic spawner (openshell-supervisor-relay) gets its
+            // shutdown notice over the control channel (see delete_sandbox's
+            // "shutdown" request) -- no file needed. Only mxc-ws-agent.rs
+            // (set directly as agent_command, not spawner-wrapped, no
+            // control channel) still polls a signal file for it.
+            if !spawner_wrapping_active && !config.share_dir.is_empty() {
+                entry.signal_file =
+                    Some(PathBuf::from(&config.share_dir).join("openshell-shutdown.signal"));
+            }
+            Some((rx, done_tx))
+        } else {
+            None
+        }
+    };
+
+    // 6. Monitor exec completion in background.
+    let registry2 = registry.clone();
+    let watch_tx2 = watch_tx.clone();
+    let sandbox2 = sandbox.clone();
+    let sandbox_id2 = sandbox_id.clone();
+    tokio::spawn(async move {
+        monitor_exec(
+            registry2,
+            watch_tx2,
+            attribution,
+            sandbox2,
+            sandbox_id2,
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    // A cancellable handle now exists in the registry (exec_child, plus
+    // shutdown_tx/terminated_rx for ProcessContainer) -- stop_sandbox/
+    // delete_sandbox arriving from here on can act immediately instead of
+    // waiting out the target-readiness wait below.
+    drop(startup_guard);
+
+    // When spawner wrapping is active, openshell-supervisor-relay.rs hasn't
+    // spawned the real target yet -- it waits for a "launch" request over
+    // the control channel instead of reading agent-cmd.txt/agent-env.txt
+    // from share_dir (see its module docs). Wait for its startup-ready
+    // event, then send the real command/env directly; this keeps them off
+    // disk (they can carry secrets, e.g. OPENCLAW_GATEWAY_TOKEN) and also
+    // proves the correlated request/response path works end to end -- the
+    // old unconditional "ping" this replaces only logged a warning on
+    // failure, but failure here is fatal: nothing was ever spawned.
+    if let (Some(channel), Some(ready_rx), Some(target_ready_rx)) =
+        (control_channel.clone(), ready_rx, target_ready_rx)
+    {
+        // Generous timeout: this fires right after spawn, so it's racing UAC
+        // elevation + AppContainer creation (observed up to several
+        // seconds), not just the control channel itself. The `forward` path
+        // won't have this constraint -- it only runs once the sandbox is
+        // already Ready, long past this window.
+        let ready_timeout = std::time::Duration::from_mins(2);
+        let ready_err = match tokio::time::timeout(ready_timeout, ready_rx).await {
+            Ok(Ok(Ok(()))) => None,
+            // Protocol version mismatch (see try_route_ready) -- an
+            // independently staged, out-of-sync relay binary. Reject fast
+            // and clearly instead of proceeding into a "launch" handshake
+            // it may not understand.
+            Ok(Ok(Err(version_err))) => Some(version_err),
+            Ok(Err(_)) => Some("spawner exited before sending its ready event".to_string()),
+            Err(_) => Some(format!(
+                "timed out after {ready_timeout:?} waiting for spawner ready event"
+            )),
+        };
+        let launch_err = if let Some(e) = ready_err {
+            Some(e)
+        } else {
+            let launch_data = serde_json::json!({
+                "command": sandbox_config.command,
+                "env": env,
+            });
+            match channel
+                .request("launch", launch_data, std::time::Duration::from_mins(2))
+                .await
+            {
+                Ok(resp) if resp.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+                    info!(sandbox = %sandbox_name, "control-channel launch acknowledged");
+                    // The "launch" response above only confirms the
+                    // command/env reached the spawner -- it still needs
+                    // to spawn the target and confirm its configured
+                    // port is accepting connections
+                    // (openshell-supervisor-relay's own
+                    // wait_for_port_ready, up to ~300s worst case across
+                    // its own retries). Await that distinct
+                    // "target_ready" event before treating launch as
+                    // successful, so a caller acting on Ready=True below
+                    // can never race a target that hasn't bound its port
+                    // yet.
+                    let target_ready_timeout = std::time::Duration::from_secs(310);
+                    match tokio::time::timeout(target_ready_timeout, target_ready_rx).await {
+                        Ok(Ok(Ok(()))) => {
+                            info!(sandbox = %sandbox_name, "control-channel target ready");
+                            None
+                        }
+                        // No version gate on this event, so this arm
+                        // never actually fires today -- see
+                        // try_route_target_ready -- but match it
+                        // explicitly rather than unreachable!(), in case
+                        // that ever changes.
+                        Ok(Ok(Err(target_err))) => Some(target_err),
+                        Ok(Err(_)) => {
+                            Some("spawner exited before its target became ready".to_string())
+                        }
+                        Err(_) => Some(format!(
+                            "timed out after {target_ready_timeout:?} waiting for target to become ready"
+                        )),
+                    }
+                }
+                Ok(resp) => Some(
+                    resp.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("launch rejected")
+                        .to_string(),
+                ),
+                Err(e) => Some(e.to_string()),
+            }
+        };
+        if let Some(err) = launch_err {
+            warn!(sandbox = %sandbox_name, "control-channel launch failed: {err}");
+            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &err).await;
+            // `child` was already moved into the registry (and possibly
+            // already claimed by monitor_exec, spawned above) once a
+            // cancellable handle was published. ProcessContainer has
+            // shutdown_tx/terminated_rx for exactly this: signal it and
+            // await confirmed termination, the same way stop_sandbox/
+            // delete_sandbox would. Otherwise fall back to reclaiming
+            // exec_child directly and killing it (a monitor_exec race that
+            // hasn't claimed exec_child yet -- rare, but possible), or, for
+            // isolation_session (which has neither shutdown_tx/terminated_rx
+            // nor -- by this point -- a leftover exec_child, since
+            // monitor_exec almost always already claimed it), an explicit
+            // invoker.stop() on the isolation session.
+            let (shutdown_tx, terminated_rx, leftover_child, iso_id, isolation_stopped) = {
+                let mut reg = registry.lock().await;
+                match reg.get_mut(&sandbox_id) {
+                    Some(entry) => (
+                        entry.shutdown_tx.take(),
+                        // .clone(), not .take(): see stop_sandbox's matching
+                        // comment on terminated_rx.
+                        entry.terminated_rx.clone(),
+                        entry.exec_child.take(),
+                        entry.iso_sandbox_id.clone(),
+                        entry.isolation_stopped,
+                    ),
+                    None => (None, None, None, None, false),
+                }
+            };
+            if let Some(tx) = shutdown_tx {
+                let _ = tx.send(());
+            }
+            if let Some(mut child) = leftover_child {
+                // We raced monitor_exec for exec_child and this branch's
+                // earlier `entry.exec_child.take()` won: monitor_exec will
+                // find the registry slot already empty and return before
+                // ever reaching its `done_tx.send(true)` (MR !98 review
+                // thread). Waiting on terminated_rx here would therefore
+                // wait out the full timeout for a signal that never comes,
+                // while `child` -- which does not kill-on-drop -- leaks.
+                // Kill and reap it directly instead.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            } else if let Some(mut rx) = terminated_rx {
+                // leftover_child was None, so monitor_exec already claimed
+                // exec_child and is the one racing shutdown_tx against
+                // child.wait(); await its confirmed termination.
+                if !wait_for_termination(&mut rx).await {
+                    warn!(sandbox = %sandbox_name, "timed out waiting for ProcessContainer termination after launch failure");
+                }
+            } else if let Some(iso_id) = iso_id {
+                // isolation_session: no shutdown_tx/terminated_rx (those are
+                // ProcessContainer-only -- see the wiring site above) and no
+                // leftover_child either at this point, so without this the
+                // MXC session (and the wxc-exec `exec` child monitor_exec's
+                // own child.wait() is blocked on) would keep running
+                // indefinitely after a launch/target-ready failure here
+                // (MR !98 review thread). Best-effort: log rather than
+                // propagate, since this cleanup runs inside an
+                // already-failing path.
+                if !isolation_stopped {
+                    if let Err(error) = invoker.stop(&iso_id).await {
+                        warn!(sandbox = %sandbox_name, %error, "failed to stop isolation session after launch failure");
+                    } else {
+                        let mut reg = registry.lock().await;
+                        if let Some(entry) = reg.get_mut(&sandbox_id) {
+                            entry.isolation_stopped = true;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // 5. Self-report Ready=True. The cancellable handle (exec_child, and for
+    // ProcessContainer shutdown_tx/terminated_rx) was already published to
+    // the registry and monitor_exec already spawned, above -- this only
+    // updates the sandbox's condition now that the target is confirmed
+    // reachable.
     let ready_sandbox = make_sandbox_with_condition(
         &sandbox,
         &DriverCondition {
@@ -1127,60 +2160,38 @@ async fn run_lifecycle(
         },
         false,
     );
-    let (cancel_tx, cancel_rx) = watch::channel(false);
     {
-        // Publish cancellation state before the monitor can observe a fast
-        // process exit. Holding the registry lock while spawning prevents a
-        // completed child from being overwritten with AgentRunning.
-        let mut registry_guard = registry.lock().await;
-        let Some(entry) = registry_guard.get_mut(&sandbox_id) else {
-            // The sandbox was deleted between agent launch and readiness. Bail
-            // without seeding ETW attribution (a stale key would misroute later
-            // events to a dead sandbox), without reporting Ready, and without
-            // spawning the exec monitor. `delete` already tore down the process.
+        let mut reg = registry.lock().await;
+        let Some(entry) = reg.get_mut(&sandbox_id) else {
             return;
         };
-
-        // Seed ETW attribution while holding the registry lock so a concurrent
-        // `delete` cannot remove the sandbox after we register (which would leave
-        // a stale key). The `wxc-exec` pid we just spawned is the collision-proof
-        // anchor that ties the `Sandboxing` provider's events back to this
-        // `sandbox_id` while the child is alive. Command text is never an
-        // attribution key. No-op unless the ETW consumer is running.
-        if config.etw_audit
-            && let Some(pid) = child.id()
-        {
-            match crate::etw_consumer::child_process_start_key(&child) {
-                Ok(process_start_key) => {
-                    if let Ok(mut idx) = attribution.lock() {
-                        idx.register_launch(&sandbox_id, &sandbox_name, pid, process_start_key);
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        sandbox = %sandbox_name,
-                        pid,
-                        error,
-                        "failed to obtain wxc-exec process generation key; PID-based ETW attribution disabled for this launch"
-                    );
-                }
-            }
+        // Only Starting -> Running is valid here. This publish runs after
+        // run_lifecycle released its startup gate (see drop(startup_guard)
+        // above) specifically so a stop/delete arriving during the
+        // target-readiness wait isn't blocked behind it -- but that means a
+        // stop/delete may have already moved this sandbox past Starting by
+        // the time this runs. Overwriting that final state with a stale
+        // Running, or emitting a Ready event for an already-Stopped
+        // sandbox, would be wrong (MR !98 review thread; same reasoning as
+        // set_failed's matching guard).
+        if entry.phase_state != PhaseState::Starting {
+            return;
         }
-
         entry.sandbox = ready_sandbox.clone();
         entry.phase_state = PhaseState::Running;
-        entry.monitor_cancel = Some(cancel_tx);
-        entry.monitor_task = Some(tokio::spawn(monitor_exec(
-            registry.clone(),
-            watch_tx.clone(),
-            attribution.clone(),
-            sandbox.clone(),
-            sandbox_id.clone(),
-            cancel_rx,
-            child,
-        )));
     }
     let _ = watch_tx.send(sandbox_event(ready_sandbox));
+}
+
+async fn wait_for_termination(rx: &mut watch::Receiver<bool>) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rx.wait_for(|done| *done)
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 async fn monitor_exec(
@@ -1189,40 +2200,62 @@ async fn monitor_exec(
     attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
     sandbox: DriverSandbox,
     sandbox_id: String,
-    mut cancel_rx: watch::Receiver<bool>,
-    mut child: tokio::process::Child,
+    shutdown: Option<(oneshot::Receiver<()>, watch::Sender<bool>)>,
 ) {
-    let wxc_pid = child.id();
-    let status = tokio::select! {
-        status = child.wait() => Some(status),
-        changed = cancel_rx.changed() => {
-            let should_kill = changed.is_ok() && *cancel_rx.borrow_and_update();
-            if should_kill {
-                if let Err(error) = child.kill().await {
-                    warn!(sandbox = %sandbox.name, error = %error, "failed to terminate MXC agent process");
-                }
-                // `kill` waits on current Tokio releases, but an explicit wait is
-                // harmless and guarantees the OS process handle is reaped.
-                let _ = child.wait().await;
-            }
-            None
-        }
+    let child = {
+        let mut reg = registry.lock().await;
+        reg.get_mut(&sandbox_id).and_then(|e| e.exec_child.take())
     };
-
-    // A Windows PID is authoritative only while the exact driver-owned child is
-    // alive. Retire it on every monitor exit path, including cancellation, before
-    // Windows can recycle it while the sandbox remains in the registry.
-    if let Some(pid) = wxc_pid
-        && let Ok(mut idx) = attribution.lock()
-    {
-        idx.retire_launch(&sandbox_id, pid);
-    }
-
-    let Some(status) = status else {
+    let Some(mut child) = child else {
         return;
     };
+    let wxc_pid = child.id();
 
-    match status {
+    // For ProcessContainer sandboxes a stop/delete can arrive while the
+    // agent is still running. Race child exit against the kill signal so
+    // that the wxc-exec process — and therefore the entire AppContainer
+    // (including any long-lived servers bound to ports) — is terminated
+    // promptly. `done_tx`, when present, is signaled once the process has
+    // genuinely exited (natural exit or the forced kill below) so
+    // stop_sandbox/delete_sandbox can await *confirmed* termination instead
+    // of firing the kill signal and immediately reporting success.
+    let (wait_result, done_tx) = if let Some((rx, done_tx)) = shutdown {
+        tokio::select! {
+            res = child.wait() => (res, Some(done_tx)),
+            _ = rx => {
+                if let Err(error) = child.kill().await {
+                    warn!(sandbox = %sandbox.name, %error, "failed to terminate MXC process");
+                    return;
+                }
+                if let Err(error) = child.wait().await {
+                    warn!(sandbox = %sandbox.name, %error, "failed to confirm MXC process termination");
+                    return;
+                }
+                if let Some(pid) = wxc_pid
+                    && let Ok(mut idx) = attribution.lock()
+                {
+                    idx.retire_launch(&sandbox_id, pid);
+                }
+                info!(sandbox = %sandbox.name, "MXC ProcessContainer terminated for sandbox stop/delete");
+                let _ = done_tx.send(true);
+                return;
+            }
+        }
+    } else {
+        (child.wait().await, None)
+    };
+    if wait_result.is_ok() {
+        if let Some(pid) = wxc_pid
+            && let Ok(mut idx) = attribution.lock()
+        {
+            idx.retire_launch(&sandbox_id, pid);
+        }
+        if let Some(done_tx) = done_tx {
+            let _ = done_tx.send(true);
+        }
+    }
+
+    match wait_result {
         Ok(status) if status.success() => {
             info!(sandbox = %sandbox.name, "MXC agent exec completed successfully");
             let done = make_sandbox_with_condition(
@@ -1298,11 +2331,24 @@ async fn set_failed(
         false,
     );
     let mut reg = registry.lock().await;
-    if let Some(entry) = reg.get_mut(sandbox_id) {
-        entry.host_proxy = None;
-        entry.sandbox = failed.clone();
-        entry.phase_state = PhaseState::Failed(message.to_string());
+    let Some(entry) = reg.get_mut(sandbox_id) else {
+        return;
+    };
+    // Only Starting -> Failed is valid here. Every call site before
+    // run_lifecycle releases its startup gate is safe by construction
+    // (phase_state is provably still Starting -- stop_sandbox/delete_sandbox
+    // can't touch the entry until the gate opens). The one call site after
+    // the gate is released (the control-channel launch-failure path) is not:
+    // a concurrent stop/delete may have already moved this sandbox past
+    // Starting while this lifecycle was still waiting on target-readiness,
+    // and overwriting that final state with a stale Failed -- or emitting a
+    // Failed event for an already-Stopped sandbox -- would be wrong
+    // (MR !98 review thread).
+    if entry.phase_state != PhaseState::Starting {
+        return;
     }
+    entry.sandbox = failed.clone();
+    entry.phase_state = PhaseState::Failed(message.to_string());
     drop(reg);
     let _ = watch_tx.send(sandbox_event(failed));
 }
@@ -1352,6 +2398,21 @@ mod lifecycle_tests {
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
         driver_sandbox_with_command(id, "", vec!["cmd".into(), "/c".into(), "exit 0".into()])
+    }
+
+    #[tokio::test]
+    async fn termination_confirmation_rejects_closed_unconfirmed_channel() {
+        let (tx, mut rx) = watch::channel(false);
+        drop(tx);
+        assert!(!wait_for_termination(&mut rx).await);
+    }
+
+    #[tokio::test]
+    async fn termination_confirmation_accepts_confirmed_exit() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        drop(tx);
+        assert!(wait_for_termination(&mut rx).await);
     }
 
     #[test]
@@ -1494,12 +2555,9 @@ mod lifecycle_tests {
 
         config.egress_proxy_addr = "127.0.0.1:18080".into();
         config.backend = MxcBackend::IsolationSession;
-        assert!(
-            configured_egress_addr(&config)
-                .unwrap_err()
-                .message()
-                .contains("MXC M1")
-        );
+        let error = configured_egress_addr(&config).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("requires process_container"));
     }
 
     #[test]
@@ -1679,7 +2737,152 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn sandbox_environment_inherits_host_with_spec_precedence() {
+    fn tls_state_replaces_user_trust_overrides_and_grants_ca_directory_once() {
+        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
+        let ca_cert = tls_dir.join("openshell-ca.pem");
+        let bundle = tls_dir.join("ca-bundle.pem");
+        let mut env = vec![
+            "FOO=bar".to_string(),
+            "SSL_CERT_FILE=C:\\old\\bundle.pem".to_string(),
+        ];
+        append_tls_env_vars(&mut env, Some(&(ca_cert.clone(), bundle.clone())));
+        assert!(env.contains(&"FOO=bar".to_string()));
+        assert!(
+            !env.iter()
+                .any(|entry| entry == "SSL_CERT_FILE=C:\\old\\bundle.pem")
+        );
+        assert!(env.contains(&format!("SSL_CERT_FILE={}", bundle.display())));
+
+        let existing = tls_dir.display().to_string().to_ascii_lowercase();
+        let mut readonly = vec![existing.clone()];
+        append_tls_readonly_grant(&mut readonly, Some(&(ca_cert, bundle)));
+        assert_eq!(readonly, vec![existing]);
+    }
+
+    #[test]
+    fn tls_ca_files_are_staged_under_the_authorized_share() {
+        let source = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let ca = source.path().join("source-ca.pem");
+        let bundle = source.path().join("source-bundle.pem");
+        std::fs::write(&ca, b"ca").unwrap();
+        std::fs::write(&bundle, b"bundle").unwrap();
+
+        let staged = stage_tls_ca_files(
+            Some(&(ca, bundle)),
+            share.path().to_str().expect("UTF-8 test path"),
+            "sandbox-a",
+        )
+        .unwrap()
+        .expect("staged paths");
+
+        assert_eq!(
+            staged.0.parent().unwrap(),
+            share.path().join(".openshell-proxy").join("sandbox-a")
+        );
+        assert_eq!(std::fs::read(staged.0).unwrap(), b"ca");
+        assert_eq!(std::fs::read(staged.1).unwrap(), b"bundle");
+    }
+
+    #[test]
+    fn tls_ca_staging_keeps_sandboxes_in_the_same_share_independent() {
+        let source = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let paths = (
+            source.path().join("ca.pem"),
+            source.path().join("bundle.pem"),
+        );
+        std::fs::write(&paths.0, b"first-ca").unwrap();
+        std::fs::write(&paths.1, b"first-bundle").unwrap();
+        let first = stage_tls_ca_files(Some(&paths), share.path().to_str().unwrap(), "sandbox-a")
+            .unwrap()
+            .unwrap();
+        std::fs::write(&paths.0, b"second-ca").unwrap();
+        std::fs::write(&paths.1, b"second-bundle").unwrap();
+        let second = stage_tls_ca_files(Some(&paths), share.path().to_str().unwrap(), "sandbox-b")
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first.0).unwrap(), b"first-ca");
+        assert_eq!(std::fs::read(first.1).unwrap(), b"first-bundle");
+        assert_eq!(std::fs::read(second.0).unwrap(), b"second-ca");
+        assert_eq!(std::fs::read(second.1).unwrap(), b"second-bundle");
+    }
+
+    #[test]
+    fn tls_ca_staging_rejects_empty_shares_and_unsafe_sandbox_components() {
+        let share = tempfile::tempdir().unwrap();
+        let paths = (PathBuf::from("unused-ca"), PathBuf::from("unused-bundle"));
+        for empty in ["", "  ", "\t"] {
+            assert_eq!(
+                stage_tls_ca_files(Some(&paths), empty, "sandbox-a")
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        for id in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "..\\outside",
+            "C:\\outside",
+            "file:stream",
+        ] {
+            assert_eq!(
+                stage_tls_ca_files(Some(&paths), share.path().to_str().unwrap(), id)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(std::fs::read_dir(share.path()).unwrap().count(), 0);
+        assert_eq!(stage_tls_ca_files(None, "", "").unwrap(), None);
+    }
+
+    #[test]
+    fn proxy_env_replaces_inherited_values_and_clears_bypass_rules() {
+        let mut env = vec![
+            "PATH=C:\\Windows".to_owned(),
+            "HTTP_PROXY=http://stale.invalid:1".to_owned(),
+            "https_proxy=http://stale.invalid:2".to_owned(),
+            "NO_PROXY=example.com".to_owned(),
+            "no_proxy=example.org".to_owned(),
+        ];
+
+        let proxy_auth = SandboxProxyAuth {
+            password: "sandbox-secret".to_owned(),
+        };
+        append_proxy_env_vars(
+            &mut env,
+            Some("127.0.0.1:18080".parse().unwrap()),
+            Some(&proxy_auth),
+        );
+
+        assert!(env.contains(&"PATH=C:\\Windows".to_owned()));
+        for key in PROXY_ENV_KEYS {
+            assert_eq!(
+                env.iter()
+                    .filter(|entry| entry.starts_with(&format!("{key}=")))
+                    .count(),
+                1,
+                "{key} must be emitted exactly once"
+            );
+        }
+        assert!(
+            env.contains(&"HTTP_PROXY=http://openshell:sandbox-secret@127.0.0.1:18080".to_owned())
+        );
+        assert!(
+            env.contains(&"HTTPS_PROXY=http://openshell:sandbox-secret@127.0.0.1:18080".to_owned())
+        );
+        assert!(env.contains(&"NO_PROXY=".to_owned()));
+        assert!(env.contains(&"no_proxy=".to_owned()));
+    }
+
+    #[test]
+    fn sandbox_environment_uses_sandbox_scope_with_spec_precedence() {
         let mut sandbox = driver_sandbox("sb-env");
         let spec = sandbox.spec.as_mut().unwrap();
         spec.template
@@ -1689,17 +2892,12 @@ mod lifecycle_tests {
             .insert("SHARED".into(), "template".into());
         spec.environment.insert("SHARED".into(), "spec".into());
         spec.environment.insert("TOKEN".into(), "value".into());
-        let environment = sandbox_environment(&sandbox);
+        let environment = sandbox_environment(&sandbox, &MxcComputeConfig::default());
         assert!(environment.contains(&"SHARED=spec".to_string()));
         assert!(environment.contains(&"TOKEN=value".to_string()));
-        for key in MINIMAL_WINDOWS_BOOTSTRAP_ENV {
-            if let Ok(value) = std::env::var(key) {
-                assert!(environment.contains(&format!("{key}={value}")));
-            }
-        }
         assert!(environment.iter().all(|entry| {
             let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
-            key == "SHARED" || key == "TOKEN" || MINIMAL_WINDOWS_BOOTSTRAP_ENV.contains(&key)
+            key == "SHARED" || key == "TOKEN"
         }));
     }
 
@@ -1792,7 +2990,7 @@ mod lifecycle_tests {
         assert!(ready.is_some(), "sandbox should self-report Ready=True");
 
         // Positive proof: the in-policy write materializes the host artifact.
-        let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
+        let host_path = tmp.path().join("hello.txt");
         let mut found = false;
         for _ in 0..100 {
             if host_path.exists() {
@@ -1862,7 +3060,7 @@ mod lifecycle_tests {
         assert_eq!(recorded["ui"]["clipboard"], "none");
         assert_eq!(recorded["ui"]["injection"], false);
 
-        let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
+        let host_path = tmp.path().join("hello.txt");
         let mut found = false;
         for _ in 0..100 {
             if host_path.exists() {
@@ -1890,10 +3088,12 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let mut config = MxcComputeConfig::default();
-        config.backend = MxcBackend::ProcessContainer;
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let config = MxcComputeConfig {
+            backend: MxcBackend::ProcessContainer,
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        };
         let backend = MxcComputeBackend::new_mocked(config);
         let mut stream = backend.watch_sandboxes().await;
 
@@ -1934,23 +3134,16 @@ mod lifecycle_tests {
         );
 
         let recorded = crate::mxc::mock_recorded_config("sb-egress").expect("mock recorded config");
-        assert_eq!(recorded["network"]["defaultPolicy"], "block");
+        assert_eq!(recorded["version"], "0.8.0-alpha");
+        assert_eq!(recorded["network"]["egress"]["default"], "deny");
+        assert_eq!(
+            recorded["network"]["egress"]["allow"],
+            serde_json::json!([{"to": [{"cidr": "127.0.0.1/32"}]}])
+        );
         assert!(recorded["network"].get("allowedHosts").is_none());
         assert!(recorded["network"].get("blockedHosts").is_none());
-        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
-        let proxy_port = recorded["network"]["proxy"]["localhost"]
-            .as_u64()
-            .expect("proxy localhost port");
-        assert!(proxy_port > 0);
-        assert!(proxy_port <= u64::from(u16::MAX));
-        assert!(
-            recorded["network"]["proxy"].get("host").is_none(),
-            "proxy must not contain 'host' key"
-        );
-        assert!(
-            recorded["network"]["proxy"].get("port").is_none(),
-            "proxy must not contain 'port' key"
-        );
+        assert!(recorded["network"].get("proxy").is_none());
+        assert!(recorded.get("networkProxy").is_none());
 
         let reg = backend.registry.lock().await;
         let entry = reg.get("sb-egress").expect("registry entry");
@@ -1959,7 +3152,19 @@ mod lifecycle_tests {
             entry_proxy_addr.ip(),
             std::net::IpAddr::from([127, 0, 0, 1])
         );
-        assert_eq!(u64::from(entry_proxy_addr.port()), proxy_port);
+        assert_ne!(entry_proxy_addr.port(), 0);
+        let child_env = recorded["process"]["env"].as_array().expect("child env");
+        let proxy_env = child_env
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find_map(|entry| entry.strip_prefix("HTTP_PROXY="))
+            .expect("HTTP_PROXY must direct clients to the authenticated proxy");
+        let (credentials, address) = proxy_env
+            .strip_prefix("http://openshell:")
+            .and_then(|value| value.split_once('@'))
+            .expect("proxy URL must contain the per-sandbox credential");
+        assert!(!credentials.is_empty());
+        assert_eq!(address, entry_proxy_addr.to_string());
         assert_eq!(
             entry.trimmed_policy.as_ref().unwrap().network_policies,
             policy.network_policies
@@ -1982,7 +3187,7 @@ mod lifecycle_tests {
                     }
                 }
                 Ok(_) => break,
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
         assert!(saw_redirect, "expected EgressRedirect platform event");
@@ -2087,7 +3292,7 @@ mod lifecycle_tests {
         );
 
         // The out-of-policy artifact must NOT have been written by the mock.
-        let out_fs = std::path::Path::new(out_tmp.path()).join("hello.txt");
+        let out_fs = out_tmp.path().join("hello.txt");
         assert!(!out_fs.exists(), "out-of-policy write must be denied");
 
         // And the sandbox surfaces a terminal ExecFailed Ready=False condition.
@@ -2132,6 +3337,144 @@ mod lifecycle_tests {
         assert_eq!(ready_condition(&stopped).unwrap().reason, "Stopped");
     }
 
+    /// `delete_sandbox` must await *confirmed* `ProcessContainer` termination
+    /// before removing the registry entry and reporting success -- not just
+    /// fire the kill signal and report success regardless (which could
+    /// leave the process retaining ports and file locks past a successful
+    /// delete). Bounded well under the child's own sleep duration: if
+    /// delete stopped awaiting `terminated_rx`, this would still return
+    /// quickly (the bug was reporting success *too early*, not hanging), so
+    /// the meaningful assertion is that the sandbox is confirmed gone from
+    /// the registry immediately after -- a second delete finds nothing.
+    #[tokio::test]
+    async fn delete_terminates_and_reaps_a_running_process_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let command = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("$null = '{share}'; Start-Sleep -Seconds 60"),
+        ];
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let policy = fs_policy(&[&share]);
+        let sandbox = with_policy(
+            driver_sandbox_with_command("sb-delete", "", command),
+            policy,
+        );
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+        wait_for(&backend, "sb-delete", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+        })
+        .await
+        .expect("long-running child should start");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let deleted = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.delete_sandbox(&sandbox.id, "sb-delete"),
+        )
+        .await
+        .expect("delete should not wait for the child sleep")
+        .expect("delete should terminate and reap the child");
+        assert!(deleted, "delete should report the sandbox as removed");
+        assert!(
+            backend.get_sandbox("sb-delete").await.is_none(),
+            "sandbox should be gone from the registry after delete"
+        );
+    }
+
+    /// `delete_sandbox` must confirm genuine termination via `terminated_rx`
+    /// even when `shutdown_tx` was already consumed by an earlier attempt (a
+    /// timed-out delete/stop, or -- as constructed directly here -- any
+    /// other caller that got to the field first). `terminated_rx` must
+    /// therefore be `.clone()`d, not `.take()`n, from the registry entry:
+    /// taking it would make this call's own None-shutdown_tx branch skip
+    /// the wait entirely and report success (and remove the registry entry)
+    /// before termination was ever confirmed -- exactly the MR !98 review
+    /// thread this regression-tests ("delete timeout loses termination
+    /// state").
+    #[tokio::test]
+    async fn delete_confirms_termination_even_when_shutdown_tx_already_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let command = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("$null = '{share}'; Start-Sleep -Seconds 60"),
+        ];
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let policy = fs_policy(&[&share]);
+        let sandbox = with_policy(
+            driver_sandbox_with_command("sb-delete-retry", "", command),
+            policy,
+        );
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+        wait_for(&backend, "sb-delete-retry", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+        })
+        .await
+        .expect("long-running child should start");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Simulate an earlier delete/stop attempt that already consumed and
+        // fired shutdown_tx (e.g. one that then timed out before
+        // confirming termination) -- take a fresh watch subscription first
+        // so this test can observe the SAME completion delete_sandbox
+        // itself must wait for.
+        let terminated = {
+            let registry = backend.registry.lock().await;
+            registry
+                .get(&sandbox.id)
+                .expect("sandbox should be registered")
+                .terminated_rx
+                .clone()
+                .expect("ProcessContainer entry should have terminated_rx wired")
+        };
+        {
+            let mut registry = backend.registry.lock().await;
+            let entry = registry
+                .get_mut(&sandbox.id)
+                .expect("sandbox should be registered");
+            let tx = entry
+                .shutdown_tx
+                .take()
+                .expect("ProcessContainer entry should have shutdown_tx wired");
+            let _ = tx.send(());
+        }
+
+        let deleted = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.delete_sandbox(&sandbox.id, "sb-delete-retry"),
+        )
+        .await
+        .expect("delete should still confirm termination within the timeout, not hang")
+        .expect("delete should succeed even with shutdown_tx already taken");
+        assert!(deleted, "delete should report the sandbox as removed");
+
+        // The regression this guards against: delete_sandbox used to
+        // .take() terminated_rx too, so finding shutdown_tx already None
+        // made it skip waiting entirely and return success immediately --
+        // well before the real OS process had actually been killed and
+        // reaped. If that bug were back, this watch value could still be
+        // false right here.
+        assert!(
+            *terminated.borrow(),
+            "delete_sandbox must not report success before terminated_rx confirms the process died"
+        );
+        assert!(
+            backend.get_sandbox("sb-delete-retry").await.is_none(),
+            "sandbox should be gone from the registry after delete"
+        );
+    }
+
     #[tokio::test]
     async fn unmappable_network_policy_fails_create_lifecycle() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
@@ -2163,9 +3506,11 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn governed_egress_rejects_network_middleware_before_lifecycle() {
-        let mut config = MxcComputeConfig::default();
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let config = MxcComputeConfig {
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        };
         let backend = MxcComputeBackend::new_mocked(config);
 
         let mut policy = fs_policy(&[]);

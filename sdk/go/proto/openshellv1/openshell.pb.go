@@ -3523,8 +3523,18 @@ type DeleteSandboxRequest struct {
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Explicit workspace scope. The all-workspaces selection is invalid.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Optional immutable sandbox identity precondition. When non-empty, the
+	// gateway rejects the request with ABORTED unless the currently resolved
+	// sandbox has this exact metadata ID. The check is repeated under the
+	// lifecycle lock immediately before any delete mutation.
+	ExpectedSandboxId string `protobuf:"bytes,4,opt,name=expected_sandbox_id,json=expectedSandboxId,proto3" json:"expected_sandbox_id,omitempty"`
+	// Optional optimistic-concurrency precondition. Requires
+	// expected_sandbox_id. When non-zero, the gateway rejects the request with
+	// ABORTED unless the sandbox's current resource version matches this value
+	// immediately before any delete mutation.
+	ExpectedResourceVersion uint64 `protobuf:"varint,5,opt,name=expected_resource_version,json=expectedResourceVersion,proto3" json:"expected_resource_version,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *DeleteSandboxRequest) Reset() {
@@ -3569,6 +3579,20 @@ func (x *DeleteSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelecto
 		return x.WorkspaceScope
 	}
 	return nil
+}
+
+func (x *DeleteSandboxRequest) GetExpectedSandboxId() string {
+	if x != nil {
+		return x.ExpectedSandboxId
+	}
+	return ""
+}
+
+func (x *DeleteSandboxRequest) GetExpectedResourceVersion() uint64 {
+	if x != nil {
+		return x.ExpectedResourceVersion
+	}
+	return 0
 }
 
 // Stop sandbox request.
@@ -9045,8 +9069,8 @@ type UpdateConfigRequest struct {
 	// The new policy to apply.
 	//
 	// Sandbox scope (`global=false`):
-	//   - only network_policies may differ from create-time
-	//     policy; static fields must match version 1.
+	// - only network_policies may differ from create-time
+	//   policy; static fields must match version 1.
 	//
 	// Global scope (`global=true`):
 	// - applies to all sandboxes in full (no merge).
@@ -14922,10 +14946,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12#\n" +
 	"\rprovider_name\x18\x02 \x01(\tR\fproviderName\x12:\n" +
 	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05R\tworkspace\"\x8f\x01\n" +
+	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05R\tworkspace\"\xfb\x01\n" +
 	"\x14DeleteSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\x8d\x01\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12.\n" +
+	"\x13expected_sandbox_id\x18\x04 \x01(\tR\x11expectedSandboxId\x12:\n" +
+	"\x19expected_resource_version\x18\x05 \x01(\x04R\x17expectedResourceVersionJ\x04\b\x02\x10\x03R\tworkspace\"\x8d\x01\n" +
 	"\x12StopSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\x8e\x01\n" +

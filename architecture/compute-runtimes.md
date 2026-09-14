@@ -168,6 +168,20 @@ in-tree driver cannot silently depend on a server-only API.
 
 ## Stop and Start Lifecycle
 
+On Windows, the MXC driver can wrap the workload in
+`openshell-supervisor-relay`. Its inherited stdin/stdout control channel carries
+the launch environment, shutdown requests, and multiplexed dynamic forwards.
+The gateway accepts driver-reported readiness only after the configured target
+port is reachable. Stop/delete interrupt readiness waits and await process
+termination; they must not publish success while owned processes remain.
+
+With governed egress enabled, MXC denies direct Internet access and allows
+host loopback. Proxy-aware workloads receive per-sandbox authenticated
+`HTTP_PROXY`/`HTTPS_PROXY` URLs and public CA trust material. The host CONNECT
+proxy enforces OpenShell network policy, but this configuration does not isolate
+unrelated host-loopback services. See the MXC driver README for compatibility
+settings and the remaining policy limitations.
+
 The gateway persists lifecycle intent before mutating compute:
 
 ```text

@@ -16,6 +16,8 @@
 #![allow(clippy::result_large_err)]
 
 #[cfg(target_os = "windows")]
+mod control_channel;
+#[cfg(target_os = "windows")]
 mod driver;
 #[cfg(target_os = "windows")]
 mod grpc;
@@ -32,11 +34,17 @@ mod policy_map;
 // Windows-only.
 #[cfg(target_os = "windows")]
 mod etw_consumer;
+#[cfg(target_os = "windows")]
+mod relay;
 
 #[cfg(target_os = "windows")]
-pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
+pub use driver::{
+    ForwardSink, MxcBackend, MxcComputeBackend, MxcComputeConfig, OpenDynamicForwardError,
+};
 #[cfg(target_os = "windows")]
 pub use grpc::ComputeDriverService;
+#[cfg(target_os = "windows")]
+pub use relay::RelayHandle;
 // Re-export the embedded mapper API so the windows-only example and integration
 // test can reach it without making `policy_map` a public module.
 #[cfg(target_os = "windows")]

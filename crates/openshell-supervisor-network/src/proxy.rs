@@ -174,6 +174,7 @@ pub(crate) enum ProxyIdentityMode {
     Static {
         binary_path: PathBuf,
         binary_sha256: String,
+        required_proxy_authorization: Option<Arc<str>>,
     },
 }
 
@@ -191,12 +192,31 @@ impl ProxyIdentityMode {
 
     #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::static_binary_with_client_auth(path, None)
+    }
+
+    pub(crate) fn static_binary_with_client_auth(
+        path: impl Into<PathBuf>,
+        required_proxy_authorization: Option<Arc<str>>,
+    ) -> Result<Self> {
         let binary_path = path.into();
         let binary_sha256 = crate::procfs::file_sha256(&binary_path)?;
         Ok(Self::Static {
             binary_path,
             binary_sha256,
+            required_proxy_authorization,
         })
+    }
+
+    fn required_proxy_authorization(&self) -> Option<&str> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Procfs { .. } => None,
+            Self::Static {
+                required_proxy_authorization,
+                ..
+            } => required_proxy_authorization.as_deref(),
+        }
     }
 
     fn entrypoint_pid(&self) -> u32 {
@@ -983,11 +1003,15 @@ enum AcceptAction {
     },
 }
 
+// The resource-pressure counter is used only by the Unix errno classifier.
+#[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> AcceptAction {
+    #[cfg(not(unix))]
+    let _ = (err, &*consecutive_resource_errors);
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -1696,6 +1720,40 @@ async fn deny_forward_destination(
     .await
 }
 
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn has_valid_proxy_authorization(request: &str, expected: &str) -> bool {
+    let mut provided = None;
+    for line in request.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            // Reject duplicates even when both values are correct. Accepting
+            // ambiguous credentials can produce parser differentials between
+            // this proxy and downstream HTTP implementations.
+            if provided.is_some() {
+                return false;
+            }
+            provided = Some(value.trim());
+        }
+    }
+
+    provided.is_some_and(|value| constant_time_bytes_eq(value.as_bytes(), expected.as_bytes()))
+}
+
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
@@ -1764,6 +1822,20 @@ async fn handle_tcp_connection(
         std::str::from_utf8(&buf[..header_end]).expect("validated HTTP request headers are UTF-8");
     if crate::l7::rest::parse_body_length(request).is_err() {
         respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
+    }
+    if let Some(expected) = identity_mode.required_proxy_authorization()
+        && !has_valid_proxy_authorization(request, expected)
+    {
+        warn!("Rejected host proxy request with missing or invalid per-sandbox credentials");
+        respond(
+            &mut client,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"OpenShell\"\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await?;
         return Ok(());
     }
     let mut lines = request.split("\r\n");
@@ -2867,6 +2939,7 @@ fn authorize_egress_intent(
         ProxyIdentityMode::Static {
             binary_path,
             binary_sha256,
+            ..
         } => {
             let input = crate::opa::NetworkInput {
                 host: intent.destination.host.clone(),
@@ -7464,6 +7537,7 @@ network_policies:
             ProxyIdentityMode::Static {
                 binary_path,
                 binary_sha256,
+                ..
             } => {
                 assert_eq!(binary_path, tmp.path());
                 assert_eq!(

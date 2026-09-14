@@ -1312,6 +1312,16 @@ message DeleteSandboxRequest {
   string name = 1;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  // Optional immutable sandbox identity precondition. When non-empty, the
+  // gateway rejects the request with ABORTED unless the currently resolved
+  // sandbox has this exact metadata ID. The check is repeated under the
+  // lifecycle lock immediately before any delete mutation.
+  string expected_sandbox_id = 4;
+  // Optional optimistic-concurrency precondition. Requires
+  // expected_sandbox_id. When non-zero, the gateway rejects the request with
+  // ABORTED unless the sandbox's current resource version matches this value
+  // immediately before any delete mutation.
+  uint64 expected_resource_version = 5;
 }
 
 // Stop sandbox request.

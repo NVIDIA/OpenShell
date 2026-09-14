@@ -4,8 +4,8 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs, warn_credential_env_vars,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
+    parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -391,7 +391,9 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+    if let Err(err) =
+        sandbox_delete(server, &names, false, None, None, workspace, tls, gateway).await
+    {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3171,14 +3173,35 @@ fn labels_display(labels: &HashMap<String, String>) -> String {
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
+#[allow(clippy::too_many_arguments)] // user-facing CLI command with explicit identity guards
 pub async fn sandbox_delete(
     server: &str,
     names: &[String],
     all: bool,
+    expected_id: Option<&str>,
+    expected_resource_version: Option<u64>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
 ) -> Result<()> {
+    if (expected_id.is_some() || expected_resource_version.is_some()) && (all || names.len() != 1) {
+        return Err(miette!(
+            "--expected-id and --expected-resource-version require exactly one sandbox name"
+        ));
+    }
+    if expected_id.is_some_and(str::is_empty) {
+        return Err(miette!("--expected-id must not be empty"));
+    }
+    if expected_resource_version.is_some() && expected_id.is_none() {
+        return Err(miette!(
+            "--expected-resource-version requires --expected-id"
+        ));
+    }
+    if expected_resource_version == Some(0) {
+        return Err(miette!(
+            "--expected-resource-version must be greater than zero"
+        ));
+    }
     let mut client = grpc_client(server, tls).await?;
 
     let names_to_delete: Vec<String> = if all {
@@ -3229,6 +3252,8 @@ pub async fn sandbox_delete(
             .delete_sandbox(DeleteSandboxRequest {
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                expected_sandbox_id: expected_id.unwrap_or_default().to_string(),
+                expected_resource_version: expected_resource_version.unwrap_or_default(),
             })
             .await
         {
@@ -5996,7 +6021,7 @@ mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
         format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
+        parse_credential_expiry_cli_value, parse_driver_config_json, parse_env_from_pairs,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         provisioning_timeout_message, ready_false_condition_message, resolve_from,
         rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
@@ -6199,6 +6224,52 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_env_from_pairs_reads_named_and_same_name_environment_variables() {
+        let _named = EnvVarGuard::set("NAV_PARSE_ENV_FROM_NAMED", "named-value");
+        let _same_name = EnvVarGuard::set("NAV_PARSE_ENV_FROM_SAME", "same-name-value");
+
+        let parsed = parse_env_from_pairs(&[
+            "SANDBOX_NAMED=NAV_PARSE_ENV_FROM_NAMED".to_string(),
+            "NAV_PARSE_ENV_FROM_SAME".to_string(),
+        ])
+        .expect("parse");
+        assert_eq!(
+            parsed.get("SANDBOX_NAMED"),
+            Some(&"named-value".to_string())
+        );
+        assert_eq!(
+            parsed.get("NAV_PARSE_ENV_FROM_SAME"),
+            Some(&"same-name-value".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_env_from_pairs_rejects_missing_invalid_reserved_and_duplicate_keys() {
+        let _missing = EnvVarGuard::unset("NAV_PARSE_ENV_FROM_MISSING");
+        let _present = EnvVarGuard::set("NAV_PARSE_ENV_FROM_PRESENT", "value");
+
+        for (input, expected) in [
+            ("TARGET=NAV_PARSE_ENV_FROM_MISSING", "is not set"),
+            ("1BAD=NAV_PARSE_ENV_FROM_PRESENT", "key must match"),
+            ("TARGET=BAD-NAME", "source must match"),
+            ("OPENSHELL_RESERVED=NAV_PARSE_ENV_FROM_PRESENT", "reserved"),
+        ] {
+            let error = parse_env_from_pairs(&[input.to_string()]).expect_err("must reject");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        let error = parse_env_from_pairs(&[
+            "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+            "TARGET=NAV_PARSE_ENV_FROM_PRESENT".to_string(),
+        ])
+        .expect_err("duplicate must reject");
+        assert!(error.to_string().contains("duplicate --env-from"));
     }
 
     #[test]

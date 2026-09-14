@@ -1072,6 +1072,65 @@ pub enum ComputeDriverInstance {
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
 
+/// Type-erased tracing layer contributed by a compiled compute driver.
+pub type ComputeDriverTracingLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// Shutdown callback for resources owned by a compute-driver tracing layer.
+pub type ComputeDriverTracingShutdown =
+    Box<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
+
+/// Optional process-wide tracing integration supplied by a compiled driver.
+#[derive(Default)]
+pub struct ComputeDriverTracingSetup {
+    layer: Option<ComputeDriverTracingLayer>,
+    shutdown: Option<ComputeDriverTracingShutdown>,
+    error: Option<String>,
+    target_prefix: Option<&'static str>,
+}
+
+impl ComputeDriverTracingSetup {
+    #[must_use]
+    pub fn new(
+        layer: Option<ComputeDriverTracingLayer>,
+        shutdown: Option<ComputeDriverTracingShutdown>,
+        error: Option<String>,
+        target_prefix: Option<&'static str>,
+    ) -> Self {
+        Self {
+            layer,
+            shutdown,
+            error,
+            target_prefix,
+        }
+    }
+}
+
+/// Factory for a compiled driver's optional tracing integration.
+pub type ComputeDriverTracingFactory = fn(Option<&str>, Option<&str>) -> ComputeDriverTracingSetup;
+
+/// Type-erased dynamic TCP forward capability.
+///
+/// Optionally contributed by a
+/// compiled in-process driver that has no in-sandbox supervisor of its own to
+/// relay through (e.g. MXC: no live `ConnectSupervisor` session ever exists,
+/// so `ForwardTcp` must bridge through the driver's own control channel
+/// instead). Most drivers never call `ComputeDriverBuildContext::set_forward_sink`
+/// and this stays `None`.
+#[async_trait::async_trait]
+pub trait ComputeDriverForwardSink: Send + Sync {
+    /// Opens a fresh, on-demand relay to `target_port` inside the sandbox.
+    /// Returns the relay's address, an auth nonce the caller must send as the
+    /// first bytes on its own connection to that address, and an opaque
+    /// handle the caller must hold for as long as the forward should stay
+    /// open (drop to tear it down).
+    async fn open_dynamic_forward(
+        &self,
+        sandbox_id: &str,
+        target_port: u16,
+    ) -> std::result::Result<(SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>), String>;
+}
+
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
@@ -1390,6 +1449,7 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    forward_sink: Arc<Mutex<Option<Arc<dyn ComputeDriverForwardSink>>>>,
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -1457,6 +1517,13 @@ impl ComputeDriverBuildContext<'_> {
             .file
             .and_then(|file| file.openshell.gateway.otlp.as_ref())
     }
+
+    /// Contributes this driver's dynamic TCP forward capability, if it has
+    /// one, so `ComputeRuntime::forward_sink` can bridge `ForwardTcp` for
+    /// sandboxes with no live `ConnectSupervisor` session.
+    pub fn set_forward_sink(&self, sink: Arc<dyn ComputeDriverForwardSink>) {
+        *self.forward_sink.lock().unwrap() = Some(sink);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1496,6 +1563,8 @@ async fn build_compute_runtime(
 
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            let forward_sink: Arc<Mutex<Option<Arc<dyn ComputeDriverForwardSink>>>> =
+                Arc::new(Mutex::new(None));
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1505,42 +1574,57 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                forward_sink: forward_sink.clone(),
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
-                ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
-                    registration.name,
-                    driver,
-                    None,
-                    None,
-                    store,
-                    sandbox_index,
-                    sandbox_watch_bus,
-                    tracing_log_bus,
-                    supervisor_sessions,
-                )
-                .await
-                .map_err(|error| {
-                    Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                ComputeDriverInstance::InProcess(driver) => {
+                    let mut runtime = ComputeRuntime::from_driver(
+                        registration.name,
+                        driver,
+                        None,
+                        None,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?;
+                    let sink = forward_sink.lock().unwrap().take();
+                    if let Some(sink) = sink {
+                        runtime.set_forward_sink(sink);
+                    }
+                    runtime
+                }
                 ComputeDriverInstance::InProcessWithProviderCredentials {
                     driver,
                     provider_credentials_sink,
-                } => ComputeRuntime::from_driver(
-                    registration.name,
-                    driver,
-                    None,
-                    Some(provider_credentials_sink),
-                    store,
-                    sandbox_index,
-                    sandbox_watch_bus,
-                    tracing_log_bus,
-                    supervisor_sessions,
-                )
-                .await
-                .map_err(|error| {
-                    Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                } => {
+                    let mut runtime = ComputeRuntime::from_driver(
+                        registration.name,
+                        driver,
+                        None,
+                        Some(provider_credentials_sink),
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?;
+                    let sink = forward_sink.lock().unwrap().take();
+                    if let Some(sink) = sink {
+                        runtime.set_forward_sink(sink);
+                    }
+                    runtime
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(

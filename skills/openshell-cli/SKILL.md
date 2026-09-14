@@ -408,7 +408,16 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
+
+# Fail closed if the observed sandbox was replaced or changed
+openshell sandbox delete my-sandbox \
+  --expected-id <sandbox-id> \
+  --expected-resource-version <resource-version>
 ```
+
+Identity preconditions are valid only for one named sandbox, and a resource
+version requires the immutable ID. A mismatch returns `ABORTED` before
+OpenShell mutates gateway state or calls the compute driver.
 
 ### Stop and start sandboxes
 

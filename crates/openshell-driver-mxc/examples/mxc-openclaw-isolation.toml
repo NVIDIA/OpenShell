@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# mxc-openclaw-isolation.toml
+#
+# Like mxc-openclaw-gateway.toml, but on the isolation_session backend
+# (persistent provision -> start -> exec session) instead of ProcessContainer
+# (one-shot AppContainer). Dynamic forward relies on the same
+# pc_relay_spawner_path / control-channel mechanism either way -- the driver
+# computes spawner wrapping before branching on backend, so nothing about
+# openshell-supervisor-relay or the relay protocol differs between the two.
+#
+# Two things ARE genuinely different from the ProcessContainer config, and
+# both make this one simpler:
+#   - No pc_minimal_env: isolation_session MERGES injected agent_env onto the
+#     full inherited host environment (PATH/SystemRoot kept) rather than
+#     REPLACING it, so none of ProcessContainer's curated-minimal-env /
+#     LOCALAPPDATA workaround is needed here (see mxc-openclaw-gateway.toml's
+#     agent_env comment for that whole story).
+#   - No pc_capabilities / pc_least_privilege / pc_allow_local_network /
+#     pc_network_allow: those fields only apply to the ProcessContainer
+#     branch in driver.rs and are silently ignored here. Egress is
+#     default-allow for isolation_session.
+#
+# Driven by run-openclaw-forward-test.ps1 -Backend isolation_session, which
+# patches wxc_exec_path and stages node.exe / openclaw-capture.mjs /
+# openshell-supervisor-relay.exe / the caller's OpenClaw install into
+# share_dir before creating the sandbox, same as the ProcessContainer path.
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+
+backend = "isolation_session"
+default_configuration_id = "composable"
+
+share_dir = "C:/openshell-openclaw"
+agent_cwd = "C:/openshell-openclaw"
+
+agent_command = [
+  "C:/openshell-openclaw/node.exe",
+  "C:/openshell-openclaw/openclaw-capture.mjs",
+  "gateway", "run", "--dev", "--allow-unconfigured",
+  "--auth", "token", "--bind", "loopback", "--port", "18889",
+]
+
+agent_env = [
+  "OPENCLAW_NO_UPDATE_CHECK=1",
+  "NO_UPDATE_NOTIFIER=1",
+  "HOME=C:/openshell-openclaw/home",
+  "USERPROFILE=C:/openshell-openclaw/home",
+  "TEMP=C:/openshell-openclaw/temp",
+  "TMP=C:/openshell-openclaw/temp",
+  "NEMOCLAW_MXC_CAPTURE_ENTRY=C:/openshell-openclaw/runtime/node_modules/openclaw/openclaw.mjs",
+  "NEMOCLAW_MXC_CAPTURE_LOG=C:/openshell-openclaw/openclaw-capture.log",
+  # Credential-free target-side probe used only by the qualification harness.
+  # It records response byte counts, never response payloads.
+  "NEMOCLAW_MXC_CAPTURE_SELF_PROBE_PORT=18889",
+  # Required for a stable/known token instead of a fresh random one every
+  # restart. run-openclaw-forward-test.ps1 sets this in the gateway's own
+  # process env before launching it.
+  "OPENCLAW_GATEWAY_TOKEN",
+]
+
+# No static bridge -- relay bridging is entirely on-demand via
+# ForwardSink::open_dynamic_forward / the control channel's "forward" op,
+# driven by `openshell forward service --target-port 18889`.
+pc_relay_spawner_path = "C:/openshell-openclaw/openshell-supervisor-relay.exe"
+pc_relay_target_port  = 18889
+
+debug = true
