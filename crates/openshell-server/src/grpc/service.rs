@@ -267,15 +267,22 @@ pub(super) async fn handle_delete_service(
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
+    state
+        .store
+        .get_message_by_name::<Sandbox>(&workspace, &req.sandbox)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let endpoint = get_service_endpoint(state, &workspace, &req.sandbox, &req.service).await?;
     let Some(endpoint) = endpoint else {
-        return Ok(Response::new(DeleteServiceResponse { deleted: false }));
+        return Ok(Response::new(DeleteServiceResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "service endpoint")?,
+        }));
     };
 
-    let key = service_routing::endpoint_key(&req.sandbox, &req.service);
     let deleted = state
         .store
-        .delete_by_name(ServiceEndpoint::object_type(), &workspace, &key)
+        .delete(ServiceEndpoint::object_type(), endpoint.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete endpoint failed: {e}")))?;
 
@@ -283,7 +290,9 @@ pub(super) async fn handle_delete_service(
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
-    Ok(Response::new(DeleteServiceResponse { deleted }))
+    Ok(Response::new(DeleteServiceResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 async fn get_service_endpoint(
@@ -477,6 +486,7 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -487,7 +497,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let err = handle_get_service(
             &state,
@@ -826,6 +839,7 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -836,7 +850,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let listed = handle_list_services(
             &state,
@@ -977,6 +994,7 @@ mod tests {
         let err = handle_delete_service(
             &state,
             non_member_request(DeleteServiceRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),

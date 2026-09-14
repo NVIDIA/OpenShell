@@ -57,6 +57,27 @@ function readySandbox(
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
+describe('deletion outcomes', () => {
+  it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
+    const flags: boolean[] = [];
+    let outcome = 2;
+    const sandbox = client({
+      deleteSandbox: (req) => {
+        flags.push(req.allowMissing);
+        return { outcome, sandboxId: 'original-id' };
+      },
+    });
+    expect(await sandbox.delete('sandbox')).toEqual({ outcome: 'accepted', rawOutcome: 2, sandboxId: 'original-id' });
+    outcome = 99;
+    expect(await sandbox.delete('sandbox', { allowMissing: true })).toEqual({
+      outcome: 'unknown',
+      rawOutcome: 99,
+      sandboxId: 'original-id',
+    });
+    expect(flags).toEqual([false, true]);
+  });
+});
+
 type ScopedRequest = {
   workspaceScope?: { selection?: { case?: string; value?: unknown } };
 };
@@ -400,7 +421,7 @@ describe('create', () => {
       },
       deleteSandbox: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
       attachSandboxProvider: (req) => {
         observed.attach = req;
@@ -454,7 +475,7 @@ describe('create', () => {
         hostKeyFingerprint: '',
         expiresAtMs: 0n,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
@@ -485,7 +506,7 @@ describe('create', () => {
     expect(created.workspace).toBe('staging');
     expect(got.workspace).toBe('staging');
     expect(listed[0]?.workspace).toBe('staging');
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(attached.sandbox.workspace).toBe('staging');
     expect(detached.sandbox.workspace).toBe('staging');
     expect(selectedWorkspace(observed.create ?? {})).toBe('staging');
@@ -688,7 +709,7 @@ describe('sandbox templates', () => {
       },
       deleteSandboxTemplate: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
     });
 
@@ -698,7 +719,7 @@ describe('sandbox templates', () => {
 
     expect(got.metadata?.name).toBe('gpu-kata');
     expect(listed).toHaveLength(1);
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(observed.get).toMatchObject({ name: 'gpu-kata' });
     expect(selectedWorkspace(observed.get ?? {})).toBe('staging');
     expect(observed.list).toMatchObject({
@@ -1181,8 +1202,8 @@ describe('ssh sessions', () => {
   });
 
   it('revokeSshSession returns the revoked flag', async () => {
-    const sandbox = client({ revokeSshSession: () => ({ revoked: true }) });
-    expect(await sandbox.revokeSshSession('tok')).toBe(true);
+    const sandbox = client({ revokeSshSession: () => ({ outcome: 1 }) });
+    expect((await sandbox.revokeSshSession('tok')).outcome).toBe('completed');
   });
 
   it('rejects a response that violates the ProxyCommand trust-boundary contract', async () => {
@@ -1256,7 +1277,7 @@ describe('forward', () => {
       },
       revokeSshSession: (req) => {
         revokedToken = req.token;
-        return { revoked: true };
+        return { outcome: 1 };
       },
       forwardTcp: async function* (requests) {
         for await (const frame of requests) {
@@ -1336,7 +1357,7 @@ describe('forward', () => {
         hostKeyFingerprint: '',
         expirationTime: undefined,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
       // Ignore inbound frames; just blast a large, verifiable byte stream back.
       forwardTcp: async function* () {
         for (let i = 0; i < CHUNKS; i++) {
@@ -1402,7 +1423,7 @@ describe('forward', () => {
       forwardTcp: async function* () {
         return;
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });
@@ -1481,7 +1502,7 @@ describe('forward', () => {
         });
         throw new ConnectError('canceled', Code.Canceled);
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });

@@ -211,10 +211,20 @@ pub async fn delete_refresh_state_with_credentials(
     provider_id: &str,
     credential_key: &str,
 ) -> Result<bool, Status> {
-    let Some(mut state) = get_refresh_state(store, workspace, provider_id, credential_key).await?
+    let Some(state) = get_refresh_state(store, workspace, provider_id, credential_key).await?
     else {
         return Ok(false);
     };
+    delete_observed_refresh_state_with_credentials(store, credentials, state).await?;
+    Ok(true)
+}
+
+/// Delete the observed refresh identity without resolving its name again.
+pub async fn delete_observed_refresh_state_with_credentials(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    mut state: StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
     let mut version = state
         .metadata
         .as_ref()
@@ -231,11 +241,24 @@ pub async fn delete_refresh_state_with_credentials(
         state.authorization_epoch = uuid::Uuid::new_v4().to_string();
         state.status = "deleting".to_string();
         state.next_refresh_at_ms = i64::MAX;
-        version = persist_refresh_state_if_current(store, &state, version)
-            .await?
-            .ok_or_else(|| {
-                Status::aborted("provider refresh was concurrently modified during deletion")
-            })?;
+        let Some(current_version) =
+            persist_refresh_state_if_current(store, &state, version).await?
+        else {
+            if store
+                .get_message::<StoredProviderCredentialRefreshState>(state.object_id())
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("fetch provider refresh state failed: {err}"))
+                })?
+                .is_none()
+            {
+                return Ok(());
+            }
+            return Err(Status::aborted(
+                "provider refresh was concurrently modified during deletion",
+            ));
+        };
+        version = current_version;
         if let Some(metadata) = state.metadata.as_mut() {
             metadata.resource_version = version;
         }
@@ -260,7 +283,8 @@ pub async fn delete_refresh_state_with_credentials(
                 Status::aborted("provider refresh was concurrently modified during deletion")
             }
             other => Status::internal(format!("delete provider refresh state failed: {other}")),
-        })
+        })?;
+    Ok(())
 }
 
 pub async fn delete_refresh_states_for_provider_with_credentials(
@@ -4245,6 +4269,55 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("aws_session_token requires"));
+    }
+
+    #[tokio::test]
+    async fn deletion_of_observed_refresh_preserves_same_name_replacement() {
+        use super::delete_observed_refresh_state_with_credentials;
+        use crate::persistence::ObjectType;
+        let store = test_store().await;
+        let original = StoredProviderCredentialRefreshState {
+            metadata: Some(ObjectMeta {
+                id: "original-id".into(),
+                name: "refresh-name".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&original).await.unwrap();
+        let observed = store
+            .get_message::<StoredProviderCredentialRefreshState>("original-id")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .delete(
+                StoredProviderCredentialRefreshState::object_type(),
+                "original-id",
+            )
+            .await
+            .unwrap();
+        let mut replacement = original;
+        replacement.metadata.as_mut().unwrap().id = "replacement-id".into();
+        store.put_message(&replacement).await.unwrap();
+        let replacement = store
+            .get_message::<StoredProviderCredentialRefreshState>("replacement-id")
+            .await
+            .unwrap()
+            .unwrap();
+
+        delete_observed_refresh_state_with_credentials(&store, &test_credentials(), observed)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_message::<StoredProviderCredentialRefreshState>("replacement-id")
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -116,15 +116,16 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 	return converter.ProviderFromProto(resp.GetProvider()), nil
 }
 
-func (p *providerClient) Delete(ctx context.Context, workspace, name string) error {
-	_, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
+func (p *providerClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
+		AllowMissing:   allowMissing(opts),
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }
 
 func (p *providerClient) Ensure(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {

@@ -292,7 +292,7 @@ func TestProviderDelete(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "deleteme")
+	_, err := client.Delete(context.Background(), "default", "deleteme")
 
 	require.NoError(t, err)
 	assert.Empty(t, mock.providers["deleteme"])
@@ -304,7 +304,7 @@ func TestProviderDelete_NotFound(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "nonexistent")
+	_, err := client.Delete(context.Background(), "default", "nonexistent")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))

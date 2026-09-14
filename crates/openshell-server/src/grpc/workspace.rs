@@ -292,7 +292,8 @@ pub(super) async fn handle_delete_workspace(
     state: &Arc<ServerState>,
     request: Request<DeleteWorkspaceRequest>,
 ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-    let name = request.into_inner().name;
+    let req = request.into_inner();
+    let name = req.name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -302,12 +303,16 @@ pub(super) async fn handle_delete_workspace(
         ));
     }
 
-    let ws: Workspace = state
+    let ws: Option<Workspace> = state
         .store
         .get_message_by_name("", &name)
         .await
-        .map_err(|e| Status::internal(format!("fetch workspace failed: {e}")))?
-        .ok_or_else(|| Status::not_found(format!("workspace '{name}' not found")))?;
+        .map_err(|e| Status::internal(format!("fetch workspace failed: {e}")))?;
+    let Some(ws) = ws else {
+        return Ok(Response::new(DeleteWorkspaceResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "workspace")?,
+        }));
+    };
 
     let ws_id = ws
         .metadata
@@ -344,14 +349,15 @@ pub(super) async fn handle_delete_workspace(
             }
             Err(e) => {
                 if matches!(e, crate::persistence::PersistenceError::Conflict { .. }) {
-                    let refreshed: Option<Workspace> = state
-                        .store
-                        .get_message_by_name("", &name)
-                        .await
-                        .map_err(|e| Status::internal(format!("workspace re-fetch failed: {e}")))?;
-                    let refreshed = refreshed.ok_or_else(|| {
-                        Status::not_found(format!("workspace '{name}' not found"))
-                    })?;
+                    let refreshed: Option<Workspace> =
+                        state.store.get_message(&ws_id).await.map_err(|e| {
+                            Status::internal(format!("workspace re-fetch failed: {e}"))
+                        })?;
+                    let Some(refreshed) = refreshed else {
+                        return Ok(Response::new(DeleteWorkspaceResponse {
+                            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+                        }));
+                    };
                     let now_terminating = refreshed
                         .metadata
                         .as_ref()
@@ -431,7 +437,7 @@ pub(super) async fn handle_delete_workspace(
         )
     })?;
 
-    let deleted = state
+    let _deleted = state
         .store
         .delete_if(Workspace::object_type(), &ws_id, delete_version)
         .await
@@ -443,7 +449,9 @@ pub(super) async fn handle_delete_workspace(
             }
         })?;
 
-    Ok(Response::new(DeleteWorkspaceResponse { deleted }))
+    Ok(Response::new(DeleteWorkspaceResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 pub(super) async fn handle_add_workspace_member(
@@ -585,7 +593,9 @@ pub(super) async fn handle_remove_workspace_member(
         .await
         .map_err(|e| Status::internal(format!("remove workspace member failed: {e}")))?;
 
-    Ok(Response::new(RemoveWorkspaceMemberResponse { removed }))
+    Ok(Response::new(RemoveWorkspaceMemberResponse {
+        outcome: super::deletion_outcome(removed, req.allow_missing, "workspace member")?,
+    }))
 }
 
 pub(super) async fn handle_list_workspace_members(
@@ -801,6 +811,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "ephemeral".to_string(),
             }),
         )
@@ -822,13 +833,17 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "ephemeral".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.deleted);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -863,6 +878,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "templated".to_string(),
             }),
         )
@@ -888,13 +904,17 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "templated".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.deleted);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -932,6 +952,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "sessioned".to_string(),
             }),
         )
@@ -977,6 +998,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "profiles-ws".to_string(),
             }),
         )
@@ -1002,13 +1024,17 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "profiles-ws".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.deleted);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -1018,6 +1044,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "default".to_string(),
             }),
         )
@@ -1090,6 +1117,7 @@ mod tests {
         let resp = handle_remove_workspace_member(
             &state,
             authed_request(RemoveWorkspaceMemberRequest {
+                allow_missing: false,
                 workspace: "default".to_string(),
                 principal_subject: "charlie@example.com".to_string(),
             }),
@@ -1097,7 +1125,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.removed);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let list = handle_list_workspace_members(
             &state,
@@ -1195,13 +1226,17 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "cleanup-test".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.deleted);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         // Membership records should have been cleaned up.
         let remaining: Vec<WorkspaceMember> = state
@@ -1284,6 +1319,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "term-test".to_string(),
             }),
         )
@@ -1337,6 +1373,7 @@ mod tests {
         let _ = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "dying-ws".to_string(),
             }),
         )
@@ -1382,6 +1419,7 @@ mod tests {
         let _ = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "idempotent-ws".to_string(),
             }),
         )
@@ -1398,13 +1436,17 @@ mod tests {
         let resp = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "idempotent-ws".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(resp.deleted);
+        assert_eq!(
+            resp.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -1424,6 +1466,7 @@ mod tests {
         let err = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "cleanup-retry".to_string(),
             }),
         )
@@ -1442,13 +1485,17 @@ mod tests {
         let retry = handle_delete_workspace(
             &state,
             Request::new(DeleteWorkspaceRequest {
+                allow_missing: false,
                 name: "cleanup-retry".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(retry.deleted);
+        assert_eq!(
+            retry.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert!(
             state
                 .store
@@ -1587,6 +1634,7 @@ mod tests {
         let err = handle_remove_workspace_member(
             &state,
             non_member_request(RemoveWorkspaceMemberRequest {
+                allow_missing: false,
                 workspace: "no-such-ws".into(),
                 ..Default::default()
             }),

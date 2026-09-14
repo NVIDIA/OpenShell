@@ -331,7 +331,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -887,7 +890,13 @@ impl OpenShell for TestOpenShell {
             .await
             .remove(&(request.provider, request.credential_key))
             .is_some();
-        Ok(Response::new(DeleteProviderRefreshResponse { deleted }))
+        Ok(Response::new(DeleteProviderRefreshResponse {
+            outcome: if deleted {
+                openshell_core::proto::DeletionOutcome::Completed.into()
+            } else {
+                openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+            },
+        }))
     }
 
     async fn delete_provider(
@@ -905,7 +914,13 @@ impl OpenShell for TestOpenShell {
             return Err(Status::internal(message));
         }
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
-        Ok(Response::new(DeleteProviderResponse { deleted }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: if deleted {
+                openshell_core::proto::DeletionOutcome::Completed.into()
+            } else {
+                openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+            },
+        }))
     }
 
     async fn delete_provider_profile(
@@ -929,7 +944,13 @@ impl OpenShell for TestOpenShell {
         }
         let deleted = self.state.profiles.lock().await.remove(&id).is_some();
         Ok(Response::new(
-            openshell_core::proto::DeleteProviderProfileResponse { deleted },
+            openshell_core::proto::DeleteProviderProfileResponse {
+                outcome: if deleted {
+                    openshell_core::proto::DeletionOutcome::Completed.into()
+                } else {
+                    openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+                },
+            },
         ))
     }
 

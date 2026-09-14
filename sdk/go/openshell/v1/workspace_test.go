@@ -265,13 +265,13 @@ func TestWorkspaceList_EmptyReturnsNonNilSlice(t *testing.T) {
 
 func TestWorkspaceDelete_Success(t *testing.T) {
 	mock := &mockWorkspaceServer{
-		deleteResp: &pb.DeleteWorkspaceResponse{Deleted: true},
+		deleteResp: &pb.DeleteWorkspaceResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED},
 	}
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "test-ws")
+	_, err := wc.Delete(context.Background(), "test-ws")
 
 	require.NoError(t, err)
 }
@@ -282,7 +282,7 @@ func TestWorkspaceDelete_EmptyName(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "")
+	_, err := wc.Delete(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -296,7 +296,7 @@ func TestWorkspaceDelete_NotFound(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "missing-ws")
+	_, err := wc.Delete(context.Background(), "missing-ws")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
@@ -387,13 +387,13 @@ func TestAddMember_AlreadyExists(t *testing.T) {
 
 func TestRemoveMember_Success(t *testing.T) {
 	mock := &mockWorkspaceServer{
-		removeMemberResp: &pb.RemoveWorkspaceMemberResponse{Removed: true},
+		removeMemberResp: &pb.RemoveWorkspaceMemberResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED},
 	}
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "user@example.com")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "user@example.com")
 
 	require.NoError(t, err)
 }
@@ -404,7 +404,7 @@ func TestRemoveMember_EmptyWorkspace(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "", "user@example.com")
+	_, err := wc.RemoveMember(context.Background(), "", "user@example.com")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -416,7 +416,7 @@ func TestRemoveMember_EmptySubject(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -430,7 +430,7 @@ func TestRemoveMember_NotFound(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "missing@example.com")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "missing@example.com")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))

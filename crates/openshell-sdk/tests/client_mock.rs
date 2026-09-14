@@ -298,7 +298,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::DeleteSandboxTemplateResponse>, Status> {
         *self.state.last_template_delete.lock().await = Some(request.into_inner());
         Ok(Response::new(proto::DeleteSandboxTemplateResponse {
-            deleted: true,
+            outcome: proto::DeletionOutcome::Completed.into(),
         }))
     }
 
@@ -438,7 +438,8 @@ impl OpenShell for TestOpenShell {
         *self.state.last_delete_workspace.lock().await =
             selected_workspace(&req.workspace_scope).map(str::to_string);
         Ok(Response::new(proto::DeleteSandboxResponse {
-            deleted: true,
+            sandbox_id: String::new(),
+            outcome: proto::DeletionOutcome::Completed.into(),
         }))
     }
 
@@ -871,7 +872,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::DeleteWorkspaceResponse>, Status> {
         *self.state.last_workspace_request.lock().await = Some(request.into_inner().name);
         Ok(Response::new(proto::DeleteWorkspaceResponse {
-            deleted: true,
+            outcome: proto::DeletionOutcome::Completed.into(),
         }))
     }
 
@@ -1052,8 +1053,11 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert!(observed_list.page_token.is_empty());
     assert!(selects_all_workspaces(&observed_list.workspace_scope));
 
-    let deleted = client.delete_sandbox_template("python").await.unwrap();
-    assert!(deleted);
+    let deleted = client
+        .delete_sandbox_template("python", openshell_sdk::DeleteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
     assert_eq!(
@@ -1179,8 +1183,11 @@ async fn delete_sandbox_returns_server_ack() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let deleted = client.delete_sandbox("doomed").await.unwrap();
-    assert!(deleted);
+    let deleted = client
+        .delete_sandbox("doomed", openshell_sdk::DeleteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
 
     let observed = state.last_delete_name.lock().await.clone();
     assert_eq!(observed.as_deref(), Some("doomed"));
@@ -1564,8 +1571,11 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
     let observed_all = state.last_template_list.lock().await.clone().unwrap();
     assert!(selects_all_workspaces(&observed_all.workspace_scope));
 
-    let deleted = ws.delete_sandbox_template("python").await.unwrap();
-    assert!(deleted);
+    let deleted = ws
+        .delete_sandbox_template("python", openshell_sdk::DeleteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
     assert_eq!(
@@ -1581,8 +1591,11 @@ async fn workspace_scoped_delete_passes_workspace() {
     let client = connect(&endpoint).await;
 
     let ws = client.workspace("staging");
-    let deleted = ws.delete_sandbox("doomed").await.unwrap();
-    assert!(deleted);
+    let deleted = ws
+        .delete_sandbox("doomed", openshell_sdk::DeleteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
 
     let observed_ws = state.last_delete_workspace.lock().await.clone();
     assert_eq!(observed_ws.as_deref(), Some("staging"));
@@ -1658,8 +1671,11 @@ async fn delete_workspace_returns_ack() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let deleted = client.delete_workspace("doomed").await.unwrap();
-    assert!(deleted);
+    let deleted = client
+        .delete_workspace("doomed", openshell_sdk::DeleteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
 
     let observed = state.last_workspace_request.lock().await.clone();
     assert_eq!(observed.as_deref(), Some("doomed"));

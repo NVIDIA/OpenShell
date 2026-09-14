@@ -54,11 +54,11 @@ func (c *fakeServiceClient) ListAll(_ context.Context, _, _ string, _ ...v1.List
 }
 
 // Delete returns Unimplemented.
-func (c *fakeServiceClient) Delete(_ context.Context, _, _, _ string) error {
+func (c *fakeServiceClient) Delete(_ context.Context, _, _, _ string, _ ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
 }
 
 // Compile-time check that fakeServiceClient implements v1.ServiceInterface.

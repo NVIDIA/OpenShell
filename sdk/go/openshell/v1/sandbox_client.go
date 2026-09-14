@@ -141,15 +141,16 @@ func (s *sandboxClient) ListAll(ctx context.Context, workspace string, opts ...L
 	return pager.All(ctx)
 }
 
-func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {
-	_, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
+func (s *sandboxClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
+		AllowMissing:   allowMissing(opts),
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome()), SandboxID: resp.GetSandboxId()}, nil
 }
 
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {

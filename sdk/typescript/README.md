@@ -41,8 +41,16 @@ await client.sandbox.waitReady(sandbox.name, 120)
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
 console.log(result.stdout.toString())
 
-await client.sandbox.delete(sandbox.name)
+const deletion = await client.sandbox.delete(sandbox.name)
+console.log(deletion.outcome) // completed, accepted, or already_absent
 ```
+
+Deletion returns a typed result, not a boolean. `accepted` means cleanup is
+pending; `unspecified` and unknown outcomes do not establish completion.
+`sandboxId` identifies the original sandbox. Missing targets are errors unless
+you pass `{ allowMissing: true }`; this does not suppress missing parents or make
+retries safe when names are reused. Upgrade gateway and SDK together for this
+pre-1.0 API change.
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for

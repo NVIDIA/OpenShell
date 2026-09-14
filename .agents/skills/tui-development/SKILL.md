@@ -484,8 +484,12 @@ use openshell_core::proto::{
   let req = openshell_core::proto::DeleteSandboxRequest {
       name: sandbox_name,
       workspace_scope: Some(workspace_selector(workspace)),
+      allow_missing: true,
   };
   ```
+- Delete responses carry `DeletionOutcome`: distinguish `Accepted` (cleanup
+  pending), `Completed`, and `AlreadyAbsent`. Treat unspecified or unknown
+  outcomes as unconfirmed, not completed.
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
   let req = openshell_core::proto::WatchSandboxRequest {

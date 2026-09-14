@@ -608,9 +608,12 @@ pub(super) async fn delete_provider_record_with_credentials(
         .await?;
 
     store
-        .delete_by_name(Provider::object_type(), workspace, name)
+        .delete(Provider::object_type(), provider.object_id())
         .await
-        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))?;
+    // This call observed the original target. A concurrent removal is also
+    // completion, and must not remove a replacement with the same name.
+    Ok(true)
 }
 
 /// Iterate over every `Sandbox` in the store and collect items produced by
@@ -2962,9 +2965,11 @@ pub(super) async fn handle_delete_provider_profile(
         .get_message_by_name::<StoredProviderProfile>(&workspace, &id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
-    if existing.is_none() {
-        return Err(Status::not_found("provider profile not found"));
-    }
+    let Some(existing) = existing else {
+        return Ok(Response::new(DeleteProviderProfileResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "provider profile")?,
+        }));
+    };
 
     let blocking_providers = providers_using_profile(state.store.as_ref(), &workspace, &id).await?;
     if !blocking_providers.is_empty() {
@@ -2974,13 +2979,15 @@ pub(super) async fn handle_delete_provider_profile(
         )));
     }
 
-    let deleted = state
+    state
         .store
-        .delete_by_name(StoredProviderProfile::object_type(), &workspace, &id)
+        .delete(StoredProviderProfile::object_type(), existing.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
-    Ok(Response::new(DeleteProviderProfileResponse { deleted }))
+    Ok(Response::new(DeleteProviderProfileResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 pub(super) fn get_provider_type_profile_for_scope(
@@ -4835,12 +4842,19 @@ pub(super) async fn handle_delete_provider_refresh(
         credential_key,
     )
     .await?;
-    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state_with_credentials(
+    let Some(refresh_state) = existing_refresh_state else {
+        return Ok(Response::new(DeleteProviderRefreshResponse {
+            outcome: super::deletion_outcome(
+                false,
+                request.allow_missing,
+                "provider refresh configuration",
+            )?,
+        }));
+    };
+    crate::provider_refresh::delete_observed_refresh_state_with_credentials(
         state.store.as_ref(),
         &state.credentials,
-        &workspace,
-        provider.object_id(),
-        credential_key,
+        refresh_state.clone(),
     )
     .await?;
 
@@ -4850,9 +4864,7 @@ pub(super) async fn handle_delete_provider_refresh(
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if let Some(refresh_state) = existing_refresh_state
-        && crate::provider_refresh::refresh_has_expiration(&refresh_state)
-    {
+    if crate::provider_refresh::refresh_has_expiration(&refresh_state) {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
         let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
             .chain(refresh_state.additional_output_keys.into_values())
@@ -4871,7 +4883,7 @@ pub(super) async fn handle_delete_provider_refresh(
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
-        deleted: deleted_refresh_state,
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
     }))
 }
 
@@ -4903,13 +4915,15 @@ pub(super) async fn handle_delete_provider(
     .await;
     match result {
         Ok(deleted) => {
-            let outcome = TelemetryOutcome::from_success(deleted);
+            let outcome = TelemetryOutcome::from_success(deleted || req.allow_missing);
             emit_provider_profile_lifecycle(
                 provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
                 LifecycleOperation::Delete,
                 outcome,
             );
-            Ok(Response::new(DeleteProviderResponse { deleted }))
+            Ok(Response::new(DeleteProviderResponse {
+                outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
+            }))
         }
         Err(err) => {
             emit_provider_profile_lifecycle(
@@ -6482,6 +6496,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: " Alex-API ".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6489,7 +6504,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert_eq!(state.credentials.stored_credential_count(), Some(0));
     }
 
@@ -6760,6 +6778,7 @@ mod tests {
         let builtin_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "github".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6800,6 +6819,7 @@ mod tests {
         let in_use_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6851,6 +6871,7 @@ mod tests {
         let err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "global-custom".to_string(),
                 workspace: String::new(),
             }),
@@ -7066,6 +7087,7 @@ mod tests {
         let deleted = handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7076,7 +7098,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert_eq!(state.credentials.stored_credential_count(), Some(0));
 
         let status_after_delete = handle_get_provider_refresh_status(
@@ -7465,6 +7490,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7647,6 +7673,7 @@ mod tests {
         let deleted = handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7657,7 +7684,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let provider_after_delete = state
             .store
@@ -7764,6 +7794,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -8247,6 +8278,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -8254,7 +8286,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let missing = handle_get_provider_profile(
             &state,
@@ -8283,6 +8318,7 @@ mod tests {
             handle_delete_provider_profile(
                 &task_state,
                 authed_request(DeleteProviderProfileRequest {
+                    allow_missing: false,
                     id: "guarded-delete".to_string(),
                     workspace: "default".to_string(),
                 }),
@@ -8303,7 +8339,10 @@ mod tests {
             .expect("join delete task")
             .expect("delete should succeed")
             .into_inner();
-        assert!(response.deleted);
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -13549,6 +13588,7 @@ mod tests {
         let deleted = handle_delete_provider(
             &state,
             authed_request(DeleteProviderRequest {
+                allow_missing: false,
                 name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -13558,7 +13598,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let listed = handle_list_providers(
             &state,
@@ -13715,6 +13758,7 @@ mod tests {
         let delete_error = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "nonexistent".to_string(),
                 workspace: String::new(),
             }),
@@ -14035,7 +14079,11 @@ mod tests {
             async move {
                 handle_delete_provider_profile(
                     &state,
-                    authed_request(DeleteProviderProfileRequest { id, workspace }),
+                    authed_request(DeleteProviderProfileRequest {
+                        allow_missing: false,
+                        id,
+                        workspace,
+                    }),
                 )
                 .await
                 .unwrap()
@@ -14043,8 +14091,14 @@ mod tests {
             }
         };
 
-        assert!(delete("e2e-platform", "").await.deleted);
-        assert!(delete("e2e-workspace", "default").await.deleted);
+        assert_eq!(
+            delete("e2e-platform", "").await.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
+        assert_eq!(
+            delete("e2e-workspace", "default").await.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -14544,6 +14598,7 @@ mod tests {
         let err = handle_delete_provider_refresh(
             &state,
             non_member_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -14559,6 +14614,7 @@ mod tests {
         let err = handle_delete_provider(
             &state,
             non_member_request(DeleteProviderRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -14651,6 +14707,7 @@ mod tests {
         let err = handle_delete_provider_profile(
             &state,
             non_member_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 workspace: "no-such-ws".into(),
                 ..Default::default()
             }),

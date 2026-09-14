@@ -40,14 +40,15 @@ func (s *sshClient) CreateSession(ctx context.Context, _, sandboxID string) (*SS
 	return converter.SSHSessionFromProto(resp), nil
 }
 
-func (s *sshClient) RevokeSession(ctx context.Context, _, token string) (bool, error) {
+func (s *sshClient) RevokeSession(ctx context.Context, _, token string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := s.client.RevokeSshSession(ctx, &pb.RevokeSshSessionRequest{
-		Token: token,
+		AllowMissing: allowMissing(opts),
+		Token:        token,
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetRevoked(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }
 
 func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, port uint32, opts ...TunnelOption) (io.ReadWriteCloser, error) {
@@ -141,7 +142,7 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 func (s *sshClient) revokeSessionForCleanup(workspace, token string) {
 	ctx, cancel := context.WithTimeout(context.Background(), sshCleanupTimeout)
 	defer cancel()
-	_, _ = s.RevokeSession(ctx, workspace, token)
+	_, _ = s.RevokeSession(ctx, workspace, token, DeleteOptions{AllowMissing: true})
 }
 
 type sshTunnel struct {
