@@ -478,6 +478,9 @@ Mutation admission uses a private, version-tagged JSON envelope in the same
 object store. Its identity namespace stays stable across format changes, and an
 unknown format fails closed. It contains explicit typed receipts, not arbitrary
 public response payloads, and is not part of the protobuf storage closure.
+Workspace create/delete admissions include the requested workspace name in the
+key, but omit a workspace UUID guard. Different names have independent request-ID
+namespaces; deletion receipts remain replayable after the target disappears.
 
 Each sandbox policy revision stores the complete provenance annotation map
 supplied with that update. The revision payload is the authoritative immutable

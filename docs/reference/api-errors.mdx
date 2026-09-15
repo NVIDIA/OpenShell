@@ -111,6 +111,17 @@ subject, RPC method, and requested workspace. Use the same identity, scope, ID,
 and payload when checking an admitted attempt. Map ordering does not affect the
 payload fingerprint; changed values or protobuf message presence do.
 
+For `CreateWorkspace` and `DeleteWorkspace`, the requested workspace is the
+request's `name`. The same caller can reuse an ID for the same method on different
+workspace names. Within one workspace name, a changed payload still returns
+`REQUEST_ID_PAYLOAD_MISMATCH`. Workspace deletion replay does not require the
+deleted workspace to exist and does not delete a same-name replacement.
+
+Pre-release gateways that used unscoped workspace admission require reconciliation
+before upgrading. Their workspace create/delete receipts do not replay under the
+corrected name-scoped namespace. Do not retry those IDs after upgrading without
+reconciling the original operations' effects.
+
 The gateway durably admits one owner before executing the mutation. Concurrent
 duplicates either replay its confirmed success or return
 `REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop

@@ -646,8 +646,10 @@ resource_mutation!(
     "CreateWorkspace",
     workspace::handle_create_workspace,
     workspace,
-    async |_req: &CreateWorkspaceRequest, state: &ServerState, principal: &Principal| {
-        global_scope(state, principal)
+    async |req: &CreateWorkspaceRequest, state: &ServerState, principal: &Principal| {
+        let mut scope = global_scope(state, principal)?;
+        scope.name.clone_from(&req.name);
+        Ok(scope)
     }
 );
 deletion_mutation!(
@@ -655,8 +657,10 @@ deletion_mutation!(
     DeleteWorkspaceResponse,
     "DeleteWorkspace",
     workspace::handle_delete_workspace,
-    async |_req: &DeleteWorkspaceRequest, state: &ServerState, principal: &Principal| {
-        global_scope(state, principal)
+    async |req: &DeleteWorkspaceRequest, state: &ServerState, principal: &Principal| {
+        let mut scope = global_scope(state, principal)?;
+        scope.name.clone_from(&req.name);
+        Ok(scope)
     }
 );
 resource_mutation!(

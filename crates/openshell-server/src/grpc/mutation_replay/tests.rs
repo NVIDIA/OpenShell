@@ -184,6 +184,139 @@ async fn sqlite_concurrency_restart_name_reuse_expiry_and_uncertainty() {
 }
 
 #[tokio::test]
+async fn workspace_create_request_id_is_scoped_to_each_target() {
+    let state = test_server_state().await;
+    let service = crate::grpc::OpenShellService::new(state.clone());
+    let first = create("scope-a");
+    let second = CreateWorkspaceRequest {
+        name: "scope-b".into(),
+        ..first.clone()
+    };
+    let mut originals = Vec::new();
+    for req in [&first, &second] {
+        let response = service
+            .create_workspace(authed_request(req.clone()))
+            .await
+            .unwrap();
+        assert!(response.metadata().get("openshell-replayed").is_none());
+        let original = response.into_inner();
+        assert_eq!(
+            original
+                .workspace
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .name,
+            req.name
+        );
+        assert_eq!(
+            state
+                .store
+                .get_message_by_name::<Workspace>("", &req.name)
+                .await
+                .unwrap(),
+            original.workspace
+        );
+        originals.push(original);
+    }
+    assert_ne!(
+        originals[0].workspace.as_ref().unwrap().object_id(),
+        originals[1].workspace.as_ref().unwrap().object_id()
+    );
+    for (req, original) in [&first, &second].into_iter().zip(originals) {
+        let replay = service
+            .create_workspace(authed_request(req.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+        assert_eq!(replay.into_inner(), original);
+        let mut mismatch = req.clone();
+        mismatch.labels.insert("changed".into(), "payload".into());
+        assert_eq!(
+            reason(
+                &service
+                    .create_workspace(authed_request(mismatch))
+                    .await
+                    .unwrap_err()
+            ),
+            "REQUEST_ID_PAYLOAD_MISMATCH"
+        );
+    }
+    let rows = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+        assert!(admission.workspace_id.is_none());
+    }
+}
+
+#[tokio::test]
+async fn workspace_delete_request_id_is_scoped_to_each_target() {
+    let state = test_server_state().await;
+    let service = crate::grpc::OpenShellService::new(state.clone());
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut requests = Vec::new();
+    for name in ["scope-a", "scope-b"] {
+        service
+            .create_workspace(authed_request(CreateWorkspaceRequest {
+                name: name.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        requests.push(DeleteWorkspaceRequest {
+            name: name.into(),
+            request_id: request_id.clone(),
+            ..Default::default()
+        });
+    }
+    for req in &requests {
+        let response = service
+            .delete_workspace(authed_request(req.clone()))
+            .await
+            .unwrap();
+        assert!(response.metadata().get("openshell-replayed").is_none());
+        assert_eq!(
+            response.get_ref().outcome,
+            openshell_core::proto::DeletionOutcome::Completed as i32
+        );
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Workspace>("", &req.name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for req in requests {
+        // The target no longer exists; deletion replay must not require its UUID.
+        let replay = service.delete_workspace(authed_request(req)).await.unwrap();
+        assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+        assert_eq!(
+            replay.get_ref().outcome,
+            openshell_core::proto::DeletionOutcome::Completed as i32
+        );
+    }
+    let rows = state
+        .store
+        .list_by_type_after(OBJECT_TYPE, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let admission: Admission = serde_json::from_slice(&row.payload).unwrap();
+        assert!(admission.workspace_id.is_none());
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_REPLAY_TEST_DATABASE_URL"]
 async fn postgres_concurrency_restart_name_reuse_expiry_and_uncertainty() {
     let url = std::env::var("OPENSHELL_REPLAY_TEST_DATABASE_URL")
@@ -463,7 +596,13 @@ impl Mutation for ControlledCreate {
         &self.request_id
     }
     async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status> {
-        global_scope(state, principal)
+        // Fault-injected execution must use the real adapter's admission key.
+        CreateWorkspaceRequest {
+            name: self.name.clone(),
+            ..Default::default()
+        }
+        .authorize(state, principal)
+        .await
     }
     async fn execute(
         state: &Arc<ServerState>,
