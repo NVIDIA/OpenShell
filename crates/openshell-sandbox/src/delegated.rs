@@ -48,6 +48,16 @@ pub async fn spawn_workload(
     let workspace = ResolvedWorkspace::new(workdir.map(str::to_string), true);
 
     #[cfg(target_os = "linux")]
+    if let Some(workspace_root) = workspace.root()
+        && workspace_root != openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT
+    {
+        crate::process::validate_oci_workspace_as_effective_identity(std::path::Path::new(
+            workspace_root,
+        ))
+        .wrap_err("image workspace validation failed")?;
+    }
+
+    #[cfg(target_os = "linux")]
     {
         let mode = if std::env::var_os("OPENSHELL_REQUIRE_RUNTIME_PID_LIMIT").is_some() {
             crate::process::RuntimePidLimitMode::Require
