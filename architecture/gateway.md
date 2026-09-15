@@ -55,6 +55,34 @@ the gateway listener uses TLS; package-managed local TLS can supply that bundle.
 Kubernetes instead projects guest credentials through its configured Secret.
 The gateway validates this requirement before constructing the selected driver.
 
+### Helm configuration boundary
+
+The Kubernetes Helm chart exposes `gatewayConfig` as its non-secret gateway
+application-configuration boundary. Each top-level map key names a TOML table,
+and the chart serializes its fields into the mounted `gateway.toml` ConfigMap.
+This keeps the chart independent of individual gateway fields: a new non-secret
+gateway option does not require a chart template change.
+
+Secret material never belongs in `gatewayConfig` or the ConfigMap. Database
+URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
+through the chart's supported environment-variable, file, or volume wiring.
+The gateway's normal precedence still applies: CLI flags and `OPENSHELL_*`
+environment variables override the mounted TOML file.
+
+The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
+are omitted; `null` array members are rejected because TOML has no equivalent.
+Strings, booleans, integers, and floats preserve their types. Scalar arrays
+become TOML arrays, maps become inline tables, and arrays of maps become arrays
+of inline tables. Keys are ordered alphabetically, so equivalent input produces
+the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
+string values, never in keys or YAML structure.
+
+Helm retains ownership of values that create or modify Kubernetes resources,
+including Services, workloads, probes, Secrets, certificate resources, Routes,
+RBAC, NetworkPolicies, and mounts. When one of those inputs also determines a
+gateway runtime value, the chart derives one from the other rather than
+exposing two independently configurable settings.
+
 ## Protocol and Auth
 
 Gateway validation and concurrency errors use the standard rich gRPC error
