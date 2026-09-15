@@ -3,12 +3,19 @@
 
 //! JSON-RPC 2.0 over HTTP L7 inspection.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use miette::Result;
+use openshell_core::mcp::{MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tower_mcp_types::protocol::{
-    JSONRPC_VERSION, JsonRpcNotification, JsonRpcRequest, McpNotification, McpRequest,
+use tower_mcp_types::{
+    inspection::{
+        JsonRpcEnvelope, JsonRpcPayload, McpCallKind, McpDirection, McpInspection,
+        McpInspectionError, McpInspectionErrorKind, McpInspector,
+        McpMethodClassification as TowerMcpMethodClassification,
+    },
+    protocol::{InitializeParams, JSONRPC_VERSION, McpRequest, RequestMeta, validate_meta_object},
 };
 
 use crate::l7::provider::{L7Provider, L7Request};
@@ -35,8 +42,13 @@ impl JsonRpcInspectionMode {
 /// Endpoint-specific JSON-RPC-family parser settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonRpcInspectionOptions {
+    /// Select generic JSON-RPC or MCP semantic inspection.
     pub mode: JsonRpcInspectionMode,
+    /// Enforce the MCP recommended tool-name character and length boundary.
     pub mcp_strict_tool_names: bool,
+    /// Exact revision selected by the HTTP transport for non-initialize MCP
+    /// traffic. `None` permits only a bootstrap `initialize` request.
+    pub mcp_revision: Option<McpProtocolVersion>,
 }
 
 impl JsonRpcInspectionOptions {
@@ -44,7 +56,41 @@ impl JsonRpcInspectionOptions {
         Self {
             mode: JsonRpcInspectionMode::for_protocol(config.protocol),
             mcp_strict_tool_names: config.mcp_strict_tool_names,
+            // Policy declares an allowlist, not an effective wire revision.
+            // The transport must select one from the request version header
+            // or the declared legacy fallback.
+            mcp_revision: None,
         }
+    }
+
+    /// Return MCP inspection options for an initial `initialize` request.
+    ///
+    /// Any non-initialize MCP payload inspected with these options fails
+    /// closed because no effective revision has been selected yet.
+    #[must_use]
+    pub const fn mcp_bootstrap(strict_tool_names: bool) -> Self {
+        Self {
+            mode: JsonRpcInspectionMode::Mcp,
+            mcp_strict_tool_names: strict_tool_names,
+            mcp_revision: None,
+        }
+    }
+
+    /// Return MCP inspection options for one exact effective wire revision.
+    #[must_use]
+    pub const fn mcp_selected(revision: McpProtocolVersion, strict_tool_names: bool) -> Self {
+        Self {
+            mode: JsonRpcInspectionMode::Mcp,
+            mcp_strict_tool_names: strict_tool_names,
+            mcp_revision: Some(revision),
+        }
+    }
+
+    /// Bind an exact transport-selected MCP revision to existing options.
+    #[must_use]
+    pub const fn with_mcp_revision(mut self, revision: McpProtocolVersion) -> Self {
+        self.mcp_revision = Some(revision);
+        self
     }
 }
 
@@ -53,6 +99,10 @@ impl From<JsonRpcInspectionMode> for JsonRpcInspectionOptions {
         Self {
             mode,
             mcp_strict_tool_names: true,
+            // Mode alone cannot select an MCP wire revision. The resulting
+            // options accept bootstrap initialize only until the transport
+            // supplies exact per-request revision evidence.
+            mcp_revision: None,
         }
     }
 }
@@ -142,8 +192,23 @@ pub struct JsonRpcRequestInfo {
     pub is_batch: bool,
     pub receive_stream: bool,
     pub has_response: bool,
+    /// Exact MCP revision used for semantic inspection. Bootstrap initialize,
+    /// receive-stream requests, and generic JSON-RPC leave this unset.
+    pub mcp_revision: Option<McpProtocolVersion>,
+    /// Body fields mirrored into HTTP headers by sessionless MCP requests.
+    /// Populated only after the request passes its selected inspection profile.
+    pub mcp_http_metadata: Option<McpHttpRequestMetadata>,
     /// Typed inspection failure discovered before policy evaluation.
     pub error: Option<JsonRpcInspectionError>,
+}
+
+/// Inspected body fields that the MCP HTTP transport must compare with headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpHttpRequestMetadata {
+    /// The JSON-RPC method mirrored in `Mcp-Method`.
+    pub method: String,
+    /// Tool or prompt name, or resource URI, mirrored in `Mcp-Name` when required.
+    pub name: Option<String>,
 }
 
 /// Stable kind of failure found while inspecting a JSON-RPC-family message.
@@ -154,6 +219,13 @@ pub enum JsonRpcInspectionErrorKind {
     InvalidJson,
     /// The decoded JSON fails JSON-RPC or protocol-specific message validation.
     InvalidMessage,
+    /// MCP traffic lacked the transport-selected revision required for exact
+    /// semantic inspection.
+    RevisionNotSelected,
+    /// The selected MCP revision's immutable wire profile rejected the body.
+    McpProfileViolation,
+    /// An MCP lifecycle message appeared in a forbidden wire shape.
+    McpLifecycleViolation,
 }
 
 /// Typed JSON-RPC inspection failure with an inseparable kind and diagnostic.
@@ -171,9 +243,37 @@ impl JsonRpcInspectionError {
         }
     }
 
+    fn invalid_json_with_detail(detail: impl Into<String>) -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::InvalidJson,
+            detail: detail.into(),
+        }
+    }
+
     fn invalid_message(detail: impl Into<String>) -> Self {
         Self {
             kind: JsonRpcInspectionErrorKind::InvalidMessage,
+            detail: detail.into(),
+        }
+    }
+
+    fn revision_not_selected() -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::RevisionNotSelected,
+            detail: "MCP effective protocol revision has not been selected".to_string(),
+        }
+    }
+
+    fn mcp_profile_violation(detail: impl Into<String>) -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::McpProfileViolation,
+            detail: detail.into(),
+        }
+    }
+
+    fn mcp_lifecycle_violation(detail: impl Into<String>) -> Self {
+        Self {
+            kind: JsonRpcInspectionErrorKind::McpLifecycleViolation,
             detail: detail.into(),
         }
     }
@@ -198,13 +298,28 @@ impl JsonRpcInspectionError {
     }
 }
 
-impl std::fmt::Display for JsonRpcInspectionError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for JsonRpcInspectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.detail)
     }
 }
 
 impl std::error::Error for JsonRpcInspectionError {}
+
+/// Policy-relevant classification of one accepted MCP method.
+///
+/// Known methods unavailable in the selected revision are rejected before a
+/// call is produced, so the policy boundary represents only core methods that
+/// are available and unknown extension methods that need an exact allow rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpMethodClassification {
+    /// A core method defined by the selected MCP revision.
+    Available,
+    /// A method unknown to every supported core profile.
+    Extension,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcCallInfo {
@@ -217,6 +332,9 @@ pub struct JsonRpcCallInfo {
     /// MCP `tools/call` tool name when known. Generic JSON-RPC leaves this
     /// unset because params are not inspected.
     pub tool: Option<String>,
+    /// Exact-profile MCP method classification retained for policy evaluation.
+    /// Generic JSON-RPC calls leave this unset.
+    pub mcp_classification: Option<McpMethodClassification>,
     /// Whether this call is a JSON-RPC notification without an `id`.
     ///
     /// MCP initialization is a request, so transport code uses this bit to
@@ -232,6 +350,8 @@ impl JsonRpcRequestInfo {
             is_batch,
             receive_stream: false,
             has_response: false,
+            mcp_revision: None,
+            mcp_http_metadata: None,
             error: Some(error),
         }
     }
@@ -244,6 +364,8 @@ impl JsonRpcRequestInfo {
             is_batch: false,
             receive_stream: true,
             has_response: false,
+            mcp_revision: None,
+            mcp_http_metadata: None,
             error: None,
         }
     }
@@ -279,6 +401,10 @@ fn request_accepts_sse(request: &L7Request) -> bool {
     })
 }
 /// Parse a JSON-RPC-family body using the endpoint's inspection mode.
+///
+/// Mode-only MCP inspection accepts the bootstrap `initialize` request but
+/// rejects later requests until the negotiated revision is supplied through
+/// [`parse_jsonrpc_body_with_options`].
 pub fn parse_jsonrpc_body(
     body: &[u8],
     inspection_mode: JsonRpcInspectionMode,
@@ -291,9 +417,14 @@ pub fn parse_jsonrpc_body_with_options(
     body: &[u8],
     inspection_options: JsonRpcInspectionOptions,
 ) -> JsonRpcRequestInfo {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return JsonRpcRequestInfo::rejected(false, JsonRpcInspectionError::invalid_json());
+    let value = match parse_unique_json_value(body) {
+        Ok(value) => value,
+        Err(error) => return JsonRpcRequestInfo::rejected(false, error),
     };
+
+    if inspection_options.mode == JsonRpcInspectionMode::Mcp {
+        return parse_mcp_payload(&value, inspection_options);
+    }
 
     if let serde_json::Value::Array(items) = value {
         if items.is_empty() {
@@ -305,24 +436,8 @@ pub fn parse_jsonrpc_body_with_options(
         let mut calls = Vec::new();
         let mut has_response = false;
         for item in &items {
-            match parse_jsonrpc_message(item, inspection_options) {
-                Ok(JsonRpcMessageInfo::Call(call)) => {
-                    // Initialization establishes the MCP exchange before any
-                    // profile-specific request rules apply. A batch has no
-                    // single bootstrap exchange, so fail closed before policy
-                    // evaluation can forward any member.
-                    if inspection_options.mode == JsonRpcInspectionMode::Mcp
-                        && call.method == "initialize"
-                    {
-                        return JsonRpcRequestInfo::rejected(
-                            true,
-                            JsonRpcInspectionError::invalid_message(
-                                "MCP initialize must not appear in a batch",
-                            ),
-                        );
-                    }
-                    calls.push(call);
-                }
+            match parse_jsonrpc_message(item) {
+                Ok(JsonRpcMessageInfo::Call(call)) => calls.push(call),
                 Ok(JsonRpcMessageInfo::Response) => has_response = true,
                 Err(error) => {
                     return JsonRpcRequestInfo::rejected(
@@ -339,16 +454,20 @@ pub fn parse_jsonrpc_body_with_options(
             is_batch: true,
             receive_stream: false,
             has_response,
+            mcp_revision: None,
+            mcp_http_metadata: None,
             error: None,
         };
     }
 
-    match parse_jsonrpc_message(&value, inspection_options) {
+    match parse_jsonrpc_message(&value) {
         Ok(JsonRpcMessageInfo::Call(call)) => JsonRpcRequestInfo {
             calls: vec![call],
             is_batch: false,
             receive_stream: false,
             has_response: false,
+            mcp_revision: None,
+            mcp_http_metadata: None,
             error: None,
         },
         Ok(JsonRpcMessageInfo::Response) => JsonRpcRequestInfo {
@@ -356,12 +475,169 @@ pub fn parse_jsonrpc_body_with_options(
             is_batch: false,
             receive_stream: false,
             has_response: true,
+            mcp_revision: None,
+            mcp_http_metadata: None,
             error: None,
         },
         Err(error) => {
             JsonRpcRequestInfo::rejected(false, JsonRpcInspectionError::invalid_message(error))
         }
     }
+}
+
+#[derive(Debug)]
+struct DuplicateJsonObjectKey {
+    key: String,
+    object_path: String,
+}
+
+struct UniqueJsonValueSeed<'a> {
+    duplicate: &'a mut Option<DuplicateJsonObjectKey>,
+    path: String,
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor {
+            duplicate: self.duplicate,
+            path: self.path,
+        })
+    }
+}
+
+struct UniqueJsonValueVisitor<'a> {
+    duplicate: &'a mut Option<DuplicateJsonObjectKey>,
+    path: String,
+}
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(serde_json::Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValueSeed {
+            duplicate: self.duplicate,
+            path: self.path,
+        }
+        .deserialize(deserializer)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(UniqueJsonValueSeed {
+            duplicate: &mut *self.duplicate,
+            path: format!("{}[{}]", self.path, values.len()),
+        })? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            // Record the first duplicate but continue decoding so syntax and
+            // trailing-data failures still use serde_json's normal handling.
+            if values.contains_key(&key) && self.duplicate.is_none() {
+                *self.duplicate = Some(DuplicateJsonObjectKey {
+                    key: key.clone(),
+                    object_path: self.path.clone(),
+                });
+            }
+            let value = object.next_value_seed(UniqueJsonValueSeed {
+                duplicate: &mut *self.duplicate,
+                path: format!("{}.{}", self.path, key),
+            })?;
+            values.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(values))
+    }
+}
+
+/// Decode one JSON value while rejecting duplicate object keys recursively.
+///
+/// Callers that inspect and then forward the original bytes must use this
+/// boundary so `OpenShell` and the upstream cannot select different values for
+/// the same object key.
+pub(crate) fn parse_unique_json_value(
+    body: &[u8],
+) -> std::result::Result<serde_json::Value, JsonRpcInspectionError> {
+    let mut duplicate = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let value = UniqueJsonValueSeed {
+        duplicate: &mut duplicate,
+        path: "$".to_string(),
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|_| JsonRpcInspectionError::invalid_json())?;
+    deserializer
+        .end()
+        .map_err(|_| JsonRpcInspectionError::invalid_json())?;
+
+    if let Some(duplicate) = duplicate {
+        return Err(JsonRpcInspectionError::invalid_json_with_detail(format!(
+            "duplicate JSON object key '{}' at {}",
+            duplicate.key, duplicate.object_path
+        )));
+    }
+    Ok(value)
 }
 
 enum JsonRpcMessageInfo {
@@ -373,7 +649,6 @@ enum JsonRpcMessageInfo {
 // only after the common JSON-RPC version/method/response checks.
 fn parse_jsonrpc_message(
     value: &serde_json::Value,
-    inspection_options: JsonRpcInspectionOptions,
 ) -> std::result::Result<JsonRpcMessageInfo, String> {
     let version = value
         .get("jsonrpc")
@@ -395,22 +670,13 @@ fn parse_jsonrpc_message(
     }
 
     if has_method {
-        return parse_jsonrpc_call(value, inspection_options).map(JsonRpcMessageInfo::Call);
+        return parse_jsonrpc_call(value).map(JsonRpcMessageInfo::Call);
     }
 
     Err("missing or non-string 'method' field".to_string())
 }
 
-fn parse_jsonrpc_call(
-    value: &serde_json::Value,
-    inspection_options: JsonRpcInspectionOptions,
-) -> std::result::Result<JsonRpcCallInfo, String> {
-    // MCP mode delegates method-specific validation to tower-mcp-types. The
-    // generic mode intentionally remains looser for non-MCP JSON-RPC servers.
-    if inspection_options.mode == JsonRpcInspectionMode::Mcp {
-        return parse_mcp_call(value, inspection_options.mcp_strict_tool_names);
-    }
-
+fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcCallInfo, String> {
     let method = value
         .get("method")
         .and_then(|m| m.as_str())
@@ -419,6 +685,7 @@ fn parse_jsonrpc_call(
         method: method.to_string(),
         params: HashMap::new(),
         tool: None,
+        mcp_classification: None,
         is_notification: value.get("id").is_none(),
     })
 }
@@ -452,60 +719,382 @@ fn parse_jsonrpc_response(value: &serde_json::Value) -> std::result::Result<(), 
     Ok(())
 }
 
-fn parse_mcp_call(
+fn parse_mcp_payload(
     value: &serde_json::Value,
-    strict_tool_names: bool,
-) -> std::result::Result<JsonRpcCallInfo, String> {
-    if value.get("id").is_some() {
-        // Typed parsing validates known MCP params, but policy method profiles
-        // stay OpenShell-owned; see McpOptions in proto/sandbox.proto.
-        let request: JsonRpcRequest = serde_json::from_value(value.clone())
-            .map_err(|error| format!("invalid MCP request: {error}"))?;
-        request
-            .validate()
-            .map_err(|error| format!("invalid MCP request: {error:?}"))?;
-        let mcp_request = McpRequest::from_jsonrpc(&request)
-            .map_err(|error| format!("invalid MCP request params: {error}"))?;
-        let tool = mcp_tool_name(&mcp_request);
-        if strict_tool_names && let Some(tool_name) = tool.as_deref() {
-            validate_mcp_tool_name(tool_name)?;
+    inspection_options: JsonRpcInspectionOptions,
+) -> JsonRpcRequestInfo {
+    let payload = match JsonRpcPayload::inspect(value) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return JsonRpcRequestInfo::rejected(
+                value.is_array(),
+                JsonRpcInspectionError::invalid_message(error.to_string()),
+            );
+        }
+    };
+
+    // Legacy initialization proposes a revision rather than selecting one.
+    // Sessionless requests carry their revision in _meta and must never use
+    // this exemption, even if the transport has not selected a profile yet.
+    if payload_contains_method(&payload, "initialize")
+        && inspection_options.mcp_revision != Some(McpProtocolVersion::V2026_07_28)
+        && value
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some("2026-07-28")
+    {
+        return parse_mcp_initialize(payload);
+    }
+
+    let Some(revision) = inspection_options.mcp_revision else {
+        return JsonRpcRequestInfo::rejected(
+            payload.is_batch(),
+            JsonRpcInspectionError::revision_not_selected(),
+        );
+    };
+
+    let mut mcp_http_metadata = match inspect_mcp_request_metadata(value, revision) {
+        Ok(metadata) => metadata,
+        Err(error) => return JsonRpcRequestInfo::rejected(payload.is_batch(), error),
+    };
+
+    let inspection =
+        match inspect_mcp_payload_for_revision(&payload, revision, McpDirection::ClientToServer) {
+            Ok(inspection) => inspection,
+            Err(error) => return JsonRpcRequestInfo::rejected(payload.is_batch(), error),
+        };
+
+    let mut calls = Vec::with_capacity(inspection.methods().len());
+    for method in inspection.methods() {
+        let named_request = match mcp_named_request_for_inspected_method(
+            inspection.payload(),
+            method.method(),
+            method.batch_index(),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return JsonRpcRequestInfo::rejected(
+                    inspection.payload().is_batch(),
+                    JsonRpcInspectionError::invalid_message(error),
+                );
+            }
+        };
+        // Use the same typed tool name for authorization and its HTTP mirror.
+        // Prompt names and resource URIs participate only in HTTP matching.
+        let (tool, http_name) = match named_request {
+            Some(McpRequest::CallTool(params)) => (Some(params.name.clone()), Some(params.name)),
+            Some(McpRequest::GetPrompt(params)) => (None, Some(params.name)),
+            Some(McpRequest::ReadResource(params)) => (None, Some(params.uri)),
+            None => (None, None),
+            Some(_) => {
+                return JsonRpcRequestInfo::rejected(
+                    inspection.payload().is_batch(),
+                    JsonRpcInspectionError::invalid_message(
+                        "inspected MCP name-bearing method has an unexpected typed request",
+                    ),
+                );
+            }
+        };
+        if let Some(metadata) = mcp_http_metadata.as_mut() {
+            metadata.name = http_name;
+        }
+        if inspection_options.mcp_strict_tool_names
+            && let Some(tool_name) = tool.as_deref()
+            && let Err(error) = validate_mcp_tool_name(tool_name)
+        {
+            return JsonRpcRequestInfo::rejected(
+                inspection.payload().is_batch(),
+                JsonRpcInspectionError::invalid_message(error),
+            );
         }
 
-        let params = mcp_policy_params(tool.as_deref());
-        return Ok(JsonRpcCallInfo {
-            method: mcp_request.method_name().to_string(),
-            params,
+        let mcp_classification = match method.classification() {
+            TowerMcpMethodClassification::Available => McpMethodClassification::Available,
+            TowerMcpMethodClassification::Extension => McpMethodClassification::Extension,
+            TowerMcpMethodClassification::Unavailable => {
+                return JsonRpcRequestInfo::rejected(
+                    inspection.payload().is_batch(),
+                    JsonRpcInspectionError::mcp_profile_violation(format!(
+                        "MCP {revision} does not make `{}` available",
+                        method.method()
+                    )),
+                );
+            }
+            _ => {
+                return JsonRpcRequestInfo::rejected(
+                    inspection.payload().is_batch(),
+                    JsonRpcInspectionError::mcp_profile_violation(format!(
+                        "MCP {revision} returned an unsupported classification for `{}`",
+                        method.method()
+                    )),
+                );
+            }
+        };
+
+        calls.push(JsonRpcCallInfo {
+            method: method.method().to_string(),
+            params: mcp_policy_params(tool.as_deref()),
             tool,
-            is_notification: false,
+            mcp_classification: Some(mcp_classification),
+            is_notification: method.kind() == McpCallKind::Notification,
         });
     }
 
-    // Notifications have no id and no response expectation. Validate them as
-    // MCP notifications but keep extension notifications addressable.
-    let notification: JsonRpcNotification = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid MCP notification: {error}"))?;
-    if notification.jsonrpc != JSONRPC_VERSION {
-        return Err(format!(
-            "unsupported JSON-RPC version '{}'",
-            notification.jsonrpc
-        ));
+    JsonRpcRequestInfo {
+        calls,
+        is_batch: inspection.payload().is_batch(),
+        receive_stream: false,
+        has_response: payload_has_response(inspection.payload()),
+        mcp_revision: Some(revision),
+        mcp_http_metadata,
+        error: None,
     }
-    McpNotification::from_jsonrpc(&notification)
-        .map_err(|error| format!("invalid MCP notification params: {error}"))?;
+}
 
-    Ok(JsonRpcCallInfo {
-        method: notification.method,
-        params: HashMap::new(),
-        tool: None,
-        is_notification: true,
+/// Validate the common request contract before method-specific inspection.
+/// Extension requests need the same metadata as core requests, even when the
+/// upstream inspector has no typed parameter schema for their method.
+fn inspect_mcp_request_metadata(
+    value: &serde_json::Value,
+    revision: McpProtocolVersion,
+) -> std::result::Result<Option<McpHttpRequestMetadata>, JsonRpcInspectionError> {
+    // A legacy header or missing-header fallback cannot reinterpret a body
+    // that explicitly declares a different per-request protocol revision.
+    let messages = value
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(value), Vec::as_slice);
+    for message in messages {
+        if let Some(declared) =
+            message.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            && declared.as_str() != Some(revision.as_str())
+        {
+            return Err(JsonRpcInspectionError::mcp_profile_violation(
+                "MCP request metadata protocol version must match the selected revision",
+            ));
+        }
+    }
+
+    if revision != McpProtocolVersion::V2026_07_28 {
+        return Ok(None);
+    }
+    let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
+        return Err(JsonRpcInspectionError::mcp_profile_violation(
+            "MCP 2026-07-28 HTTP bodies must contain one request or extension notification",
+        ));
+    };
+    if value.get("id").is_none() {
+        // Cancellation for HTTP is closing the response stream. The core
+        // notification exists only for stdio; extension notifications retain
+        // their explicit policy gate and have no standardized HTTP metadata.
+        if method == "notifications/cancelled" {
+            return Err(JsonRpcInspectionError::mcp_profile_violation(
+                "MCP 2026-07-28 notifications/cancelled is not available over HTTP",
+            ));
+        }
+        return Ok(None);
+    }
+
+    let meta = value.pointer("/params/_meta").ok_or_else(|| {
+        JsonRpcInspectionError::invalid_message("MCP 2026-07-28 requests require params._meta")
+    })?;
+    validate_meta_object(meta)
+        .map_err(|error| JsonRpcInspectionError::invalid_message(error.to_string()))?;
+    // Tower owns the capability and implementation schemas. Apply its common
+    // metadata contract here so extension requests receive the same checks
+    // even though the method inspector has no extension parameter schema.
+    let meta: RequestMeta = serde_json::from_value(meta.clone())
+        .map_err(|error| JsonRpcInspectionError::invalid_message(error.to_string()))?;
+    meta.validate_for_version(revision.as_str())
+        .map_err(|error| JsonRpcInspectionError::invalid_message(error.to_string()))?;
+
+    Ok(Some(McpHttpRequestMetadata {
+        method: method.to_string(),
+        // Name-bearing parameters are projected from Tower's typed requests
+        // only after exact-revision method inspection succeeds.
+        name: None,
+    }))
+}
+
+/// Inspect one complete JSON-RPC payload under an exact MCP wire profile.
+///
+/// The caller supplies the peer direction because it is transport context, not
+/// JSON-RPC data. This boundary enforces the revision's batch shape and bound,
+/// typed method parameters, peer direction, and known-method availability.
+/// Unknown extension methods remain valid for explicit policy authorization.
+pub(crate) fn inspect_mcp_payload_for_revision(
+    payload: &JsonRpcPayload,
+    revision: McpProtocolVersion,
+    direction: McpDirection,
+) -> std::result::Result<McpInspection, JsonRpcInspectionError> {
+    // Bound work before typed inspection. Tower owns whether the selected
+    // revision permits batches; this limit applies to every attempted batch.
+    if payload.is_batch() && payload.len() > MAX_MCP_LEGACY_BATCH_MESSAGES {
+        return Err(JsonRpcInspectionError::mcp_profile_violation(format!(
+            "MCP {revision} batch contains {} messages; the maximum is {MAX_MCP_LEGACY_BATCH_MESSAGES}",
+            payload.len()
+        )));
+    }
+
+    let inspector = McpInspector::new(revision.as_str())
+        .map_err(|error| JsonRpcInspectionError::mcp_profile_violation(error.to_string()))?;
+    let inspection = inspector
+        .inspect_payload(payload.clone(), Some(direction))
+        .map_err(map_mcp_inspection_error)?;
+
+    for method in inspection.methods() {
+        match method.classification() {
+            TowerMcpMethodClassification::Unavailable => {
+                return Err(JsonRpcInspectionError::mcp_profile_violation(format!(
+                    "MCP {revision} does not make `{}` available",
+                    method.method()
+                )));
+            }
+            TowerMcpMethodClassification::Available | TowerMcpMethodClassification::Extension => {}
+            _ => {
+                return Err(JsonRpcInspectionError::mcp_profile_violation(format!(
+                    "MCP {revision} returned an unsupported classification for `{}`",
+                    method.method()
+                )));
+            }
+        }
+    }
+
+    Ok(inspection)
+}
+
+fn parse_mcp_initialize(payload: JsonRpcPayload) -> JsonRpcRequestInfo {
+    if payload.is_batch() {
+        return JsonRpcRequestInfo::rejected(
+            true,
+            JsonRpcInspectionError::mcp_lifecycle_violation(
+                "MCP `initialize` must be exactly one non-batched request",
+            ),
+        );
+    }
+
+    let Some(JsonRpcEnvelope::Request(request)) = payload.as_single() else {
+        return JsonRpcRequestInfo::rejected(
+            false,
+            JsonRpcInspectionError::mcp_lifecycle_violation(
+                "MCP `initialize` must be a request with an id",
+            ),
+        );
+    };
+    let Some(params) = request.params.as_ref() else {
+        return JsonRpcRequestInfo::rejected(
+            false,
+            JsonRpcInspectionError::invalid_message("MCP `initialize` params are required"),
+        );
+    };
+    if let Err(error) = serde_json::from_value::<InitializeParams>(params.clone()) {
+        return JsonRpcRequestInfo::rejected(
+            false,
+            JsonRpcInspectionError::invalid_message(format!(
+                "invalid MCP `initialize` params: {error}"
+            )),
+        );
+    }
+
+    JsonRpcRequestInfo {
+        calls: vec![JsonRpcCallInfo {
+            method: "initialize".to_string(),
+            params: HashMap::new(),
+            tool: None,
+            mcp_classification: Some(McpMethodClassification::Available),
+            is_notification: false,
+        }],
+        is_batch: false,
+        receive_stream: false,
+        has_response: false,
+        mcp_revision: None,
+        mcp_http_metadata: None,
+        error: None,
+    }
+}
+
+fn payload_contains_method(payload: &JsonRpcPayload, expected: &str) -> bool {
+    if let Some(envelope) = payload.as_single() {
+        return envelope_method(envelope) == Some(expected);
+    }
+    payload.as_batch().is_some_and(|batch| {
+        batch
+            .messages()
+            .iter()
+            .any(|envelope| envelope_method(envelope) == Some(expected))
     })
 }
 
-fn mcp_tool_name(request: &McpRequest) -> Option<String> {
-    if let McpRequest::CallTool(params) = request {
-        Some(params.name.clone())
-    } else {
-        None
+fn envelope_method(envelope: &JsonRpcEnvelope) -> Option<&str> {
+    match envelope {
+        JsonRpcEnvelope::Request(request) => Some(request.method.as_str()),
+        JsonRpcEnvelope::Notification(notification) => Some(notification.method.as_str()),
+        _ => None,
+    }
+}
+
+fn payload_has_response(payload: &JsonRpcPayload) -> bool {
+    if let Some(envelope) = payload.as_single() {
+        return matches!(
+            envelope,
+            JsonRpcEnvelope::Result(_) | JsonRpcEnvelope::Error(_)
+        );
+    }
+    payload.as_batch().is_some_and(|batch| {
+        batch.messages().iter().any(|envelope| {
+            matches!(
+                envelope,
+                JsonRpcEnvelope::Result(_) | JsonRpcEnvelope::Error(_)
+            )
+        })
+    })
+}
+
+// The inspector retains untyped envelopes. Decode name-bearing requests with
+// Tower so policy and HTTP metadata share its parameter schemas.
+fn mcp_named_request_for_inspected_method(
+    payload: &JsonRpcPayload,
+    method: &str,
+    batch_index: Option<usize>,
+) -> std::result::Result<Option<McpRequest>, String> {
+    if !matches!(method, "tools/call" | "prompts/get" | "resources/read") {
+        return Ok(None);
+    }
+
+    let envelope = batch_index
+        .map_or_else(
+            || payload.as_single(),
+            |index| {
+                payload
+                    .as_batch()
+                    .and_then(|batch| batch.messages().get(index))
+            },
+        )
+        .ok_or_else(|| "inspected MCP method is missing its JSON-RPC envelope".to_string())?;
+    let JsonRpcEnvelope::Request(request) = envelope else {
+        return Err(format!("MCP `{method}` must be a request with an id"));
+    };
+    let request = McpRequest::from_jsonrpc(request)
+        .map_err(|error| format!("invalid MCP `{method}` params: {error}"))?;
+    Ok(Some(request))
+}
+
+fn map_mcp_inspection_error(error: McpInspectionError) -> JsonRpcInspectionError {
+    match error.kind() {
+        McpInspectionErrorKind::BatchUnavailable
+        | McpInspectionErrorKind::DirectionMismatch
+        | McpInspectionErrorKind::UnsupportedProfile => {
+            JsonRpcInspectionError::mcp_profile_violation(error.to_string())
+        }
+        McpInspectionErrorKind::InitializeInBatch => {
+            JsonRpcInspectionError::mcp_lifecycle_violation(error.to_string())
+        }
+        McpInspectionErrorKind::JsonRpc
+        | McpInspectionErrorKind::MessageKindMismatch
+        | McpInspectionErrorKind::MissingParams
+        | McpInspectionErrorKind::InvalidParams => {
+            JsonRpcInspectionError::invalid_message(error.to_string())
+        }
+        _ => JsonRpcInspectionError::mcp_profile_violation(error.to_string()),
     }
 }
 
@@ -537,6 +1126,21 @@ fn validate_mcp_tool_name(name: &str) -> std::result::Result<(), String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn mcp_options(revision: McpProtocolVersion) -> JsonRpcInspectionOptions {
+        JsonRpcInspectionOptions::mcp_selected(revision, true)
+    }
+
+    #[test]
+    fn every_policy_revision_selects_the_matching_tower_profile() {
+        // Policy support is deliberately independent of Tower's vocabulary;
+        // every enabled revision must still have an exact inspector profile.
+        for revision in McpProtocolVersion::ALL {
+            let inspector = McpInspector::new(revision.as_str())
+                .expect("supported policy revision must have an inspector");
+            assert_eq!(inspector.revision().as_str(), revision.as_str());
+        }
+    }
 
     #[test]
     fn parses_method_from_request_body() {
@@ -572,6 +1176,216 @@ mod tests {
         assert!(info.calls.is_empty());
         assert!(info.has_response);
         assert!(info.error.is_none());
+    }
+
+    fn sessionless_request(method: &str, mut params: serde_json::Value) -> serde_json::Value {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    }
+
+    #[test]
+    fn mcp_sessionless_inspects_core_and_extension_requests_without_initialize() {
+        for (method, params, name, classification) in [
+            (
+                "server/discover",
+                serde_json::json!({}),
+                None,
+                McpMethodClassification::Available,
+            ),
+            (
+                "tools/list",
+                serde_json::json!({}),
+                None,
+                McpMethodClassification::Available,
+            ),
+            (
+                "tools/call",
+                serde_json::json!({"name": "echo", "arguments": {}}),
+                Some("echo"),
+                McpMethodClassification::Available,
+            ),
+            (
+                "prompts/get",
+                serde_json::json!({"name": "summarize"}),
+                Some("summarize"),
+                McpMethodClassification::Available,
+            ),
+            (
+                "resources/read",
+                serde_json::json!({"uri": "file:///guide.txt"}),
+                Some("file:///guide.txt"),
+                McpMethodClassification::Available,
+            ),
+            (
+                "subscriptions/listen",
+                serde_json::json!({"notifications": {"toolsListChanged": true}}),
+                None,
+                McpMethodClassification::Available,
+            ),
+            (
+                "vendor/inspect",
+                serde_json::json!({}),
+                None,
+                McpMethodClassification::Extension,
+            ),
+        ] {
+            let body = serde_json::to_vec(&sessionless_request(method, params)).unwrap();
+            let info = parse_jsonrpc_body_with_options(
+                &body,
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.error.is_none(), "{method}: {:?}", info.error);
+            assert_eq!(info.calls.len(), 1);
+            assert_eq!(info.calls[0].mcp_classification, Some(classification));
+            let expected_tool = if method == "tools/call" { name } else { None };
+            assert_eq!(info.calls[0].tool.as_deref(), expected_tool);
+            assert_eq!(
+                info.calls[0].params.get("name").map(String::as_str),
+                expected_tool
+            );
+            assert_eq!(
+                info.mcp_http_metadata,
+                Some(McpHttpRequestMetadata {
+                    method: method.to_string(),
+                    name: name.map(str::to_string),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_sessionless_requires_valid_common_metadata_for_extension_requests_too() {
+        for method in ["server/discover", "vendor/inspect"] {
+            for meta in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"}),
+                serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}}),
+                serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": "invalid"}),
+                serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}, "invalid key": true}),
+            ] {
+                let mut request = sessionless_request(method, serde_json::json!({}));
+                request["params"]["_meta"] = meta;
+                let info = parse_jsonrpc_body_with_options(
+                    &serde_json::to_vec(&request).unwrap(),
+                    mcp_options(McpProtocolVersion::V2026_07_28),
+                );
+                assert!(info.error.is_some(), "accepted {request}");
+                assert!(info.mcp_http_metadata.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_sessionless_preserves_arbitrary_extension_and_experimental_settings() {
+        for method in ["server/discover", "vendor/inspect"] {
+            let mut request = sessionless_request(method, serde_json::json!({}));
+            request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+                "roots": {"listChanged": true, "deprecated": {}},
+                "sampling": {"tools": {}, "context": {}, "deprecated": {}},
+                "elicitation": {"form": {}, "url": {}},
+                "tasks": {
+                    "list": {}, "cancel": {},
+                    "requests": {"sampling": {"createMessage": {}}, "elicitation": {"create": {}}}
+                },
+                "experimental": {"list": [1, true, null], "label": "custom", "optional": null},
+                "extensions": {"com.example/custom": {"list": [1, true, null], "optional": null}},
+                "vendorData": []
+            });
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.error.is_none(), "{method}: {:?}", info.error);
+            assert!(info.mcp_http_metadata.is_some());
+        }
+    }
+
+    #[test]
+    fn mcp_sessionless_validates_subscription_parameters() {
+        for (notifications, valid) in [
+            (serde_json::json!({}), true),
+            (serde_json::json!({"toolsListChanged": true}), true),
+            (serde_json::json!(null), false),
+            (serde_json::json!({"toolsListChanged": []}), false),
+        ] {
+            let request = sessionless_request(
+                "subscriptions/listen",
+                serde_json::json!({"notifications": notifications}),
+            );
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert_eq!(info.error.is_none(), valid, "{request}: {:?}", info.error);
+            assert_eq!(info.mcp_http_metadata.is_some(), valid);
+        }
+    }
+
+    #[test]
+    fn mcp_sessionless_metadata_cannot_be_inspected_as_a_legacy_revision() {
+        let body =
+            serde_json::to_vec(&sessionless_request("tools/list", serde_json::json!({}))).unwrap();
+        for revision in [
+            McpProtocolVersion::V2025_03_26,
+            McpProtocolVersion::V2025_06_18,
+            McpProtocolVersion::V2025_11_25,
+        ] {
+            let info = parse_jsonrpc_body_with_options(&body, mcp_options(revision));
+            assert!(
+                info.error.is_some(),
+                "sessionless body accepted as {revision}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_sessionless_rejects_legacy_lifecycle_and_non_http_message_shapes() {
+        let options = mcp_options(McpProtocolVersion::V2026_07_28);
+        let initialize = sessionless_request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2026-07-28", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}
+            }),
+        );
+        let bootstrap = parse_jsonrpc_body_with_options(
+            &serde_json::to_vec(&initialize).unwrap(),
+            JsonRpcInspectionOptions::mcp_bootstrap(true),
+        );
+        assert!(
+            bootstrap.error.is_some(),
+            "sessionless initialize used legacy bootstrap"
+        );
+        for request in [
+            initialize,
+            sessionless_request("logging/setLevel", serde_json::json!({"level": "info"})),
+            sessionless_request(
+                "resources/subscribe",
+                serde_json::json!({"uri": "file:///guide.txt"}),
+            ),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            serde_json::json!([sessionless_request("tools/list", serde_json::json!({}))]),
+            sessionless_request("subscriptions/listen", serde_json::json!({})),
+        ] {
+            let info =
+                parse_jsonrpc_body_with_options(&serde_json::to_vec(&request).unwrap(), options);
+            assert!(info.error.is_some(), "accepted {request}");
+        }
+        let extension = parse_jsonrpc_body_with_options(
+            br#"{"jsonrpc":"2.0","method":"vendor/notice","params":{}}"#,
+            options,
+        );
+        assert!(extension.error.is_none(), "{:?}", extension.error);
+        assert_eq!(
+            extension.calls[0].mcp_classification,
+            Some(McpMethodClassification::Extension)
+        );
+        assert!(extension.mcp_http_metadata.is_none());
     }
 
     #[test]
@@ -616,6 +1430,85 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_jsonrpc_envelope_keys_before_semantic_inspection() {
+        let fixtures: &[(&str, &[u8])] = &[
+            (
+                "jsonrpc",
+                br#"{"jsonrpc":"2.0","jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            ),
+            (
+                "id",
+                br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/list","params":{}}"#,
+            ),
+            (
+                "method",
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","method":"vendor/other","params":{}}"#,
+            ),
+            (
+                "params",
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{},"params":{"cursor":"next"}}"#,
+            ),
+        ];
+
+        for (key, body) in fixtures {
+            let info =
+                parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
+            assert!(info.calls.is_empty());
+            assert_eq!(
+                info.error.as_ref().map(JsonRpcInspectionError::kind),
+                Some(JsonRpcInspectionErrorKind::InvalidJson),
+                "duplicate {key} must fail before MCP inspection: {info:?}"
+            );
+            assert!(
+                info.error
+                    .as_ref()
+                    .is_some_and(|error| error.detail().contains(key)),
+                "duplicate-key detail should identify {key}: {info:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_recursively_but_allows_same_key_in_distinct_objects() {
+        let duplicate = br#"{
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{
+                "name":"search_web",
+                "arguments":{"query":"allowed","query":"different"}
+            }
+        }"#;
+        let rejected = parse_jsonrpc_body_with_options(
+            duplicate,
+            mcp_options(McpProtocolVersion::V2025_11_25),
+        );
+        assert!(rejected.calls.is_empty());
+        assert_eq!(
+            rejected.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::InvalidJson)
+        );
+
+        let distinct_objects = br#"{
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{
+                "name":"search_web",
+                "arguments":{"left":{"value":1},"right":{"value":2}}
+            }
+        }"#;
+        let accepted = parse_jsonrpc_body_with_options(
+            distinct_objects,
+            mcp_options(McpProtocolVersion::V2025_11_25),
+        );
+        assert!(
+            accepted.error.is_none(),
+            "keys may repeat in different objects: {accepted:?}"
+        );
+    }
+
+    #[test]
     fn ignores_params_when_extracting_method() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"reports.search","params":{"query":"quarterly","filters":{"scope":"workspace/main"}}}"#;
         let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::JsonRpc);
@@ -649,7 +1542,8 @@ mod tests {
     #[test]
     fn mcp_mode_validates_known_methods_and_extracts_tool() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_web","arguments":{"query":"openshell"}}}"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
 
         assert!(info.error.is_none(), "expected valid MCP call: {info:?}");
         let call = info.calls.first().expect("single MCP call");
@@ -660,12 +1554,18 @@ mod tests {
             Some("search_web")
         );
         assert_eq!(call.params.len(), 1);
+        assert_eq!(
+            call.mcp_classification,
+            Some(McpMethodClassification::Available)
+        );
+        assert_eq!(info.mcp_revision, Some(McpProtocolVersion::V2025_11_25));
     }
 
     #[test]
     fn mcp_mode_rejects_non_recommended_tool_names_by_default() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read status","arguments":{}}}"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
 
         assert!(info.calls.is_empty());
         assert!(
@@ -682,10 +1582,7 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read status","arguments":{}}}"#;
         let info = parse_jsonrpc_body_with_options(
             body,
-            JsonRpcInspectionOptions {
-                mode: JsonRpcInspectionMode::Mcp,
-                mcp_strict_tool_names: false,
-            },
+            JsonRpcInspectionOptions::mcp_selected(McpProtocolVersion::V2025_11_25, false),
         );
 
         let call = info
@@ -703,7 +1600,8 @@ mod tests {
     #[test]
     fn mcp_mode_rejects_invalid_known_method_params() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"query":"openshell"}}}"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
 
         assert!(info.calls.is_empty());
         assert_eq!(
@@ -714,7 +1612,7 @@ mod tests {
             info.error
                 .as_ref()
                 .map(JsonRpcInspectionError::detail)
-                .is_some_and(|error| error.contains("invalid MCP request params")),
+                .is_some_and(|error| error.contains("invalid `tools/call` params")),
             "expected MCP params validation error, got {info:?}"
         );
     }
@@ -723,7 +1621,8 @@ mod tests {
     fn mcp_mode_allows_unknown_extension_methods() {
         let body =
             br#"{"jsonrpc":"2.0","id":1,"method":"vendor/extension","params":{"name":"custom"}}"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_06_18));
 
         assert!(
             info.error.is_none(),
@@ -733,17 +1632,16 @@ mod tests {
             info.calls.first().map(|call| call.method.as_str()),
             Some("vendor/extension")
         );
-        assert!(
-            info.calls
-                .first()
-                .is_some_and(|call| call.params.is_empty() && call.tool.is_none())
-        );
+        assert!(info.calls.first().is_some_and(|call| call.params.is_empty()
+            && call.tool.is_none()
+            && call.mcp_classification == Some(McpMethodClassification::Extension)));
     }
 
     #[test]
     fn mcp_mode_ignores_tool_arguments_when_extracting_policy_params() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{"scope.key":"literal","scope":{"key":"nested"}}}}"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_11_25));
         let call = info.calls.first().expect("single MCP call");
 
         assert!(info.error.is_none(), "expected valid MCP call: {info:?}");
@@ -862,21 +1760,165 @@ mod tests {
     }
 
     #[test]
-    fn preserves_current_mcp_batch_acceptance() {
+    fn mcp_batch_acceptance_follows_the_selected_revision() {
         let body = br#"[
             {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}},
             {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_web","arguments":{"query":"openshell"}}}
         ]"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let march =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_03_26));
 
         assert!(
-            info.error.is_none(),
-            "MCP batch should remain valid: {info:?}"
+            march.error.is_none(),
+            "March MCP batch should be valid: {march:?}"
         );
+        assert!(march.is_batch);
+        assert_eq!(march.calls.len(), 2);
+        assert_eq!(march.calls[0].tool.as_deref(), Some("read_status"));
+        assert_eq!(march.calls[1].tool.as_deref(), Some("search_web"));
+
+        for revision in [
+            McpProtocolVersion::V2025_06_18,
+            McpProtocolVersion::V2025_11_25,
+        ] {
+            let info = parse_jsonrpc_body_with_options(body, mcp_options(revision));
+            assert!(info.calls.is_empty());
+            assert!(info.is_batch);
+            assert_eq!(
+                info.error.as_ref().map(JsonRpcInspectionError::kind),
+                Some(JsonRpcInspectionErrorKind::McpProfileViolation),
+                "revision {revision} must reject batches: {info:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn march_batch_limit_counts_all_top_level_messages() {
+        let mut messages = (0..MAX_MCP_LEGACY_BATCH_MESSAGES)
+            .map(|index| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "result": {"ok": true}
+                })
+            })
+            .collect::<Vec<_>>();
+        let at_limit = serde_json::to_vec(&serde_json::Value::Array(messages.clone()))
+            .expect("serialize in-bound MCP batch fixture");
+        let accepted = parse_jsonrpc_body_with_options(
+            &at_limit,
+            mcp_options(McpProtocolVersion::V2025_03_26),
+        );
+        assert!(
+            accepted.error.is_none(),
+            "64-member March batch should be accepted: {accepted:?}"
+        );
+
+        messages.push(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": MAX_MCP_LEGACY_BATCH_MESSAGES,
+            "result": {"ok": true}
+        }));
+        let over_limit = serde_json::to_vec(&serde_json::Value::Array(messages))
+            .expect("serialize over-limit MCP batch fixture");
+        let info = parse_jsonrpc_body_with_options(
+            &over_limit,
+            mcp_options(McpProtocolVersion::V2025_03_26),
+        );
+
+        assert!(info.calls.is_empty());
         assert!(info.is_batch);
-        assert_eq!(info.calls.len(), 2);
-        assert_eq!(info.calls[0].tool.as_deref(), Some("read_status"));
-        assert_eq!(info.calls[1].tool.as_deref(), Some("search_web"));
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::McpProfileViolation)
+        );
+        assert!(
+            info.error
+                .as_ref()
+                .is_some_and(|error| error.detail().contains("maximum is 64")),
+            "expected total-message batch bound, got {info:?}"
+        );
+    }
+
+    #[test]
+    fn initialize_proposal_is_not_treated_as_an_effective_revision() {
+        let body = br#"{
+            "jsonrpc":"2.0",
+            "id":"bootstrap-1",
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2099-12-31",
+                "capabilities":{},
+                "clientInfo":{"name":"test-client","version":"1.0"}
+            }
+        }"#;
+        let info =
+            parse_jsonrpc_body_with_options(body, JsonRpcInspectionOptions::mcp_bootstrap(true));
+
+        assert!(info.error.is_none(), "initialize should parse: {info:?}");
+        assert_eq!(info.calls.len(), 1);
+        assert_eq!(info.calls[0].method, "initialize");
+        assert_eq!(
+            info.calls[0].mcp_classification,
+            Some(McpMethodClassification::Available)
+        );
+        assert_eq!(info.mcp_revision, None);
+    }
+
+    #[test]
+    fn non_initialize_mcp_requires_a_transport_selected_revision() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let info =
+            parse_jsonrpc_body_with_options(body, JsonRpcInspectionOptions::mcp_bootstrap(true));
+
+        assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::RevisionNotSelected)
+        );
+    }
+
+    #[test]
+    fn known_method_unavailable_in_selected_revision_is_rejected() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"task-1"}}"#;
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_06_18));
+
+        assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::McpProfileViolation)
+        );
+        assert!(
+            info.error
+                .as_ref()
+                .is_some_and(|error| error.detail().contains("tasks/get")),
+            "expected unavailable-method evidence, got {info:?}"
+        );
+    }
+
+    #[test]
+    fn server_originated_method_is_rejected_in_client_to_server_direction() {
+        let body = br#"{
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"sampling/createMessage",
+            "params":{"messages":[],"maxTokens":1}
+        }"#;
+        let info =
+            parse_jsonrpc_body_with_options(body, mcp_options(McpProtocolVersion::V2025_03_26));
+
+        assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::kind),
+            Some(JsonRpcInspectionErrorKind::McpProfileViolation)
+        );
+        assert!(
+            info.error
+                .as_ref()
+                .is_some_and(|error| error.detail().contains("client-to-server")),
+            "expected direction mismatch evidence, got {info:?}"
+        );
     }
 
     #[test]
@@ -885,14 +1927,15 @@ mod tests {
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}},
             {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status","arguments":{}}}
         ]"#;
-        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+        let info =
+            parse_jsonrpc_body_with_options(body, JsonRpcInspectionOptions::mcp_bootstrap(true));
 
         assert!(info.is_batch);
         assert!(info.calls.is_empty());
         assert!(!info.has_response);
         assert_eq!(
             info.error.as_ref().map(JsonRpcInspectionError::detail),
-            Some("MCP initialize must not appear in a batch")
+            Some("MCP `initialize` must be exactly one non-batched request")
         );
     }
 

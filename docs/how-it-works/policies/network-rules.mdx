@@ -531,12 +531,48 @@ Verify initialization and `read_status` before confirming that `delete_resource`
 returns a policy denial. Tool argument matching is not supported, so an allowed
 tool can receive any arguments accepted by the server.
 
-Omitting `mcp.versions` allows only the `2025-11-25` revision. To support an
-older server, list the exact revisions it needs, as described in [MCP Version
+Omitting `mcp.versions` allows only the `2025-11-25` revision. To support a
+server that uses another revision, list the exact revisions it needs, as
+described in [MCP Version
 Selection](/how-it-works/policies/schema#mcp-version-selection). Server
 responses and SSE messages are relayed without MCP policy parsing. Do not put an
 MCP endpoint on the same host and port as an endpoint that uses a different
 protocol. `openshell policy update` rejects this combination.
+
+A server that uses the sessionless `2026-07-28` revision has no initialization
+step. Its clients send their protocol version and capabilities with every
+request, and can call `server/discover` to learn what the server supports. This
+rule allows discovery and `read_status` on such a server:
+
+```yaml
+mcp_server:
+  endpoints:
+    - host: mcp.example.com
+      port: 443
+      path: /mcp
+      protocol: mcp
+      enforcement: enforce
+      mcp:
+        versions: ["2026-07-28"]
+      rules:
+        - allow:
+            method: server/discover
+        - allow:
+            method: tools/list
+        - allow:
+            method: tools/call
+            tool: read_status
+  binaries:
+    - path: /usr/bin/python3.12
+```
+
+OpenShell rejects a `2026-07-28` request that lacks a required
+`MCP-Protocol-Version`, `Mcp-Method`, or `Mcp-Name` header, or whose headers do
+not match its body. Refer to [Sessionless MCP
+Requests](/how-it-works/policies/schema#sessionless-mcp-requests) for the
+complete request checks. To serve clients of both revisions on one endpoint,
+list both revisions and combine the rules from the two examples. OpenShell
+inspects each request under the revision that the request selects.
 
 ### Allow Native TCP
 

@@ -617,7 +617,7 @@ Read `last_result` to choose the next check:
 
 - `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
 - `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
-- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version or request-body policy checks. Check the sandbox policy and denial logs.
+- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
 - `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
 - `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
 - `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
