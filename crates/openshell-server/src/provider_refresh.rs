@@ -1614,7 +1614,7 @@ async fn request_token(
         }
     }
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -2536,7 +2536,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();

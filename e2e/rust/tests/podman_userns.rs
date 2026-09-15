@@ -139,7 +139,7 @@ async fn restart_gateway() -> Result<(), String> {
         .ok_or_else(|| "managed gateway metadata disappeared".to_string())?;
     gateway.stop()?;
     gateway.start()?;
-    wait_for_healthy(Duration::from_secs(120)).await
+    wait_for_healthy(Duration::from_mins(2)).await
 }
 
 #[tokio::test]
