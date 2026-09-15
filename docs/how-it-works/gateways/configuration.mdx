@@ -29,13 +29,24 @@ URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
 through the chart's supported environment-variable, file, or volume wiring.
 The normal precedence above still applies to the resulting mounted TOML file.
 
-The serializer has a deterministic YAML-to-TOML contract: YAML `null` fields
-are omitted, `null` array members are rejected, strings are the only values
-evaluated as Helm templates, and equivalent input produces the same ConfigMap
-checksum. Helm retains ownership of Services, workloads, probes, Secrets,
-certificate resources, Routes, RBAC, NetworkPolicies, and mounts. When one of
-those inputs also determines a gateway runtime value, the chart derives it
-from its resource owner instead of exposing two independent settings.
+The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
+are omitted; `null` array members are rejected because TOML has no equivalent.
+Strings, booleans, integers, and floats preserve their types. Scalar arrays
+become TOML arrays, maps become inline tables, and arrays of maps become arrays
+of inline tables. Keys are ordered alphabetically, so equivalent input produces
+the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
+string values, never in keys or YAML structure.
+
+The implementation intentionally uses only long-standing Helm 3 template and
+Sprig functions (`tpl`, `kindIs`, `keys`, `sortAlpha`, `splitList`, `quote`, and
+`toJson`); it does not rely on a Helm-specific TOML encoder. This preserves the
+chart's documented Helm 3 compatibility while making the serialization rules
+explicit in the chart itself.
+
+Helm retains ownership of Services, workloads, probes, Secrets, certificate
+resources, Routes, RBAC, NetworkPolicies, and mounts. When one of those inputs
+also determines a gateway runtime value, the chart derives it from its resource
+owner instead of exposing two independent settings.
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 

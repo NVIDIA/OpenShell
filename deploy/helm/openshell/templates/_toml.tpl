@@ -23,7 +23,20 @@ field must not require a Helm template change.
 {{- $value := index . 1 -}}
 {{- if kindIs "string" $value -}}
 {{- tpl $value $root | quote -}}
-{{- else if or (kindIs "bool" $value) (kindIs "int" $value) (kindIs "int64" $value) (kindIs "float64" $value) -}}
+{{- else if or
+    (kindIs "bool" $value)
+    (kindIs "int" $value)
+    (kindIs "int8" $value)
+    (kindIs "int16" $value)
+    (kindIs "int32" $value)
+    (kindIs "int64" $value)
+    (kindIs "uint" $value)
+    (kindIs "uint8" $value)
+    (kindIs "uint16" $value)
+    (kindIs "uint32" $value)
+    (kindIs "uint64" $value)
+    (kindIs "float32" $value)
+    (kindIs "float64" $value) -}}
 {{- $value | toJson -}}
 {{- else -}}
 {{- fail (printf "gatewayConfig values must be strings, booleans, numbers, maps, or arrays; got %s" (kindOf $value)) -}}
