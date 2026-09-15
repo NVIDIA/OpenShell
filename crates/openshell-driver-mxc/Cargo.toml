@@ -36,6 +36,7 @@ openshell-supervisor-network = { path = "../openshell-supervisor-network" }
 windows = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { path = "../openshell-crypto" }
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"
@@ -47,7 +48,6 @@ openshell-policy = { path = "../openshell-policy" }
 # base64 and serde_json are already [dependencies] but dev-dependency resolution
 # is independent; explicit entries make them visible to integration tests.
 base64 = { workspace = true }
-rustls = { workspace = true }
 serde_json = { workspace = true }
 # Used by the drift guard test (handled_fields_inventory) to parse YAML into a
 # generic serde_json::Value for key enumeration.
