@@ -267,7 +267,6 @@ struct DockerDriverRuntimeConfig {
     log_level: String,
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
-    daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
@@ -618,7 +617,6 @@ impl DockerComputeDriver {
                 log_level: gateway_log_level.to_string(),
                 supervisor_bin,
                 guest_tls,
-                daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
@@ -648,7 +646,7 @@ impl DockerComputeDriver {
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
             driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
+            driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -667,6 +665,12 @@ impl DockerComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/docker",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 

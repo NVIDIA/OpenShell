@@ -5,15 +5,15 @@ syntax = "proto3";
 
 package openshell.middleware.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
+import "extension.proto";
 
 // SupervisorMiddleware discovers and configures one operator-run middleware.
 // It evaluates HTTP requests and WebSocket messages before credentials.
 // Phase-specific services share the same registration.
 service SupervisorMiddleware {
   // Describe returns the service manifest and declared bindings.
-  rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
+  rpc Describe(MiddlewareDescribeRequest) returns (MiddlewareManifest);
 
   // ValidateConfig checks service-specific configuration for one binding.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
@@ -33,6 +33,12 @@ service SupervisorMiddleware {
       returns (stream WebSocketSessionEventResult);
 }
 
+message MiddlewareDescribeRequest {
+  // Gateway or supervisor protocol metadata. Middleware must reject unmet
+  // requirements before accepting traffic.
+  openshell.extension.v1.PeerMetadata gateway = 1;
+}
+
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox.
 service HttpResponsePreReturn {
@@ -48,8 +54,8 @@ message MiddlewareManifest {
   // Human-readable middleware service name used only for diagnostics. This is
   // not required to match an operator-owned registration name.
   string name = 1;
-  // Release version of the middleware service implementation, used for
-  // diagnostics.
+  // Deprecated diagnostic compatibility field. Use
+  // extension.implementation_version.
   string service_version = 2;
   // Bindings exposed by this middleware service.
   repeated MiddlewareBinding bindings = 3;
@@ -59,6 +65,8 @@ message MiddlewareManifest {
   // reject an incorrect audience before returning this manifest. Empty skips
   // this post-authentication consistency check.
   string expected_audience = 4;
+  // Supervisor-middleware protocol metadata. Required for negotiation.
+  openshell.extension.v1.PeerMetadata extension = 5;
 }
 
 // MiddlewareBinding declares one operation and phase supported by a service.

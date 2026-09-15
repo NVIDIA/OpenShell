@@ -20,6 +20,9 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+};
 use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
@@ -300,6 +303,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_name: String,
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
+    /// Common extension protocol negotiation result.
+    pub negotiated_extension: NegotiatedExtension,
     /// Whether the driver asks the gateway to reconcile compute across restarts.
     pub gateway_manages_lifecycle: bool,
     /// Whether the driver authenticates driver-native sandbox credentials.
@@ -644,14 +649,24 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
         let capabilities = driver
-            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(gateway.clone()),
+            }))
             .await
             .map_err(|status| {
                 tracing::Span::current().record("otel.status_code", "ERROR");
                 compute_error_from_status(status)
             })?
             .into_inner();
+        let negotiated_extension = negotiate(
+            ExtensionFamily::Compute,
+            &driver_name,
+            &gateway,
+            capabilities.extension.clone(),
+        )
+        .map_err(|error| ComputeError::Message(error.to_string()))?;
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
@@ -661,6 +676,7 @@ impl ComputeRuntime {
             name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
+            negotiated_extension,
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
@@ -4780,6 +4796,12 @@ impl ComputeDriver for NoopTestDriver {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::Compute,
+                    "openshell/noop-test-driver",
+                    "test",
+                    [],
+                )),
             },
         ))
     }
@@ -4904,6 +4926,23 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 }
 
 #[cfg(test)]
+fn test_compute_negotiation(name: &str) -> NegotiatedExtension {
+    let gateway = gateway_metadata(ExtensionFamily::Compute);
+    negotiate(
+        ExtensionFamily::Compute,
+        name,
+        &gateway,
+        Some(openshell_core::extension_protocol::extension_metadata(
+            ExtensionFamily::Compute,
+            format!("openshell/{name}"),
+            "test",
+            [],
+        )),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
     new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await
 }
@@ -4921,6 +4960,7 @@ pub async fn new_test_runtime_with_driver(
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
+            negotiated_extension: test_compute_negotiation(driver_name),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
@@ -5210,6 +5250,7 @@ mod tests {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
+        omit_protocol_metadata: bool,
     }
 
     #[tonic::async_trait]
@@ -5242,6 +5283,14 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                extension: (!self.omit_protocol_metadata).then(|| {
+                    openshell_core::extension_protocol::extension_metadata(
+                        ExtensionFamily::Compute,
+                        "openshell/test-driver",
+                        "test",
+                        [],
+                    )
+                }),
             }))
         }
 
@@ -5586,6 +5635,12 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::Compute,
+                    "openshell/controlled-test-driver",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -5793,6 +5848,7 @@ mod tests {
                 name: driver_name.to_string(),
                 driver_name: driver_name.to_string(),
                 driver_version: "test".to_string(),
+                negotiated_extension: test_compute_negotiation(driver_name),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
@@ -9946,6 +10002,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -10117,6 +10174,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -10926,6 +10984,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compute_driver_initialization_rejects_missing_protocol_metadata() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let error = ComputeRuntime::from_driver(
+            "legacy-driver".to_string(),
+            Arc::new(TestDriver {
+                omit_protocol_metadata: true,
+                ..Default::default()
+            }),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .expect_err("legacy driver must fail negotiation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not provide protocol metadata")
+        );
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn remote_compute_driver_interceptor_propagates_every_rpc() {
         use crate::otel_tracing::test_exporter;
@@ -10948,7 +11032,9 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             remote
-                .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+                .get_capabilities(Request::new(GetCapabilitiesRequest {
+                    gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
+                }))
                 .await
                 .unwrap();
             remote

@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.extension.v1;
+
+// Version of an OpenShell extension protocol contract.
+//
+// The major version changes when peers cannot safely interoperate. Minor
+// versions add optional fields or capabilities and remain compatible when both
+// peers' required capabilities are satisfied.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// Non-secret metadata exchanged by the gateway and an extension before use.
+message PeerMetadata {
+  // Extension-family protocol contract version, distinct from the build.
+  ProtocolVersion protocol_version = 1;
+
+  // Stable human-readable implementation identity, such as "openshell/docker".
+  string implementation_name = 2;
+
+  // Implementation or build version used only for diagnostics.
+  string implementation_version = 3;
+
+  // Optional namespaced capabilities this peer understands.
+  repeated string supported_capabilities = 4;
+
+  // Capabilities that the opposite peer must advertise.
+  repeated string required_capabilities = 5;
+}

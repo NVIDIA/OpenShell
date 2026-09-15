@@ -40,6 +40,10 @@ pub mod compute {
     pub use super::generated::openshell::compute::v1;
 }
 
+pub mod extension {
+    pub use super::generated::openshell::extension::v1;
+}
+
 #[allow(
     clippy::all,
     clippy::pedantic,

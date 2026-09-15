@@ -843,6 +843,34 @@ message GetGatewayInfoResponse {
   // Compute driver runtimes initialized by this gateway. Current gateways
   // return exactly one entry.
   repeated ComputeDriverInfo compute_drivers = 3;
+
+  // Negotiated non-secret metadata for every initialized extension.
+  repeated NegotiatedExtensionInfo extensions = 4;
+}
+
+enum ExtensionKind {
+  EXTENSION_KIND_UNSPECIFIED = 0;
+  EXTENSION_KIND_COMPUTE_DRIVER = 1;
+  EXTENSION_KIND_CREDENTIAL_DRIVER = 2;
+  EXTENSION_KIND_GATEWAY_INTERCEPTOR = 3;
+  EXTENSION_KIND_SUPERVISOR_MIDDLEWARE = 4;
+}
+
+// Public, non-secret snapshot of one successful startup negotiation.
+message NegotiatedExtensionInfo {
+  ExtensionKind kind = 1;
+  // Gateway/operator-selected registration name.
+  string configured_name = 2;
+  // Extension-reported implementation identity.
+  string implementation_name = 3;
+  // Extension build version, distinct from the protocol version.
+  string implementation_version = 4;
+  uint32 protocol_major = 5;
+  uint32 protocol_minor = 6;
+  // Extension-supported optional capabilities, sorted for stable output.
+  repeated string supported_capabilities = 7;
+  // Capabilities the extension requires from the gateway.
+  repeated string required_capabilities = 8;
 }
 
 // Info for one initialized compute driver runtime.
