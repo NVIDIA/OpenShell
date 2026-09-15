@@ -41,7 +41,7 @@ let
     }
     .${stdenv.hostPlatform.system};
   archive = fetchurl {
-    url = "https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime-capability-free/vm-runtime-${runtime.platform}.tar.zst";
+    url = "https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-${runtime.platform}.tar.zst";
     inherit (runtime) hash;
   };
 in

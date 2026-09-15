@@ -281,7 +281,7 @@ create TAP devices or install nftables/iptables rules.
 
 - development builds: the rolling `dev` release
 - tagged builds: the corresponding `v*` release
-- runtime tarballs: the rolling `vm-runtime-capability-free` release, rebuilt on demand by
+- runtime tarballs: the rolling `vm-runtime` release, rebuilt on demand by
   `release-vm-kernel.yml`
 
 On Debian-family Linux amd64 and arm64 systems, `install.sh` installs the
