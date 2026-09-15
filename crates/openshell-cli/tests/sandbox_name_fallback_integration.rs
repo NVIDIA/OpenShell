@@ -203,8 +203,9 @@ impl OpenShell for TestOpenShell {
                                 host: "api.user.example.com".to_string(),
                                 port: 443,
                                 protocol: "rest".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -218,8 +219,9 @@ impl OpenShell for TestOpenShell {
                                 host: "api.provider.example.com".to_string(),
                                 port: 443,
                                 protocol: "rest".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -473,8 +475,8 @@ impl OpenShell for TestOpenShell {
                         host: "api.example.com".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
-                        enforcement: "enforce".to_string(),
-                        access: "read-only".to_string(),
+                        enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                        access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                         ..Default::default()
                     }],
                     ..Default::default()

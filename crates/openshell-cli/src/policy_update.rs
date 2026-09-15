@@ -345,8 +345,10 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
         port,
         ports: vec![port],
         protocol: protocol.to_string(),
-        enforcement: enforcement.to_string(),
-        access: access.to_string(),
+        enforcement: openshell_policy::network_enforcement_mode_from_str(enforcement)
+            .expect("validated enforcement") as i32,
+        access: openshell_policy::network_access_preset_from_str(access).expect("validated access")
+            as i32,
         ..Default::default()
     };
     apply_add_endpoint_options(spec, &mut endpoint, options)?;
@@ -545,8 +547,14 @@ mod tests {
         let endpoint = &rule.endpoints[0];
         assert_eq!(endpoint.host, "realtime.example.com");
         assert_eq!(endpoint.protocol, "websocket");
-        assert_eq!(endpoint.access, "read-write");
-        assert_eq!(endpoint.enforcement, "enforce");
+        assert_eq!(
+            endpoint.access,
+            openshell_core::proto::NetworkAccessPreset::ReadWrite as i32
+        );
+        assert_eq!(
+            endpoint.enforcement,
+            openshell_core::proto::NetworkEnforcementMode::Enforce as i32
+        );
     }
 
     #[test]
@@ -566,7 +574,7 @@ mod tests {
             panic!("expected add-rule preview");
         };
         assert_eq!(rule.endpoints[0].protocol, "tcp");
-        assert!(rule.endpoints[0].access.is_empty());
+        assert_eq!(rule.endpoints[0].access, 0);
     }
 
     #[test]

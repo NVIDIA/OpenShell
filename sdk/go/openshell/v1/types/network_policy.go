@@ -13,6 +13,46 @@ type NetworkPolicyRule struct {
 	Binaries []PolicyNetworkBinary
 }
 
+// NetworkTLSMode controls TLS handling for a policy endpoint.
+type NetworkTLSMode int32
+
+const (
+	// NetworkTLSModeUnspecified uses automatic TLS handling.
+	NetworkTLSModeUnspecified NetworkTLSMode = 0
+	// NetworkTLSModeSkip disables TLS inspection.
+	NetworkTLSModeSkip NetworkTLSMode = 1
+	// NetworkTLSModeTerminate is retained for wire compatibility; prefer unspecified.
+	NetworkTLSModeTerminate NetworkTLSMode = 2
+	// NetworkTLSModePassthrough is retained for wire compatibility; prefer unspecified.
+	NetworkTLSModePassthrough NetworkTLSMode = 3
+)
+
+// NetworkEnforcementMode controls whether an endpoint audits or enforces L7 rules.
+type NetworkEnforcementMode int32
+
+const (
+	// NetworkEnforcementModeUnspecified uses the documented audit default.
+	NetworkEnforcementModeUnspecified NetworkEnforcementMode = 0
+	// NetworkEnforcementModeEnforce blocks policy violations.
+	NetworkEnforcementModeEnforce NetworkEnforcementMode = 1
+	// NetworkEnforcementModeAudit logs policy violations without blocking them.
+	NetworkEnforcementModeAudit NetworkEnforcementMode = 2
+)
+
+// NetworkAccessPreset selects a predefined endpoint access policy.
+type NetworkAccessPreset int32
+
+const (
+	// NetworkAccessPresetUnspecified selects no access preset.
+	NetworkAccessPresetUnspecified NetworkAccessPreset = 0
+	// NetworkAccessPresetReadOnly permits read operations.
+	NetworkAccessPresetReadOnly NetworkAccessPreset = 1
+	// NetworkAccessPresetReadWrite permits read and write operations.
+	NetworkAccessPresetReadWrite NetworkAccessPreset = 2
+	// NetworkAccessPresetFull permits every operation supported by the protocol.
+	NetworkAccessPresetFull NetworkAccessPreset = 3
+)
+
 // PolicyNetworkEndpoint describes a full network endpoint with its access controls
 // as used in sandbox network policy rules. This is distinct from [NetworkEndpoint]
 // which is the simplified profile-level endpoint (Host, Port, Protocol only).
@@ -21,9 +61,9 @@ type PolicyNetworkEndpoint struct {
 	Port                         uint32
 	Ports                        []uint32
 	Protocol                     string
-	TLS                          string
-	Enforcement                  string
-	Access                       string
+	TLS                          NetworkTLSMode
+	Enforcement                  NetworkEnforcementMode
+	Access                       NetworkAccessPreset
 	Rules                        []L7Rule
 	AllowedIPs                   []string
 	DenyRules                    []L7DenyRule

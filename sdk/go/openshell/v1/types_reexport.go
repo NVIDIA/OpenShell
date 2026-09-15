@@ -15,6 +15,42 @@ type NetworkPolicyRule = types.NetworkPolicyRule
 // PolicyNetworkEndpoint describes a full network endpoint in a sandbox network policy rule.
 type PolicyNetworkEndpoint = types.PolicyNetworkEndpoint
 
+// NetworkTLSMode controls TLS handling for a policy endpoint.
+type NetworkTLSMode = types.NetworkTLSMode
+
+// NetworkEnforcementMode controls endpoint L7 enforcement behavior.
+type NetworkEnforcementMode = types.NetworkEnforcementMode
+
+// NetworkAccessPreset selects a predefined endpoint access policy.
+type NetworkAccessPreset = types.NetworkAccessPreset
+
+const (
+	// NetworkTLSModeUnspecified uses automatic TLS handling.
+	NetworkTLSModeUnspecified = types.NetworkTLSModeUnspecified
+	// NetworkTLSModeSkip disables TLS inspection.
+	NetworkTLSModeSkip = types.NetworkTLSModeSkip
+	// NetworkTLSModeTerminate is retained for wire compatibility.
+	NetworkTLSModeTerminate = types.NetworkTLSModeTerminate
+	// NetworkTLSModePassthrough is retained for wire compatibility.
+	NetworkTLSModePassthrough = types.NetworkTLSModePassthrough
+
+	// NetworkEnforcementModeUnspecified uses the documented audit default.
+	NetworkEnforcementModeUnspecified = types.NetworkEnforcementModeUnspecified
+	// NetworkEnforcementModeEnforce blocks policy violations.
+	NetworkEnforcementModeEnforce = types.NetworkEnforcementModeEnforce
+	// NetworkEnforcementModeAudit logs policy violations without blocking them.
+	NetworkEnforcementModeAudit = types.NetworkEnforcementModeAudit
+
+	// NetworkAccessPresetUnspecified selects no access preset.
+	NetworkAccessPresetUnspecified = types.NetworkAccessPresetUnspecified
+	// NetworkAccessPresetReadOnly permits read operations.
+	NetworkAccessPresetReadOnly = types.NetworkAccessPresetReadOnly
+	// NetworkAccessPresetReadWrite permits read and write operations.
+	NetworkAccessPresetReadWrite = types.NetworkAccessPresetReadWrite
+	// NetworkAccessPresetFull permits every operation supported by the protocol.
+	NetworkAccessPresetFull = types.NetworkAccessPresetFull
+)
+
 // PolicyNetworkBinary identifies a binary subject to network policy enforcement.
 type PolicyNetworkBinary = types.PolicyNetworkBinary
 

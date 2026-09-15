@@ -818,8 +818,11 @@ fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
     };
 
     let mut tags = vec![endpoint_layer_label(endpoint).to_string()];
-    if !endpoint.access.is_empty() {
-        tags.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        tags.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
     for rule in &endpoint.rules {
         if let Some(allow) = &rule.allow {
@@ -839,11 +842,18 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     if !endpoint.path.is_empty() {
         details.push(format!("Path scope: {}", endpoint.path));
     }
-    if !endpoint.tls.is_empty() {
-        details.push(format!("TLS: {}", endpoint.tls));
+    if endpoint.tls != 0 {
+        details.push(format!(
+            "TLS: {}",
+            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
+        ));
     }
-    if !endpoint.enforcement.is_empty() {
-        details.push(format!("Enforcement: {}", endpoint.enforcement));
+    if endpoint.enforcement != 0 {
+        details.push(format!(
+            "Enforcement: {}",
+            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
+                .unwrap_or("unknown")
+        ));
     }
     if endpoint.request_body_credential_rewrite {
         details.push("Request body credential rewrite".to_string());

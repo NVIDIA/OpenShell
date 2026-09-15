@@ -3356,14 +3356,15 @@ impl App {
                         } else {
                             endpoint.protocol.as_str()
                         };
-                        let access = if endpoint.access.is_empty() {
+                        let access = if endpoint.access == 0 {
                             if endpoint.rules.is_empty() {
                                 "custom"
                             } else {
                                 "rules"
                             }
                         } else {
-                            endpoint.access.as_str()
+                            openshell_policy::network_access_preset_to_str(endpoint.access)
+                                .unwrap_or("unknown")
                         };
                         let path = if endpoint.path.is_empty() {
                             String::new()

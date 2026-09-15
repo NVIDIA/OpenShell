@@ -2011,14 +2011,24 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.protocol.is_empty() {
                         ep["protocol"] = e.protocol.clone().into();
                     }
-                    if !e.tls.is_empty() {
-                        ep["tls"] = e.tls.clone().into();
+                    if e.tls != 0 {
+                        ep["tls"] = openshell_policy::network_tls_mode_to_str(e.tls)
+                            .map_or_else(|| format!("unknown({})", e.tls), str::to_owned)
+                            .into();
                     }
-                    if !e.enforcement.is_empty() {
-                        ep["enforcement"] = e.enforcement.clone().into();
+                    if e.enforcement != 0 {
+                        ep["enforcement"] =
+                            openshell_policy::network_enforcement_mode_to_str(e.enforcement)
+                                .map_or_else(
+                                    || format!("unknown({})", e.enforcement),
+                                    str::to_owned,
+                                )
+                                .into();
                     }
-                    if !e.access.is_empty() {
-                        ep["access"] = e.access.clone().into();
+                    if e.access != 0 {
+                        ep["access"] = openshell_policy::network_access_preset_to_str(e.access)
+                            .map_or_else(|| format!("unknown({})", e.access), str::to_owned)
+                            .into();
                     }
                     if !e.rules.is_empty() {
                         let rules: Vec<serde_json::Value> = e
@@ -3435,7 +3445,7 @@ process:
                     host: "host.k3d.internal".to_string(),
                     port: 56123,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "GET".to_string(),
@@ -3973,7 +3983,7 @@ network_policies:
                     host: "api.proto.com".to_string(),
                     port: 8080,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "GET".to_string(),
@@ -4044,7 +4054,7 @@ network_policies:
                     port: 8000,
                     path: "/rpc".to_string(),
                     protocol: "json-rpc".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "initialize".to_string(),
@@ -4116,7 +4126,7 @@ network_policies:
                     port: 8000,
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     mcp: Some(McpOptions {
                         versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
                         ..Default::default()
@@ -5220,11 +5230,10 @@ network_policies:
                             protocol: authored.clone(),
                             // TCP has no L7 settings; SQL only supports audit.
                             enforcement: match canonical {
-                                "tcp" => "",
-                                "sql" => "audit",
-                                _ => "enforce",
-                            }
-                            .into(),
+                                "tcp" => openshell_core::proto::NetworkEnforcementMode::Unspecified,
+                                "sql" => openshell_core::proto::NetworkEnforcementMode::Audit,
+                                _ => openshell_core::proto::NetworkEnforcementMode::Enforce,
+                            } as i32,
                             rules: allow
                                 .clone()
                                 .map(|allow| L7Rule { allow: Some(allow) })
@@ -5616,8 +5625,8 @@ network_policies:
                     host: "registry.npmjs.org".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-only".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                     allow_encoded_slash: true,
                     ..Default::default()
                 }],
@@ -5673,8 +5682,8 @@ network_policies:
                     host: "gateway.example.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "full".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     websocket_credential_rewrite: true,
                     ..Default::default()
                 }],
@@ -5730,8 +5739,8 @@ network_policies:
                     host: "bedrock-runtime.us-east-2.amazonaws.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-write".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
                     credential_signing: "sigv4".to_string(),
                     signing_service: "bedrock".to_string(),
                     ..Default::default()
@@ -5789,8 +5798,8 @@ network_policies:
                     host: "custom-vpc-endpoint.example.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "full".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     credential_signing: "sigv4".to_string(),
                     signing_service: "s3".to_string(),
                     signing_region: "us-west-2".to_string(),
@@ -5850,8 +5859,8 @@ network_policies:
                     host: "slack.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-write".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
                     request_body_credential_rewrite: true,
                     ..Default::default()
                 }],
@@ -5982,7 +5991,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.com".to_string(),
                     port: 443,
-                    tls: "skip".to_string(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {

@@ -100,6 +100,40 @@ message NetworkCredentialBinding {
   string provider = 1;
 }
 
+// TLS handling for a network endpoint.
+enum NetworkTlsMode {
+  // Auto-detect TLS and terminate it when inspection is configured.
+  NETWORK_TLS_MODE_UNSPECIFIED = 0;
+  // Disable TLS detection and relay the connection without inspection.
+  NETWORK_TLS_MODE_SKIP = 1;
+  // Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+  NETWORK_TLS_MODE_TERMINATE = 2 [deprecated = true];
+  // Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+  NETWORK_TLS_MODE_PASSTHROUGH = 3 [deprecated = true];
+}
+
+// Enforcement behavior for inspected network traffic.
+enum NetworkEnforcementMode {
+  // Preserve the existing default: log violations and allow traffic.
+  NETWORK_ENFORCEMENT_MODE_UNSPECIFIED = 0;
+  // Deny traffic that does not satisfy the endpoint policy.
+  NETWORK_ENFORCEMENT_MODE_ENFORCE = 1;
+  // Log policy violations and allow the traffic.
+  NETWORK_ENFORCEMENT_MODE_AUDIT = 2;
+}
+
+// Shorthand access policy for an inspected network endpoint.
+enum NetworkAccessPreset {
+  // No access preset; explicit rules may define allowed traffic.
+  NETWORK_ACCESS_PRESET_UNSPECIFIED = 0;
+  // Allow read-only operations for the selected protocol.
+  NETWORK_ACCESS_PRESET_READ_ONLY = 1;
+  // Allow read and write operations for the selected protocol.
+  NETWORK_ACCESS_PRESET_READ_WRITE = 2;
+  // Allow every operation supported by the selected protocol.
+  NETWORK_ACCESS_PRESET_FULL = 3;
+}
+
 // A network endpoint (host + port) with optional L7 inspection config.
 message NetworkEndpoint {
   // Hostname or host glob pattern. Exact match is case-insensitive.
@@ -112,13 +146,13 @@ message NetworkEndpoint {
   // Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
   // "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
   string protocol = 3;
-  // TLS handling: "terminate" or "passthrough" (default).
-  string tls = 4;
-  // Enforcement mode: "enforce" or "audit" (default).
-  string enforcement = 5;
-  // Access preset shorthand: "read-only", "read-write", "full".
+  // TLS handling. Unspecified enables automatic detection and termination.
+  NetworkTlsMode tls = 4;
+  // Enforcement mode. Unspecified preserves the audit default.
+  NetworkEnforcementMode enforcement = 5;
+  // Access preset shorthand. Unspecified means no preset.
   // Mutually exclusive with rules.
-  string access = 6;
+  NetworkAccessPreset access = 6;
   // Explicit L7 rules (mutually exclusive with access).
   repeated L7Rule rules = 7;
   // Allowed resolved IP addresses or CIDR ranges for this endpoint.
