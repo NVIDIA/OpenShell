@@ -27,6 +27,23 @@ tests:
           path: spec.template.spec.securityContext.fsGroup
           value: 2000
 
+  - it: renders a Restricted-compatible container securityContext by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.seccompProfile.type
+          value: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value:
+            - ALL
+
   - it: omits the pod securityContext block when podSecurityContext is null
     template: templates/statefulset.yaml
     set:
