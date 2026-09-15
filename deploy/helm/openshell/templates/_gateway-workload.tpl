@@ -5,6 +5,10 @@
 Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 */}}
 {{- define "openshell.gatewayPodTemplate" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $gatewayRuntimeConfig := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
+{{- $kubernetesRuntimeConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
@@ -27,9 +31,9 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   serviceAccountName: {{ include "openshell.serviceAccountName" . }}
-  {{- if .Values.server.hostGatewayIP }}
+  {{- if get $kubernetesRuntimeConfig "host_gateway_ip" }}
   hostAliases:
-    - ip: {{ .Values.server.hostGatewayIP | quote }}
+    - ip: {{ get $kubernetesRuntimeConfig "host_gateway_ip" | quote }}
       hostnames:
         - host.docker.internal
         - host.openshell.internal
@@ -70,7 +74,7 @@ spec:
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
         # env vars that the TOML references by name. Some process-level
         # settings consumed by libraries outside gateway code also remain here.
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
         # consumed by the TLS stack itself, not by gateway code, so it
@@ -114,7 +118,7 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
@@ -196,7 +200,7 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}

@@ -327,7 +327,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
-{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
 {{- end -}}
