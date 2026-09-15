@@ -108,6 +108,13 @@ field must not require a Helm template change.
 {{- $_ := unset $kubernetes "client_tls_secret_name" -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
 {{- end -}}
+{{- if and (not .Values.server.disableTls) .Values.certManager.serverIssuerRef.name -}}
+{{- $gatewayTls := get $config "openshell.gateway.tls" | default dict -}}
+{{- $_ := set $gatewayTls "external_cert_path" "/etc/openshell-tls/server-external/tls.crt" -}}
+{{- $_ := set $gatewayTls "external_key_path" "/etc/openshell-tls/server-external/tls.key" -}}
+{{- $_ := set $gatewayTls "external_server_names" (deepCopy (.Values.certManager.serverDnsNames | default list)) -}}
+{{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
+{{- end -}}
 {{- range $tableName := keys $config | sortAlpha -}}
 {{- $fields := get $config $tableName -}}
 {{- if ne $fields nil -}}
