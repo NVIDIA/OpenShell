@@ -397,7 +397,6 @@ pub enum ParameterMatcher {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AnyMatcher {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any: Vec<String>,
@@ -1316,6 +1315,31 @@ mod tests {
         assert_eq!(
             parsed.extensions[0].path,
             "network_policies.api.endpoints[0].future_authority"
+        );
+        assert!(parse_document(source, ParseProfile::RuntimeStrict).is_err());
+    }
+
+    #[test]
+    fn containment_retains_unknown_matcher_fields() {
+        let source = r#"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: example.com
+        port: 443
+        rules:
+          - allow:
+              query:
+                q:
+                  any: ["one"]
+                  future_constraint: true
+"#;
+        let parsed = parse_document(source, ParseProfile::ContainmentInput).unwrap();
+        assert_eq!(parsed.extensions.len(), 1);
+        assert_eq!(
+            parsed.extensions[0].path,
+            "network_policies.api.endpoints[0].rules[0].allow.query.q.future_constraint"
         );
         assert!(parse_document(source, ParseProfile::RuntimeStrict).is_err());
     }

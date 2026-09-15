@@ -849,6 +849,16 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
     to_proto(raw)
 }
 
+/// Parse a sandbox policy from a regular file using the shared bounded reader.
+pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
+    let raw = openshell_policy_schema::parse_policy_file(
+        path,
+        openshell_policy_schema::ParseProfile::RuntimeStrict,
+        openshell_policy_schema::ParseLimits::default(),
+    )?;
+    to_proto(raw)
+}
+
 /// Serialize a proto sandbox policy to a YAML string.
 ///
 /// This is the inverse of [`parse_sandbox_policy`] — the output uses the
@@ -914,22 +924,14 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// caller to omit the policy and let the server / sandbox apply its own
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let document = if let Some(p) = cli_path {
-        openshell_policy_schema::parse_policy_file(
-            Path::new(p),
-            openshell_policy_schema::ParseProfile::RuntimeStrict,
-            openshell_policy_schema::ParseLimits::default(),
-        )?
+    let policy = if let Some(p) = cli_path {
+        parse_sandbox_policy_file(Path::new(p))?
     } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        openshell_policy_schema::parse_policy_file(
-            Path::new(&policy_path),
-            openshell_policy_schema::ParseProfile::RuntimeStrict,
-            openshell_policy_schema::ParseLimits::default(),
-        )?
+        parse_sandbox_policy_file(Path::new(&policy_path))?
     } else {
         return Ok(None);
     };
-    to_proto(document).map(Some)
+    Ok(Some(policy))
 }
 
 /// Well-known path where a sandbox container image can ship a policy YAML file.
