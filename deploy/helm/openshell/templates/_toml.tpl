@@ -7,9 +7,14 @@ This keeps the YAML-to-TOML boundary generic: adding a non-secret gateway
 field must not require a Helm template change.
 */}}
 
-{{/* Quote a TOML key. Quoted keys safely support every YAML map key. */}}
+{{/* Render a TOML key. Bare keys keep ordinary output readable. */}}
 {{- define "openshell.toml.key" -}}
-{{- . | toString | quote -}}
+{{- $key := . | toString -}}
+{{- if regexMatch "^[A-Za-z0-9_-]+$" $key -}}
+{{- $key -}}
+{{- else -}}
+{{- $key | quote -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Render a scalar. Strings alone are Helm-templated. */}}
@@ -77,14 +82,21 @@ field must not require a Helm template change.
 {{- if not (kindIs "map" $fields) -}}
 {{- fail (printf "gatewayConfig table %q must be a map, got %s" $tableName (kindOf $fields)) -}}
 {{- end -}}
-[{{ include "openshell.toml.key" $tableName }}]
+{{- $header := list -}}
+{{- $segments := splitList "." $tableName -}}
+{{- range $index, $segment := $segments -}}
+{{- if eq $segment "" -}}
+{{- fail (printf "gatewayConfig table %q contains an empty TOML key segment" $tableName) -}}
+{{- end -}}
+{{- $header = append $header (include "openshell.toml.key" $segment) -}}
+{{- end -}}
+{{ printf "[%s]\n" (join "." $header) }}
 {{- range $fieldName := keys $fields | sortAlpha }}
 {{- $value := get $fields $fieldName -}}
 {{- if ne $value nil }}
-{{ include "openshell.toml.key" $fieldName }} = {{ include "openshell.toml.value" (list $root $value) }}
+{{ printf "%s = %s\n" (include "openshell.toml.key" $fieldName) (include "openshell.toml.value" (list $root $value)) }}
 {{- end }}
 {{- end }}
-
 {{- end -}}
 {{- end -}}
 {{- end -}}
