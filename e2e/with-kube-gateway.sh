@@ -104,6 +104,9 @@ VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
 VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
+VAULT_CA_CONFIG_MAP="openbao-ca"
+VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
+VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 OPENSHIFT_DETECTED=0
@@ -214,6 +217,7 @@ deploy_vault_fixture() {
   helmctl upgrade --install "${VAULT_RELEASE_NAME}" openbao/openbao \
     --namespace "${VAULT_NAMESPACE}" --create-namespace \
     --version "${VAULT_CHART_VERSION}" \
+    --values "${ROOT}/e2e/kubernetes/openbao-tls-values.yaml" \
     --set "server.dev.enabled=true" \
     --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
     --set "injector.enabled=false" \
@@ -225,6 +229,15 @@ deploy_vault_fixture() {
     --for=condition=Ready pod \
     -l "app.kubernetes.io/name=openbao,component=server" \
     --timeout=300s
+
+  kctl -n "${VAULT_NAMESPACE}" exec "${VAULT_RELEASE_NAME}-0" -- \
+    cat /openbao/tls/vault-ca.pem >"${VAULT_CA_FILE}"
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${VAULT_CA_CONFIG_MAP}" \
+    --from-file="ca.crt=${VAULT_CA_FILE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create service externalname "${VAULT_DNS_ALIAS}" \
+    --external-name="${VAULT_RELEASE_NAME}-0.${VAULT_RELEASE_NAME}-internal.${VAULT_NAMESPACE}.svc.cluster.local" \
+    --dry-run=client -o yaml | kctl apply -f -
 
   provision_vault_auth
 
@@ -284,6 +297,11 @@ provision_vault_auth() {
 cleanup_vault_fixture() {
   [ -n "${KUBE_CONTEXT}" ] || return 0
   [ -n "${VAULT_NAMESPACE}" ] || return 0
+
+  kctl -n "${NAMESPACE}" delete service "${VAULT_DNS_ALIAS}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kctl -n "${NAMESPACE}" delete configmap "${VAULT_CA_CONFIG_MAP}" \
+    --ignore-not-found >/dev/null 2>&1 || true
 
   if command -v helm >/dev/null 2>&1; then
     helmctl uninstall "${VAULT_RELEASE_NAME}" \

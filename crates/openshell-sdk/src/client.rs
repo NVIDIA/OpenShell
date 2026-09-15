@@ -1179,17 +1179,7 @@ fn sandbox_template_from_response(
 }
 
 fn map_status(status: tonic::Status) -> SdkError {
-    let message = status.message().to_string();
-    match status.code() {
-        tonic::Code::NotFound => SdkError::NotFound { message },
-        tonic::Code::AlreadyExists => SdkError::AlreadyExists { message },
-        tonic::Code::InvalidArgument => SdkError::invalid_config(message),
-        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => SdkError::auth(message),
-        _ => SdkError::Rpc {
-            code: status.code() as i32,
-            message,
-        },
-    }
+    SdkError::from_status(status)
 }
 
 #[cfg(test)]

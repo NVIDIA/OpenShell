@@ -4057,6 +4057,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-types",
  "tracing",
  "url",
 ]
@@ -4230,6 +4231,7 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -4237,10 +4239,12 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wiremock",
 ]
 
@@ -4440,6 +4444,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "futures",
+ "http 1.4.0",
  "miette",
  "nix 0.29.0",
  "openshell-core",

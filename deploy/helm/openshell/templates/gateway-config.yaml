@@ -118,9 +118,11 @@ data:
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]
-    issuer        = {{ .Values.server.oidc.issuer | quote }}
-    audience      = {{ .Values.server.oidc.audience | quote }}
-    jwks_ttl_secs = {{ .Values.server.oidc.jwksTtl }}
+    issuer                           = {{ .Values.server.oidc.issuer | quote }}
+    dangerously_allow_insecure_http = {{ .Values.server.oidc.dangerouslyAllowInsecureHttp }}
+    jwks_allowed_origins             = {{ .Values.server.oidc.jwksAllowedOrigins | toJson }}
+    audience                         = {{ .Values.server.oidc.audience | quote }}
+    jwks_ttl_secs                    = {{ .Values.server.oidc.jwksTtl }}
     {{- if .Values.server.oidc.rolesClaim }}
     roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
     {{- end }}
@@ -240,6 +242,9 @@ data:
 
     [openshell.credential_drivers.vault]
     address = {{ .Values.server.credentialDrivers.vault.address | quote }}
+    {{- if .Values.server.credentialDrivers.vault.caConfigMapName }}
+    ca_bundle = "/etc/openshell-tls/vault-ca/ca.crt"
+    {{- end }}
     mount = {{ .Values.server.credentialDrivers.vault.mount | quote }}
     kv_version = {{ .Values.server.credentialDrivers.vault.kvVersion | quote }}
     auth_method = {{ .Values.server.credentialDrivers.vault.authMethod | quote }}

@@ -751,6 +751,11 @@ if [ "${OIDC_MODE}" = "1" ]; then
     --oidc-audience openshell-cli
     --oidc-scopes-claim scope
   )
+  case "${OIDC_ISSUER}" in
+    http://127.*|http://\[::1\]*)
+      GATEWAY_ARGS+=(--oidc-dangerously-allow-insecure-http true)
+      ;;
+  esac
 else
   GATEWAY_ARGS+=(
     --tls-client-ca "${PKI_DIR}/ca.crt"

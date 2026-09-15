@@ -1,0 +1,85 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "API Errors"
+sidebar-title: "API Errors"
+description: "Inspect structured gateway failures and choose an appropriate recovery action."
+keywords: "OpenShell, SDK, gRPC, API errors, retries"
+---
+
+Gateway errors include a gRPC status code and a message. Shared request validation
+and concurrency checks also return standard protobuf details in
+`grpc-status-details-bin`. Use the status code and structured fields for decisions.
+Treat messages as explanations whose text can change.
+
+## Structured details
+
+The SDKs decode these standard detail types while retaining the original failure.
+Older gateways and checks that have not adopted structured details can return only
+a code and message. Missing details do not change the meaning of the status code.
+
+| Detail | Meaning |
+|---|---|
+| `google.rpc.BadRequest` | `field_violations` identifies rejected fields and explains each violation. Shared sandbox, exec, provider size, and workspace selector checks supply these details. |
+| `google.rpc.ErrorInfo` | `reason`, `domain`, and `metadata` identify a failure without parsing its message. Gateway reasons use the `openshell.nvidia.com` domain. |
+| `google.rpc.RetryInfo` | `retry_delay` gives a minimum delay before an otherwise safe retry. Its presence does not guarantee that a mutation has not already committed. |
+
+Recognized gateway reasons include the following.
+
+| Reason | Code | Recovery |
+|---|---|---|
+| `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
+| `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
+| `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+
+## Status and retry guidance
+
+A timeout or disconnected transport can occur after a mutation commits. Do not
+automatically repeat creates, credential rotation, or command execution based
+only on a transient status. Retry a mutation only when its documented operation
+contract makes the repeated request safe. A correlation ID does not provide that
+guarantee.
+
+| Status | Recovery |
+|---|---|
+| `INVALID_ARGUMENT`, `OUT_OF_RANGE` | Correct the request. |
+| `UNAUTHENTICATED` | Refresh or replace credentials before a new attempt. |
+| `PERMISSION_DENIED` | Obtain the required authorization. |
+| `NOT_FOUND` | Check the resource and workspace. Follow the operation's missing-resource contract. |
+| `ALREADY_EXISTS` | Inspect the existing resource before deciding whether it satisfies the request. |
+| `FAILED_PRECONDITION` | Resolve the reported state or configuration requirement. |
+| `ABORTED` | Read fresh state before retrying a conditional operation. |
+| `UNAVAILABLE`, `RESOURCE_EXHAUSTED` | A transient condition may recover. Apply backoff and any minimum retry delay only to a retry-safe operation. |
+| `DEADLINE_EXCEEDED`, `CANCELLED` | A mutation's outcome can be unknown. Cancellation does not imply rollback. |
+| `UNIMPLEMENTED` | Check gateway and SDK version compatibility. |
+| `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
+
+## SDK access
+
+Each SDK exposes decoded fields and an escape hatch for complete transport data.
+Unknown details remain available through the original error even when the SDK
+does not recognize their message type.
+
+| SDK | Decoded details | Original failure |
+|---|---|---|
+| Rust | `SdkError::error_details()`, `retry_delay()` | `SdkError::grpc_status()` returns the original `tonic::Status`, including details bytes and metadata. |
+| Go | `StatusError.FieldViolations`, `ErrorInfo`, `RetryDelay`, `GRPCCode` | `StatusError.Cause` retains the gRPC error. `status.FromError` can recover its details through error wrapping. |
+| TypeScript | `SdkError.fieldViolations`, `errorInfo`, `retryDelayMs`, `connectCode` | `SdkError.cause` retains the `ConnectError`, including all details and metadata. Use `fromConnect` for raw calls. |
+| Python | `GatewayError.field_violations`, `error_info`, `retry_delay` | `raw_error` retains the gRPC exception and metadata; `raw_status` retains the parsed envelope. Use `from_grpc_error` for raw calls. |
+
+Retry delays are Rust and Go durations, TypeScript milliseconds, and Python
+seconds. Absent or invalid delay details do not produce a suggested delay.
+
+## Migration
+
+Existing error codes and human-readable messages remain available. Python curated
+clients now raise `GatewayError`, which remains a `grpc.RpcError`; existing
+`except grpc.RpcError` handlers continue to work. `GatewayError` is not a
+`grpc.Call`. If your handler checks that interface, inspect `raw_error` before
+checking the status. The Python SDK's deletion wait and managed-sandbox cleanup
+use the original call to recognize `NOT_FOUND`; other failures still propagate.
+Rust error variants now retain
+status fields; use `..` when destructuring variants that do not need those fields.
+Go and TypeScript add typed detail fields to their existing error types.
+
+No SDK automatically retries a mutation as a result of decoding these details.

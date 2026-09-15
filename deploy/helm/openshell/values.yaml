@@ -343,8 +343,10 @@ server:
     vault:
       # -- Enable the in-tree Vault credential driver.
       enabled: false
-      # -- Vault service base URL, for example http://vault.vault.svc.cluster.local:8200.
+      # -- Vault service base URL. Non-loopback endpoints must use HTTPS, for example https://vault.vault.svc.cluster.local:8200.
       address: ""
+      # -- ConfigMap containing the private Vault CA certificate bundle in the ca.crt key. Leave empty to use platform trust roots.
+      caConfigMapName: ""
       # -- Default KV mount name.
       mount: secret
       # -- Default KV engine version. Use "1" or "2".
@@ -419,6 +421,12 @@ server:
   oidc:
     # -- OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
     issuer: ""
+    # -- Development only: permit cleartext OIDC requests to numeric loopback
+    # addresses. This never permits HTTP to hostnames or non-loopback addresses.
+    dangerouslyAllowInsecureHttp: false
+    # -- Additional trusted HTTPS origins allowed to serve JWKS. The issuer
+    # origin is always allowed. Entries must not include a path or query.
+    jwksAllowedOrigins: []
     # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"

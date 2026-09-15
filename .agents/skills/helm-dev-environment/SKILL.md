@@ -256,15 +256,19 @@ Key Helm values:
 
 ### Keycloak OIDC
 
-One-time setup — only needed once per cluster lifetime:
+Initial setup — rerun it whenever you want to rotate the development CA:
 
 ```bash
 mise run keycloak:k8s:setup
 ```
 
 This deploys Keycloak (`quay.io/keycloak/keycloak:24.0`) into the `keycloak` namespace,
-imports the openshell realm from `scripts/keycloak-realm.json`, and prints a port-forward
-command for acquiring tokens from the CLI.
+imports the openshell realm from `scripts/keycloak-realm.json`, generates a short-lived
+development TLS certificate, and publishes its trust anchor as the
+`openshell-keycloak-ca` ConfigMap in the OpenShell namespace. The command prints a
+port-forward command for acquiring tokens from the CLI. Rerunning setup rotates the
+development certificate and trust anchor; redeploy the gateway afterward so it reloads
+the mounted CA bundle.
 
 Then activate OIDC in the OpenShell Helm chart:
 1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
@@ -293,6 +297,25 @@ grants. Supervisor-to-gateway authentication remains on the Kubernetes
 ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
 Kubernetes compute driver validates the projected token before the gateway
 mints its JWT.
+
+### Vault Credential Driver
+
+The `credential-driver-vault` Skaffold profile applies
+`ci/values-credential-driver-vault.yaml`. Its external OpenBao/Vault backend
+must expose HTTPS at the configured service DNS name and publish the issuing CA
+certificate as the `ca.crt` key in the `openbao-ca` ConfigMap. Local e2e uses
+OpenBao dev TLS and an `openbao-0` DNS alias matching its generated certificate.
+The Helm value
+`server.credentialDrivers.vault.caConfigMapName` mounts that key into the
+gateway and renders the driver's `ca_bundle` setting. Non-loopback HTTP
+addresses fail gateway startup, and hostname verification requires the service
+DNS name in the server certificate SANs.
+
+```bash
+cd deploy/helm/openshell
+skaffold run -p credential-driver-vault
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
+```
 
 ---
 
@@ -353,6 +376,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
+| `deploy/helm/openshell/ci/values-credential-driver-vault.yaml` | Vault credential-driver validation overlay with HTTPS and private-CA trust |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
-| `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy + realm import |
+| `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |

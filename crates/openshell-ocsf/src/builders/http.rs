@@ -10,7 +10,7 @@ use crate::events::{HttpActivityEvent, OcsfEvent};
 use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
-pub struct HttpActivityBuilder<'a> {
+pub struct HttpActivityBuilder<'a, Context = MissingHttpContext> {
     ctx: &'a EventContext,
     activity: ActivityId,
     action: Option<ActionId>,
@@ -26,9 +26,35 @@ pub struct HttpActivityBuilder<'a> {
     message: Option<String>,
     status_detail: Option<String>,
     unmapped: serde_json::Map<String, serde_json::Value>,
+    context: std::marker::PhantomData<Context>,
 }
 
-impl<'a> HttpActivityBuilder<'a> {
+/// Marker for an HTTP Activity builder that has neither request nor response.
+pub struct MissingHttpContext;
+
+/// Marker for an HTTP Activity builder that has a request or response.
+pub struct HasHttpContext;
+
+impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
+    /// Start building an HTTP Activity event.
+    ///
+    /// An HTTP Activity must include an HTTP request or response before it can
+    /// be built.
+    ///
+    /// ```compile_fail
+    /// use openshell_ocsf::{EventContext, HttpActivityBuilder};
+    ///
+    /// let ctx = EventContext {
+    ///     sandbox_id: String::new(),
+    ///     sandbox_name: String::new(),
+    ///     container_image: String::new(),
+    ///     hostname: String::new(),
+    ///     product_version: String::new(),
+    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
+    ///     proxy_port: 3128,
+    /// };
+    /// HttpActivityBuilder::new(&ctx).build();
+    /// ```
     #[must_use]
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
@@ -47,19 +73,78 @@ impl<'a> HttpActivityBuilder<'a> {
             message: None,
             status_detail: None,
             unmapped: serde_json::Map::new(),
+            context: std::marker::PhantomData,
         }
     }
 
+    #[must_use]
+    pub fn http_request(self, req: HttpRequest) -> HttpActivityBuilder<'a, HasHttpContext> {
+        self.with_http_request(req)
+    }
+
+    #[must_use]
+    pub fn http_response(self, resp: HttpResponse) -> HttpActivityBuilder<'a, HasHttpContext> {
+        self.with_http_response(resp)
+    }
+}
+
+impl HttpActivityBuilder<'_, HasHttpContext> {
     #[must_use]
     pub fn http_request(mut self, req: HttpRequest) -> Self {
         self.http_request = Some(req);
         self
     }
+
     #[must_use]
     pub fn http_response(mut self, resp: HttpResponse) -> Self {
         self.http_response = Some(resp);
         self
     }
+}
+
+impl<'a, Context> HttpActivityBuilder<'a, Context> {
+    fn with_http_request(self, req: HttpRequest) -> HttpActivityBuilder<'a, HasHttpContext> {
+        HttpActivityBuilder {
+            ctx: self.ctx,
+            activity: self.activity,
+            action: self.action,
+            disposition: self.disposition,
+            severity: self.severity,
+            status: self.status,
+            http_request: Some(req),
+            http_response: self.http_response,
+            src_endpoint: self.src_endpoint,
+            dst_endpoint: self.dst_endpoint,
+            actor: self.actor,
+            firewall_rule: self.firewall_rule,
+            message: self.message,
+            status_detail: self.status_detail,
+            unmapped: self.unmapped,
+            context: std::marker::PhantomData,
+        }
+    }
+
+    fn with_http_response(self, resp: HttpResponse) -> HttpActivityBuilder<'a, HasHttpContext> {
+        HttpActivityBuilder {
+            ctx: self.ctx,
+            activity: self.activity,
+            action: self.action,
+            disposition: self.disposition,
+            severity: self.severity,
+            status: self.status,
+            http_request: self.http_request,
+            http_response: Some(resp),
+            src_endpoint: self.src_endpoint,
+            dst_endpoint: self.dst_endpoint,
+            actor: self.actor,
+            firewall_rule: self.firewall_rule,
+            message: self.message,
+            status_detail: self.status_detail,
+            unmapped: self.unmapped,
+            context: std::marker::PhantomData,
+        }
+    }
+
     #[must_use]
     pub fn src_endpoint(mut self, ep: Endpoint) -> Self {
         self.src_endpoint = Some(ep);
@@ -78,6 +163,62 @@ impl<'a> HttpActivityBuilder<'a> {
         self
     }
 
+    #[must_use]
+    pub fn activity(mut self, id: ActivityId) -> Self {
+        self.activity = id;
+        self
+    }
+
+    #[must_use]
+    pub fn action(mut self, id: ActionId) -> Self {
+        self.action = Some(id);
+        self
+    }
+
+    #[must_use]
+    pub fn disposition(mut self, id: DispositionId) -> Self {
+        self.disposition = Some(id);
+        self
+    }
+
+    #[must_use]
+    pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
+        self.actor = Some(Actor { process });
+        self
+    }
+
+    #[must_use]
+    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.dst_endpoint = Some(endpoint);
+        self
+    }
+
+    #[must_use]
+    pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
+        self.firewall_rule = Some(FirewallRule::new(name, rule_type));
+        self
+    }
+
+    #[must_use]
+    pub fn severity(mut self, id: SeverityId) -> Self {
+        self.severity = id;
+        self
+    }
+
+    #[must_use]
+    pub fn status(mut self, id: StatusId) -> Self {
+        self.status = Some(id);
+        self
+    }
+
+    #[must_use]
+    pub fn message(mut self, msg: impl Into<String>) -> Self {
+        self.message = Some(msg.into());
+        self
+    }
+}
+
+impl HttpActivityBuilder<'_, HasHttpContext> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.http_label().to_string();
@@ -117,13 +258,6 @@ impl<'a> HttpActivityBuilder<'a> {
         })
     }
 }
-
-impl_activity_setter!(HttpActivityBuilder);
-impl_action_disposition_setters!(HttpActivityBuilder);
-impl_actor_process_setter!(HttpActivityBuilder);
-impl_dst_endpoint_setter!(HttpActivityBuilder);
-impl_firewall_rule_setter!(HttpActivityBuilder);
-impl_builder_setters!(HttpActivityBuilder);
 
 #[cfg(test)]
 mod tests {

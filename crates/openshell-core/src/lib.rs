@@ -44,6 +44,7 @@ pub mod proposals;
 pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
+pub mod rpc_error;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;
