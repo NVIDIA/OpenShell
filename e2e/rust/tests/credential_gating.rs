@@ -79,7 +79,7 @@ async fn delete_until_gone(args: &[&str]) -> Result<(), String> {
 /// before it is recreated, otherwise creation fails with "already exists".
 async fn ensure_provider_resources_absent() -> Result<(), String> {
     delete_until_gone(&["provider", "delete", PROVIDER_NAME]).await?;
-    delete_until_gone(&["provider", "profile", "delete", PROFILE_ID]).await
+    delete_until_gone(&["profile", "delete", PROFILE_ID]).await
 }
 
 /// Best-effort teardown. Never fails the test: it also runs on the failure
@@ -134,8 +134,7 @@ async fn install_provider(rest_port: u16, websocket_port: u16) -> Result<(), Str
         .path()
         .to_str()
         .ok_or_else(|| "profile path is not UTF-8".to_string())?;
-    let (imported, output) =
-        run_cli(&["provider", "profile", "import", "--file", profile_path]).await;
+    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
     if !imported {
         return Err(format!("profile import failed:\n{output}"));
     }
@@ -192,8 +191,7 @@ async fn install_endpointless_provider() -> Result<(), String> {
         .path()
         .to_str()
         .ok_or_else(|| "endpointless profile path is not UTF-8".to_string())?;
-    let (imported, output) =
-        run_cli(&["provider", "profile", "import", "--file", profile_path]).await;
+    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
     if !imported {
         return Err(format!("endpointless profile import failed:\n{output}"));
     }

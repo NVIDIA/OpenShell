@@ -93,8 +93,8 @@ binaries:
 Lint and import the profile:
 
 ```shell
-openshell provider profile lint -f microsoft-graph-mail.yaml
-openshell provider profile import -f microsoft-graph-mail.yaml
+openshell profile lint -f microsoft-graph-mail.yaml
+openshell profile import -f microsoft-graph-mail.yaml
 ```
 
 The profile defines the refresh strategy and Graph network policy. The `tenant_id` refresh material selects the Microsoft token endpoint during gateway-managed refresh.
