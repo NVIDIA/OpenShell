@@ -1892,6 +1892,7 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
         "table",
         "team-a",
         &tls,
+        true,
     )
     .await
     .expect("template create should succeed");
@@ -2013,6 +2014,7 @@ async fn sandbox_template_create_allows_omitted_image() {
         "table",
         "default",
         &tls,
+        true,
     )
     .await
     .expect("template create without image should succeed");

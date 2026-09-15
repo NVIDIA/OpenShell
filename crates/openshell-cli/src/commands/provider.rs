@@ -775,6 +775,39 @@ fn provider_profile_lookup_error(status: &Status) -> miette::Report {
     }
 }
 
+/// Fetch the gateway's active provider profile catalog.
+///
+/// Nothing about provider profiles is compiled into the CLI: the catalog is
+/// whatever the connected gateway publishes, so anything that reasons about
+/// available profiles has to ask for it.
+pub async fn fetch_provider_profile_catalog(
+    client: &mut crate::tls::GrpcClient,
+    workspace: &str,
+) -> Result<Vec<ProviderTypeProfile>> {
+    let mut page_token = String::new();
+    let mut profiles = Vec::new();
+    loop {
+        let response = client
+            .list_provider_profiles(ListProviderProfilesRequest {
+                page_size: 100,
+                page_token,
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        profiles.extend(response.profiles);
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        page_token = response.next_page_token;
+    }
+    Ok(profiles
+        .iter()
+        .map(ProviderTypeProfile::from_proto)
+        .collect())
+}
+
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
@@ -1546,32 +1579,15 @@ pub async fn provider_list_profiles(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let mut page_token = String::new();
-    let mut profiles = Vec::new();
-    loop {
-        let response = client
-            .list_provider_profiles(ListProviderProfilesRequest {
-                page_size: 100,
-                page_token,
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
-        profiles.extend(response.profiles);
-        if response.next_page_token.is_empty() {
-            break;
-        }
-        page_token = response.next_page_token;
-    }
-    profiles.sort_by(|left, right| {
+    let mut dto_profiles = fetch_provider_profile_catalog(&mut client, workspace).await?;
+    dto_profiles.sort_by(|left, right| {
         left.category
             .cmp(&right.category)
             .then_with(|| left.id.cmp(&right.id))
     });
-    let dto_profiles = profiles
+    let profiles = dto_profiles
         .iter()
-        .map(ProviderTypeProfile::from_proto)
+        .map(ProviderTypeProfile::to_proto)
         .collect::<Vec<_>>();
 
     if crate::output::print_output_direct(

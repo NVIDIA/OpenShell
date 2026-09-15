@@ -3159,7 +3159,6 @@ async fn run_async() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
-                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3214,6 +3213,7 @@ async fn run_async() -> Result<()> {
                             approval_mode: &approval_mode,
                             output: output.as_str(),
                             detach,
+                            suppress_credential_warnings: no_credential_warnings,
                         },
                         &cli.workspace,
                         &tls,
@@ -3478,7 +3478,6 @@ async fn run_async() -> Result<()> {
                                 let annotations =
                                     run::parse_key_value_pairs(&annotations, "--annotation")?;
                                 let environment = run::parse_env_pairs(&envs)?;
-                                run::warn_credential_env_vars(&environment, no_credential_warnings);
                                 let gpu_requirements: Option<GpuResourceRequirements> =
                                     gpu.map(Into::into);
                                 run::sandbox_template_create(
@@ -3497,6 +3496,7 @@ async fn run_async() -> Result<()> {
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,
+                                    no_credential_warnings,
                                 )
                                 .await?;
                             }
