@@ -134,12 +134,24 @@ fn reason_tag(base: &BaseEventData) -> String {
         .map_or_else(String::new, |text| format!(" [reason:{text}]"))
 }
 
-fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
-    base.unmapped
+fn sorted_unmapped_fields(base: &BaseEventData) -> Vec<(&str, &serde_json::Value)> {
+    let mut fields: Vec<_> = base
+        .unmapped
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    // Cargo can enable insertion-ordered JSON maps through another dependency.
+    // Keep shorthand ordering and truncated field selection stable either way.
+    fields.sort_unstable_by_key(|(key, _)| *key);
+    fields
+}
+
+fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
+    sorted_unmapped_fields(base)
+        .into_iter()
         .filter_map(|(key, value)| {
             let value = match value {
                 serde_json::Value::Bool(value) => value.to_string(),
@@ -502,9 +514,9 @@ impl OcsfEvent {
                         if obj.is_empty() {
                             return None;
                         }
-                        let fields: Vec<String> = obj
-                            .iter()
-                            .take(3) // Limit to 3 most important fields
+                        let fields: Vec<String> = sorted_unmapped_fields(&e.base)
+                            .into_iter()
+                            .take(3)
                             .map(|(k, v)| {
                                 let val = v.as_str().map_or_else(|| v.to_string(), String::from);
                                 format!("{k}:{val}")
@@ -676,8 +688,8 @@ mod tests {
     #[test]
     fn test_http_activity_shorthand_includes_unmapped_attributes() {
         let mut base = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
-        base.add_unmapped("attempt", serde_json::json!(2));
         base.add_unmapped("cached", serde_json::json!(true));
+        base.add_unmapped("attempt", serde_json::json!(2));
         let event = OcsfEvent::HttpActivity(HttpActivityEvent {
             base,
             http_request: Some(HttpRequest::new(
@@ -1244,6 +1256,21 @@ mod tests {
         assert_eq!(
             shorthand,
             "EVENT [INFO] Network namespace created [ns:openshell-sandbox-abc123]"
+        );
+    }
+
+    #[test]
+    fn test_base_event_selects_unmapped_fields_in_key_order() {
+        let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+        b.set_message("Context");
+        for (key, value) in [("z", 4), ("c", 3), ("a", 1), ("b", 2)] {
+            b.add_unmapped(key, serde_json::json!(value));
+        }
+
+        let event = OcsfEvent::Base(BaseEvent { base: b });
+        assert_eq!(
+            event.format_shorthand(),
+            "EVENT [INFO] Context [a:1 b:2 c:3]"
         );
     }
 }

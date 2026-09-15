@@ -25,7 +25,10 @@ pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
 use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, ParseMcpVersionsError,
+    canonicalize_mcp_versions, parse_mcp_versions,
+};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
@@ -261,24 +264,19 @@ fn validate_authored_mcp_versions(versions: Option<&[String]>, context: &str) ->
     let Some(versions) = versions else {
         return Ok(());
     };
-    if versions.is_empty() {
-        return Err(miette::miette!(
-            "{context} has an empty mcp.versions list; omit mcp.versions to use the pinned default revision"
-        ));
-    }
-
-    let mut seen = BTreeSet::new();
-    for value in versions {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !seen.insert(version) {
-            return Err(miette::miette!(
-                "{context} has duplicate protocol version '{value}'"
-            ));
-        }
-    }
-    Ok(())
+    parse_mcp_versions(versions)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ParseMcpVersionsError::Empty => miette::miette!(
+                "{context} has an empty mcp.versions list; omit mcp.versions to use the pinned default revision"
+            ),
+            ParseMcpVersionsError::Unsupported(error) => {
+                miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}")
+            }
+            ParseMcpVersionsError::Duplicate(version) => {
+                miette::miette!("{context} has duplicate protocol version '{version}'")
+            }
+        })
 }
 
 fn mcp_config_from_proto(max_body_bytes: u32, mcp: Option<&McpOptions>) -> Option<McpConfigDef> {
@@ -683,22 +681,6 @@ fn default_mcp_versions() -> Vec<String> {
     // size and order, so adding support for a revision cannot widen an
     // existing versionless policy.
     vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()]
-}
-
-fn canonicalize_mcp_versions(versions: &mut [String]) {
-    // Unknown and duplicate values remain present so canonicalization cannot
-    // erase evidence that the raw policy was invalid.
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
 }
 
 /// Sort one protobuf MCP contract without hiding invalid input.
@@ -2666,7 +2648,7 @@ network_policies:
         }
     }
 
-    const MCP_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+    const MCP_VERSIONS: [&str; 4] = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
 
     fn mcp_version_options(versions: &[&str]) -> McpOptions {
         McpOptions {
@@ -2765,6 +2747,30 @@ network_policies:
             [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
         );
         assert!(McpProtocolVersion::ALL.len() > default_mcp_versions().len());
+    }
+
+    #[test]
+    fn sessionless_mcp_version_requires_an_explicit_policy_opt_in() {
+        let mut authored =
+            mcp_version_endpoint_yaml("mcp", Some("          versions: [\"2026-07-28\"]\n"));
+        authored.push_str("        rules:\n          - allow:\n              method: tools/list\n");
+        let explicit = parse_sandbox_policy(&authored)
+            .expect("the sessionless revision must be accepted when explicitly allowed");
+        let options = explicit.network_policies["versioned"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options must be materialized");
+        assert_eq!(options.versions, ["2026-07-28"]);
+        validate_sandbox_policy(&explicit)
+            .expect("a sessionless endpoint with an explicit method rule must validate");
+
+        let yaml = serialize_sandbox_policy(&explicit)
+            .expect("an explicitly allowed sessionless revision must serialize");
+        assert_eq!(
+            parse_sandbox_policy(&yaml).expect("the sessionless policy must round-trip"),
+            explicit
+        );
+        assert!(!default_mcp_versions().contains(&"2026-07-28".to_string()));
     }
 
     #[test]
@@ -2936,7 +2942,7 @@ network_policies:
             "rendered diagnostic omitted remediation choices: {authored_diagnostic}"
         );
 
-        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-28"])));
+        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-29"])));
         let violations = validate_sandbox_policy(&policy)
             .expect_err("unsupported protobuf revisions must fail closed");
         assert!(violations.iter().map(ToString::to_string).any(|message| {
@@ -3033,6 +3039,7 @@ network_policies:
         let policy = mcp_version_policy(
             "mcp",
             Some(mcp_version_options(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
