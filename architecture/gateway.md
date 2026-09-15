@@ -77,6 +77,12 @@ of inline tables. Keys are ordered alphabetically, so equivalent input produces
 the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
 string values, never in keys or YAML structure.
 
+The implementation intentionally uses only long-standing Helm 3 template and
+Sprig functions (tpl, kindIs, keys, sortAlpha, splitList, quote, and toJson);
+it does not rely on a Helm-specific TOML encoder. This preserves the chart's
+documented Helm 3 compatibility while making the serialization rules explicit
+in the chart itself.
+
 Helm retains ownership of values that create or modify Kubernetes resources,
 including Services, workloads, probes, Secrets, certificate resources, Routes,
 RBAC, NetworkPolicies, and mounts. When one of those inputs also determines a

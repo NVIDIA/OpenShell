@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gatewayConfig TOML serializer
+templates:
+  - templates/gateway-config.yaml
+release:
+  name: serializer-test
+  namespace: serializer-namespace
+
+tests:
+  - it: renders all supported YAML shapes with deterministic TOML output
+    set:
+      gatewayConfig:
+        example.config:
+          string_value: plain text
+          boolean_value: true
+          integer_value: 42
+          float_value: 1.5
+          scalar_array:
+            - first
+            - second
+          nested_map:
+            zebra: 2
+            alpha: false
+          map_array:
+            - name: first
+              enabled: true
+            - name: second
+              enabled: false
+          omitted_value: null
+          empty_value: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)^\[example\.config\]\n.*?boolean_value = true\n.*?empty_value = ""\n.*?float_value = 1\.5\n.*?integer_value = 42\n.*?map_array = \[\{ enabled = true, name = "first" \}, \{ enabled = false, name = "second" \}\]\n.*?nested_map = \{ alpha = false, zebra = 2 \}\n.*?scalar_array = \["first", "second"\]\n.*?string_value = "plain text"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: omitted_value
+
+  - it: evaluates templates only in string values
+    set:
+      gatewayConfig:
+        example:
+          rendered_string: '{{ .Release.Namespace }}/{{ .Release.Name }}'
+          boolean_value: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^rendered_string = "serializer-namespace/serializer-test"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^boolean_value = true$'
+
+  - it: quotes non-bare TOML keys safely
+    set:
+      gatewayConfig:
+        example:
+          "field with spaces": value
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^"field with spaces" = "value"$'
+
+  - it: rejects a top-level table that is not a map
+    set:
+      gatewayConfig:
+        example: invalid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig table "example" must be a map, got string'
+
+  - it: rejects null members in arrays
+    set:
+      gatewayConfig:
+        example:
+          values:
+            - valid
+            - null
+    asserts:
+      - failedTemplate:
+          errorMessage: gatewayConfig arrays cannot contain null values
+
+  - it: rejects table names with empty TOML key segments
+    set:
+      gatewayConfig:
+        "example..config":
+          value: valid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig table "example..config" contains an empty TOML key segment'
