@@ -225,6 +225,7 @@ ocsf_emit!(event);
 - Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
 - Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
 - Tests use bufconn for in-process gRPC and testify for assertions.
+- E2E tests live in `e2e/go/` (a separate Go module using a `replace` directive to `sdk/go/`, gated by the `e2e` build tag) and connect to a real gateway via `gateway.NewClient`. Run `mise run e2e:go`.
 
 ## TypeScript SDK (`sdk/typescript/`)
 
