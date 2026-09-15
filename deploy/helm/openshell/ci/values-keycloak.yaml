@@ -31,7 +31,7 @@ gatewayConfig:
     audience: "openshell-cli"
     # Short TTL for dev so JWKS key rotation is picked up quickly.
     # Use 3600 (default) in production.
-    jwks_ttl: 60
+    jwks_ttl_secs: 60
     # Keycloak puts realm roles at realm_access.roles in the JWT.
     roles_claim: "realm_access.roles"
     # Leave both empty for authentication-only mode (any valid token is accepted).
