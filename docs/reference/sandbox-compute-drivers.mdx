@@ -170,6 +170,8 @@ which request forms a driver implements. It does not report live resource
 inventory, availability, or scheduling capacity, so a supported request can
 still fail when the selected runtime cannot provide the resource.
 
+The same response includes the compute driver's negotiated extension snapshot. Protocol version and implementation version are separate: the implementation version identifies the OpenShell driver build, not the Docker daemon, Kubernetes server, or another compute backend. See [Extension Protocol Negotiation](/extensibility/extension-negotiation).
+
 CPU and memory capabilities report whether the driver enforces a resource
 limit. GPU capabilities report whether the driver accepts a default GPU request
 and an explicit GPU count. An omitted `resource_capabilities` message, or an

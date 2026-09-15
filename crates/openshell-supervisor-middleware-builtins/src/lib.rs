@@ -193,6 +193,12 @@ impl InProcessMiddleware for BuiltinMiddlewareService {
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: regex::describe(),
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                "openshell/regex",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 

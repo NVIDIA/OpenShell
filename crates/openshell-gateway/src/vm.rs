@@ -718,7 +718,7 @@ async fn wait_for_compute_driver(
                 let mut client =
                     ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor);
                 match client
-                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {}))
+                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest::default()))
                     .await
                 {
                     Ok(_) => return Ok(channel),

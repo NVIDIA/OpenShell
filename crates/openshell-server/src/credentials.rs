@@ -25,6 +25,9 @@ use std::{
 use async_trait::async_trait;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, extension_metadata, gateway_metadata, negotiate,
+};
 use openshell_core::proto::credentials::v1::{
     DeleteCredentialRequest, GetCredentialDriverCapabilitiesRequest,
     GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
@@ -122,6 +125,7 @@ pub struct CredentialRuntime {
     registry: CredentialDriverRegistry,
     drivers: BTreeMap<String, Arc<dyn CredentialDriver>>,
     _driver_processes: Vec<Arc<ManagedCredentialDriverProcess>>,
+    negotiated_extensions: Vec<NegotiatedExtension>,
 }
 
 impl CredentialRuntime {
@@ -154,10 +158,15 @@ impl CredentialRuntime {
             }
         }
 
+        let negotiated_extensions = drivers
+            .keys()
+            .map(|name| negotiate_builtin_credential_driver(name))
+            .collect::<CoreResult<Vec<_>>>()?;
         Ok(Self {
             registry,
             drivers,
             _driver_processes: Vec::new(),
+            negotiated_extensions,
         })
     }
 
@@ -184,6 +193,7 @@ impl CredentialRuntime {
         let registry = CredentialDriverRegistry::from_config(config)?;
         let mut drivers = BTreeMap::new();
         let mut driver_processes = Vec::new();
+        let mut negotiated_extensions = Vec::new();
         let empty_config = toml::Table::new();
         let default_store_config = config_file
             .and_then(|file| file.openshell.gateway.credential_storage.as_ref())
@@ -194,6 +204,11 @@ impl CredentialRuntime {
             default_store_config,
             registry.requires_default_store(),
         )?;
+        if drivers.contains_key(DbCredstoreCredentialDriver::NAME) {
+            negotiated_extensions.push(negotiate_builtin_credential_driver(
+                DbCredstoreCredentialDriver::NAME,
+            )?);
+        }
 
         for driver_name in registry.enabled_driver_names() {
             let driver_config = config_file
@@ -205,12 +220,14 @@ impl CredentialRuntime {
                 let built =
                     build_configured_driver(driver_name, driver_config, store.clone()).await?;
                 drivers.insert(driver_name.clone(), built.driver);
+                negotiated_extensions.push(built.negotiated_extension);
                 if let Some(process) = built.process {
                     driver_processes.push(process);
                 }
             } else {
                 let driver = build_default_in_tree_driver(driver_name, store.clone()).await?;
                 drivers.insert(driver_name.clone(), driver);
+                negotiated_extensions.push(negotiate_builtin_credential_driver(driver_name)?);
             }
         }
 
@@ -218,6 +235,7 @@ impl CredentialRuntime {
             registry,
             drivers,
             _driver_processes: driver_processes,
+            negotiated_extensions,
         })
     }
 
@@ -228,6 +246,11 @@ impl CredentialRuntime {
     pub fn stores_provider_credentials(&self) -> bool {
         let driver_name = self.registry.storage_owner_name();
         self.drivers.contains_key(&driver_name)
+    }
+
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        &self.negotiated_extensions
     }
 
     pub fn storage_owns_handle(&self, handle: &CredentialHandle) -> bool {
@@ -1111,10 +1134,27 @@ fn connect_default_credential_store(
     Ok(())
 }
 
+fn negotiate_builtin_credential_driver(name: &str) -> CoreResult<NegotiatedExtension> {
+    let gateway = gateway_metadata(ExtensionFamily::Credentials);
+    negotiate(
+        ExtensionFamily::Credentials,
+        name,
+        &gateway,
+        Some(extension_metadata(
+            ExtensionFamily::Credentials,
+            format!("openshell/{name}"),
+            openshell_core::VERSION,
+            [],
+        )),
+    )
+    .map_err(|error| Error::config(error.to_string()))
+}
+
 #[derive(Debug)]
 struct BuiltCredentialDriver {
     driver: Arc<dyn CredentialDriver>,
     process: Option<Arc<ManagedCredentialDriverProcess>>,
+    negotiated_extension: NegotiatedExtension,
 }
 
 async fn build_configured_driver(
@@ -1134,6 +1174,7 @@ async fn build_configured_driver(
             Ok(BuiltCredentialDriver {
                 driver,
                 process: None,
+                negotiated_extension: negotiate_builtin_credential_driver(driver_name)?,
             })
         }
         CredentialDriverTransport::Uds => {
@@ -1472,10 +1513,12 @@ async fn connect_uds_driver(
     if config.command.is_some() {
         spawn_uds_driver(driver_name, config, socket_path).await
     } else {
-        let channel = connect_ready_credential_driver(driver_name, socket_path).await?;
+        let (channel, negotiated_extension) =
+            connect_ready_credential_driver(driver_name, socket_path).await?;
         Ok(BuiltCredentialDriver {
             driver: Arc::new(RemoteCredentialDriver::new(channel)),
             process: None,
+            negotiated_extension,
         })
     }
 }
@@ -1528,7 +1571,7 @@ async fn spawn_uds_driver(
             command_path.display()
         ))
     })?;
-    let channel = wait_for_launched_credential_driver(
+    let (channel, negotiated_extension) = wait_for_launched_credential_driver(
         driver_name,
         socket_path,
         &mut child,
@@ -1542,6 +1585,7 @@ async fn spawn_uds_driver(
     Ok(BuiltCredentialDriver {
         driver: Arc::new(RemoteCredentialDriver::new(channel)),
         process: Some(process),
+        negotiated_extension,
     })
 }
 
@@ -1593,7 +1637,7 @@ async fn wait_for_launched_credential_driver(
     socket_path: &Path,
     child: &mut tokio::process::Child,
     timeout: Duration,
-) -> CoreResult<Channel> {
+) -> CoreResult<(Channel, NegotiatedExtension)> {
     let deadline = Instant::now() + timeout;
     let mut last_error: Option<String> = None;
 
@@ -1624,7 +1668,7 @@ async fn wait_for_launched_credential_driver(
         )
         .await
         {
-            Ok(Ok(channel)) => return Ok(channel),
+            Ok(Ok(connected)) => return Ok(connected),
             Ok(Err(err)) => last_error = Some(err.to_string()),
             Err(_) => {
                 return Err(Error::execution(format!(
@@ -1649,15 +1693,29 @@ async fn wait_for_launched_credential_driver(
 async fn connect_ready_credential_driver(
     driver_name: &str,
     socket_path: &Path,
-) -> CoreResult<Channel> {
+) -> CoreResult<(Channel, NegotiatedExtension)> {
     let channel = connect_credential_driver_socket(driver_name, socket_path).await?;
     let mut client = CredentialDriverClient::new(channel.clone());
-    let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {});
+    let gateway = gateway_metadata(ExtensionFamily::Credentials);
+    let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {
+        gateway: Some(gateway.clone()),
+    });
     let timeout = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
     request.set_timeout(timeout);
-    await_credential_driver_capabilities(driver_name, timeout, client.get_capabilities(request))
-        .await?;
-    Ok(channel)
+    let capabilities = await_credential_driver_capabilities(
+        driver_name,
+        timeout,
+        client.get_capabilities(request),
+    )
+    .await?;
+    let negotiated_extension = negotiate(
+        ExtensionFamily::Credentials,
+        driver_name,
+        &gateway,
+        capabilities.extension,
+    )
+    .map_err(|error| Error::config(error.to_string()))?;
+    Ok((channel, negotiated_extension))
 }
 
 #[cfg(unix)]
@@ -1667,7 +1725,7 @@ async fn await_credential_driver_capabilities(
     response: impl Future<
         Output = Result<tonic::Response<GetCredentialDriverCapabilitiesResponse>, Status>,
     >,
-) -> CoreResult<()> {
+) -> CoreResult<GetCredentialDriverCapabilitiesResponse> {
     tokio::time::timeout(timeout, response)
         .await
         .map_err(|_| {
@@ -1679,8 +1737,8 @@ async fn await_credential_driver_capabilities(
             Error::config(format!(
                 "credential driver '{driver_name}' GetCapabilities failed: {status}"
             ))
-        })?;
-    Ok(())
+        })
+        .map(tonic::Response::into_inner)
 }
 
 #[cfg(unix)]
@@ -1926,6 +1984,23 @@ mod tests {
         assert_eq!(
             registry.storage_owner_name().as_str(),
             DbCredstoreCredentialDriver::NAME
+        );
+    }
+
+    #[test]
+    fn built_in_credential_driver_uses_common_negotiation_snapshot() {
+        let runtime = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+
+        let negotiated = runtime.negotiated_extensions();
+        assert_eq!(negotiated.len(), 1);
+        assert_eq!(negotiated[0].family, ExtensionFamily::Credentials);
+        assert_eq!(negotiated[0].configured_name, "test-static");
+        assert_eq!(
+            negotiated[0].protocol_major,
+            openshell_core::extension_protocol::PROTOCOL_MAJOR
         );
     }
 

@@ -3550,7 +3550,7 @@ network_policies:
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> std::result::Result<Response<openshell_core::proto::MiddlewareManifest>, Status>
         {
             use openshell_core::proto::{
@@ -3568,6 +3568,12 @@ network_policies:
                     timeout: "1s".into(),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
