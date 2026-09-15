@@ -170,6 +170,7 @@ pub(crate) enum ProxyIdentityMode {
     /// unavailable. MXC uses this on Windows: every connection redirected to
     /// the per-sandbox listener is evaluated as the configured sandbox agent
     /// identity.
+    #[cfg(any(not(target_os = "linux"), test))]
     Static {
         binary_path: PathBuf,
         binary_sha256: String,
@@ -189,10 +190,12 @@ impl ProxyIdentityMode {
         }
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Result<Self> {
         Self::static_binary_with_client_auth(path, None)
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn static_binary_with_client_auth(
         path: impl Into<PathBuf>,
         required_proxy_authorization: Option<Arc<str>>,
@@ -210,6 +213,7 @@ impl ProxyIdentityMode {
         match self {
             #[cfg(target_os = "linux")]
             Self::Procfs { .. } => None,
+            #[cfg(any(not(target_os = "linux"), test))]
             Self::Static {
                 required_proxy_authorization,
                 ..
@@ -223,6 +227,7 @@ impl ProxyIdentityMode {
             Self::Procfs { entrypoint_pid, .. } => {
                 entrypoint_pid.load(std::sync::atomic::Ordering::Acquire)
             }
+            #[cfg(any(not(target_os = "linux"), test))]
             Self::Static { .. } => 0,
         }
     }
@@ -2932,6 +2937,7 @@ fn authorize_egress_intent(
             entrypoint_pid,
             intent,
         ),
+        #[cfg(any(not(target_os = "linux"), test))]
         ProxyIdentityMode::Static {
             binary_path,
             binary_sha256,
