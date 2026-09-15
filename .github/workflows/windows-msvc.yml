@@ -56,7 +56,6 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
-      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
@@ -122,7 +121,6 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
-      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
@@ -180,7 +178,6 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
-      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"

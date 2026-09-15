@@ -171,36 +171,6 @@ binary_allowed(policy, exec) if {
 	glob.match(b.path, ["/"], p)
 }
 
-user_declared_binary_allowed(_, _) if {
-	not binary_identity_required
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	b.path == exec.path
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	ancestor := exec.ancestors[_]
-	b.path == ancestor
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b in policy.binaries
-	not object.get(b, "advisor_proposed", false)
-	contains(b.path, "*")
-	all_paths := array.concat([exec.path], exec.ancestors)
-	some p in all_paths
-	glob.match(b.path, ["/"], p)
-}
-
 # --- Network action (allow / deny) ---
 #
 # These rules are mutually exclusive by construction:
@@ -982,7 +952,7 @@ _policy_has_exact_declared_endpoint(policy) if {
 exact_declared_endpoint_host if {
 	some pname
 	policy := data.network_policies[pname]
-	user_declared_binary_allowed(policy, input.exec)
+	binary_allowed(policy, input.exec)
 	_policy_has_exact_declared_endpoint(policy)
 }
 

@@ -26,9 +26,11 @@ use openshell_ocsf::{
 
 use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
+use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proposals::AgentProposals;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(target_os = "linux")]
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
@@ -36,7 +38,7 @@ use crate::l7::tls::{
 };
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
-use crate::proxy::ProxyHandle;
+use crate::proxy::{ProxyHandle, ProxyIdentityMode};
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -161,6 +163,13 @@ pub struct Networking {
     _transparent_tcp: Option<crate::proxy::TransparentTcpHandle>,
 }
 
+#[cfg(not(target_os = "linux"))]
+fn current_exe_static_identity_path() -> Result<std::path::PathBuf> {
+    std::env::current_exe().map_err(|e| {
+        miette::miette!("failed to resolve supervisor executable for static proxy identity: {e}")
+    })
+}
+
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
 /// and the SSH-side proxy URL / netns FD.
 ///
@@ -192,6 +201,7 @@ pub async fn run_networking(
     openshell_endpoint: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
@@ -308,8 +318,9 @@ pub async fn run_networking(
         let _ = engine_ready_tx.send(true);
     }
 
-    // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
-    // the proxy, so it's owned here.
+    // Linux procfs identity mode uses a SHA256 TOFU cache. Windows host mode
+    // uses an explicit static sandbox identity instead.
+    #[cfg(target_os = "linux")]
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
@@ -410,10 +421,6 @@ pub async fn run_networking(
             miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
         })?;
 
-        let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
-        })?;
-
         // If the orchestrator gave us a proxy bind IP (the host-side veth IP
         // from the workload's netns on Linux), use it so only traffic
         // originating inside the namespace can reach the proxy. Otherwise the
@@ -424,12 +431,25 @@ pub async fn run_networking(
             SocketAddr::new(ip, port)
         });
 
+        #[cfg(target_os = "linux")]
+        let identity_mode = {
+            let cache = identity_cache.clone().ok_or_else(|| {
+                miette::miette!(
+                    "Proxy mode requires an identity cache (OPA engine must be configured)"
+                )
+            })?;
+            ProxyIdentityMode::procfs(cache, entrypoint_pid.clone())
+        };
+        #[cfg(target_os = "windows")]
+        let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+        let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
+
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
             engine,
-            cache,
-            entrypoint_pid.clone(),
+            Arc::new(identity_mode),
             tls_state,
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
@@ -437,6 +457,7 @@ pub async fn run_networking(
             activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
+            endpoint_observation_tx,
         )
         .await?;
         Some(proxy_handle)

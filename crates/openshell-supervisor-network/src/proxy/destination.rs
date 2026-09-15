@@ -9,10 +9,10 @@
 //! Shared external destination validation and upstream dial boundary.
 
 use super::{
-    BLOCKED_CONTROL_PLANE_PORTS, implicit_allowed_ips_for_ip_host, is_cloud_metadata_ip,
-    is_host_gateway_alias, is_link_local_ip, parse_allowed_ips, resolve_and_check_allowed_ips,
-    resolve_and_check_declared_endpoint, resolve_and_check_trusted_gateway,
-    resolve_and_reject_internal,
+    BLOCKED_CONTROL_PLANE_PORTS, DestinationCheckError, implicit_allowed_ips_for_ip_host,
+    is_cloud_metadata_ip, is_host_gateway_alias, is_link_local_ip, parse_allowed_ips,
+    resolve_and_check_allowed_ips, resolve_and_check_declared_endpoint,
+    resolve_and_check_trusted_gateway, resolve_and_reject_internal,
 };
 use ipnet::IpNet;
 use openshell_core::net::{connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip};
@@ -56,6 +56,7 @@ pub(crate) struct DestinationRequest<'a> {
 /// and OCSF message shapes while sharing the underlying validation logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DestinationDenialKind {
+    Resolution,
     TrustedGateway,
     InvalidAllowedIps,
     AllowedIps,
@@ -72,6 +73,15 @@ pub(crate) struct DestinationDenial {
 impl DestinationDenial {
     fn new(kind: DestinationDenialKind, reason: String) -> Self {
         Self { kind, reason }
+    }
+
+    fn from_check(error: DestinationCheckError, denied_kind: DestinationDenialKind) -> Self {
+        match error {
+            DestinationCheckError::Resolution(reason) => {
+                Self::new(DestinationDenialKind::Resolution, reason)
+            }
+            DestinationCheckError::Denied(reason) => Self::new(denied_kind, reason),
+        }
     }
 }
 
@@ -292,37 +302,37 @@ pub(crate) async fn validate_destination(
         AddressAuthorization::TrustedGatewayAlias { expected_ip } => {
             resolve_and_check_trusted_gateway(host, port, *expected_ip, sandbox_entrypoint_pid)
                 .await
-                .map_err(|reason| {
-                    DestinationDenial::new(DestinationDenialKind::TrustedGateway, reason)
+                .map_err(|error| {
+                    DestinationDenial::from_check(error, DestinationDenialKind::TrustedGateway)
                 })?
         }
         AddressAuthorization::ExplicitAllowedIps(networks) => {
             resolve_and_check_allowed_ips(host, port, networks, sandbox_entrypoint_pid)
                 .await
-                .map_err(|reason| {
-                    DestinationDenial::new(DestinationDenialKind::AllowedIps, reason)
+                .map_err(|error| {
+                    DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
                 })?
         }
         AddressAuthorization::ImplicitIpLiteral(ip) => {
             let network = IpNet::from(*ip);
             resolve_and_check_allowed_ips(host, port, &[network], sandbox_entrypoint_pid)
                 .await
-                .map_err(|reason| {
-                    DestinationDenial::new(DestinationDenialKind::AllowedIps, reason)
+                .map_err(|error| {
+                    DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
                 })?
         }
         AddressAuthorization::ExactDeclaredHost => {
             resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid)
                 .await
-                .map_err(|reason| {
-                    DestinationDenial::new(DestinationDenialKind::DeclaredEndpoint, reason)
+                .map_err(|error| {
+                    DestinationDenial::from_check(error, DestinationDenialKind::DeclaredEndpoint)
                 })?
         }
         AddressAuthorization::DefaultPublicOnly => {
             resolve_and_reject_internal(host, port, sandbox_entrypoint_pid)
                 .await
-                .map_err(|reason| {
-                    DestinationDenial::new(DestinationDenialKind::InternalAddress, reason)
+                .map_err(|error| {
+                    DestinationDenial::from_check(error, DestinationDenialKind::InternalAddress)
                 })?
         }
         AddressAuthorization::PinnedResolved(addresses) => addresses
@@ -376,6 +386,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolver_failure_has_a_distinct_failure_kind() {
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::ExactDeclaredHost,
+        };
+        let denial = validate_destination(request("does-not-resolve.invalid", &plan))
+            .await
+            .err()
+            .expect("reserved invalid TLD must not resolve");
+
+        assert_eq!(denial.kind, DestinationDenialKind::Resolution);
+    }
+
+    #[tokio::test]
     async fn invalid_allowed_ips_has_a_distinct_denial_kind() {
         let denial = build_validation_plan(
             "api.example.test",
@@ -409,7 +432,7 @@ mod tests {
                 expected_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             },
         };
-        let denial = validate_destination(request("host.openshell.internal", &plan))
+        let denial = validate_destination(request("127.0.0.1", &plan))
             .await
             .err()
             .expect("loopback cannot be a trusted gateway");

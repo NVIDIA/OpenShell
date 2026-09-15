@@ -104,6 +104,15 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
     async fn begin_rootfs_tar_staging(
         &self,
         _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
@@ -2560,7 +2569,6 @@ binaries: [/usr/bin/yaml-client]
 }
 
 #[tokio::test]
-#[allow(deprecated)]
 async fn provider_profile_import_preserves_advanced_network_policy_fields() {
     let ts = run_server().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2589,7 +2597,6 @@ endpoints:
     path: /v1
 binaries:
   - path: /usr/bin/advanced
-    harness: true
 ",
     )
     .unwrap();
@@ -2618,7 +2625,7 @@ binaries:
     assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
     assert!(endpoint.allow_encoded_slash);
     assert_eq!(endpoint.path, "/v1");
-    assert!(profile.binaries[0].harness);
+    assert_eq!(profile.binaries[0].path, "/usr/bin/advanced");
 }
 
 #[tokio::test]

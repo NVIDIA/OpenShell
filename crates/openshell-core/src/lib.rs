@@ -18,6 +18,7 @@ pub mod driver_mounts;
 pub mod driver_utils;
 pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
+pub mod endpoint_status;
 pub mod error;
 #[cfg(unix)]
 pub mod external_driver_socket;
@@ -37,6 +38,7 @@ pub mod net;
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub mod policy_identity;
 pub mod progress;
 pub mod proposals;
 pub mod proto;

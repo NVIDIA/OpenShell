@@ -27,7 +27,9 @@ if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; 
 fi
 
 if [ ! -e "$destination" ]; then
-    install -Dm 0644 "$current_default" "$destination"
+    destination_dir=$(dirname "$destination")
+    mkdir -p "$destination_dir"
+    install -m 0644 "$current_default" "$destination"
     exit 0
 fi
 

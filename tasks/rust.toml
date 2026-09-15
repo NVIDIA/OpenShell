@@ -13,6 +13,7 @@ hide = true
 ["rust:lockfiles:check"]
 description = "Verify all tracked Cargo lockfiles are current"
 run = "tasks/scripts/check-cargo-lockfiles.sh"
+run_windows = "echo Skipping rust:lockfiles:check: Cargo lockfile validation uses a Unix shell helper."
 hide = true
 
 ["rust:lint"]

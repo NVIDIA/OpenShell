@@ -3720,6 +3720,10 @@ pub(super) async fn handle_update_provider(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // Provider material contributes to the route-report configuration epoch.
+    // Serialize its mutation with route-status validation so a report derived
+    // from the prior revision cannot commit after this update.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -6381,7 +6385,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn import_provider_profiles_preserves_advanced_proto_policy_fields() {
         let state = test_server_state().await;
         let response = handle_import_provider_profiles(
@@ -6414,7 +6417,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/advanced".to_string(),
-                            harness: true,
                         }],
                         inference_capable: false,
                         discovery: None,
@@ -6457,7 +6459,7 @@ mod tests {
         );
         assert!(endpoint.allow_encoded_slash);
         assert_eq!(endpoint.path, "/v1");
-        assert!(fetched.binaries[0].harness);
+        assert_eq!(fetched.binaries[0].path, "/usr/bin/advanced");
     }
 
     #[tokio::test]

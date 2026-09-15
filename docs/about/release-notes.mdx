@@ -10,6 +10,14 @@ position: 6
 
 NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub resources directly.
 
+## 0.1.0 migration notes
+
+### Network policy binaries
+
+OpenShell 0.1.0 removes the deprecated `NetworkBinary.harness` protobuf field and reserves its field number and name. Generated protobuf decoders ignore the unknown value. When the gateway loads policy history written by an older version, it migrates binaries marked by the former field into endpoint-provenance-marked rules so the upgrade cannot widen private-address access.
+
+Remove `harness` from sandbox policies and provider profiles before upgrading. Policy and profile YAML now reject the property. Provider profiles should list binaries as scalar paths, such as `- /usr/bin/curl`; the transitional object form `- path: /usr/bin/curl` remains accepted and is exported as a scalar.
+
 | Resource | Description |
 |---|---|
 | [Releases](https://github.com/NVIDIA/OpenShell/releases) | Versioned release notes and downloadable assets. |

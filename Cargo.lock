@@ -3949,6 +3949,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4048,6 +4049,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -4174,6 +4176,8 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-supervisor-network",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -4501,6 +4505,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "chrono",
  "clap",
  "futures",
  "futures-util",
@@ -5793,6 +5798,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "serde_yaml",
  "spin",
  "thiserror 2.0.18",
 ]

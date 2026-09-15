@@ -8,7 +8,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-parity-test.XXXXXX")"
+TMP_ROOT="${TMPDIR:-/tmp}"
+TMP_ROOT="${TMP_ROOT%/}"
+WORKDIR="$(mktemp -d "${TMP_ROOT}/openshell-parity-test.XXXXXX")"
 trap 'rm -rf "${WORKDIR}"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

@@ -18,10 +18,11 @@ use crate::l7::middleware::{
 };
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
-use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
+use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
+use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
@@ -80,6 +81,8 @@ pub struct L7EvalContext {
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
+    /// Bounded, nonblocking sink for privacy-safe tool server endpoint outcomes.
+    pub(crate) endpoint_observation_tx: Option<EndpointObservationSender>,
 }
 
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
@@ -169,6 +172,7 @@ where
 
 /// Enforce MCP request-version policy and emit a transport or policy rejection.
 /// Non-MCP adapters share this entry point without changing their behavior.
+/// Record endpoint version-policy denials before client response delivery.
 pub(crate) async fn enforce_mcp_protocol_version<W>(
     config: &L7EndpointConfig,
     request: &crate::l7::provider::L7Request,
@@ -176,6 +180,7 @@ pub(crate) async fn enforce_mcp_protocol_version<W>(
     client: &mut W,
     ctx: &L7EvalContext,
     redacted_target: &str,
+    observer: Option<&EndpointObserver>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -191,6 +196,12 @@ where
             Ok(true)
         }
         Err(error) => {
+            if let Some(observer) = observer {
+                // Every explicit version-gate rejection is local to this MCP
+                // endpoint. Record it before delivery can fail; an invalid client
+                // version is not an upstream transport failure.
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             let reason = error.to_string();
             let summary = l7_protocol_log_summary(None, Some(info));
             ocsf_emit!(build_l7_request_event(
@@ -240,6 +251,7 @@ pub(crate) async fn enforce_final_mcp_protocol_version<W>(
     client: &mut W,
     ctx: &L7EvalContext,
     redacted_target: &str,
+    observer: Option<&EndpointObserver>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -251,7 +263,16 @@ where
         request,
         crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
     )?;
-    enforce_mcp_protocol_version(config, request, &info, client, ctx, redacted_target).await
+    enforce_mcp_protocol_version(
+        config,
+        request,
+        &info,
+        client,
+        ctx,
+        redacted_target,
+        observer,
+    )
+    .await
 }
 
 fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -404,13 +425,39 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_http_request_with_credential_rejection_observed(
+        request,
+        client,
+        upstream,
+        options,
+        ctx,
+        response_middleware,
+        None,
+    )
+    .await
+}
+
+async fn relay_http_request_with_credential_rejection_observed<C, U>(
+    request: &crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: crate::l7::rest::RelayRequestOptions<'_>,
+    ctx: &L7EvalContext,
+    response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     match Box::pin(
-        crate::l7::rest::relay_http_request_with_response_middleware_guarded(
+        crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
             request,
             client,
             upstream,
             options,
             response_middleware,
+            observer,
         ),
     )
     .await
@@ -418,13 +465,30 @@ where
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
             if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                // Body classification includes credentials for other destinations,
+                // so denial does not establish that this endpoint lacks credentials.
+                // Record the local decision before cleanup or client I/O can fail.
+                if let Some(observer) = observer {
+                    observer.observe(EndpointResult::PolicyDenied);
+                }
                 let _ = upstream.shutdown().await;
                 reject_body_credential(client, *error).await?;
                 Ok(None)
             } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
             {
+                if let Some(observer) = observer {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
                 reject_credential_resolution(client, ctx, error).await?;
                 Ok(None)
+            } else if report
+                .downcast_ref::<crate::l7::rest::CredentialUnavailableError>()
+                .is_some()
+            {
+                if let Some(observer) = observer {
+                    observer.observe_credential_failure(false);
+                }
+                Err(report)
             } else {
                 Err(report)
             }
@@ -733,6 +797,12 @@ where
             return Ok(());
         }
 
+        // Pin observation authority before parsing can await or a later
+        // provider lookup can select state from another installation.
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         let mut req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
@@ -779,6 +849,13 @@ where
                 .await?;
             return Ok(());
         };
+        let observer = EndpointObserver::begin_captured(
+            ctx.endpoint_observation_tx.as_ref(),
+            config,
+            observation_context.as_ref(),
+            ctx.provider_credential_revision,
+            Some(engine.generation_guard()),
+        );
         // The request was canonicalized before the matching config was known,
         // so `allow_encoded_slash` was taken permissively across every config
         // on this host:port. Re-check it against the config that actually
@@ -792,6 +869,9 @@ where
             && crate::l7::path::canonical_path_has_encoded_slash(&req.target)
         {
             let detail = "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
@@ -882,6 +962,9 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
+                if let Some(observer) = observer.as_ref() {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
                 reject_credential_resolution(client, ctx, &error).await?;
                 return Ok(());
             }
@@ -895,8 +978,16 @@ where
             jsonrpc: jsonrpc_info.clone(),
         };
         if let Some(info) = jsonrpc_info.as_ref()
-            && !enforce_mcp_protocol_version(config, &req, info, client, ctx, &redacted_target)
-                .await?
+            && !enforce_mcp_protocol_version(
+                config,
+                &req,
+                info,
+                client,
+                ctx,
+                &redacted_target,
+                observer.as_ref(),
+            )
+            .await?
         {
             return Ok(());
         }
@@ -970,6 +1061,9 @@ where
             let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
+                    if let Some(observer) = observer.as_ref() {
+                        observer.observe(EndpointResult::PolicyDenied);
+                    }
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1005,13 +1099,30 @@ where
                     return Ok(());
                 }
             };
-            if !enforce_final_mcp_protocol_version(config, &req, client, ctx, &redacted_target)
-                .await?
+            if !enforce_final_mcp_protocol_version(
+                config,
+                &req,
+                client,
+                ctx,
+                &redacted_target,
+                observer.as_ref(),
+            )
+            .await?
             {
                 return Ok(());
             }
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+            // Credential scoping can acquire a newer revision after middleware.
+            // Bind its actual snapshot to the original authority, never a fresh
+            // epoch; the earlier handle served only pre-forward local decisions.
+            let observer = EndpointObserver::begin_captured(
+                ctx.endpoint_observation_tx.as_ref(),
+                config,
+                observation_context.as_ref(),
+                ctx.provider_credential_revision,
+                Some(engine.generation_guard()),
+            );
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -1045,7 +1156,7 @@ where
             } else {
                 None
             };
-            let outcome_result = relay_http_request_with_credential_rejection(
+            let outcome_result = relay_http_request_with_credential_rejection_observed(
                 &req,
                 client,
                 upstream,
@@ -1078,6 +1189,7 @@ where
                     engine.middleware_runner(),
                     Some(engine.generation_guard()),
                 )),
+                observer.as_ref(),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -1140,6 +1252,9 @@ where
                 }
             }
         } else {
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -2002,6 +2117,12 @@ where
             return Ok(());
         }
 
+        // Body inspection may await the caller while policy or provider state
+        // changes; a completed parse must retain its original authority.
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
             client,
             config.json_rpc_max_body_bytes,
@@ -2034,7 +2155,17 @@ where
 
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
+        let observer = EndpointObserver::begin_captured(
+            ctx.endpoint_observation_tx.as_ref(),
+            config,
+            observation_context.as_ref(),
+            ctx.provider_credential_revision,
+            Some(engine.generation_guard()),
+        );
         if !request_authority_matches_endpoint(&req, ctx) {
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             reject_request_authority_mismatch(client, ctx).await?;
             return Ok(());
         }
@@ -2045,6 +2176,9 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
+                if let Some(observer) = observer.as_ref() {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
                 reject_credential_resolution(client, ctx, &error).await?;
                 return Ok(());
             }
@@ -2057,8 +2191,16 @@ where
             graphql: None,
             jsonrpc: Some(jsonrpc_info.clone()),
         };
-        if !enforce_mcp_protocol_version(config, &req, &jsonrpc_info, client, ctx, &redacted_target)
-            .await?
+        if !enforce_mcp_protocol_version(
+            config,
+            &req,
+            &jsonrpc_info,
+            client,
+            ctx,
+            &redacted_target,
+            observer.as_ref(),
+        )
+        .await?
         {
             return Ok(());
         }
@@ -2141,6 +2283,9 @@ where
             {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
+                    if let Some(observer) = observer.as_ref() {
+                        observer.observe(EndpointResult::PolicyDenied);
+                    }
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -2176,19 +2321,36 @@ where
                     return Ok(());
                 }
             };
-            if !enforce_final_mcp_protocol_version(config, &req, client, ctx, &redacted_target)
-                .await?
+            if !enforce_final_mcp_protocol_version(
+                config,
+                &req,
+                client,
+                ctx,
+                &redacted_target,
+                observer.as_ref(),
+            )
+            .await?
             {
                 return Ok(());
             }
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+            // The outgoing resolver and revision are one snapshot. Rebind using
+            // the original authority so a newly scoped provider revision cannot
+            // publish its result under the earlier inventory.
+            let observer = EndpointObserver::begin_captured(
+                ctx.endpoint_observation_tx.as_ref(),
+                config,
+                observation_context.as_ref(),
+                ctx.provider_credential_revision,
+                Some(engine.generation_guard()),
+            );
             // Future MCP response/SSE introspection or rewrite would hook here
             // before returning upstream bytes. The current policy schema has no
             // trusted-annotations or version-profile field, so MCP responses and
             // SSE streams are relayed unchanged; see McpOptions in
             // proto/sandbox.proto for planned policy extensions.
-            let Some(outcome) = relay_http_request_with_credential_rejection(
+            let Some(outcome) = relay_http_request_with_credential_rejection_observed(
                 &req,
                 client,
                 upstream,
@@ -2209,6 +2371,7 @@ where
                     engine.middleware_runner(),
                     Some(engine.generation_guard()),
                 )),
+                observer.as_ref(),
             )
             .await?
             else {
@@ -2229,6 +2392,9 @@ where
                 }
             }
         } else {
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -3205,6 +3371,137 @@ mod tests {
         let mut sent = String::new();
         server.read_to_string(&mut sent).await.unwrap();
         assert!(!sent.contains("openshell:resolve:"));
+    }
+
+    async fn assert_body_denial_observation(
+        token: &str,
+        classifier: Option<&secrets::body::BodyCredentialClassifier>,
+        expected_reason: &str,
+        disconnect_client: bool,
+    ) {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".into(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:body-test".into(),
+                    uses_provider_credentials: true,
+                }],
+            )
+            .await
+            .expect("install endpoint inventory");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(EndpointStatusCommand::Reset { .. })
+        ));
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:body-test","policy_hash":"policy","provider_credentialed":true}"#,
+        )
+        .expect("parse endpoint configuration");
+        let config = crate::l7::parse_l7_config(&value).expect("parse MCP configuration");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+
+        let body = format!(r#"{{"input":"{token}"}}"#);
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: TestHashMap::new(),
+            raw_header: format!(
+                "POST /mcp HTTP/1.1\r\nHost: tools.example.test\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut client, caller) = tokio::io::duplex(4096);
+        let mut caller = Some(caller);
+        if disconnect_client {
+            // The denial must survive failure to deliver the local HTTP response.
+            drop(caller.take());
+        }
+        let (mut upstream, mut server) = tokio::io::duplex(4096);
+        let outcome = relay_http_request_with_credential_rejection_observed(
+            &req,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                body_classifier: classifier,
+                deny_uninspected_credentials: true,
+                host: "tools.example.test",
+                port: 443,
+                ..Default::default()
+            },
+            &L7EvalContext::default(),
+            None,
+            Some(&observer),
+        )
+        .await;
+        if disconnect_client {
+            assert!(outcome.is_err());
+        } else {
+            assert!(outcome.expect("reject body locally").is_none());
+        }
+        drop(client);
+        if let Some(mut caller) = caller {
+            let mut response = String::new();
+            caller.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["error"]["reason"], expected_reason);
+            assert!(!response.contains(token));
+        }
+        let mut sent = String::new();
+        server.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("openshell:resolve:"));
+        assert!(!sent.contains("403 Forbidden"));
+        assert!(matches!(
+            receiver.try_recv().expect("body denial observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::PolicyDenied,
+                ..
+            }
+        ));
+        assert!(receiver.try_recv().is_err(), "only one result per exchange");
+    }
+
+    #[tokio::test]
+    async fn body_denial_observation_reports_policy_denied_before_client_io() {
+        for disconnect_client in [false, true] {
+            assert_body_denial_observation(
+                "openshell:resolve:env:KEY",
+                None,
+                "classification_unavailable",
+                disconnect_client,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn body_denial_observation_does_not_attribute_unrelated_unavailable_credential() {
+        let (state, _) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".into(),
+            "private-test-secret".into(),
+        )]));
+        let (_, classifier, _) =
+            state.resolver_and_body_classifier_for_endpoint("tools.example.test", 443, "/mcp");
+        let classifier = classifier.expect("body classifier");
+        // This stale token belongs to allowed.example.test, not the observed server.
+        let token = "openshell:resolve:env:v999_API_TOKEN";
+        assert_eq!(
+            classifier.check(token),
+            Err(secrets::body::BodyCredentialError::KnownUnavailable)
+        );
+        assert_body_denial_observation(token, Some(&classifier), "known_unavailable", false).await;
     }
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
@@ -7725,6 +8022,8 @@ network_policies:
     fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
         let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {
             protocol: L7Protocol::Rest,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: path.into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
@@ -8170,6 +8469,8 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Rest,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
@@ -8373,6 +8674,8 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Websocket,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
@@ -8500,6 +8803,8 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Websocket,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/graphql".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
@@ -9116,6 +9421,348 @@ network_policies:
         assert!(forwarded.is_empty(), "rejected request reached upstream");
     }
 
+    const MCP_VERSION_DENIALS: &[(&str, &str, &str)] = &[
+        ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
+        (
+            "MCP-Protocol-Version: \r\n",
+            "400 Bad Request",
+            "invalid_mcp_protocol_version_header",
+        ),
+        (
+            "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
+            "400 Bad Request",
+            "invalid_mcp_protocol_version_header",
+        ),
+        (
+            "MCP-Protocol-Version: 2026-07-28\r\n",
+            "400 Bad Request",
+            "unsupported_mcp_protocol_version",
+        ),
+        (
+            "MCP-Protocol-Version: 2025-06-18\r\n",
+            "403 Forbidden",
+            "mcp_protocol_version_not_allowed",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn endpoint_observation_binds_scoped_provider_revision() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for route_selected in [false, true] {
+            for scoped_revision in [1, 2] {
+                let scenario = format!(
+                    "route_selected={route_selected}, inventory_revision=1, parent_revision=1, scoped_revision={scoped_revision}"
+                );
+                let (mut config, engine, mut ctx) = mcp_test_relay_context();
+                config.provider_credentialed = true;
+                let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                // The tunnel retains revision 1 while request scoping may obtain
+                // revision 2 before its replacement inventory has been published.
+                ctx.provider_credential_revision = Some(1);
+                let credentials = ProviderCredentialState::from_bound_environment(
+                    scoped_revision,
+                    TestHashMap::from([("API_TOKEN".into(), "scoped-secret".into())]),
+                    TestHashMap::new(),
+                    TestHashMap::new(),
+                    TestHashMap::from([(
+                        "API_TOKEN".into(),
+                        StaticCredentialBinding {
+                            endpoints: vec![StaticCredentialEndpointBinding {
+                                host: ctx.host.clone(),
+                                port: u32::from(ctx.port),
+                                path: "/mcp".into(),
+                            }],
+                            credential_identity: "provider:API_TOKEN".into(),
+                            workload_credential_handle: String::new(),
+                        },
+                    )]),
+                    Vec::new(),
+                )
+                .unwrap_or_else(|error| panic!("{scenario}: invalid provider fixture: {error}"));
+                // Endpoint-bound input must use the workload-issued handle;
+                // a canonical alias carries no authorized credential identity.
+                let placeholder = credentials.snapshot().child_env["API_TOKEN"].clone();
+                ctx.provider_credentials = Some(credentials);
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut server) = tokio::io::duplex(8192);
+                let relay = tokio::spawn(async move {
+                    if route_selected {
+                        relay_with_route_selection(
+                            &[config],
+                            engine,
+                            &mut client,
+                            &mut upstream,
+                            &ctx,
+                        )
+                        .await
+                    } else {
+                        relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                            .await
+                    }
+                });
+                let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+                let request = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAuthorization: Bearer {placeholder}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                app.write_all(request.as_bytes()).await.unwrap();
+                app.write_all(body).await.unwrap();
+                let mut forwarded = Vec::new();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !forwarded.ends_with(body) {
+                        let mut buffer = [0; 1024];
+                        let count = server.read(&mut buffer).await.unwrap();
+                        assert_ne!(
+                            count, 0,
+                            "{scenario}: request closed before forwarding its body"
+                        );
+                        forwarded.extend_from_slice(&buffer[..count]);
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{scenario}: upstream exchange timed out: {error}"));
+                assert!(
+                    String::from_utf8_lossy(&forwarded)
+                        .contains("Authorization: Bearer scoped-secret\r\n"),
+                    "{scenario}: endpoint-scoped credential was not injected"
+                );
+                server
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                    .await
+                    .unwrap_or_else(|error| panic!("{scenario}: relay timed out: {error}"))
+                    .unwrap_or_else(|error| panic!("{scenario}: relay task failed: {error}"))
+                    .unwrap_or_else(|error| panic!("{scenario}: relay failed: {error}"));
+
+                if scoped_revision == 1 {
+                    assert!(
+                        matches!(
+                            receiver.try_recv().unwrap_or_else(|error| panic!(
+                                "{scenario}: matching revision observation missing: {error}"
+                            )),
+                            EndpointStatusCommand::Observe {
+                                result: EndpointResult::HttpResponseReceived,
+                                ..
+                            }
+                        ),
+                        "{scenario}: matching revision produced an unexpected observation"
+                    );
+                }
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "{scenario}: another provider revision cannot supply this inventory's result"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_mcp_version_policy_denial() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for &(version_headers, status, response_code) in MCP_VERSION_DENIALS {
+            for route_selected in [false, true] {
+                for disconnect_client in [false, true] {
+                    let (mut config, engine, mut ctx) = mcp_test_relay_context();
+                    let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                    let (mut app, mut client) = tokio::io::duplex(8192);
+                    let (mut upstream, mut server) = tokio::io::duplex(8192);
+                    let body = br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+                    let request = format!(
+                        "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    app.write_all(request.as_bytes()).await.unwrap();
+                    app.write_all(body).await.unwrap();
+                    let mut app = Some(app);
+                    if disconnect_client {
+                        // The buffered request remains readable after its caller
+                        // disconnects, but delivering the local denial must fail.
+                        drop(app.take());
+                    }
+
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                                .await
+                        }
+                    })
+                    .await
+                    .expect("version policy must reject before upstream I/O");
+                    assert_eq!(result.is_err(), disconnect_client);
+                    drop(client);
+                    drop(upstream);
+                    if let Some(mut app) = app {
+                        let mut response = String::new();
+                        app.read_to_string(&mut response).await.unwrap();
+                        assert!(
+                            response.starts_with(&format!("HTTP/1.1 {status}")),
+                            "{response}"
+                        );
+                        assert!(response.contains(response_code), "{response}");
+                    }
+                    let mut sent = Vec::new();
+                    server.read_to_end(&mut sent).await.unwrap();
+                    assert!(sent.is_empty(), "disallowed version reached upstream");
+                    assert!(matches!(
+                        receiver
+                            .try_recv()
+                            .expect("version policy denial observation"),
+                        EndpointStatusCommand::Observe {
+                            result: EndpointResult::PolicyDenied,
+                            ..
+                        }
+                    ));
+                    assert!(receiver.try_recv().is_err(), "one result per exchange");
+                }
+            }
+        }
+    }
+
+    async fn install_mcp_test_observation(
+        config: &mut L7EndpointConfig,
+        ctx: &mut L7EvalContext,
+    ) -> openshell_core::endpoint_status::EndpointStatusReceiver {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        config.endpoint_id = "endpoint:v1:mcp-version".into();
+        config.policy_hash = "mcp-version-policy".into();
+        config.mcp_versions = vec![openshell_core::mcp::McpProtocolVersion::V2025_11_25];
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: config.policy_hash.clone(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: config.endpoint_id.clone(),
+                    uses_provider_credentials: config.provider_credentialed,
+                }],
+            )
+            .await
+            .expect("install MCP endpoint inventory");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(EndpointStatusCommand::Reset { .. })
+        ));
+        ctx.endpoint_observation_tx = Some(sender);
+        receiver
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_final_mcp_version_policy_denial() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for &(version_headers, status, response_code) in MCP_VERSION_DENIALS {
+            for disconnect_client in [false, true] {
+                let (mut config, _, mut ctx) = mcp_test_relay_context();
+                let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                // One request handle survives initialize's version exemption and
+                // the final check after a middleware changes the outgoing body.
+                let observer =
+                    EndpointObserver::begin(ctx.endpoint_observation_tx.as_ref(), &config)
+                        .expect("begin transformed request observation");
+                let buffered_request = |body: &[u8]| {
+                    let mut raw_header = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                    raw_header.extend_from_slice(body);
+                    crate::l7::provider::L7Request {
+                        action: "POST".into(),
+                        target: "/mcp".into(),
+                        query_params: TestHashMap::new(),
+                        raw_header,
+                        body_length: crate::l7::provider::BodyLength::ContentLength(
+                            body.len() as u64
+                        ),
+                    }
+                };
+                let initialize = buffered_request(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+            );
+                let (mut client, app) = tokio::io::duplex(2048);
+                assert!(
+                    enforce_final_mcp_protocol_version(
+                        &config,
+                        &initialize,
+                        &mut client,
+                        &ctx,
+                        "/mcp",
+                        Some(&observer),
+                    )
+                    .await
+                    .expect("initialize version exemption")
+                );
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "allowed request is not a terminal result"
+                );
+                let rewritten =
+                    buffered_request(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+                let mut app = Some(app);
+                if disconnect_client {
+                    // Dropping the peer makes the final rejection undeliverable.
+                    drop(app.take());
+                }
+                let result = enforce_final_mcp_protocol_version(
+                    &config,
+                    &rewritten,
+                    &mut client,
+                    &ctx,
+                    "/mcp",
+                    Some(&observer),
+                )
+                .await;
+                if disconnect_client {
+                    assert!(
+                        result.is_err(),
+                        "local denial cannot reach a disconnected client"
+                    );
+                } else {
+                    assert!(!result.expect("reject rewritten request version"));
+                }
+                drop(client);
+                if let Some(mut app) = app {
+                    let mut response = String::new();
+                    app.read_to_string(&mut response).await.unwrap();
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{response}"
+                    );
+                    assert!(response.contains(response_code), "{response}");
+                }
+                assert!(matches!(
+                    receiver
+                        .try_recv()
+                        .expect("final version policy denial observation"),
+                    EndpointStatusCommand::Observe {
+                        result: EndpointResult::PolicyDenied,
+                        ..
+                    }
+                ));
+                assert!(receiver.try_recv().is_err(), "one result per exchange");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn final_mcp_version_check_reclassifies_a_rewritten_initialize_body() {
         let (config, _, ctx) = mcp_test_relay_context();
@@ -9135,10 +9782,16 @@ network_policies:
         };
         let (mut client, mut relay_client) = tokio::io::duplex(2048);
 
-        let allowed =
-            enforce_final_mcp_protocol_version(&config, &request, &mut relay_client, &ctx, "/mcp")
-                .await
-                .expect("final request inspection");
+        let allowed = enforce_final_mcp_protocol_version(
+            &config,
+            &request,
+            &mut relay_client,
+            &ctx,
+            "/mcp",
+            None,
+        )
+        .await
+        .expect("final request inspection");
         assert!(
             !allowed,
             "rewritten non-initialize request must require a version"

@@ -467,10 +467,6 @@ struct L7DenyRuleDef {
 #[serde(deny_unknown_fields)]
 struct NetworkBinaryDef {
     path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -908,10 +904,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                 binaries: rule
                     .binaries
                     .into_iter()
-                    .map(|b| NetworkBinary {
-                        path: b.path,
-                        ..Default::default()
-                    })
+                    .map(|b| NetworkBinary { path: b.path })
                     .collect(),
             };
             (key, proto_rule)
@@ -1079,7 +1072,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                     .iter()
                     .map(|b| NetworkBinaryDef {
                         path: b.path.clone(),
-                        harness: false,
                     })
                     .collect(),
             };
@@ -5003,6 +4995,28 @@ network_policies:
             bogus: true
 ";
         assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_removed_network_binary_harness_field() {
+        let yaml = r"
+version: 1
+network_policies:
+  legacy:
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+        harness: true
+";
+
+        let error = parse_sandbox_policy(yaml).expect_err("removed harness field must be rejected");
+        let error_debug = format!("{error:?}");
+        assert!(
+            error_debug.contains("unknown field") && error_debug.contains("harness"),
+            "unexpected error: {error_debug}"
+        );
     }
 
     #[test]

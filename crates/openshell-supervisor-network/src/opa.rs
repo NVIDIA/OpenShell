@@ -9,9 +9,11 @@
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
+use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
+use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
@@ -1947,6 +1949,7 @@ fn l7_matchers_to_json(
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+    let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
             serde_json::json!({
@@ -2129,6 +2132,17 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.provider_credentialed {
                         ep["provider_credentialed"] = true.into();
                     }
+                    if is_mcp_protocol(&e.protocol) {
+                        // Derive endpoint identity from the policy endpoint while
+                        // it is still available. Request handling carries this
+                        // opaque value through exact path selection and never
+                        // recomputes identity from a concrete request host.
+                        ep["endpoint_id"] =
+                            openshell_core::endpoint_status::endpoint_id(e).into();
+                        // The selected endpoint must retain its policy identity
+                        // so it cannot bind to a replacement observation inventory.
+                        ep["policy_hash"] = policy_hash.clone().into();
+                    }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
                     }
@@ -2188,17 +2202,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .binaries
                 .iter()
                 .flat_map(|b| {
-                    // The deprecated harness bit is ignored by policy YAML, but
-                    // advisor-generated proposals use it as internal provenance.
-                    #[allow(deprecated)]
-                    let advisor_proposed = b.harness;
-                    let binary_entry = |path: &str| {
-                        let mut entry = serde_json::json!({"path": path});
-                        if advisor_proposed {
-                            entry["advisor_proposed"] = true.into();
-                        }
-                        entry
-                    };
+                    let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
                     match resolve_binary_in_container(&b.path, entrypoint_pid) {
                         BinaryResolution::Resolved(resolved) => {
@@ -2340,7 +2344,6 @@ mod tests {
                 ],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2355,7 +2358,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/glab".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2399,7 +2401,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3452,7 +3453,6 @@ process:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3990,7 +3990,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4062,7 +4061,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4139,7 +4137,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5237,7 +5234,6 @@ network_policies:
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".into(),
-                            ..Default::default()
                         }],
                     },
                 );
@@ -5496,6 +5492,120 @@ network_policies:
     }
 
     #[test]
+    fn l7_endpoint_config_derives_endpoint_id_from_proto() {
+        let mut policy = defaultable_mcp_proto(None);
+        let endpoint = policy
+            .network_policies
+            .get_mut("mcp")
+            .and_then(|rule| rule.endpoints.first_mut())
+            .expect("MCP test endpoint");
+        endpoint.path = "/mcp".to_string();
+        let expected = openshell_core::endpoint_status::endpoint_id(endpoint);
+        policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .binaries = vec![NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+        }];
+        let canonical = openshell_policy::validate_and_canonicalize_sandbox_policy(policy.clone())
+            .expect("canonical MCP test policy");
+        let expected_hash = deterministic_policy_hash(&canonical);
+        let engine = OpaEngine::from_proto(&policy).expect("engine from proto");
+        let config = engine
+            .query_endpoint_config(&NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("query endpoint config")
+            .expect("MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse MCP config");
+        assert_eq!(
+            l7.endpoint_id, expected,
+            "OPA must carry the ID derived from the exact proto endpoint"
+        );
+        assert_eq!(l7.policy_hash, expected_hash);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_mcp_policy_keeps_endpoint_observation_identity() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, endpoint_id,
+            endpoint_status_channel,
+        };
+        use openshell_core::policy_identity::deterministic_policy_hash;
+
+        for protocol in ["Mcp", "MCP"] {
+            let mut policy = defaultable_mcp_proto(None);
+            let rule = policy
+                .network_policies
+                .get_mut("mcp")
+                .expect("MCP test rule");
+            rule.endpoints[0].protocol = protocol.to_string();
+            rule.binaries = vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }];
+            let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+                .expect("mixed-case MCP policy is valid");
+            let expected_id = endpoint_id(&policy.network_policies["mcp"].endpoints[0]);
+            let (sender, mut receiver) = endpoint_status_channel();
+            let mut tracker = receiver.tracker();
+            sender
+                .reset(
+                    EndpointConfigVersion {
+                        policy_hash: deterministic_policy_hash(&policy),
+                        provider_env_revision: 1,
+                    },
+                    vec![EndpointInventoryEntry {
+                        endpoint_id: expected_id.clone(),
+                        uses_provider_credentials: false,
+                    }],
+                )
+                .await
+                .expect("install mixed-case MCP inventory");
+            assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
+            let engine = OpaEngine::from_proto(&policy).expect("engine from mixed-case MCP proto");
+            let selected = engine
+                .query_endpoint_config(&NetworkInput {
+                    host: "mcp.example.com".into(),
+                    port: 443,
+                    binary_path: PathBuf::from("/usr/bin/curl"),
+                    binary_sha256: String::new(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                })
+                .expect("query mixed-case MCP endpoint")
+                .expect("mixed-case MCP endpoint config");
+            let selected =
+                crate::l7::parse_l7_config(&selected).expect("parse selected MCP config");
+            assert_eq!(selected.protocol, crate::l7::L7Protocol::Mcp);
+            assert_eq!(
+                selected.endpoint_id, expected_id,
+                "{protocol} must retain inventory identity"
+            );
+            let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
+                .expect("mixed-case MCP endpoint begins an observation");
+            observer.observe(EndpointResult::HttpResponseReceived);
+            while let Ok(command) = receiver.try_recv() {
+                tracker.apply(command);
+            }
+            let snapshot = tracker
+                .snapshot()
+                .expect("mixed-case MCP inventory remains installed");
+            assert_eq!(snapshot.endpoints.len(), 1);
+            assert_eq!(snapshot.endpoints[0].endpoint_id, expected_id);
+            assert_eq!(
+                snapshot.endpoints[0].result,
+                EndpointResult::HttpResponseReceived
+            );
+        }
+    }
+
+    #[test]
     fn l7_endpoint_config_preserves_proto_allow_encoded_slash() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -5513,7 +5623,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5571,7 +5680,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5630,7 +5738,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5691,7 +5798,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/aws".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5751,7 +5857,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5882,7 +5987,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5897,7 +6001,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7131,64 +7234,6 @@ network_policies:
     }
 
     #[test]
-    fn exact_declared_endpoint_host_false_for_advisor_proposed_binary() {
-        let mut network_policies = std::collections::HashMap::new();
-        let mut proposal_binary = NetworkBinary {
-            path: "/usr/bin/curl".to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            proposal_binary.harness = true;
-        }
-        network_policies.insert(
-            "allow_mcp_internal_corp_example_com_8443".to_string(),
-            NetworkPolicyRule {
-                name: "allow_mcp_internal_corp_example_com_8443".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "mcp-internal.corp.example.com".to_string(),
-                    port: 8443,
-                    ..Default::default()
-                }],
-                binaries: vec![proposal_binary],
-            },
-        );
-        let proto = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(ProtoFs {
-                include_workdir: true,
-                read_only: vec![],
-                read_write: vec![],
-            }),
-            landlock: Some(openshell_core::proto::LandlockPolicy {
-                compatibility: "best_effort".to_string(),
-            }),
-            process: Some(ProtoProc {
-                run_as_user: "sandbox".to_string(),
-                run_as_group: "sandbox".to_string(),
-            }),
-            network_policies,
-            network_middlewares: std::collections::HashMap::default(),
-        };
-        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
-        let input = NetworkInput {
-            host: "mcp-internal.corp.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "advisor proposal should still allow at OPA L4"
-        );
-        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
-    }
-
-    #[test]
     fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -7204,7 +7249,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7275,7 +7319,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7506,7 +7549,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8483,7 +8525,6 @@ network_policies:
                     .iter()
                     .map(|p| NetworkBinary {
                         path: p.to_str().unwrap().to_string(),
-                        ..Default::default()
                     })
                     .collect(),
             },
@@ -8543,7 +8584,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8617,7 +8657,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8824,7 +8863,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -9115,10 +9153,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -9193,10 +9228,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {

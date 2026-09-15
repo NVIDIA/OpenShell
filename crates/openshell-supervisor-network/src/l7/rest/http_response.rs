@@ -21,18 +21,20 @@ pub struct HttpResponseMiddlewareRelay<'a> {
 }
 
 #[derive(Clone)]
-pub(super) struct RelayResponseOptions {
+pub(super) struct RelayResponseOptions<'a> {
     pub(super) websocket_extensions: WebSocketExtensionMode,
     pub(super) client_requested_upgrade: bool,
     pub(super) websocket: Option<WebSocketResponseValidation>,
+    pub(super) observer: Option<&'a EndpointObserver>,
 }
 
-impl Default for RelayResponseOptions {
+impl Default for RelayResponseOptions<'_> {
     fn default() -> Self {
         Self {
             websocket_extensions: WebSocketExtensionMode::Preserve,
             client_requested_upgrade: true,
             websocket: None,
+            observer: None,
         }
     }
 }
@@ -41,7 +43,7 @@ pub(super) async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
-    options: RelayResponseOptions,
+    options: RelayResponseOptions<'_>,
     response_middleware: Option<HttpResponseMiddlewareRelay<'_>>,
 ) -> Result<RelayOutcome>
 where
@@ -52,28 +54,31 @@ where
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
 
-    // Read response headers. Forward interim responses unchanged, but retain
-    // the final response head until response middleware preflight completes.
-    loop {
-        if buf.len() > MAX_HEADER_BYTES {
+    // Forward interim responses unchanged, but retain the final response head
+    // until response middleware preflight completes.
+    let mut informational_header_bytes = 0;
+    let header_end = loop {
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|end| end + 4);
+        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
+        if header_end.is_some_and(|end| end > remaining_header_bytes)
+            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
+        {
+            if let Some(observer) = options.observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
             return Err(miette!("HTTP response headers exceed limit"));
         }
 
-        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
-        if n == 0 {
-            // Upstream closed — forward whatever we have
-            if !buf.is_empty() {
-                client.write_all(&buf).await.into_diagnostic()?;
-            }
-            return Ok(RelayOutcome::Consumed);
-        }
-        buf.extend_from_slice(&tmp[..n]);
-
-        while let Some(position) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_end = position + 4;
+        if let Some(header_end) = header_end {
             let header_str = String::from_utf8_lossy(&buf[..header_end]);
-            let status_code = parse_status_code(&header_str).unwrap_or(200);
-            if (100..200).contains(&status_code) && status_code != 101 {
+            if matches!(
+                parse_observed_http_status_code(&header_str),
+                Some(100 | 102..=199)
+            ) {
+                informational_header_bytes += header_end;
                 client
                     .write_all(&buf[..header_end])
                     .await
@@ -82,17 +87,34 @@ where
                 buf.drain(..header_end);
                 continue;
             }
-            break;
+            break header_end;
         }
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
 
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
+        if n == 0 {
+            if let Some(observer) = options.observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            if !buf.is_empty() {
+                client.write_all(&buf).await.into_diagnostic()?;
+            }
+            return Ok(RelayOutcome::Consumed);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
 
     // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
+    let observed_status = parse_observed_http_status_code(&header_str);
+    if let Some(observer) = options.observer.as_ref() {
+        match observed_status {
+            Some(status_code) if status_code < 400 => {
+                observer.observe(EndpointResult::HttpResponseReceived);
+            }
+            Some(_) => observer.observe(EndpointResult::UpstreamRejected),
+            None => observer.observe(EndpointResult::TransportFailed),
+        }
+    }
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
     let event_stream = response_is_event_stream(&header_str);
@@ -1968,6 +1990,23 @@ pub(super) fn parse_status_code(headers: &str) -> Option<u16> {
     let status_line = headers.lines().next()?;
     let code_str = status_line.split_whitespace().nth(1)?;
     code_str.parse().ok()
+}
+
+/// Parse a syntactically valid HTTP/1.x response status for endpoint reporting.
+pub(super) fn parse_observed_http_status_code(headers: &str) -> Option<u16> {
+    let status_line = headers.lines().next()?;
+    let mut fields = status_line.split_whitespace();
+    match fields.next()? {
+        "HTTP/1.0" | "HTTP/1.1" => {}
+        _ => return None,
+    }
+    let code = fields.next()?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    code.parse()
+        .ok()
+        .filter(|status| (100..=999).contains(status))
 }
 
 /// Check if the response headers contain `Connection: close`.

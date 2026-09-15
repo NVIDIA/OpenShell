@@ -1117,6 +1117,15 @@ async fn apply_minted_credential(
             updated.credential_expires_at_ms.remove(key);
         }
     }
+    // Acquire the shared sandbox mutation boundary only around validation and
+    // persistence, after any remote minting or credential staging. This
+    // prevents route status from committing against the old provider revision
+    // after the rotation writes, without holding the guard across network I/O.
+    let _sandbox_sync_guard = if let Some(compute) = compute {
+        Some(compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
     if let Err(err) = crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
         store, workspace, &updated,
     )

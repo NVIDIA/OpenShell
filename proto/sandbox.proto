@@ -311,8 +311,8 @@ message L7QueryMatcher {
 // A binary identity for network policy matching.
 message NetworkBinary {
   string path = 1;
-  // Deprecated: the harness concept has been removed. This field is ignored.
-  bool harness = 2 [deprecated = true];
+  reserved 2;
+  reserved "harness";
 }
 
 // Request to get sandbox settings by sandbox ID.
