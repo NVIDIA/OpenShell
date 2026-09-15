@@ -387,8 +387,12 @@ candidate policy with an operator-supplied local boundary. It establishes
 result. It does not fetch gateway state, compose provider rules, apply policy,
 or decide whether an in-boundary change is eligible for automatic approval.
 
-The initial model covers filesystem paths, L4 network authority, and enforced
-REST method and path authority. It returns explicit unsupported or inconclusive
+The containment model covers filesystem paths, supported process identities,
+Landlock compatibility requirements, L4 destinations including IP ranges, and
+enforced REST method and path authority. Identity comparisons assume consistent
+user and group resolution. Compatibility checks compare requested enforcement
+requirements, not the actual kernel state of a running sandbox.
+It returns explicit unsupported or inconclusive
 results when a sound decision depends on authority or runtime context outside
 the model. The result records the model version and covered domains so callers
 can bind a successful check to those semantics.

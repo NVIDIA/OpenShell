@@ -143,7 +143,8 @@ inconclusive results as failures in CI.
 
 ## Interpretation and Limits
 
-The initial containment model covers filesystem paths, L4 network authority,
+The `boundary-v2` containment model covers filesystem paths, process
+identity settings, Landlock compatibility requirements, L4 destination authority,
 and enforced REST method and path authority, including explicit REST denies.
 The result object reports the domains used for each check. Policies that use
 recognized authority outside that model return `unsupported` rather than
@@ -163,6 +164,41 @@ pattern, and 1 MiB of modeled pattern text. Exceeding any limit returns
 requested at preflight takes precedence over that result; otherwise a resource
 limit takes precedence over unsupported policy-shape diagnostics. This ordering
 keeps validation work bounded for checked-in CI inputs.
+
+### Process and Landlock settings
+
+Matching supported `run_as_user` and `run_as_group` values do not expand the
+configuration. Changing an explicit non-root identity to `root` or `0` returns
+`exceeds_boundary` with the field and both values. Other identity changes return
+`unsupported`; the command does not resolve accounts from a sandbox image.
+These comparisons assume consistent identity resolution and execution settings.
+They do not prove permission relationships between arbitrary Linux accounts.
+
+Landlock `hard_requirement` may not become `best_effort`. That change returns
+`exceeds_boundary`. Keeping the same mode or strengthening it to
+`hard_requirement` passes this part of the check. This compares the requested
+requirement, not whether a target kernel successfully installed Landlock
+restrictions.
+
+### Destination IP restrictions
+
+The network action includes an IPv4 or IPv6 destination address. CIDR entries
+in `allowed_ips` are modeled together with host, port, executable, and REST
+restrictions; network counterexamples include `destination_ip`. An empty IP
+list follows the runtime's destination rules and is not a universal allowlist.
+The check does not resolve DNS on the host running the CLI.
+
+Policies whose overlapping endpoints select different destination restrictions
+remain unsupported because the runtime uses the selected endpoint's address
+filter. CIDR unions within a supported endpoint are checked by the solver.
+Unsupported IP-literal wildcard selectors and ranges rejected by the runtime
+also cannot produce a successful proof.
+
+Consumers must explicitly accept model `boundary-v2` and its additional
+`process` and `landlock` domains. Do not treat a v1 result as covering these
+fields.
+
+### Remaining limits
 
 Network binary selectors, endpoint host and path selectors, and REST allow and
 deny method and path selectors must use ASCII literals in both the candidate and

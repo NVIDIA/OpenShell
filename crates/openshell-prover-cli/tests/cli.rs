@@ -80,9 +80,9 @@ fn contained_policy_returns_stable_json_and_zero() {
     assert_eq!(
         value["scope"],
         serde_json::json!({
-            "model_version": "boundary-v1",
+            "model_version": "boundary-v2",
             "policy_version": 1,
-            "domains": ["filesystem", "network_l4", "network_rest"]
+            "domains": ["filesystem", "network_l4", "network_rest", "process", "landlock"]
         })
     );
     assert!(value["counterexample"].is_null());
@@ -536,6 +536,9 @@ fn sigint_interrupts_the_check_with_exit_130() {
         policy(
             (0..300)
                 .map(|index| format!("/route{index}/**/tail*"))
+                // Cover the bounded concrete-witness sample so this fixture
+                // still exercises interruption of the unrestricted solver.
+                .chain(std::iter::once("/routea/**/tail*".to_owned()))
                 .collect(),
         )
         .to_string(),

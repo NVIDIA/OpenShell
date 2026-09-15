@@ -12,7 +12,7 @@
 //! remains exhaustive: its four outcomes are the stable, closed result-state
 //! contract, and authorization should accept only [`CheckResult::Within`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -27,6 +27,9 @@ use openshell_policy_schema::{
 use z3::ast::{Ast, Bool, Int, Regexp, String as Z3String};
 use z3::{Context, Params, SatResult, Solver};
 
+mod execution;
+mod ip;
+
 const LAYER_L4: &str = "l4";
 const LAYER_REST: &str = "rest";
 const WORKDIR_SYMBOL: &str = "<OCI_WORKDIR>";
@@ -35,6 +38,7 @@ const MAX_ENDPOINTS: usize = 4_096;
 const MAX_BINARIES: usize = 4_096;
 const MAX_PORT_ENTRIES: usize = 65_536;
 const MAX_L7_RULES: usize = 16_384;
+const MAX_IP_RANGES: usize = 4_096;
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_TOTAL_PATTERN_BYTES: usize = 1024 * 1024;
 
@@ -182,6 +186,8 @@ pub enum CheckDomain {
     Filesystem,
     NetworkL4,
     NetworkRest,
+    Process,
+    Landlock,
 }
 
 impl CheckDomain {
@@ -191,6 +197,8 @@ impl CheckDomain {
             Self::Filesystem => "filesystem",
             Self::NetworkL4 => "network_l4",
             Self::NetworkRest => "network_rest",
+            Self::Process => "process",
+            Self::Landlock => "landlock",
         }
     }
 }
@@ -208,10 +216,12 @@ static DOMAINS: &[CheckDomain] = &[
     CheckDomain::Filesystem,
     CheckDomain::NetworkL4,
     CheckDomain::NetworkRest,
+    CheckDomain::Process,
+    CheckDomain::Landlock,
 ];
 fn check_scope() -> &'static CheckScope {
     static SCOPE: CheckScope = CheckScope {
-        model_version: "boundary-v1",
+        model_version: "boundary-v2",
         policy_version: 1,
         domains: DOMAINS,
     };
@@ -256,6 +266,14 @@ impl Protocol {
 #[non_exhaustive]
 pub enum Counterexample {
     #[non_exhaustive]
+    Process {
+        field: &'static str,
+        boundary: String,
+        candidate: String,
+    },
+    #[non_exhaustive]
+    Landlock { boundary: String, candidate: String },
+    #[non_exhaustive]
     Filesystem {
         access: FilesystemAccess,
         path: String,
@@ -266,6 +284,8 @@ pub enum Counterexample {
         ancestor_binary: Option<String>,
         binary_identity_required: bool,
         host: String,
+        destination_ip: IpAddr,
+        trusted_gateway: bool,
         port: u16,
         protocol: Protocol,
         method: Option<String>,
@@ -347,6 +367,8 @@ struct SymbolicAction {
     layer: Z3String,
     method: Z3String,
     path: Z3String,
+    ip: ip::SymbolicIp,
+    trusted_gateway: Bool,
 }
 
 enum NetworkSolve {
@@ -393,6 +415,9 @@ fn check_within_boundary_inner(
     if let Some(reason) = unresolved_workdir_reason(boundary, candidate) {
         return unsupported(ReasonCode::UnresolvedWorkdir, reason);
     }
+    if let Some(result) = execution::check(boundary, candidate) {
+        return result;
+    }
     if boundary == candidate {
         return CheckResult::Within(WithinEvidence);
     }
@@ -402,6 +427,13 @@ fn check_within_boundary_inner(
     }
     let started = Instant::now();
     for binary_identity_required in [false, true] {
+        if binary_identity_required && has_ambiguous_candidate_binary_path(boundary, candidate) {
+            return unsupported(
+                ReasonCode::UnresolvedBinaryPath,
+                "network containment depends on image-specific binary symlink resolution"
+                    .to_owned(),
+            );
+        }
         match solve_network_mode(
             boundary,
             candidate,
@@ -415,13 +447,6 @@ fn check_within_boundary_inner(
                 return CheckResult::Exceeds(ExceedsEvidence(counterexample));
             }
             NetworkSolve::Incomplete(result) => return result,
-        }
-        if binary_identity_required && has_ambiguous_candidate_binary_path(boundary, candidate) {
-            return unsupported(
-                ReasonCode::UnresolvedBinaryPath,
-                "network containment depends on image-specific binary symlink resolution"
-                    .to_owned(),
-            );
         }
     }
     if unresolved_exact_deny_symlink(boundary, candidate) {
@@ -494,6 +519,9 @@ fn solve_network_mode(
     if network_is_structurally_contained(boundary, candidate, binary_identity_required) {
         return NetworkSolve::Within;
     }
+    if let Some(witness) = concrete_network_witness(boundary, candidate, binary_identity_required) {
+        return NetworkSolve::Exceeds(witness);
+    }
     let solver = Solver::new();
     let action = symbolic_action(if binary_identity_required {
         "strict_boundary_policy_action"
@@ -501,10 +529,13 @@ fn solve_network_mode(
         "relaxed_boundary_policy_action"
     });
     assert_action_domain(&solver, &action, binary_identity_required);
-    solver.assert(Bool::and(&[
-        policy_allows(candidate, &action, binary_identity_required),
-        !policy_allows(boundary, &action, binary_identity_required),
-    ]));
+    solver.assert(
+        Bool::and(&[
+            policy_allows(candidate, &action, binary_identity_required),
+            !policy_allows(boundary, &action, binary_identity_required),
+        ])
+        .simplify(),
+    );
 
     let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
         return NetworkSolve::Incomplete(solver_timeout_result());
@@ -554,6 +585,72 @@ fn solve_network_mode(
                 NetworkSolve::Exceeds,
             ),
     }
+}
+
+/// A few concrete requests make common counterexamples cheap and readable.
+/// Each is replayed against the full predicate. Failure to find one never
+/// establishes containment: the unrestricted symbolic query still follows.
+fn concrete_network_witness(
+    boundary: &ContainmentPolicy,
+    candidate: &ContainmentPolicy,
+    binary_identity_required: bool,
+) -> Option<Counterexample> {
+    for (rule, endpoint) in candidate
+        .network_policies
+        .values()
+        .flat_map(|rule| rule.endpoints.iter().map(move |endpoint| (rule, endpoint)))
+        .take(8)
+    {
+        let host = endpoint
+            .host
+            .to_ascii_lowercase()
+            .replace("**", "a")
+            .replace('*', "a");
+        let binary = binary_identity_required.then(|| {
+            rule.binaries.first().map_or_else(
+                || "/usr/bin/worker".to_owned(),
+                |binary| binary.path.replace("**", "a").replace('*', "a"),
+            )
+        });
+        let method = endpoint
+            .rules
+            .first()
+            .map_or("GET", |rule| rule.allow.method.as_str())
+            .to_ascii_uppercase();
+        let path = endpoint
+            .rules
+            .first()
+            .map_or(endpoint.path.as_str(), |rule| rule.allow.path.as_str());
+        let path = if path.is_empty() {
+            "/".to_owned()
+        } else {
+            path.replace("**", "a").replace('*', "a")
+        };
+        if !is_canonical_dns_host(&host)
+            || !is_canonical_rest_path(&path)
+            || !is_http_method(&method)
+        {
+            continue;
+        }
+        for destination_ip in ip::sample_addresses(endpoint) {
+            let witness = Counterexample::Network {
+                binary: binary.clone(),
+                ancestor_binary: binary.clone(),
+                binary_identity_required,
+                host: host.clone(),
+                destination_ip,
+                trusted_gateway: false,
+                port: endpoint.effective_ports()[0],
+                protocol: endpoint.protocol_kind(),
+                method: (endpoint.protocol_kind() == Protocol::Rest).then(|| method.clone()),
+                path: (endpoint.protocol_kind() == Protocol::Rest).then(|| path.clone()),
+            };
+            if counterexample_satisfies_predicate(boundary, candidate, &witness) {
+                return Some(witness);
+            }
+        }
+    }
+    None
 }
 
 fn solver_timeout_result() -> CheckResult {
@@ -645,6 +742,7 @@ fn rest_endpoint_structurally_contains(boundary: &Endpoint, candidate: &Endpoint
         || candidate.protocol_kind() != Protocol::Rest
         || !boundary.host.eq_ignore_ascii_case(&candidate.host)
         || boundary.path != candidate.path
+        || boundary.allowed_ips != candidate.allowed_ips
         || !candidate
             .effective_ports()
             .iter()
@@ -702,10 +800,13 @@ fn symbolic_action(name: &str) -> SymbolicAction {
         layer: Z3String::new_const(format!("{name}_layer")),
         method: Z3String::new_const(format!("{name}_method")),
         path: Z3String::new_const(format!("{name}_path")),
+        ip: ip::SymbolicIp::new(name),
+        trusted_gateway: Bool::new_const(format!("{name}_trusted_gateway")),
     }
 }
 
 fn assert_action_domain(solver: &Solver, action: &SymbolicAction, binary_identity_required: bool) {
+    action.ip.assert_domain(solver);
     if binary_identity_required {
         solver.assert(action.binary.regex_matches(&glob_regex("/**", "/")));
         solver.assert(action.binary.length().le(4_096));
@@ -755,7 +856,11 @@ fn policy_allows(
             .values()
             .map(|rule| rule_denies(rule, action, binary_identity_required)),
     );
-    Bool::and(&[allowed, !denied])
+    Bool::and(&[
+        allowed,
+        !denied,
+        ip::policy_allows(policy, action, binary_identity_required),
+    ])
 }
 
 fn rule_allows(
@@ -945,6 +1050,8 @@ fn counterexample_from_model(
         ancestor_binary,
         binary_identity_required,
         host,
+        destination_ip: action.ip.decode(model)?,
+        trusted_gateway: model.eval(&action.trusted_gateway, true)?.as_bool()?,
         port: u16::try_from(port).ok()?,
         protocol,
         method,
@@ -979,6 +1086,8 @@ fn counterexample_satisfies_predicate(
         ancestor_binary,
         binary_identity_required,
         host,
+        destination_ip,
+        trusted_gateway,
         port,
         protocol,
         method,
@@ -995,6 +1104,8 @@ fn counterexample_satisfies_predicate(
         layer: Z3String::from_str(protocol.as_str()).unwrap(),
         method: Z3String::from_str(method.as_deref().unwrap_or("GET")).unwrap(),
         path: Z3String::from_str(path.as_deref().unwrap_or("/")).unwrap(),
+        ip: ip::SymbolicIp::concrete(*destination_ip),
+        trusted_gateway: Bool::from_bool(*trusted_gateway),
     };
     Bool::and(&[
         policy_allows(candidate, &concrete, *binary_identity_required),
@@ -1378,12 +1489,12 @@ fn validate_supported_policy(
 }
 
 fn validate_supported_common_policy(policy: &ContainmentPolicy) -> Result<(), UnsupportedFeature> {
-    if policy.landlock.is_some()
-        || policy.process.is_some()
-        || !policy.network_middlewares.is_empty()
-    {
+    if let Some(reason) = execution::unsupported_reason(policy) {
+        return Err(UnsupportedFeature::policy_shape(reason));
+    }
+    if !policy.network_middlewares.is_empty() {
         return Err(UnsupportedFeature::policy_shape(
-            "uses process, Landlock, or network middleware controls",
+            "uses network middleware controls",
         ));
     }
     Ok(())
@@ -1487,14 +1598,18 @@ fn validate_supported_endpoint_extensions(
     context: &str,
     endpoint: &Endpoint,
 ) -> Result<(), UnsupportedFeature> {
-    if !endpoint.allowed_ips.is_empty()
-        || !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
+    if !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
         || endpoint.allow_encoded_slash
         || endpoint.websocket_credential_rewrite
         || endpoint.request_body_credential_rewrite
         || endpoint.allow_uninspected_credentials
     {
         return unsupported_endpoint_extension(context);
+    }
+    if let Some(reason) = ip::unsupported_endpoint(endpoint) {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} {reason}"
+        )));
     }
     validate_supported_graphql(context, endpoint)?;
     validate_supported_credentials(context, endpoint)?;
@@ -1636,33 +1751,83 @@ fn validate_supported_rest(context: &str, endpoint: &Endpoint) -> Result<(), Uns
     Ok(())
 }
 
-#[derive(Default)]
-struct ProtocolAuthorityIndex {
-    all: BTreeSet<u16>,
-    wildcards: BTreeSet<u16>,
-    exact: BTreeMap<String, BTreeSet<u16>>,
+struct AttributeSummary<T> {
+    first: Option<T>,
+    mixed: bool,
 }
 
-impl ProtocolAuthorityIndex {
-    fn overlaps(&self, host: &str, ports: &[u16]) -> bool {
+impl<T: Clone + Eq> AttributeSummary<T> {
+    fn conflicts(&self, value: &T) -> bool {
+        self.mixed || self.first.as_ref().is_some_and(|first| first != value)
+    }
+
+    fn insert(&mut self, value: &T) {
+        if let Some(first) = &self.first {
+            self.mixed |= first != value;
+        } else {
+            self.first = Some(value.clone());
+        }
+    }
+}
+
+impl<T> Default for AttributeSummary<T> {
+    fn default() -> Self {
+        Self {
+            first: None,
+            mixed: false,
+        }
+    }
+}
+
+struct AuthorityAttributeIndex<T> {
+    all: BTreeMap<u16, AttributeSummary<T>>,
+    wildcards: BTreeMap<u16, AttributeSummary<T>>,
+    exact: BTreeMap<String, BTreeMap<u16, AttributeSummary<T>>>,
+}
+
+impl<T> Default for AuthorityAttributeIndex<T> {
+    fn default() -> Self {
+        Self {
+            all: BTreeMap::new(),
+            wildcards: BTreeMap::new(),
+            exact: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Clone + Eq> AuthorityAttributeIndex<T> {
+    fn overlaps_with_different(&self, host: &str, ports: &[u16], value: &T) -> bool {
         ports.iter().any(|port| {
-            self.wildcards.contains(port)
-                || if host.contains('*') {
-                    self.all.contains(port)
-                } else {
-                    self.exact
+            if host.contains('*') {
+                self.all
+                    .get(port)
+                    .is_some_and(|summary| summary.conflicts(value))
+            } else {
+                self.wildcards
+                    .get(port)
+                    .is_some_and(|summary| summary.conflicts(value))
+                    || self
+                        .exact
                         .get(host)
-                        .is_some_and(|ports_for_host| ports_for_host.contains(port))
-                }
+                        .and_then(|ports_for_host| ports_for_host.get(port))
+                        .is_some_and(|summary| summary.conflicts(value))
+            }
         })
     }
 
-    fn insert(&mut self, host: &str, ports: &[u16]) {
-        self.all.extend(ports);
-        if host.contains('*') {
-            self.wildcards.extend(ports);
-        } else {
-            self.exact.entry(host.to_owned()).or_default().extend(ports);
+    fn insert(&mut self, host: &str, ports: &[u16], value: &T) {
+        for port in ports {
+            self.all.entry(*port).or_default().insert(value);
+            if host.contains('*') {
+                self.wildcards.entry(*port).or_default().insert(value);
+            } else {
+                self.exact
+                    .entry(host.to_owned())
+                    .or_default()
+                    .entry(*port)
+                    .or_default()
+                    .insert(value);
+            }
         }
     }
 }
@@ -1671,8 +1836,10 @@ fn validate_no_cross_protocol_overlap(
     policy: &ContainmentPolicy,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), PolicyValidationError> {
-    let mut l4 = ProtocolAuthorityIndex::default();
-    let mut rest = ProtocolAuthorityIndex::default();
+    let mut protocols = AuthorityAttributeIndex::default();
+    let mut allowed_ips = AuthorityAttributeIndex::default();
+    let mut different_allowed_ips_overlap = false;
+    let mut different_protocols_overlap = false;
     for endpoint in policy
         .network_policies
         .values()
@@ -1683,17 +1850,24 @@ fn validate_no_cross_protocol_overlap(
         }
         let host = endpoint.host.to_ascii_lowercase();
         let ports = endpoint.effective_ports();
-        let (current, other) = match endpoint.protocol_kind() {
-            Protocol::L4 => (&mut l4, &rest),
-            Protocol::Rest => (&mut rest, &l4),
-        };
-        if other.overlaps(&host, &ports) {
-            return Err(UnsupportedFeature::policy_shape(
-                "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",
-            )
-            .into());
-        }
-        current.insert(&host, &ports);
+        let protocol = endpoint.protocol_kind();
+        different_allowed_ips_overlap |=
+            allowed_ips.overlaps_with_different(&host, &ports, &endpoint.allowed_ips);
+        different_protocols_overlap |= protocols.overlaps_with_different(&host, &ports, &protocol);
+        allowed_ips.insert(&host, &ports, &endpoint.allowed_ips);
+        protocols.insert(&host, &ports, &protocol);
+    }
+    if different_allowed_ips_overlap {
+        return Err(UnsupportedFeature::policy_shape(
+            "has overlapping endpoints with different allowed_ips; runtime first-endpoint selection is not modeled",
+        )
+        .into());
+    }
+    if different_protocols_overlap {
+        return Err(UnsupportedFeature::policy_shape(
+            "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",
+        )
+        .into());
     }
     Ok(())
 }
@@ -1749,6 +1923,7 @@ fn resource_limit_reason(
 
     let mut port_entry_count = 0_usize;
     let mut l7_count = 0_usize;
+    let mut ip_range_count = 0_usize;
     let mut total_pattern_bytes = 0_usize;
     for policy in policies {
         for path in policy
@@ -1788,8 +1963,22 @@ fn resource_limit_reason(
                     return Some(resource_limit_detail("l7_rules", l7_count, MAX_L7_RULES));
                 }
 
+                ip_range_count = ip_range_count.saturating_add(endpoint.allowed_ips.len());
+                if ip_range_count > MAX_IP_RANGES {
+                    return Some(resource_limit_detail(
+                        "ip_ranges",
+                        ip_range_count,
+                        MAX_IP_RANGES,
+                    ));
+                }
+
                 for value in [&endpoint.host, &endpoint.path] {
                     if let Some(reason) = account_pattern_bytes(value, &mut total_pattern_bytes) {
+                        return Some(reason);
+                    }
+                }
+                for range in &endpoint.allowed_ips {
+                    if let Some(reason) = account_pattern_bytes(range, &mut total_pattern_bytes) {
                         return Some(reason);
                     }
                 }
@@ -2022,6 +2211,20 @@ mod tests {
         CheckOptions::new(Duration::from_secs(10))
     }
 
+    // Keep address permissions identical when testing hostname/binary logic:
+    // an exact declaration without allowed_ips permits private addresses,
+    // whereas a wildcard declaration without allowed_ips does not.
+    fn fixed_test_ips(mut policy: ContainmentPolicy) -> ContainmentPolicy {
+        for endpoint in policy
+            .network_policies
+            .values_mut()
+            .flat_map(|rule| &mut rule.endpoints)
+        {
+            endpoint.allowed_ips = vec!["8.8.8.0/24".to_owned()];
+        }
+        policy
+    }
+
     #[test]
     fn filesystem_containment_and_counterexample() {
         let boundary =
@@ -2140,6 +2343,8 @@ mod tests {
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: api_internal.example.com, port: 443 }]\n    binaries: []\n",
         );
+        let boundary = fixed_test_ips(boundary);
+        let candidate = fixed_test_ips(candidate);
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
@@ -2535,6 +2740,8 @@ mod tests {
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
+        let boundary = fixed_test_ips(boundary);
+        let candidate = fixed_test_ips(candidate);
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
@@ -2961,6 +3168,8 @@ network_policies:
         let recursive = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '**.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
+        let recursive = fixed_test_ips(recursive);
+        let nested = fixed_test_ips(nested);
         assert!(matches!(
             check_within_boundary(&recursive, &nested, options()),
             CheckResult::Within(_)

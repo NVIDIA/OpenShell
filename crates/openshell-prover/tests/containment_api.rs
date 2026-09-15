@@ -38,6 +38,8 @@ fn domain_name(domain: CheckDomain) -> &'static str {
         CheckDomain::Filesystem => "filesystem",
         CheckDomain::NetworkL4 => "network_l4",
         CheckDomain::NetworkRest => "network_rest",
+        CheckDomain::Process => "process",
+        CheckDomain::Landlock => "landlock",
         _ => "unknown",
     }
 }
@@ -63,7 +65,7 @@ fn external_callers_use_extensible_construction_and_matching_patterns() {
     let CheckResult::Exceeds(evidence) = &result else {
         panic!("expected filesystem violation, got {result:?}");
     };
-    assert_eq!(evidence.scope().model_version, "boundary-v1");
+    assert_eq!(evidence.scope().model_version, "boundary-v2");
     assert!(
         evidence
             .scope()
