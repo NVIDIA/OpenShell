@@ -61,6 +61,10 @@ fn assert_json_response(
 async fn destination_denials_preserve_adapter_specific_wire_contracts() {
     let cases = [
         (
+            DestinationDenialKind::Resolution,
+            "destination resolution failed",
+        ),
+        (
             DestinationDenialKind::TrustedGateway,
             "trusted-gateway check failed",
         ),
@@ -551,6 +555,7 @@ network_policies:
                                     AgentProposals::default(),
                                     Arc::new(None),
                                     Arc::new(None),
+                                    None,
                                     None,
                                     None,
                                     None,

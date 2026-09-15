@@ -46,15 +46,15 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    DeleteServiceRequest, EndpointResult, EndpointStatus, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
     GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
     ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
+    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
     exec_sandbox_event, tcp_forward_init,
@@ -1589,6 +1589,36 @@ pub async fn sandbox_get(
         );
     }
 
+    if let Some(status) = &sandbox.status
+        && !status.conditions.is_empty()
+    {
+        println!("  {}", "Conditions:".dimmed());
+        for condition in &status.conditions {
+            for (index, line) in sandbox_condition_display_lines(condition)
+                .iter()
+                .enumerate()
+            {
+                let prefix = if index == 0 { "- " } else { "  " };
+                println!("    {prefix}{line}");
+            }
+        }
+    }
+
+    if let Some(status) = &sandbox.status
+        && !status.endpoint_statuses.is_empty()
+    {
+        println!("  {}", "Tool server connections:".dimmed());
+        for endpoint in &status.endpoint_statuses {
+            for (index, line) in endpoint_status_display_lines(endpoint).iter().enumerate() {
+                let prefix = if index == 0 { "- " } else { "  " };
+                println!("    {prefix}{line}");
+            }
+        }
+        println!(
+            "    Results come from observed MCP over HTTP traffic. They do not check current availability or tool-call success."
+        );
+    }
+
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
         "  {} {}",
@@ -2392,6 +2422,29 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "resource_version": provenance.resource_version,
                 })
             });
+    let conditions = sandbox.status.as_ref().map_or_else(Vec::new, |status| {
+        status
+            .conditions
+            .iter()
+            .map(sandbox_condition_to_json)
+            .collect::<Vec<_>>()
+    });
+    let endpoint_statuses = sandbox.status.as_ref().map_or_else(Vec::new, |status| {
+        status
+            .endpoint_statuses
+            .iter()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "endpoint_id": endpoint.endpoint_id,
+                    "host": endpoint.host,
+                    "ports": endpoint.ports,
+                    "path": endpoint.path,
+                    "last_result": endpoint_result_name(endpoint.last_result()),
+                    "last_reported_at": endpoint.last_reported_at,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2403,8 +2456,91 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
+        "conditions": conditions,
+        "endpoint_statuses": endpoint_statuses,
         "created_from_workload_template": created_from_workload_template,
     })
+}
+
+fn sandbox_condition_to_json(condition: &SandboxCondition) -> serde_json::Value {
+    serde_json::json!({
+        "type": condition.r#type,
+        "status": condition.status,
+        "reason": condition.reason,
+        "message": condition.message,
+        "last_transition_time": condition.last_transition_time,
+    })
+}
+
+fn sandbox_condition_display_lines(condition: &SandboxCondition) -> Vec<String> {
+    let reason = if condition.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", condition.reason)
+    };
+    let message = if condition.message.is_empty() {
+        String::new()
+    } else {
+        format!(" - {}", condition.message)
+    };
+    let mut lines = vec![format!(
+        "{}: {}{reason}{message}",
+        condition.r#type, condition.status
+    )];
+    if !condition.last_transition_time.is_empty() {
+        lines.push(format!(
+            "Last transition: {}",
+            condition.last_transition_time
+        ));
+    }
+    lines
+}
+
+// These names are part of the CLI JSON/YAML contract, independent of the
+// generated Rust enum's Debug output and protobuf's prefixed wire names.
+fn endpoint_result_name(result: EndpointResult) -> &'static str {
+    match result {
+        EndpointResult::Unspecified => "Unspecified",
+        EndpointResult::NoObservedExchange => "NoObservedExchange",
+        EndpointResult::HttpResponseReceived => "HttpResponseReceived",
+        EndpointResult::PolicyDenied => "PolicyDenied",
+        EndpointResult::CredentialUnavailable => "CredentialUnavailable",
+        EndpointResult::TlsFailed => "TlsFailed",
+        EndpointResult::TransportFailed => "TransportFailed",
+        EndpointResult::UpstreamRejected => "UpstreamRejected",
+    }
+}
+
+fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
+    let ports = endpoint
+        .ports
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = match endpoint.last_result() {
+        EndpointResult::Unspecified => "No result provided.",
+        EndpointResult::NoObservedExchange => "No exchange observed.",
+        EndpointResult::HttpResponseReceived => "Server returned an HTTP response below 400.",
+        EndpointResult::PolicyDenied => "Blocked by OpenShell policy.",
+        EndpointResult::CredentialUnavailable => {
+            "Required OpenShell-managed credential was unavailable."
+        }
+        EndpointResult::TlsFailed => "TLS connection failed.",
+        EndpointResult::TransportFailed => "Connection failed before an HTTP response arrived.",
+        EndpointResult::UpstreamRejected => "Server rejected the request (HTTP 400 or higher).",
+    };
+    // The gateway supplies acceptance time, which can follow the actual
+    // exchange. An empty timestamp means there is no accepted observation.
+    let reported_at = non_empty_or(&endpoint.last_reported_at, "no report yet");
+    vec![
+        format!(
+            "{} (ports: {ports}; path: {})",
+            endpoint.host, endpoint.path
+        ),
+        format!("Last result: {result}"),
+        format!("Reported at (gateway acceptance): {reported_at}"),
+    ]
 }
 
 fn sandbox_detail_to_json(
@@ -5883,12 +6019,12 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
-        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
-        datamodel::v1::ObjectMeta,
+        EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
+        PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
+        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
+        WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7142,6 +7278,195 @@ mod tests {
         assert_eq!(json["policy_source"], "sandbox");
         assert!(json["revision"].is_null());
         assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn sandbox_detail_keeps_failed_endpoint_separate_from_ready_conditions_in_json_and_yaml() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Ready as i32,
+                endpoint_statuses: vec![EndpointStatus {
+                    endpoint_id: "endpoint:example".to_string(),
+                    host: "tools.example.test".to_string(),
+                    ports: vec![443, 8443],
+                    path: "/mcp".to_string(),
+                    last_result: EndpointResult::TransportFailed as i32,
+                    last_reported_at: "2026-09-05T10:01:00Z".to_string(),
+                }],
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Supervisor session connected".to_string(),
+                    last_transition_time: "2026-09-05T10:00:00Z".to_string(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(
+            &sandbox,
+            &GetSandboxConfigResponse {
+                policy_source: PolicySource::Sandbox as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Both formats preserve the complete endpoint record and independent
+        // lifecycle condition without requiring a join.
+        let yaml = serde_yml::to_string(&json).unwrap();
+        let from_yaml: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        for output in [json, from_yaml] {
+            assert_eq!(output["phase"], "Ready");
+            assert_eq!(
+                output["conditions"],
+                serde_json::json!([{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "DependenciesReady",
+                    "message": "Supervisor session connected",
+                    "last_transition_time": "2026-09-05T10:00:00Z",
+                }])
+            );
+            assert_eq!(
+                output["endpoint_statuses"],
+                serde_json::json!([{
+                    "endpoint_id": "endpoint:example",
+                    "host": "tools.example.test",
+                    "ports": [443, 8443],
+                    "path": "/mcp",
+                    "last_result": "TransportFailed",
+                    "last_reported_at": "2026-09-05T10:01:00Z",
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_status_display_explains_failure_and_report_time() {
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:example".to_string(),
+            host: "tools.example.test".to_string(),
+            ports: vec![443, 8443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::TransportFailed as i32,
+            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+        };
+
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint),
+            vec![
+                "tools.example.test (ports: 443, 8443; path: /mcp)",
+                "Last result: Connection failed before an HTTP response arrived.",
+                "Reported at (gateway acceptance): 2026-09-05T11:01:00Z",
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_status_preserves_address_without_an_observation() {
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:reset".to_string(),
+            host: "tools.example.test".to_string(),
+            ports: vec![443],
+            path: "/**".to_string(),
+            last_result: EndpointResult::NoObservedExchange as i32,
+            last_reported_at: String::new(),
+        };
+
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint),
+            vec![
+                "tools.example.test (ports: 443; path: /**)",
+                "Last result: No exchange observed.",
+                "Reported at (gateway acceptance): no report yet",
+            ]
+        );
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                endpoint_statuses: vec![endpoint],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = super::sandbox_to_json(&sandbox);
+        assert_eq!(
+            output["endpoint_statuses"],
+            serde_json::json!([{
+                "endpoint_id": "endpoint:reset",
+                "host": "tools.example.test",
+                "ports": [443],
+                "path": "/**",
+                "last_result": "NoObservedExchange",
+                "last_reported_at": "",
+            }])
+        );
+        assert_eq!(output["conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn endpoint_status_http_response_does_not_claim_a_successful_tool_call() {
+        let endpoint = EndpointStatus {
+            host: "tools.example.test".to_string(),
+            ports: vec![443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint)[1],
+            "Last result: Server returned an HTTP response below 400."
+        );
+    }
+
+    #[test]
+    fn endpoint_status_structured_output_uses_stable_result_names() {
+        for (result, name) in [
+            (EndpointResult::Unspecified, "Unspecified"),
+            (EndpointResult::NoObservedExchange, "NoObservedExchange"),
+            (EndpointResult::HttpResponseReceived, "HttpResponseReceived"),
+            (EndpointResult::PolicyDenied, "PolicyDenied"),
+            (
+                EndpointResult::CredentialUnavailable,
+                "CredentialUnavailable",
+            ),
+            (EndpointResult::TlsFailed, "TlsFailed"),
+            (EndpointResult::TransportFailed, "TransportFailed"),
+            (EndpointResult::UpstreamRejected, "UpstreamRejected"),
+        ] {
+            let sandbox = Sandbox {
+                status: Some(SandboxStatus {
+                    endpoint_statuses: vec![EndpointStatus {
+                        last_result: result as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["endpoint_statuses"][0]["last_result"],
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_condition_display_leaves_lifecycle_conditions_unchanged() {
+        let ordinary = SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "DependenciesReady".to_string(),
+            message: "Supervisor session connected".to_string(),
+            last_transition_time: String::new(),
+        };
+        assert_eq!(
+            super::sandbox_condition_display_lines(&ordinary),
+            vec!["Ready: True (DependenciesReady) - Supervisor session connected".to_string()]
+        );
     }
 
     fn log_line(
