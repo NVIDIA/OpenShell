@@ -573,6 +573,12 @@ sandbox workload directly. The relay supports:
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
+The OCSF device describes the sandbox environment, with type ID Other and type
+label `Sandbox`; its operating system is a separate attribute.
+HTTP Activity records contain a request or response; early rejections with only
+connection context use Network Activity. Producer regression tests validate
+required fields and `at_least_one` constraints against the vendored OCSF 1.8
+schemas.
 
 ## Policy Proposals
 
