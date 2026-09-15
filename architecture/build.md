@@ -27,6 +27,25 @@ Workload images are standard OCI images supplied by operators or users.
 
 ## Build Features
 
+Rust builds require Rust 1.94 or newer. TLS and certificate generation use
+AWS-LC, including the CLI and standalone examples. Native and cross-build
+environments must provide the C toolchain required by aws-lc-sys; the Nix
+development shells provide static AWS-LC libraries.
+
+First-party crypto selection lives in `openshell-crypto`: backend-neutral
+primitive traits and protocol adapters preserve existing TLS, PKI, JWT, and
+credential-storage behavior. Application crates enable integration features on
+that crate instead of naming a backend. Process-default initialization preserves
+existing embedder providers; context capability reporting does not attest those
+globals or dependency-owned crypto. OpenSSL and strict FIPS operation are separate
+follow-up work. The crate README defines extension and coverage boundaries.
+
+SQLx uses AWS-LC with native certificate roots.
+ The server enables
+`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
+that root selection independently of the crypto provider. Credential storage
+continues to use the same AES-256-GCM envelope format across backend changes.
+
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or

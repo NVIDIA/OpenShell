@@ -17,8 +17,8 @@ use tokio::time::timeout;
 const WORKLOAD_MANIFEST_ENV: &str = "OPENSHELL_E2E_WORKLOAD_MANIFEST";
 const GPU_WORKLOAD_SUCCESS_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_SUCCESS";
 const GPU_WORKLOAD_FAILURE_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_FAILURE";
-const WORKLOAD_SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
-const WORKLOAD_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+const WORKLOAD_SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_mins(10);
+const WORKLOAD_PHASE_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Deserialize)]
 struct WorkloadManifest {

@@ -34,14 +34,15 @@ pub fn generate_test_certs_with_ca(dir: &Path) -> (rcgen::Certificate, KeyPair) 
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-ca");
-    let ca_key = KeyPair::generate().expect("failed to generate CA key");
+    let ca_key = openshell_crypto::pki::generate_keypair().expect("failed to generate CA key");
     let ca_cert = ca_params
         .self_signed(&ca_key)
         .expect("failed to sign CA cert");
 
     let server_params = CertificateParams::new(vec!["localhost".to_string()])
         .expect("failed to create server params");
-    let server_key = KeyPair::generate().expect("failed to generate server key");
+    let server_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
     let server_cert = server_params
         .signed_by(&server_key, &ca_cert, &ca_key)
         .expect("failed to sign server cert");
