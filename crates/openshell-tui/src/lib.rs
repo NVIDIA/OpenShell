@@ -815,6 +815,7 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest {
+        request_id: String::new(),
         allow_missing: true,
         name: sandbox_name,
         workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
@@ -1474,6 +1475,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let req = openshell_core::proto::CreateSandboxRequest {
+            request_id: String::new(),
             name,
             spec: Some(openshell_core::proto::SandboxSpec {
                 providers: selected_providers,
@@ -1748,6 +1750,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             };
 
             let req = openshell_core::proto::CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(openshell_core::proto::Provider {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
@@ -1865,6 +1868,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         }
 
         let req = openshell_core::proto::UpdateProviderRequest {
+            request_id: String::new(),
             provider: Some(openshell_core::proto::Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -1914,6 +1918,7 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::DeleteProviderRequest {
+            request_id: String::new(),
             allow_missing: true,
             name,
             workspace_scope: Some(named_workspace_scope(workspace)),
@@ -1966,6 +1971,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::ApproveDraftChunkRequest {
+            request_id: String::new(),
             name,
             chunk_id,
             workspace_scope: Some(named_workspace_scope(workspace)),
@@ -2011,6 +2017,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::RejectDraftChunkRequest {
+            request_id: String::new(),
             name,
             chunk_id,
             reason: String::new(),
@@ -2061,6 +2068,7 @@ fn spawn_draft_approve_all(
             })
             .collect();
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
+            request_id: String::new(),
             name,
             include_security_flagged: false,
             workspace_scope: Some(named_workspace_scope(workspace)),

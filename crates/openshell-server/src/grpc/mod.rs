@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
 mod sandbox;
@@ -265,7 +266,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_create_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn begin_rootfs_tar_staging(
@@ -302,7 +303,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxTemplateRequest>,
     ) -> Result<Response<SandboxTemplateResponse>, Status> {
-        sandbox::handle_create_sandbox_template(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_sandbox_template(
@@ -323,7 +324,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteSandboxTemplateRequest>,
     ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
-        sandbox::handle_delete_sandbox_template(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn list_sandbox_providers(
@@ -337,35 +338,35 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-        sandbox::handle_attach_sandbox_provider(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn detach_sandbox_provider(
         &self,
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-        sandbox::handle_detach_sandbox_provider(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        sandbox::handle_delete_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_stop_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_start_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     // --- Exec ---
@@ -411,7 +412,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExposeServiceRequest>,
     ) -> Result<Response<ServiceEndpointResponse>, Status> {
-        service::handle_expose_service(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_service(
@@ -432,7 +433,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteServiceRequest>,
     ) -> Result<Response<DeleteServiceResponse>, Status> {
-        service::handle_delete_service(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn revoke_ssh_session(
@@ -448,7 +449,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        provider::handle_create_provider(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_provider(
@@ -483,14 +484,14 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ImportProviderProfilesRequest>,
     ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
-        provider::handle_import_provider_profiles(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn update_provider_profiles(
         &self,
         request: Request<UpdateProviderProfilesRequest>,
     ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
-        provider::handle_update_provider_profiles(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn lint_provider_profiles(
@@ -504,7 +505,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        provider::handle_update_provider(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_provider_refresh_status(
@@ -518,35 +519,35 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ConfigureProviderRefreshRequest>,
     ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
-        provider::handle_configure_provider_refresh(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn rotate_provider_credential(
         &self,
         request: Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
-        provider::handle_rotate_provider_credential(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn delete_provider_refresh(
         &self,
         request: Request<DeleteProviderRefreshRequest>,
     ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
-        provider::handle_delete_provider_refresh(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        provider::handle_delete_provider(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn delete_provider_profile(
         &self,
         request: Request<DeleteProviderProfileRequest>,
     ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
-        provider::handle_delete_provider_profile(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     // --- Config / Policy ---
@@ -583,7 +584,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        policy::handle_update_config(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_sandbox_policy_status(
@@ -643,42 +644,42 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        policy::handle_approve_draft_chunk(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn reject_draft_chunk(
         &self,
         request: Request<RejectDraftChunkRequest>,
     ) -> Result<Response<RejectDraftChunkResponse>, Status> {
-        policy::handle_reject_draft_chunk(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn approve_all_draft_chunks(
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        policy::handle_approve_all_draft_chunks(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn edit_draft_chunk(
         &self,
         request: Request<EditDraftChunkRequest>,
     ) -> Result<Response<EditDraftChunkResponse>, Status> {
-        policy::handle_edit_draft_chunk(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn undo_draft_chunk(
         &self,
         request: Request<UndoDraftChunkRequest>,
     ) -> Result<Response<UndoDraftChunkResponse>, Status> {
-        policy::handle_undo_draft_chunk(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn clear_draft_chunks(
         &self,
         request: Request<ClearDraftChunksRequest>,
     ) -> Result<Response<ClearDraftChunksResponse>, Status> {
-        policy::handle_clear_draft_chunks(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_draft_history(
@@ -746,7 +747,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateWorkspaceRequest>,
     ) -> Result<Response<CreateWorkspaceResponse>, Status> {
-        workspace::handle_create_workspace(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_workspace(
@@ -767,21 +768,21 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        workspace::handle_delete_workspace(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn add_workspace_member(
         &self,
         request: Request<AddWorkspaceMemberRequest>,
     ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
-        workspace::handle_add_workspace_member(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn remove_workspace_member(
         &self,
         request: Request<RemoveWorkspaceMemberRequest>,
     ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
-        workspace::handle_remove_workspace_member(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn list_workspace_members(

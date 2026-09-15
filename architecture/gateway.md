@@ -62,6 +62,36 @@ transport status, metadata, and unknown details alongside decoded fields.
 SDK deletion waits recognize missing-resource status through typed error wrappers
 without suppressing other failures.
 
+Ordinary user-callable unary mutations explicitly opt into durable request
+admission when the client supplies a UUID. Typed adapters
+check current authorization before looking up a caller/method/workspace-scoped
+key. The payload fingerprint excludes that UUID and canonicalizes protobuf maps.
+An atomic, quota-checked insert chooses one executor; owned execution survives
+client cancellation. Success is persisted before acknowledgment. Errors or
+interruption leave permanent unresolved claims, never stealable leases.
+
+Admission rows live outside user workspace namespaces and are bounded per caller.
+Successes expire after 24 hours; cleanup uses the unique admission incarnation
+and version so an old cleaner cannot delete a new attempt. Replay stores only
+resource references and reviewed public scalar/diagnostic receipts, never
+credential-bearing response snapshots. It checks original identities and current
+authorization and never substitutes a same-name resource. Sandbox responses are
+live projections of the original UUID; normal status reconciliation does not
+invalidate replay. Refresh status additionally requires the original grant epoch.
+Other resource projections retain exact-version guards. Terminal delete receipts
+do not require the deleted target or parent to remain present.
+
+Sandbox, service, provider/profile, and policy/config adapters use keyed payload
+fingerprints derived from existing gateway JWT or primary TLS private material.
+Replicas must share that material; missing keys or key changes fail closed without
+changing admission identity. Workspace/template adapters retain their original
+format. Intercepted requests carry the original decoded payload only in a private
+in-memory extension. Replay reauthorizes original and current effective scopes,
+requires the same effective payload, and reruns current interceptor validation.
+Interceptors cannot mutate the request UUID. Server-marked replay suppresses
+post-commit observation, which remains best-effort rather than an outbox.
+Credential capabilities and streaming execution require separate contracts.
+
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
 clients present a certificate signed by the local deployment CA, and the
@@ -352,7 +382,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 13 enums
-(`bdbb745af0748b5bda67528753450feb81aa5cdc42ccbeb4ed094773a30739e5`).
+(`5de04dd390599ebd165111df4f14c6dd05ae77aa748866a0e3ec1a22abd63133`).
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
@@ -394,7 +424,8 @@ Missing targets return `NOT_FOUND` unless `allow_missing` explicitly requests
 failures remain errors. Already-revoked sessions complete without another write
 after current authorization. The removed response booleans are reserved by name
 and number; this coordinated pre-1.0 API change does not alter durable schemas.
-It does not add request deduplication or identity preconditions for later retries.
+The outcome alone does not provide request deduplication. Opted-in unary methods
+require a request UUID for the admission contract.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
@@ -444,6 +475,14 @@ and labels from protobuf metadata traits before encoding the full message into
 populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
+
+Mutation admission uses a private, version-tagged JSON envelope in the same
+object store. Its identity namespace stays stable across format changes, and an
+unknown format fails closed. It contains explicit typed receipts, not arbitrary
+public response payloads, and is not part of the protobuf storage closure.
+Workspace create/delete admissions include the requested workspace name in the
+key, but omit a workspace UUID guard. Different names have independent request-ID
+namespaces; deletion receipts remain replayable after the target disappears.
 
 Each sandbox policy revision stores the complete provenance annotation map
 supplied with that update. The revision payload is the authoritative immutable
