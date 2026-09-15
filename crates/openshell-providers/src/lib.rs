@@ -5,6 +5,8 @@
 
 mod context;
 mod discovery;
+#[cfg(any(test, feature = "example-profiles"))]
+pub mod example_profiles;
 mod profiles;
 mod providers;
 #[cfg(test)]
