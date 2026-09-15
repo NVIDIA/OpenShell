@@ -417,16 +417,26 @@ impl OpenShellClient {
         .await
     }
 
-    /// Poll until the sandbox is gone (gRPC `NotFound`) or the `timeout`
-    /// elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    /// Poll until the sandbox is gone (gRPC `NotFound`) or the timeout elapses.
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
-                Ok(snapshot) if snapshot.phase == SandboxPhase::Deleting => {}
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -1009,13 +1019,25 @@ impl WorkspaceScopedClient {
     }
 
     /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
