@@ -49,8 +49,6 @@ oc create ns openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
-  --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
 ```
@@ -157,7 +155,6 @@ namespace to limit access to OpenShell-managed Secrets.
 Append these flags to any of the PostgreSQL commands above for OpenShift:
 
 ```
---set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
 ```

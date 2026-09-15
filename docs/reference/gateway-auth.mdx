@@ -99,20 +99,18 @@ The same settings are available through environment variables:
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
 | `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. | Empty |
 
-For Helm deployments, set the same values under `server.oidc`:
+For Helm deployments, set the same values in `gatewayConfig` under the
+`openshell.gateway.oidc` TOML table:
 
 ```yaml
-server:
-  oidc:
+gatewayConfig:
+  openshell.gateway.oidc:
     issuer: https://idp.example.com/realms/openshell
     audience: openshell-cli
-    # Only needed when discovery returns a deliberately separate JWKS origin.
-    jwksAllowedOrigins:
-      - https://keys.example.com
-    rolesClaim: realm_access.roles
-    adminRole: openshell-admin
-    userRole: openshell-user
-    scopesClaim: ""
+    roles_claim: realm_access.roles
+    admin_role: openshell-admin
+    user_role: openshell-user
+    scopes_claim: ""
 ```
 
 The gateway requires HTTPS for OIDC discovery and JWKS retrieval, rejects
@@ -270,7 +268,7 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 ### Plaintext
 
-When a gateway is deployed with `server.disableTls=true`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+When a gateway is deployed without a TLS table in `gatewayConfig`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
 
 Register a plaintext gateway with an explicit `http://` endpoint:
 
