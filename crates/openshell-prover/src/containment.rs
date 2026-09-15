@@ -2528,9 +2528,12 @@ mod tests {
         let broader_method = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_boundary(&boundary, &narrower, options());
+        let options = CheckOptions {
+            timeout: Duration::from_secs(30),
+        };
+        let result = check_within_boundary(&boundary, &narrower, options);
         assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
-        let result = check_within_boundary(&boundary, &broader_method, options());
+        let result = check_within_boundary(&boundary, &broader_method, options);
         assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
     }
 
