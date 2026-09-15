@@ -108,6 +108,12 @@ async functions caused by cfg-gated Windows stubs. Repository-wide pre-commit
 skips only Linux-specific installer, build-environment shell-helper, and
 packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
+Tracked Cargo lockfiles are checked natively through PowerShell. Deterministic
+gateway parity uses Git for Windows Bash with temporary, checkout-scoped Python
+launchers. The TypeScript SDK uses Windows protobuf plugin paths and x64 Biome
+under emulation on ARM64, while its test binding follows Node's architecture
+and the locked Rolldown version. Go tests retain race coverage wherever the
+toolchain supports it; POSIX permission-bit checks are not Windows ACL tests.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
 By default it enables bundled Z3 for reproducible Windows builds. `z3-sys`
