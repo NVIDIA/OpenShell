@@ -200,10 +200,14 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
     ) -> Result<ProviderProfileSnapshot, Status> {
         let InterceptorProfileSnapshot { revision, profiles } =
             Self::snapshot(self).await.map_err(|err| {
-                Status::unavailable(format!(
-                    "provider profile source '{}' snapshot failed: {err}",
-                    self.source_id()
-                ))
+                openshell_core::rpc_error::unavailable(
+                    "PROFILE_SOURCE_UNAVAILABLE",
+                    format!(
+                        "provider profile source '{}' snapshot failed: {err}",
+                        self.source_id()
+                    ),
+                    std::time::Duration::from_secs(1),
+                )
             })?;
         let profiles = profiles
             .into_iter()

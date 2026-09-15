@@ -3,8 +3,8 @@
 
 //! Schema validation utilities for testing OCSF events against vendored schemas.
 //!
-//! These utilities are gated behind `#[cfg(test)]` — they are only available
-//! in test builds.
+//! Available in this crate's tests or through the `test-support` feature for
+//! producer regression tests.
 
 pub mod schema;
 

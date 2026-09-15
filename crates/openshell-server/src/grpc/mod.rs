@@ -82,11 +82,14 @@ pub fn persistence_error_to_status(
     match err {
         PersistenceError::Conflict {
             current_resource_version,
-        } => Status::aborted(format!(
-            "{} failed due to concurrent modification (current resource_version: {})",
-            operation,
-            current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
-        )),
+        } => openshell_core::rpc_error::resource_version_conflict(
+            format!(
+                "{} failed due to concurrent modification (current resource_version: {})",
+                operation,
+                current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            ),
+            current_resource_version,
+        ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }

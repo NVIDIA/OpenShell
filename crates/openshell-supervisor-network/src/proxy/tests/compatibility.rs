@@ -208,7 +208,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
-    assert_eq!(forward["activity_name"], "Other");
+    assert_eq!(forward["activity_name"], "Post");
     assert_eq!(forward["action"], "Denied");
     assert_eq!(forward["disposition"], "Blocked");
     assert_eq!(forward["severity"], "Medium");
@@ -267,7 +267,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
-    assert_eq!(forward["activity_name"], "Other");
+    assert_eq!(forward["activity_name"], "Get");
     assert_eq!(forward["action"], "Allowed");
     assert_eq!(forward["disposition"], "Allowed");
     assert_eq!(forward["severity"], "Informational");
