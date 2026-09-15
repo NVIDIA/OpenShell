@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Inputs used by deploy/helm/test-gateway-config-parser.sh. The driver table is
+# intentionally opaque to the gateway loader, which makes it a safe way to
+# exercise every TOML shape supported by the chart serializer.
+gatewayConfig:
+  openshell.gateway:
+    name: '{{ .Release.Namespace }}/{{ .Release.Name }} "quoted" \\ path'
+    server_sans:
+      - localhost
+      - gateway.example.test
+    provider_profile_sources:
+      - type: builtin
+      - type: user
+  openshell.drivers.parser-validation:
+    boolean_value: true
+    integer_value: 42
+    float_value: 1.5
+    empty_value: ""
+    scalar_array:
+      - first
+      - second
+    inline_map:
+      alpha: false
+      zebra: 2
+    map_array:
+      - name: first
+        enabled: true
+      - name: second
+        enabled: false
+    escaped_string: 'quotes " and backslash \\ and a newline
+      are preserved'
+    omitted_value: null
