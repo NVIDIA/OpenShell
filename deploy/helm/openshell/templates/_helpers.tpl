@@ -290,7 +290,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
-{{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
+{{- fail "gatewayConfig.openshell.drivers.kubernetes.workspace_mode must be one of: shared, managed, operator." -}}
 {{- end -}}
 {{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
 {{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}

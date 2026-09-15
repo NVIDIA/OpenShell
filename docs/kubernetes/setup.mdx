@@ -52,7 +52,7 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `gatewayConfig.openshell.drivers.kubernetes.default_image` / `supervisor_image` for the sandbox runtime.
 </Note>
 
 Confirm the controller pod is running before proceeding:
@@ -126,7 +126,7 @@ helm upgrade --install openshell-workspace \
 The workspace chart does not create the namespace or deploy a gateway. It owns
 only the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy in its
 release namespace. For one pre-provisioned namespace, keep
-`server.drivers.kubernetes.workspaceMode=shared` and set
+`gatewayConfig.openshell.drivers.kubernetes.workspace_mode=shared` and set
 `server.sandboxNamespace=app-a`. To map multiple workspaces to separately
 provisioned namespaces, use `workspaceMode=operator`, configure exactly one of
 `operatorNamespaceLabel` or `operatorNamespaceFile`, and install the workspace
@@ -199,16 +199,17 @@ The most commonly changed values are:
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
 | `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
-| `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
-| `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
-| `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
-| `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
-| `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
-| `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
+| `gatewayConfig.openshell.drivers.kubernetes.default_image` | Default sandbox image used when a sandbox does not specify one. |
+| `gatewayConfig.openshell.drivers.kubernetes.image_pull_secrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `gatewayConfig.openshell.drivers.kubernetes.grpc_endpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Helm derives it from the release Service unless overridden. |
+| `gatewayConfig.openshell.drivers.kubernetes.app_armor_profile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
+| `gatewayConfig.openshell.gateway.auth.allow_unauthenticated_users` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
+| `gatewayConfig.openshell.gateway.enable_loopback_service_http` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
-| `supervisor.sandboxRuntime.networkPolicyEnforced` | Required acknowledgement that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. |
-| `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
-| `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
+| `gatewayConfig.openshell.drivers.kubernetes.supervisor_sideload_method` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |
+| `gatewayConfig.openshell.drivers.kubernetes.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
+| `gatewayConfig.openshell.drivers.kubernetes.sidecar.proxy_uid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
+| `gatewayConfig.openshell.drivers.kubernetes.https_proxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 
 Use a values file for repeatable deployments:
 
@@ -221,6 +222,13 @@ helm upgrade --install openshell \
   --values my-values.yaml
 ```
 
+The chart defaults `gatewayConfig.openshell.drivers.kubernetes.app_armor_profile` to `Unconfined` because
+runtime/default AppArmor profiles can block the supervisor's network namespace
+mount setup on AppArmor-enabled nodes. Set it to an empty string to omit the
+field, `RuntimeDefault` to force the runtime default, or
+`Localhost/<profile-name>` when you load and manage a localhost profile on each
+node.
+
 To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
 in the sandbox namespace and reference its name:
 
@@ -232,10 +240,11 @@ kubectl -n openshell create secret docker-registry regcred \
 ```
 
 ```yaml
-server:
-  sandboxImage: registry.example.com/team/openshell-sandbox:latest
-  sandboxImagePullSecrets:
-    - name: regcred
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    default_image: registry.example.com/team/openshell-sandbox:latest
+    image_pull_secrets:
+      - regcred
 ```
 
 ## Configure a Corporate Upstream Proxy
@@ -249,20 +258,20 @@ kubectl -n openshell create secret generic corporate-proxy-auth \
   --from-literal=credentials="$PROXY_USER:$PROXY_PASSWORD"
 ```
 
-Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `noProxy` with values for your cluster. `noProxy` bypasses only the corporate proxy. OpenShell policy evaluation still applies.
+Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `no_proxy` with values for your cluster. `no_proxy` bypasses only the corporate proxy. OpenShell policy evaluation still applies.
 
 ```yaml
-upstreamProxy:
-  url: http://proxy.corp.example:8080
-  noProxy: .svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16
-  authSecret:
-    name: corporate-proxy-auth
-    key: credentials
-  authAllowInsecure: true
-
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    https_proxy: http://proxy.corp.example:8080
+    no_proxy: .svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16
+    proxy_auth_secret_name: corporate-proxy-auth
+    proxy_auth_secret_key: credentials
+    proxy_auth_allow_insecure: true
+    topology: sidecar
 ```
 
-Use `authAllowInsecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. The initial release supports `http://` proxy endpoints and TLS CONNECT egress. It does not support HTTPS-to-proxy, custom corporate CA bundles, or forwarding plain HTTP egress through the proxy.
+Use `proxy_auth_allow_insecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. The initial release supports `http://` proxy endpoints and TLS CONNECT egress. It does not support HTTPS-to-proxy, custom corporate CA bundles, or forwarding plain HTTP egress through the proxy.
 
 The credential mounts only in the separately scheduled supervisor Pod. The
 sandbox workload cannot read it through its environment or volumes.

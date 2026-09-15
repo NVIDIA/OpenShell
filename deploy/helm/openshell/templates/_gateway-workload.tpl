@@ -75,7 +75,7 @@ spec:
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
         # env vars that the TOML references by name. Some process-level
         # settings consumed by libraries outside gateway code also remain here.
-        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
         # consumed by the TLS stack itself, not by gateway code, so it
@@ -119,7 +119,7 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
@@ -201,10 +201,10 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if and (get $oidcRuntimeConfig "issuer") .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
-        name: {{ .Values.server.oidc.caConfigMapName }}
+        name: {{ .Values.oidc.caConfigMapName }}
     {{- end }}
     {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
     - name: vault-ca

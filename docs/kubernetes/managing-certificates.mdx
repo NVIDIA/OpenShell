@@ -105,9 +105,9 @@ validates this at install time and fails with an actionable error if
 `certManager.serverDnsNames` contains internal-only entries while
 `serverIssuerRef` is set.
 
-You do **not** need to set `server.grpcEndpoint` to the external hostname.
+You do **not** need to set `gatewayConfig.openshell.drivers.kubernetes.grpc_endpoint` to the external hostname.
 Supervisors connect via the internal service name automatically. Setting
-`server.grpcEndpoint` to an external hostname would cause supervisors to
+`grpc_endpoint` to an external hostname would cause supervisors to
 receive the ACME certificate (via SNI) which they cannot verify against the
 chart CA.
 </Note>
