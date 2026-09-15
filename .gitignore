@@ -6,6 +6,9 @@
 /target/
 e2e/rust/target/
 target/
+
+# Test result artifacts (JUnit XML, etc.)
+/results/
 debug/
 release/
 
