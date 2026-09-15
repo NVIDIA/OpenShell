@@ -198,13 +198,16 @@ gatewayConfig:
     bind_address: '0.0.0.0:{{ .Values.service.port }}'
     health_bind_address: '0.0.0.0:{{ .Values.service.healthPort }}'
     metrics_bind_address: '0.0.0.0:{{ .Values.service.metricsPort }}'
+    log_level: info
     compute_driver: kubernetes
     enable_loopback_service_http: true
+    policy_validation_failure_mode: fail_closed
   openshell.gateway.gateway_jwt:
     signing_key_path: /etc/openshell-jwt/signing.pem
     public_key_path: /etc/openshell-jwt/public.pem
     kid_path: /etc/openshell-jwt/kid
     gateway_id: '{{ include "openshell.fullname" . }}'
+    ttl_secs: 3600
   openshell.gateway.tls:
     cert_path: /etc/openshell-tls/server/tls.crt
     key_path: /etc/openshell-tls/server/tls.key
@@ -219,6 +222,8 @@ gatewayConfig:
     service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
     supervisor_sideload_method: '{{ include "openshell.supervisorSideloadMethod" . }}'
     topology: '{{ .Values.supervisor.topology }}'
+    sa_token_ttl_secs: 3600
+    app_armor_profile: Unconfined
   openshell.drivers.kubernetes.managed_ssh_ingress:
     enabled: true
     gateway_namespace: '{{ .Release.Namespace }}'
