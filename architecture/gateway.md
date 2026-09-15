@@ -94,6 +94,26 @@ RBAC, NetworkPolicies, and mounts. When one of those inputs also determines a
 gateway runtime value, the chart derives one from the other rather than
 exposing two independently configurable settings.
 
+### Legacy Helm value inventory
+
+The former hand-written ConfigMap template read the following values. This
+inventory is the migration boundary for `gatewayConfig`; it prevents a legacy
+knob from silently surviving as a second source of truth.
+
+| Classification | Legacy values read by the ConfigMap | Migration |
+| --- | --- | --- |
+| Application-only | `server.name`, `server.logLevel`, `server.enableLoopbackServiceHttp`, `server.policyValidationFailureMode`, `server.grpcRateLimit.requests`, `server.grpcRateLimit.windowSeconds` | `openshell.gateway`; defaulted runtime values are now in `gatewayConfig`, optional values are omitted unless the operator adds them. |
+| Application-only | `server.otlp.endpoint`, `server.otlp.serviceName`, `server.auth.allowUnauthenticatedUsers`, `server.oidc.{issuer,audience,jwksTtl,rolesClaim,adminRole,userRole,scopesClaim}` | `openshell.gateway.{otlp,auth,oidc}`. Empty optional tables are not rendered. |
+| Application-only | `server.sandboxImage`, `server.sandboxImagePullPolicy`, `server.sandboxImagePullSecrets`, `server.workspaceDefaultStorageSize`, `server.workspaceStorageClass`, `server.defaultRuntimeClassName`, `server.enableUserNamespaces`, `server.appArmorProfile` | `openshell.drivers.kubernetes`; image and AppArmor defaults are in `gatewayConfig`. |
+| Application-only | `server.drivers.kubernetes.{workspaceMode,operatorNamespaceLabel,operatorNamespaceFile}`, `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}`, `supervisor.{topology,image.pullPolicy}`, `supervisor.sidecar.{proxyUid,processBinaryAwareNetworkPolicy}` | `openshell.drivers.kubernetes`, `.managed_ssh_ingress`, `.sidecar`, and `openshell.gateway.gateway_jwt`. |
+| Application-only | `upstreamProxy.{url,noProxy,authSecret.name,authSecret.key,authAllowInsecure,connectByHostname}`, `server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace`, `server.credentialDrivers.vault.{address,mount,kvVersion,authMethod,role,kubernetesAuthMount,serviceAccountTokenPath,tokenPath,timeoutSecs}` | The corresponding `openshell.drivers.kubernetes` or `openshell.credential_drivers.*` table. Secret names and keys remain references, never Secret data. |
+| Deployment-only | `server.dbUrl`, `server.externalDbSecret` | Gateway process args and `OPENSHELL_DB_URL` Secret reference. They are never TOML. |
+| Deployment-only | `server.credentialStorage.existingSecret`, `server.sandboxJwt.signingSecretName`, `server.tls.certSecretName`, `server.tls.clientCaSecretName` | Secret creation, mounting, and environment wiring. TOML contains only stable paths or an environment-variable name. |
+| Dual-use | `service.{port,healthPort,metricsPort}`, `server.disableTls`, `server.tls.clientTlsSecretName` | The chart owns the Service, workload ports, mounts, and Secret references; `gatewayConfig` derives listener addresses and runtime references from them. |
+| Dual-use | `certManager.{enabled,serverIssuerRef.name,serverDnsNames}`, `pkiInitJob.{enabled,serverDnsNames}` | Certificate resources and mounts remain chart-owned; the TLS table and server SANs are derived from their selected certificate source. |
+| Dual-use | `networkPolicy.enabled`, `server.hostGatewayIP`, `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | The chart owns NetworkPolicies, pod host aliases, CSI mounts, and process environment; runtime fields are derived from the same values. |
+| Dual-use | `server.credentialDrivers.{kubernetesSecrets.enabled,vault.enabled}` | The chart owns Secret/RBAC resources and derives the gateway credential-driver selection and configuration tables. |
+
 ## Protocol and Auth
 
 Gateway validation and concurrency errors use the standard rich gRPC error
