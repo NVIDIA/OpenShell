@@ -1348,7 +1348,7 @@ async fn mint_google_service_account_jwt(
         exp: now_secs.saturating_add(lifetime_secs),
         sub: subject.as_deref(),
     };
-    let assertion = jsonwebtoken::encode(
+    let assertion = openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
