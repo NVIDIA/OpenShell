@@ -1347,6 +1347,23 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             }
         }
 
+        // The credential runtime withholds expired handle-backed values. Keep
+        // the identity of any otherwise injectable key so MXC create-time
+        // validation can reject the incomplete credential snapshot.
+        for key in resolved_refs.expired_keys {
+            if accepted_stored_credential_keys
+                .as_ref()
+                .is_some_and(|accepted| !accepted.contains(&key))
+                || is_non_injectable_provider_credential(provider, &key)
+                || broker_only_credential_keys.contains(&key)
+                || has_no_usable_endpoint
+                || !is_valid_env_key(&key)
+            {
+                continue;
+            }
+            expired_static_keys.insert(key);
+        }
+
         // Build each provider's emitted environment independently so another
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
@@ -10580,6 +10597,49 @@ mod tests {
                 .get("GITHUB_TOKEN")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_preserves_expired_handle_key_for_create_time_rejection() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        let mut provider = provider_with_credential_value(
+            "github-expired",
+            "github",
+            "GITHUB_TOKEN",
+            "github-token",
+        );
+        provider.credential_expires_at_ms.insert(
+            "GITHUB_TOKEN".to_string(),
+            crate::persistence::current_time_ms() - 1,
+        );
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider,
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &catalog,
+            "default",
+            &["github-expired".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.contains_key("GITHUB_TOKEN"));
+        assert!(result.expired_static_keys.contains("GITHUB_TOKEN"));
     }
 
     #[tokio::test]
