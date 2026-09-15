@@ -2,7 +2,7 @@ name: Release VM Kernel
 
 # Build custom libkrunfw (kernel firmware) + libkrun (VMM) for all
 # supported openshell-driver-vm platforms. Artifacts are uploaded to the
-# rolling "vm-runtime-capability-free" GitHub Release and consumed by normal dev/tag release
+# rolling "vm-runtime" GitHub Release and consumed by normal dev/tag release
 # workflows when building the openshell-driver-vm binary.
 #
 # The Linux kernel is compiled once on aarch64 Linux.  The resulting kernel.c
@@ -23,7 +23,7 @@ permissions:
 
 # Serialize runtime release updates.
 concurrency:
-  group: vm-runtime-release-vm-runtime-capability-free
+  group: vm-runtime-release
   cancel-in-progress: false
 
 defaults:
@@ -195,7 +195,7 @@ jobs:
 
       - name: Ensure vm-runtime tag exists
         env:
-          RELEASE_TAG: vm-runtime-capability-free
+          RELEASE_TAG: vm-runtime
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -205,7 +205,7 @@ jobs:
       - name: Prune stale runtime assets from vm-runtime release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          RELEASE_TAG: vm-runtime-capability-free
+          RELEASE_TAG: vm-runtime
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
@@ -233,7 +233,7 @@ jobs:
         with:
           name: OpenShell VM Runtime
           prerelease: true
-          tag_name: vm-runtime-capability-free
+          tag_name: vm-runtime
           target_commitish: ${{ github.sha }}
           body: |
             Build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
@@ -255,7 +255,7 @@ jobs:
             ### Verify
 
             ```bash
-            gh release download vm-runtime-capability-free -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
+            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
             gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
             ```
 
