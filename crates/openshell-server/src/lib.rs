@@ -51,7 +51,7 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{Config, Error, ObjectId, ObjectLabels, Result};
+use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
@@ -318,9 +318,6 @@ pub struct ServerState {
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
 
-    /// Active launch generation and refresh ordering for each sandbox.
-    pub sandbox_auth_sessions: Arc<auth::sandbox_session::SandboxSessionRegistry>,
-
     /// Authenticator that validates gateway-minted sandbox JWTs on every
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
@@ -430,9 +427,6 @@ impl ServerState {
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
-            sandbox_auth_sessions: Arc::new(
-                auth::sandbox_session::SandboxSessionRegistry::default(),
-            ),
             sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
             grpc_rate_limiter,
@@ -829,33 +823,17 @@ pub(crate) async fn run_server(
                 let state = state.clone();
                 let sandbox = sandbox.clone();
                 async move {
-                    let Some(authority) = &state.sandbox_session_jwt_authority else {
+                    if state.sandbox_session_jwt_authority.is_none() {
                         return Ok(Vec::new());
-                    };
-                    let authentication = grpc::mint_and_persist_successor(&state, &sandbox)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    state
-                        .sandbox_auth_sessions
-                        .activate(sandbox.object_id(), &authentication, authority)
+                    }
+                    let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
                         .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&authentication)
                         .map_err(|error| format!("encode launch authentication: {error}"))
                 }
             },
-            |sandbox_id| {
-                let state = state.clone();
-                let sandbox_id = sandbox_id.to_string();
-                async move {
-                    if state.sandbox_session_jwt_authority.is_none() {
-                        return Ok(());
-                    }
-                    grpc::mark_session_successor_committed(&state, &sandbox_id)
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-            },
-            |sandbox_id| state.sandbox_auth_sessions.deactivate(sandbox_id),
+            |_| async { Ok(()) },
+            |_| {},
         )
         .await
     {

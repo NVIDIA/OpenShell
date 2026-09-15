@@ -7,7 +7,7 @@ mod auth_rpc;
 pub mod policy;
 pub mod provider;
 mod sandbox;
-pub use sandbox::{mark_session_successor_committed, mint_and_persist_successor};
+pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
 pub mod workspace;

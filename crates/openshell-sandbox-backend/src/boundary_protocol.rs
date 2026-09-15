@@ -331,6 +331,8 @@ pub struct BoundaryConfig {
     pub session_id: SandboxSessionId,
     /// Monotonic signed supervisor replacement within this generation.
     pub session_rotation: openshell_core::jwt::SessionRotation,
+    /// Durable authorization epoch required in every Sandbox Protocol JWT.
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
     /// Gateway identity expected in Sandbox Protocol JWTs.
     pub gateway_id: String,
     /// Immutable current and staged-next gateway verification keys.
@@ -367,6 +369,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("generation", &self.generation)
             .field("session_id", &self.session_id)
             .field("session_rotation", &self.session_rotation)
+            .field("auth_epoch", &self.auth_epoch)
             .field("gateway_id", &self.gateway_id)
             .field(
                 "verification_key_ids",

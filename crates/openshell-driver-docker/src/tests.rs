@@ -35,12 +35,11 @@ fn test_launch_authentication() -> Vec<u8> {
             )
             .unwrap(),
             session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
-            predecessor_session_id: None,
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
             gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
             gateway_expires_at: i64::MAX,
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
-            credential_epoch: CredentialEpoch::new(1).unwrap(),
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {

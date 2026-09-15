@@ -102,7 +102,9 @@ mod session {
         }
     }
 
-    /// Monotonic identity for a supervisor replacement within one runtime generation.
+    /// Monotonic identity for Sandbox Protocol attachment state.
+    ///
+    /// This is a protocol coordination value, not part of JWT authorization.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     #[serde(transparent)]
     pub struct SessionRotation(u64);
@@ -169,24 +171,17 @@ mod session {
         exp: i64,
         jti: String,
         sandbox_id: SandboxId,
-        session_id: SandboxSessionId,
         runtime_generation: SandboxGenerationId,
-        session_rotation: SessionRotation,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        predecessor_session_id: Option<SandboxSessionId>,
+        auth_epoch: CredentialEpoch,
         component: SessionComponent,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        credential_epoch: Option<CredentialEpoch>,
     }
 
-    /// Authoritative fields used to mint one token pair.
+    /// Durable identity shared by every short-lived token for one sandbox runtime.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct SandboxSessionIdentity {
+    pub struct SandboxRuntimeIdentity {
         pub sandbox_id: SandboxId,
-        pub session_id: SandboxSessionId,
         pub runtime_generation: SandboxGenerationId,
-        pub session_rotation: SessionRotation,
-        pub predecessor_session_id: Option<SandboxSessionId>,
+        pub auth_epoch: CredentialEpoch,
     }
 
     /// A JWT whose contents are deliberately omitted from `Debug` output and
@@ -238,15 +233,17 @@ mod session {
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct SupervisorAuthBundle {
+        /// Correlates the two ends of one Sandbox Protocol launch. This value
+        /// is not carried in JWTs and is not an authorization identity.
         pub session_id: SandboxSessionId,
         pub runtime_generation: SandboxGenerationId,
+        /// Orders protocol attachment replacement, independently of auth.
         pub session_rotation: SessionRotation,
-        pub predecessor_session_id: Option<SandboxSessionId>,
+        pub auth_epoch: CredentialEpoch,
         pub gateway_token: SecretJwt,
         pub gateway_expires_at: i64,
         pub sandbox_token: SecretJwt,
         pub sandbox_expires_at: i64,
-        pub credential_epoch: CredentialEpoch,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -306,11 +303,8 @@ mod session {
                 return Err(SessionJwtError::InvalidLifetime);
             }
             SandboxGenerationId::parse(self.runtime_generation.to_string())
-                .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             SessionRotation::new(self.session_rotation.get())?;
-            if (self.session_rotation.get() == 1) != self.predecessor_session_id.is_none() {
-                return Err(SessionJwtError::InvalidSessionLineage);
-            }
             Ok(())
         }
 
@@ -318,7 +312,7 @@ mod session {
             SessionBearerTokenSlot::new(
                 self.sandbox_token.clone(),
                 self.sandbox_expires_at,
-                self.credential_epoch,
+                self.auth_epoch,
             )
         }
     }
@@ -330,12 +324,11 @@ mod session {
                 .field("session_id", &self.session_id)
                 .field("runtime_generation", &self.runtime_generation)
                 .field("session_rotation", &self.session_rotation)
-                .field("predecessor_session_id", &self.predecessor_session_id)
+                .field("auth_epoch", &self.auth_epoch)
                 .field("gateway_token", &"[REDACTED]")
                 .field("gateway_expires_at", &self.gateway_expires_at)
                 .field("sandbox_token", &"[REDACTED]")
                 .field("sandbox_expires_at", &self.sandbox_expires_at)
-                .field("credential_epoch", &self.credential_epoch)
                 .finish()
         }
     }
@@ -351,7 +344,7 @@ mod session {
     pub struct MintedSessionTokenPair {
         pub gateway: MintedSessionToken,
         pub sandbox: MintedSessionToken,
-        pub credential_epoch: CredentialEpoch,
+        pub auth_epoch: CredentialEpoch,
     }
 
     /// Refreshable Sandbox Protocol bearer credential shared by all streams on
@@ -401,7 +394,7 @@ mod session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if stored
                 .as_ref()
-                .is_some_and(|current| credential_epoch <= current.credential_epoch)
+                .is_some_and(|current| credential_epoch < current.credential_epoch)
             {
                 return Err(SessionJwtError::StaleCredentialEpoch);
             }
@@ -534,31 +527,20 @@ mod session {
 
         pub fn mint_pair(
             &self,
-            identity: &SandboxSessionIdentity,
-            credential_epoch: CredentialEpoch,
+            identity: &SandboxRuntimeIdentity,
         ) -> Result<MintedSessionTokenPair, SessionJwtError> {
             Ok(MintedSessionTokenPair {
-                gateway: self.mint(SessionTokenProfile::Gateway, identity, None)?,
-                sandbox: self.mint(
-                    SessionTokenProfile::Sandbox,
-                    identity,
-                    Some(credential_epoch),
-                )?,
-                credential_epoch,
+                gateway: self.mint(SessionTokenProfile::Gateway, identity)?,
+                sandbox: self.mint(SessionTokenProfile::Sandbox, identity)?,
+                auth_epoch: identity.auth_epoch,
             })
         }
 
         fn mint(
             &self,
             profile: SessionTokenProfile,
-            identity: &SandboxSessionIdentity,
-            credential_epoch: Option<CredentialEpoch>,
+            identity: &SandboxRuntimeIdentity,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            if matches!(profile, SessionTokenProfile::Gateway) && credential_epoch.is_some()
-                || matches!(profile, SessionTokenProfile::Sandbox) && credential_epoch.is_none()
-            {
-                return Err(SessionJwtError::ProfileMismatch);
-            }
             let issued_at = self.clock.now_unix_seconds();
             let expires_at = issued_at.saturating_add(
                 i64::try_from(self.ttl.as_secs()).map_err(|_| SessionJwtError::InvalidLifetime)?,
@@ -572,12 +554,9 @@ mod session {
                 exp: expires_at,
                 jti: token_id.to_string(),
                 sandbox_id: identity.sandbox_id.clone(),
-                session_id: identity.session_id,
                 runtime_generation: identity.runtime_generation.clone(),
-                session_rotation: identity.session_rotation,
-                predecessor_session_id: identity.predecessor_session_id,
+                auth_epoch: identity.auth_epoch,
                 component: SessionComponent::OpenShellSupervisor,
-                credential_epoch,
             };
             let mut header = Header::new(Algorithm::EdDSA);
             header.kid = Some(self.key_id.clone());
@@ -622,11 +601,8 @@ mod session {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct AuthenticatedSandboxSession {
         pub sandbox_id: SandboxId,
-        pub session_id: SandboxSessionId,
         pub runtime_generation: SandboxGenerationId,
-        pub session_rotation: SessionRotation,
-        pub predecessor_session_id: Option<SandboxSessionId>,
-        pub credential_epoch: Option<CredentialEpoch>,
+        pub auth_epoch: CredentialEpoch,
         pub token_id: Uuid,
         pub issued_at: i64,
         pub expires_at: i64,
@@ -699,16 +675,8 @@ mod session {
             if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
                 return Err(SessionJwtError::SubjectMismatch);
             }
-            let expected_epoch = matches!(self.profile, SessionTokenProfile::Sandbox);
-            if claims.credential_epoch.is_some() != expected_epoch {
-                return Err(SessionJwtError::ProfileMismatch);
-            }
             SandboxGenerationId::parse(claims.runtime_generation.to_string())
-                .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
-            SessionRotation::new(claims.session_rotation.get())?;
-            if (claims.session_rotation.get() == 1) != claims.predecessor_session_id.is_none() {
-                return Err(SessionJwtError::InvalidSessionLineage);
-            }
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
             if claims.exp <= claims.iat {
                 return Err(SessionJwtError::InvalidLifetime);
@@ -727,11 +695,8 @@ mod session {
             }
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
-                session_id: claims.session_id,
                 runtime_generation: claims.runtime_generation,
-                session_rotation: claims.session_rotation,
-                predecessor_session_id: claims.predecessor_session_id,
-                credential_epoch: claims.credential_epoch,
+                auth_epoch: claims.auth_epoch,
                 token_id,
                 issued_at: claims.iat,
                 expires_at: claims.exp,
@@ -753,10 +718,10 @@ mod session {
         InvalidSessionRotation,
         #[error("session rotation overflow")]
         SessionRotationOverflow,
-        #[error("sandbox session lineage is missing")]
-        MissingSessionLineage,
-        #[error("sandbox session lineage is invalid")]
-        InvalidSessionLineage,
+        #[error("sandbox runtime identity is missing")]
+        MissingRuntimeIdentity,
+        #[error("sandbox runtime identity is invalid")]
+        InvalidRuntimeIdentity,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -910,7 +875,7 @@ mod tests {
             SessionJwtIssuer,
             SessionJwtVerifier,
             SessionJwtVerifier,
-            SandboxSessionIdentity,
+            SandboxRuntimeIdentity,
         ) {
             let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
             let public_key_pem = key.public_key_pem().into_bytes();
@@ -937,13 +902,11 @@ mod tests {
             let sandbox =
                 SessionJwtVerifier::new("test", SessionTokenProfile::Sandbox, [key()], clock)
                     .expect("sandbox verifier");
-            let identity = SandboxSessionIdentity {
+            let identity = SandboxRuntimeIdentity {
                 sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
-                session_id: SandboxSessionId::new(),
                 runtime_generation: SandboxGenerationId::parse("generation-1")
                     .expect("runtime generation"),
-                session_rotation: SessionRotation::new(1).expect("session rotation"),
-                predecessor_session_id: None,
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
             };
             (issuer, gateway, sandbox, identity)
         }
@@ -951,19 +914,17 @@ mod tests {
         #[test]
         fn token_profiles_are_not_interchangeable() {
             let (issuer, gateway, sandbox, identity) = fixture();
-            let epoch = CredentialEpoch::new(1).expect("epoch");
-            let pair = issuer.mint_pair(&identity, epoch).expect("token pair");
+            let pair = issuer.mint_pair(&identity).expect("token pair");
 
             let gateway_session = gateway
                 .verify(pair.gateway.token.expose_secret())
                 .expect("gateway token");
-            assert_eq!(gateway_session.session_id, identity.session_id);
-            assert_eq!(gateway_session.credential_epoch, None);
+            assert_eq!(gateway_session.auth_epoch, identity.auth_epoch);
 
             let sandbox_session = sandbox
                 .verify(pair.sandbox.token.expose_secret())
                 .expect("sandbox token");
-            assert_eq!(sandbox_session.credential_epoch, Some(epoch));
+            assert_eq!(sandbox_session.auth_epoch, identity.auth_epoch);
 
             assert_eq!(
                 gateway.verify(pair.sandbox.token.expose_secret()),
@@ -978,9 +939,7 @@ mod tests {
         #[test]
         fn token_debug_is_redacted() {
             let (issuer, _gateway, _sandbox, identity) = fixture();
-            let pair = issuer
-                .mint_pair(&identity, CredentialEpoch::new(1).expect("epoch"))
-                .expect("token pair");
+            let pair = issuer.mint_pair(&identity).expect("token pair");
             let debug = format!("{:?}", pair.sandbox.token);
             assert_eq!(debug, "SecretJwt([REDACTED])");
             assert!(!debug.contains(pair.sandbox.token.expose_secret()));
@@ -989,26 +948,22 @@ mod tests {
         #[test]
         fn supervisor_auth_bundle_round_trips_without_exposing_secrets_in_debug() {
             let (issuer, _gateway, _sandbox, identity) = fixture();
-            let pair = issuer
-                .mint_pair(&identity, CredentialEpoch::new(7).expect("epoch"))
-                .expect("token pair");
+            let pair = issuer.mint_pair(&identity).expect("token pair");
             let bundle = SupervisorAuthBundle {
-                session_id: identity.session_id,
+                session_id: SandboxSessionId::new(),
+                session_rotation: SessionRotation::new(1).expect("session rotation"),
                 runtime_generation: identity.runtime_generation.clone(),
-                session_rotation: identity.session_rotation,
-                predecessor_session_id: identity.predecessor_session_id,
+                auth_epoch: identity.auth_epoch,
                 gateway_token: pair.gateway.token,
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
-                credential_epoch: pair.credential_epoch,
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
             let decoded: SupervisorAuthBundle =
                 serde_json::from_slice(&encoded).expect("deserialize auth bundle");
-            assert_eq!(decoded.session_id, bundle.session_id);
-            assert_eq!(decoded.credential_epoch, bundle.credential_epoch);
+            assert_eq!(decoded.auth_epoch, bundle.auth_epoch);
             assert_eq!(
                 decoded.gateway_token.expose_secret(),
                 bundle.gateway_token.expose_secret()
@@ -1033,7 +988,8 @@ mod tests {
             exp: i64,
             jti: String,
             sandbox_id: &'a str,
-            session_id: SandboxSessionId,
+            runtime_generation: &'a str,
+            auth_epoch: CredentialEpoch,
             component: SessionComponent,
         }
 
@@ -1059,7 +1015,8 @@ mod tests {
                 exp: 1_900_003_600,
                 jti: uuid::Uuid::new_v4().to_string(),
                 sandbox_id: "sandbox-a",
-                session_id: SandboxSessionId::new(),
+                runtime_generation: "generation-1",
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
                 component: SessionComponent::OpenShellSupervisor,
             };
             let mut header = Header::new(Algorithm::EdDSA);
