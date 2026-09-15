@@ -19,7 +19,7 @@ on:
         default: ""
     secrets:
       CACHIX_AUTH_TOKEN:
-        required: true
+        required: false
 
 permissions:
   contents: read
