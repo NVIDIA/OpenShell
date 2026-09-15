@@ -2809,7 +2809,7 @@ async fn load_policy_with_gateway(
                 continue;
             }
             let (engine, policy, captured_provider_credentials) =
-                match prepare_startup_configuration(&snapshot, &proto_policy, provider) {
+                match prepare_startup_configuration(&snapshot, &proto_policy, &provider) {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         report_initial_policy_failure(
@@ -2977,7 +2977,7 @@ fn discover_image_policy_from_path(
 fn prepare_startup_configuration(
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
     policy: &openshell_core::proto::SandboxPolicy,
-    provider: openshell_core::grpc_client::ProviderEnvironmentResult,
+    provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<(OpaEngine, SandboxPolicy, ProviderCredentialState)> {
     if !snapshot.configuration_admitted {
         return Err(miette::miette!(
@@ -2996,15 +2996,15 @@ fn prepare_startup_configuration(
 }
 
 fn prepare_provider_environment(
-    provider: openshell_core::grpc_client::ProviderEnvironmentResult,
+    provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
     ProviderCredentialState::from_bound_environment(
         provider.provider_env_revision,
-        provider.environment,
-        provider.credential_expires_at_ms,
-        provider.dynamic_credentials,
-        provider.static_credential_bindings,
-        provider.non_secret_environment_keys,
+        provider.environment.clone(),
+        provider.credential_expires_at_ms.clone(),
+        provider.dynamic_credentials.clone(),
+        provider.static_credential_bindings.clone(),
+        provider.non_secret_environment_keys.clone(),
     )
     .map_err(|_| miette::miette!("Provider credential bindings are invalid"))
 }
@@ -4397,7 +4397,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             &result,
         );
         let mut policy_runtime_reconciled = false;
-        let mut provider_runtime_changed = false;
+        let provider_runtime_changed = provider_env_changed;
 
         // A local policy override is not coupled to the gateway policy
         // snapshot, so its service registry can still be reconciled alone.
@@ -4476,8 +4476,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 .build());
         }
 
-        // Prepare the matching environment off to the side. Fetch errors and
-        // invalid bindings preserve the previously accepted credential state.
+        // Prepare the matching environment before activation. Failed refreshes
+        // revoke static credentials while preserving independently bound dynamic grants.
         let prepared_provider = if provider_env_changed {
             let provider = match openshell_core::grpc_client::fetch_provider_environment(
                 &ctx.endpoint,
@@ -4489,6 +4489,21 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     provider
                 }
                 _ => {
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "fail_closed")
+                        .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
+                        .build());
+                    ctx.provider_credentials
+                        .revoke_static_provider_environment(result.provider_env_revision);
+                    endpoint_status::reset(
+                        ctx.endpoint_observation_tx.as_ref(),
+                        current_endpoint_policy.as_ref(),
+                        &current_policy_hash,
+                        result.provider_env_revision,
+                    )
+                    .await;
                     report_runtime_configuration(
                         &ctx,
                         &result,
@@ -4499,9 +4514,32 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     continue;
                 }
             };
-            if let Ok(prepared) = prepare_provider_environment(provider) {
+            if let Ok(prepared) = prepare_provider_environment(&provider) {
                 Some(prepared)
             } else {
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "fail_closed")
+                    .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
+                    .build());
+                // Repeat the rejected binding validation on the live state to
+                // revoke static material and retain the fetched dynamic grants.
+                let _ = ctx.provider_credentials.install_bound_environment(
+                    provider.provider_env_revision,
+                    provider.environment,
+                    provider.credential_expires_at_ms,
+                    provider.dynamic_credentials,
+                    provider.static_credential_bindings,
+                    provider.non_secret_environment_keys,
+                );
+                endpoint_status::reset(
+                    ctx.endpoint_observation_tx.as_ref(),
+                    current_endpoint_policy.as_ref(),
+                    &current_policy_hash,
+                    result.provider_env_revision,
+                )
+                .await;
                 report_runtime_configuration(
                     &ctx,
                     &result,
@@ -5791,9 +5829,9 @@ network_policies:
             openshell_core::proto::PolicySource::Sandbox,
         );
         snapshot.provider_env_revision = 10;
-        assert!(prepare_startup_configuration(&snapshot, &policy, startup_provider(11)).is_err());
+        assert!(prepare_startup_configuration(&snapshot, &policy, &startup_provider(11)).is_err());
         let (_, _, credentials) =
-            prepare_startup_configuration(&snapshot, &policy, startup_provider(10))
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
     }
@@ -5809,10 +5847,12 @@ network_policies:
         for _restart in 0..2 {
             snapshot.configuration_admitted = false;
             assert!(
-                prepare_startup_configuration(&snapshot, &policy, startup_provider(0)).is_err()
+                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_err()
             );
             snapshot.configuration_admitted = true;
-            assert!(prepare_startup_configuration(&snapshot, &policy, startup_provider(0)).is_ok());
+            assert!(
+                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_ok()
+            );
         }
     }
 
@@ -5831,7 +5871,7 @@ network_policies:
             1,
             openshell_core::proto::PolicySource::Sandbox,
         );
-        assert!(prepare_startup_configuration(&snapshot, &policy, startup_provider(0)).is_err());
+        assert!(prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_err());
     }
 
     #[derive(Clone)]

@@ -678,6 +678,10 @@ impl ProviderCredentialState {
         );
         inner.static_credential_bindings = bindings;
         inner.non_secret_environment_keys = non_secret_keys;
+        inner.body_inventory_available = true;
+        inner
+            .known_body_keys
+            .extend(snapshot.child_env.keys().cloned());
         inner.current = Arc::new(snapshot);
         inner.current.child_env.len()
     }
@@ -2351,6 +2355,34 @@ mod tests {
             resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
             Some("second-secret"),
         );
+    }
+
+    #[test]
+    fn prepared_install_restores_body_inventory_after_revocation() {
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        live.revoke_static_provider_environment(2);
+        assert!(!live.inner.read().unwrap().body_inventory_available);
+        let candidate = ProviderCredentialState::from_bound_environment(
+            3,
+            HashMap::from([("NEW_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "NEW_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        live.install_prepared(&candidate);
+        let inner = live.inner.read().unwrap();
+        assert!(inner.body_inventory_available);
+        assert!(inner.known_body_keys.contains("NEW_KEY"));
     }
 
     #[test]
