@@ -13,6 +13,10 @@ adapters. These adapters retain their protocol libraries' validation and encodin
 they do not expose AWS-LC types. A later native OpenSSL TLS integration may need
 an additional transport adapter; this interface does not claim to provide one.
 
+Digest creation, updates, and finalization return `Result` so backends can report
+provider and operation failures. Callers discard a digest after an update error;
+the one-shot SHA-256 helper propagates the first failure without fallback.
+
 Callers use `aead`, `pki`, `tls`, and `jwt`, or an explicit `CryptoContext`.
 Certificate policy and JWT claim validation remain at their existing callers.
 The rcgen adapter returns key pairs that own their signing implementation; a

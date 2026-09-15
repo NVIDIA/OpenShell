@@ -11,6 +11,28 @@ use std::sync::{
 
 static JWT_SIGNERS: AtomicUsize = AtomicUsize::new(0);
 static JWT_VERIFIERS: AtomicUsize = AtomicUsize::new(0);
+static DIGEST_FAILURE: AtomicUsize = AtomicUsize::new(0);
+static DIGEST_UPDATES: AtomicUsize = AtomicUsize::new(0);
+static DIGEST_FINISHES: AtomicUsize = AtomicUsize::new(0);
+
+struct FailingDigest(usize);
+impl Digest for FailingDigest {
+    fn update(&mut self, _: &[u8]) -> Result<(), CryptoError> {
+        DIGEST_UPDATES.fetch_add(1, Ordering::SeqCst);
+        if self.0 == 2 {
+            Err(CryptoError::Operation)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Result<[u8; 32], CryptoError> {
+        DIGEST_FINISHES.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.0, 3, "must not finalize after an update failure");
+        Err(CryptoError::Operation)
+    }
+}
+
 static JWT_PROVIDER: LazyLock<jsonwebtoken::crypto::CryptoProvider> = LazyLock::new(|| {
     let mut provider = CryptoContext::default().backend().jwt_provider().clone();
     provider.signer_factory = |algorithm, key| {
@@ -41,8 +63,12 @@ impl CryptoBackend for TestBackend {
         bytes.fill(0x55);
         Ok(())
     }
-    fn sha256_digest(&self) -> Box<dyn Digest> {
-        self.0.backend().sha256_digest()
+    fn sha256_digest(&self) -> Result<Box<dyn Digest>, CryptoError> {
+        match DIGEST_FAILURE.load(Ordering::SeqCst) {
+            0 => self.0.backend().sha256_digest(),
+            1 => Err(CryptoError::Operation),
+            stage => Ok(Box::new(FailingDigest(stage))),
+        }
     }
     fn seal(&self, _: &[u8; 32], _: &[u8], _: &[u8]) -> Result<Sealed, CryptoError> {
         Err(CryptoError::Random)
@@ -79,6 +105,20 @@ fn selected_context_controls_application_adapters_and_cannot_be_replaced() {
         Err(CryptoError::Random)
     );
     assert!(openshell_crypto::pki::generate_keypair().is_err());
+    // Exercise each fallible stage through the public helper. No failed stage
+    // may be retried with the default backend or followed by another operation.
+    for (stage, updates, finishes) in [(1, 0, 0), (2, 1, 0), (3, 1, 1)] {
+        DIGEST_FAILURE.store(stage, Ordering::SeqCst);
+        DIGEST_UPDATES.store(0, Ordering::SeqCst);
+        DIGEST_FINISHES.store(0, Ordering::SeqCst);
+        assert_eq!(
+            openshell_crypto::sha256(b"abc"),
+            Err(CryptoError::Operation)
+        );
+        assert_eq!(DIGEST_UPDATES.load(Ordering::SeqCst), updates);
+        assert_eq!(DIGEST_FINISHES.load(Ordering::SeqCst), finishes);
+    }
+    DIGEST_FAILURE.store(0, Ordering::SeqCst);
     // A plain round trip could pass with the default backend. Instrument both
     // factories to prove that JWT operations use the selected context instead.
     let claims = serde_json::json!({"sub": "sandbox", "exp": 4_000_000_000_u64});
