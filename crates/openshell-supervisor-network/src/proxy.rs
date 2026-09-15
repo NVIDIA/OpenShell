@@ -20,6 +20,9 @@ use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
+use openshell_core::endpoint_status::{
+    EndpointObservationContext, EndpointObservationSender, EndpointResult,
+};
 use openshell_core::net::{
     connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
     set_tcp_nodelay_best_effort,
@@ -212,6 +215,7 @@ impl ProxyHandle {
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
+        endpoint_observation_tx: Option<EndpointObservationSender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         backend_host_gateway: Option<IpAddr>,
@@ -439,6 +443,7 @@ impl ProxyHandle {
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
+                        let endpoint_observations = endpoint_observation_tx.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_mediated_connection(
@@ -461,6 +466,7 @@ impl ProxyHandle {
                                 dynamic_credentials,
                                 dtx,
                                 atx,
+                                endpoint_observations,
                             )
                             .await
                             {
@@ -961,13 +967,16 @@ async fn handle_transparent_tcp_connection(
         &decision,
         None,
         None,
-        activity_tx.clone(),
         None,
         agent_proposals,
         // The transparent TCP path carries no PolicyLocalContext, so no
         // workspace is available here; matches the CONNECT path default when
         // policy-local context is absent.
         String::new(),
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: None,
+        },
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
@@ -1790,11 +1799,45 @@ fn build_forward_policy_deny_ocsf_event(
 
 fn destination_denial_detail(kind: DestinationDenialKind) -> &'static str {
     match kind {
+        DestinationDenialKind::Resolution => "destination resolution failed",
         DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
         DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
         DestinationDenialKind::AllowedIps => "allowed_ips check failed",
         DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
         DestinationDenialKind::InternalAddress => "internal address",
+    }
+}
+
+fn endpoint_result_for_destination_failure(kind: DestinationDenialKind) -> EndpointResult {
+    if kind == DestinationDenialKind::Resolution {
+        EndpointResult::TransportFailed
+    } else {
+        EndpointResult::PolicyDenied
+    }
+}
+
+/// Separates resolver failures from address-policy rejections while preserving
+/// the existing diagnostic text used by proxy responses and tests.
+#[derive(Debug)]
+pub(crate) enum DestinationCheckError {
+    /// Name resolution did not produce an address set to authorize.
+    Resolution(String),
+    /// The resolved address set violated destination policy.
+    Denied(String),
+}
+
+impl DestinationCheckError {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl std::fmt::Display for DestinationCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolution(reason) | Self::Denied(reason) => formatter.write_str(reason),
+        }
     }
 }
 
@@ -1999,6 +2042,7 @@ async fn handle_tcp_connection(
     >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
     let socket_addrs = client.peer_addr().ok().zip(client.local_addr().ok());
     let stream: BoundaryDuplexStream = Box::new(client);
@@ -2022,6 +2066,7 @@ async fn handle_tcp_connection(
         dynamic_credentials,
         denial_tx,
         activity_tx,
+        endpoint_observation_tx,
     ))
     .await
 }
@@ -2092,7 +2137,13 @@ async fn handle_mediated_connection(
     >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    // Bind observations to the policy/provider inventory active when this
+    // connection was accepted, even if configuration changes while it runs.
+    let endpoint_observation_context = endpoint_observation_tx
+        .as_ref()
+        .and_then(EndpointObservationSender::capture);
     let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
         transparent_open
     {
@@ -2156,7 +2207,7 @@ async fn handle_mediated_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        return handle_forward_proxy(
+        return Box::pin(handle_forward_proxy(
             method,
             target,
             &buf[..],
@@ -2176,7 +2227,8 @@ async fn handle_mediated_connection(
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
-        )
+            endpoint_observation_tx,
+        ))
         .await;
     }
 
@@ -2325,6 +2377,16 @@ async fn handle_mediated_connection(
     hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
+    // Route materialization is safe before destination dialing and lets an
+    // unambiguous MCP authority report local fail-closed outcomes that occur
+    // before the HTTP request path becomes available.
+    hydrate_l7_route(&mut decision);
+    let connect_endpoint_observer = begin_unambiguous_endpoint_observation(
+        decision.endpoint.l7_route.as_ref(),
+        endpoint_observation_tx.as_ref(),
+        endpoint_observation_context.as_ref(),
+        &connect_generation_guard,
+    );
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
@@ -2333,6 +2395,9 @@ async fn handle_mediated_connection(
         {
             Ok(()) => {}
             Err(denial) => {
+                if let Some(observer) = connect_endpoint_observer.as_ref() {
+                    observer.observe(endpoint_result_for_destination_failure(denial.kind));
+                }
                 deny_connect_destination(
                     &mut client,
                     &denial,
@@ -2373,6 +2438,9 @@ async fn handle_mediated_connection(
         {
             Ok(connector) => connector,
             Err(denial) => {
+                if let Some(observer) = connect_endpoint_observer.as_ref() {
+                    observer.observe(endpoint_result_for_destination_failure(denial.kind));
+                }
                 deny_connect_destination(
                     &mut client,
                     &denial,
@@ -2403,6 +2471,9 @@ async fn handle_mediated_connection(
     if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
         .await?
     {
+        if let Some(observer) = connect_endpoint_observer.as_ref() {
+            observer.observe(EndpointResult::TlsFailed);
+        }
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -2438,6 +2509,9 @@ async fn handle_mediated_connection(
     if credential_guard.blocks_connect() {
         const DETAIL: &str =
             "credentialed endpoint requires L7 inspection; raw tunnel is not explicitly allowed";
+        if let Some(observer) = connect_endpoint_observer.as_ref() {
+            observer.observe(EndpointResult::PolicyDenied);
+        }
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -2482,7 +2556,6 @@ async fn handle_mediated_connection(
 
     // CONNECT must use one policy generation from authorization through route
     // materialization and relay startup.
-    hydrate_l7_route(&mut decision);
     let l7_route = decision.endpoint.l7_route.as_ref();
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
@@ -2512,7 +2585,15 @@ async fn handle_mediated_connection(
         .await?;
         return Ok(());
     };
-    let mut upstream = upstream_result.into_diagnostic()?;
+    let mut upstream = match upstream_result {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            if let Some(observer) = connect_endpoint_observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            return Err(error).into_diagnostic();
+        }
+    };
     if let Err(error) = connect_generation_guard.ensure_current() {
         reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
             .await?;
@@ -2555,10 +2636,13 @@ async fn handle_mediated_connection(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        activity_tx.clone(),
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: endpoint_observation_tx,
+        },
     );
 
     if effective_tls_skip {
@@ -2613,12 +2697,41 @@ async fn handle_mediated_connection(
         // TLS detected — terminate unconditionally.
         if let Some(ref tls) = tls_state {
             ctx.request_default_port = Some(443);
+            // Complete the client handshake before observing the upstream
+            // connection. A malformed client handshake provides no evidence
+            // of an endpoint network failure.
+            let mut tls_client =
+                match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        debug!(host = %host_lc, port, "client TLS handshake failed");
+                        return Err(error);
+                    }
+                };
+            let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
+                upstream,
+                &host_lc,
+                tls.upstream_config(),
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    if let Some(observer) = connect_endpoint_observer.as_ref() {
+                        observer.observe(EndpointResult::TlsFailed);
+                    }
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message("Upstream TLS establishment failed")
+                        .build();
+                    ocsf_emit!(event);
+                    return Err(error);
+                }
+            };
             let tls_result = async {
-                let mut tls_client =
-                    crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
-                        .await?;
                 let Some(relay_context) =
                     relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
                 else {
@@ -3384,6 +3497,24 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|snapshot| snapshot.config.path_specificity())
 }
 
+/// Begin a pre-path observation only when an authority identifies one tool server endpoint.
+fn begin_unambiguous_endpoint_observation(
+    route: Option<&L7RouteSnapshot>,
+    sender: Option<&EndpointObservationSender>,
+    context: Option<&EndpointObservationContext>,
+    guard: &PolicyGenerationGuard,
+) -> Option<crate::l7::EndpointObserver> {
+    let mut mcp_configs = route?.configs.iter().filter(|snapshot| {
+        snapshot.config.protocol == crate::l7::L7Protocol::Mcp
+            && !snapshot.config.endpoint_id.is_empty()
+    });
+    let config = &mcp_configs.next()?.config;
+    if mcp_configs.any(|candidate| candidate.config.endpoint_id != config.endpoint_id) {
+        return None;
+    }
+    crate::l7::EndpointObserver::begin_captured(sender, config, context, None, Some(guard))
+}
+
 /// Query the TLS mode for an endpoint, independent of L7 config.
 ///
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
@@ -3587,43 +3718,45 @@ async fn resolve_and_check_trusted_gateway(
     port: u16,
     trusted_gw: IpAddr,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
     if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
-        return Err(format!(
+        return Err(DestinationCheckError::Denied(format!(
             "port {port} is a blocked control-plane port, connection rejected"
-        ));
+        )));
     }
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
     if addrs.is_empty() {
-        return Err(format!(
+        return Err(DestinationCheckError::Resolution(format!(
             "DNS resolution returned no addresses for {}",
             normalize_host_lookup_key(host)
-        ));
+        )));
     }
     for addr in &addrs {
         if is_cloud_metadata_ip(addr.ip()) {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to cloud metadata address {}, connection rejected",
                 addr.ip()
-            ));
+            )));
         }
         if addr.ip() != trusted_gw {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to {} which does not match trusted host gateway \
                  {trusted_gw}, connection rejected",
                 addr.ip()
-            ));
+            )));
         }
         // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
         // any non-link-local address. detect_trusted_host_gateway() already
         // enforces this at startup, but we re-check here to guard against any
         // unanticipated code path that might admit a private or loopback IP.
         if !is_link_local_ip(addr.ip()) {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to non-link-local address {}, \
                  connection rejected",
                 addr.ip()
-            ));
+            )));
         }
     }
     Ok(addrs)
@@ -3938,9 +4071,11 @@ async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    reject_internal_resolved_addrs(host, &addrs)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    reject_internal_resolved_addrs(host, &addrs).map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -3957,9 +4092,12 @@ async fn resolve_and_check_allowed_ips(
     port: u16,
     allowed_ips: &[ipnet::IpNet],
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)
+        .map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -3972,9 +4110,12 @@ async fn resolve_and_check_declared_endpoint(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    validate_declared_endpoint_resolved_addrs(host, port, &addrs)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    validate_declared_endpoint_resolved_addrs(host, port, &addrs)
+        .map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -4680,7 +4821,12 @@ async fn handle_forward_proxy(
     >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    let endpoint_observation_context = endpoint_observation_tx
+        .as_ref()
+        .and_then(EndpointObservationSender::capture);
+    let mut endpoint_observer = None;
     let mut telemetry_path = forward_telemetry_path(target_uri);
     // 1. Parse the absolute-form URI. Every external forward target is
     // canonicalized below before credential binding, policy-path evaluation,
@@ -4971,10 +5117,13 @@ async fn handle_forward_proxy(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        activity_tx.cloned(),
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        relay::RelaySignals {
+            activity: activity_tx.cloned(),
+            endpoint_observation: endpoint_observation_tx,
+        },
     );
     l7_ctx.request_default_port = match scheme.as_str() {
         "http" => Some(80),
@@ -5077,6 +5226,13 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        endpoint_observer = crate::l7::EndpointObserver::begin_captured(
+            l7_ctx.endpoint_observation_tx.as_ref(),
+            &l7_config.config,
+            endpoint_observation_context.as_ref(),
+            None,
+            Some(&forward_generation_guard),
+        );
         // `canonicalize_options` was built before the matching config was
         // known, so `allow_encoded_slash` was taken permissively across every
         // config on this route. Re-check it against the config that actually
@@ -5285,6 +5441,7 @@ async fn handle_forward_proxy(
                 client,
                 &l7_ctx,
                 &telemetry_path,
+                endpoint_observer.as_ref(),
             )
             .await?
             {
@@ -5789,6 +5946,7 @@ async fn handle_forward_proxy(
                 client,
                 &l7_ctx,
                 &telemetry_path,
+                endpoint_observer.as_ref(),
             )
             .await?
             {
@@ -6646,6 +6804,7 @@ network_policies: {}
             None,
             None,
             None,
+            None,
         ))
         .await
         .expect("malformed request should be handled");
@@ -6670,6 +6829,7 @@ network_policies: {}
             engine,
             Arc::new(BinaryIdentityCache::new()),
             Arc::new(AtomicU32::new(1)),
+            None,
             None,
             None,
             None,
@@ -6847,6 +7007,7 @@ network_policies:
                     None,
                     None,
                     None,
+                    None,
                 )),
             )
             .await
@@ -6965,6 +7126,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
+                None,
                 None,
                 None,
                 None,
@@ -7092,7 +7254,7 @@ network_policies:
         let mut proxy_connection = tokio::io::BufReader::new(stream);
 
         let handler = tokio::spawn(async move {
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -7112,7 +7274,8 @@ network_policies:
                 None,
                 None,
                 None,
-            )
+                None,
+            ))
             .await
         });
         let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
@@ -7631,6 +7794,8 @@ network_policies:
         websocket_credential_rewrite: bool,
     ) -> crate::l7::L7EndpointConfig {
         crate::l7::L7EndpointConfig {
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             protocol,
             path: "/**".to_string(),
             tls: crate::l7::TlsMode::Auto,
@@ -8883,6 +9048,8 @@ network_policies:
         let configs = vec![
             L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     protocol: crate::l7::L7Protocol::Rest,
                     path: "/**".to_string(),
                     tls: crate::l7::TlsMode::Auto,
@@ -8904,6 +9071,8 @@ network_policies:
             },
             L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     protocol: crate::l7::L7Protocol::Graphql,
                     path: "/graphql".to_string(),
                     tls: crate::l7::TlsMode::Auto,
@@ -11752,6 +11921,7 @@ network_policies:
                 None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
                 None,                      // activity_tx
+                None,                      // endpoint_observation_tx
             )),
         )
         .await
@@ -11818,6 +11988,7 @@ network_policies:
             None,
             None,
             Some(denial_tx),
+            None,
             None,
         ))
         .await

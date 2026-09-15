@@ -86,6 +86,7 @@ pub async fn start_boundary_access(
     boundary_exec: Arc<dyn BoundaryExec>,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
+    supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -162,7 +163,10 @@ pub async fn start_boundary_access(
                 port_forward,
                 None,
                 terminating.clone(),
-                instance_id.clone(),
+                crate::supervisor_session::SessionRuntimeContext {
+                    instance_id: instance_id.clone(),
+                    session_id_updates: supervisor_session_updates,
+                },
             );
             let accepted_result =
                 tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))

@@ -27,7 +27,7 @@ use openshell_ocsf::{
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
@@ -36,6 +36,14 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Runtime identity and status channel shared with a supervisor session task.
+pub struct SessionRuntimeContext {
+    /// Identifies the local supervisor process across gateway reconnects.
+    pub instance_id: String,
+    /// Publishes the currently accepted gateway session to sibling reporters.
+    pub session_id_updates: Option<watch::Sender<Option<String>>>,
+}
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
 /// to treating the whole string as a domain if parsing fails.
@@ -275,7 +283,7 @@ pub fn spawn(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
-    instance_id: String,
+    runtime: SessionRuntimeContext,
 ) -> tokio::task::JoinHandle<()> {
     spawn_with_readiness(
         endpoint,
@@ -284,7 +292,7 @@ pub fn spawn(
         port_forward,
         expected_ssh_peer_pid,
         terminating,
-        instance_id,
+        runtime,
     )
     .0
 }
@@ -297,12 +305,9 @@ pub fn spawn_with_readiness(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
-    instance_id: String,
-) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::watch::Receiver<bool>,
-) {
-    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    runtime: SessionRuntimeContext,
+) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
+    let (ready_tx, ready_rx) = watch::channel(false);
     let config = SessionConfig {
         endpoint,
         sandbox_id,
@@ -310,7 +315,8 @@ pub fn spawn_with_readiness(
         port_forward,
         expected_ssh_peer_pid,
         terminating,
-        instance_id,
+        instance_id: runtime.instance_id,
+        session_id_updates: runtime.session_id_updates,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -324,7 +330,9 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-    ready_tx: tokio::sync::watch::Sender<bool>,
+    /// Publishes the currently accepted session to sibling control-plane reporters.
+    session_id_updates: Option<watch::Sender<Option<String>>>,
+    ready_tx: watch::Sender<bool>,
 }
 
 async fn run_session_loop(config: SessionConfig) {
@@ -334,7 +342,11 @@ async fn run_session_loop(config: SessionConfig) {
     loop {
         attempt += 1;
 
-        match run_single_session(&config).await {
+        let result = run_single_session(&config).await;
+        if let Some(updates) = &config.session_id_updates {
+            updates.send_replace(None);
+        }
+        match result {
             Ok(()) => {
                 config.ready_tx.send_replace(false);
                 let event = session_closed_event(
@@ -409,6 +421,9 @@ async fn run_single_session(
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
+    if let Some(updates) = &config.session_id_updates {
+        updates.send_replace(Some(accepted.session_id.clone()));
+    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         &config.endpoint,
