@@ -105,7 +105,7 @@ async fn delete_provider(name: &str) {
 
 async fn delete_provider_profile(id: &str) {
     let mut cmd = openshell_cmd();
-    cmd.args(["provider", "profile", "delete", id])
+    cmd.args(["profile", "delete", id])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
@@ -1668,7 +1668,7 @@ async fn http_credentials_are_rewritten_in_headers_and_bodies_for_both_adapters(
         let server = CredentialProbeServer::start().await?;
         let profile = write_credential_profile(server.port)?;
         let profile_path = profile.path().to_string_lossy().into_owned();
-        run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+        run_cli(&["profile", "import", "--file", &profile_path]).await?;
         create_bound_provider(PROVIDER_NAME).await?;
         let endpoint_options = r#"        path: /probe
         protocol: rest
