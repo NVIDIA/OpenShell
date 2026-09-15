@@ -513,12 +513,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            101 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            75 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            76 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -526,7 +526,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            75 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            76 + PROVIDER_READINESS_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
