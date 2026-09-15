@@ -13,7 +13,7 @@ let
     {
       x86_64-linux = {
         platform = "linux-x86_64";
-        hash = "sha256-dJauQnv4L+rT003rJfFPbrJNsQwoWpX61X3GlBkuIog=";
+        hash = "sha256-kA6ZQz53geBp2zHx8tv+D8VcGkSrnC74Op/60H4fmck=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
@@ -22,7 +22,7 @@ let
       };
       aarch64-linux = {
         platform = "linux-aarch64";
-        hash = "sha256-VvqnmAClehcU1IifoZsd4XrSI6N2Hlu1dskNuPQxME4=";
+        hash = "sha256-7FNqUtC6ixfw202EyoYCgZOLdyxJYfg/YzdlkTT/+sM=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
@@ -31,7 +31,7 @@ let
       };
       aarch64-darwin = {
         platform = "darwin-aarch64";
-        hash = "sha256-orr16ZuCLQ5b2Uwg1NuobjLMpmxZjaGwmb+i/QZ5TZM=";
+        hash = "sha256-cPfogd7QiPFk76kR1JJeKLaWwFksAZ9BeW/LsmDgsjo=";
         artifacts = [
           "libkrun.dylib"
           "libkrunfw.5.dylib"
