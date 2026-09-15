@@ -3387,7 +3387,10 @@ fn validate_create_time_provider_credential_lifetimes(
                 .get(*key)
                 .is_some_and(|expires_at_ms| *expires_at_ms > 0)
         })
+        .chain(provider_environment.expired_static_keys.iter())
         .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     expiring_static_keys.sort();
 
@@ -3395,7 +3398,7 @@ fn validate_create_time_provider_credential_lifetimes(
         Ok(())
     } else {
         Err(Status::failed_precondition(format!(
-            "compute driver cannot refresh expiring provider credentials for running sandbox '{sandbox_id}'; recreate the sandbox with non-expiring credentials (expiring keys: {})",
+            "compute driver cannot refresh expiring or already-expired provider credentials for sandbox '{sandbox_id}'; recreate the sandbox with non-expiring, current credentials (affected keys: {})",
             expiring_static_keys.join(", ")
         )))
     }
@@ -11829,6 +11832,28 @@ mod tests {
 
         validate_create_time_provider_credential_lifetimes("sandbox-static", &provider_environment)
             .expect("non-expiring static credentials are supported");
+    }
+
+    #[test]
+    fn create_time_provider_credentials_reject_already_expired_static_values() {
+        // The shared resolver withholds already-expired static credentials
+        // entirely -- they never appear in `static_credential_keys` or
+        // `credential_expires_at_ms` -- so this check must consult
+        // `expired_static_keys` independently instead of silently allowing
+        // sandbox creation without the configured credential.
+        let provider_environment = ProviderEnvironment {
+            expired_static_keys: HashSet::from(["GITHUB_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        let error = validate_create_time_provider_credential_lifetimes(
+            "sandbox-expired",
+            &provider_environment,
+        )
+        .expect_err("already-expired static credentials must fail closed");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("GITHUB_TOKEN"));
     }
 
     #[tokio::test]
