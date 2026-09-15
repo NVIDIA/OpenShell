@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode_header};
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
@@ -24,6 +22,7 @@ use openshell_core::proto::{
     ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
+use openshell_crypto::jwt::{decode, encode};
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
 use policy_hash::{
@@ -34,7 +33,6 @@ use prost::Message as _;
 use prost_types::ListValue;
 use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use proto_json::{decode_message_to_json, encode_json_to_message};
-use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
@@ -101,7 +99,7 @@ struct ProfileSignatureClaims {
 
 impl PolicySigner {
     fn generate() -> Result<Self, String> {
-        let keypair = KeyPair::generate_for(&PKCS_ED25519)
+        let keypair = openshell_crypto::pki::generate_jwt_keypair()
             .map_err(|err| format!("failed to generate policy signing key: {err}"))?;
         let signing_key_pem = keypair.serialize_pem();
         let public_key_pem = keypair.public_key_pem();

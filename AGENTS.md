@@ -37,6 +37,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |

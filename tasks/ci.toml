@@ -52,6 +52,7 @@ hide = true
 [lint]
 description = "Run repository lint checks"
 depends = [
+  "crypto:check",
   "license:check",
   "rust:format:check",
   "rust:lockfiles:check",

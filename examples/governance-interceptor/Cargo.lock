@@ -1065,6 +1065,7 @@ dependencies = [
  "ipnet",
  "miette",
  "nix",
+ "openshell-crypto",
  "openshell-extension-core",
  "openshell-policy-schema",
  "prost",
@@ -1089,6 +1090,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-crypto"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "jsonwebtoken",
+ "rcgen",
+ "rustls",
+ "serde",
+ "thiserror",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
@@ -1107,6 +1121,7 @@ dependencies = [
  "jsonwebtoken",
  "noyalib",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
  "openshell-providers",
  "prost",
