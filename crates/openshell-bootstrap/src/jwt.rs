@@ -42,7 +42,7 @@ pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
         .wrap_err("failed to generate Ed25519 JWT signing key")?;
     let signing_key_pem = keypair.serialize_pem();
     let public_key_pem = keypair.public_key_pem();
-    let kid = kid_from_public_key_der(&keypair.public_key_der());
+    let kid = kid_from_public_key_der(&keypair.public_key_der())?;
     Ok(JwtKeyMaterial {
         signing_key_pem,
         public_key_pem,
@@ -55,9 +55,11 @@ pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
 /// First 16 bytes hex-encoded — collision-resistant for the small N of
 /// signing keys a single deployment ever has, while staying short enough
 /// to keep JWT headers compact.
-fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
-    let digest = openshell_crypto::sha256(public_key_der);
-    hex_encode_prefix(&digest, 16)
+fn kid_from_public_key_der(public_key_der: &[u8]) -> Result<String> {
+    let digest = openshell_crypto::sha256(public_key_der)
+        .into_diagnostic()
+        .wrap_err("failed to derive JWT signing key ID")?;
+    Ok(hex_encode_prefix(&digest, 16))
 }
 
 fn hex_encode_prefix(bytes: &[u8], n: usize) -> String {
@@ -85,15 +87,15 @@ mod tests {
     #[test]
     fn kid_is_stable_for_identical_public_keys() {
         // Same input -> same kid. Hash of a fixed byte string.
-        let kid_a = kid_from_public_key_der(b"abc");
-        let kid_b = kid_from_public_key_der(b"abc");
+        let kid_a = kid_from_public_key_der(b"abc").unwrap();
+        let kid_b = kid_from_public_key_der(b"abc").unwrap();
         assert_eq!(kid_a, kid_b);
     }
 
     #[test]
     fn kid_differs_for_different_public_keys() {
-        let kid_a = kid_from_public_key_der(b"first");
-        let kid_b = kid_from_public_key_der(b"second");
+        let kid_a = kid_from_public_key_der(b"first").unwrap();
+        let kid_b = kid_from_public_key_der(b"second").unwrap();
         assert_ne!(kid_a, kid_b);
     }
 

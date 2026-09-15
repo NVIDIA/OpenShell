@@ -472,7 +472,7 @@ impl EncryptedGatewayCredentialSettings {
 impl EncryptedGatewayCredentialState {
     fn from_settings(settings: EncryptedGatewayCredentialSettings) -> CoreResult<Self> {
         let key_encryption_key = load_key_encryption_key(&settings)?;
-        let key_encryption_key_id = key_id(&key_encryption_key);
+        let key_encryption_key_id = key_id(&key_encryption_key)?;
         Ok(Self {
             settings,
             key_encryption_key,
@@ -885,9 +885,10 @@ fn random_bytes_status<const N: usize>() -> Result<[u8; N], Status> {
     Ok(bytes)
 }
 
-fn key_id(key: &[u8; KEY_LEN]) -> String {
-    let digest = openshell_crypto::sha256(key);
-    format!("sha256:{}", hex_encode(&digest))
+fn key_id(key: &[u8; KEY_LEN]) -> CoreResult<String> {
+    let digest = openshell_crypto::sha256(key)
+        .map_err(|_| Error::config("failed to derive default credential storage key ID"))?;
+    Ok(format!("sha256:{}", hex_encode(&digest)))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

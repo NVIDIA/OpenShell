@@ -21,7 +21,7 @@ pub enum CryptoError {
     /// A backend could not obtain cryptographic randomness.
     #[error("cryptographic random generation failed")]
     Random,
-    /// Encryption or key initialization failed.
+    /// Digest, encryption, or key initialization failed.
     #[error("cryptographic operation failed")]
     Operation,
     /// Authentication failed; do not distinguish key, nonce, AAD, or tag errors.
@@ -58,11 +58,13 @@ pub struct Capabilities {
 }
 
 /// Object-safe incremental SHA-256 computation.
+///
+/// After an update fails, callers must discard the computation without finalizing it.
 pub trait Digest: Send {
     /// Append bytes without allocating a concatenated message.
-    fn update(&mut self, bytes: &[u8]);
+    fn update(&mut self, bytes: &[u8]) -> Result<(), CryptoError>;
     /// Consume the state and return the digest.
-    fn finish(self: Box<Self>) -> [u8; 32];
+    fn finish(self: Box<Self>) -> Result<[u8; 32], CryptoError>;
 }
 
 /// Primitive contract. No concrete crypto-library types cross this boundary.
@@ -76,7 +78,7 @@ pub trait CryptoBackend: Send + Sync {
     /// Fill the entire output or report an entropy failure.
     fn fill_random(&self, output: &mut [u8]) -> Result<(), CryptoError>;
     /// Create an incremental SHA-256 computation.
-    fn sha256_digest(&self) -> Box<dyn Digest>;
+    fn sha256_digest(&self) -> Result<Box<dyn Digest>, CryptoError>;
     /// Encrypt with a fresh random 96-bit nonce, appending the 128-bit GCM tag.
     fn seal(
         &self,
@@ -183,16 +185,14 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N], CryptoError> {
 }
 
 /// Create an incremental SHA-256 computation.
-#[must_use]
-pub fn sha256_digest() -> Box<dyn Digest> {
+pub fn sha256_digest() -> Result<Box<dyn Digest>, CryptoError> {
     default_context().backend().sha256_digest()
 }
 
 /// Compute SHA-256 using the selected implementation.
-#[must_use]
-pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut digest = sha256_digest();
-    digest.update(bytes);
+pub fn sha256(bytes: &[u8]) -> Result<[u8; 32], CryptoError> {
+    let mut digest = sha256_digest()?;
+    digest.update(bytes)?;
     digest.finish()
 }
 
@@ -220,11 +220,11 @@ mod tests {
             0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
             0xf2, 0x00, 0x15, 0xad,
         ];
-        assert_eq!(sha256(b"abc"), expected);
-        let mut digest = sha256_digest();
-        digest.update(b"a");
-        digest.update(b"bc");
-        assert_eq!(digest.finish(), expected);
+        assert_eq!(sha256(b"abc").unwrap(), expected);
+        let mut digest = sha256_digest().unwrap();
+        digest.update(b"a").unwrap();
+        digest.update(b"bc").unwrap();
+        assert_eq!(digest.finish().unwrap(), expected);
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         fn fill_random(&self, _: &mut [u8]) -> Result<(), CryptoError> {
             Err(CryptoError::Random)
         }
-        fn sha256_digest(&self) -> Box<dyn Digest> {
+        fn sha256_digest(&self) -> Result<Box<dyn Digest>, CryptoError> {
             aws_lc::AwsLc.sha256_digest()
         }
         fn seal(&self, _: &[u8; 32], _: &[u8], _: &[u8]) -> Result<aead::Sealed, CryptoError> {
