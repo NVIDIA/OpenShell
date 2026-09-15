@@ -8,7 +8,7 @@
 {{- $managedSshIngressEnabled := true -}}
 {{- if hasKey $managedSshIngress "enabled" -}}
 {{- $managedSshIngressEnabled = get $managedSshIngress "enabled" -}}
-{{- end -}}
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

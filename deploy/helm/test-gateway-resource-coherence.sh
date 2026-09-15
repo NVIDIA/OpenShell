@@ -17,6 +17,15 @@ render() {
     --namespace resource-namespace \
     --set agentSandbox.preflight.enabled=false \
     "$@" >"${work_dir}/${name}.yaml"
+
+  if ! awk 'BEGIN { RS="---" }
+    /^\n?# Source:/ && $0 !~ /\napiVersion:/ {
+      print "rendered an empty or invalid Kubernetes document:" $0 > "/dev/stderr"
+      exit 1
+    }' "${work_dir}/${name}.yaml"; then
+    echo "${name}: rendered an invalid Kubernetes document" >&2
+    exit 1
+  fi
 }
 
 toml() {
