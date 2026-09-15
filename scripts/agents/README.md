@@ -86,14 +86,17 @@ Manifest paths support these prefixes:
      to the sandbox.
 15. Configure and rotate refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from the resulting image reference.
-17. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
-18. The runtime entrypoint starts
+16. Run `openshell sandbox create` from the resulting image reference, with the
+    runtime entrypoint persisted as the detached canonical main process.
+17. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
+    gateway to delete it after the canonical process exits.
+18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
+19. The runtime entrypoint starts
     `/etc/openshell/agent-payload/runtime/supervisor.sh`.
-19. The supervisor invokes
+20. The supervisor invokes
     `/etc/openshell/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
     bounded child execution.
-20. Harness adapters prepare harness-local auth/config and execute the agent
+21. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
 
 The payload directory is baked into the image under `/etc/openshell`, which the

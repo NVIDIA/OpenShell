@@ -46,6 +46,17 @@ captures the command result, and deletes the sandbox after the command exits:
 openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
 
+Combine `--detach` and `--no-keep` for a background workload whose lifecycle
+belongs entirely to the gateway:
+
+```shell
+openshell sandbox create --detach --no-keep -- ./worker
+```
+
+The create command returns after the workload is ready. The gateway keeps the
+canonical process running without a host-side attachment and deletes the
+sandbox after that process exits.
+
 `--upload` cannot yet be combined with a trailing main command because uploads
 finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the

@@ -34,7 +34,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
-| `scripts/agents/gator/logs/` | Background launch and supervisor logs. |
+| `scripts/agents/gator/logs/` | Background image-build and provisioning logs. Runtime logs live on the gateway. |
 
 ## Preflight
 
@@ -160,7 +160,9 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries gateway's selected compute driver, builds gator image in matching Docker or Podman image store, stages immutable payload, imports provider profiles, configures provider credentials and refresh, creates and uploads sandbox payload, then starts agent supervisor with `sandbox exec`. It writes a background log under `scripts/agents/gator/logs/`. `CONTAINER_ENGINE`, when set, must match gateway driver.
+The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the supervisor exits. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+
+With `--background`, the launcher writes local image-build and provisioning output under `scripts/agents/gator/logs/`. The flag does not leave a host process behind: creation waits until the detached workload is ready, then the launcher exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
 ### Launch An Issue Or Issue/PR Pair
 
@@ -274,10 +276,10 @@ CODEX_MODEL=gpt-5.6-sol \
 
 ### Read The Launch Result
 
-The launcher prints the log path when `--background` is used:
+The launcher prints the provisioning log path when `--background` is used:
 
 ```text
-Started in background. Log: scripts/agents/gator/logs/<sandbox-name>.log
+Started detached. Provisioning log: scripts/agents/gator/logs/<sandbox-name>.log
 ```
 
 Read that file directly. Important markers:
