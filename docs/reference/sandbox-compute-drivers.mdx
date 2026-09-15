@@ -55,7 +55,7 @@ cargo build --release -p openshell-gateway --no-default-features --features tele
 On Windows, select only MXC with:
 
 ```shell
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,openshell-server/prebuilt-z3
 ```
 
 The default `in-tree-compute-drivers` feature retains the full platform driver

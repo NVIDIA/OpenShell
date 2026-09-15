@@ -115,7 +115,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for bundled Z3 and other native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses MSVC's Visual Studio generator. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses an architecture-specific prebuilt release. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -203,8 +203,7 @@ jobs in the current mirror push run, or push a new mirrored commit. The binaries
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and builds bundled Z3 with native MSVC `cl.exe` and the Visual
-Studio generator.
+`clang-cl`, and downloads the official prebuilt ARM64 Z3 static library.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -259,7 +258,7 @@ MXC on Windows. Each other `compute-driver-*` feature installs its own Windows
 rejection stub without linking that driver crate. The default
 `in-tree-compute-drivers` alias enables all five features. An MXC-only build
 uses `--no-default-features --features compute-driver-mxc` (add `telemetry`
-and `bundled-z3` as needed).
+and `openshell-server/prebuilt-z3` as needed).
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
@@ -311,12 +310,13 @@ Useful log files:
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
 
-The first check builds bundled Z3 from source through `z3-sys`. Cargo stores the
-native build output in its target tree, so the Windows target cache reuses it.
-The resulting release executables do not require `libz3.dll`. The artifact
-report computes SHA256 through .NET directly and does not rely on the
-`Get-FileHash` module being available inside the mise-launched Windows
-PowerShell process.
+The first check downloads the pinned official Z3 archive for the target
+architecture through `z3-sys`. GitHub Actions authenticates the lookup with its
+read-only workflow token; local users can set `READ_ONLY_GITHUB_TOKEN` if an
+unauthenticated lookup is rate-limited. Cargo stores the extracted library in
+its target tree, so the Windows target cache reuses it. The artifact report
+computes SHA256 through .NET directly and does not rely on the `Get-FileHash`
+module being available inside the mise-launched Windows PowerShell process.
 
 ## Common Fix Patterns
 
