@@ -22,8 +22,8 @@
 # CLI token acquisition: keep a port-forward running while using openshell login:
 #   kubectl -n keycloak port-forward svc/keycloak 9090:80
 
-server:
-  oidc:
+gatewayConfig:
+  openshell.gateway.oidc:
     # Must match KC_HOSTNAME set by keycloak:k8s:setup (in-cluster service hostname).
     issuer: "https://keycloak.keycloak.svc.cluster.local:443/realms/openshell"
     caConfigMapName: "openshell-keycloak-ca"
@@ -31,9 +31,9 @@ server:
     audience: "openshell-cli"
     # Short TTL for dev so JWKS key rotation is picked up quickly.
     # Use 3600 (default) in production.
-    jwksTtl: 60
+    jwks_ttl: 60
     # Keycloak puts realm roles at realm_access.roles in the JWT.
-    rolesClaim: "realm_access.roles"
+    roles_claim: "realm_access.roles"
     # Leave both empty for authentication-only mode (any valid token is accepted).
-    adminRole: "openshell-admin"
-    userRole: "openshell-user"
+    admin_role: "openshell-admin"
+    user_role: "openshell-user"

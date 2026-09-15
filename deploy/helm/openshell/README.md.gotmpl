@@ -128,9 +128,29 @@ database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
 
-Use `kubernetes-secrets` or `vault` instead when credentials should live in a
-cluster or external secret backend. Enabling one external credential driver
-disables the default credential-storage key-encryption key Secret and env injection.
+Use `gatewayConfig` to select `kubernetes-secrets` or `vault` when credentials
+should live in a cluster or external secret backend. Selecting an external
+credential driver disables the default credential-storage key-encryption-key
+Secret and environment injection. The map is rendered directly as gateway TOML,
+so it uses the gateway's snake_case field names:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    credential_drivers:
+      - vault
+  openshell.credential_drivers.vault:
+    address: http://vault.vault.svc.cluster.local:8200
+    mount: secret
+    kv_version: "2"
+    auth_method: kubernetes
+    role: openshell-gateway
+```
+
+For the Kubernetes Secret driver, use
+`openshell.credential_drivers.kubernetes-secrets.namespace` in the same map.
+The chart derives any required RBAC from the selected driver; use a dedicated
+namespace to limit access to OpenShell-managed Secrets.
 
 #### OpenShift
 
@@ -158,12 +178,16 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
-sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
-chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
-mounts the SPIFFE CSI socket into the gateway pod, exports
-`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
-the Kubernetes driver so sandbox pods can mount the same socket.
+Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
+sandbox JWTs and passes the configured socket path to the Kubernetes driver.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+```
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.

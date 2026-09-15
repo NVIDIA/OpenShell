@@ -25,20 +25,21 @@
 # is true and mTLS is MANDATORY at the TLS handshake — a caller with only the
 # Route URL and no client certificate is rejected before any RPC. The passthrough
 # Route terminates TLS at the gateway pod, so this holds end-to-end.
-# `allowUnauthenticatedUsers` only promotes the already cert-verified caller to a
+# `allow_unauthenticated_users` only promotes the already cert-verified caller to a
 # dev principal at the app layer (mtls_auth is unsupported with the Kubernetes
 # driver). Both are required together; the client certificate is the access gate.
 image:
   pullPolicy: Always
 
-supervisor:
-  image:
-    pullPolicy: Always
-
 server:
   disableTls: false
-  auth:
-    allowUnauthenticatedUsers: true
+
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_image_pull_policy: always
+    image_pull_policy: always
+  openshell.gateway.auth:
+    allow_unauthenticated_users: true
 
 openshiftRoute:
   enabled: true
