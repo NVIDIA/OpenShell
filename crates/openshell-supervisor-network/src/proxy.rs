@@ -2932,7 +2932,6 @@ fn authorize_egress_intent(
             entrypoint_pid,
             intent,
         ),
-        #[cfg(any(not(target_os = "linux"), test))]
         ProxyIdentityMode::Static {
             binary_path,
             binary_sha256,
