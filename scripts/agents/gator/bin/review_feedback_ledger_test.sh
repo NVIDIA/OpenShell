@@ -349,7 +349,7 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
   "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 7
+  abort unless manifest.fetch("payload_version") == 9
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
@@ -384,6 +384,10 @@ rg -q 'alone is not a process blocker' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q '`test_dispatch_required`' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -q 'Apply `test:windows` whenever a PR affects Windows support' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -q 'require the `test:windows` label' \
+    "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
 rg -Fq 'Write `Summary` as natural prose that can be read aloud' \
