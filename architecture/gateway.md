@@ -734,6 +734,14 @@ resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
 placeholder generations from an earlier provider credential snapshot.
 
+All gateway-owned extension registries negotiate the same peer metadata envelope
+before accepting work. Compute drivers, credential drivers, gateway interceptors,
+and supervisor middleware retain their typed family manifests, while the shared
+validator enforces protocol-major compatibility and mutual required-capability
+sets. The gateway aggregates immutable, non-secret startup snapshots for the
+protected gateway-info API; it does not publish transport, authentication, or
+backend configuration.
+
 Static credential delivery is capability-negotiated and endpoint-bound. The
 gateway classifies each returned environment entry as either a credential or
 non-secret provider configuration and associates every credential key with the

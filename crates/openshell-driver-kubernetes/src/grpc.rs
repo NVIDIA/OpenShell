@@ -376,9 +376,12 @@ mod tests {
                 otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
                 otel.kind = "client"
             );
-            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
-                .instrument(gateway_span)
-                .await?;
+            ComputeDriver::get_capabilities(
+                &service,
+                Request::new(GetCapabilitiesRequest::default()),
+            )
+            .instrument(gateway_span)
+            .await?;
 
             ComputeDriver::validate_sandbox_create(
                 &service,

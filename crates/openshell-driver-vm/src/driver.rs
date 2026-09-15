@@ -1002,6 +1002,12 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/vm",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 
@@ -7141,7 +7147,7 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest::default()))
             .await
             .unwrap();
         client.shutdown().await;
@@ -7173,7 +7179,7 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest::default()))
             .await
             .unwrap();
         assert!(

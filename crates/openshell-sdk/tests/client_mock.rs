@@ -224,6 +224,7 @@ impl OpenShell for TestOpenShell {
             status: proto::ServiceStatus::Healthy.into(),
             gateway_version: "test-1.2.3".to_string(),
             compute_drivers: Vec::new(),
+            extensions: Vec::new(),
         }))
     }
 

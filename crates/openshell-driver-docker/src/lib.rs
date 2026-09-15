@@ -311,7 +311,6 @@ struct DockerDriverRuntimeConfig {
     gateway_tls_server_name: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
-    daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
@@ -859,7 +858,7 @@ impl DockerComputeDriver {
                 .map_err(|err| {
                     Error::execution(format!("failed to create Docker client: {err}"))
                 })?;
-        let version = docker.version().await.map_err(|err| {
+        docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
         let info = docker.info().await.map_err(|err| {
@@ -973,7 +972,6 @@ impl DockerComputeDriver {
                 gateway_tls_server_name,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
-                daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
@@ -1014,7 +1012,7 @@ impl DockerComputeDriver {
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
             driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
+            driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -1033,6 +1031,12 @@ impl DockerComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/docker",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 

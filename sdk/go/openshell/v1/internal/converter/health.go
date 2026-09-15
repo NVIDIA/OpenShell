@@ -18,11 +18,46 @@ func GatewayInfoFromProto(resp *pb.GetGatewayInfoResponse) *types.GatewayInfo {
 	for _, d := range resp.GetComputeDrivers() {
 		drivers = append(drivers, ComputeDriverInfoFromProto(d))
 	}
+	extensions := make([]types.ExtensionInfo, 0, len(resp.GetExtensions()))
+	for _, extension := range resp.GetExtensions() {
+		extensions = append(extensions, ExtensionInfoFromProto(extension))
+	}
 
 	return &types.GatewayInfo{
 		Status:         ServiceStatusFromProto(resp.GetStatus()),
 		Version:        resp.GetGatewayVersion(),
 		ComputeDrivers: drivers,
+		Extensions:     extensions,
+	}
+}
+
+// ExtensionInfoFromProto converts a negotiated extension snapshot.
+func ExtensionInfoFromProto(extension *pb.NegotiatedExtensionInfo) types.ExtensionInfo {
+	return types.ExtensionInfo{
+		Kind:                  ExtensionKindFromProto(extension.GetKind()),
+		ConfiguredName:        extension.GetConfiguredName(),
+		ImplementationName:    extension.GetImplementationName(),
+		ImplementationVersion: extension.GetImplementationVersion(),
+		ProtocolMajor:         extension.GetProtocolMajor(),
+		ProtocolMinor:         extension.GetProtocolMinor(),
+		SupportedCapabilities: CopyStringSlice(extension.GetSupportedCapabilities()),
+		RequiredCapabilities:  CopyStringSlice(extension.GetRequiredCapabilities()),
+	}
+}
+
+// ExtensionKindFromProto converts the public extension family enum.
+func ExtensionKindFromProto(kind pb.ExtensionKind) types.ExtensionKind {
+	switch kind {
+	case pb.ExtensionKind_EXTENSION_KIND_COMPUTE_DRIVER:
+		return types.ExtensionKindComputeDriver
+	case pb.ExtensionKind_EXTENSION_KIND_CREDENTIAL_DRIVER:
+		return types.ExtensionKindCredentialDriver
+	case pb.ExtensionKind_EXTENSION_KIND_GATEWAY_INTERCEPTOR:
+		return types.ExtensionKindGatewayInterceptor
+	case pb.ExtensionKind_EXTENSION_KIND_SUPERVISOR_MIDDLEWARE:
+		return types.ExtensionKindSupervisorMiddleware
+	default:
+		return types.ExtensionKindUnknown
 	}
 }
 

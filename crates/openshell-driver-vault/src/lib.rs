@@ -509,6 +509,12 @@ impl CredentialDriver for CredentialDriverService {
             backend_kind: VaultCredentialDriver::NAME.to_string(),
             supports_list: false,
             supports_expires_at: false,
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Credentials,
+                "openshell/vault",
+                VERSION,
+                [],
+            )),
         }))
     }
 

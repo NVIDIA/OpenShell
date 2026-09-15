@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.gateway_interceptor.v1;
 
 import "google/protobuf/struct.proto";
+import "extension.proto";
 import "openshell.proto";
 
 // GatewayInterceptor lets an external governance service evaluate gateway
@@ -25,7 +26,10 @@ service GatewayInterceptor {
   rpc Evaluate(InterceptorEvaluation) returns (InterceptorResult);
 }
 
-message DescribeRequest {}
+message DescribeRequest {
+  // Gateway protocol metadata. Interceptors must reject unmet requirements.
+  openshell.extension.v1.PeerMetadata gateway = 1;
+}
 
 message ProviderProfileSnapshotRequest {}
 
@@ -106,6 +110,8 @@ message InterceptorManifest {
   // an incorrect audience before returning this manifest. Empty skips this
   // post-authentication consistency check.
   string expected_audience = 5;
+  // Gateway-interceptor protocol metadata. Required for negotiation.
+  openshell.extension.v1.PeerMetadata extension = 6;
 }
 
 message ProviderProfileSnapshot {

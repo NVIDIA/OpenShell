@@ -4210,7 +4210,7 @@ network_policies:
 
         async fn describe(
             &self,
-            _request: tonic::Request<()>,
+            _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::MiddlewareManifest>,
             tonic::Status,
@@ -4233,6 +4233,12 @@ network_policies:
                         }),
                     }],
                     expected_audience: String::new(),
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                        "openshell/test-middleware",
+                        "test",
+                        [],
+                    )),
                 },
             ))
         }
@@ -6046,6 +6052,12 @@ network_policies:
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -6193,6 +6205,12 @@ network_policies:
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -6664,6 +6682,12 @@ network_policies:
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 

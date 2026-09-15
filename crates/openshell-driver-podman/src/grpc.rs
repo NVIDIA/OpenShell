@@ -378,7 +378,7 @@ mod tests {
 
         async {
             let gateway_span = tracing::info_span!(target: "openshell_server::compute", "driver", otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities", otel.kind = "client");
-            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
+            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest::default()))
                 .instrument(gateway_span)
                 .await
         }
@@ -441,7 +441,7 @@ mod tests {
         let (mut client, shutdown, server) = standalone_traced_client().await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest::default()))
             .await
             .expect("capabilities should succeed");
         client

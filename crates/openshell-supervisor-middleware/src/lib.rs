@@ -30,12 +30,15 @@ use std::time::Duration;
 use miette::{Result, miette};
 use prost::Message;
 
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    ValidateConfigRequest, ValidateConfigResponse,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
+    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
@@ -55,7 +58,7 @@ struct GeneratedMiddlewareEndpoint {
 impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
     async fn describe(
         &self,
-        request: Request<()>,
+        request: Request<MiddlewareDescribeRequest>,
     ) -> std::result::Result<TonicResponse<MiddlewareManifest>, TonicStatus> {
         self.service.describe(request).await
     }
@@ -89,7 +92,9 @@ impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
 impl InProcessMiddleware for GeneratedMiddlewareEndpoint {
     async fn describe(&self) -> MiddlewareManifest {
         self.service
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("generated in-process Describe failed")
             .into_inner()
@@ -145,7 +150,9 @@ struct EndpointInProcessAdapter {
 impl InProcessMiddleware for EndpointInProcessAdapter {
     async fn describe(&self) -> MiddlewareManifest {
         self.endpoint
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("in-process endpoint Describe failed")
             .into_inner()
@@ -723,6 +730,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
+    negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
@@ -758,6 +766,7 @@ impl Default for MiddlewareRegistry {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
             middleware_names: Arc::new(HashSet::new()),
+            negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -1121,6 +1130,8 @@ impl MiddlewareRegistry {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
         let mut middleware_names = HashSet::new();
+        let mut negotiated_extensions = Vec::new();
+        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
 
         for service in in_process_services {
             let service = MiddlewareDispatch::InProcess(service);
@@ -1151,6 +1162,15 @@ impl MiddlewareRegistry {
                 ));
             }
             validate_manifest_bindings(&source, &manifest, None)?;
+            negotiated_extensions.push(
+                negotiate(
+                    ExtensionFamily::SupervisorMiddleware,
+                    &manifest.name,
+                    &gateway,
+                    manifest.extension.clone(),
+                )
+                .map_err(|error| miette!(error.to_string()))?,
+            );
             let attachment_name = manifest.name.clone();
             let manifest_cell = OnceCell::new();
             manifest_cell
@@ -1223,6 +1243,15 @@ impl MiddlewareRegistry {
                 operator_max_payload_bytes,
                 authenticated,
             )?;
+            negotiated_extensions.push(
+                negotiate(
+                    ExtensionFamily::SupervisorMiddleware,
+                    &registration.name,
+                    &gateway,
+                    manifest.extension.clone(),
+                )
+                .map_err(|error| miette!(error.to_string()))?,
+            );
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -1242,6 +1271,7 @@ impl MiddlewareRegistry {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
             middleware_names: Arc::new(middleware_names),
+            negotiated_extensions: Arc::new(negotiated_extensions),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -1304,6 +1334,11 @@ impl MiddlewareRegistry {
             .map(|service| service.registration.clone())
             .collect()
     }
+
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        &self.negotiated_extensions
+    }
 }
 
 impl Default for ChainRunner {
@@ -1338,6 +1373,7 @@ impl ChainRunner {
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 middleware_names: Arc::new(HashSet::new()),
+                negotiated_extensions: Arc::new(Vec::new()),
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -2181,6 +2217,7 @@ mod tests {
     struct BorrowedRecordingService {
         manifest_name: String,
         received: std::sync::Mutex<Vec<RequestAddresses>>,
+        advertise_protocol: bool,
     }
 
     #[tonic::async_trait]
@@ -2196,6 +2233,14 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: self.advertise_protocol.then(|| {
+                    openshell_core::extension_protocol::extension_metadata(
+                        ExtensionFamily::SupervisorMiddleware,
+                        "openshell/test-middleware",
+                        "test",
+                        [],
+                    )
+                }),
             }
         }
 
@@ -2240,6 +2285,7 @@ mod tests {
         let service = Arc::new(BorrowedRecordingService {
             manifest_name: "acme/redactor".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
         let runner = ChainRunner::new(service.clone());
         let entries = [
@@ -2332,6 +2378,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -2423,6 +2475,12 @@ mod tests {
                     request_timeout: Some(proto_duration("10ms")),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -2632,10 +2690,12 @@ mod tests {
         let first: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
         let second: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
 
         let error = MiddlewareRegistry::connect_services(vec![first, second], Vec::new())
@@ -2645,6 +2705,25 @@ mod tests {
             error
                 .to_string()
                 .contains("duplicate supervisor middleware name")
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_service_without_protocol_metadata_is_rejected() {
+        let service: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
+            manifest_name: "openshell/legacy".into(),
+            received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: false,
+        });
+
+        let error = MiddlewareRegistry::connect_services(vec![service], Vec::new())
+            .await
+            .expect_err("legacy middleware must fail negotiation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not provide protocol metadata")
         );
     }
 
@@ -2671,7 +2750,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: self.manifest_name.clone(),
@@ -2683,6 +2762,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -2726,7 +2811,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/slow".into(),
@@ -2738,6 +2823,12 @@ mod tests {
                     request_timeout: self.binding_timeout,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -2785,7 +2876,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-stage".into(),
@@ -2797,6 +2888,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3055,7 +3152,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/recorder".into(),
@@ -3067,6 +3164,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3123,6 +3226,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -3170,7 +3279,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/header-chain".into(),
@@ -3182,6 +3291,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3450,7 +3565,9 @@ mod tests {
             .expect("built-in manifest cache");
 
         let manifest = service
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("describe test service")
             .into_inner();
@@ -3484,6 +3601,7 @@ mod tests {
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
+            negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -3679,6 +3797,12 @@ mod tests {
                 request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         let error = validate_external_manifest(&registration, &manifest, 4097, false)
             .expect_err("operator limit must fit capability");
@@ -3706,6 +3830,12 @@ mod tests {
                 request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, false)
             .expect_err("extreme advertised payload limit must be rejected");
@@ -3726,6 +3856,12 @@ mod tests {
             service_version: "test".into(),
             bindings: vec![binding(), binding()],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 4096, false)
@@ -3753,6 +3889,12 @@ mod tests {
                 }),
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         validate_external_manifest(&registration, &manifest, 4096, false)
@@ -3772,6 +3914,12 @@ mod tests {
             service_version: "test".into(),
             bindings: vec![binding(SupervisorMiddlewarePhase::PreCredentials)],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         validate_manifest_bindings("test WebSocket service", &manifest, None)
             .expect("forward WebSocket binding is supported");
@@ -3795,6 +3943,12 @@ mod tests {
                 request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 0, false)
@@ -3819,6 +3973,12 @@ mod tests {
                 request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 4097, false)
@@ -3893,6 +4053,12 @@ mod tests {
                     request_timeout: Some(proto_duration(timeout)),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             };
             let error = validate_external_manifest(&registration, &manifest, 4096, false)
                 .expect_err("out-of-bounds binding timeout must be rejected");
@@ -4950,7 +5116,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             self.describe_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4971,6 +5137,12 @@ mod tests {
                     }),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -5011,7 +5183,7 @@ mod tests {
     impl SupervisorMiddlewareEndpoint for OpenAiRedactionService {
         async fn describe(
             &self,
-            request: Request<()>,
+            request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             SupervisorMiddleware::describe(self, request).await
         }
