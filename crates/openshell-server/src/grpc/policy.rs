@@ -25,10 +25,9 @@ use crate::auth::workspace_authz::{
     require_platform_admin, selected_workspace_name,
 };
 use crate::pagination::Pagination;
-#[cfg(test)]
-use crate::persistence::ObjectType;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectWorkspace, PolicyRecord, Store,
+    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
+    PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
