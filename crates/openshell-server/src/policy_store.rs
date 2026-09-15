@@ -108,6 +108,14 @@ pub fn project_policy_revision_onto_sandbox(
 }
 
 pub trait PolicyStoreExt {
+    /// Insert version-one policy history when the sandbox still has no policy
+    /// revisions. Existing history and apply status are left untouched.
+    async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()>;
+
     async fn put_policy_revision(
         &self,
         id: &str,
@@ -231,6 +239,17 @@ pub trait PolicyStoreExt {
 }
 
 impl PolicyStoreExt for Store {
+    async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => store.put_initial_policy_revision(record, workspace).await,
+            Self::Sqlite(store) => store.put_initial_policy_revision(record, workspace).await,
+        }
+    }
+
     async fn put_policy_revision(
         &self,
         id: &str,
