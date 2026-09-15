@@ -294,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn starts_loopback_proxy_and_serves_policy_local() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let binary = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(binary.path(), b"agent").unwrap();
 
