@@ -17,6 +17,7 @@ compile_error!(
 
 mod activity_aggregator;
 mod denial_aggregator;
+mod endpoint_status;
 mod mechanistic_mapper;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -364,6 +365,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
@@ -696,6 +698,37 @@ pub async fn run_sandbox(
         (None, None)
     };
 
+    // Endpoint observations are bounded and never backpressure proxied traffic.
+    // Reports are authorized by the currently accepted supervisor session.
+    let (endpoint_observation_tx, endpoint_status_rx) = if sandbox_id.is_some() {
+        let (sender, receiver) = openshell_core::endpoint_status::endpoint_status_channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let (supervisor_session_updates, supervisor_session_id) =
+        tokio::sync::watch::channel::<Option<String>>(None);
+    if let (
+        Some(sender),
+        Some(proto),
+        LoadedPolicyOrigin::Gateway {
+            revision: Some(revision),
+            ..
+        },
+    ) = (
+        endpoint_observation_tx.as_ref(),
+        retained_proto.as_ref(),
+        &loaded_policy_origin,
+    ) {
+        endpoint_status::reset(
+            Some(sender),
+            Some(proto),
+            &revision.policy_hash,
+            provider_credentials.snapshot().revision,
+        )
+        .await;
+    }
+
     // Workspace watch: the policy poll loop learns the workspace from
     // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
     // API read the current value so proposals target the correct workspace.
@@ -731,6 +764,7 @@ pub async fn run_sandbox(
             openshell_endpoint_for_proxy.as_deref(),
             denial_tx,
             activity_tx,
+            endpoint_observation_tx.clone(),
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
@@ -857,6 +891,10 @@ pub async fn run_sandbox(
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
+        let poll_endpoint_policy = loaded_policy_origin
+            .allows_gateway_policy_reload()
+            .then(|| retained_proto.clone())
+            .flatten();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -881,6 +919,10 @@ pub async fn run_sandbox(
                 capable: transparent_tcp_capable,
                 substrate_ready: transparent_tcp_substrate_ready,
             },
+            endpoint_observation_tx,
+            endpoint_status_rx,
+            endpoint_policy: poll_endpoint_policy,
+            supervisor_session_id,
         };
 
         tokio::spawn(async move {
@@ -930,6 +972,7 @@ pub async fn run_sandbox(
             running.exec(),
             running.loopback_connector(),
             agent.clone(),
+            Some(supervisor_session_updates),
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
@@ -2764,6 +2807,14 @@ trait PolicyGatewayClient: Clone + Send + Sync + 'static {
         error: &str,
     ) -> Result<()>;
 
+    async fn report_endpoint_status(
+        &self,
+        _sandbox_id: &str,
+        _snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn refresh_installed_extension_credentials(&self) -> Result<()> {
         Ok(())
     }
@@ -2796,6 +2847,14 @@ impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient 
     ) -> Result<()> {
         self.report_policy_status(sandbox_id, version, loaded, error)
             .await
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        sandbox_id: &str,
+        snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
+    ) -> Result<()> {
+        self.report_endpoint_status(sandbox_id, snapshot).await
     }
 
     async fn refresh_installed_extension_credentials(&self) -> Result<()> {
@@ -2975,6 +3034,14 @@ struct PolicyPollLoopContext {
     middleware_connector: MiddlewareConnector,
     /// Immutable driver capability and startup substrate state.
     transparent_tcp: TransparentTcpReloadState,
+    /// Producer shared with network enforcement and policy installation.
+    endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
+    /// Single FIFO consumed by the endpoint status reporter.
+    endpoint_status_rx: Option<openshell_core::endpoint_status::EndpointStatusReceiver>,
+    /// Gateway policy currently installed in OPA, absent for local overrides.
+    endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
+    /// Session accepted by `ConnectSupervisor`; `None` suspends endpoint reports.
+    supervisor_session_id: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 type MiddlewareConnector = Arc<
@@ -3363,7 +3430,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 }
 
 async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
-    ctx: PolicyPollLoopContext,
+    mut ctx: PolicyPollLoopContext,
     client: C,
 ) -> Result<()> {
     use openshell_core::proto::PolicySource;
@@ -3375,11 +3442,20 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         ctx.sandbox_id.clone(),
         status_receiver,
     ));
+    if let Some(endpoint_status_receiver) = ctx.endpoint_status_rx.take() {
+        tokio::spawn(endpoint_status::run_reporter(
+            client.clone(),
+            ctx.sandbox_id.clone(),
+            endpoint_status_receiver,
+            ctx.supervisor_session_id.clone(),
+        ));
+    }
 
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_version: u32 = 0;
     let mut current_policy_hash = String::new();
+    let mut current_endpoint_policy = ctx.endpoint_policy.clone();
     let mut current_middleware_services = Vec::new();
     let mut current_extension_authentication_enabled = ctx.extension_authentication_enabled;
     let mut middleware_registry_status = ctx.middleware_registry_status;
@@ -3416,6 +3492,14 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_config_revision = candidate.config_revision;
                     current_policy_version = candidate.version;
                     current_policy_hash.clone_from(&candidate.policy_hash);
+                    current_endpoint_policy.clone_from(&result.policy);
+                    endpoint_status::reset(
+                        ctx.endpoint_observation_tx.as_ref(),
+                        current_endpoint_policy.as_ref(),
+                        &current_policy_hash,
+                        ctx.provider_credentials.snapshot().revision,
+                    )
+                    .await;
                     current_middleware_services = result.supervisor_middleware_services;
                     current_extension_authentication_enabled =
                         result.extension_authentication_enabled;
@@ -3797,6 +3881,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     }
 
                     current_policy_hash.clone_from(&result.policy_hash);
+                    current_endpoint_policy.clone_from(&result.policy);
                     current_middleware_services.clone_from(&result.supervisor_middleware_services);
                     current_extension_authentication_enabled =
                         result.extension_authentication_enabled;
@@ -3904,6 +3989,16 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 PolicyStatusUpdate::unchanged_loaded(version, result.policy_hash.clone()),
             );
             current_policy_version = version;
+        }
+
+        if policy_runtime_reconciled || provider_env_changed {
+            endpoint_status::reset(
+                ctx.endpoint_observation_tx.as_ref(),
+                current_endpoint_policy.as_ref(),
+                &current_policy_hash,
+                ctx.provider_credentials.snapshot().revision,
+            )
+            .await;
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
@@ -4541,6 +4636,10 @@ network_policies:
             extension_authentication_enabled: false,
             middleware_connector,
             transparent_tcp: TransparentTcpReloadState::default(),
+            endpoint_observation_tx: None,
+            endpoint_status_rx: None,
+            endpoint_policy: None,
+            supervisor_session_id: tokio::sync::watch::channel(None).1,
         }
     }
 

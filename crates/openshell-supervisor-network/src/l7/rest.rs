@@ -7,11 +7,13 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
+use crate::l7::EndpointObserver;
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::endpoint_status::EndpointResult;
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, contains_reserved_credential_marker_bytes,
@@ -768,6 +770,31 @@ pub(crate) struct CredentialGenerationGuard<'a> {
     revision: u64,
 }
 
+/// Typed marker for provider credential material that cannot be used.
+///
+/// The type deliberately carries no secret or raw provider error, allowing
+/// callers to classify the outcome without inspecting error strings.
+#[derive(Debug)]
+pub(crate) struct CredentialUnavailableError {
+    reason: &'static str,
+}
+
+impl CredentialUnavailableError {
+    fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+impl fmt::Display for CredentialUnavailableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for CredentialUnavailableError {}
+
+impl miette::Diagnostic for CredentialUnavailableError {}
+
 impl<'a> CredentialGenerationGuard<'a> {
     pub(crate) fn new(
         state: &'a openshell_core::provider_credentials::ProviderCredentialState,
@@ -780,9 +807,9 @@ impl<'a> CredentialGenerationGuard<'a> {
         if self.state.revision() == self.revision {
             Ok(())
         } else {
-            Err(miette!(
-                "provider credential generation changed before upstream write"
-            ))
+            Err(miette::Report::new(CredentialUnavailableError::new(
+                "provider credential generation changed before upstream write",
+            )))
         }
     }
 }
@@ -799,6 +826,37 @@ pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
     client: &mut C,
     upstream: &mut U,
     options: RelayRequestOptions<'_>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_http_request_with_options_guarded_observed(req, client, upstream, options, None).await
+}
+
+/// Relay one request while attributing only terminal, privacy-safe MCP outcomes.
+pub(crate) async fn relay_http_request_with_options_guarded_observed<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    observer: Option<&EndpointObserver>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut upstream = ObservedUpstream { upstream, observer };
+    relay_http_request_with_options_guarded_inner(req, client, &mut upstream, options, observer)
+        .await
+}
+
+async fn relay_http_request_with_options_guarded_inner<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
+    observer: Option<&EndpointObserver>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -1066,15 +1124,15 @@ where
                     openshell_ocsf::ocsf_emit!(event);
                 }
                 _ => {
-                    return Err(miette!(
-                        "SigV4 signing configured but AWS credentials not found in provider"
-                    ));
+                    return Err(miette::Report::new(CredentialUnavailableError::new(
+                        "SigV4 signing configured but AWS credentials not found in provider",
+                    )));
                 }
             }
         } else {
-            return Err(miette!(
-                "SigV4 signing configured but no secret resolver available"
-            ));
+            return Err(miette::Report::new(CredentialUnavailableError::new(
+                "SigV4 signing configured but no secret resolver available",
+            )));
         }
     } else if options.request_body_credential_rewrite {
         let body = collect_and_rewrite_request_body(
@@ -1153,6 +1211,7 @@ where
             websocket_extensions: options.websocket_extensions,
             websocket: websocket_response,
             client_requested_upgrade,
+            observer,
         },
     )
     .await?;
@@ -1170,6 +1229,71 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
         guard.ensure_current()?;
     }
     Ok(())
+}
+
+/// Upstream-only I/O adapter that cannot accidentally classify client errors.
+///
+/// Once a valid response status consumes the observation token, later stream
+/// failures are ignored and cannot overwrite the endpoint's first network result.
+struct ObservedUpstream<'a, U> {
+    upstream: &'a mut U,
+    observer: Option<&'a EndpointObserver>,
+}
+
+impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Err(_)))
+            && let Some(observer) = this.observer
+        {
+            observer.observe(EndpointResult::TransportFailed);
+        }
+        result
+    }
+}
+
+impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Err(_)))
+            && let Some(observer) = this.observer
+        {
+            observer.observe(EndpointResult::TransportFailed);
+        }
+        result
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.upstream).poll_flush(cx);
+        if matches!(result, std::task::Poll::Ready(Err(_)))
+            && let Some(observer) = this.observer
+        {
+            observer.observe(EndpointResult::TransportFailed);
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut *this.upstream).poll_shutdown(cx)
+    }
 }
 
 async fn write_body_bytes<W: AsyncWrite + Unpin>(
@@ -3110,18 +3234,20 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 }
 
 #[derive(Clone)]
-struct RelayResponseOptions {
+struct RelayResponseOptions<'a> {
     websocket_extensions: WebSocketExtensionMode,
     client_requested_upgrade: bool,
     websocket: Option<WebSocketResponseValidation>,
+    observer: Option<&'a EndpointObserver>,
 }
 
-impl Default for RelayResponseOptions {
+impl Default for RelayResponseOptions<'_> {
     fn default() -> Self {
         Self {
             websocket_extensions: WebSocketExtensionMode::Preserve,
             client_requested_upgrade: true,
             websocket: None,
+            observer: None,
         }
     }
 }
@@ -3130,7 +3256,7 @@ async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
-    options: RelayResponseOptions,
+    options: RelayResponseOptions<'_>,
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
@@ -3140,14 +3266,49 @@ where
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
 
-    // Read response headers
-    loop {
-        if buf.len() > MAX_HEADER_BYTES {
+    let mut informational_header_bytes = 0;
+    let header_end = loop {
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|end| end + 4);
+        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
+        if header_end.is_some_and(|end| end > remaining_header_bytes)
+            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
+        {
+            if let Some(observer) = options.observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
             return Err(miette!("HTTP response headers exceed limit"));
+        }
+
+        if let Some(header_end) = header_end {
+            let header_str = String::from_utf8_lossy(&buf[..header_end]);
+            if matches!(
+                parse_observed_http_status_code(&header_str),
+                Some(100 | 102..=199)
+            ) {
+                // Informational responses keep this exchange and its observation
+                // pending. Preserve any coalesced final response, and charge every
+                // header block to one budget so repeated 1xx frames stay bounded.
+                informational_header_bytes += header_end;
+                client
+                    .write_all(&buf[..header_end])
+                    .await
+                    .into_diagnostic()?;
+                client.flush().await.into_diagnostic()?;
+                buf.drain(..header_end);
+                continue;
+            }
+            // A 101 response transfers ownership to the upgrade handler below.
+            break header_end;
         }
 
         let n = upstream.read(&mut tmp).await.into_diagnostic()?;
         if n == 0 {
+            if let Some(observer) = options.observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
             // Upstream closed — forward whatever we have
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
@@ -3155,16 +3316,25 @@ where
             return Ok(RelayOutcome::Consumed);
         }
         buf.extend_from_slice(&tmp[..n]);
-
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
-
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    };
 
     // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
+    let observed_status = parse_observed_http_status_code(&header_str);
+    if let Some(observer) = options.observer.as_ref() {
+        match observed_status {
+            Some(status_code) if status_code < 400 => {
+                observer.observe(EndpointResult::HttpResponseReceived);
+            }
+            Some(_) => observer.observe(EndpointResult::UpstreamRejected),
+            None => {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+        }
+    }
+    // Preserve the relay's legacy framing fallback for non-MCP traffic and
+    // malformed upstream responses. Endpoint status uses the strict parser above,
+    // so this fallback can never become a false successful observation.
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
     let event_stream = response_is_event_stream(&header_str);
@@ -3308,30 +3478,33 @@ fn parse_status_code(headers: &str) -> Option<u16> {
     code_str.parse().ok()
 }
 
-/// Check whether the response is delimited by closing the connection.
-///
-/// HTTP/1.0 closes by default unless the server explicitly negotiates
-/// keep-alive. HTTP/1.1 keeps connections alive by default unless the server
-/// sends `Connection: close`.
+/// Parse a syntactically valid HTTP/1.x response status for endpoint reporting.
+fn parse_observed_http_status_code(headers: &str) -> Option<u16> {
+    let status_line = headers.lines().next()?;
+    let mut fields = status_line.split_whitespace();
+    match fields.next()? {
+        "HTTP/1.0" | "HTTP/1.1" => {}
+        _ => return None,
+    }
+    let code = fields.next()?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    code.parse()
+        .ok()
+        .filter(|status| (100..=999).contains(status))
+}
+
+/// Check if the response headers contain `Connection: close`.
 fn parse_connection_close(headers: &str) -> bool {
-    let http_1_0 = headers
-        .lines()
-        .next()
-        .is_some_and(|line| line.starts_with("HTTP/1.0 "));
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("connection:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            return if http_1_0 {
-                !val.split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("keep-alive"))
-            } else {
-                val.split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
-            };
+            return val.contains("close");
         }
     }
-    http_1_0
+    false
 }
 
 fn response_is_event_stream(headers: &str) -> bool {
@@ -3643,6 +3816,7 @@ mod tests {
     use super::*;
     use crate::opa::OpaEngine;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+    use openshell_core::endpoint_status::{EndpointStatusCommand, EndpointStatusReceiver};
     use openshell_core::proposals::AgentProposals;
     use openshell_core::secrets::SecretResolver;
     use std::pin::Pin;
@@ -5487,6 +5661,304 @@ mod tests {
         assert_eq!(parse_status_code(""), None);
     }
 
+    async fn test_endpoint_observer() -> (EndpointObserver, EndpointStatusReceiver) {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let endpoint_id = "endpoint:v1:test".to_string();
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: endpoint_id.clone(),
+                    uses_provider_credentials: true,
+                }],
+            )
+            .await
+            .expect("install MCP test inventory");
+        let reset = receiver.recv().await.expect("inventory reset");
+        assert!(matches!(reset, EndpointStatusCommand::Reset { .. }));
+        let value = regorus::Value::from_json_str(&format!(
+            r#"{{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"{endpoint_id}","policy_hash":"policy","provider_credentialed":true}}"#
+        ))
+        .expect("parse MCP config JSON");
+        let config = crate::l7::parse_l7_config(&value).expect("parse MCP observation config");
+        let observer =
+            EndpointObserver::begin(Some(&sender), &config).expect("begin MCP observation");
+        (observer, receiver)
+    }
+
+    async fn assert_observed_response_result(response: &'static [u8], expected: EndpointResult) {
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            upstream_peer
+                .write_all(response)
+                .await
+                .expect("write response");
+        });
+        let mut client = tokio::io::sink();
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("relay observed response");
+        writer.await.expect("join upstream writer");
+        let command = receiver.recv().await.expect("endpoint observation");
+        assert!(matches!(
+            command,
+            EndpointStatusCommand::Observe { result, .. } if result == expected
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_http_response_at_header_receipt() {
+        assert_observed_response_result(
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+            EndpointResult::HttpResponseReceived,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_classifies_upstream_http_rejections() {
+        for response in [
+            &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            assert_observed_response_result(response, EndpointResult::UpstreamRejected).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_waits_for_final_response_after_coalesced_interim() {
+        let response = b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\ndeny";
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        let mut upstream = &response[..];
+        let mut client = Vec::new();
+
+        let outcome = relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("relay informational and final responses");
+
+        assert!(matches!(
+            receiver.try_recv().expect("final response observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::UpstreamRejected,
+                ..
+            }
+        ));
+        assert_eq!(
+            client, response,
+            "preserve coalesced final headers and body"
+        );
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+        assert!(receiver.try_recv().is_err(), "one result per exchange");
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_relays_split_interim_and_final_headers() {
+        let first = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 ";
+        let last = b"200 OK\r\nContent-Length: 4\r\n\r\nbody";
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        // Separate reads split the final status line after the complete interim
+        // block; draining interim bytes must preserve the partial final header.
+        let mut upstream = first.as_slice().chain(last.as_slice());
+        let mut client = Vec::new();
+
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("relay split informational and final responses");
+
+        assert_eq!(client, [first.as_slice(), last.as_slice()].concat());
+        assert!(matches!(
+            receiver.try_recv().expect("final response observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::HttpResponseReceived,
+                ..
+            }
+        ));
+        assert!(receiver.try_recv().is_err(), "one result per exchange");
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_reports_transport_failure_after_interim_eof() {
+        for response in [
+            &b"HTTP/1.1 100 Continue\r\n\r\n"[..],
+            &b"HTTP/1.1 103 Early Hints\r\n\r\n"[..],
+        ] {
+            assert_observed_response_result(response, EndpointResult::TransportFailed).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_bounds_informational_response_headers() {
+        let interim = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+        let mut response = interim.repeat(MAX_HEADER_BYTES / interim.len() + 1);
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        let mut upstream = response.as_slice();
+        let mut client = Vec::new();
+
+        relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("informational headers must share a bounded exchange budget");
+
+        assert!(matches!(
+            receiver.try_recv().expect("header limit observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::TransportFailed,
+                ..
+            }
+        ));
+        assert!(client.len() <= MAX_HEADER_BYTES);
+        assert!(receiver.try_recv().is_err(), "one result per exchange");
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_preserves_response_result_after_body_read_error() {
+        struct FailedReader;
+
+        impl AsyncRead for FailedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream response body interrupted",
+                )))
+            }
+        }
+
+        for (headers, expected) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n"[..],
+                EndpointResult::HttpResponseReceived,
+            ),
+            (
+                &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\n"[..],
+                EndpointResult::UpstreamRejected,
+            ),
+        ] {
+            let (observer, mut receiver) = test_endpoint_observer().await;
+            let mut response = headers.chain(FailedReader);
+            let mut upstream = ObservedUpstream {
+                upstream: &mut response,
+                observer: Some(&observer),
+            };
+            let mut client = Vec::new();
+            relay_response(
+                "POST",
+                &mut upstream,
+                &mut client,
+                RelayResponseOptions {
+                    observer: Some(&observer),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("response body read must fail");
+            assert_eq!(client, headers);
+            assert!(matches!(
+                receiver.try_recv().expect("HTTP response observation"),
+                EndpointStatusCommand::Observe { result, .. } if result == expected
+            ));
+            assert!(
+                receiver.try_recv().is_err(),
+                "body error must not replace the response result"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_malformed_http_status() {
+        assert_observed_response_result(
+            b"not-http 200 nope\r\nContent-Length: 0\r\n\r\n",
+            EndpointResult::TransportFailed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_reports_sse_headers_before_body_eof() {
+        let (observer, mut receiver) = test_endpoint_observer().await;
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
+        let mut client = tokio::io::sink();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer = async move {
+            upstream_peer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .expect("write SSE headers");
+            let _ = release_rx.await;
+        };
+        let relay = relay_response(
+            "POST",
+            &mut upstream,
+            &mut client,
+            RelayResponseOptions {
+                observer: Some(&observer),
+                ..Default::default()
+            },
+        );
+        let assertion = async {
+            let command = receiver.recv().await.expect("SSE endpoint observation");
+            assert!(matches!(
+                command,
+                EndpointStatusCommand::Observe {
+                    result: EndpointResult::HttpResponseReceived,
+                    ..
+                }
+            ));
+            let _ = release_tx.send(());
+        };
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            async { tokio::join!(writer, relay, assertion) },
+        ))
+        .await
+        .expect("SSE observation must not wait for body EOF")
+        .1
+        .expect("relay SSE response");
+    }
+
     #[test]
     fn test_parse_connection_close() {
         assert!(parse_connection_close(
@@ -5497,10 +5969,6 @@ mod tests {
         ));
         assert!(!parse_connection_close(
             "HTTP/1.1 200 OK\r\nHost: x\r\n\r\n"
-        ));
-        assert!(parse_connection_close("HTTP/1.0 200 OK\r\nHost: x\r\n\r\n"));
-        assert!(!parse_connection_close(
-            "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n"
         ));
     }
 
@@ -5571,41 +6039,6 @@ mod tests {
         assert!(
             received_str.contains("hello world"),
             "body should be forwarded"
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_response_http_1_0_defaults_to_connection_close() {
-        let response = b"HTTP/1.0 200 OK\r\nServer: test\r\n\r\nhello world";
-        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
-        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
-
-        tokio::spawn(async move {
-            upstream_write.write_all(response).await.unwrap();
-            upstream_write.shutdown().await.unwrap();
-        });
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            relay_response(
-                "POST",
-                &mut upstream_read,
-                &mut client_write,
-                RelayResponseOptions::default(),
-            ),
-        )
-        .await
-        .expect("HTTP/1.0 close-delimited response should not deadlock")
-        .expect("HTTP/1.0 response should relay");
-        assert!(matches!(outcome, RelayOutcome::Consumed));
-
-        client_write.shutdown().await.unwrap();
-        let mut received = Vec::new();
-        client_read.read_to_end(&mut received).await.unwrap();
-        assert!(
-            received
-                .windows(b"hello world".len())
-                .any(|value| value == b"hello world")
         );
     }
 

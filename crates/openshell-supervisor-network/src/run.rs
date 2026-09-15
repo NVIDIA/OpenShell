@@ -37,6 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
+use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_isolation_interface::contract::NetworkMediationSource;
 
 #[cfg(target_os = "linux")]
@@ -194,6 +195,7 @@ pub async fn run_networking(
     openshell_endpoint: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
@@ -483,6 +485,7 @@ pub async fn run_networking(
             Some(policy_local_ctx.clone()),
             denial_tx.clone(),
             activity_tx.clone(),
+            endpoint_observation_tx,
             engine_ready_rx,
             upstream_proxy_args,
             host_gateway_ip,
