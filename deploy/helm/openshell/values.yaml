@@ -26,50 +26,6 @@ image:
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
 
-# Trusted workload-side runtime image.
-sandboxRuntime:
-  image:
-    # -- Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/sandbox
-    # -- Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty.
-    pullPolicy: ""
-    # -- Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed.
-    tag: ""
-
-# Trusted control-side runtime image.
-supervisor:
-  image:
-    # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/supervisor
-    # -- Sandbox supervisor pull policy. Leave unset to use the Kubernetes
-    # image default. Prefer always, if_not_present, or never; the chart also
-    # accepts legacy Kubernetes spellings Always, IfNotPresent, and Never.
-    pullPolicy: null
-    # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
-    tag: ""
-  sandboxRuntime:
-    # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
-    networkPolicyEnforced: false
-    # -- Workload boundary TLS listener port.
-    boundaryPort: 5500
-
-# -- Operator-owned corporate forward proxy for policy-approved TLS egress
-# from Kubernetes sandboxes. The workload cannot select or override it.
-upstreamProxy:
-  # -- HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported.
-  url: ""
-  # -- Comma-separated destinations that bypass only the corporate proxy.
-  noProxy: ""
-  authSecret:
-    # -- Existing Secret in the sandbox namespace containing a user:pass value.
-    name: ""
-    # -- Secret key containing the proxy credential.
-    key: ""
-  # -- Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext.
-  authAllowInsecure: false
-  # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
-  connectByHostname: false
-
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
 # -- Override the chart name used in generated resource names.
@@ -220,8 +176,8 @@ gatewayConfig:
     gateway_id: '{{ include "openshell.fullname" . }}'
     grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
     service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
-    supervisor_sideload_method: '{{ include "openshell.supervisorSideloadMethod" . }}'
-    topology: '{{ .Values.supervisor.topology }}'
+    supervisor_sideload_method: '{{ if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version }}image-volume{{ else }}init-container{{ end }}'
+    topology: combined
     sa_token_ttl_secs: 3600
     app_armor_profile: Unconfined
   openshell.drivers.kubernetes.managed_ssh_ingress:

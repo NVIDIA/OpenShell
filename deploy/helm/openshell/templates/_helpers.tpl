@@ -94,30 +94,6 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
-{{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
-{{- define "openshell.defaultSandboxRuntimeRepository" -}}
-ghcr.io/nvidia/openshell/sandbox
-{{- end }}
-
-{{/* Whether Helm must propagate a sandbox runtime image override. */}}
-{{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
-{{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
-{{- $repository := .Values.sandboxRuntime.image.repository | default $defaultRepository -}}
-{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag -}}true{{- end -}}
-{{- end }}
-
-{{/* Sandbox runtime image override. */}}
-{{- define "openshell.sandboxRuntimeImage" -}}
-{{- $repository := .Values.sandboxRuntime.image.repository | default (include "openshell.defaultSandboxRuntimeRepository" .) -}}
-{{- $tag := .Values.sandboxRuntime.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" $repository $tag }}
-{{- end }}
-
-{{/* Official supervisor repository used by the gateway's built-in default. */}}
-{{- define "openshell.defaultSupervisorRepository" -}}
-ghcr.io/nvidia/openshell/supervisor
-{{- end }}
-
 {{/*
 Whether the gateway listener should verify client certificates (mTLS).
 An explicit empty server.tls.clientCaSecretName disables client-CA wiring in
@@ -132,26 +108,6 @@ defaults.
 true
 {{- end -}}
 {{- end -}}
-
-{{/*
-Whether Helm must propagate a supervisor image override into gateway.toml.
-The chart's documented repository and empty tag are the gateway-owned default.
-*/}}
-{{- define "openshell.supervisorImageOverrideEnabled" -}}
-{{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
-{{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
-{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
-{{- end }}
-
-{{/*
-Supervisor image override. A tag-only override uses the official repository;
-a repository-only override uses the effective gateway image tag.
-*/}}
-{{- define "openshell.supervisorImage" -}}
-{{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
-{{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" $repository $tag }}
-{{- end }}
 
 {{/*
 Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
@@ -221,20 +177,10 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
-{{/*
-gRPC endpoint sandbox pods use to call back into the gateway. An explicit
-.Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
-the in-cluster Service DNS, release namespace, service port, and disableTls
-flag — so the default value works for any release name or namespace without
-override.
-*/}}
+{{/* Derive the in-cluster callback endpoint from the chart-owned TLS state. */}}
 {{- define "openshell.grpcEndpoint" -}}
-{{- if .Values.server.grpcEndpoint -}}
-{{- .Values.server.grpcEndpoint -}}
-{{- else -}}
 {{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
-{{- end -}}
 {{- end }}
 
 {{/*
@@ -340,7 +286,6 @@ Validate chart values that Helm would otherwise accept silently.
 {{- include "openshell.validateSecretReference" (list "server.credentialStorage.existingSecret" .Values.server.credentialStorage.existingSecret) -}}
 {{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
-{{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
