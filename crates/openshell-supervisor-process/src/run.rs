@@ -125,6 +125,14 @@ pub async fn run_process(
     #[cfg(target_os = "linux")]
     crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
 
+    // Bubblewrap must construct its namespaces before the supervisor installs
+    // its inherited mount/namespace seccomp prelude. The experimental launcher
+    // is a separate unprivileged process with a fixed request protocol; the
+    // generated child receives the normal OpenShell Landlock/seccomp policy
+    // after Bubblewrap has finished setup.
+    #[cfg(target_os = "linux")]
+    let _bwrap_launcher = crate::bwrap_launcher::spawn_if_enabled()?;
+
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, identity mount namespace setup,

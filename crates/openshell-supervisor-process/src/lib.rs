@@ -8,6 +8,8 @@
 //! and log push. Populated by follow-up commits as modules migrate out of
 //! `openshell-sandbox`.
 
+#[cfg(target_os = "linux")]
+pub mod bwrap_launcher;
 pub mod child_env;
 pub mod debug_rpc;
 #[cfg(unix)]

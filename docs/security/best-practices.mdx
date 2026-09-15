@@ -35,6 +35,33 @@ You can update dynamic controls on a running sandbox with `openshell policy upda
 
 ## Network Controls
 
+### Globster Inline Python Launcher
+
+The Globster-maintained supervisor can expose a fixed-function Python launcher
+when the reviewed workload image sets `OPENSHELL_EXPERIMENTAL_BWRAP_LAUNCHER=1`.
+The workload image must include `/usr/bin/bwrap`, `/usr/bin/timeout`, and
+`/app/.venv/bin/python`. Deploy the compatible supervisor and workload image
+together before installing Inline Code on an existing agent.
+
+The helper starts before the supervisor's inherited seccomp policy. Ordinary
+agent processes keep their existing restrictions. The helper accepts only
+protocol version 1 and Python source over a same-user, mode-0600 Unix socket;
+callers cannot select commands, mounts, environment variables, or host paths.
+Each execution receives fresh namespaces, no network, a cleared environment,
+read-only Python libraries, and Landlock and seccomp enforcement. The agent
+workspace, credentials, and launcher socket are absent from the code jail.
+
+Runs are serialized and limited to five seconds of wall time, three seconds of
+CPU time, 512 MiB of address space, and one process and thread. Each scratch
+filesystem is limited to 16 MiB and disappears after the run. Output files are
+bounded to 1 MiB; the plugin applies smaller JSON limits and validates the
+declared output schema. An unavailable launcher fails closed.
+
+This integration supports runc. Its namespaces and security filters share the
+host kernel; they do not provide a virtual-machine boundary. Keep the host
+kernel, container runtime, Bubblewrap, and supervisor patched, and retain the
+outer workload's resource and network controls.
+
 The CONNECT proxy and OPA policy engine enforce all network controls at the gateway level.
 
 ### Deny-by-Default Egress

@@ -40,6 +40,26 @@ New limits should follow these rules:
   query parameters, or external free-form diagnostics.
 - Test time bounds with simulated time and test shared budgets under saturation.
 
+## Fixed Python launcher
+
+| Resource | Bound | Terminal behavior |
+|---|---:|---|
+| Active execution | 1 per launcher | Requests are serviced serially. |
+| Request JSON | 256 KiB | Reject before creating a jail. |
+| Socket read/write | 2 seconds each | Close stalled connections. |
+| Python process/thread count | 1 | Seccomp rejects clone/fork/thread creation. |
+| Wall time / CPU time | 5 seconds / 3 seconds | Terminate execution. |
+| Python address space | 512 MiB | Allocation fails. |
+| `/tmp` and `/work/output` | 16 MiB each | Private tmpfs rejects writes when full. |
+| File size / descriptors | 1 MiB / 64 | Kernel rejects excess file growth or opens. |
+| Returned stdout / stderr | 1 MiB each | Read no more than the bound. |
+
+These are fixed-function execution limits, not a general cgroup delegation API.
+The owning container must retain its normal resource limits. New processes and
+threads are deliberately unsupported so a program cannot multiply the per-process
+address-space/CPU limits. No writable host-directory mount or artifact listing is
+exposed to Python. Temporary files are removed after each execution.
+
 ## Middleware
 
 Middleware limits are process-wide per sandbox. Registry replacement preserves

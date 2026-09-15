@@ -33,6 +33,10 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
+#[cfg(target_os = "linux")]
+use openshell_supervisor_process::bwrap_launcher::{
+    BWRAP_CHILD_SUBCOMMAND, BWRAP_LAUNCHER_SUBCOMMAND,
+};
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
@@ -538,6 +542,17 @@ fn main() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
         return validate_workspace(&raw_args[2..]);
+    }
+    #[cfg(target_os = "linux")]
+    if raw_args.get(1).map(String::as_str) == Some(BWRAP_LAUNCHER_SUBCOMMAND) {
+        let socket = raw_args.get(2).ok_or_else(|| {
+            miette::miette!("usage: openshell-sandbox {BWRAP_LAUNCHER_SUBCOMMAND} <SOCKET>")
+        })?;
+        return openshell_supervisor_process::bwrap_launcher::serve(Path::new(socket));
+    }
+    #[cfg(target_os = "linux")]
+    if raw_args.get(1).map(String::as_str) == Some(BWRAP_CHILD_SUBCOMMAND) {
+        return openshell_supervisor_process::bwrap_launcher::run_hardened_child();
     }
 
     let args = Args::parse();

@@ -50,6 +50,26 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
+## Fixed Python launcher
+
+The Globster process-supervisor integration can start a non-root Bubblewrap
+launcher before installing the inherited supervisor seccomp prelude. Ordinary
+agent restrictions remain unchanged. The launcher accepts bounded, versioned JSON
+containing Python source through an owner-only Unix socket; callers cannot choose
+commands, mounts, environment variables or network policy. Peer credentials must
+match the launcher's UID, and the launcher disables process-memory inspection.
+
+Each call creates private namespaces and bounded scratch filesystems. Only `/usr`,
+`/app/.venv`, the submitted program and the fixed child launcher are mounted
+read-only. Before Python starts, the child requires Landlock, blocks networking,
+and installs seccomp restrictions including denial of process/thread creation.
+Setup errors fail closed. The deadline terminates the Bubblewrap process tree;
+scratch mounts disappear with the namespace. Results are bounded stdout/stderr,
+with no file-export interface. See [Sandbox Limits](sandbox-limits.md).
+
+This path relies on the enclosing container and node kernel. It does not add a VM
+boundary or protect the agent from trusted plugins already executing in its process.
+
 ## Network and Inference
 
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
