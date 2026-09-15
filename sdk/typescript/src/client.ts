@@ -302,6 +302,11 @@ export interface WaitOptions extends SandboxWorkspaceOptions {
   signal?: AbortSignal;
 }
 
+export interface WaitDeletedOptions extends WaitOptions {
+  /** Original ID from delete(). Complete on absence or a different ID; omit to wait for name absence. */
+  expectedSandboxId?: string;
+}
+
 export interface ForwardOptions extends SandboxWorkspaceOptions {
   /** Loopback TCP port inside the sandbox to dial. */
   targetPort: number;
@@ -970,9 +975,9 @@ export class SandboxClient {
     }
   }
 
-  // Poll until the sandbox is gone. Timeout and cancellation bound the returned
-  // promise the same way as waitReady.
-  async waitDeleted(name: string, timeoutSecs: number, options?: WaitOptions | null): Promise<void> {
+  // Poll until the sandbox is gone, or its name resolves to a different ID when
+  // expectedSandboxId is supplied. Timeout and cancellation work as in waitReady.
+  async waitDeleted(name: string, timeoutSecs: number, options?: WaitDeletedOptions | null): Promise<void> {
     const deadline = Date.now() + timeoutSecs * 1000;
     const signal = options?.signal;
     let delay = 250;
@@ -981,7 +986,8 @@ export class SandboxClient {
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
-        await this.get(name, { ...pollOptions, workspace: options?.workspace });
+        const ref = await this.get(name, { ...pollOptions, workspace: options?.workspace });
+        if (options?.expectedSandboxId !== undefined && ref.id !== options.expectedSandboxId) return;
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
         throw mapWaitError(e, name, deadline, signal, pollOptions.signal);

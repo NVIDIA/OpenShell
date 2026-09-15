@@ -809,13 +809,82 @@ describe('waits', () => {
     });
   });
 
-  it('waitDeleted resolves when the gateway reports NotFound', async () => {
+  it.each([undefined, 'old-id'])('waitDeleted resolves on NotFound with expected ID %s', async (expectedSandboxId) => {
     const sandbox = client({
       getSandbox: () => {
         throw new ConnectError('gone', Code.NotFound);
       },
     });
-    await expect(sandbox.waitDeleted('sb', 1)).resolves.toBeUndefined();
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId })).resolves.toBeUndefined();
+  });
+
+  it.each([undefined, 'team'])(
+    'waitDeleted completes on replacement after accepted deletion in %s',
+    async (workspace) => {
+      let polls = 0;
+      const sandbox = client({
+        deleteSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          return { outcome: 2, sandboxId: 'old-id' };
+        },
+        getSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      const deletion = await sandbox.delete('sb', { workspace });
+      expect(deletion.outcome).toBe('accepted');
+      expect(deletion.sandboxId).toBe('old-id');
+      await expect(
+        sandbox.waitDeleted('sb', 1, {
+          workspace,
+          expectedSandboxId: deletion.sandboxId,
+        }),
+      ).resolves.toBeUndefined();
+      expect(polls).toBe(1);
+    },
+  );
+
+  it('waitDeleted keeps polling the original identity until it disappears', async () => {
+    let polls = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        if (++polls === 1) return readySandbox('sb', 'old-id');
+        throw new ConnectError('gone', Code.NotFound);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 5, { expectedSandboxId: 'old-id' })).resolves.toBeUndefined();
+    expect(polls).toBe(2);
+  });
+
+  it.each([undefined, 'replacement-id'])(
+    'waitDeleted times out while observed identity remains with expected ID %s',
+    async (expectedSandboxId) => {
+      let polls = 0;
+      const sandbox = client({
+        getSandbox: () => {
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      await expect(sandbox.waitDeleted('sb', 0.2, { expectedSandboxId })).rejects.toMatchObject({
+        code: 'connect',
+        message: "[connect] timed out waiting for sandbox 'sb' to delete",
+      });
+      expect(polls).toBeGreaterThan(0);
+    },
+  );
+
+  it.each([Code.PermissionDenied, Code.Unavailable])('waitDeleted propagates lookup error %s', async (code) => {
+    const sandbox = client({
+      getSandbox: () => {
+        throw new ConnectError('lookup failed', code);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId: 'old-id' })).rejects.toMatchObject({
+      connectCode: code,
+    });
   });
 
   it('waitDeleted rejects rather than hanging when get() never resolves', async () => {

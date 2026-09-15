@@ -76,9 +76,10 @@ Existing error codes and human-readable messages remain available. Python curate
 clients now raise `GatewayError`, which remains a `grpc.RpcError`; existing
 `except grpc.RpcError` handlers continue to work. `GatewayError` is not a
 `grpc.Call`. If your handler checks that interface, inspect `raw_error` before
-checking the status. The Python SDK's deletion wait and managed-sandbox cleanup
-use the original call to recognize `NOT_FOUND`; other failures still propagate.
-Rust error variants now retain
+checking the status, or call `GatewayError.code()` directly. Python deletion waits
+recognize `NOT_FOUND` through the wrapper; managed-sandbox cleanup requests
+`allow_missing=True` and handles the typed deletion outcome. Other failures still
+propagate. Rust error variants now retain
 status fields; use `..` when destructuring variants that do not need those fields.
 Go and TypeScript add typed detail fields to their existing error types.
 
@@ -106,6 +107,19 @@ returns `COMPLETED` after authorization without changing its resource version.
 For an accepted deletion, poll or watch that identity. A same-name sandbox with a
 different ID is not the sandbox being deleted. Cancellation or a disconnected
 client does not stop the gateway's already-started deletion worker.
+
+Pass the deletion result's ID to the SDK wait helper to avoid following a
+same-name replacement.
+
+| SDK | Identity-aware deletion wait |
+|---|---|
+| Rust | `client.wait_deleted(name, timeout, result.sandbox_id.as_deref()).await?` on either the default or workspace-scoped client. |
+| Python | `client.wait_deleted(name, workspace=workspace, expected_sandbox_id=result.sandbox_id)`. Managed-sandbox cleanup supplies this automatically. |
+| TypeScript | `client.sandbox.waitDeleted(name, timeoutSecs, { workspace, expectedSandboxId: result.sandboxId })`. |
+
+These waits complete on `NOT_FOUND` or a different observed ID. Without an
+expected ID, they wait for the name to be absent. Existing Rust callers must add
+the third argument; use `None` to retain name-only behavior.
 
 `allow_missing` is not request deduplication. A later request by name can delete
 a newly created resource with that name. Do not blindly repeat a timed-out
