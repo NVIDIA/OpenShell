@@ -81,16 +81,6 @@ func TestConverterCoversAllProtoFields_SandboxWorkloadConfig(t *testing.T) {
 	assertAllFieldsCovered(t, (&pb.SandboxWorkloadConfig{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
-func TestConverterCoversAllProtoFields_SandboxResources(t *testing.T) {
-	handled := fieldSet{
-		"cpu":    true,
-		"memory": true,
-		"gpu":    true,
-	}
-
-	assertAllFieldsCovered(t, (&pb.SandboxResources{}).ProtoReflect().Descriptor(), handled, nil)
-}
-
 func TestConverterCoversAllProtoFields_SandboxServiceLevel(t *testing.T) {
 	handled := fieldSet{
 		"startup": true,

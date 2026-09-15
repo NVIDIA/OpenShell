@@ -78,7 +78,8 @@ while let Some(page) = pages.next_page().await? {
 
 ```rust
 use openshell_sdk::{
-    ClientConfig, OpenShellClient, SandboxTemplateCreateSpec,
+    ClientConfig, CpuResourceRequirements, MemoryResourceRequirements, OpenShellClient,
+    ResourceRequirements, SandboxTemplateCreateSpec,
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
 };
 
@@ -93,6 +94,11 @@ client
         spec: Some(SandboxWorkloadTemplateSpec {
             workload: Some(SandboxWorkloadConfig {
                 image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest".to_string(),
+                resources: Some(ResourceRequirements {
+                    cpu: Some(CpuResourceRequirements { limit: "1".to_string() }),
+                    memory: Some(MemoryResourceRequirements { limit: "512Mi".to_string() }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()

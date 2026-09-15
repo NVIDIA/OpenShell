@@ -517,9 +517,11 @@ impl PodmanComputeDriver {
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
+                    request_supported: false,
                 }),
                 memory: Some(MemoryResourceCapabilities {
                     limit_supported: true,
+                    request_supported: false,
                 }),
                 gpu: Some(GpuResourceCapabilities {
                     default_selection_supported: true,
@@ -1684,6 +1686,8 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            cpu: None,
+            memory: None,
         }
     }
 
@@ -3171,8 +3175,12 @@ mod tests {
             .unwrap()
             .resource_capabilities
             .unwrap();
-        assert!(resources.cpu.unwrap().limit_supported);
-        assert!(resources.memory.unwrap().limit_supported);
+        let cpu = resources.cpu.unwrap();
+        assert!(cpu.limit_supported);
+        assert!(!cpu.request_supported);
+        let memory = resources.memory.unwrap();
+        assert!(memory.limit_supported);
+        assert!(!memory.request_supported);
         let gpu = resources.gpu.unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
