@@ -373,6 +373,18 @@ impl ProviderCredentialState {
             .revision
     }
 
+    /// Whether this snapshot contains endpoint-bound material that must be
+    /// resolved by a network proxy rather than exposed to the child process.
+    #[must_use]
+    pub fn requires_proxy_resolution(&self) -> bool {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        !inner.static_credential_bindings.is_empty()
+            || !inner.current.dynamic_credentials.is_empty()
+    }
+
     /// Remove a key from the credential snapshot's child env.
     ///
     /// Used when a sandbox-side service (e.g., metadata server) fails to start

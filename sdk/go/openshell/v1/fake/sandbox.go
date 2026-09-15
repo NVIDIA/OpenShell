@@ -78,6 +78,10 @@ func copySandboxPolicy(p *types.SandboxPolicy) *types.SandboxPolicy {
 		pr := *p.Process
 		cp.Process = &pr
 	}
+	if p.UI != nil {
+		ui := *p.UI
+		cp.UI = &ui
+	}
 	if p.NetworkPolicies != nil {
 		np := make(map[string]types.NetworkPolicyRule, len(p.NetworkPolicies))
 		for k, rule := range p.NetworkPolicies {

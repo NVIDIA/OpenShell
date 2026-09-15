@@ -1097,8 +1097,11 @@ type ComputeDriverCapabilities struct {
 	DriverVersion string `protobuf:"bytes,2,opt,name=driver_version,json=driverVersion,proto3" json:"driver_version,omitempty"`
 	// Static portable resource request forms reported by the driver.
 	ResourceCapabilities *ResourceCapabilities `protobuf:"bytes,3,opt,name=resource_capabilities,json=resourceCapabilities,proto3" json:"resource_capabilities,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Whether the configured driver instance completely enforces the portable
+	// SandboxPolicy.ui contract.
+	SupportsUiPolicy bool `protobuf:"varint,4,opt,name=supports_ui_policy,json=supportsUiPolicy,proto3" json:"supports_ui_policy,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ComputeDriverCapabilities) Reset() {
@@ -1150,6 +1153,13 @@ func (x *ComputeDriverCapabilities) GetResourceCapabilities() *ResourceCapabilit
 		return x.ResourceCapabilities
 	}
 	return nil
+}
+
+func (x *ComputeDriverCapabilities) GetSupportsUiPolicy() bool {
+	if x != nil {
+		return x.SupportsUiPolicy
+	}
+	return false
 }
 
 // Static portable resource request forms reported by a compute driver.
@@ -14345,12 +14355,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fcompute_drivers\x18\x03 \x03(\v2\x1f.openshell.v1.ComputeDriverInfoR\x0ecomputeDrivers\"t\n" +
 	"\x11ComputeDriverInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12K\n" +
-	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xbc\x01\n" +
+	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xea\x01\n" +
 	"\x19ComputeDriverCapabilities\x12\x1f\n" +
 	"\vdriver_name\x18\x01 \x01(\tR\n" +
 	"driverName\x12%\n" +
 	"\x0edriver_version\x18\x02 \x01(\tR\rdriverVersion\x12W\n" +
-	"\x15resource_capabilities\x18\x03 \x01(\v2\".openshell.v1.ResourceCapabilitiesR\x14resourceCapabilities\"\xca\x01\n" +
+	"\x15resource_capabilities\x18\x03 \x01(\v2\".openshell.v1.ResourceCapabilitiesR\x14resourceCapabilities\x12,\n" +
+	"\x12supports_ui_policy\x18\x04 \x01(\bR\x10supportsUiPolicy\"\xca\x01\n" +
 	"\x14ResourceCapabilities\x127\n" +
 	"\x03cpu\x18\x01 \x01(\v2%.openshell.v1.CpuResourceCapabilitiesR\x03cpu\x12@\n" +
 	"\x06memory\x18\x02 \x01(\v2(.openshell.v1.MemoryResourceCapabilitiesR\x06memory\x127\n" +

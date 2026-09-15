@@ -32,8 +32,8 @@ launches and monitors the policy-constrained workload itself.
 
 `compute_driver.proto` is the supported gateway/driver extension boundary.
 At initialization the gateway snapshots the driver's identity, version,
-default image, gateway-lifecycle preference, and
-`driver_reports_runtime_readiness` from `GetCapabilities`. The gateway includes
+default image, gateway-lifecycle preference, runtime-readiness ownership, and
+complete UI-policy enforcement support from `GetCapabilities`. The gateway includes
 the canonical `SandboxPolicy` in `DriverSandboxSpec.policy` for validation and
 creation. Drivers that enforce policy outside the standard supervisor fetch
 later revisions through `GetSandboxConfig` and acknowledge them through
@@ -105,6 +105,18 @@ configuration API. RFC-0010 lifecycle hooks may observe readiness transitions vi
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
+
+UI policy is capability-negotiated at the configured driver-instance boundary.
+`supports_ui_policy = true` means the driver completely enforces every field in
+the current portable `SandboxPolicy.ui` contract; partial implementations must
+report false. When `ui` is explicitly present, including as `{}`, the gateway
+rejects create before the driver validation RPC or provisioning unless this
+capability is true. An absent section bypasses this gate and preserves the
+runtime's existing behavior. The startup snapshot is also exposed through
+gateway info so clients can discover the selected runtime's support. UI cannot
+be supplied by a gateway-global policy because it is applied at startup. When a
+global dynamic policy is active, effective-policy reads retain the UI block from
+the sandbox's creation policy.
 
 The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead

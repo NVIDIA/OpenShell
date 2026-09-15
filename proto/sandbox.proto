@@ -31,6 +31,10 @@ message SandboxPolicy {
   // policy-local names. At most 10 configs are accepted, and at most 10 stages
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
+  // Static, platform-neutral user-interface access policy. Within an explicit
+  // section, omitted capabilities deny. Omitting the section preserves the
+  // compute platform's existing behavior.
+  UiPolicy ui = 7;
 }
 
 // Filesystem access policy.
@@ -55,6 +59,32 @@ message ProcessPolicy {
   string run_as_user = 1;
   // Group name to run the sandboxed process as.
   string run_as_group = 2;
+}
+
+// Directional clipboard access for a sandboxed workload.
+enum UiClipboardAccess {
+  // Unspecified resolves to no clipboard access.
+  UI_CLIPBOARD_ACCESS_UNSPECIFIED = 0;
+  // No clipboard reads or writes.
+  UI_CLIPBOARD_ACCESS_NONE = 1;
+  // The sandbox may read host clipboard contents.
+  UI_CLIPBOARD_ACCESS_READ = 2;
+  // The sandbox may write host clipboard contents.
+  UI_CLIPBOARD_ACCESS_WRITE = 3;
+  // The sandbox may read and write host clipboard contents.
+  UI_CLIPBOARD_ACCESS_ALL = 4;
+}
+
+// Platform-neutral user-interface capabilities. Every omitted field in an
+// explicit policy defaults to deny. Compute platforms without complete support
+// reject the entire explicit policy before provisioning.
+message UiPolicy {
+  // Allow the sandbox to display graphical windows.
+  bool allow_graphical_ui = 1;
+  // Directional host clipboard access.
+  UiClipboardAccess clipboard = 2;
+  // Allow the sandbox to synthesize keyboard or pointer input.
+  bool allow_input_injection = 3;
 }
 
 // A named network access policy rule.

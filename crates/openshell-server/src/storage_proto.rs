@@ -119,11 +119,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8ac68c71d93e6a5e56406b8df1882ee40c6066270969e03eb99803f0e6396fc1";
+        "eec8e3e8c45cb7e17944777887b3c6e1d0ae897263b6994082acd19e839fc3bf";
     const DURABLE_SCHEMA_SHA256: &str =
-        "369b36511c2e38b9df9621704a00123516c7538d8ee89a499158d7de5cee1882";
+        "69fdc72cc033f37704e8aa4b089dc799990b52cb9cdd5c13decef67fb662177d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
+        "9d5c40ec9820139c2fe0c9a9ce2098289c0b5c63c3e3ad6d16de558d504cdecc";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -487,13 +487,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (278, 12)
+            (279, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (81, 8)
+            (82, 9)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (71, 8));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
