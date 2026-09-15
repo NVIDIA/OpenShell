@@ -23,7 +23,6 @@ RUN_MODE_OVERRIDE="${OPENSHELL_AGENT_RUN_MODE:-}"
 POLL_INTERVAL_OVERRIDE="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-}"
 MAX_TRANSIENT_FAILURES_OVERRIDE="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-}"
 RESET_REFRESH="${OPENSHELL_AGENT_RESET_REFRESH:-0}"
-BACKGROUND=0
 KEEP_SANDBOX=0
 
 usage() {
@@ -44,7 +43,6 @@ Options:
   --watch                 Keep the sandbox alive and re-run bounded cycles
   --poll-interval SECONDS Sleep duration between watch cycles
   --reset-refresh         Replace gateway-owned refresh material from host auth before rotating
-  --background            Write image-build and provisioning output to a log
   --keep                  Keep the sandbox after the harness exits
   -h, --help              Show this help
 EOF
@@ -127,10 +125,6 @@ while [[ $# -gt 0 ]]; do
             RESET_REFRESH=1
             shift
             ;;
-        --background)
-            BACKGROUND=1
-            shift
-            ;;
         --keep)
             KEEP_SANDBOX=1
             shift
@@ -207,7 +201,6 @@ emit "HARNESS_REASONING", harness_config.fetch("reasoning", "")
 emit "SANDBOX_NAME_PREFIX", manifest.dig("sandbox", "name_prefix") || manifest.fetch("id")
 emit "SANDBOX_FROM_DEFAULT", manifest.dig("sandbox", "from") || "agent://."
 emit "GATEWAY_DEFAULT", manifest.dig("sandbox", "gateway") || "docker-dev"
-emit "BACKGROUND_LOG_DIR", manifest.dig("sandbox", "background_log_dir") || "logs"
 emit "PROMPT_TEMPLATE", manifest.fetch("prompt_template")
 emit_array "PROFILE_PATHS", manifest.fetch("profile_paths", [])
 
@@ -841,12 +834,4 @@ run_agent_sandbox() {
 }
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
-if [[ "$BACKGROUND" == "1" ]]; then
-    LOG_DIR="$(resolve_manifest_path "$BACKGROUND_LOG_DIR")"
-    mkdir -p "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/${SANDBOX_NAME}.log"
-    run_agent_sandbox >"$LOG_FILE" 2>&1
-    echo "Started detached. Provisioning log: $LOG_FILE"
-else
-    run_agent_sandbox
-fi
+run_agent_sandbox

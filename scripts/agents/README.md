@@ -34,8 +34,7 @@ Each agent has an `agent.yaml` manifest. The launcher currently reads these
 sections:
 
 - `id`, `display_name`, `description`: human and runtime identity.
-- `sandbox`: default sandbox name prefix, gateway, source image or Dockerfile,
-  and background log directory.
+- `sandbox`: default sandbox name prefix, gateway, and source image or Dockerfile.
 - `harness`: default harness and per-harness settings such as model and
   reasoning effort.
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and

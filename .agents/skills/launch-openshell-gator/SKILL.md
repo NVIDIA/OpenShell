@@ -13,7 +13,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 
 ## Non-Negotiable Rules
 
-- Keep normal gator launches supervised: use `--watch --background` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
+- Keep normal gator launches supervised: use `--watch` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
 - Do not add passive `sleep` loops in the operator session to watch gator. Check logs or status once, then report the current state or launch a proper watcher outside the model session only when explicitly asked.
 - Do not change the default gator model in `scripts/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
 - Do not push to contributor branches, approve, merge, post `/ok to test`, or broaden gator scope unless the operator explicitly authorized that action.
@@ -34,7 +34,6 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
-| `scripts/agents/gator/logs/` | Background image-build and provisioning logs. Runtime logs live on the gateway. |
 
 ## Preflight
 
@@ -156,13 +155,12 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
 The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the supervisor exits. `CONTAINER_ENGINE`, when set, must match the gateway driver.
 
-With `--background`, the launcher writes local image-build and provisioning output under `scripts/agents/gator/logs/`. The flag does not leave a host process behind: creation waits until the detached workload is ready, then the launcher exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
+The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
 ### Launch An Issue Or Issue/PR Pair
 
@@ -179,7 +177,6 @@ sandbox_name="gator-issue-${issue_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Run gator on issue #${issue_number}. Scope this invocation only to issue #${issue_number}."
 ```
 
@@ -200,7 +197,6 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} with linked issue #${issue_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number} and issue #${issue_number}."
 ```
 
@@ -221,7 +217,6 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test for the current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
 ```
 
@@ -243,7 +238,6 @@ CODEX_MODEL=gpt-5.6-sol \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
 ```
 
@@ -268,7 +262,6 @@ CODEX_MODEL=gpt-5.6-sol \
   --name "$sandbox_name" \
   --from "$tmp_context" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
@@ -276,13 +269,7 @@ CODEX_MODEL=gpt-5.6-sol \
 
 ### Read The Launch Result
 
-The launcher prints the provisioning log path when `--background` is used:
-
-```text
-Started detached. Provisioning log: scripts/agents/gator/logs/<sandbox-name>.log
-```
-
-Read that file directly. Important markers:
+The launcher streams image-build and provisioning output to the terminal. Important markers:
 
 - `Built image ...` means the local image build completed.
 - `Created sandbox: <name>` means OpenShell accepted the sandbox.
@@ -348,7 +335,6 @@ openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "<same scoped operator prompt, updated only with the reason for relaunch>"
 ```
 
@@ -410,7 +396,6 @@ When you launch or inspect gator, report:
 
 - Sandbox name.
 - Gateway name.
-- Log path.
 - Target issue/PR scope.
 - Harness and model when relevant.
 - Whether image build and sandbox creation succeeded.

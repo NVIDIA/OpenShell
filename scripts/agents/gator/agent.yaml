@@ -10,7 +10,6 @@ sandbox:
   name_prefix: gtr
   from: agent://.
   gateway: docker-dev
-  background_log_dir: logs
 
 harness:
   default: codex
