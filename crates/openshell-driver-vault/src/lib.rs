@@ -1007,14 +1007,14 @@ mod tests {
     fn test_ca() -> (rcgen::Certificate, KeyPair) {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let key = KeyPair::generate().unwrap();
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
         let certificate = params.self_signed(&key).unwrap();
         (certificate, key)
     }
 
     async fn start_tls_server(response: String) -> (SocketAddr, String) {
         let (ca_certificate, ca_key) = test_ca();
-        let server_key = KeyPair::generate().unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
         let server_certificate = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()
             .signed_by(&server_key, &ca_certificate, &ca_key)
