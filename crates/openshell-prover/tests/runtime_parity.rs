@@ -4,7 +4,7 @@
 //! Regression tests against the network supervisor's actual Rego policy.
 
 use openshell_prover::containment::{
-    CheckOptions, CheckResult, Counterexample, check_within_maximum, parse_policy_str,
+    CheckOptions, CheckResult, Counterexample, check_within_boundary, parse_policy_str,
 };
 use regorus::{Engine, Value};
 use serde_json::json;
@@ -13,11 +13,11 @@ use std::time::Duration;
 const SANDBOX_POLICY_REGO: &str =
     include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego");
 
-fn check(maximum: &str, candidate: &str) -> CheckResult {
-    let maximum = parse_policy_str(maximum).expect("maximum policy should parse");
+fn check(boundary: &str, candidate: &str) -> CheckResult {
+    let boundary = parse_policy_str(boundary).expect("boundary policy should parse");
     let candidate = parse_policy_str(candidate).expect("candidate policy should parse");
-    check_within_maximum(
-        &maximum,
+    check_within_boundary(
+        &boundary,
         &candidate,
         CheckOptions {
             timeout: Duration::from_secs(5),
@@ -89,7 +89,7 @@ fn eval_array_len(engine: &mut Engine, input: &Value, rule: &str) -> usize {
 
 #[test]
 fn underscore_host_counterexample_replays_at_runtime() {
-    let maximum = "version: 1\n";
+    let boundary = "version: 1\n";
     let candidate = r"
 version: 1
 network_policies:
@@ -97,7 +97,7 @@ network_policies:
     endpoints: [{ host: api_internal.example.com, ports: [443] }]
     binaries: [{ path: /usr/bin/curl }]
 ";
-    let result = check(maximum, candidate);
+    let result = check(boundary, candidate);
     let CheckResult::Exceeds(evidence) = result else {
         panic!("expected exceeding witness, got {result:?}");
     };
@@ -118,7 +118,7 @@ network_policies:
         "data.openshell.sandbox.allow_network"
     ));
     assert!(!eval_bool(
-        &mut runtime_engine_with_identity(maximum, *binary_identity_required),
+        &mut runtime_engine_with_identity(boundary, *binary_identity_required),
         &input,
         "data.openshell.sandbox.allow_network"
     ));
@@ -140,7 +140,7 @@ fn recursive_path_globs_preserve_zero_directory_grants_and_denies() {
             }}
         }).to_string()
     };
-    for (maximum, candidate, within) in [
+    for (boundary, candidate, within) in [
         (
             policy("/**", Some("/a/**/b"), ""),
             policy("/a/b", None, ""),
@@ -171,13 +171,13 @@ fn recursive_path_globs_preserve_zero_directory_grants_and_denies() {
         ));
         assert_eq!(
             eval_bool(
-                &mut runtime_engine(&maximum),
+                &mut runtime_engine(&boundary),
                 &input,
                 "data.openshell.sandbox.allow_request"
             ),
             within
         );
-        let result = check(&maximum, &candidate);
+        let result = check(&boundary, &candidate);
         if within {
             assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
         } else {
@@ -200,7 +200,7 @@ network_policies:
         rules: [{ allow: { method: GET, path: "/items/*" } }]
     binaries: [{ path: /usr/bin/curl }]
 "#;
-    let maximum = r#"
+    let boundary = r#"
 version: 1
 network_policies:
   grant:
@@ -231,14 +231,17 @@ network_policies:
         );
         assert!(
             !eval_bool(
-                &mut runtime_engine(maximum),
+                &mut runtime_engine(boundary),
                 &input,
                 "data.openshell.sandbox.allow_request"
             ),
-            "maximum should deny {path:?}"
+            "boundary should deny {path:?}"
         );
     }
-    assert!(matches!(check(maximum, candidate), CheckResult::Exceeds(_)));
+    assert!(matches!(
+        check(boundary, candidate),
+        CheckResult::Exceeds(_)
+    ));
 
     let binary_wildcard = r#"
 version: 1
@@ -266,7 +269,7 @@ network_policies:
 
 #[test]
 fn intra_label_host_wildcard_matches_empty_suffix_at_runtime() {
-    let maximum = r#"
+    let boundary = r#"
 version: 1
 network_policies:
   grant:
@@ -300,7 +303,7 @@ network_policies:
     binaries: [{ path: /usr/bin/curl }]
 "#;
     let input = runtime_input("/usr/bin/curl", &[], "api.example.com", "GET");
-    let mut maximum_runtime = runtime_engine(maximum);
+    let mut boundary_runtime = runtime_engine(boundary);
     let mut candidate_runtime = runtime_engine(candidate);
 
     assert!(eval_bool(
@@ -309,19 +312,22 @@ network_policies:
         "data.openshell.sandbox.allow_request"
     ));
     assert!(!eval_bool(
-        &mut maximum_runtime,
+        &mut boundary_runtime,
         &input,
         "data.openshell.sandbox.allow_request"
     ));
-    assert!(matches!(check(maximum, candidate), CheckResult::Exceeds(_)));
+    assert!(matches!(
+        check(boundary, candidate),
+        CheckResult::Exceeds(_)
+    ));
 }
 
 #[test]
 fn ancestor_identity_applies_to_runtime_denies() {
-    let maximum = policy_with_ancestor_deny("/usr/bin/python3");
+    let boundary = policy_with_ancestor_deny("/usr/bin/python3");
     let candidate = policy_with_ancestor_deny("/usr/bin/node");
     let input = runtime_input("/usr/bin/curl", &["/usr/bin/python3"], "example.com", "GET");
-    let mut maximum_runtime = runtime_engine(&maximum);
+    let mut boundary_runtime = runtime_engine(&boundary);
     let mut candidate_runtime = runtime_engine(&candidate);
 
     assert!(eval_bool(
@@ -330,12 +336,12 @@ fn ancestor_identity_applies_to_runtime_denies() {
         "data.openshell.sandbox.allow_request"
     ));
     assert!(!eval_bool(
-        &mut maximum_runtime,
+        &mut boundary_runtime,
         &input,
         "data.openshell.sandbox.allow_request"
     ));
     assert!(matches!(
-        check(&maximum, &candidate),
+        check(&boundary, &candidate),
         CheckResult::Exceeds(_)
     ));
 }
@@ -368,7 +374,7 @@ network_policies:
 
 #[test]
 fn inspected_endpoint_restricts_an_overlapping_l4_grant() {
-    let maximum = r#"
+    let boundary = r#"
 version: 1
 network_policies:
   egress:
@@ -390,7 +396,7 @@ network_policies:
     binaries: [{ path: /usr/bin/curl }]
 ";
     let input = runtime_input("/usr/bin/curl", &[], "api.example.com", "POST");
-    let mut maximum_runtime = runtime_engine(maximum);
+    let mut boundary_runtime = runtime_engine(boundary);
     let mut candidate_runtime = runtime_engine(candidate);
 
     assert_eq!(
@@ -403,18 +409,18 @@ network_policies:
     );
     assert_eq!(
         eval_array_len(
-            &mut maximum_runtime,
+            &mut boundary_runtime,
             &input,
             "data.openshell.sandbox._matching_endpoint_configs"
         ),
         1
     );
     assert!(!eval_bool(
-        &mut maximum_runtime,
+        &mut boundary_runtime,
         &input,
         "data.openshell.sandbox.allow_request"
     ));
-    let result = check(maximum, candidate);
+    let result = check(boundary, candidate);
     assert!(
         matches!(result, CheckResult::Unsupported(_)),
         "overlapping inspection must be rejected explicitly: {result:?}"
@@ -424,10 +430,10 @@ network_policies:
 #[test]
 fn runtime_accepts_methods_longer_than_sixty_four_bytes() {
     let long_method = "X".repeat(65);
-    let maximum = rest_method_policy("GET");
+    let boundary = rest_method_policy("GET");
     let candidate = rest_method_policy(&long_method);
     let input = runtime_input("/usr/bin/curl", &[], "api.example.com", &long_method);
-    let mut maximum_runtime = runtime_engine(&maximum);
+    let mut boundary_runtime = runtime_engine(&boundary);
     let mut candidate_runtime = runtime_engine(&candidate);
 
     assert!(eval_bool(
@@ -436,12 +442,12 @@ fn runtime_accepts_methods_longer_than_sixty_four_bytes() {
         "data.openshell.sandbox.allow_request"
     ));
     assert!(!eval_bool(
-        &mut maximum_runtime,
+        &mut boundary_runtime,
         &input,
         "data.openshell.sandbox.allow_request"
     ));
     assert!(matches!(
-        check(&maximum, &candidate),
+        check(&boundary, &candidate),
         CheckResult::Exceeds(_)
     ));
 }

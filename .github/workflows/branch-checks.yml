@@ -188,9 +188,9 @@ jobs:
           fi
           target/release/openshell-prover check \
             crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
-            --maximum crates/openshell-prover-cli/tests/fixtures/maximum.yaml \
+            --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \
             --output json > /tmp/openshell-prover-result.json
-          grep -q '"result"[[:space:]]*:[[:space:]]*"within_max"' /tmp/openshell-prover-result.json
+          grep -q '"result"[[:space:]]*:[[:space:]]*"within_boundary"' /tmp/openshell-prover-result.json
 
       - name: Verify telemetry can be compiled out
         run: |

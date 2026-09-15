@@ -461,7 +461,7 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
-| `crates/openshell-prover-cli/` | Standalone local policy maximum checker |
+| `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |

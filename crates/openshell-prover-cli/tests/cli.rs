@@ -27,12 +27,12 @@ fn run(args: &[&str]) -> Output {
         .expect("run openshell-prover")
 }
 
-fn check_json(candidate: &str, maximum: &str) -> Output {
+fn check_json(candidate: &str, boundary: &str) -> Output {
     run(&[
         "check",
         fixture(candidate).to_str().expect("UTF-8 fixture path"),
-        "--maximum",
-        fixture(maximum).to_str().expect("UTF-8 fixture path"),
+        "--boundary",
+        fixture(boundary).to_str().expect("UTF-8 fixture path"),
         "--output",
         "json",
     ])
@@ -64,7 +64,7 @@ fn bare_invocation_shows_help() {
 
 #[test]
 fn contained_policy_returns_stable_json_and_zero() {
-    let output = check_json("candidate-contained.yaml", "maximum.yaml");
+    let output = check_json("candidate-contained.yaml", "boundary.yaml");
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -74,13 +74,13 @@ fn contained_policy_returns_stable_json_and_zero() {
     assert!(output.stderr.is_empty());
     let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
     assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["check"], "maximum_boundary");
-    assert_eq!(value["result"], "within_max");
+    assert_eq!(value["check"], "boundary");
+    assert_eq!(value["result"], "within_boundary");
     assert_eq!(value["exit_code"], 0);
     assert_eq!(
         value["scope"],
         serde_json::json!({
-            "model_version": "maximum-boundary-v1",
+            "model_version": "boundary-v1",
             "policy_version": 1,
             "domains": ["filesystem", "network_l4", "network_rest"]
         })
@@ -90,7 +90,7 @@ fn contained_policy_returns_stable_json_and_zero() {
 
 #[test]
 fn exceeding_policy_returns_counterexample_and_one() {
-    let output = check_json("candidate-exceeds.yaml", "maximum-no-write.yaml");
+    let output = check_json("candidate-exceeds.yaml", "boundary-no-write.yaml");
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -98,14 +98,14 @@ fn exceeding_policy_returns_counterexample_and_one() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
-    assert_eq!(value["result"], "exceeds_max");
+    assert_eq!(value["result"], "exceeds_boundary");
     assert_eq!(value["exit_code"], 1);
     assert_eq!(value["counterexample"]["domain"], "filesystem");
 }
 
 #[test]
 fn unsupported_policy_returns_reason_and_three() {
-    let output = check_json("unsupported.yaml", "maximum.yaml");
+    let output = check_json("unsupported.yaml", "boundary.yaml");
     assert_eq!(
         output.status.code(),
         Some(3),
@@ -120,8 +120,8 @@ fn unsupported_policy_returns_reason_and_three() {
 }
 
 #[test]
-fn underscore_host_exceeds_an_empty_maximum() {
-    let output = check_json("candidate-underscore-host.yaml", "maximum-empty.yaml");
+fn underscore_host_exceeds_an_empty_boundary() {
+    let output = check_json("candidate-underscore-host.yaml", "boundary-empty.yaml");
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -129,25 +129,25 @@ fn underscore_host_exceeds_an_empty_maximum() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
-    assert_eq!(value["result"], "exceeds_max");
+    assert_eq!(value["result"], "exceeds_boundary");
     assert_eq!(value["counterexample"]["host"], "api_internal.example.com");
 }
 
 #[test]
 fn non_ascii_network_literals_are_unsupported_in_both_inputs() {
-    for (candidate, maximum, input_label) in [
+    for (candidate, boundary, input_label) in [
         (
             "candidate-unicode-network-selector.yaml",
-            "maximum-empty.yaml",
+            "boundary-empty.yaml",
             "candidate",
         ),
         (
-            "maximum-empty.yaml",
+            "boundary-empty.yaml",
             "candidate-unicode-network-selector.yaml",
-            "maximum",
+            "boundary",
         ),
     ] {
-        let output = check_json(candidate, maximum);
+        let output = check_json(candidate, boundary);
         assert_eq!(
             output.status.code(),
             Some(3),
@@ -170,8 +170,8 @@ fn non_ascii_network_literals_are_unsupported_in_both_inputs() {
         fixture("candidate-unicode-network-selector.yaml")
             .to_str()
             .unwrap(),
-        "--maximum",
-        fixture("maximum-empty.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary-empty.yaml").to_str().unwrap(),
     ]);
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stderr.is_empty());
@@ -195,8 +195,8 @@ fn embedded_nul_network_literal_is_unsupported_without_panicking() {
     let output = run(&[
         "check",
         path.to_str().expect("UTF-8 temporary path"),
-        "--maximum",
-        fixture("maximum-empty.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary-empty.yaml").to_str().unwrap(),
         "--output",
         "json",
     ]);
@@ -225,8 +225,8 @@ fn resource_exhaustion_is_inconclusive_and_returns_three() {
     let output = run(&[
         "check",
         path.to_str().expect("UTF-8 temporary path"),
-        "--maximum",
-        fixture("maximum.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary.yaml").to_str().unwrap(),
         "--output",
         "json",
     ]);
@@ -240,7 +240,7 @@ fn resource_exhaustion_is_inconclusive_and_returns_three() {
 
 #[test]
 fn invalid_json_mode_input_uses_error_envelope_and_two() {
-    let output = check_json("invalid.yaml", "maximum.yaml");
+    let output = check_json("invalid.yaml", "boundary.yaml");
     assert_eq!(
         output.status.code(),
         Some(2),
@@ -258,8 +258,8 @@ fn missing_json_mode_input_uses_error_envelope_and_two() {
     let output = run(&[
         "check",
         fixture("does-not-exist.yaml").to_str().unwrap(),
-        "--maximum",
-        fixture("maximum.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary.yaml").to_str().unwrap(),
         "--output",
         "json",
     ]);
@@ -279,12 +279,29 @@ fn usage_errors_return_two() {
 }
 
 #[test]
-fn timeout_must_be_positive() {
+fn removed_maximum_option_is_rejected() {
     let output = run(&[
         "check",
         fixture("candidate-contained.yaml").to_str().unwrap(),
         "--maximum",
-        fixture("maximum.yaml").to_str().unwrap(),
+        fixture("boundary.yaml").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--maximum'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn timeout_must_be_positive() {
+    let output = run(&[
+        "check",
+        fixture("candidate-contained.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary.yaml").to_str().unwrap(),
         "--timeout",
         "0ms",
     ]);
@@ -297,8 +314,8 @@ fn text_diagnostics_escape_terminal_controls() {
     let output = run(&[
         "check",
         "missing\u{1b}[31m.yaml",
-        "--maximum",
-        fixture("maximum.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("boundary.yaml").to_str().unwrap(),
     ]);
     assert_eq!(output.status.code(), Some(2));
     assert!(!output.stderr.contains(&0x1b));
@@ -317,8 +334,8 @@ fn fifo_input_is_rejected_without_blocking() {
         .args([
             "check",
             path.to_str().expect("UTF-8 temporary path"),
-            "--maximum",
-            fixture("maximum.yaml").to_str().unwrap(),
+            "--boundary",
+            fixture("boundary.yaml").to_str().unwrap(),
             "--output",
             "json",
         ])
@@ -379,14 +396,14 @@ fn sigint_interrupts_the_check_with_exit_130() {
         })
     };
     let candidate = directory.join("candidate.yaml");
-    let maximum = directory.join("maximum.yaml");
+    let boundary = directory.join("boundary.yaml");
     fs::write(
         &candidate,
         policy(vec!["/route*/**/tail*".into()]).to_string(),
     )
     .unwrap();
     fs::write(
-        &maximum,
+        &boundary,
         policy(
             (0..300)
                 .map(|index| format!("/route{index}/**/tail*"))
@@ -400,8 +417,8 @@ fn sigint_interrupts_the_check_with_exit_130() {
         .args([
             "check",
             candidate.to_str().expect("UTF-8 temporary path"),
-            "--maximum",
-            maximum.to_str().expect("UTF-8 temporary path"),
+            "--boundary",
+            boundary.to_str().expect("UTF-8 temporary path"),
             "--output",
             "json",
             "--timeout",
@@ -444,8 +461,8 @@ fn symlink_descendants_require_sandbox_path_resolution() {
     std::os::unix::fs::symlink(&outside, safe.join("link")).unwrap();
     for access in ["read_only", "read_write"] {
         let candidate = directory.join("candidate.yaml");
-        let maximum = directory.join("maximum.yaml");
-        for (file, path) in [(&candidate, safe.join("link")), (&maximum, safe.clone())] {
+        let boundary = directory.join("boundary.yaml");
+        for (file, path) in [(&candidate, safe.join("link")), (&boundary, safe.clone())] {
             fs::write(
                 file,
                 serde_json::json!({"version": 1, "filesystem_policy": {access: [path]}})
@@ -456,8 +473,8 @@ fn symlink_descendants_require_sandbox_path_resolution() {
         let output = run(&[
             "check",
             candidate.to_str().unwrap(),
-            "--maximum",
-            maximum.to_str().unwrap(),
+            "--boundary",
+            boundary.to_str().unwrap(),
             "--output",
             "json",
         ]);

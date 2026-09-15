@@ -8,18 +8,18 @@ SPDX-License-Identifier: Apache-2.0
 This package builds the standalone `openshell-prover` executable. It is a thin synchronous adapter around the reusable containment engine in `openshell-prover`; it owns local file loading, command parsing, result rendering, and process exit codes.
 
 ```shell
-openshell-prover check candidate.yaml --maximum maximum.yaml
-openshell-prover check candidate.yaml --maximum maximum.yaml --output json
+openshell-prover check candidate.yaml --boundary boundary.yaml
+openshell-prover check candidate.yaml --boundary boundary.yaml --output json
 ```
 
-The command checks whether a fully composed candidate policy stays within an operator-supplied maximum. It does not discover a gateway, fetch policy state, or apply policy changes.
+The command checks whether a fully composed candidate policy stays within an operator-supplied boundary. It does not discover a gateway, fetch policy state, or apply policy changes.
 
 Results use these exit codes:
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | The candidate is within the maximum. |
-| `1` | The candidate exceeds the maximum. |
+| `0` | The candidate is within the boundary. |
+| `1` | The candidate exceeds the boundary. |
 | `2` | Usage, input, output, or internal error. |
 | `3` | Unsupported policy semantics or an inconclusive solve. |
 | `130` | Interrupted with Ctrl-C on Unix; graceful JSON output reports an inconclusive cancellation. |

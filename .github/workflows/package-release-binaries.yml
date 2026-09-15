@@ -145,25 +145,25 @@ jobs:
           fi
           extracted/openshell-prover check \
             crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
-            --maximum crates/openshell-prover-cli/tests/fixtures/maximum.yaml \
+            --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \
             --output json > result.json
-          grep -q '"result"[[:space:]]*:[[:space:]]*"within_max"' result.json
+          grep -q '"result"[[:space:]]*:[[:space:]]*"within_boundary"' result.json
 
           if extracted/openshell-prover check \
             crates/openshell-prover-cli/tests/fixtures/candidate-underscore-host.yaml \
-            --maximum crates/openshell-prover-cli/tests/fixtures/maximum-empty.yaml \
+            --boundary crates/openshell-prover-cli/tests/fixtures/boundary-empty.yaml \
             --output json > underscore.json; then
-            echo "ERROR: underscore host unexpectedly stayed within an empty maximum" >&2
+            echo "ERROR: underscore host unexpectedly stayed within an empty boundary" >&2
             exit 1
           else
             test "$?" = 1
           fi
-          grep -q '"result"[[:space:]]*:[[:space:]]*"exceeds_max"' underscore.json
+          grep -q '"result"[[:space:]]*:[[:space:]]*"exceeds_boundary"' underscore.json
           grep -q '"host"[[:space:]]*:[[:space:]]*"api_internal.example.com"' underscore.json
 
           if extracted/openshell-prover check \
             crates/openshell-prover-cli/tests/fixtures/candidate-unicode-network-selector.yaml \
-            --maximum crates/openshell-prover-cli/tests/fixtures/maximum-empty.yaml \
+            --boundary crates/openshell-prover-cli/tests/fixtures/boundary-empty.yaml \
             --output json > unicode.json; then
             echo "ERROR: non-ASCII network selector unexpectedly produced a definitive result" >&2
             exit 1

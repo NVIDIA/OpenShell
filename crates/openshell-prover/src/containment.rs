@@ -40,7 +40,7 @@ impl fmt::Display for ParsePolicyError {
 
 impl std::error::Error for ParsePolicyError {}
 
-/// Policy representation used only by maximum-boundary checking.
+/// Policy representation used by boundary checking.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ContainmentPolicy {
     version: u32,
@@ -54,7 +54,7 @@ pub struct ContainmentPolicy {
     process: Option<Value>,
     #[serde(default)]
     network_middlewares: BTreeMap<String, Value>,
-    // Managed-maximum metadata changes workflow, not authority. Retain it in
+    // Managed-boundary metadata changes workflow, not authority. Retain it in
     // the parsed representation without letting it alter containment.
     #[serde(default)]
     metadata: Option<ManagedPolicyMetadata>,
@@ -63,14 +63,14 @@ pub struct ContainmentPolicy {
 }
 
 impl ContainmentPolicy {
-    /// Managed-maximum metadata retained from the input, when present.
+    /// Managed-boundary metadata retained from the input, when present.
     #[must_use]
     pub const fn metadata(&self) -> Option<&ManagedPolicyMetadata> {
         self.metadata.as_ref()
     }
 }
 
-/// Workflow metadata carried by a managed-maximum document.
+/// Workflow metadata carried by a managed-boundary document.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ManagedPolicyMetadata {
     #[serde(default)]
@@ -431,7 +431,7 @@ static DOMAINS: &[CheckDomain] = &[
 ];
 fn check_scope() -> &'static CheckScope {
     static SCOPE: CheckScope = CheckScope {
-        model_version: "maximum-boundary-v1",
+        model_version: "boundary-v1",
         policy_version: 1,
         domains: DOMAINS,
     };
@@ -537,7 +537,7 @@ impl ReasonEvidence {
     }
 }
 
-/// Result of a maximum-boundary proof attempt.
+/// Result of a boundary proof attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     Within(WithinEvidence),
@@ -570,41 +570,41 @@ enum NetworkSolve {
     Incomplete(CheckResult),
 }
 
-/// Determine whether every modeled candidate action is allowed by `maximum`.
+/// Determine whether every modeled candidate action is allowed by `boundary`.
 #[must_use]
-pub fn check_within_maximum(
-    maximum: &ContainmentPolicy,
+pub fn check_within_boundary(
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     options: CheckOptions,
 ) -> CheckResult {
-    check_within_maximum_inner(maximum, candidate, options, None)
+    check_within_boundary_inner(boundary, candidate, options, None)
 }
 
 /// Determine containment while allowing a caller-owned cancellation flag to
 /// interrupt the solver. The caller remains responsible for signal handling.
 #[must_use]
-pub fn check_within_maximum_cancellable(
-    maximum: &ContainmentPolicy,
+pub fn check_within_boundary_cancellable(
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     options: CheckOptions,
     cancelled: &AtomicBool,
 ) -> CheckResult {
-    check_within_maximum_inner(maximum, candidate, options, Some(cancelled))
+    check_within_boundary_inner(boundary, candidate, options, Some(cancelled))
 }
 
-fn check_within_maximum_inner(
-    maximum: &ContainmentPolicy,
+fn check_within_boundary_inner(
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     options: CheckOptions,
     cancelled: Option<&AtomicBool>,
 ) -> CheckResult {
-    if let Some(reason) = unsupported_reason("maximum", maximum) {
+    if let Some(reason) = unsupported_reason("boundary", boundary) {
         return unsupported(reason.0, reason.1);
     }
     if let Some(reason) = unsupported_reason("candidate", candidate) {
         return unsupported(reason.0, reason.1);
     }
-    if let Some(reason) = resource_limit_reason(maximum, candidate) {
+    if let Some(reason) = resource_limit_reason(boundary, candidate) {
         return CheckResult::Inconclusive(ReasonEvidence {
             code: ReasonCode::ResourceLimit,
             reason,
@@ -619,20 +619,20 @@ fn check_within_maximum_inner(
             reason: "solver timeout must be positive".to_owned(),
         });
     }
-    if let Some(reason) = unresolved_workdir_reason(maximum, candidate) {
+    if let Some(reason) = unresolved_workdir_reason(boundary, candidate) {
         return unsupported(ReasonCode::UnresolvedWorkdir, reason);
     }
-    if maximum == candidate {
+    if boundary == candidate {
         return CheckResult::Within(WithinEvidence);
     }
-    let filesystem_result = check_filesystem(maximum, candidate);
+    let filesystem_result = check_filesystem(boundary, candidate);
     if let Some(result @ CheckResult::Exceeds(_)) = filesystem_result {
         return result;
     }
     let started = Instant::now();
     for binary_identity_required in [false, true] {
         match solve_network_mode(
-            maximum,
+            boundary,
             candidate,
             binary_identity_required,
             started,
@@ -645,7 +645,7 @@ fn check_within_maximum_inner(
             }
             NetworkSolve::Incomplete(result) => return result,
         }
-        if binary_identity_required && has_ambiguous_candidate_binary_path(maximum, candidate) {
+        if binary_identity_required && has_ambiguous_candidate_binary_path(boundary, candidate) {
             return unsupported(
                 ReasonCode::UnresolvedBinaryPath,
                 "network containment depends on image-specific binary symlink resolution"
@@ -653,7 +653,7 @@ fn check_within_maximum_inner(
             );
         }
     }
-    if unresolved_exact_deny_symlink(maximum, candidate) {
+    if unresolved_exact_deny_symlink(boundary, candidate) {
         return unsupported(
             ReasonCode::UnresolvedBinaryPath,
             "network deny containment depends on image-specific exact binary symlink resolution"
@@ -664,26 +664,26 @@ fn check_within_maximum_inner(
 }
 
 fn solve_network_mode(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     binary_identity_required: bool,
     started: Instant,
     timeout: Duration,
     cancelled: Option<&AtomicBool>,
 ) -> NetworkSolve {
-    if network_is_structurally_contained(maximum, candidate, binary_identity_required) {
+    if network_is_structurally_contained(boundary, candidate, binary_identity_required) {
         return NetworkSolve::Within;
     }
     let solver = Solver::new();
     let action = symbolic_action(if binary_identity_required {
-        "strict_maximum_policy_action"
+        "strict_boundary_policy_action"
     } else {
-        "relaxed_maximum_policy_action"
+        "relaxed_boundary_policy_action"
     });
     assert_action_domain(&solver, &action, binary_identity_required);
     solver.assert(Bool::and(&[
         policy_allows(candidate, &action, binary_identity_required),
-        !policy_allows(maximum, &action, binary_identity_required),
+        !policy_allows(boundary, &action, binary_identity_required),
     ]));
 
     let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
@@ -722,7 +722,7 @@ fn solve_network_mode(
             .get_model()
             .and_then(|model| counterexample_from_model(&model, &action, binary_identity_required))
             .filter(|counterexample| {
-                counterexample_satisfies_predicate(maximum, candidate, counterexample)
+                counterexample_satisfies_predicate(boundary, candidate, counterexample)
             })
             .map_or_else(
                 || {
@@ -782,11 +782,11 @@ fn unsupported(code: ReasonCode, reason: String) -> CheckResult {
 /// covers the common case where selectors are identical and the candidate only
 /// narrows explicit method/path grants. More complex unions still use Z3.
 fn network_is_structurally_contained(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     binary_identity_required: bool,
 ) -> bool {
-    if maximum
+    if boundary
         .network_policies
         .values()
         .flat_map(|rule| &rule.endpoints)
@@ -795,43 +795,43 @@ fn network_is_structurally_contained(
         return false;
     }
     candidate.network_policies.values().all(|candidate_rule| {
-        maximum.network_policies.values().any(|maximum_rule| {
-            rule_structurally_contains(maximum_rule, candidate_rule, binary_identity_required)
+        boundary.network_policies.values().any(|boundary_rule| {
+            rule_structurally_contains(boundary_rule, candidate_rule, binary_identity_required)
         })
     })
 }
 
 fn rule_structurally_contains(
-    maximum: &NetworkRule,
+    boundary: &NetworkRule,
     candidate: &NetworkRule,
     binary_identity_required: bool,
 ) -> bool {
     (!binary_identity_required
         || candidate.binaries.iter().all(|candidate_binary| {
-            maximum
+            boundary
                 .binaries
                 .iter()
-                .any(|maximum_binary| maximum_binary.path == candidate_binary.path)
+                .any(|boundary_binary| boundary_binary.path == candidate_binary.path)
         }))
         && candidate.endpoints.iter().all(|candidate_endpoint| {
-            maximum.endpoints.iter().any(|maximum_endpoint| {
-                rest_endpoint_structurally_contains(maximum_endpoint, candidate_endpoint)
+            boundary.endpoints.iter().any(|boundary_endpoint| {
+                rest_endpoint_structurally_contains(boundary_endpoint, candidate_endpoint)
             })
         })
 }
 
-fn rest_endpoint_structurally_contains(maximum: &Endpoint, candidate: &Endpoint) -> bool {
-    if maximum.protocol_kind() != Protocol::Rest
+fn rest_endpoint_structurally_contains(boundary: &Endpoint, candidate: &Endpoint) -> bool {
+    if boundary.protocol_kind() != Protocol::Rest
         || candidate.protocol_kind() != Protocol::Rest
-        || !maximum.host.eq_ignore_ascii_case(&candidate.host)
-        || maximum.path != candidate.path
+        || !boundary.host.eq_ignore_ascii_case(&candidate.host)
+        || boundary.path != candidate.path
         || !candidate
             .effective_ports()
             .iter()
-            .all(|port| maximum.effective_ports().contains(port))
-        || !maximum.access.is_empty()
+            .all(|port| boundary.effective_ports().contains(port))
+        || !boundary.access.is_empty()
         || !candidate.access.is_empty()
-        || !maximum.deny_rules.is_empty()
+        || !boundary.deny_rules.is_empty()
         || !candidate.deny_rules.is_empty()
     {
         return false;
@@ -841,31 +841,31 @@ fn rest_endpoint_structurally_contains(maximum: &Endpoint, candidate: &Endpoint)
         if candidate_rule.allow.method.is_empty() {
             return false;
         }
-        maximum.rules.iter().any(|maximum_rule| {
-            method_pattern_contains(&maximum_rule.allow.method, &candidate_rule.allow.method)
-                && path_pattern_contains(&maximum_rule.allow.path, &candidate_rule.allow.path)
+        boundary.rules.iter().any(|boundary_rule| {
+            method_pattern_contains(&boundary_rule.allow.method, &candidate_rule.allow.method)
+                && path_pattern_contains(&boundary_rule.allow.path, &candidate_rule.allow.path)
         })
     })
 }
 
-fn method_pattern_contains(maximum: &str, candidate: &str) -> bool {
-    maximum == "*"
-        || maximum.eq_ignore_ascii_case(candidate)
-        || (maximum.eq_ignore_ascii_case("GET") && candidate.eq_ignore_ascii_case("HEAD"))
+fn method_pattern_contains(boundary: &str, candidate: &str) -> bool {
+    boundary == "*"
+        || boundary.eq_ignore_ascii_case(candidate)
+        || (boundary.eq_ignore_ascii_case("GET") && candidate.eq_ignore_ascii_case("HEAD"))
 }
 
-fn path_pattern_contains(maximum: &str, candidate: &str) -> bool {
+fn path_pattern_contains(boundary: &str, candidate: &str) -> bool {
     // Inputs are already validated. Keep this sufficient proof deliberately
     // limited to equality and a terminal recursive path segment.
-    let maximum = if maximum.is_empty() { "**" } else { maximum };
+    let boundary = if boundary.is_empty() { "**" } else { boundary };
     let candidate = if candidate.is_empty() {
         "**"
     } else {
         candidate
     };
-    maximum == candidate
-        || maximum == "**"
-        || maximum.strip_suffix("/**").is_some_and(|prefix| {
+    boundary == candidate
+        || boundary == "**"
+        || boundary.strip_suffix("/**").is_some_and(|prefix| {
             candidate
                 .strip_prefix(prefix)
                 .is_some_and(|suffix| suffix.starts_with('/'))
@@ -1151,7 +1151,7 @@ fn model_string_exact(model: &z3::Model, value: &Z3String) -> Option<String> {
 }
 
 fn counterexample_satisfies_predicate(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     counterexample: &Counterexample,
 ) -> bool {
@@ -1179,7 +1179,7 @@ fn counterexample_satisfies_predicate(
     };
     Bool::and(&[
         policy_allows(candidate, &concrete, *binary_identity_required),
-        !policy_allows(maximum, &concrete, *binary_identity_required),
+        !policy_allows(boundary, &concrete, *binary_identity_required),
     ])
     .simplify()
     .as_bool()
@@ -1300,59 +1300,59 @@ fn is_literal_canonical_pchar(byte: u8) -> bool {
 }
 
 fn unresolved_workdir_reason(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> Option<String> {
-    let maximum_writes = &maximum.filesystem_policy.read_write;
-    let mut maximum_reads = maximum.filesystem_policy.read_only.clone();
-    maximum_reads.extend(maximum_writes.iter().cloned());
+    let boundary_writes = &boundary.filesystem_policy.read_write;
+    let mut boundary_reads = boundary.filesystem_policy.read_only.clone();
+    boundary_reads.extend(boundary_writes.iter().cloned());
 
     if candidate.filesystem_policy.include_workdir
-        && !maximum.filesystem_policy.include_workdir
-        && !maximum_writes.iter().any(|path| path == "/")
+        && !boundary.filesystem_policy.include_workdir
+        && !boundary_writes.iter().any(|path| path == "/")
     {
         return Some(
             "candidate filesystem authority depends on an unresolved image workdir".to_owned(),
         );
     }
-    if maximum.filesystem_policy.include_workdir
+    if boundary.filesystem_policy.include_workdir
         && (candidate
             .filesystem_policy
             .read_write
             .iter()
-            .any(|path| !path_is_covered(path, maximum_writes))
+            .any(|path| !path_is_covered(path, boundary_writes))
             || candidate
                 .filesystem_policy
                 .read_only
                 .iter()
-                .any(|path| !path_is_covered(path, &maximum_reads)))
+                .any(|path| !path_is_covered(path, &boundary_reads)))
     {
         return Some(
-            "maximum filesystem authority depends on an unresolved image workdir".to_owned(),
+            "boundary filesystem authority depends on an unresolved image workdir".to_owned(),
         );
     }
     None
 }
 
 fn has_ambiguous_candidate_binary_path(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> bool {
-    maximum.network_policies.values().any(|maximum_rule| {
-        maximum_rule
+    boundary.network_policies.values().any(|boundary_rule| {
+        boundary_rule
             .binaries
             .iter()
             .filter(|binary| binary.path.contains('*') && binary.path != "/**")
-            .any(|maximum_binary| {
+            .any(|boundary_binary| {
                 candidate.network_policies.values().any(|candidate_rule| {
                     endpoint_authority_sets_overlap(
                         &candidate_rule.endpoints,
-                        &maximum_rule.endpoints,
+                        &boundary_rule.endpoints,
                     ) && candidate_rule.binaries.iter().any(|candidate_binary| {
                         !candidate_binary.path.contains('*')
-                            && glob::Pattern::new(&maximum_binary.path)
+                            && glob::Pattern::new(&boundary_binary.path)
                                 .is_ok_and(|pattern| pattern.matches(&candidate_binary.path))
-                            && !maximum.network_policies.values().any(|exact_rule| {
+                            && !boundary.network_policies.values().any(|exact_rule| {
                                 endpoint_authority_sets_equal(
                                     &candidate_rule.endpoints,
                                     &exact_rule.endpoints,
@@ -1368,31 +1368,34 @@ fn has_ambiguous_candidate_binary_path(
 }
 
 fn unresolved_exact_deny_symlink(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> bool {
-    maximum.network_policies.values().any(|maximum_rule| {
-        let maximum_deny_endpoints = maximum_rule
+    boundary.network_policies.values().any(|boundary_rule| {
+        let boundary_deny_endpoints = boundary_rule
             .endpoints
             .iter()
             .filter(|endpoint| !endpoint.deny_rules.is_empty())
             .collect::<Vec<_>>();
-        if maximum_deny_endpoints.is_empty() {
+        if boundary_deny_endpoints.is_empty() {
             return false;
         }
-        maximum_rule
+        boundary_rule
             .binaries
             .iter()
             .filter(|binary| !binary.path.contains('*'))
-            .any(|maximum_binary| {
+            .any(|boundary_binary| {
                 candidate.network_policies.values().any(|candidate_rule| {
                     let endpoints_overlap = candidate_rule
                         .endpoints
                         .iter()
                         .filter(|endpoint| !endpoint.deny_rules.is_empty())
                         .any(|candidate_endpoint| {
-                            maximum_deny_endpoints.iter().any(|maximum_endpoint| {
-                                endpoint_authority_may_overlap(candidate_endpoint, maximum_endpoint)
+                            boundary_deny_endpoints.iter().any(|boundary_endpoint| {
+                                endpoint_authority_may_overlap(
+                                    candidate_endpoint,
+                                    boundary_endpoint,
+                                )
                             })
                         });
                     endpoints_overlap
@@ -1400,7 +1403,7 @@ fn unresolved_exact_deny_symlink(
                             candidate_binary.path.contains('*')
                                 && candidate_binary.path != "/**"
                                 && glob::Pattern::new(&candidate_binary.path)
-                                    .is_ok_and(|pattern| pattern.matches(&maximum_binary.path))
+                                    .is_ok_and(|pattern| pattern.matches(&boundary_binary.path))
                         })
                 })
             })
@@ -1466,27 +1469,27 @@ fn endpoint_authority_equal(left: &Endpoint, right: &Endpoint) -> bool {
 }
 
 fn check_filesystem(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> Option<CheckResult> {
-    let mut maximum_writes = maximum.filesystem_policy.read_write.clone();
-    if maximum.filesystem_policy.include_workdir {
-        maximum_writes.push(WORKDIR_SYMBOL.to_owned());
+    let mut boundary_writes = boundary.filesystem_policy.read_write.clone();
+    if boundary.filesystem_policy.include_workdir {
+        boundary_writes.push(WORKDIR_SYMBOL.to_owned());
     }
-    let mut maximum_reads = maximum.filesystem_policy.read_only.clone();
-    maximum_reads.extend(maximum_writes.iter().cloned());
+    let mut boundary_reads = boundary.filesystem_policy.read_only.clone();
+    boundary_reads.extend(boundary_writes.iter().cloned());
 
     let mut unresolved = None;
     for (access, candidates, maxima) in [
         (
             FilesystemAccess::Write,
             &candidate.filesystem_policy.read_write,
-            &maximum_writes,
+            &boundary_writes,
         ),
         (
             FilesystemAccess::Read,
             &candidate.filesystem_policy.read_only,
-            &maximum_reads,
+            &boundary_reads,
         ),
     ] {
         for path in candidates {
@@ -1506,7 +1509,7 @@ fn check_filesystem(
             unresolved = Some(unsupported(
                 ReasonCode::UnresolvedFilesystemPath,
                 format!(
-                    "filesystem {access} containment for '{path}' depends on sandbox path resolution; use matching paths in candidate and maximum",
+                    "filesystem {access} containment for '{path}' depends on sandbox path resolution; use matching paths in candidate and boundary",
                     access = access.as_str()
                 ),
             ));
@@ -1515,10 +1518,10 @@ fn check_filesystem(
     unresolved
 }
 
-fn path_is_covered(candidate: &str, maximum_paths: &[String]) -> bool {
-    maximum_paths
+fn path_is_covered(candidate: &str, boundary_paths: &[String]) -> bool {
+    boundary_paths
         .iter()
-        .any(|maximum| maximum == "/" || candidate == maximum)
+        .any(|boundary| boundary == "/" || candidate == boundary)
 }
 
 fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(ReasonCode, String)> {
@@ -1535,7 +1538,7 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
         ));
     }
     if label == "candidate" && policy.metadata.is_some() {
-        return unsupported("contains managed-maximum metadata".to_owned());
+        return unsupported("contains managed-boundary metadata".to_owned());
     }
     if policy
         .metadata
@@ -1714,7 +1717,7 @@ fn unsupported_network_literal(value: &str) -> Option<&'static str> {
 }
 
 fn resource_limit_reason(
-    maximum: &ContainmentPolicy,
+    boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> Option<String> {
     const MAX_RULES: usize = 1_024;
@@ -1724,7 +1727,7 @@ fn resource_limit_reason(
     const MAX_PATTERN_BYTES: usize = 4 * 1024;
     const MAX_TOTAL_PATTERN_BYTES: usize = 1024 * 1024;
 
-    let policies = [maximum, candidate];
+    let policies = [boundary, candidate];
     let rule_count = policies
         .iter()
         .map(|policy| policy.network_policies.len())
@@ -1992,16 +1995,16 @@ mod tests {
 
     #[test]
     fn filesystem_containment_and_counterexample() {
-        let maximum =
+        let boundary =
             parse("version: 1\nfilesystem_policy: { read_only: [/usr], read_write: [/tmp] }\n");
         let within = parse("version: 1\nfilesystem_policy: { read_only: [/usr, /tmp] }\n");
         let exceeds = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
         assert!(matches!(
-            check_within_maximum(&maximum, &within, options()),
+            check_within_boundary(&boundary, &within, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(
+            check_within_boundary(
                 &parse("version: 1\nfilesystem_policy: {}\n"),
                 &exceeds,
                 options()
@@ -2019,7 +2022,7 @@ mod tests {
         assert!(!explicit.filesystem_policy.include_workdir);
 
         assert!(matches!(
-            check_within_maximum(&explicit, &omitted, options()),
+            check_within_boundary(&explicit, &omitted, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedWorkdir
         ));
@@ -2034,22 +2037,22 @@ mod tests {
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&l4, &rest, options()),
+            check_within_boundary(&l4, &rest, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&rest, &l4, options()),
+            check_within_boundary(&rest, &l4, options()),
             CheckResult::Exceeds(_)
         ));
     }
 
     #[test]
     fn network_containment_covers_disabled_binary_identity() {
-        let maximum = parse("version: 1\n");
+        let boundary = parse("version: 1\n");
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: []\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
             result,
             CheckResult::Exceeds(ref evidence)
@@ -2085,7 +2088,7 @@ mod tests {
             let candidate = parse(&format!(
                 "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{endpoint}]\n    binaries: []\n"
             ));
-            let result = check_within_maximum(&parse("version: 1\n"), &candidate, options());
+            let result = check_within_boundary(&parse("version: 1\n"), &candidate, options());
             assert!(
                 matches!(
                     result,
@@ -2102,25 +2105,25 @@ mod tests {
 
     #[test]
     fn underscore_hosts_preserve_exact_and_wildcard_containment() {
-        let maximum = parse(
-            "version: 1\nnetwork_policies:\n  maximum:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: []\n",
+        let boundary = parse(
+            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: []\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: api_internal.example.com, port: 443 }]\n    binaries: []\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
         ));
 
-        let exact_maximum = parse(
-            "version: 1\nnetwork_policies:\n  maximum:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
+        let exact_boundary = parse(
+            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
         );
         let exact_candidate = parse(
             "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
         );
         assert!(matches!(
-            check_within_maximum(&exact_maximum, &exact_candidate, options()),
+            check_within_boundary(&exact_boundary, &exact_candidate, options()),
             CheckResult::Within(_)
         ));
     }
@@ -2186,7 +2189,7 @@ mod tests {
                 "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{{ host: {unsupported}, port: 443 }}]\n    binaries: []\n"
             ));
             assert!(matches!(
-                check_within_maximum(&parse("version: 1\n"), &candidate, options()),
+                check_within_boundary(&parse("version: 1\n"), &candidate, options()),
                 CheckResult::Unsupported(ref evidence)
                     if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
                         && evidence.reason().contains("endpoint host")
@@ -2196,13 +2199,13 @@ mod tests {
 
     #[test]
     fn differing_binary_selectors_are_checked_when_identity_is_required() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/wget }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
             result,
             CheckResult::Exceeds(ref evidence)
@@ -2218,25 +2221,25 @@ mod tests {
 
     #[test]
     fn explicit_deny_removes_authority() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: DELETE, path: /** }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: DELETE, path: /private/resource } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
     }
 
     #[test]
     fn host_wildcard_zero_length_suffix_preserves_exact_deny() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: GET, path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
             result,
             CheckResult::Exceeds(ref evidence)
@@ -2248,14 +2251,14 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_binary_can_supply_a_maximum_deny() {
-        let maximum = parse(
+    fn ancestor_binary_can_supply_a_boundary_deny() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/node }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(
             matches!(
                 result,
@@ -2276,15 +2279,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_maximum_deny_under_candidate_glob_requires_image_resolution() {
-        let maximum = parse(
+    fn exact_boundary_deny_under_candidate_glob_requires_image_resolution() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: '/venv/bin/*' }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
         ));
@@ -2292,28 +2295,28 @@ mod tests {
 
     #[test]
     fn definite_network_expansion_precedes_symlink_uncertainty() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  extra:\n    endpoints: [{ host: extra.example.com, port: 443 }]\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: '/venv/bin/*' }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Exceeds(_)
         ));
     }
 
     #[test]
     fn overlapping_l4_and_rest_authority_is_unsupported() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443 }\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
         ));
@@ -2322,13 +2325,13 @@ mod tests {
     #[test]
     fn methods_longer_than_sixty_four_bytes_are_in_the_action_domain() {
         let method = "X".repeat(65);
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(&format!(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - {{ host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{{ allow: {{ method: {method}, path: '/**' }} }}] }}\n    binaries: [{{ path: /usr/bin/curl }}]\n"
         ));
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
             result,
             CheckResult::Exceeds(ref evidence)
@@ -2341,7 +2344,7 @@ mod tests {
 
     #[test]
     fn rest_methods_and_paths_must_be_narrower() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/repos/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let narrower = parse(
@@ -2350,9 +2353,9 @@ mod tests {
         let broader_method = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_maximum(&maximum, &narrower, options());
+        let result = check_within_boundary(&boundary, &narrower, options());
         assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
-        let result = check_within_maximum(&maximum, &broader_method, options());
+        let result = check_within_boundary(&boundary, &broader_method, options());
         assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
     }
 
@@ -2364,15 +2367,15 @@ mod tests {
     }
 
     #[test]
-    fn structural_fast_path_does_not_ignore_separate_maximum_denies() {
-        let maximum = parse(
+    fn structural_fast_path_does_not_ignore_separate_boundary_denies() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: full, deny_rules: [{ method: GET, path: '/repos/private/**' }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/private/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(!network_is_structurally_contained(
-            &maximum, &candidate, true
+            &boundary, &candidate, true
         ));
     }
 
@@ -2380,33 +2383,33 @@ mod tests {
     fn unknown_and_environment_dependent_shapes_fail_closed() {
         let unknown = parse("version: 1\nfuture_authority: true\n");
         assert!(matches!(
-            check_within_maximum(&unknown, &unknown, options()),
+            check_within_boundary(&unknown, &unknown, options()),
             CheckResult::Unsupported(_)
         ));
         let workdir = parse("version: 1\nfilesystem_policy: { include_workdir: true }\n");
         let empty = parse("version: 1\nfilesystem_policy: {}\n");
         assert!(matches!(
-            check_within_maximum(&empty, &workdir, options()),
+            check_within_boundary(&empty, &workdir, options()),
             CheckResult::Unsupported(_)
         ));
-        let maximum_workdir = parse("version: 1\nfilesystem_policy: { include_workdir: true }\n");
+        let boundary_workdir = parse("version: 1\nfilesystem_policy: { include_workdir: true }\n");
         let explicit = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
         assert!(matches!(
-            check_within_maximum(&maximum_workdir, &explicit, options()),
+            check_within_boundary(&boundary_workdir, &explicit, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedWorkdir
         ));
     }
 
     #[test]
-    fn exact_binary_under_a_maximum_glob_requires_image_resolution() {
-        let maximum = parse(
+    fn exact_binary_under_a_boundary_glob_requires_image_resolution() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*3' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(
             matches!(
                 result,
@@ -2418,41 +2421,41 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_maximum_glob_does_not_make_exact_containment_unsupported() {
-        let maximum = parse(
+    fn unrelated_boundary_glob_does_not_make_exact_containment_unsupported() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  unrelated:\n    endpoints: [{ host: other.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
         ));
     }
 
     #[test]
-    fn redundant_maximum_glob_does_not_hide_equivalent_exact_containment() {
-        let maximum = parse(
+    fn redundant_boundary_glob_does_not_hide_equivalent_exact_containment() {
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  glob:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let result = check_within_maximum(&maximum, &candidate, options());
+        let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
     }
 
     #[test]
     fn unrelated_universal_glob_does_not_hide_symlink_ambiguity() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  ambiguous:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  unrelated:\n    endpoints: [{ host: unrelated.example.com, port: 80 }]\n    binaries: [{ path: '/**' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
         ));
@@ -2460,14 +2463,14 @@ mod tests {
 
     #[test]
     fn shared_glob_does_not_hide_exact_binary_symlink_ambiguity() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }, { path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
         ));
@@ -2475,14 +2478,14 @@ mod tests {
 
     #[test]
     fn wildcard_endpoint_overlap_does_not_hide_symlink_ambiguity() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
         ));
@@ -2490,14 +2493,14 @@ mod tests {
 
     #[test]
     fn ambiguity_check_preserves_shared_unrelated_globs() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  ambiguous:\n    endpoints: [{ host: unrelated.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  shared:\n    endpoints: [{ host: shared.example.com, port: 443 }, { host: mirror.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  shared:\n    endpoints: [{ host: mirror.example.com, port: 443 }, { host: shared.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
         ));
     }
@@ -2510,14 +2513,14 @@ mod tests {
         let second = parse(
             "version: 1\nnetwork_policies:\n  b:\n    endpoints: [{ host: api.example.org, port: 8443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  a:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
-        let reflexive = check_within_maximum(&first, &first, options());
+        let reflexive = check_within_boundary(&first, &first, options());
         assert!(matches!(reflexive, CheckResult::Within(_)), "{reflexive:?}");
         assert!(matches!(
-            check_within_maximum(&first, &second, options()),
+            check_within_boundary(&first, &second, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&second, &first, options()),
+            check_within_boundary(&second, &first, options()),
             CheckResult::Within(_)
         ));
     }
@@ -2528,15 +2531,15 @@ mod tests {
         let middle = parse("version: 1\nfilesystem_policy: { read_write: [/workspace] }\n");
         let narrow = parse("version: 1\nfilesystem_policy: { read_only: [/workspace] }\n");
         assert!(matches!(
-            check_within_maximum(&broad, &middle, options()),
+            check_within_boundary(&broad, &middle, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&middle, &narrow, options()),
+            check_within_boundary(&middle, &narrow, options()),
             CheckResult::Within(_)
         ));
         assert!(matches!(
-            check_within_maximum(&broad, &narrow, options()),
+            check_within_boundary(&broad, &narrow, options()),
             CheckResult::Within(_)
         ));
     }
@@ -2547,7 +2550,7 @@ mod tests {
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl, harness: true }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&policy, &policy, options()),
+            check_within_boundary(&policy, &policy, options()),
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
         ));
@@ -2555,7 +2558,7 @@ mod tests {
 
     #[test]
     fn excessive_model_size_is_inconclusive() {
-        let maximum = parse("version: 1\n");
+        let boundary = parse("version: 1\n");
         let mut candidate = parse("version: 1\n");
         for index in 0..=1_024 {
             candidate.network_policies.insert(
@@ -2569,7 +2572,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Inconclusive(ref evidence)
                 if evidence.reason_code() == ReasonCode::ResourceLimit
         ));
@@ -2603,7 +2606,7 @@ mod tests {
         let policy = parse("version: 1\n");
         let cancelled = AtomicBool::new(true);
         assert!(matches!(
-            check_within_maximum_cancellable(&policy, &policy, options(), &cancelled),
+            check_within_boundary_cancellable(&policy, &policy, options(), &cancelled),
             CheckResult::Inconclusive(ref evidence)
                 if evidence.reason_code() == ReasonCode::Cancelled
         ));
@@ -2611,38 +2614,38 @@ mod tests {
 
     #[test]
     fn review_reason_and_deprecated_tls_spelling_do_not_change_authority() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nmetadata: { policy_id: ceiling, version: 7, allowed_modes: [ask], default_mode: ask, audit_label: production }\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n        review: { required: true, reason: sensitive }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**', review: { required: true, reason: inspect } }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &candidate, options()),
+            check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
         ));
-        let metadata = maximum.metadata().expect("managed metadata retained");
+        let metadata = boundary.metadata().expect("managed metadata retained");
         assert_eq!(metadata.policy_id, "ceiling");
         assert_eq!(metadata.version, 7);
     }
 
     #[test]
     fn host_wildcards_do_not_cross_or_elide_labels() {
-        let maximum = parse(
+        let boundary = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let nested = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: deep.api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&maximum, &nested, options()),
+            check_within_boundary(&boundary, &nested, options()),
             CheckResult::Exceeds(_)
         ));
         let recursive = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '**.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
-            check_within_maximum(&recursive, &nested, options()),
+            check_within_boundary(&recursive, &nested, options()),
             CheckResult::Within(_)
         ));
     }
@@ -2702,7 +2705,7 @@ mod tests {
     #[test]
     fn filesystem_comparisons_do_not_assume_path_ancestry_or_distinctness() {
         for access in ["read_only", "read_write"] {
-            let maximum = parse(&format!(
+            let boundary = parse(&format!(
                 "version: 1\nfilesystem_policy: {{ {access}: [/safe] }}\n"
             ));
             for path in [
@@ -2716,7 +2719,7 @@ mod tests {
                 ));
                 assert!(
                     matches!(
-                        check_within_maximum(&maximum, &candidate, options()),
+                        check_within_boundary(&boundary, &candidate, options()),
                         CheckResult::Unsupported(ref evidence)
                             if evidence.reason_code() == ReasonCode::UnresolvedFilesystemPath
                     ),
@@ -2727,14 +2730,14 @@ mod tests {
                 "version: 1\nfilesystem_policy: {{ {access}: [/safe, /safe] }}\n"
             ));
             assert!(matches!(
-                check_within_maximum(&maximum, &matching, options()),
+                check_within_boundary(&boundary, &matching, options()),
                 CheckResult::Within(_)
             ));
             let root = parse(&format!(
                 "version: 1\nfilesystem_policy: {{ {access}: [/] }}\n"
             ));
             assert!(matches!(
-                check_within_maximum(&root, &maximum, options()),
+                check_within_boundary(&root, &boundary, options()),
                 CheckResult::Within(_)
             ));
         }
@@ -2852,12 +2855,12 @@ mod tests {
         let empty = parse("version: 1\n");
         for (field, yaml) in policies {
             let policy = parse(yaml);
-            for (maximum, candidate, label) in [
-                (&policy, &empty, "maximum"),
+            for (boundary, candidate, label) in [
+                (&policy, &empty, "boundary"),
                 (&empty, &policy, "candidate"),
-                (&policy, &policy, "maximum"),
+                (&policy, &policy, "boundary"),
             ] {
-                let result = check_within_maximum(maximum, candidate, options());
+                let result = check_within_boundary(boundary, candidate, options());
                 assert!(
                     matches!(
                         result,
@@ -2888,12 +2891,12 @@ mod tests {
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let empty = parse("version: 1\n");
-        for (maximum, candidate, label) in [
-            (&policy, &empty, "maximum"),
+        for (boundary, candidate, label) in [
+            (&policy, &empty, "boundary"),
             (&empty, &policy, "candidate"),
-            (&policy, &policy, "maximum"),
+            (&policy, &policy, "boundary"),
         ] {
-            let result = check_within_maximum(maximum, candidate, options());
+            let result = check_within_boundary(boundary, candidate, options());
             assert!(
                 matches!(
                     result,

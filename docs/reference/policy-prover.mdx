@@ -3,17 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Standalone Policy Prover"
 sidebar-title: "Policy Prover"
-description: "Install and use the standalone OpenShell policy prover to check a local candidate policy against a managed maximum."
-keywords: "Generative AI, Cybersecurity, Policy, Prover, Maximum, Containment, CI"
+description: "Install and use the standalone OpenShell policy prover to check a local candidate policy against a managed boundary."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Containment, CI"
 position: 4
 ---
 
 `openshell-prover` checks whether the authority in a local candidate policy is
-contained within a local maximum policy. The command reads files from the host
+contained within a local boundary policy. The command reads files from the host
 and does not connect to an OpenShell gateway.
 
 The candidate must be the fully composed effective policy after the proposed
-change, including any provider-contributed authority. The maximum is an
+change, including any provider-contributed authority. The boundary is an
 operator-owned ceiling. It does not grant authority by itself.
 
 ## Install the Prover
@@ -37,7 +37,7 @@ a separate Z3 installation.
 
 ## Check a Policy Boundary
 
-Create `maximum.yaml` with this maximum policy:
+Create `boundary.yaml` with this boundary policy:
 
 ```yaml
 version: 1
@@ -63,12 +63,12 @@ filesystem_policy:
 Run the check:
 
 ```shell
-openshell-prover check candidate.yaml --maximum maximum.yaml
+openshell-prover check candidate.yaml --boundary boundary.yaml
 ```
 
-A contained candidate prints `result: within_max` and exits with status `0`.
+A contained candidate prints `result: within_boundary` and exits with status `0`.
 To see an exceeding result and its counterexample, replace `candidate.yaml`
-with a policy that makes `/etc` writable even though the maximum grants only
+with a policy that makes `/etc` writable even though the boundary grants only
 read access:
 
 ```yaml
@@ -82,7 +82,7 @@ filesystem_policy:
 ```
 
 ```shell
-openshell-prover check candidate.yaml --maximum maximum.yaml
+openshell-prover check candidate.yaml --boundary boundary.yaml
 ```
 
 To check the current effective policy of an existing sandbox, export it without
@@ -90,7 +90,7 @@ display metadata:
 
 ```shell
 openshell sandbox get my-sandbox --policy-only > candidate.yaml
-openshell-prover check candidate.yaml --maximum maximum.yaml
+openshell-prover check candidate.yaml --boundary boundary.yaml
 ```
 
 This export includes provider-contributed rules. For a proposed change that is
@@ -101,7 +101,7 @@ Use JSON when a script consumes the result:
 
 ```shell
 openshell-prover check candidate.yaml \
-  --maximum maximum.yaml \
+  --boundary boundary.yaml \
   --output json
 ```
 
@@ -114,7 +114,7 @@ parsing the human-readable explanation.
 
 | Field | When populated |
 |---|---|
-| `counterexample` | An object for `exceeds_max`; otherwise `null`. |
+| `counterexample` | An object for `exceeds_boundary`; otherwise `null`. |
 | `reason_code` | A stable identifier for an emitted `error`, `unsupported`, or `inconclusive` result; otherwise `null`. |
 | `reason` | A human-readable explanation paired with `reason_code`; otherwise `null`. |
 
@@ -128,7 +128,7 @@ budget with an integer followed by `ms`, `s`, or `m`:
 
 ```shell
 openshell-prover check candidate.yaml \
-  --maximum maximum.yaml \
+  --boundary boundary.yaml \
   --timeout 30s \
   --output json
 ```
@@ -137,8 +137,8 @@ openshell-prover check candidate.yaml \
 
 | Exit | Result | Meaning |
 |---|---|---|
-| `0` | `within_max` | Containment was established for the reported model scope. |
-| `1` | `exceeds_max` | The candidate exceeds the maximum; inspect the counterexample. |
+| `0` | `within_boundary` | Containment was established for the reported model scope. |
+| `1` | `exceeds_boundary` | The candidate exceeds the boundary; inspect the counterexample. |
 | `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
 | `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
 | `130` | `inconclusive` when graceful handling completes | The user interrupted the command with Ctrl-C on Unix; a second or very early interruption may prevent output. |
@@ -156,7 +156,7 @@ silently ignoring it.
 
 Network binary selectors, endpoint host and path selectors, and REST allow and
 deny method and path selectors must use ASCII literals in both the candidate and
-maximum. A non-ASCII literal in one of these fields returns `unsupported` with
+boundary. A non-ASCII literal in one of these fields returns `unsupported` with
 `reason_code: unsupported_policy_shape`, including when it appears only in a
 deny. Embedded NUL bytes in these fields are also unsupported. This is a
 prover-model limitation, not a general policy validation rule: filesystem paths
@@ -164,7 +164,7 @@ and unrelated policy text retain their existing Unicode behavior. ASCII
 wildcard selectors still cover non-ASCII runtime values matched by the policy
 engine.
 
-Containment means `Allowed(candidate)` is a subset of `Allowed(maximum)` under
+Containment means `Allowed(candidate)` is a subset of `Allowed(boundary)` under
 the reported model. It does not establish least privilege, automatic approval
 eligibility, semantic safety, or equivalence to a running sandbox's kernel
 state. In particular:
@@ -178,7 +178,7 @@ state. In particular:
   returns `unsupported` when the result depends on that missing context.
 - Binary comparisons that can change when an image resolves an exact selector
   through a symlink return `unsupported`. This covers exact candidate grants
-  under maximum globs and exact maximum denies replaced by candidate globs.
+  under boundary globs and exact boundary denies replaced by candidate globs.
   Use matching exact canonical paths when possible.
 - Policies with overlapping L4 and enforced REST endpoints return
   `unsupported` because inspection selection depends on the complete set of
@@ -195,13 +195,13 @@ state. In particular:
   mount model, with stable path resolution when enforcement rules are created.
   The CLI does not resolve sandbox paths against the host.
 - Filesystem containment supports removing grants and reducing write grants to
-  read-only grants at matching paths. A maximum grant for `/` also covers other
+  read-only grants at matching paths. A boundary grant for `/` also covers other
   paths for the same access. Comparisons between different paths otherwise
   return `unsupported` with `reason_code: unresolved_filesystem_path`: a lexical
   child can resolve outside its parent through a symlink, and unrelated paths
   can resolve to the same object. This includes narrowing `/tmp` to `/tmp/cache`.
-  If the maximum grants no access of the requested kind, adding that access
-  returns `exceeds_max`.
+  If the boundary grants no access of the requested kind, adding that access
+  returns `exceeds_boundary`.
 
 Use the [Policy Schema Reference](/reference/policy-schema) for the full policy
 language. A successful prover result covers only the scope reported in its

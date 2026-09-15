@@ -9,7 +9,7 @@ model, then runs reachability queries to detect credentialed-reach and
 capability changes a reviewer should be aware of.
 
 The crate also exposes an independent containment API for checking whether a
-fully composed candidate policy stays within an operator-supplied maximum. The
+fully composed candidate policy stays within an operator-supplied boundary. The
 `openshell-prover-cli` package wraps that API for local files. Containment and
 the legacy proposal-risk queries answer different questions; gateway callers
 continue to use the proposal-risk API until the managed-policy migration.

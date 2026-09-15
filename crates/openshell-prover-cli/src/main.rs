@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Standalone policy maximum checker.
+//! Standalone policy boundary checker.
 
 #[cfg(not(unix))]
 use std::fs::File;
@@ -35,13 +35,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Check whether a candidate policy is contained within a maximum policy.
+    /// Check whether a candidate policy is contained within a boundary policy.
     Check {
         /// Fully composed effective candidate policy.
         candidate: PathBuf,
-        /// Operator-owned maximum policy.
+        /// Operator-owned boundary policy.
         #[arg(long, value_name = "FILE")]
-        maximum: PathBuf,
+        boundary: PathBuf,
         /// Result output format.
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
@@ -81,7 +81,7 @@ struct ScopeJson<'a> {
 #[derive(Debug, Serialize)]
 struct InputsJson {
     candidate: String,
-    maximum: String,
+    boundary: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,23 +146,23 @@ fn execute(command: Command, cancelled: &AtomicBool) -> Result<u8, String> {
     match command {
         Command::Check {
             candidate,
-            maximum,
+            boundary,
             output,
             timeout,
-        } => check(&candidate, &maximum, output, timeout, cancelled),
+        } => check(&candidate, &boundary, output, timeout, cancelled),
     }
 }
 
 fn check(
     candidate_path: &Path,
-    maximum_path: &Path,
+    boundary_path: &Path,
     output: OutputFormat,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<u8, String> {
     let inputs = InputsJson {
         candidate: candidate_path.to_string_lossy().into_owned(),
-        maximum: maximum_path.to_string_lossy().into_owned(),
+        boundary: boundary_path.to_string_lossy().into_owned(),
     };
 
     let candidate_source = match read_policy(candidate_path) {
@@ -172,7 +172,7 @@ fn check(
     if cancelled.load(Ordering::Relaxed) {
         return render_cancelled(output, inputs);
     }
-    let maximum_source = match read_policy(maximum_path) {
+    let boundary_source = match read_policy(boundary_path) {
         Ok(source) => source,
         Err(error) => return render_input_error(output, inputs, &error),
     };
@@ -183,7 +183,7 @@ fn check(
         Ok(policy) => policy,
         Err(error) => return render_input_error(output, inputs, &error),
     };
-    let maximum = match parse_input("maximum", &maximum_source) {
+    let boundary = match parse_input("boundary", &boundary_source) {
         Ok(policy) => policy,
         Err(error) => return render_input_error(output, inputs, &error),
     };
@@ -191,8 +191,8 @@ fn check(
         return render_cancelled(output, inputs);
     }
 
-    let result = openshell_prover::containment::check_within_maximum_cancellable(
-        &maximum,
+    let result = openshell_prover::containment::check_within_boundary_cancellable(
+        &boundary,
         &candidate,
         CheckOptions { timeout },
         cancelled,
@@ -283,7 +283,7 @@ fn render_input_error(
         let envelope = Envelope {
             schema_version: 1,
             prover_version: env!("CARGO_PKG_VERSION"),
-            check: "maximum_boundary",
+            check: "boundary",
             scope: None,
             result: "error",
             exit_code: 2,
@@ -309,10 +309,10 @@ fn render_cancelled(output: OutputFormat, inputs: InputsJson) -> Result<u8, Stri
 
 fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Envelope<'_> {
     let (scope, result_name, exit_code, counterexample, reason_code, reason) = match result {
-        CheckResult::Within(evidence) => (evidence.scope(), "within_max", 0, None, None, None),
+        CheckResult::Within(evidence) => (evidence.scope(), "within_boundary", 0, None, None, None),
         CheckResult::Exceeds(evidence) => (
             evidence.scope(),
-            "exceeds_max",
+            "exceeds_boundary",
             1,
             Some(counterexample_json(evidence.counterexample())),
             None,
@@ -346,7 +346,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Envelope<'_> {
     Envelope {
         schema_version: 1,
         prover_version: env!("CARGO_PKG_VERSION"),
-        check: "maximum_boundary",
+        check: "boundary",
         scope: Some(scope_json(scope)),
         result: result_name,
         exit_code,
@@ -553,13 +553,13 @@ mod tests {
         let envelope = Envelope {
             schema_version: 1,
             prover_version: env!("CARGO_PKG_VERSION"),
-            check: "maximum_boundary",
+            check: "boundary",
             scope: None,
-            result: "within_max",
+            result: "within_boundary",
             exit_code: 0,
             inputs: InputsJson {
                 candidate: "candidate.yaml".to_owned(),
-                maximum: "maximum.yaml".to_owned(),
+                boundary: "boundary.yaml".to_owned(),
             },
             counterexample: None,
             reason_code: None,

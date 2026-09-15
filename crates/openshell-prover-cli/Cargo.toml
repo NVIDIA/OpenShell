@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-prover-cli"
-description = "Standalone OpenShell policy maximum checker"
+description = "Standalone OpenShell policy boundary checker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
