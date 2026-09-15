@@ -3,8 +3,6 @@
 
 //! Registered, portable conformance scenarios.
 
-mod sandbox_continuity;
 mod smoke;
 
-pub use sandbox_continuity::SANDBOX_CONTINUITY_SCENARIO;
 pub use smoke::SMOKE_SCENARIO;
