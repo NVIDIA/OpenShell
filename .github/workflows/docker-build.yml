@@ -96,5 +96,6 @@ jobs:
       - name: Verify merged manifest SBOM attestation
         shell: bash
         env:
+          CONTAINER_ENGINE: docker
           IMAGE_REF: ${{ inputs.image-repository }}/${{ inputs.component }}:${{ inputs.image-tag || github.sha }}
         run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
