@@ -98,7 +98,16 @@ field must not require a Helm template change.
 {{/* Render the top-level gatewayConfig map as deterministic TOML tables. */}}
 {{- define "openshell.gatewayConfigToml" -}}
 {{- $root := . -}}
-{{- $config := .Values.gatewayConfig | default dict -}}
+{{- $config := deepCopy (.Values.gatewayConfig | default dict) -}}
+{{- if .Values.server.disableTls -}}
+{{- $gateway := get $config "openshell.gateway" | default dict -}}
+{{- $_ := set $gateway "disable_tls" true -}}
+{{- $_ := set $config "openshell.gateway" $gateway -}}
+{{- $_ := unset $config "openshell.gateway.tls" -}}
+{{- $kubernetes := get $config "openshell.drivers.kubernetes" | default dict -}}
+{{- $_ := unset $kubernetes "client_tls_secret_name" -}}
+{{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
+{{- end -}}
 {{- range $tableName := keys $config | sortAlpha -}}
 {{- $fields := get $config $tableName -}}
 {{- if ne $fields nil -}}

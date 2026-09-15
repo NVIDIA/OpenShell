@@ -839,9 +839,8 @@ tests:
                 key: uri
   - it: renders provider SPIFFE token grants while keeping gateway JWT auth
     set:
-      server.providerTokenGrants.spiffe.enabled: true
       gatewayConfig:
-        openshell.gateway:
+        openshell.drivers.kubernetes:
           provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     template: templates/gateway-config.yaml
     asserts:
@@ -857,7 +856,9 @@ tests:
 
   - it: mounts the gateway SPIFFE socket while keeping sandbox JWT auth
     set:
-      server.providerTokenGrants.spiffe.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     template: templates/statefulset.yaml
     asserts:
       - contains:

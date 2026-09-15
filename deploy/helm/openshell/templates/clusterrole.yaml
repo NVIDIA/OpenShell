@@ -4,6 +4,11 @@
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" }}
+{{- $managedSshIngress := get $gatewayConfig "openshell.drivers.kubernetes.managed_ssh_ingress" | default dict -}}
+{{- $managedSshIngressEnabled := true -}}
+{{- if hasKey $managedSshIngress "enabled" -}}
+{{- $managedSshIngressEnabled = get $managedSshIngress "enabled" -}}
+{{- end -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -154,7 +159,7 @@ rules:
     verbs:
       - create
       - get
-  {{- if .Values.networkPolicy.enabled }}
+  {{- if $managedSshIngressEnabled }}
   # Apply gateway-only SSH ingress isolation in managed namespaces.
   - apiGroups:
       - networking.k8s.io

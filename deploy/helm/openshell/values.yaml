@@ -257,16 +257,6 @@ server:
     # (owner-read only). Override to 0440 or 0444 if the container UID
     # does not match the volume file owner.
     secretDefaultMode: ""
-  # Dynamic provider token grants. When SPIFFE is enabled here, both the
-  # gateway and sandbox supervisors mount the SPIFFE Workload API socket so
-  # token-exchange profiles can use gateway- and sandbox-scoped JWT-SVIDs.
-  # Supervisor-to-gateway authentication still uses gateway-minted sandbox JWTs.
-  providerTokenGrants:
-    spiffe:
-      # -- Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants.
-      enabled: false
-      # -- Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods.
-      workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
 # Kubernetes resource reference for a private-CA OIDC issuer. The OIDC
 # runtime settings themselves belong in gatewayConfig.openshell.gateway.oidc.
 oidc:
