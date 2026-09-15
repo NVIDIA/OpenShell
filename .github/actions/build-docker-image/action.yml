@@ -34,9 +34,17 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Detect optional BuildKit configuration
+      id: buildkit
+      shell: bash
+      run: |
+        if [[ -r /etc/buildkit/buildkitd.toml ]]; then
+          echo "config=/etc/buildkit/buildkitd.toml" >> "$GITHUB_OUTPUT"
+        fi
+
     - uses: ./.github/actions/setup-buildx
       with:
-        buildkitd-config: /etc/buildkit/buildkitd.toml
+        buildkitd-config: ${{ steps.buildkit.outputs.config }}
 
     - name: Log in to GHCR
       shell: bash
