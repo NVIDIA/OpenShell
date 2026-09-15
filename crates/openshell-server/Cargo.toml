@@ -129,6 +129,9 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+# Tests import the example profiles from providers/ the way an operator
+# would; the feature is test-only and never reaches a release binary.
+openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }

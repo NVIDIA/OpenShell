@@ -3286,11 +3286,7 @@ mod tests {
             ProviderProfileSources::from_config(&[GatewayProviderProfileSourceConfig::User], None)
                 .expect("user-only provider profile source configuration should be valid");
 
-        let github_profile = openshell_providers::builtin_profiles()
-            .iter()
-            .find(|profile| profile.id == "github")
-            .expect("github builtin profile")
-            .to_proto();
+        let github_profile = openshell_providers::example_profiles::load("github").to_proto();
         state
             .store
             .put_message(&crate::provider_profile_sources::stored_provider_profile(

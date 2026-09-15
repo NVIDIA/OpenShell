@@ -960,11 +960,7 @@ mod tests {
     }
 
     fn profile(id: &str) -> ProviderProfile {
-        let mut profile = builtin_profiles()
-            .iter()
-            .find(|profile| profile.id == "github")
-            .expect("github built-in profile")
-            .clone();
+        let mut profile = openshell_providers::example_profiles::load("github");
         profile.id = id.to_string();
         profile.display_name = id.to_string();
         profile.to_proto()

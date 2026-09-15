@@ -494,7 +494,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let profiles = openshell_providers::builtin_profiles()
+        let profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect();
@@ -511,7 +511,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
-        let profile = openshell_providers::builtin_profiles()
+        let profile = helpers::example_profiles()
             .iter()
             .find(|profile| profile.id == id)
             .ok_or_else(|| Status::not_found("provider profile not found"))?

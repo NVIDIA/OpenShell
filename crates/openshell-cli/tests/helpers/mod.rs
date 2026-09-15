@@ -8,6 +8,20 @@
 //! mod helpers;
 //! ```
 
+/// The example provider profiles in `providers/`, parsed once per test binary.
+///
+/// Fake gateways serve these the way a real gateway serves what an operator
+/// imported. Nothing is compiled into the CLI, so the fixtures come from the
+/// same files the documentation tells operators to import.
+#[allow(dead_code)]
+pub fn example_profiles() -> &'static [openshell_providers::ProviderTypeProfile] {
+    static CATALOG: std::sync::OnceLock<Vec<openshell_providers::ProviderTypeProfile>> =
+        std::sync::OnceLock::new();
+    CATALOG
+        .get_or_init(openshell_providers::example_profiles::load_all)
+        .as_slice()
+}
+
 #[macro_export]
 macro_rules! unimplemented_sandbox_template_rpcs {
     () => {
