@@ -1,6 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/copilot.yaml
+#   openshell provider profile import -f providers/copilot.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   copilot.
+# Reference layout:  /usr/bin/copilot plus the npm global install under
+#                    /usr/lib/node_modules/@github/copilot/**. That npm path is
+#                    an OpenShell Community image layout; check `npm root -g` in
+#                    your image.
+# Credential scope:  COPILOT_GITHUB_TOKEN, GH_TOKEN or GITHUB_TOKEN, sent as a
+#                    bearer authorization header to the Copilot API hosts below.
+# Endpoint access:   the githubcopilot.com API hosts (individual, business and
+#                    enterprise variants) read-write and L7 enforced. The two
+#                    telemetry hosts are L4 passthrough and do not receive the
+#                    credential; drop them if your policy forbids telemetry.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      copilot -p 'reply with OK'
+
 id: copilot
 display_name: GitHub Copilot
 description: GitHub Copilot CLI and Copilot service APIs
