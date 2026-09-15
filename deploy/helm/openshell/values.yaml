@@ -186,6 +186,51 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- Non-secret gateway application configuration. Top-level keys name TOML
+# tables and are rendered into the mounted gateway.toml file. Kubernetes
+# resource inputs remain outside this map; template expressions derive the
+# corresponding runtime values from their resource owner.
+gatewayConfig:
+  openshell:
+    version: 2
+  openshell.gateway:
+    name: '{{ include "openshell.fullname" . }}'
+    bind_address: '0.0.0.0:{{ .Values.service.port }}'
+    health_bind_address: '0.0.0.0:{{ .Values.service.healthPort }}'
+    metrics_bind_address: '0.0.0.0:{{ .Values.service.metricsPort }}'
+    compute_driver: kubernetes
+    enable_loopback_service_http: true
+  openshell.gateway.gateway_jwt:
+    signing_key_path: /etc/openshell-jwt/signing.pem
+    public_key_path: /etc/openshell-jwt/public.pem
+    kid_path: /etc/openshell-jwt/kid
+    gateway_id: '{{ include "openshell.fullname" . }}'
+  openshell.gateway.tls:
+    cert_path: /etc/openshell-tls/server/tls.crt
+    key_path: /etc/openshell-tls/server/tls.key
+    client_ca_path: /etc/openshell-tls/client-ca/ca.crt
+  openshell.drivers.kubernetes:
+    namespace: '{{ include "openshell.sandboxNamespace" . }}'
+    default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+    client_tls_secret_name: '{{ .Values.server.tls.clientTlsSecretName }}'
+    workspace_mode: shared
+    gateway_id: '{{ include "openshell.fullname" . }}'
+    grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
+    service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
+    supervisor_sideload_method: '{{ include "openshell.supervisorSideloadMethod" . }}'
+    topology: '{{ .Values.supervisor.topology }}'
+  openshell.drivers.kubernetes.managed_ssh_ingress:
+    enabled: true
+    gateway_namespace: '{{ .Release.Namespace }}'
+    gateway_pod_selector:
+      app.kubernetes.io/name: '{{ include "openshell.name" . }}'
+      app.kubernetes.io/instance: '{{ .Release.Name }}'
+  openshell.drivers.kubernetes.sidecar:
+    proxy_uid: 1337
+    process_binary_aware_network_policy: true
+  openshell.gateway.credential_storage:
+    key_encryption_key_env: '{{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}'
+
 # Server configuration
 server:
   # -- Operator-facing gateway name. Defaults to the chart fullname so all
