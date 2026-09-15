@@ -2196,6 +2196,8 @@ async fn handle_mediated_connection(
         decision
     } else if let Some(identity) = supplied_identity.as_ref() {
         authorize_supplied_identity(&opa_engine, intent, identity)
+    } else if !opa_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(&opa_engine, intent)
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
@@ -3115,7 +3117,6 @@ fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
     (entrypoint_pid != 0).then_some(entrypoint_pid)
 }
 
-#[cfg(test)]
 fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
     let input = crate::opa::NetworkInput {
         host: intent.destination.host.clone(),
@@ -4762,6 +4763,8 @@ async fn handle_forward_proxy(
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = if let Some(identity) = supplied_identity {
         authorize_supplied_identity(&opa_engine, intent, identity)
+    } else if !opa_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(&opa_engine, intent)
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
