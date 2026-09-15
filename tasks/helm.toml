@@ -64,6 +64,7 @@ run = """
   helm unittest deploy/helm/openshell-workspace
   deploy/helm/test-split-ownership.sh
   deploy/helm/test-gateway-config-parser.sh
+  deploy/helm/test-gateway-resource-coherence.sh
 """
 run_windows = "echo Skipping helm:test: Helm validation is not part of the native Windows lane."
 
