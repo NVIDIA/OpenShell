@@ -173,7 +173,18 @@ Namespace where sandbox pods are created. An explicit
 Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}
-{{- .Values.server.credentialDrivers.kubernetesSecrets.namespace | default .Release.Namespace -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $config := get $gatewayConfig "openshell.credential_drivers.kubernetes-secrets" | default dict -}}
+{{- get $config "namespace" | default .Release.Namespace -}}
+{{- end }}
+
+{{/* Whether a credential driver is enabled in the generic gateway config. */}}
+{{- define "openshell.credentialDriverEnabled" -}}
+{{- $root := index . 0 -}}
+{{- $driver := index . 1 -}}
+{{- $gatewayConfig := $root.Values.gatewayConfig | default dict -}}
+{{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- if has $driver (get $gateway "credential_drivers" | default list) -}}true{{- end -}}
 {{- end }}
 
 {{/*
@@ -335,16 +346,6 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
-{{- end -}}
-{{- $credentialDrivers := list -}}
-{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
-{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
-{{- end -}}
-{{- if .Values.server.credentialDrivers.vault.enabled -}}
-{{- $credentialDrivers = append $credentialDrivers "vault" -}}
-{{- end -}}
-{{- if gt (len $credentialDrivers) 1 -}}
-{{- fail "only one external server.credentialDrivers backend can be enabled at a time." -}}
 {{- end -}}
 {{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
 {{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}

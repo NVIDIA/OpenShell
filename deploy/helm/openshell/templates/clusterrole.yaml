@@ -132,7 +132,7 @@ rules:
     verbs:
       - create
   {{- end }}
-  {{- if and (ne $workspaceMode "shared") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+  {{- if and (ne $workspaceMode "shared") (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") }}
   # The kubernetes-secrets credential driver uses dynamic hashed names in
   # workspace namespaces, so Kubernetes RBAC cannot restrict resourceNames.
   - apiGroups:
