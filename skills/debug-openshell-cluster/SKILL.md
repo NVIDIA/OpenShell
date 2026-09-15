@@ -488,6 +488,8 @@ Alpine packages updated at image build time. A dependency or base-image fix only
 reaches deployed containers after rebuilding, publishing, and redeploying the
 images. Compare findings against the SBOM for that digest, not just its mutable
 `latest` or `dev` tag.
+For gateway base refreshes, verify the installed libc package revision in each
+platform's SBOM; the binary's glibc compatibility floor is not its runtime version.
 
 For plaintext local evaluation, confirm the chart has:
 

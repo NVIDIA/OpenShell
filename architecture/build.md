@@ -221,6 +221,8 @@ Runtime layout:
   gateway bundles z3, so the image does not need a distro-provided z3 runtime.
   The base is pinned to a multi-architecture digest; distro security updates
   require refreshing that digest and rebuilding the gateway image.
+  Updating the container's glibc package does not raise the binary's glibc
+  compatibility floor.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
