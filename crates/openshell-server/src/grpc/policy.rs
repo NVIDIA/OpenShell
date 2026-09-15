@@ -2858,7 +2858,6 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     .await
 }
 
-#[cfg(test)]
 async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,

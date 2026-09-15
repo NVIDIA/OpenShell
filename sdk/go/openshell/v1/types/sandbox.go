@@ -119,7 +119,7 @@ type SandboxStatus struct {
 	ExitCode             *int32
 	// EndpointStatuses describes configured external tool endpoints and their
 	// last accepted network results, independently of sandbox readiness.
-	EndpointStatuses []EndpointStatus
+	EndpointStatuses       []EndpointStatus
 	ConfigurationAdmission *SandboxConfigurationAdmission
 }
 
