@@ -1476,6 +1476,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             workspace_scope: Some(named_workspace_scope(&workspace)),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
+            delegated_identity: None,
         };
 
         let sandbox_name =

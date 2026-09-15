@@ -435,6 +435,30 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"retain_last_valid"'
 
+  - it: renders the default delegated identity duration limit
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?max_delegated_identity_duration_secs\s*=\s*86400'
+
+  - it: renders a configured delegated identity duration limit
+    template: templates/gateway-config.yaml
+    set:
+      server.maxDelegatedIdentityDurationSecs: 3600
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?max_delegated_identity_duration_secs\s*=\s*3600'
+
+  - it: rejects a negative delegated identity duration limit
+    template: templates/statefulset.yaml
+    set:
+      server.maxDelegatedIdentityDurationSecs: -1
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.maxDelegatedIdentityDurationSecs must not be negative; it maps to an unsigned gateway setting"
+
   - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
     template: templates/gateway-config.yaml
     set:

@@ -599,6 +599,31 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hash))
 }
 
+/// Run fork-based socket fixtures outside the parallel test process. Otherwise
+/// their children inherit unrelated tests' sockets and can cause real, correctly
+/// fail-closed shared-owner denials in those tests.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_fork_socket_test_in_subprocess(test_name: &str) -> bool {
+    const ISOLATED_TEST_ENV: &str = "OPENSHELL_ISOLATED_FORK_SOCKET_TEST";
+    if std::env::var(ISOLATED_TEST_ENV).is_ok_and(|name| name == test_name) {
+        return false;
+    }
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_TEST_ENV, test_name)
+            .output()
+            .expect("run isolated fork/socket test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("running 1 test"),
+        "isolated test {test_name} did not pass exactly one fixture: {}\n{stdout}\n{stderr}",
+        output.status,
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +938,12 @@ mod tests {
                     libc::waitpid(self.0, std::ptr::null_mut(), 0);
                 }
             }
+        }
+
+        if run_fork_socket_test_in_subprocess(
+            "procfs::tests::resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders",
+        ) {
+            return;
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");

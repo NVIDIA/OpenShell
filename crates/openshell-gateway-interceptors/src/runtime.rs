@@ -1078,6 +1078,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
+            delegated_identity: None,
         };
 
         let bytes = request.encode_to_vec();

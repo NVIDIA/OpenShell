@@ -1133,6 +1133,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         workspace_scope: Some(proto::workspace_selector("default")),
         await_main_process_attachment: false,
         workload_template_name: String::new(),
+        delegated_identity: None,
     }
 }
 
@@ -1162,6 +1163,7 @@ fn create_sandbox_from_template_request(
         workspace_scope: Some(proto::workspace_selector("default")),
         workload_template_name: template_name,
         await_main_process_attachment: false,
+        delegated_identity: None,
     }
 }
 

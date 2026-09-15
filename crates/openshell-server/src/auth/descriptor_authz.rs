@@ -29,7 +29,11 @@ const AUTH_ONLY_METHODS: &[&str] = &["/openshell.v1.OpenShell/GetCurrentUser"];
 ///
 /// Keep this list explicit so an incomplete authorization annotation cannot
 /// silently turn a future mutating RPC into a scope-only endpoint.
-const SCOPE_ONLY_METHODS: &[&str] = &["/openshell.v1.OpenShell/GetGatewayConfig"];
+const SCOPE_ONLY_METHODS: &[&str] = &[
+    "/openshell.v1.OpenShell/GetGatewayConfig",
+    "/openshell.v1.OpenShell/GetDelegatedIdentityAuthorizationStatus",
+    "/openshell.v1.OpenShell/AuthorizeDelegatedIdentity",
+];
 
 /// Per-method authorization entry decoded from proto annotations.
 #[derive(Debug, Clone)]
