@@ -3936,6 +3936,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openshell-binary-identity"
+version = "0.0.0"
+dependencies = [
+ "openshell-isolation-interface",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "openshell-bootstrap"
 version = "0.0.0"
 dependencies = [
@@ -4035,6 +4043,7 @@ dependencies = [
  "chrono",
  "glob",
  "ipnet",
+ "jsonwebtoken",
  "miette",
  "nix 0.29.0",
  "openshell-extension-core",
@@ -4060,6 +4069,8 @@ dependencies = [
  "tonic-types",
  "tracing",
  "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4089,15 +4100,21 @@ dependencies = [
  "clap",
  "futures",
  "http 1.4.0",
+ "libc",
  "miette",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
+ "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
+ "rand 0.9.4",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "temp-env",
  "tempfile",
@@ -4127,13 +4144,17 @@ dependencies = [
  "miette",
  "notify",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
+ "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
  "prost-types",
+ "rand 0.9.4",
+ "rcgen",
  "serde",
  "serde_json",
  "temp-env",
@@ -4203,14 +4224,17 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
+ "openshell-sandbox-backend",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "tar",
  "temp-env",
  "thiserror 2.0.18",
  "tokio",
@@ -4221,6 +4245,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4249,6 +4274,7 @@ dependencies = [
 name = "openshell-driver-vm"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bollard",
  "clap",
  "flate2",
@@ -4261,15 +4287,18 @@ dependencies = [
  "oci-client",
  "openshell-core",
  "openshell-driver-podman",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
+ "openshell-sandbox-backend",
  "openshell-vfio",
  "opentelemetry",
  "opentelemetry_sdk",
  "polling",
  "prost",
  "prost-types",
+ "rand 0.9.4",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4349,6 +4378,18 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-isolation-interface"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "openshell-core",
+ "rustix 1.1.4",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -4439,32 +4480,71 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "capctl",
  "clap",
- "futures",
- "http 1.4.0",
+ "hex",
+ "ipnet",
+ "landlock",
+ "libc",
  "miette",
  "nix 0.29.0",
+ "openshell-binary-identity",
  "openshell-core",
- "openshell-extension-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
- "openshell-supervisor-middleware",
- "openshell-supervisor-middleware-builtins",
- "openshell-supervisor-network",
- "openshell-supervisor-process",
- "prost",
- "prost-types",
+ "openshell-sandbox-backend",
+ "rand 0.10.2",
+ "rcgen",
+ "rustix 1.1.4",
  "rustls",
+ "rustls-pemfile",
+ "seccompiler",
  "serde",
  "serde_json",
- "temp-env",
+ "sha2 0.10.9",
+ "socket2",
  "tempfile",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-sandbox-backend"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "libc",
+ "openshell-core",
+ "openshell-isolation-interface",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
  "uuid",
 ]
 
@@ -4597,6 +4677,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-extension-core",
+ "openshell-isolation-interface",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-sandbox-backend",
+ "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
+ "openshell-supervisor-network",
+ "openshell-supervisor-process",
+ "prost",
+ "prost-types",
+ "rustix 1.1.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-supervisor-middleware"
 version = "0.0.0"
 dependencies = [
@@ -4633,6 +4748,7 @@ name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
  "apollo-parser",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
@@ -4648,7 +4764,9 @@ dependencies = [
  "libc",
  "miette",
  "noyalib",
+ "openshell-binary-identity",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4685,25 +4803,20 @@ name = "openshell-supervisor-process"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "bytes",
- "capctl",
  "hex",
- "ipnet",
- "landlock",
  "libc",
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation-interface",
  "openshell-ocsf",
- "openshell-policy",
  "rand 0.10.2",
  "russh",
- "rustix 1.1.4",
- "seccompiler",
  "serde_json",
  "sha2 0.10.9",
- "socket2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5728,6 +5841,7 @@ dependencies = [
  "pem",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -7178,7 +7292,6 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
- "futures",
  "parking_lot",
 ]
 
@@ -8749,6 +8862,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

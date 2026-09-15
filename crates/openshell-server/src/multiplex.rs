@@ -940,6 +940,14 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
     }
+    if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
+        authenticators.push(Arc::new(
+            crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                authority,
+                state.store.clone(),
+            ),
+        ));
+    }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
     }

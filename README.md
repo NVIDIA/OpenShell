@@ -48,7 +48,8 @@ uv add openshell
 Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
 
 ```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.

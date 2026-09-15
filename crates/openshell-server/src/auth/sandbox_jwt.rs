@@ -29,11 +29,20 @@ pub use openshell_extension_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     io::Cursor,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tonic::Status;
 use tracing::{debug, warn};
 use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::SubjectPublicKeyInfo};
+
+use openshell_core::SandboxSessionId;
+use openshell_core::jwt::{
+    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
+    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+};
+use openshell_core::sandbox_generation::SandboxGenerationId;
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -103,6 +112,177 @@ impl std::fmt::Debug for SandboxJwtIssuer {
 pub struct MintedToken {
     pub token: String,
     pub expires_at_ms: i64,
+}
+
+/// Issuer and verifier for launch-scoped supervisor credentials.
+pub struct SandboxSessionJwtAuthority {
+    issuer: SessionJwtIssuer,
+    gateway_verifier: SessionJwtVerifier,
+    gateway_id: String,
+    verification_keys: Vec<SessionVerificationKey>,
+}
+
+impl std::fmt::Debug for SandboxSessionJwtAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxSessionJwtAuthority")
+            .field("gateway_id", &self.gateway_id)
+            .field(
+                "verification_key_ids",
+                &self
+                    .verification_keys
+                    .iter()
+                    .map(|key| key.key_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxSessionJwtAuthority {
+    pub fn from_pem(
+        signing_key_pem: &[u8],
+        public_key_pem: &[u8],
+        key_id: String,
+        gateway_id: &str,
+        ttl: Duration,
+    ) -> Result<Self, String> {
+        let clock = Arc::new(SystemJwtClock);
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            signing_key_pem,
+            key_id.clone(),
+            gateway_id,
+            ttl,
+            clock.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let verification_keys = vec![SessionVerificationKey {
+            key_id,
+            public_key_pem: public_key_pem.to_vec(),
+        }];
+        let gateway_verifier = SessionJwtVerifier::new(
+            gateway_id,
+            SessionTokenProfile::Gateway,
+            verification_keys.clone(),
+            clock,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            issuer,
+            gateway_verifier,
+            gateway_id: gateway_id.to_string(),
+            verification_keys,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn mint_persisted_launch(
+        &self,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch(
+            sandbox_id,
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn mint_launch(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse(sandbox_id)
+                .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
+            runtime_generation: runtime_generation.clone(),
+            auth_epoch,
+        };
+        let pair = self.issuer.mint_pair(&identity).map_err(|error| {
+            warn!(%error, "failed to mint launch-scoped sandbox credentials");
+            Status::internal("failed to mint sandbox launch credentials")
+        })?;
+        Ok(SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id: SandboxSessionId::new(),
+                runtime_generation,
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                auth_epoch: pair.auth_epoch,
+                gateway_token: pair.gateway.token,
+                gateway_expires_at: pair.gateway.expires_at,
+                sandbox_token: pair.sandbox.token,
+                sandbox_expires_at: pair.sandbox.expires_at,
+            },
+            gateway_id: self.gateway_id.clone(),
+            verification_keys: self.verification_keys.clone(),
+        })
+    }
+
+    pub fn verify_gateway_token(&self, token: &str) -> Result<AuthenticatedSandboxSession, Status> {
+        self.gateway_verifier
+            .verify(token)
+            .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
+    }
+}
+
+/// Authenticates launch-scoped supervisor tokens and checks their identity
+/// against the durable sandbox record.
+pub struct SandboxSessionJwtAuthenticator {
+    authority: Arc<SandboxSessionJwtAuthority>,
+    store: Arc<crate::persistence::Store>,
+}
+
+impl SandboxSessionJwtAuthenticator {
+    pub fn new(
+        authority: Arc<SandboxSessionJwtAuthority>,
+        store: Arc<crate::persistence::Store>,
+    ) -> Self {
+        Self { authority, store }
+    }
+}
+
+impl std::fmt::Debug for SandboxSessionJwtAuthenticator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxSessionJwtAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Authenticator for SandboxSessionJwtAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        _path: &str,
+    ) -> Result<Option<Principal>, Status> {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return Ok(None);
+        };
+        let Ok(header) = decode_header(token) else {
+            return Ok(None);
+        };
+        if header.typ.as_deref() != Some(GATEWAY_SESSION_JWT_TYPE) {
+            return Ok(None);
+        }
+        let authenticated = self.authority.verify_gateway_token(token)?;
+        crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
+        Ok(Some(Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: authenticated.sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "launch-session".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })))
+    }
 }
 
 impl SandboxJwtIssuer {

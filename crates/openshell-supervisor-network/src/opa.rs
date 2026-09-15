@@ -94,15 +94,6 @@ pub struct NetworkInput {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
-pub(crate) fn network_binary_identity_required() -> bool {
-    std::env::var(openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY).map_or(true, |value| {
-        !matches!(
-            value.as_str(),
-            "relaxed" | "disabled" | "endpoint-only" | "false" | "0"
-        )
-    })
-}
-
 fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
     let Some(obj) = data.as_object_mut() else {
         return;
@@ -152,6 +143,7 @@ pub struct SandboxConfig {
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
+    binary_identity_required: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -280,17 +272,23 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
-    fn with_engine(engine: regorus::Engine) -> Self {
+    fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
             engine: Mutex::new(engine),
+            binary_identity_required,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
+    }
+
+    /// Whether network authorization requires a workload binary identity.
+    pub const fn binary_identity_required(&self) -> bool {
+        self.binary_identity_required
     }
 
     fn advance_generation(&self) -> u64 {
@@ -313,6 +311,36 @@ impl OpaEngine {
         data_path: &Path,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            true,
+            validate_middleware_config,
+        )
+    }
+
+    /// Load local policy for a standalone proxy that cannot observe the
+    /// calling process. Authorization is based on the requested endpoint and
+    /// protocol rules instead of binary identity.
+    pub fn from_files_for_endpoint_only_proxy(
+        policy_path: &Path,
+        data_path: &Path,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            false,
+            validate_middleware_config,
+        )
+    }
+
+    fn from_files_with_identity_requirement(
+        policy_path: &Path,
+        data_path: &Path,
+        require_binary_identity: bool,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
             miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
         })?;
@@ -320,7 +348,6 @@ impl OpaEngine {
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let require_binary_identity = network_binary_identity_required();
         emit_binary_identity_mode(require_binary_identity, "files");
         let data_json = preprocess_yaml_data(
             &yaml_str,
@@ -330,14 +357,14 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Load policy rules and data from strings (data is YAML).
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
-        Self::from_strings_with_options(policy, data_yaml, network_binary_identity_required(), None)
+        Self::from_strings_with_options(policy, data_yaml, true, None)
     }
 
     pub fn from_strings_with_middleware_config(
@@ -345,12 +372,7 @@ impl OpaEngine {
         data_yaml: &str,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        Self::from_strings_with_options(
-            policy,
-            data_yaml,
-            network_binary_identity_required(),
-            validate_middleware_config,
-        )
+        Self::from_strings_with_options(policy, data_yaml, true, validate_middleware_config)
     }
 
     #[cfg(test)]
@@ -381,7 +403,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -403,11 +425,7 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
-        Self::from_proto_with_pid_and_binary_identity_required(
-            proto,
-            entrypoint_pid,
-            network_binary_identity_required(),
-        )
+        Self::from_proto_with_pid_and_binary_identity_required(proto, entrypoint_pid, true)
     }
 
     fn from_proto_with_pid_and_binary_identity_required(
@@ -474,7 +492,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -818,6 +836,7 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
+    #[allow(dead_code)]
     pub(crate) fn with_current_generation<T>(
         &self,
         expected_generation: u64,
@@ -2509,13 +2528,13 @@ process:
 "#;
 
     #[test]
-    fn policy_dns_snapshot_is_tcp_only_stable_and_generation_consistent() {
+    fn policy_dns_snapshot_includes_every_tcp_carried_endpoint() {
         let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
 
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
 
         assert_eq!(snapshot.generation, engine.current_generation());
-        assert_eq!(snapshot.endpoints.len(), 2);
+        assert_eq!(snapshot.endpoints.len(), 4);
         assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
         assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
         assert_eq!(
@@ -2528,15 +2547,17 @@ process:
             panic!("eligible endpoint must retain concrete ports");
         };
         assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
-        assert_eq!(snapshot.endpoints[1].endpoint_index, 4);
+        assert_eq!(snapshot.endpoints[1].endpoint_index, 1);
+        assert_eq!(snapshot.endpoints[2].endpoint_index, 2);
+        assert_eq!(snapshot.endpoints[3].endpoint_index, 4);
 
         engine
             .reload(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA)
             .unwrap();
         let reloaded = engine.policy_dns_eligibility_snapshot().unwrap();
         assert_eq!(reloaded.generation, snapshot.generation + 1);
-        assert_eq!(reloaded.endpoints.len(), 2);
-        assert_eq!(reloaded.endpoints[1].endpoint_index, 4);
+        assert_eq!(reloaded.endpoints.len(), 4);
+        assert_eq!(reloaded.endpoints[3].endpoint_index, 4);
     }
 
     #[test]
@@ -2554,7 +2575,13 @@ process:
     fn policy_dns_snapshot_accepts_the_default_multi_policy_shape() {
         let engine = OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap();
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
-        assert!(snapshot.endpoints.is_empty());
+        assert_eq!(snapshot.endpoints.len(), 15);
+        assert!(
+            snapshot
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.policy_name == "claude_code")
+        );
     }
 
     #[test]
@@ -3793,7 +3820,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine::with_engine(rego);
+        let engine = OpaEngine::with_engine(rego, true);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{

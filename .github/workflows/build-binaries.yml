@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: ""
+      interpreter:
+        description: Expected ELF program interpreter, "none" for static, or "skip"
+        required: false
+        type: string
+        default: skip
       checkout-ref:
         required: false
         type: string
@@ -67,3 +72,4 @@ jobs:
           image-tag: ${{ inputs['image-tag'] }}
           artifact-name: ${{ inputs['artifact-name'] }}
           extra-cargo-flags: ${{ inputs['extra-cargo-flags'] }}
+          interpreter: ${{ inputs.interpreter }}

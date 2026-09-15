@@ -60,9 +60,11 @@ pub struct PodmanComputeConfig {
     pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
-    /// OCI image containing the openshell-sandbox supervisor binary.
-    /// Mounted read-only into sandbox containers at /opt/openshell/bin
-    /// using Podman's `type=image` mount.
+    /// OCI image containing the statically linked `openshell-sandbox` binary.
+    /// The driver extracts the binary from this image into a verified host
+    /// cache and mounts it read-only into each sandbox container.
+    pub sandbox_runtime_image: String,
+    /// OCI image containing the dynamically linked `openshell-supervisor` binary.
     pub supervisor_image: String,
     /// Host path to the CA certificate for sandbox mTLS.
     ///
@@ -91,11 +93,11 @@ pub struct PodmanComputeConfig {
     /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
     /// supervisors for provider token exchange client assertions.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
-    /// `AppArmor` confinement requested for sandbox containers. Omission sends
-    /// no override and preserves Podman's runtime-selected profile.
+    /// `AppArmor` confinement requested for the workload container. Omission
+    /// sends no override and preserves Podman's runtime-selected profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
-    /// Health check interval in seconds for sandbox containers.
+    /// Health check interval in seconds for supervisor containers.
     ///
     /// Podman runs the health check command at this interval to determine
     /// container readiness. Lower values detect readiness faster but
@@ -469,6 +471,7 @@ impl Default for PodmanComputeConfig {
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
+            sandbox_runtime_image: openshell_core::config::default_sandbox_runtime_image(),
             supervisor_image: openshell_core::config::default_supervisor_image(),
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -503,6 +506,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("network_name", &self.network_name)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
+            .field("sandbox_runtime_image", &self.sandbox_runtime_image)
             .field("supervisor_image", &self.supervisor_image)
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)

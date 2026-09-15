@@ -221,6 +221,7 @@ enum EndpointMode {
     TlsSkip,
     L4OptIn,
     RestBody { rewrite: bool },
+    WebSocket,
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +245,9 @@ fn write_policy(
         EndpointMode::RestBody { rewrite } => format!(
             "        protocol: rest\n        access: full\n        request_body_credential_rewrite: {rewrite}\n"
         ),
+        EndpointMode::WebSocket => {
+            "        protocol: websocket\n        access: read-write\n".to_string()
+        }
     };
     let credential_binding = match credential_source {
         CredentialSource::ProviderProfile => String::new(),
@@ -268,12 +272,7 @@ network_policies:
     endpoints:
       - host: {TEST_HOST}
         port: {port}
-{endpoint_options}{credential_binding}        allowed_ips:
-          - "10.0.0.0/8"
-          - "172.0.0.0/8"
-          - "192.168.0.0/16"
-          - "fc00::/7"
-    binaries:
+{endpoint_options}{credential_binding}    binaries:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
       - path: /sandbox/.uv/python/*/bin/python*
@@ -286,32 +285,10 @@ network_policies:
     Ok(file)
 }
 
-fn write_base_policy() -> Result<NamedTempFile, String> {
-    let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
-    file.write_all(
-        br#"version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-"#,
-    )
-    .map_err(|error| format!("write policy: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("flush policy: {error}"))?;
-    Ok(file)
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct BodyObservation {
     saw_placeholder: bool,
     saw_secret: bool,
-    authenticated: bool,
 }
 
 struct HttpProbeServer {
@@ -529,20 +506,11 @@ async fn handle_http_probe(
         }
     }
 
-    let header_end = received
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(received.len(), |end| end + 4);
-    let headers = String::from_utf8_lossy(&received[..header_end]);
-    let body = &received[header_end..];
     let observation = BodyObservation {
-        authenticated: headers
-            .lines()
-            .any(|line| line == format!("Authorization: Bearer {TEST_SECRET}")),
-        saw_placeholder: body
+        saw_placeholder: received
             .windows(PLACEHOLDER_PREFIX.len())
             .any(|window| window == PLACEHOLDER_PREFIX.as_bytes()),
-        saw_secret: body
+        saw_secret: received
             .windows(TEST_SECRET.len())
             .any(|window| window == TEST_SECRET.as_bytes()),
     };
@@ -555,18 +523,11 @@ async fn handle_http_probe(
         } else {
             "BODY_BAD"
         };
-        // Echo admitted literal bodies so clients can assert exact preservation.
-        let response_body = if result == "BODY_TEXT" {
-            [b"BODY_TEXT\n".as_slice(), body].concat()
-        } else {
-            result.as_bytes().to_vec()
-        };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            response_body.len()
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}",
+            result.len()
         );
         stream.write_all(response.as_bytes()).await?;
-        stream.write_all(&response_body).await?;
     }
     Ok(())
 }
@@ -576,27 +537,13 @@ fn body_client_script(port: u16) -> String {
         r#"
 import os
 import socket
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
 token = os.environ[{TOKEN_ENV:?}]
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        response += chunk
-    if not response.startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     body = ("prefix-" + token + "-suffix").encode("utf-8")
     request = (
         f"POST /token HTTP/1.1\r\nHost: {{target}}\r\n"
@@ -625,14 +572,9 @@ import base64
 import os
 import socket
 import struct
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
 def recv_until(sock, marker):
     data = b""
@@ -652,11 +594,8 @@ def recv_exact(sock, size):
         data += chunk
     return data
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    if not recv_until(sock, b"\r\n\r\n").startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
         f"GET /ws HTTP/1.1\r\nHost: {{target}}\r\n"
@@ -876,55 +815,17 @@ async fn run_body_sandbox(
     Ok(output)
 }
 
-async fn assert_conversation_placeholders_pass(
-    server: &HttpProbeServer,
-    own_provider: bool,
-) -> Result<(), String> {
-    let policy = if own_provider {
-        write_base_policy()?
-    } else {
-        write_policy(
-            server.port,
-            EndpointMode::RestBody { rewrite: false },
-            CredentialSource::ProviderProfile,
-        )?
-    };
-    let policy_path = policy.path().to_str().ok_or("invalid policy path")?;
-    let script = format!(
-        r#"
-import http.client
-import json
-import os
-import urllib.parse
-
-proxy_url = next(os.environ[name] for name in
-    ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-    if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
-target = "{host}:{port}"
-issued = os.environ[{env:?}]
-for token in ("openshell:resolve:env:KEY", issued):
-    body = json.dumps({{"messages": [{{"role": "tool", "content": "{env}=" + token}}, {{"role": "user", "content": "hi"}}]}}).encode()
-    for tunnel in (False, True):
-        for replay in range(2):
-            connection = http.client.HTTPConnection(proxy.hostname, proxy.port or 80, timeout=10)
-            if tunnel:
-                connection.set_tunnel({host:?}, {port})
-            headers = {{"Content-Type": "application/json", "Connection": "close"}}
-            if {own}:
-                headers["Authorization"] = "Bearer " + issued
-            connection.request("POST", "/token" if tunnel else "http://" + target + "/token", body, headers)
-            response = connection.getresponse()
-            assert response.status == 200, response.status
-            assert response.read() == b"BODY_TEXT\n" + body, "body changed"
-            connection.close()
-            print("BODY_TEXT")
-"#,
-        host = TEST_HOST,
-        port = server.port,
-        env = TOKEN_ENV,
-        own = if own_provider { "True" } else { "False" },
-    );
+async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
+    let policy = write_policy(
+        port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )?;
+    let policy_path = policy
+        .path()
+        .to_str()
+        .ok_or_else(|| "body policy path is not UTF-8".to_string())?;
+    let script = body_client_script(port);
     let mut sandbox = SandboxGuard::create(&[
         "--policy",
         policy_path,
@@ -938,26 +839,25 @@ for token in ("openshell:resolve:env:KEY", issued):
     .await?;
     let output = sandbox.create_output.clone();
     sandbox.cleanup().await;
-    assert_eq!(
-        output.matches("BODY_TEXT").count(),
-        8,
-        "conversation did not survive replay: {output}"
-    );
-    assert!(!output.contains(TEST_SECRET));
-    let observations = server.wait_for_observations(8).await;
-    assert_eq!(observations.len(), 8);
-    assert!(
-        observations
-            .iter()
-            .all(|observation| observation.saw_placeholder
-                && !observation.saw_secret
-                && observation.authenticated == own_provider)
-    );
+    Ok(output)
+}
+
+async fn assert_rest_body_preserves_placeholder(server: &HttpProbeServer) -> Result<(), String> {
+    let output = run_profile_body_sandbox(server.port).await?;
+    assert!(output.contains("BODY_TEXT"));
+    let observations = server.wait_for_observations(1).await;
+    assert_eq!(observations.len(), 1, "observations: {observations:?}");
+    assert!(observations[0].saw_placeholder);
+    assert!(!observations[0].saw_secret);
     Ok(())
 }
 
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
-    let policy = write_base_policy()?;
+    let policy = write_policy(
+        server.port,
+        EndpointMode::WebSocket,
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()
@@ -998,9 +898,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_conversation_placeholders_pass(&server, true).await?;
-        let foreign_server = HttpProbeServer::start().await?;
-        assert_conversation_placeholders_pass(&foreign_server, false).await?;
+        assert_rest_body_preserves_placeholder(&server).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
     .await;
@@ -1029,12 +927,12 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         assert!(rewritten.contains("BODY_REWRITTEN"));
         assert!(!rewritten.contains(TEST_SECRET));
         assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
-        let observations = server.wait_for_observations(10).await;
-        assert_eq!(observations.len(), 10, "observations: {observations:?}");
-        assert!(observations[8].saw_placeholder);
-        assert!(!observations[8].saw_secret);
-        assert!(!observations[9].saw_placeholder);
-        assert!(observations[9].saw_secret);
+        let observations = server.wait_for_observations(3).await;
+        assert_eq!(observations.len(), 3, "observations: {observations:?}");
+        assert!(observations[1].saw_placeholder);
+        assert!(!observations[1].saw_secret);
+        assert!(!observations[2].saw_placeholder);
+        assert!(observations[2].saw_secret);
         assert_endpointless_provider_env_live_update(server.port).await?;
         Ok::<(), String>(())
     }

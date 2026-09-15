@@ -8,7 +8,7 @@
 //! store, terminates TLS from the client (presenting dynamic certs per hostname),
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
-use miette::{IntoDiagnostic, Result, miette};
+use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
@@ -17,7 +17,6 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const MAX_CACHED_CERTS: usize = 256;
@@ -66,6 +65,76 @@ impl SandboxCa {
     /// Returns the CA certificate in PEM format.
     pub fn cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// Returns the CA private key in PKCS#8 PEM format.
+    pub fn private_key_pem(&self) -> String {
+        self.ca_key.serialize_pem()
+    }
+
+    /// Load a durable CA certificate and matching private key from absolute paths.
+    pub fn load_from_paths(certificate_path: &Path, private_key_path: &Path) -> Result<Self> {
+        if !certificate_path.is_absolute() || !private_key_path.is_absolute() {
+            return Err(miette!(
+                "proxy CA certificate and key paths must be absolute"
+            ));
+        }
+        if certificate_path == private_key_path {
+            return Err(miette!(
+                "proxy CA certificate and private key must use different paths"
+            ));
+        }
+        let certificate_pem = std::fs::read_to_string(certificate_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("read proxy CA certificate {}", certificate_path.display())
+            })?;
+        let private_key_pem = std::fs::read_to_string(private_key_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("read proxy CA private key {}", private_key_path.display())
+            })?;
+        Self::from_pem(&certificate_pem, &private_key_pem)
+    }
+
+    /// Load a durable CA while preserving the exact certificate bytes supplied
+    /// by the provisioner for boundary launch replay.
+    pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca_key = KeyPair::from_pem(private_key_pem)
+            .into_diagnostic()
+            .wrap_err("parse proxy CA private key")?;
+        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .into_diagnostic()
+            .wrap_err("parse proxy CA certificate")?;
+        if certificates.len() != 1 {
+            return Err(miette!(
+                "proxy CA certificate file must contain exactly one certificate"
+            ));
+        }
+        let private_key = rustls_pemfile::private_key(&mut private_key_pem.as_bytes())
+            .into_diagnostic()
+            .wrap_err("parse proxy CA private key")?
+            .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .into_diagnostic()
+            .wrap_err("proxy CA certificate and private key do not match")?;
+
+        let params = CertificateParams::from_ca_cert_pem(certificate_pem)
+            .into_diagnostic()
+            .wrap_err("parse proxy CA signing certificate")?;
+        let ca_cert = params
+            .self_signed(&ca_key)
+            .into_diagnostic()
+            .wrap_err("initialize proxy CA signer")?;
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            ca_cert_pem: certificate_pem.to_string(),
+        })
     }
 }
 
@@ -170,11 +239,14 @@ impl ProxyTlsState {
 /// Accept TLS from a sandbox client, presenting a dynamic cert for the hostname.
 ///
 /// Returns a TLS stream that can be used for plaintext HTTP inspection.
-pub async fn tls_terminate_client(
-    client: TcpStream,
+pub async fn tls_terminate_client<S>(
+    client: S,
     tls_state: &ProxyTlsState,
     hostname: &str,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let acceptor = tls_state.acceptor_for(hostname)?;
     let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
     Ok(tls_stream)
@@ -557,5 +629,24 @@ mod tests {
             rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
         );
+    }
+
+    #[test]
+    fn durable_ca_round_trip_preserves_certificate_bytes() {
+        let generated = SandboxCa::generate().unwrap();
+        let certificate = generated.cert_pem().to_string();
+        let private_key = generated.private_key_pem();
+        let loaded = SandboxCa::from_pem(&certificate, &private_key).unwrap();
+
+        assert_eq!(loaded.cert_pem(), certificate);
+        assert_eq!(loaded.private_key_pem(), private_key);
+    }
+
+    #[test]
+    fn durable_ca_rejects_mismatched_key_and_relative_paths() {
+        let certificate = SandboxCa::generate().unwrap();
+        let other_key = SandboxCa::generate().unwrap();
+        assert!(SandboxCa::from_pem(certificate.cert_pem(), &other_key.private_key_pem()).is_err());
+        assert!(SandboxCa::load_from_paths(Path::new("ca.pem"), Path::new("ca.key")).is_err());
     }
 }
