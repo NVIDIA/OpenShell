@@ -191,7 +191,7 @@ jobs:
           set -euo pipefail
           gateway_metadata=$(docker buildx imagetools inspect "$GATEWAY_REPOSITORY:$ARTIFACT_TAG" --format '{{json .}}')
           supervisor_metadata=$(docker buildx imagetools inspect "$SUPERVISOR_REPOSITORY:$ARTIFACT_TAG" --format '{{json .}}')
-          exact_platforms='[.manifest.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          exact_platforms='[.manifest.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
           jq -e "$exact_platforms" <<<"$gateway_metadata" >/dev/null
           jq -e "$exact_platforms" <<<"$supervisor_metadata" >/dev/null
           gateway=$(jq -er .manifest.digest <<<"$gateway_metadata")
@@ -269,7 +269,7 @@ jobs:
           supervisor_digest=$(jq -er .artifacts.supervisor.digest <<<"$embedded")
           gateway_metadata=$(docker buildx imagetools inspect "$GATEWAY_REPOSITORY@$gateway_digest" --format '{{json .}}')
           supervisor_metadata=$(docker buildx imagetools inspect "$SUPERVISOR_REPOSITORY@$supervisor_digest" --format '{{json .}}')
-          exact_platforms='[.manifest.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          exact_platforms='[.manifest.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
           jq -e "$exact_platforms" <<<"$gateway_metadata" >/dev/null
           jq -e "$exact_platforms" <<<"$supervisor_metadata" >/dev/null
           python3 tasks/scripts/globster_compatibility_release.py write-receipt \
