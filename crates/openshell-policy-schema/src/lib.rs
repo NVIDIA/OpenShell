@@ -134,6 +134,7 @@ impl McpWireProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyDocument {
     pub version: u32,
     #[serde(
@@ -158,15 +159,10 @@ pub struct PolicyDocument {
     pub network_policies: BTreeMap<String, NetworkPolicyRule>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub network_middlewares: BTreeMap<String, NetworkMiddleware>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub metadata: Option<ManagedPolicyMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilesystemPolicy {
     #[serde(default)]
     pub include_workdir: bool,
@@ -185,12 +181,14 @@ pub enum LandlockCompatibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LandlockPolicy {
     #[serde(default)]
     pub compatibility: LandlockCompatibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessPolicy {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_as_user: String,
@@ -199,6 +197,7 @@ pub struct ProcessPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicyRule {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -213,6 +212,7 @@ pub struct NetworkPolicyRule {
     clippy::struct_excessive_bools,
     reason = "Endpoint DTO mirrors independent policy schema toggles."
 )]
+#[serde(deny_unknown_fields)]
 pub struct NetworkEndpoint {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
@@ -288,24 +288,21 @@ pub struct NetworkEndpoint {
         skip_serializing_if = "Option::is_none"
     )]
     pub mcp: Option<McpConfig>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub review: Option<ReviewAnnotation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkCredentialBinding {
     pub provider: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonRpcConfig {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub max_body_bytes: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     // Presence is retained until authored-policy validation so an omitted
     // allowlist can select the pinned default while an explicit empty list is
@@ -332,6 +329,7 @@ pub struct McpConfig {
     pub allow_all_known_mcp_methods: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphqlOperation {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub operation_type: String,
@@ -342,11 +340,13 @@ pub struct GraphqlOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L7Rule {
     pub allow: L7Allow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L7Allow {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub method: String,
@@ -370,12 +370,6 @@ pub struct L7Allow {
     pub tool: Option<QueryMatcher>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParameterMatcher>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub review: Option<ReviewAnnotation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,12 +391,14 @@ pub enum ParameterMatcher {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnyMatcher {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L7DenyRule {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub method: String,
@@ -429,10 +425,12 @@ pub struct L7DenyRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkBinary {
     pub path: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkMiddleware {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -451,35 +449,12 @@ pub struct NetworkMiddleware {
     pub endpoints: Option<MiddlewareEndpointSelector>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MiddlewareEndpointSelector {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
-}
-
-/// Workflow metadata carried by a managed maximum policy.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedPolicyMetadata {
-    #[serde(default)]
-    pub policy_id: String,
-    #[serde(default)]
-    pub version: u64,
-    #[serde(default)]
-    pub allowed_modes: Vec<String>,
-    #[serde(default)]
-    pub default_mode: String,
-    #[serde(default)]
-    pub audit_label: String,
-}
-
-/// Human-review workflow annotation. It never grants policy authority.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewAnnotation {
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub reason: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`.
@@ -508,27 +483,10 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// Validation profile applied after parsing the shared document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseProfile {
-    /// Authored runtime input: version 1 and only runtime-supported fields.
-    RuntimeStrict,
-    /// Input for maximum-policy containment analysis.
-    ContainmentInput,
-}
-
-/// An unknown field retained from a closed authored-schema object.
+// Unknown fields are collected only to produce fail-closed diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtensionField {
-    pub path: String,
-    pub value: serde_yml::Value,
-}
-
-/// A decoded policy plus unknown closed-object fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedDocument {
-    pub policy: PolicyDocument,
-    pub extensions: Vec<ExtensionField>,
+struct UnknownField {
+    path: String,
 }
 
 /// Resource budgets enforced while noyalib builds the YAML document.
@@ -583,66 +541,42 @@ fn parser_config(limits: ParseLimits) -> serde_yml::ParserConfig {
     config
 }
 
-/// Parse a UTF-8 authored policy with explicit profile and budgets.
-pub fn parse_document_with_limits(
-    source: &str,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<ParsedDocument> {
+/// Parse a UTF-8 authored policy with explicit resource budgets.
+pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<PolicyDocument> {
     let value: serde_yml::Value = serde_yml::from_str_with_config(source, &parser_config(limits))
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
-    let extensions = collect_extensions(&value);
+    let unknown_fields = collect_unknown_fields(&value);
+    if let Some(unknown_field) = unknown_fields.first() {
+        miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
+    }
     let policy: PolicyDocument = serde_yml::from_value(&value)
         .into_diagnostic()
         .wrap_err("failed to decode sandbox policy fields")?;
-    validate_profile(&policy, &extensions, profile)?;
-    Ok(ParsedDocument { policy, extensions })
-}
-
-/// Parse a document while retaining unknown fields for containment auditing.
-pub fn parse_document(source: &str, profile: ParseProfile) -> Result<ParsedDocument> {
-    parse_document_with_limits(source, profile, ParseLimits::default())
-}
-
-/// Parse only the typed policy. Strict consumers should use this convenience
-/// wrapper; containment consumers should use [`parse_document`].
-pub fn parse_policy_with_limits(
-    source: &str,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<PolicyDocument> {
-    Ok(parse_document_with_limits(source, profile, limits)?.policy)
+    validate_policy(&policy)?;
+    Ok(policy)
 }
 
 /// Parse a UTF-8 authored policy with the shared default budgets.
-pub fn parse_policy(source: &str, profile: ParseProfile) -> Result<PolicyDocument> {
-    parse_policy_with_limits(source, profile, ParseLimits::default())
+pub fn parse_policy(source: &str) -> Result<PolicyDocument> {
+    parse_policy_with_limits(source, ParseLimits::default())
 }
 
 /// Parse an authored policy from a byte slice, rejecting invalid UTF-8.
-pub fn parse_policy_bytes(bytes: &[u8], profile: ParseProfile) -> Result<PolicyDocument> {
+pub fn parse_policy_bytes(bytes: &[u8]) -> Result<PolicyDocument> {
     let source = std::str::from_utf8(bytes)
         .into_diagnostic()
         .wrap_err("sandbox policy is not valid UTF-8")?;
-    parse_policy(source, profile)
+    parse_policy(source)
 }
 
 /// Read and parse an authored policy without an unbounded allocation.
-pub fn parse_policy_reader<R: Read>(
-    reader: R,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<PolicyDocument> {
-    Ok(parse_document_reader(reader, profile, limits)?.policy)
+pub fn parse_policy_reader<R: Read>(reader: R, limits: ParseLimits) -> Result<PolicyDocument> {
+    parse_document_reader(reader, limits)
 }
 
-/// Read and parse a document while retaining unknown fields.
-pub fn parse_document_reader<R: Read>(
-    reader: R,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<ParsedDocument> {
+// Read and parse a policy after enforcing the byte limit.
+fn parse_document_reader<R: Read>(reader: R, limits: ParseLimits) -> Result<PolicyDocument> {
     let limit = u64::try_from(limits.max_bytes).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
     reader
@@ -656,24 +590,16 @@ pub fn parse_document_reader<R: Read>(
     let source = std::str::from_utf8(&bytes)
         .into_diagnostic()
         .wrap_err("sandbox policy is not valid UTF-8")?;
-    parse_document_with_limits(source, profile, limits)
+    parse_policy_with_limits(source, limits)
 }
 
 /// Load a regular file with metadata and bounded-read checks.
-pub fn parse_policy_file(
-    path: &Path,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<PolicyDocument> {
-    Ok(parse_document_file(path, profile, limits)?.policy)
+pub fn parse_policy_file(path: &Path, limits: ParseLimits) -> Result<PolicyDocument> {
+    parse_document_file(path, limits)
 }
 
-/// Load a regular file while retaining unknown fields for containment.
-pub fn parse_document_file(
-    path: &Path,
-    profile: ParseProfile,
-    limits: ParseLimits,
-) -> Result<ParsedDocument> {
+// Load and parse a policy after validating the file source.
+fn parse_document_file(path: &Path, limits: ParseLimits) -> Result<PolicyDocument> {
     let metadata = path
         .metadata()
         .into_diagnostic()
@@ -690,14 +616,10 @@ pub fn parse_document_file(
     let file = File::open(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?;
-    parse_document_reader(file, profile, limits)
+    parse_document_reader(file, limits)
 }
 
-fn validate_profile(
-    document: &PolicyDocument,
-    extensions: &[ExtensionField],
-    profile: ParseProfile,
-) -> Result<()> {
+fn validate_policy(document: &PolicyDocument) -> Result<()> {
     if document.version != 1 {
         miette::bail!(
             "unsupported policy version {}; expected version 1",
@@ -719,35 +641,11 @@ fn validate_profile(
             }
         }
     }
-    if profile == ParseProfile::RuntimeStrict {
-        if let Some(extension) = extensions.first() {
-            miette::bail!("unknown field '{}' in authored policy", extension.path);
-        }
-        if document.metadata.is_some() {
-            miette::bail!("managed maximum metadata is not valid in a runtime policy");
-        }
-        for (rule_name, rule) in &document.network_policies {
-            for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
-                if endpoint.review.is_some() {
-                    miette::bail!(
-                        "review annotation is not valid in runtime policy at network_policies.{rule_name}.endpoints[{endpoint_index}].review"
-                    );
-                }
-                for (rule_index, rule) in endpoint.rules.iter().enumerate() {
-                    if rule.allow.review.is_some() {
-                        miette::bail!(
-                            "review annotation is not valid in runtime policy at network_policies.{rule_name}.endpoints[{endpoint_index}].rules[{rule_index}].allow.review"
-                        );
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
-fn collect_extensions(root: &serde_yml::Value) -> Vec<ExtensionField> {
-    let mut extensions = Vec::new();
+fn collect_unknown_fields(root: &serde_yml::Value) -> Vec<UnknownField> {
+    let mut unknown_fields = Vec::new();
     let Some(root) = inspect_closed(
         root,
         "",
@@ -758,42 +656,29 @@ fn collect_extensions(root: &serde_yml::Value) -> Vec<ExtensionField> {
             "process",
             "network_policies",
             "network_middlewares",
-            "metadata",
         ],
-        &mut extensions,
+        &mut unknown_fields,
     ) else {
-        return extensions;
+        return unknown_fields;
     };
 
     inspect_named(
         root.get("filesystem_policy"),
         "filesystem_policy",
         &["include_workdir", "read_only", "read_write"],
-        &mut extensions,
+        &mut unknown_fields,
     );
     inspect_named(
         root.get("landlock"),
         "landlock",
         &["compatibility"],
-        &mut extensions,
+        &mut unknown_fields,
     );
     inspect_named(
         root.get("process"),
         "process",
         &["run_as_user", "run_as_group"],
-        &mut extensions,
-    );
-    inspect_named(
-        root.get("metadata"),
-        "metadata",
-        &[
-            "policy_id",
-            "version",
-            "allowed_modes",
-            "default_mode",
-            "audit_label",
-        ],
-        &mut extensions,
+        &mut unknown_fields,
     );
 
     for (name, rule) in open_map(root.get("network_policies")) {
@@ -802,13 +687,13 @@ fn collect_extensions(root: &serde_yml::Value) -> Vec<ExtensionField> {
             rule,
             &path,
             &["name", "endpoints", "binaries"],
-            &mut extensions,
+            &mut unknown_fields,
         ) {
             for (index, endpoint) in sequence(rule.get("endpoints")).iter().enumerate() {
                 inspect_endpoint(
                     endpoint,
                     &format!("{path}.endpoints[{index}]"),
-                    &mut extensions,
+                    &mut unknown_fields,
                 );
             }
             for (index, binary) in sequence(rule.get("binaries")).iter().enumerate() {
@@ -816,7 +701,7 @@ fn collect_extensions(root: &serde_yml::Value) -> Vec<ExtensionField> {
                     binary,
                     &format!("{path}.binaries[{index}]"),
                     &["path"],
-                    &mut extensions,
+                    &mut unknown_fields,
                 );
             }
         }
@@ -835,21 +720,21 @@ fn collect_extensions(root: &serde_yml::Value) -> Vec<ExtensionField> {
                 "on_error",
                 "endpoints",
             ],
-            &mut extensions,
+            &mut unknown_fields,
         ) {
             inspect_named(
                 middleware.get("endpoints"),
                 &join(&path, "endpoints"),
                 &["include", "exclude"],
-                &mut extensions,
+                &mut unknown_fields,
             );
             // `config` is deliberately an open user-data map.
         }
     }
-    extensions
+    unknown_fields
 }
 
-fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<ExtensionField>) {
+fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
     let Some(endpoint) = inspect_closed(
         value,
         path,
@@ -878,7 +763,6 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<Extensio
             "credential_binding",
             "json_rpc",
             "mcp",
-            "review",
         ],
         out,
     ) else {
@@ -907,12 +791,6 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<Extensio
         ],
         out,
     );
-    inspect_named(
-        endpoint.get("review"),
-        &join(path, "review"),
-        &["required", "reason"],
-        out,
-    );
     for (name, operation) in open_map(endpoint.get("graphql_persisted_queries")) {
         inspect_closed(
             operation,
@@ -924,26 +802,16 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<Extensio
     for (index, rule) in sequence(endpoint.get("rules")).iter().enumerate() {
         let rule_path = format!("{path}.rules[{index}]");
         if let Some(rule) = inspect_closed(rule, &rule_path, &["allow"], out) {
-            inspect_allow(rule.get("allow"), &join(&rule_path, "allow"), true, out);
+            inspect_allow(rule.get("allow"), &join(&rule_path, "allow"), out);
         }
     }
     for (index, deny) in sequence(endpoint.get("deny_rules")).iter().enumerate() {
-        inspect_allow(
-            Some(deny),
-            &format!("{path}.deny_rules[{index}]"),
-            false,
-            out,
-        );
+        inspect_allow(Some(deny), &format!("{path}.deny_rules[{index}]"), out);
     }
 }
 
-fn inspect_allow(
-    value: Option<&serde_yml::Value>,
-    path: &str,
-    allow_review: bool,
-    out: &mut Vec<ExtensionField>,
-) {
-    let mut allowed = vec![
+fn inspect_allow(value: Option<&serde_yml::Value>, path: &str, out: &mut Vec<UnknownField>) {
+    let allowed = vec![
         "method",
         "path",
         "command",
@@ -954,21 +822,10 @@ fn inspect_allow(
         "tool",
         "params",
     ];
-    if allow_review {
-        allowed.push("review");
-    }
     let Some(value) = value else { return };
     let Some(rule) = inspect_closed(value, path, &allowed, out) else {
         return;
     };
-    if allow_review {
-        inspect_named(
-            rule.get("review"),
-            &join(path, "review"),
-            &["required", "reason"],
-            out,
-        );
-    }
     for (name, matcher) in open_map(rule.get("query")) {
         inspect_matcher(matcher, &join(&join(path, "query"), name), out);
     }
@@ -980,13 +837,13 @@ fn inspect_allow(
     }
 }
 
-fn inspect_matcher(value: &serde_yml::Value, path: &str, out: &mut Vec<ExtensionField>) {
+fn inspect_matcher(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
     if value.as_mapping().is_some() {
         inspect_closed(value, path, &["any"], out);
     }
 }
 
-fn inspect_parameter(value: &serde_yml::Value, path: &str, out: &mut Vec<ExtensionField>) {
+fn inspect_parameter(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
     let Some(mapping) = value.as_mapping() else {
         return;
     };
@@ -1004,7 +861,7 @@ fn inspect_named(
     value: Option<&serde_yml::Value>,
     path: &str,
     allowed: &[&str],
-    out: &mut Vec<ExtensionField>,
+    out: &mut Vec<UnknownField>,
 ) {
     if let Some(value) = value {
         inspect_closed(value, path, allowed, out);
@@ -1015,14 +872,13 @@ fn inspect_closed<'a>(
     value: &'a serde_yml::Value,
     path: &str,
     allowed: &[&str],
-    out: &mut Vec<ExtensionField>,
+    out: &mut Vec<UnknownField>,
 ) -> Option<&'a serde_yml::Mapping> {
     let mapping = value.as_mapping()?;
-    for (name, value) in string_entries(mapping) {
+    for (name, _value) in string_entries(mapping) {
         if !allowed.contains(&name) {
-            out.push(ExtensionField {
+            out.push(UnknownField {
                 path: join(path, name),
-                value: value.clone(),
             });
         }
     }
@@ -1247,25 +1103,20 @@ mod tests {
 
     #[test]
     fn requires_version_one() {
-        assert!(parse_policy("version: 2\n", ParseProfile::RuntimeStrict).is_err());
-        assert!(parse_policy("network_policies: {}\n", ParseProfile::RuntimeStrict).is_err());
+        assert!(parse_policy("version: 2\n").is_err());
+        assert!(parse_policy("network_policies: {}\n").is_err());
     }
 
     #[test]
     fn rejects_duplicate_keys() {
-        let error = parse_policy("version: 1\nversion: 1\n", ParseProfile::RuntimeStrict)
-            .expect_err("duplicate key must fail");
+        let error = parse_policy("version: 1\nversion: 1\n").expect_err("duplicate key must fail");
         assert!(error.to_string().contains("parse sandbox policy"));
     }
 
     #[test]
     fn distinguishes_absent_and_empty_filesystem() {
-        let absent = parse_policy("version: 1\n", ParseProfile::RuntimeStrict).unwrap();
-        let empty = parse_policy(
-            "version: 1\nfilesystem_policy: {}\n",
-            ParseProfile::RuntimeStrict,
-        )
-        .unwrap();
+        let absent = parse_policy("version: 1\n").unwrap();
+        let empty = parse_policy("version: 1\nfilesystem_policy: {}\n").unwrap();
         assert!(absent.effective_filesystem_policy().include_workdir);
         assert!(!empty.effective_filesystem_policy().include_workdir);
     }
@@ -1274,7 +1125,6 @@ mod tests {
     fn rejects_oversized_port() {
         assert!(parse_policy(
             "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 65536\n",
-            ParseProfile::RuntimeStrict,
         )
         .is_err());
     }
@@ -1288,7 +1138,7 @@ mod tests {
             "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 443\n        mcp: null\n",
         ] {
             assert!(
-                parse_document(source, ParseProfile::ContainmentInput).is_err(),
+                parse_policy(source).is_err(),
                 "explicit null unexpectedly parsed: {source}"
             );
         }
@@ -1298,7 +1148,7 @@ mod tests {
     fn truncation_paths_are_unicode_safe() {
         let oversized = "é".repeat(ParseLimits::default().max_bytes);
         let source = format!("version: 1\nunknown_{oversized}: true\n");
-        assert!(parse_policy(&source, ParseProfile::RuntimeStrict).is_err());
+        assert!(parse_policy(&source).is_err());
     }
 
     #[test]
@@ -1308,44 +1158,87 @@ mod tests {
     }
 
     #[test]
-    fn containment_retains_nested_unknown_fields_with_paths() {
-        let source = "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: example.com\n        port: 443\n        future_authority: enabled\n";
-        let parsed = parse_document(source, ParseProfile::ContainmentInput).unwrap();
-        assert_eq!(parsed.extensions.len(), 1);
-        assert_eq!(
-            parsed.extensions[0].path,
-            "network_policies.api.endpoints[0].future_authority"
-        );
-        assert!(parse_document(source, ParseProfile::RuntimeStrict).is_err());
+    fn rejects_unknown_fields_at_every_closed_schema_level() {
+        let cases = [
+            ("version: 1\nfuture: true\n", "future"),
+            (
+                "version: 1\nfilesystem_policy: { future: true }\n",
+                "filesystem_policy.future",
+            ),
+            (
+                "version: 1\nlandlock: { future: true }\n",
+                "landlock.future",
+            ),
+            ("version: 1\nprocess: { future: true }\n", "process.future"),
+            (
+                "version: 1\nnetwork_policies: { api: { future: true } }\n",
+                "network_policies.api.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, future: true }] } }\n",
+                "network_policies.api.endpoints[0].future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { binaries: [{ path: /bin/tool, future: true }] } }\n",
+                "network_policies.api.binaries[0].future",
+            ),
+            (
+                "version: 1\nnetwork_middlewares: { audit: { middleware: logger, future: true } }\n",
+                "network_middlewares.audit.future",
+            ),
+            (
+                "version: 1\nnetwork_middlewares: { audit: { middleware: logger, endpoints: { future: true } } }\n",
+                "network_middlewares.audit.endpoints.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, credential_binding: { provider: p, future: true } }] } }\n",
+                "network_policies.api.endpoints[0].credential_binding.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, json_rpc: { future: true } }] } }\n",
+                "network_policies.api.endpoints[0].json_rpc.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, protocol: mcp, mcp: { future: true } }] } }\n",
+                "network_policies.api.endpoints[0].mcp.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, graphql_persisted_queries: { op: { future: true } } }] } }\n",
+                "network_policies.api.endpoints[0].graphql_persisted_queries.op.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ future: true, allow: {} }] }] } }\n",
+                "network_policies.api.endpoints[0].rules[0].future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { future: true } }] }] } }\n",
+                "network_policies.api.endpoints[0].rules[0].allow.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, deny_rules: [{ future: true }] }] } }\n",
+                "network_policies.api.endpoints[0].deny_rules[0].future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { query: { q: { any: [one], future: true } } } }] }] } }\n",
+                "network_policies.api.endpoints[0].rules[0].allow.query.q.future",
+            ),
+            (
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { tool: { any: [one], future: true } } }] }] } }\n",
+                "network_policies.api.endpoints[0].rules[0].allow.tool.future",
+            ),
+        ];
+
+        for (source, expected_path) in cases {
+            let error = parse_policy(source).expect_err("unknown field must fail closed");
+            assert!(
+                error.to_string().contains(expected_path),
+                "missing path {expected_path} in {error:?}"
+            );
+        }
     }
 
     #[test]
-    fn containment_retains_unknown_matcher_fields() {
-        let source = r#"
-version: 1
-network_policies:
-  api:
-    endpoints:
-      - host: example.com
-        port: 443
-        rules:
-          - allow:
-              query:
-                q:
-                  any: ["one"]
-                  future_constraint: true
-"#;
-        let parsed = parse_document(source, ParseProfile::ContainmentInput).unwrap();
-        assert_eq!(parsed.extensions.len(), 1);
-        assert_eq!(
-            parsed.extensions[0].path,
-            "network_policies.api.endpoints[0].rules[0].allow.query.q.future_constraint"
-        );
-        assert!(parse_document(source, ParseProfile::RuntimeStrict).is_err());
-    }
-
-    #[test]
-    fn open_user_maps_do_not_become_extensions() {
+    fn accepts_open_user_data_maps() {
         let source = r#"
 version: 1
 network_middlewares:
@@ -1370,12 +1263,11 @@ network_policies:
                   nested:
                     leaf: "value-*"
 "#;
-        let parsed = parse_document(source, ParseProfile::ContainmentInput).unwrap();
-        assert!(parsed.extensions.is_empty(), "{:?}", parsed.extensions);
+        parse_policy(source).unwrap();
     }
 
     #[test]
-    fn managed_metadata_and_review_are_containment_only() {
+    fn rejects_unsupported_managed_metadata_and_review() {
         let source = r"
 version: 1
 metadata:
@@ -1396,10 +1288,7 @@ network_policies:
               path: /v1/**
               review: { required: true, reason: broad path }
 ";
-        let parsed = parse_document(source, ParseProfile::ContainmentInput).unwrap();
-        assert_eq!(parsed.policy.metadata.unwrap().version, 7);
-        assert!(parsed.extensions.is_empty());
-        assert!(parse_document(source, ParseProfile::RuntimeStrict).is_err());
+        assert!(parse_policy(source).is_err());
     }
 
     #[test]
@@ -1418,9 +1307,8 @@ network_policies:
             alias_anchor_ratio: Some(1.0),
         };
         assert!(
-            parse_document_with_limits(
+            parse_policy_with_limits(
                 "version: 1\nnetwork_policies: {a: {}, b: {}, c: {}}\n",
-                ParseProfile::ContainmentInput,
                 tiny,
             )
             .is_err()
@@ -1433,15 +1321,8 @@ network_policies:
             max_bytes: 12,
             ..ParseLimits::default()
         };
-        assert!(
-            parse_policy_reader(
-                &b"version: 1\nextra"[..],
-                ParseProfile::RuntimeStrict,
-                limits,
-            )
-            .is_err()
-        );
-        assert!(parse_policy_bytes(&[0xff], ParseProfile::RuntimeStrict).is_err());
+        assert!(parse_policy_reader(&b"version: 1\nextra"[..], limits,).is_err());
+        assert!(parse_policy_bytes(&[0xff]).is_err());
     }
 
     #[test]

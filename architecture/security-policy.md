@@ -34,15 +34,10 @@ path normalization.
 Consumers project that syntax into purpose-specific models. `openshell-policy`
 owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
 validation that depends on runtime components. The existing prover retains its
-risk model but parses with the schema crate's `RuntimeStrict` profile. Maximum
-policy containment uses `ContainmentInput`, which retains managed metadata,
-review annotations, and unknown closed-object fields so the solver can report
-unsupported authority instead of misclassifying it as malformed input.
-
-`RuntimeStrict` requires `version: 1` and rejects managed annotations and every
-unknown field. `ContainmentInput` requires the same known field types and
-version, but returns unknown field paths and values to the containment support
-audit. Middleware `config`, query and persisted-query names, and recursive MCP
+risk model but uses the same fail-closed parser as the runtime. The parser
+requires `version: 1` and rejects managed annotations and every unknown field
+before any consumer-specific projection runs. There is no permissive parsing
+profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
 parameter names are open user-data maps rather than schema extensions.
 
 Before applying Landlock, the supervisor enriches baseline filesystem paths that

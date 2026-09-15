@@ -93,8 +93,8 @@ be additive — they don't displace existing categories.
 
 ## Inputs
 
-- **Policy** — authored YAML decoded by `openshell-policy-schema` with the
-  `RuntimeStrict` profile, then projected into the prover-only `PolicyModel`.
+- **Policy** — authored YAML decoded by `openshell-policy-schema` with the shared
+  fail-closed parser, then projected into the prover-only `PolicyModel`.
   Missing `version` and unknown authored fields are rejected consistently with
   runtime parsing. An absent `filesystem_policy` uses the runtime-effective
   `include_workdir: true`; an explicitly present empty object remains `false`.

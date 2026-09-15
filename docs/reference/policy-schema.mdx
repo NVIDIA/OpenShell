@@ -45,18 +45,11 @@ to 64 levels, total AST nodes to 100,000, parser events to 300,000, cumulative
 scalar data to 4 MiB, alias expansions to 100 with a 5:1 alias-to-anchor ratio,
 and each mapping or sequence to 10,000 entries.
 
-Ordinary runtime policy uses the strict profile. Unknown keys in closed schema
-objects are rejected with their field path. The following maps are intentionally
+Unknown keys in closed schema objects are rejected with their field path before
+the policy is converted or analyzed. The following maps are intentionally
 open user namespaces, so their keys are preserved as data: middleware `config`,
 query matcher names, GraphQL persisted-query names, and recursively nested MCP
 `params` names.
-
-The containment profile used by managed maximum-policy tooling retains unknown
-closed-object fields for a fail-closed support audit. It also recognizes
-top-level managed `metadata` and endpoint or allow-rule `review` annotations.
-Those annotations describe workflow, not authority, and ordinary runtime policy
-rejects them. Maximum-policy containment support lands separately from this
-schema boundary.
 
 An absent `filesystem_policy` resolves to the runtime-effective
 `include_workdir: true`. An explicitly present `filesystem_policy: {}` keeps

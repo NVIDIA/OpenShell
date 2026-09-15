@@ -427,7 +427,6 @@ fn allow_proto_to_def(
         fields: allow.fields,
         tool,
         params,
-        review: None,
     }
 }
 
@@ -752,7 +751,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             }),
                             json_rpc,
                             mcp,
-                            review: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -784,7 +782,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         process,
         network_policies,
         network_middlewares,
-        metadata: None,
     })
 }
 
@@ -842,10 +839,7 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // actionable MCP diagnostics the top-level user-facing error.
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_schema::parse_policy(
-        yaml,
-        openshell_policy_schema::ParseProfile::RuntimeStrict,
-    )?;
+    let raw = openshell_policy_schema::parse_policy(yaml)?;
     to_proto(raw)
 }
 
@@ -853,7 +847,6 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
     let raw = openshell_policy_schema::parse_policy_file(
         path,
-        openshell_policy_schema::ParseProfile::RuntimeStrict,
         openshell_policy_schema::ParseLimits::default(),
     )?;
     to_proto(raw)
