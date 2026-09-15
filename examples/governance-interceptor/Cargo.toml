@@ -11,14 +11,15 @@ rust-version = "1.94"
 license = "Apache-2.0"
 
 [dependencies]
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+openshell-crypto = { path = "../../crates/openshell-crypto" }
+jsonwebtoken = "10"
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
 openshell-policy = { path = "../../crates/openshell-policy" }
 openshell-providers = { path = "../../crates/openshell-providers" }
 prost = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 prost-types = "0.14"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }

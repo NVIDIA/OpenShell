@@ -2232,7 +2232,7 @@ mod tests {
     /// the server task (yielding the received CONNECT request), and the
     /// server certificate PEM to use as the corporate CA bundle.
     async fn fake_tls_proxy() -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
-        let key = rcgen::KeyPair::generate().unwrap();
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
         let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
             .unwrap()
             .self_signed(&key)

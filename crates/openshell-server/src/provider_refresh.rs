@@ -1348,7 +1348,7 @@ async fn mint_google_service_account_jwt(
         exp: now_secs.saturating_add(lifetime_secs),
         sub: subject.as_deref(),
     };
-    let assertion = jsonwebtoken::encode(
+    let assertion = openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
@@ -1516,7 +1516,7 @@ async fn request_token(
         }
     }
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -2381,7 +2381,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();

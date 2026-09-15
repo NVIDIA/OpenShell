@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { path = "../openshell-crypto" }
 openshell-core = { path = "../openshell-core" }
 async-trait = "0.1"
 futures = { workspace = true }

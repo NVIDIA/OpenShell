@@ -3,11 +3,12 @@
 
 //! Authenticated negative-path client for the governance example smoke suite.
 
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use openshell_core::proto::{
     GetSandboxConfigRequest, NetworkActivitySummary, PolicyChunk, SubmitPolicyAnalysisRequest,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
+use openshell_crypto::jwt::encode;
 use serde::Serialize;
 use tonic::Code;
 use tonic::metadata::AsciiMetadataValue;

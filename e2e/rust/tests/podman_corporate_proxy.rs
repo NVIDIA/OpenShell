@@ -547,7 +547,7 @@ async fn restart_gateway() -> Result<(), String> {
         .ok_or_else(|| "managed gateway metadata disappeared".to_string())?;
     gateway.stop()?;
     gateway.start()?;
-    wait_for_healthy(Duration::from_secs(120)).await
+    wait_for_healthy(Duration::from_mins(2)).await
 }
 
 /// Names of the per-sandbox corporate proxy credential secrets.
@@ -759,7 +759,7 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
 
     sandbox.cleanup().await;
 
-    wait_for_secret_removal(&sandbox_secret, Duration::from_secs(60))
+    wait_for_secret_removal(&sandbox_secret, Duration::from_mins(1))
         .await
         .expect("sandbox deletion should remove the proxy-auth secret");
 

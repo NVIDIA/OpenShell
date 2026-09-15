@@ -2333,7 +2333,7 @@ const MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES: usize = 1024;
 
 static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> =
     LazyLock::new(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(30))

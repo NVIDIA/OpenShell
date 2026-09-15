@@ -41,7 +41,7 @@ pub struct SandboxCa {
 impl SandboxCa {
     /// Generate a new ephemeral CA keypair.
     pub fn generate() -> Result<Self> {
-        let ca_key = KeyPair::generate().into_diagnostic()?;
+        let ca_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -53,7 +53,7 @@ impl SandboxCa {
             .push(DnType::OrganizationName, "OpenShell");
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-        let ca_cert = params.self_signed(&ca_key).into_diagnostic()?;
+        let ca_cert = openshell_crypto::pki::self_signed(params, &ca_key).into_diagnostic()?;
         let ca_cert_pem = ca_cert.pem();
 
         Ok(Self {
@@ -113,15 +113,15 @@ impl CertCache {
 
     /// Generate a new leaf certificate for the given hostname.
     fn generate_leaf(&self, hostname: &str) -> Result<CertifiedLeaf> {
-        let leaf_key = KeyPair::generate().into_diagnostic()?;
+        let leaf_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::new(vec![hostname.to_string()]).into_diagnostic()?;
         params.distinguished_name.push(DnType::CommonName, hostname);
         params.use_authority_key_identifier_extension = true;
 
-        let leaf_cert = params
-            .signed_by(&leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
-            .into_diagnostic()?;
+        let leaf_cert =
+            openshell_crypto::pki::signed_by(params, &leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
+                .into_diagnostic()?;
 
         let leaf_der = CertificateDer::from(leaf_cert.der().to_vec());
         let ca_der = CertificateDer::from(self.ca.ca_cert.der().to_vec());

@@ -137,7 +137,7 @@ async fn podman_gateway_restart_preserves_running_and_stopped_intent() {
     let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
         .await
         .expect("create long-running Podman sandbox");
-    wait_for_container_running(&sandbox.name, true, Duration::from_secs(60))
+    wait_for_container_running(&sandbox.name, true, Duration::from_mins(1))
         .await
         .expect("Podman sandbox container should initially be running");
 
@@ -157,19 +157,19 @@ async fn podman_gateway_restart_preserves_running_and_stopped_intent() {
             .expect("create Podman sandbox that will remain stopped");
     let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &stopped_sandbox.name]).await;
     assert_eq!(stop_code, 0, "sandbox stop should succeed:\n{stop_output}");
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_mins(2))
         .await
         .expect("Podman sandbox should be stopped before gateway restart");
 
     gateway.stop().expect("stop e2e gateway");
-    wait_for_container_running(&sandbox.name, false, Duration::from_secs(60))
+    wait_for_container_running(&sandbox.name, false, Duration::from_mins(1))
         .await
         .expect("gateway shutdown should stop the running-intent Podman sandbox");
     gateway.start().expect("restart e2e gateway");
-    wait_for_healthy(Duration::from_secs(120))
+    wait_for_healthy(Duration::from_mins(2))
         .await
         .expect("gateway should become healthy after restart");
-    wait_for_container_running(&sandbox.name, true, Duration::from_secs(120))
+    wait_for_container_running(&sandbox.name, true, Duration::from_mins(2))
         .await
         .expect("gateway startup should restart the running-intent Podman sandbox");
 
@@ -179,7 +179,7 @@ async fn podman_gateway_restart_preserves_running_and_stopped_intent() {
         "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
         sandbox.name
     );
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_mins(2))
         .await
         .expect("explicitly stopped Podman sandbox should remain stopped after restart");
 
@@ -187,7 +187,7 @@ async fn podman_gateway_restart_preserves_running_and_stopped_intent() {
         &sandbox.name,
         &["cat", START_FILE],
         "before-restart",
-        Duration::from_secs(240),
+        Duration::from_mins(4),
     )
     .await
     .expect("Podman sandbox should become ready again with its state preserved");

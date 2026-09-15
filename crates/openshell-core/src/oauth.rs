@@ -312,7 +312,7 @@ mod tests {
     }
 
     fn test_client() -> reqwest::Client {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .no_proxy()

@@ -17,8 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD},
@@ -29,7 +27,6 @@ use openshell_core::proto::credentials::v1::{
 };
 use openshell_core::{Error, Result as CoreResult};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::Status;
 
 const HANDLE_VERSION: &str = "v1";
@@ -723,18 +720,11 @@ fn encrypt_bytes(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<EncryptedBytes, Status> {
-    let nonce = random_bytes_status::<NONCE_LEN>()?;
-    let key = aead_key(key_bytes)?;
-    let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(aad),
-        &mut in_out,
-    )
-    .map_err(|_| Status::internal("failed to encrypt default credential storage value"))?;
+    let sealed = openshell_crypto::aead::seal(key_bytes, aad, plaintext)
+        .map_err(|_| Status::internal("failed to encrypt default credential storage value"))?;
     Ok(EncryptedBytes {
-        nonce: BASE64.encode(nonce),
-        ciphertext: BASE64.encode(in_out),
+        nonce: BASE64.encode(sealed.nonce),
+        ciphertext: BASE64.encode(sealed.ciphertext),
     })
 }
 
@@ -744,23 +734,9 @@ fn decrypt_bytes(
     encrypted: &EncryptedBytes,
 ) -> Result<Vec<u8>, Status> {
     let nonce = decode_b64_array::<NONCE_LEN>("nonce", &encrypted.nonce)?;
-    let mut in_out = decode_b64_vec("ciphertext", &encrypted.ciphertext)?;
-    let key = aead_key(key_bytes)?;
-    let plaintext = key
-        .open_in_place(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad),
-            &mut in_out,
-        )
-        .map_err(|_| Status::data_loss("failed to decrypt default credential storage value"))?;
-    Ok(plaintext.to_vec())
-}
-
-fn aead_key(key_bytes: &[u8; KEY_LEN]) -> Result<LessSafeKey, Status> {
-    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| {
-        Status::internal("failed to initialize default credential storage AEAD key")
-    })?;
-    Ok(LessSafeKey::new(unbound))
+    let ciphertext = decode_b64_vec("ciphertext", &encrypted.ciphertext)?;
+    openshell_crypto::aead::open(key_bytes, aad, &nonce, &ciphertext)
+        .map_err(|_| Status::data_loss("failed to decrypt default credential storage value"))
 }
 
 fn dek_aad(id: &str, provider_name: &str, credential_key: &str) -> Vec<u8> {
@@ -898,22 +874,21 @@ fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ()> {
 
 fn random_bytes_core<const N: usize>() -> CoreResult<[u8; N]> {
     let mut bytes = [0_u8; N];
-    SystemRandom::new()
-        .fill(&mut bytes)
+    openshell_crypto::fill_random(&mut bytes)
         .map_err(|_| Error::config("failed to generate default credential storage key material"))?;
     Ok(bytes)
 }
 
 fn random_bytes_status<const N: usize>() -> Result<[u8; N], Status> {
     let mut bytes = [0_u8; N];
-    SystemRandom::new().fill(&mut bytes).map_err(|_| {
+    openshell_crypto::fill_random(&mut bytes).map_err(|_| {
         Status::internal("failed to generate default credential storage randomness")
     })?;
     Ok(bytes)
 }
 
 fn key_id(key: &[u8; KEY_LEN]) -> String {
-    let digest = Sha256::digest(key);
+    let digest = openshell_crypto::sha256(key);
     format!("sha256:{}", hex_encode(&digest))
 }
 
@@ -958,16 +933,8 @@ mod tests {
                 ciphertext: ciphertext.to_string(),
             };
             assert_eq!(decrypt_bytes(&key, &aad, &encrypted).unwrap(), plaintext);
-            let mut sealed = plaintext;
-            aead_key(&key)
-                .unwrap()
-                .seal_in_place_append_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(aad.as_slice()),
-                    &mut sealed,
-                )
-                .unwrap();
-            assert_eq!(BASE64.encode(sealed), ciphertext);
+            let sealed = encrypt_bytes(&key, &aad, &plaintext).unwrap();
+            assert_eq!(decrypt_bytes(&key, &aad, &sealed).unwrap(), plaintext);
             assert!(decrypt_bytes(&key, b"wrong-aad", &encrypted).is_err());
             assert!(decrypt_bytes(&[0xff; KEY_LEN], &aad, &encrypted).is_err());
         }

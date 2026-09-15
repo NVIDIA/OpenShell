@@ -11,8 +11,6 @@
 //! validator and any future external verifiers.
 
 use miette::{IntoDiagnostic, Result, WrapErr};
-use rcgen::{KeyPair, PKCS_ED25519};
-use sha2::{Digest, Sha256};
 
 /// All PEM-encoded material needed to mint and validate sandbox JWTs.
 ///
@@ -39,7 +37,7 @@ pub struct JwtKeyMaterial {
 /// (validation), so the gateway can round-trip its own tokens with no
 /// further conversion.
 pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
-    let keypair = KeyPair::generate_for(&PKCS_ED25519)
+    let keypair = openshell_crypto::pki::generate_jwt_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate Ed25519 JWT signing key")?;
     let signing_key_pem = keypair.serialize_pem();
@@ -58,7 +56,7 @@ pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
 /// signing keys a single deployment ever has, while staying short enough
 /// to keep JWT headers compact.
 fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
-    let digest = Sha256::digest(public_key_der);
+    let digest = openshell_crypto::sha256(public_key_der);
     hex_encode_prefix(&digest, 16)
 }
 

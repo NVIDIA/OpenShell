@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-crypto = { path = "../openshell-crypto" }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
