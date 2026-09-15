@@ -58,7 +58,7 @@ of downloading `vm-runtime-<platform>.tar.zst`.
 - `vm-runtime-linux-x86_64.tar.zst`
 - `vm-runtime-darwin-aarch64.tar.zst`
 
-Those artifacts stay on the rolling `vm-runtime-capability-free` release. Normal `dev` and `v*`
+Those artifacts stay on the rolling `vm-runtime` release. Normal `dev` and `v*`
 release workflows download them, embed them into `openshell-driver-vm`, and
 publish the driver binary next to `openshell-gateway`.
 
