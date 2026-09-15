@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
@@ -18,6 +18,15 @@ use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::Subscriber
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum SupervisorRole {
+    /// Attach an Isolation Backend and supervise one sandbox generation.
+    #[default]
+    IsolationBackend,
+    /// Run only the explicit HTTP/CONNECT network proxy.
+    NetworkProxy,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-supervisor health")]
@@ -33,6 +42,10 @@ struct HealthArgs {
 #[command(about = "OpenShell policy and workload supervisor")]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Supervisor responsibility to run.
+    #[arg(long, value_enum, default_value_t)]
+    role: SupervisorRole,
+
     /// Command to execute as the canonical workload process.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -94,11 +107,19 @@ struct Args {
     upstream_proxy_ca_bundle: Option<String>,
 
     #[arg(long)]
-    backend_descriptor_file: PathBuf,
+    backend_descriptor_file: Option<PathBuf>,
 
     /// Protected gateway-issued credentials for this exact sandbox launch.
     #[arg(long)]
-    auth_bundle_file: PathBuf,
+    auth_bundle_file: Option<PathBuf>,
+
+    /// Loopback HTTP/CONNECT listener used by `--role=network-proxy`.
+    #[arg(long)]
+    listen: Option<std::net::SocketAddr>,
+
+    /// Directory for the generated proxy CA certificate and trust bundle.
+    #[arg(long)]
+    tls_dir: Option<PathBuf>,
 
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
@@ -152,12 +173,11 @@ fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
 }
 
 fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
-    let payload = std::fs::read(&args.backend_descriptor_file).map_err(|error| {
-        miette::miette!(
-            "read backend descriptor {}: {error}",
-            args.backend_descriptor_file.display()
-        )
+    let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
+        miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
+    let payload = std::fs::read(path)
+        .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
     Ok(BackendDescriptor {
         backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
         payload,
@@ -165,10 +185,13 @@ fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
 }
 
 fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle> {
-    let bytes = std::fs::read(&args.auth_bundle_file).map_err(|error| {
+    let path = args.auth_bundle_file.as_deref().ok_or_else(|| {
+        miette::miette!("--auth-bundle-file is required for --role=isolation-backend")
+    })?;
+    let bytes = std::fs::read(path).map_err(|error| {
         miette::miette!(
             "read supervisor authentication bundle {}: {error}",
-            args.auth_bundle_file.display()
+            path.display()
         )
     })?;
     let bundle = serde_json::from_slice::<openshell_core::jwt::SupervisorAuthBundle>(&bytes)
@@ -177,6 +200,64 @@ fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle>
         .validate()
         .map_err(|error| miette::miette!("validate supervisor authentication bundle: {error}"))?;
     Ok(bundle)
+}
+
+fn validate_role_arguments(args: &Args) -> Result<()> {
+    match args.role {
+        SupervisorRole::IsolationBackend => {
+            if args.backend_descriptor_file.is_none() {
+                return Err(miette::miette!(
+                    "--backend-descriptor-file is required for --role=isolation-backend"
+                ));
+            }
+            if args.auth_bundle_file.is_none() {
+                return Err(miette::miette!(
+                    "--auth-bundle-file is required for --role=isolation-backend"
+                ));
+            }
+            if args.listen.is_some() {
+                return Err(miette::miette!(
+                    "--listen is only valid with --role=network-proxy"
+                ));
+            }
+            if args.tls_dir.is_some() {
+                return Err(miette::miette!(
+                    "--tls-dir is only valid with --role=network-proxy"
+                ));
+            }
+        }
+        SupervisorRole::NetworkProxy => {
+            if args.backend_descriptor_file.is_some()
+                || args.auth_bundle_file.is_some()
+                || args.sandbox_id.is_some()
+                || args.sandbox.is_some()
+                || args.openshell_endpoint.is_some()
+                || args.ssh_socket_path.is_some()
+                || args.health_socket_path.is_some()
+                || args.main_exit_marker.is_some()
+                || args.parent_liveness_fd.is_some()
+            {
+                return Err(miette::miette!(
+                    "--role=network-proxy does not use sandbox identity, gateway, runtime, or process-control arguments"
+                ));
+            }
+            if !args.command.is_empty()
+                || args.workdir.is_some()
+                || args.interactive
+                || args.timeout != 0
+            {
+                return Err(miette::miette!(
+                    "--role=network-proxy does not launch or manage a workload"
+                ));
+            }
+            if args.policy_rules.is_none() || args.policy_data.is_none() {
+                return Err(miette::miette!(
+                    "--policy-rules and --policy-data are required for --role=network-proxy"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_main_exit_marker(marker: Option<&Path>) -> Result<()> {
@@ -209,14 +290,20 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_fd)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
-    let backend_descriptor = backend_descriptor(&args)?;
-    let auth_bundle = auth_bundle(&args)?;
-    // Install the driver-provisioned session before starting log push or any
-    // other gateway client. `run_sandbox` obtains the same Sandbox Protocol
-    // bearer slot after it validates the runtime descriptor binding.
-    let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
+        let descriptor = backend_descriptor(&args)?;
+        let auth = auth_bundle(&args)?;
+        // Install the driver-provisioned session before starting log push or
+        // any other gateway client. `run_sandbox` obtains the same Sandbox
+        // Protocol bearer slot after validating the descriptor binding.
+        let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
+        Some((descriptor, auth))
+    } else {
+        None
+    };
 
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -238,8 +325,8 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
-            (&args.sandbox_id, &args.openshell_endpoint)
+        let log_push_state = if args.role == SupervisorRole::IsolationBackend
+            && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {
             let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
                 endpoint.clone(),
@@ -317,8 +404,6 @@ fn main() -> Result<()> {
                 config.await_main_process_attachment,
             )
         };
-        info!(command = ?command, "Starting sandbox supervision");
-
         let upstream_proxy_args = openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs {
             https_proxy: args.upstream_proxy,
             proxy_dial_ip: args.upstream_proxy_dial_ip,
@@ -328,30 +413,56 @@ fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
             proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
-        let admitted_isolation_backend =
-            std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-
-        openshell_supervisor::run_sandbox(
-            command,
-            workdir,
-            args.timeout,
-            interactive,
-            await_main_process_attachment,
-            args.sandbox_id,
-            args.sandbox,
-            args.openshell_endpoint,
-            args.policy_rules,
-            args.policy_data,
-            args.ssh_socket_path,
-            args.health_socket_path,
-            ocsf_enabled,
-            upstream_proxy_args,
-            backend_descriptor,
-            auth_bundle,
-            admitted_isolation_backend,
-            args.main_exit_marker,
-        )
-        .await
+        match args.role {
+            SupervisorRole::IsolationBackend => {
+                info!(command = ?command, "Starting sandbox supervision");
+                let Some((backend_descriptor, auth_bundle)) = isolation_inputs else {
+                    return Err(miette::miette!(
+                        "isolation-backend role started without validated runtime inputs"
+                    ));
+                };
+                let admitted_isolation_backend =
+                    std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
+                openshell_supervisor::run_sandbox(
+                    command,
+                    workdir,
+                    args.timeout,
+                    interactive,
+                    await_main_process_attachment,
+                    args.sandbox_id,
+                    args.sandbox,
+                    args.openshell_endpoint,
+                    args.policy_rules,
+                    args.policy_data,
+                    args.ssh_socket_path,
+                    args.health_socket_path,
+                    ocsf_enabled,
+                    upstream_proxy_args,
+                    backend_descriptor,
+                    auth_bundle,
+                    admitted_isolation_backend,
+                    args.main_exit_marker,
+                )
+                .await
+            }
+            SupervisorRole::NetworkProxy => {
+                let listen = args.listen.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
+                let (Some(policy_rules), Some(policy_data)) = (args.policy_rules, args.policy_data)
+                else {
+                    return Err(miette::miette!(
+                        "network-proxy role started without validated policy files"
+                    ));
+                };
+                openshell_supervisor::run_network_proxy(
+                    listen,
+                    policy_rules,
+                    policy_data,
+                    args.tls_dir,
+                    upstream_proxy_args,
+                )
+                .await
+            }
+        }
     })?;
 
     std::process::exit(exit_code);
@@ -362,7 +473,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_specific_cli_has_no_mode_switch() {
+    fn isolation_backend_is_the_default_role() {
         let directory = tempfile::tempdir().expect("temporary runtime descriptor directory");
         let descriptor_path = directory.path().join("runtime-descriptor.json");
         let auth_bundle_path = directory.path().join("auth-bundle.json");
@@ -378,6 +489,8 @@ mod tests {
             auth_bundle_path.to_str().expect("UTF-8 auth bundle path"),
         ])
         .expect("supervisor arguments");
+        assert_eq!(args.role, SupervisorRole::IsolationBackend);
+        assert!(validate_role_arguments(&args).is_ok());
         assert_eq!(
             backend_descriptor(&args)
                 .expect("runtime descriptor")
@@ -387,8 +500,55 @@ mod tests {
     }
 
     #[test]
-    fn backend_descriptor_is_mandatory() {
-        assert!(Args::try_parse_from(["openshell-supervisor"]).is_err());
+    fn isolation_backend_inputs_are_mandatory() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn network_proxy_accepts_local_policy_files() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--role",
+            "network-proxy",
+            "--policy-rules",
+            "/tmp/policy.rego",
+            "--policy-data",
+            "/tmp/policy.yaml",
+        ])
+        .expect("network-proxy arguments");
+        assert_eq!(args.role, SupervisorRole::NetworkProxy);
+        assert!(validate_role_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn network_proxy_rejects_isolation_inputs() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--role",
+            "network-proxy",
+            "--policy-rules",
+            "/tmp/policy.rego",
+            "--policy-data",
+            "/tmp/policy.yaml",
+            "--backend-descriptor-file",
+            "/tmp/descriptor.json",
+        ])
+        .expect("network-proxy arguments");
+        assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn network_proxy_requires_both_policy_files() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--role",
+            "network-proxy",
+            "--policy-rules",
+            "/tmp/policy.rego",
+        ])
+        .expect("network-proxy arguments");
+        assert!(validate_role_arguments(&args).is_err());
     }
 
     #[test]

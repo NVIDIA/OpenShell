@@ -283,6 +283,127 @@ fn shared_ssh_socket_value(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
+/// Run the supervisor as an explicit HTTP/CONNECT network proxy.
+///
+/// This role deliberately bypasses the Isolation Backend: it does not attach
+/// a Sandbox Runtime, launch a workload, or claim process and binary identity.
+/// It reuses the same local Rego/YAML policy engine and proxy implementation as
+/// sandbox supervision.
+///
+/// # Errors
+///
+/// Returns an error when policy loading or proxy startup fails, or when the
+/// proxy accept loop exits unexpectedly.
+pub async fn run_network_proxy(
+    listen: std::net::SocketAddr,
+    policy_rules: String,
+    policy_data: String,
+    tls_dir: Option<std::path::PathBuf>,
+    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+) -> Result<i32> {
+    if !listen.ip().is_loopback() {
+        return Err(miette::miette!(
+            "network-proxy listener must use a loopback address: {listen}"
+        ));
+    }
+
+    let hostname = std::fs::read_to_string("/etc/hostname").map_or_else(
+        |_| "openshell-supervisor".to_string(),
+        |value| value.trim().to_string(),
+    );
+    if !openshell_ocsf::ctx::set_ctx(EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: "network-proxy".to_string(),
+        container_image: String::new(),
+        hostname,
+        product_version: openshell_core::VERSION.to_string(),
+        proxy_ip: listen.ip(),
+        proxy_port: listen.port(),
+    }) {
+        debug!("OCSF context already initialized, keeping existing");
+    }
+
+    let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
+    let (mut policy, opa_engine, _, _, _, initial_agent_proposals_enabled, _) = load_policy(
+        None,
+        None,
+        None,
+        Some(policy_rules),
+        Some(policy_data),
+        &extension_credentials,
+        LocalPolicyIdentity::EndpointOnly,
+    )
+    .await?;
+    policy.network = NetworkPolicy {
+        mode: NetworkMode::Proxy,
+        proxy: Some(ProxyPolicy {
+            http_addr: Some(listen),
+        }),
+    };
+
+    let provider_credentials = ProviderCredentialState::from_environment(
+        0,
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let (_, workspace_rx) = tokio::sync::watch::channel(String::new());
+    let tls_dir = tls_dir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("openshell-supervisor-{}", std::process::id()))
+    });
+    let mut networking = openshell_supervisor_network::run::run_networking(
+        &policy,
+        None,
+        opa_engine.as_ref(),
+        None,
+        Arc::new(AtomicU32::new(0)),
+        false,
+        &provider_credentials,
+        None,
+        Some("network-proxy"),
+        None,
+        None,
+        None,
+        AgentProposals::new(initial_agent_proposals_enabled),
+        workspace_rx,
+        &upstream_proxy_args,
+        Some(&tls_dir),
+        None,
+        #[cfg(target_os = "linux")]
+        None,
+        None,
+    )
+    .await?;
+
+    if let Some((ca_certificate, trust_bundle)) = networking.ca_file_paths.as_ref() {
+        info!(
+            ca_certificate = %ca_certificate.display(),
+            trust_bundle = %trust_bundle.display(),
+            "Network-proxy trust files ready"
+        );
+    }
+
+    let proxy = networking
+        .proxy
+        .as_mut()
+        .ok_or_else(|| miette::miette!("network-proxy role did not start a proxy listener"))?;
+    let bound = proxy
+        .http_addr()
+        .ok_or_else(|| miette::miette!("network-proxy role did not bind an explicit listener"))?;
+    let exited = proxy
+        .take_exit_receiver()
+        .ok_or_else(|| miette::miette!("network-proxy exit monitor is unavailable"))?;
+    info!(%bound, "Network-proxy role ready");
+
+    tokio::select! {
+        _ = exited => Err(miette::miette!("network-proxy accept loop exited unexpectedly")),
+        () = wait_for_control_shutdown_signal() => {
+            drop(networking);
+            Ok(0)
+        }
+    }
+}
+
 /// Run a command in the sandbox.
 ///
 /// # Errors
@@ -368,6 +489,7 @@ pub async fn run_sandbox(
         policy_rules,
         policy_data,
         &extension_credentials,
+        LocalPolicyIdentity::Required,
     )
     .await?;
 
@@ -612,6 +734,7 @@ pub async fn run_sandbox(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
+            None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
@@ -1785,6 +1908,12 @@ where
 /// Returns the policy, the OPA engine, and (for gRPC mode) the original proto
 /// policy. The proto is retained so the OPA engine can be rebuilt with symlink
 /// resolution after the container entrypoint starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalPolicyIdentity {
+    Required,
+    EndpointOnly,
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -1792,6 +1921,7 @@ async fn load_policy(
     policy_rules: Option<String>,
     policy_data: Option<String>,
     extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
+    local_policy_identity: LocalPolicyIdentity,
 ) -> Result<(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
@@ -1817,11 +1947,20 @@ async fn load_policy(
             openshell_supervisor_middleware_builtins::validate_config(implementation, config)
                 .map_err(|error| error.to_string())
         };
-        let engine = OpaEngine::from_files_with_middleware_config(
-            std::path::Path::new(policy_file),
-            std::path::Path::new(data_file),
-            Some(&validate_middleware_config),
-        )?;
+        let policy_path = std::path::Path::new(policy_file);
+        let data_path = std::path::Path::new(data_file);
+        let engine = match local_policy_identity {
+            LocalPolicyIdentity::Required => OpaEngine::from_files_with_middleware_config(
+                policy_path,
+                data_path,
+                Some(&validate_middleware_config),
+            )?,
+            LocalPolicyIdentity::EndpointOnly => OpaEngine::from_files_for_endpoint_only_proxy(
+                policy_path,
+                data_path,
+                Some(&validate_middleware_config),
+            )?,
+        };
         let middleware_registry =
             openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
                 openshell_supervisor_middleware_builtins::services(),

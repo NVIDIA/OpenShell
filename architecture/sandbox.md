@@ -130,6 +130,31 @@ redirect into an allowed subtree.
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
 their ownership, terminal behavior, and known gaps.
 
+### Standalone network proxy
+
+`openshell-supervisor --role=network-proxy` runs the policy proxy without an
+Isolation Backend or `openshell-sandbox`. It accepts explicit HTTP proxy and
+CONNECT requests on a loopback listener and applies the same local Rego rules,
+YAML policy data, destination checks, and L7 enforcement used by supervised
+sandboxes:
+
+```shell
+openshell-supervisor \
+  --role=network-proxy \
+  --listen=127.0.0.1:3128 \
+  --tls-dir=/tmp/openshell-proxy-tls \
+  --policy-rules=/path/to/sandbox-policy.rego \
+  --policy-data=/path/to/sandbox-policy.yaml
+```
+
+The standalone listener cannot observe which process opened a connection, so
+this role evaluates endpoint and protocol rules without binary identity. It
+does not launch a workload, attach a Sandbox Runtime, fetch gateway policy,
+inject provider credentials, or provide exec and lifecycle operations. The
+listener is loopback-only. TLS interception writes its generated public CA and
+combined trust bundle to `--tls-dir`; when omitted, the supervisor uses a
+process-specific directory under the system temporary directory.
+
 The sandbox installs one seccomp user-notification listener on a dedicated
 launcher thread. Every canonical and exec process inherits that listener. It
 virtualizes supported INET sockets before they enter the agent FD table, copies

@@ -141,6 +141,7 @@ pub struct SandboxConfig {
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
+    binary_identity_required: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -269,17 +270,23 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
-    fn with_engine(engine: regorus::Engine) -> Self {
+    fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
             engine: Mutex::new(engine),
+            binary_identity_required,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
+    }
+
+    /// Whether network authorization requires a workload binary identity.
+    pub const fn binary_identity_required(&self) -> bool {
+        self.binary_identity_required
     }
 
     fn advance_generation(&self) -> u64 {
@@ -302,6 +309,36 @@ impl OpaEngine {
         data_path: &Path,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            true,
+            validate_middleware_config,
+        )
+    }
+
+    /// Load local policy for a standalone proxy that cannot observe the
+    /// calling process. Authorization is based on the requested endpoint and
+    /// protocol rules instead of binary identity.
+    pub fn from_files_for_endpoint_only_proxy(
+        policy_path: &Path,
+        data_path: &Path,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            false,
+            validate_middleware_config,
+        )
+    }
+
+    fn from_files_with_identity_requirement(
+        policy_path: &Path,
+        data_path: &Path,
+        require_binary_identity: bool,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
             miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
         })?;
@@ -309,7 +346,6 @@ impl OpaEngine {
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let require_binary_identity = true;
         emit_binary_identity_mode(require_binary_identity, "files");
         let data_json = preprocess_yaml_data(
             &yaml_str,
@@ -319,7 +355,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -365,7 +401,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -454,7 +490,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -3770,7 +3806,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine::with_engine(rego);
+        let engine = OpaEngine::with_engine(rego, true);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
