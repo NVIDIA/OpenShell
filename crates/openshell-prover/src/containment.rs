@@ -598,11 +598,17 @@ fn check_within_boundary_inner(
     options: CheckOptions,
     cancelled: Option<&AtomicBool>,
 ) -> CheckResult {
-    if let Some(reason) = unsupported_reason("boundary", boundary) {
-        return unsupported(reason.0, reason.1);
+    if let Err(feature) = validate_supported_policy(PolicySide::Boundary, boundary) {
+        return unsupported(
+            feature.reason_code,
+            format!("boundary policy {}", feature.detail),
+        );
     }
-    if let Some(reason) = unsupported_reason("candidate", candidate) {
-        return unsupported(reason.0, reason.1);
+    if let Err(feature) = validate_supported_policy(PolicySide::Candidate, candidate) {
+        return unsupported(
+            feature.reason_code,
+            format!("candidate policy {}", feature.detail),
+        );
     }
     if let Some(reason) = resource_limit_reason(boundary, candidate) {
         return CheckResult::Inconclusive(ReasonEvidence {
@@ -1524,169 +1530,339 @@ fn path_is_covered(candidate: &str, boundary_paths: &[String]) -> bool {
         .any(|boundary| boundary == "/" || candidate == boundary)
 }
 
-fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(ReasonCode, String)> {
-    let unsupported = |detail: String| {
-        Some((
-            ReasonCode::UnsupportedPolicyShape,
-            format!("{label} policy {detail}"),
-        ))
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicySide {
+    Boundary,
+    Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedFeature {
+    reason_code: ReasonCode,
+    detail: String,
+}
+
+impl UnsupportedFeature {
+    fn policy_shape(detail: impl Into<String>) -> Self {
+        Self {
+            reason_code: ReasonCode::UnsupportedPolicyShape,
+            detail: detail.into(),
+        }
+    }
+}
+
+fn validate_supported_policy(
+    side: PolicySide,
+    policy: &ContainmentPolicy,
+) -> Result<(), UnsupportedFeature> {
+    validate_supported_common_policy(side, policy)?;
+    validate_supported_filesystem(&policy.filesystem_policy)?;
+    for (rule_name, rule) in &policy.network_policies {
+        validate_supported_network_rule(rule_name, rule)?;
+    }
+    validate_no_cross_protocol_overlap(policy)
+}
+
+fn validate_supported_common_policy(
+    side: PolicySide,
+    policy: &ContainmentPolicy,
+) -> Result<(), UnsupportedFeature> {
     if !policy.extra.is_empty() {
-        return unsupported(format!(
+        return Err(UnsupportedFeature::policy_shape(format!(
             "uses unsupported top-level fields: {}",
             keys(&policy.extra)
-        ));
+        )));
     }
-    if label == "candidate" && policy.metadata.is_some() {
-        return unsupported("contains managed-boundary metadata".to_owned());
+    if side == PolicySide::Candidate && policy.metadata.is_some() {
+        return Err(UnsupportedFeature::policy_shape(
+            "contains managed-boundary metadata",
+        ));
     }
     if policy
         .metadata
         .as_ref()
         .is_some_and(|metadata| !metadata.extra.is_empty())
     {
-        return unsupported("uses unsupported managed-metadata fields".to_owned());
+        return Err(UnsupportedFeature::policy_shape(
+            "uses unsupported managed-metadata fields",
+        ));
     }
     if policy.landlock.is_some()
         || policy.process.is_some()
         || !policy.network_middlewares.is_empty()
     {
-        return unsupported("uses process, Landlock, or network middleware controls".to_owned());
-    }
-    if !policy.filesystem_policy.extra.is_empty() {
-        return unsupported(format!(
-            "uses unsupported filesystem fields: {}",
-            keys(&policy.filesystem_policy.extra)
+        return Err(UnsupportedFeature::policy_shape(
+            "uses process, Landlock, or network middleware controls",
         ));
     }
-    for (rule_name, rule) in &policy.network_policies {
-        if !rule.extra.is_empty() {
-            return unsupported(format!("rule '{rule_name}' uses unsupported fields"));
+    Ok(())
+}
+
+fn validate_supported_filesystem(policy: &FilesystemPolicy) -> Result<(), UnsupportedFeature> {
+    if !policy.extra.is_empty() {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "uses unsupported filesystem fields: {}",
+            keys(&policy.extra)
+        )));
+    }
+    Ok(())
+}
+
+fn validate_supported_network_rule(
+    rule_name: &str,
+    rule: &NetworkRule,
+) -> Result<(), UnsupportedFeature> {
+    if !rule.extra.is_empty() {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "rule '{rule_name}' uses unsupported fields"
+        )));
+    }
+    for binary in &rule.binaries {
+        validate_supported_binary(rule_name, binary)?;
+    }
+    for endpoint in &rule.endpoints {
+        validate_supported_endpoint(rule_name, endpoint)?;
+    }
+    Ok(())
+}
+
+fn validate_supported_binary(rule_name: &str, binary: &Binary) -> Result<(), UnsupportedFeature> {
+    if let Some(reason) = unsupported_network_literal(&binary.path) {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "rule '{rule_name}' binary path {reason}"
+        )));
+    }
+    if binary.path.is_empty()
+        || !is_canonical_pattern_path(&binary.path)
+        || !binary.extra.is_empty()
+        || unsupported_glob(&binary.path)
+    {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "rule '{rule_name}' uses an unsupported binary"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_supported_endpoint(
+    rule_name: &str,
+    endpoint: &Endpoint,
+) -> Result<(), UnsupportedFeature> {
+    let context = format!("rule '{rule_name}'");
+    validate_shared_endpoint(&context, endpoint)?;
+    validate_supported_endpoint_extensions(&context, endpoint)?;
+    match validate_supported_protocol(&context, endpoint)? {
+        Protocol::L4 => validate_supported_l4(&context, endpoint),
+        Protocol::Rest => validate_supported_rest(&context, endpoint),
+    }
+}
+
+fn validate_shared_endpoint(context: &str, endpoint: &Endpoint) -> Result<(), UnsupportedFeature> {
+    if let Some(reason) = unsupported_network_literal(&endpoint.host) {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} endpoint host {reason}"
+        )));
+    }
+    if let Some(reason) = unsupported_network_literal(&endpoint.path) {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} endpoint path {reason}"
+        )));
+    }
+    if endpoint.host.is_empty()
+        || endpoint.effective_ports().is_empty()
+        || (endpoint.port != 0 && !endpoint.ports.is_empty())
+    {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} has no unambiguous host and port"
+        )));
+    }
+    if unsupported_host_glob(&endpoint.host) {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} endpoint host uses an unsupported pattern"
+        )));
+    }
+    if unsupported_glob(&endpoint.path)
+        || (!endpoint.path.is_empty() && !is_canonical_pattern_path(&endpoint.path))
+    {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses an unsupported glob"
+        )));
+    }
+    if !endpoint.path.is_empty() && !endpoint.path.starts_with('/') {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses a non-canonical endpoint path"
+        )));
+    }
+    if endpoint.host.contains(':') {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses an IP-literal shape outside the DNS host model"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_supported_endpoint_extensions(
+    context: &str,
+    endpoint: &Endpoint,
+) -> Result<(), UnsupportedFeature> {
+    if !endpoint.extra.is_empty()
+        || !endpoint.allowed_ips.is_empty()
+        || !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
+        || endpoint.allow_encoded_slash
+        || endpoint.websocket_credential_rewrite
+        || endpoint.request_body_credential_rewrite
+        || endpoint.allow_uninspected_credentials
+        || !endpoint.review.extra.is_empty()
+    {
+        return unsupported_endpoint_extension(context);
+    }
+    validate_supported_graphql(context, endpoint)?;
+    validate_supported_credentials(context, endpoint)?;
+    validate_supported_json_rpc(context, endpoint)?;
+    validate_supported_mcp(context, endpoint)
+}
+
+fn unsupported_endpoint_extension(context: &str) -> Result<(), UnsupportedFeature> {
+    Err(UnsupportedFeature::policy_shape(format!(
+        "{context} uses authority outside the initial model"
+    )))
+}
+
+fn validate_supported_graphql(
+    context: &str,
+    endpoint: &Endpoint,
+) -> Result<(), UnsupportedFeature> {
+    if !endpoint.persisted_queries.is_empty()
+        || !endpoint.graphql_persisted_queries.is_empty()
+        || endpoint.graphql_max_body_bytes != 0
+    {
+        return unsupported_endpoint_extension(context);
+    }
+    Ok(())
+}
+
+fn validate_supported_credentials(
+    context: &str,
+    endpoint: &Endpoint,
+) -> Result<(), UnsupportedFeature> {
+    if !endpoint.credential_signing.is_empty()
+        || !endpoint.signing_service.is_empty()
+        || !endpoint.signing_region.is_empty()
+        || endpoint.credential_binding.is_some()
+    {
+        return unsupported_endpoint_extension(context);
+    }
+    Ok(())
+}
+
+fn validate_supported_json_rpc(
+    context: &str,
+    endpoint: &Endpoint,
+) -> Result<(), UnsupportedFeature> {
+    if endpoint.json_rpc.is_some() {
+        return unsupported_endpoint_extension(context);
+    }
+    Ok(())
+}
+
+fn validate_supported_mcp(context: &str, endpoint: &Endpoint) -> Result<(), UnsupportedFeature> {
+    if endpoint.mcp.is_some() {
+        return unsupported_endpoint_extension(context);
+    }
+    Ok(())
+}
+
+fn validate_supported_protocol(
+    context: &str,
+    endpoint: &Endpoint,
+) -> Result<Protocol, UnsupportedFeature> {
+    match endpoint.protocol.to_ascii_lowercase().as_str() {
+        "" | "tcp" => Ok(Protocol::L4),
+        "rest" => Ok(Protocol::Rest),
+        _ => Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses protocol '{}'; only L4 TCP and REST are modeled",
+            endpoint.protocol
+        ))),
+    }
+}
+
+fn validate_supported_l4(context: &str, endpoint: &Endpoint) -> Result<(), UnsupportedFeature> {
+    if endpoint.protocol.eq_ignore_ascii_case("tcp") && endpoint.host.parse::<IpAddr>().is_ok() {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses an IP literal with explicit TCP semantics"
+        )));
+    }
+    if !endpoint.enforcement.is_empty()
+        || !endpoint.access.is_empty()
+        || !endpoint.path.is_empty()
+        || !endpoint.rules.is_empty()
+        || !endpoint.deny_rules.is_empty()
+    {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} mixes REST controls into L4 authority"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_supported_rest(context: &str, endpoint: &Endpoint) -> Result<(), UnsupportedFeature> {
+    if endpoint.enforcement != "enforce" {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} uses REST without enforced inspection"
+        )));
+    }
+    if (!endpoint.access.is_empty() && !endpoint.rules.is_empty())
+        || (endpoint.access.is_empty() && endpoint.rules.is_empty())
+        || (!endpoint.access.is_empty()
+            && !matches!(
+                endpoint.access.as_str(),
+                "read-only" | "read-write" | "full"
+            ))
+    {
+        return Err(UnsupportedFeature::policy_shape(format!(
+            "{context} has an unsupported REST allow shape"
+        )));
+    }
+    for rule in &endpoint.rules {
+        if let Some(reason) = unsupported_network_literal(&rule.allow.method) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} REST allow method {reason}"
+            )));
         }
-        for binary in &rule.binaries {
-            if let Some(reason) = unsupported_network_literal(&binary.path) {
-                return unsupported(format!("rule '{rule_name}' binary path {reason}"));
-            }
-            if binary.path.is_empty()
-                || !is_canonical_pattern_path(&binary.path)
-                || !binary.extra.is_empty()
-                || unsupported_glob(&binary.path)
-            {
-                return unsupported(format!("rule '{rule_name}' uses an unsupported binary"));
-            }
+        if let Some(reason) = unsupported_network_literal(&rule.allow.path) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} REST allow path {reason}"
+            )));
         }
-        for endpoint in &rule.endpoints {
-            let context = format!("rule '{rule_name}'");
-            if let Some(reason) = unsupported_network_literal(&endpoint.host) {
-                return unsupported(format!("{context} endpoint host {reason}"));
-            }
-            if let Some(reason) = unsupported_network_literal(&endpoint.path) {
-                return unsupported(format!("{context} endpoint path {reason}"));
-            }
-            if endpoint.host.is_empty()
-                || endpoint.effective_ports().is_empty()
-                || (endpoint.port != 0 && !endpoint.ports.is_empty())
-            {
-                return unsupported(format!("{context} has no unambiguous host and port"));
-            }
-            if unsupported_host_glob(&endpoint.host) {
-                return unsupported(format!(
-                    "{context} endpoint host uses an unsupported pattern"
-                ));
-            }
-            if unsupported_glob(&endpoint.path)
-                || (!endpoint.path.is_empty() && !is_canonical_pattern_path(&endpoint.path))
-            {
-                return unsupported(format!("{context} uses an unsupported glob"));
-            }
-            if !endpoint.path.is_empty() && !endpoint.path.starts_with('/') {
-                return unsupported(format!("{context} uses a non-canonical endpoint path"));
-            }
-            if endpoint.host.contains(':') {
-                return unsupported(format!(
-                    "{context} uses an IP-literal shape outside the DNS host model"
-                ));
-            }
-            if !endpoint.extra.is_empty()
-                || !endpoint.allowed_ips.is_empty()
-                || !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
-                || endpoint.allow_encoded_slash
-                || endpoint.websocket_credential_rewrite
-                || endpoint.request_body_credential_rewrite
-                || endpoint.allow_uninspected_credentials
-                || !endpoint.persisted_queries.is_empty()
-                || !endpoint.graphql_persisted_queries.is_empty()
-                || endpoint.graphql_max_body_bytes != 0
-                || !endpoint.credential_signing.is_empty()
-                || !endpoint.signing_service.is_empty()
-                || !endpoint.signing_region.is_empty()
-                || endpoint.credential_binding.is_some()
-                || endpoint.json_rpc.is_some()
-                || endpoint.mcp.is_some()
-                || !endpoint.review.extra.is_empty()
-            {
-                return unsupported(format!(
-                    "{context} uses authority outside the initial model"
-                ));
-            }
-            let protocol = endpoint.protocol.to_ascii_lowercase();
-            if !matches!(protocol.as_str(), "" | "tcp" | "rest") {
-                return unsupported(format!(
-                    "{context} uses protocol '{}'; only L4 TCP and REST are modeled",
-                    endpoint.protocol
-                ));
-            }
-            if protocol == "tcp" && endpoint.host.parse::<IpAddr>().is_ok() {
-                return unsupported(format!(
-                    "{context} uses an IP literal with explicit TCP semantics"
-                ));
-            }
-            if protocol == "rest" {
-                if endpoint.enforcement != "enforce" {
-                    return unsupported(format!("{context} uses REST without enforced inspection"));
-                }
-                if (!endpoint.access.is_empty() && !endpoint.rules.is_empty())
-                    || (endpoint.access.is_empty() && endpoint.rules.is_empty())
-                    || (!endpoint.access.is_empty()
-                        && !matches!(
-                            endpoint.access.as_str(),
-                            "read-only" | "read-write" | "full"
-                        ))
-                {
-                    return unsupported(format!("{context} has an unsupported REST allow shape"));
-                }
-            } else if !endpoint.enforcement.is_empty()
-                || !endpoint.access.is_empty()
-                || !endpoint.path.is_empty()
-                || !endpoint.rules.is_empty()
-                || !endpoint.deny_rules.is_empty()
-            {
-                return unsupported(format!("{context} mixes REST controls into L4 authority"));
-            }
-            for rule in &endpoint.rules {
-                if let Some(reason) = unsupported_network_literal(&rule.allow.method) {
-                    return unsupported(format!("{context} REST allow method {reason}"));
-                }
-                if let Some(reason) = unsupported_network_literal(&rule.allow.path) {
-                    return unsupported(format!("{context} REST allow path {reason}"));
-                }
-                if !rule.extra.is_empty() || unsupported_allow(&rule.allow) {
-                    return unsupported(format!("{context} uses an unsupported REST allow rule"));
-                }
-            }
-            for rule in &endpoint.deny_rules {
-                if let Some(reason) = unsupported_network_literal(&rule.method) {
-                    return unsupported(format!("{context} REST deny method {reason}"));
-                }
-                if let Some(reason) = unsupported_network_literal(&rule.path) {
-                    return unsupported(format!("{context} REST deny path {reason}"));
-                }
-                if unsupported_deny(rule) {
-                    return unsupported(format!("{context} uses an unsupported REST deny rule"));
-                }
-            }
+        if !rule.extra.is_empty() || unsupported_allow(&rule.allow) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} uses an unsupported REST allow rule"
+            )));
         }
     }
+    for rule in &endpoint.deny_rules {
+        if let Some(reason) = unsupported_network_literal(&rule.method) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} REST deny method {reason}"
+            )));
+        }
+        if let Some(reason) = unsupported_network_literal(&rule.path) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} REST deny path {reason}"
+            )));
+        }
+        if unsupported_deny(rule) {
+            return Err(UnsupportedFeature::policy_shape(format!(
+                "{context} uses an unsupported REST deny rule"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_cross_protocol_overlap(
+    policy: &ContainmentPolicy,
+) -> Result<(), UnsupportedFeature> {
     let endpoints = policy
         .network_policies
         .values()
@@ -1698,12 +1874,11 @@ fn unsupported_reason(label: &str, policy: &ContainmentPolicy) -> Option<(Reason
                 && endpoint_authority_may_overlap(endpoint, other)
         })
     }) {
-        return unsupported(
-            "contains overlapping L4 and REST endpoints whose inspection selection is not modeled"
-                .to_owned(),
-        );
+        return Err(UnsupportedFeature::policy_shape(
+            "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",
+        ));
     }
-    None
+    Ok(())
 }
 
 fn unsupported_network_literal(value: &str) -> Option<&'static str> {
@@ -2399,6 +2574,27 @@ mod tests {
             CheckResult::Unsupported(ref evidence)
                 if evidence.reason_code() == ReasonCode::UnresolvedWorkdir
         ));
+    }
+
+    #[test]
+    fn mcp_authority_fails_closed_in_both_inputs() {
+        let mcp = parse(
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        mcp: {}\n    binaries: [{ path: /usr/bin/curl }]\n",
+        );
+        let empty = parse("version: 1\n");
+        for (boundary, candidate, side) in [(&mcp, &empty, "boundary"), (&empty, &mcp, "candidate")]
+        {
+            let result = check_within_boundary(boundary, candidate, options());
+            assert!(
+                matches!(
+                    result,
+                    CheckResult::Unsupported(ref evidence)
+                        if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
+                            && evidence.reason().contains(side)
+                ),
+                "side={side} result={result:?}"
+            );
+        }
     }
 
     #[test]
