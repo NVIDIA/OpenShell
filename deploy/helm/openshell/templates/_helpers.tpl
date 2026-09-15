@@ -84,11 +84,18 @@ default to enabled so upgrades with --reuse-values preserve the old topology.
 {{- end }}
 
 {{/*
-Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
-so a released chart automatically pulls the matching image without extra overrides.
+Gateway image reference. A repository value that already contains a tag or
+digest is treated as a complete image reference. Otherwise image.tag is used,
+falling back to .Chart.AppVersion.
 */}}
 {{- define "openshell.image" -}}
-{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
+{{- $repository := .Values.image.repository -}}
+{{- $lastComponent := last (splitList "/" $repository) -}}
+{{- if or (contains "@" $repository) (contains ":" $lastComponent) -}}
+{{- $repository -}}
+{{- else -}}
+{{- printf "%s:%s" $repository (.Values.image.tag | default .Chart.AppVersion) -}}
+{{- end }}
 {{- end }}
 
 {{/* Official supervisor repository used by the gateway's built-in default. */}}
@@ -122,13 +129,19 @@ The chart's documented repository and empty tag are the gateway-owned default.
 {{- end }}
 
 {{/*
-Supervisor image override. A tag-only override uses the official repository;
-a repository-only override uses the effective gateway image tag.
+Supervisor image override. A repository value that already contains a tag or
+digest is treated as a complete image reference. Otherwise the effective
+gateway image tag is used.
 */}}
 {{- define "openshell.supervisorImage" -}}
 {{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $lastComponent := last (splitList "/" $repository) -}}
+{{- if or (contains "@" $repository) (contains ":" $lastComponent) -}}
+{{- $repository -}}
+{{- else -}}
 {{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" $repository $tag }}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end }}
 {{- end }}
 
 {{/*

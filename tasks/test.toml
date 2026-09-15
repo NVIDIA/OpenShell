@@ -13,6 +13,7 @@ depends = [
   "test:install-sh",
   "test:build-env",
   "test:gateway-pull-policy",
+  "test:e2e-image-overrides",
   "test:gateway-config",
   "test:e2e-parity",
   "test:packaging-assets",
@@ -47,6 +48,12 @@ hide = true
 description = "Test development gateway image pull-policy normalization"
 run = "tasks/scripts/test-gateway-pull-policy.sh"
 run_windows = "echo Skipping test:gateway-pull-policy: Unix gateway scripts do not apply on Windows."
+hide = true
+
+["test:e2e-image-overrides"]
+description = "Test E2E gateway and supervisor image override resolution"
+run = "tasks/scripts/test-e2e-image-overrides.sh"
+run_windows = "echo Skipping test:e2e-image-overrides: Unix E2E wrappers do not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]

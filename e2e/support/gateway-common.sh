@@ -9,6 +9,30 @@
 # Keep an explicit override so telemetry-specific tests can opt back in.
 export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
 
+# Resolve a test image override. Repository-only values inherit the caller's
+# tag, while tagged and digest-pinned references are already complete.
+e2e_image_reference_is_complete() {
+  local image=$1
+  local last_component="${image##*/}"
+
+  [[ "${image}" == *@* || "${last_component}" == *:* ]]
+}
+
+e2e_image_reference_has_digest() {
+  [[ "$1" == *@* ]]
+}
+
+e2e_resolve_image_reference() {
+  local image=$1
+  local tag=$2
+
+  if e2e_image_reference_is_complete "${image}"; then
+    printf '%s\n' "${image}"
+  else
+    printf '%s:%s\n' "${image%/}" "${tag}"
+  fi
+}
+
 e2e_cargo_target_dir() {
   local root=$1
   shift
