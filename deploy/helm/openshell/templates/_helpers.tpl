@@ -284,6 +284,23 @@ never
 {{- end }}
 
 {{/*
+Validate a non-empty, user-provided Kubernetes Secret name. Secret data never
+passes through Helm values into gateway.toml; only this reference is rendered.
+*/}}
+{{- define "openshell.validateSecretReference" -}}
+{{- $path := index . 0 -}}
+{{- $name := index . 1 -}}
+{{- if and (ne $name nil) (ne $name "") -}}
+{{- if not (kindIs "string" $name) -}}
+{{- fail (printf "%s must be a Kubernetes Secret name, got %s" $path (kindOf $name)) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name) -}}
+{{- fail (printf "%s must be a valid Kubernetes Secret name" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
@@ -305,6 +322,11 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
+{{- include "openshell.validateSecretReference" (list "server.externalDbSecret" .Values.server.externalDbSecret) -}}
+{{- include "openshell.validateSecretReference" (list "server.credentialStorage.existingSecret" .Values.server.credentialStorage.existingSecret) -}}
+{{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
+{{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
+{{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
