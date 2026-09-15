@@ -189,6 +189,8 @@ supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
 
+The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
+
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;

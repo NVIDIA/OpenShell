@@ -1379,7 +1379,79 @@ fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
     }
 }
 
-/// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
+/// Validate containers before normalizers or Rego can skip malformed policy data.
+///
+/// OPA-native data can contain runtime fields and omit authored-policy sections.
+/// Validate only the shapes consumed here; existing validators own field semantics.
+/// Return the first fixed structural diagnostic so errors cannot grow with the
+/// input or expose authored names, paths, or values.
+fn validate_opa_data_structure(data: &serde_json::Value) -> Result<()> {
+    let root = data
+        .as_object()
+        .ok_or_else(|| miette::miette!("OPA policy data must be an object"))?;
+
+    for field in ["filesystem_policy", "landlock", "process"] {
+        if root.get(field).is_some_and(|value| !value.is_object()) {
+            return Err(miette::miette!("{field} must be an object"));
+        }
+    }
+
+    if let Some(middlewares) = root.get("network_middlewares") {
+        let middlewares = middlewares
+            .as_object()
+            .ok_or_else(|| miette::miette!("network_middlewares must be an object"))?;
+        if middlewares.values().any(|value| !value.is_object()) {
+            return Err(miette::miette!(
+                "network middleware entries must be objects"
+            ));
+        }
+    }
+
+    // Omitted collections retain their existing defaults. Present malformed
+    // collections must not be mistaken for an omitted configuration.
+    let Some(policies) = root.get("network_policies") else {
+        return Ok(());
+    };
+    let policies = policies
+        .as_object()
+        .ok_or_else(|| miette::miette!("network_policies must be an object"))?;
+    for policy in policies.values() {
+        let policy = policy
+            .as_object()
+            .ok_or_else(|| miette::miette!("network policy entries must be objects"))?;
+        let endpoints =
+            validate_opa_object_array(policy.get("endpoints"), "network policy endpoints")?;
+        for endpoint in endpoints {
+            validate_opa_object_array(endpoint.get("rules"), "network endpoint rules")?;
+            validate_opa_object_array(endpoint.get("deny_rules"), "network endpoint deny_rules")?;
+        }
+        validate_opa_object_array(policy.get("binaries"), "network policy binaries")?;
+    }
+
+    Ok(())
+}
+
+/// Return an optional collection only after validating its traversal contract.
+///
+/// Callers supply fixed schema labels, never identifiers from policy data, so
+/// both error variants remain bounded and contain no author-controlled values.
+fn validate_opa_object_array<'a>(
+    value: Option<&'a serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a [serde_json::Value]> {
+    let Some(value) = value else {
+        return Ok(&[]);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| miette::miette!("{field} must be an array"))?;
+    if entries.iter().any(|entry| !entry.is_object()) {
+        return Err(miette::miette!("{field} entries must be objects"));
+    }
+    Ok(entries)
+}
+
+/// Preprocess YAML policy data: parse, validate shapes, normalize, expand presets, return JSON.
 fn preprocess_yaml_data(
     yaml_str: &str,
     require_binary_identity: bool,
@@ -1387,6 +1459,7 @@ fn preprocess_yaml_data(
 ) -> Result<String> {
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+    validate_opa_data_structure(&data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
     normalize_endpoint_protocols(&mut data);
 
@@ -2308,6 +2381,281 @@ mod tests {
 
     fn test_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).expect("Failed to load test policy")
+    }
+
+    fn opa_container_policy() -> serde_json::Value {
+        serde_json::json!({
+            "filesystem_policy": {},
+            "landlock": {},
+            "process": {},
+            "network_middlewares": {},
+            "network_policies": {
+                "admin": {
+                    "endpoints": [{
+                        "host": "admin.example.test",
+                        "port": 443,
+                        "protocol": "rest",
+                        "enforcement": "enforce",
+                        "access": "full",
+                        "deny_rules": [{"method": "DELETE", "path": "/admin/**"}],
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}],
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn yaml_containers_reject_malformed_objects_and_collections() {
+        let valid = opa_container_policy();
+        OpaEngine::from_strings(TEST_POLICY, &valid.to_string())
+            .expect("control policy must load before changing one container");
+        let invalid_objects = [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("untrusted-marker"),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ];
+        for invalid in &invalid_objects {
+            let error = OpaEngine::from_strings(TEST_POLICY, &invalid.to_string())
+                .err()
+                .expect("non-object root must reject");
+            assert_eq!(error.to_string(), "OPA policy data must be an object");
+        }
+
+        let object_cases = [
+            ("/filesystem_policy", "filesystem_policy must be an object"),
+            ("/landlock", "landlock must be an object"),
+            ("/process", "process must be an object"),
+            ("/network_policies", "network_policies must be an object"),
+            (
+                "/network_policies/admin",
+                "network policy entries must be objects",
+            ),
+            (
+                "/network_middlewares",
+                "network_middlewares must be an object",
+            ),
+            (
+                "/network_middlewares/untrusted-marker",
+                "network middleware entries must be objects",
+            ),
+        ];
+        for (pointer, expected) in object_cases {
+            for invalid in &invalid_objects {
+                let mut candidate = valid.clone();
+                let (parent, field) = pointer.rsplit_once('/').expect("field pointer");
+                candidate
+                    .pointer_mut(parent)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("container parent must be an object")
+                    .insert(field.to_string(), invalid.clone());
+                let error = OpaEngine::from_strings(TEST_POLICY, &candidate.to_string())
+                    .err()
+                    .expect("malformed object must reject");
+                assert_eq!(error.to_string(), expected, "{pointer}: {invalid}");
+            }
+        }
+
+        let collection_cases = [
+            (
+                "/network_policies/admin/endpoints",
+                "network policy endpoints",
+            ),
+            (
+                "/network_policies/admin/binaries",
+                "network policy binaries",
+            ),
+            (
+                "/network_policies/admin/endpoints/0/rules",
+                "network endpoint rules",
+            ),
+            (
+                "/network_policies/admin/endpoints/0/deny_rules",
+                "network endpoint deny_rules",
+            ),
+        ];
+        for (pointer, field_label) in collection_cases {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!({"untrusted-marker": "value"}),
+                serde_json::json!("untrusted-marker"),
+                serde_json::json!(42),
+                serde_json::json!(false),
+                serde_json::json!([null]),
+                serde_json::json!(["untrusted-marker"]),
+                serde_json::json!([{}, false]),
+            ] {
+                let mut candidate = valid.clone();
+                let (parent, field) = pointer.rsplit_once('/').expect("field pointer");
+                candidate
+                    .pointer_mut(parent)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("collection parent must be an object")
+                    .insert(field.to_string(), invalid.clone());
+                let error = OpaEngine::from_strings(TEST_POLICY, &candidate.to_string())
+                    .err()
+                    .expect("malformed collection must reject");
+                let expected = if invalid.is_array() {
+                    format!("{field_label} entries must be objects")
+                } else {
+                    format!("{field_label} must be an array")
+                };
+                assert_eq!(error.to_string(), expected, "{pointer}: {invalid}");
+                assert!(error.to_string().len() <= 128);
+                assert!(!error.to_string().contains("untrusted-marker"));
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_containers_preserve_valid_denials_and_rejected_reload_generation() {
+        let valid = opa_container_policy();
+        let engine = OpaEngine::from_strings(TEST_POLICY, &valid.to_string())
+            .expect("valid deny-rule list must load");
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+        let generation = engine.current_generation();
+
+        let mut malformed = valid.clone();
+        malformed["network_policies"]["admin"]["endpoints"][0]["deny_rules"] =
+            serde_json::json!({"method": "DELETE", "path": "/admin/**"});
+        let error = engine
+            .reload(TEST_POLICY, &malformed.to_string())
+            .expect_err("mapping-shaped deny_rules must reject before access expansion");
+        assert_eq!(
+            error.to_string(),
+            "network endpoint deny_rules must be an array"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+
+        // A later valid replacement must still install and notify consumers.
+        let mut repaired = valid;
+        repaired["network_policies"]["admin"]["endpoints"][0]["deny_rules"][0]["path"] =
+            "/other/**".into();
+        engine
+            .reload(TEST_POLICY, &repaired.to_string())
+            .expect("valid replacement must install after a rejected reload");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(eval_l7(&engine, &denied));
+    }
+
+    #[test]
+    fn yaml_containers_file_and_middleware_loaders_reject_before_config_validation() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("policy.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).expect("write policy rules");
+        let mut valid = opa_container_policy();
+        valid["network_middlewares"]["guard"] = serde_json::json!({
+            "middleware": "openshell/regex",
+            "order": 1,
+            "endpoints": {"include": ["admin.example.test"]},
+            "config": {},
+        });
+        let config_calls = Arc::new(AtomicU64::new(0));
+        let observed_calls = Arc::clone(&config_calls);
+        let count_config: &MiddlewareConfigValidator = &move |_, _| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        OpaEngine::from_strings_with_middleware_config(
+            TEST_POLICY,
+            &valid.to_string(),
+            Some(count_config),
+        )
+        .expect("valid control must reach middleware configuration validation");
+        assert_eq!(config_calls.load(Ordering::Relaxed), 1);
+
+        let mut malformed = valid;
+        malformed["network_policies"]["admin"]["endpoints"][0]["deny_rules"] =
+            serde_json::json!({"method": "DELETE", "path": "/admin/**"});
+        std::fs::write(&data_path, malformed.to_string()).expect("write malformed policy");
+        let validate_config: &MiddlewareConfigValidator =
+            &|_, _| panic!("structural rejection must precede middleware implementation callbacks");
+        for result in [
+            OpaEngine::from_files(&rules_path, &data_path),
+            OpaEngine::from_files_with_middleware_config(
+                &rules_path,
+                &data_path,
+                Some(validate_config),
+            ),
+            OpaEngine::from_strings_with_middleware_config(
+                TEST_POLICY,
+                &malformed.to_string(),
+                Some(validate_config),
+            ),
+        ] {
+            assert_eq!(
+                result.err().expect("raw loader must reject").to_string(),
+                "network endpoint deny_rules must be an array"
+            );
+        }
+
+        std::fs::write(&data_path, opa_container_policy().to_string())
+            .expect("write repaired policy");
+        let engine = OpaEngine::from_files(&rules_path, &data_path)
+            .expect("valid raw file must load after repair");
+        assert!(eval_l7(
+            &engine,
+            &l7_input("admin.example.test", 443, "GET", "/public")
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_input("admin.example.test", 443, "DELETE", "/admin/users")
+        ));
+    }
+
+    #[test]
+    fn yaml_containers_preserve_opa_only_data_and_existing_semantic_validation() {
+        for data in [
+            "{}",
+            "network_policies: {}",
+            "filesystem_policy: {}\nlandlock: {}\nprocess: {}\nnetwork_middlewares: {}",
+            "network_policies: { empty: { endpoints: [], binaries: [] } }",
+            "runtime_extension: { values: [null, true, 1, custom] }",
+        ] {
+            OpaEngine::from_strings(TEST_POLICY, data)
+                .expect("valid versionless OPA data and omitted containers must remain supported");
+        }
+
+        let mut data = opa_container_policy();
+        data["runtime_extension"] = serde_json::json!({"values": [null, true, 1, "custom"]});
+        let loaded = preprocess_yaml_data(&data.to_string(), false, None)
+            .expect("supported runtime data must preprocess");
+        let loaded: serde_json::Value = serde_json::from_str(&loaded).expect("OPA JSON data");
+        assert_eq!(loaded["runtime_extension"], data["runtime_extension"]);
+
+        data["network_policies"]["admin"]["endpoints"][0]["deny_rules"] = serde_json::json!([]);
+        let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+            .err()
+            .expect("an empty deny-rule list remains semantically invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("deny_rules list cannot be empty")
+        );
+    }
+
+    #[test]
+    fn yaml_containers_structural_errors_are_fixed_for_large_untrusted_input() {
+        let mut data = opa_container_policy();
+        let marker = "sensitive-\u{1f980}".repeat(1024);
+        data["network_policies"]["admin"]["endpoints"] =
+            serde_json::Value::Array(vec![serde_json::json!({"deny_rules": marker}); 1024]);
+        let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+            .err()
+            .expect("malformed denial collections must reject");
+        let message = error.to_string();
+        assert_eq!(message, "network endpoint deny_rules must be an array");
+        assert!(message.len() <= 128);
+        assert_eq!(message.lines().count(), 1);
+        assert!(!message.contains("sensitive"));
     }
 
     fn test_proto() -> ProtoSandboxPolicy {
