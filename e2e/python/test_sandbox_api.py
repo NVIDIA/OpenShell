@@ -198,6 +198,49 @@ def test_sandbox_interactive_exec_honors_tty(
         assert b"TTT" in stdout + stderr
 
 
+def test_interactive_exec_drains_output_after_request_eof(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    with sandbox(delete_on_exit=True) as sb:
+
+        def requests():
+            yield openshell_pb2.ExecSandboxInput(
+                start=openshell_pb2.ExecSandboxRequest(
+                    sandbox_id=sb.id,
+                    command=[
+                        "/bin/sh",
+                        "-c",
+                        "input=$(cat); sleep 0.2; "
+                        "printf '%s' \"$input\"; printf 'drained-stderr' >&2; exit 7",
+                    ],
+                    tty=False,
+                    timeout_seconds=20,
+                )
+            )
+            yield openshell_pb2.ExecSandboxInput(stdin=b"drained-stdout")
+            # End requests before the command emits output. The receive
+            # direction must survive long enough to drain both output streams.
+
+        stdout = bytearray()
+        stderr = bytearray()
+        exit_codes: list[int] = []
+        for event in sandbox_client._stub.ExecSandboxInteractive(
+            requests(), timeout=30
+        ):
+            assert not exit_codes, "received another event after terminal exit"
+            payload = event.WhichOneof("payload")
+            if payload == "stdout":
+                stdout.extend(event.stdout.data)
+            elif payload == "stderr":
+                stderr.extend(event.stderr.data)
+            elif payload == "exit":
+                exit_codes.append(event.exit.exit_code)
+        assert stdout == b"drained-stdout"
+        assert stderr == b"drained-stderr"
+        assert exit_codes == [7]
+
+
 def test_list_scoped_and_for_all_workspaces(
     sandbox_client: SandboxClient,
     workspace_client: WorkspaceClient,

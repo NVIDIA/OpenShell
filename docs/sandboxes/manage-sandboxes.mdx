@@ -319,6 +319,12 @@ OpenShell-managed SSH include file instead of cluttering your main
 
 ## Execute a Command in a Sandbox
 
+For raw `ExecSandboxInteractive` clients, ending the request stream closes stdin
+and terminal resize input. Continue reading the response to drain stdout/stderr
+and receive the exit event and final gRPC status. Input EOF does not immediately
+close the SSH output channel and is distinct from cancelling the RPC. With a PTY,
+input closure is not equivalent to sending a terminal Ctrl-D keystroke.
+
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
 ```shell

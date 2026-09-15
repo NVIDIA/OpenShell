@@ -11,6 +11,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 )
 
 type execClient struct {
@@ -177,19 +178,21 @@ func (s *execStream) Close() error {
 
 // interactiveSession wraps a bidirectional streaming RPC into the InteractiveSession interface.
 // A background goroutine owns the Recv loop and routes events to dataCh (for Read)
-// and exitCh (for ExitCode), preventing concurrent Recv calls on the stream.
+// and publishes the final exit/status through done, preventing concurrent Recv calls.
 type interactiveSession struct {
-	stream  grpc.BidiStreamingClient[pb.ExecSandboxInput, pb.ExecSandboxEvent]
-	cancel  context.CancelFunc
-	sendMu  sync.Mutex
-	dataCh  chan []byte
-	exitCh  chan int
-	done    chan struct{}
-	errOnce sync.Once
-	err     error
-	buf     []byte
+	stream        grpc.BidiStreamingClient[pb.ExecSandboxInput, pb.ExecSandboxEvent]
+	cancel        context.CancelFunc
+	sendMu        sync.Mutex
+	inputClosed   bool
+	inputCloseErr error
+	closeOnce     sync.Once
+	closeErr      error
+	dataCh        chan []byte
+	done          chan struct{}
+	errOnce       sync.Once
+	err           error
+	buf           []byte
 
-	exitMu      sync.Mutex
 	exitCode    int
 	hasExitCode bool
 }
@@ -199,7 +202,6 @@ func newInteractiveSession(ctx context.Context, cancel context.CancelFunc, strea
 		stream: stream,
 		cancel: cancel,
 		dataCh: make(chan []byte, 64),
-		exitCh: make(chan int, 1),
 		done:   make(chan struct{}),
 	}
 	go s.readLoop(ctx)
@@ -211,6 +213,7 @@ func (s *interactiveSession) setErr(err error) {
 }
 
 func (s *interactiveSession) readLoop(ctx context.Context) {
+	defer s.cancel()
 	defer close(s.dataCh)
 	defer close(s.done)
 	for {
@@ -218,10 +221,18 @@ func (s *interactiveSession) readLoop(ctx context.Context) {
 		if err != nil {
 			if err != io.EOF {
 				s.setErr(converter.FromGRPCError(err))
+			} else if ctx.Err() != nil {
+				s.setErr(converter.FromGRPCError(status.FromContextError(ctx.Err()).Err()))
+			} else if !s.hasExitCode {
+				s.setErr(&StatusError{Code: ErrorInternal, Message: "stream ended without exit event"})
 			}
 			return
 		}
 
+		if s.hasExitCode {
+			s.setErr(&StatusError{Code: ErrorInternal, Message: "received event after exit"})
+			return
+		}
 		chunk, code, convErr := converter.ExecChunkFromEvent(ev)
 		if convErr != nil {
 			s.setErr(convErr)
@@ -229,15 +240,14 @@ func (s *interactiveSession) readLoop(ctx context.Context) {
 		}
 		// nil chunk with no error means exit event
 		if chunk == nil {
-			select {
-			case s.exitCh <- code:
-			default:
-			}
-			return
+			s.exitCode = code
+			s.hasExitCode = true
+			continue
 		}
 		select {
 		case s.dataCh <- chunk.Data:
 		case <-ctx.Done():
+			s.setErr(converter.FromGRPCError(status.FromContextError(ctx.Err()).Err()))
 			return
 		}
 	}
@@ -267,6 +277,9 @@ func (s *interactiveSession) Read(p []byte) (int, error) {
 func (s *interactiveSession) Write(p []byte) (int, error) {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	if s.inputClosed {
+		return 0, io.ErrClosedPipe
+	}
 	err := s.stream.Send(&pb.ExecSandboxInput{
 		Payload: &pb.ExecSandboxInput_Stdin{Stdin: p},
 	})
@@ -279,6 +292,9 @@ func (s *interactiveSession) Write(p []byte) (int, error) {
 func (s *interactiveSession) Resize(cols, rows uint32) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	if s.inputClosed {
+		return io.ErrClosedPipe
+	}
 	err := s.stream.Send(&pb.ExecSandboxInput{
 		Payload: &pb.ExecSandboxInput_Resize{
 			Resize: &pb.ExecSandboxWindowResize{
@@ -294,41 +310,33 @@ func (s *interactiveSession) Resize(cols, rows uint32) error {
 }
 
 func (s *interactiveSession) ExitCode() (int, error) {
-	s.exitMu.Lock()
+	<-s.done
 	if s.hasExitCode {
-		code := s.exitCode
-		s.exitMu.Unlock()
-		return code, nil
+		return s.exitCode, s.err
 	}
-	s.exitMu.Unlock()
+	return -1, s.err
+}
 
-	select {
-	case code := <-s.exitCh:
-		s.exitMu.Lock()
-		s.exitCode = code
-		s.hasExitCode = true
-		s.exitMu.Unlock()
-		return code, nil
-	case <-s.done:
-		select {
-		case code := <-s.exitCh:
-			s.exitMu.Lock()
-			s.exitCode = code
-			s.hasExitCode = true
-			s.exitMu.Unlock()
-			return code, nil
-		default:
-			if s.err != nil {
-				return -1, s.err
-			}
-			return -1, &StatusError{Code: ErrorInternal, Message: "stream ended without exit event"}
-		}
+func (s *interactiveSession) CloseWrite() error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if !s.inputClosed {
+		s.inputClosed = true
+		s.inputCloseErr = s.stream.CloseSend()
 	}
+	return s.inputCloseErr
+}
+
+func (s *interactiveSession) Cancel() error {
+	s.closeOnce.Do(func() {
+		// Cancel before taking sendMu so a blocked Write can release it.
+		s.cancel()
+		s.closeErr = s.CloseWrite()
+		<-s.done
+	})
+	return s.closeErr
 }
 
 func (s *interactiveSession) Close() error {
-	s.cancel()
-	err := s.stream.CloseSend()
-	<-s.done
-	return err
+	return s.Cancel()
 }

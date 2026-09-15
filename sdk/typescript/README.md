@@ -124,7 +124,20 @@ for await (const event of client.sandbox.execStream(name, ['pytest', '-q'])) {
 }
 ```
 
-`execInteractive` is the TTY + stdin transport primitive. Drive it by consuming `output`, which yields the same chunk/exit events; `done` resolves with the exit code once the stream reaches its exit event and rejects if it ends without one. It ships raw bytes only; raw mode, signal forwarding, and SIGWINCH stay with the caller.
+`execInteractive` is the TTY + stdin transport primitive. Consume `output` concurrently with awaiting `done`. The helper yields its terminal exit event and resolves `done` only after receiving an exit event and successful final gRPC status. If transport completion fails, `done` rejects and `session.exitCode` retains any observed process exit code. Duplicate exit events and output after exit are errors.
+
+The RPC starts immediately when the session is created, even before you consume
+`output`. A background receiver observes transport errors and buffers up to 1 MiB
+of output in 64 KiB chunks. Once the queue fills, receiving waits for the caller
+to drain it; cancellation interrupts that wait. The bound excludes the transport's
+current response frame and its own buffers.
+
+Call `closeInput()` (or its compatibility alias `close()`) to end stdin and resize input while continuing to receive output. Later writes and resizes throw. Call `cancel()` to abort the RPC. Both close and cancel are idempotent. The helper ships raw bytes only; raw mode, signal forwarding, and SIGWINCH stay with the caller. Input closure is not a terminal Ctrl-D keystroke.
+
+`execInteractive()` returns `ExecInteractiveSessionControl`, which extends the
+original `ExecInteractiveSession` with `closeInput()`, `cancel()`, and `exitCode`.
+Existing mocks and wrappers can keep implementing the original interface without
+adding those members. Use the extended type when a wrapper exposes the new controls.
 
 ```ts
 const session = await client.sandbox.execInteractive(name, ['bash'])

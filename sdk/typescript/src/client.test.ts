@@ -24,6 +24,7 @@ import {
 } from './client.js';
 import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
+import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
   const transport: Transport = createRouterTransport((router) => {
@@ -910,6 +911,35 @@ describe('Pushable', () => {
 });
 
 describe('execInteractive', () => {
+  it('preserves legacy session implementations and exposes SDK lifecycle controls', async () => {
+    // These are exactly the original required members, checked through the
+    // public package exports so downstream wrappers can keep their old types.
+    const legacy: ExecInteractiveSession = {
+      output: (async function* () {
+        yield { type: 'exit' as const, exitCode: 0 };
+      })(),
+      write() {},
+      resize() {},
+      close() {},
+      done: Promise.resolve(0),
+    };
+    const wrap = (session: ExecInteractiveSession): ExecInteractiveSession => session;
+    expect(wrap(legacy)).toBe(legacy);
+
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const controlled: ExecInteractiveSessionControl = await sandbox.execInteractive('sb', ['true']);
+    expect(wrap(controlled)).toBe(controlled);
+    controlled.closeInput();
+    expect(await controlled.done).toBe(0);
+    expect(controlled.exitCode).toBe(0);
+    controlled.cancel();
+  });
+
   it('sends start first with tty/cols/rows, streams output, and resolves done', async () => {
     const cases: string[] = [];
     let started: { tty?: boolean; cols?: number; rows?: number; sandboxId?: string } | undefined;
@@ -963,6 +993,179 @@ describe('execInteractive', () => {
 });
 
 describe('exec done settlement', () => {
+  it('starts the command and observes completion before output is consumed', async () => {
+    let started = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        started = true;
+        yield { payload: { case: 'stdout', value: { data: enc('started') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect.poll(() => started).toBe(true);
+    expect(await session.done).toBe(0);
+    const events = [];
+    for await (const event of session.output) events.push(event);
+    expect(events).toEqual([
+      { stream: 'stdout', data: Buffer.from('started') },
+      { type: 'exit', exitCode: 0 },
+    ]);
+  });
+
+  it('observes early transport failures without output consumption', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: () => {
+        throw new ConnectError('early failure', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toMatchObject({ connectCode: Code.Unavailable });
+  });
+
+  it('cancels a receiver blocked by output backpressure', async () => {
+    let released = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (_requests, ctx) {
+        ctx.signal.addEventListener('abort', () => {
+          released = true;
+        });
+        // More than the SDK queue budget, in one transport event.
+        yield { payload: { case: 'stdout', value: { data: new Uint8Array(4 * 1024 * 1024) } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(session.exitCode).toBeUndefined();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await expect.poll(() => released).toBe(true);
+    await expect(session.output[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'canceled' });
+  });
+
+  it('drains output larger than the queue budget without losing bytes', async () => {
+    const data = Buffer.alloc(2 * 1024 * 1024 + 7, 'x');
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data } } };
+        yield { payload: { case: 'stderr', value: { data: enc('last') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 3 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    const chunks: Buffer[] = [];
+    for await (const event of session.output) {
+      if ('type' in event) expect(await session.done).toBe(3);
+      else chunks.push(event.data);
+    }
+    expect(Buffer.concat(chunks)).toEqual(Buffer.concat([data, Buffer.from('last')]));
+  });
+
+  it('retains the exit code but rejects completion on a later transport error', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 7 } } };
+        throw new ConnectError('connection lost after exit', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain through trailers */
+        }
+      })(),
+    ).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    expect(session.exitCode).toBe(7);
+  });
+
+  it.each(['stdout', 'exit'] as const)('rejects %s after an exit event', async (payload) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+        if (payload === 'stdout') yield { payload: { case: 'stdout', value: { data: enc('late') } } };
+        else yield { payload: { case: 'exit', value: { exitCode: 1 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain */
+        }
+      })(),
+    ).rejects.toThrow('after exit');
+    await expect(session.done).rejects.toThrow('after exit');
+    expect(session.exitCode).toBe(0);
+  });
+
+  it('closes input idempotently and rejects later stdin and resize', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (requests) {
+        for await (const _input of requests) {
+          /* wait for request EOF */
+        }
+        yield { payload: { case: 'stdout', value: { data: enc('drained') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.closeInput();
+    session.close();
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+    const output = [];
+    for await (const event of session.output) output.push(event);
+    expect(output).toHaveLength(2);
+    expect(await session.done).toBe(0);
+  });
+
+  it('cancel settles completion even before output is consumed', async () => {
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.cancel();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion before output is consumed', async () => {
+    const controller = new AbortController();
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion while output is paused', async () => {
+    const controller = new AbortController();
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await iterator.next();
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await iterator.return?.();
+  });
+
   it('resolves done even when the consumer breaks right after the exit event', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
@@ -976,7 +1179,7 @@ describe('exec done settlement', () => {
     for await (const event of session.output) {
       if ('type' in event) break; // break on exit: the generator never resumes
     }
-    // Without settling `done` before the exit yield, this would hang forever.
+    // The public exit is yielded only after successful terminal status.
     expect(await session.done).toBe(3);
   });
 

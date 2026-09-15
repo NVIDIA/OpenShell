@@ -792,6 +792,24 @@ alone — instead an unanswered keepalive on a wedged or orphaned relay closes t
 channel and returns the exec with an error. Once a command reports its exit
 status, the gateway also bounds how long it waits for the trailing channel close.
 
+Interactive exec treats normal request-stream EOF as the end of stdin and resize
+input. The gateway sends SSH EOF while keeping the output channel open until
+command completion. Input errors terminate the operation rather than masquerading
+as normal EOF. The input and output pumps are owned by the exec operation, so
+timeout or response abandonment cannot leave a detached stdin task behind.
+
+Go and TypeScript interactive-exec helpers distinguish process exit from stream
+completion. They consume the final gRPC status before reporting success and retain
+an observed exit code if transport completion fails. Callers must drain output
+concurrently with waiting for completion.
+
+TypeScript starts interactive exec eagerly and uses a bounded output queue between
+the background receiver and the consumer. Cancellation wakes a receiver blocked
+on that queue. Go exposes input closure through an optional session capability,
+preserving the original interface for existing implementations. TypeScript also
+preserves its original session interface; SDK-created sessions expose lifecycle
+controls through an extended interface.
+
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the sandbox ID, an
 authorization token from `CreateSshSession`, and an explicit target:
