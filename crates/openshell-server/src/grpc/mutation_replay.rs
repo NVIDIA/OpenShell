@@ -3,13 +3,14 @@
 
 //! Explicitly opted-in unary mutations. This is an admission fence, not a lease:
 //! an owner that cannot persist success leaves an unresolved claim forever.
-//! Intercepted and credential-bearing RPCs must not use this adapter unchanged.
+//! Each adapter explicitly approves its authorization and replay representation.
 
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
+use hmac::{Hmac, Mac};
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, CreateSandboxTemplateRequest,
     CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteSandboxTemplateRequest,
@@ -52,16 +53,31 @@ struct Admission {
     // change must reject incompatible records, not admit the old key again.
     format_version: u32,
     payload_hash: String,
+    #[serde(default)]
+    protection: Option<Protection>,
     workspace_id: Option<String>,
     success: Option<Success>,
     completed_at_ms: Option<i64>,
 }
+
+#[derive(Serialize, Deserialize, PartialEq)]
+struct Protection {
+    key_id: String,
+    effective_payload_hash: String,
+    effective_workspace_id: Option<String>,
+}
+
+/// Gateway-owned, in-memory input before hydration and interceptor modification.
+/// Never populated from HTTP metadata and never written to the admission store.
+#[derive(Clone)]
+pub struct OriginalMutation(pub(crate) Vec<u8>);
 
 /// Deliberately no serialized requests, responses, tokens, or error messages.
 #[derive(Serialize, Deserialize)]
 pub(super) enum Success {
     Resource { id: String, version: u64 },
     Deletion { outcome: i32 },
+    Ordinary(ordinary::Outcome),
 }
 
 pub(super) struct Scope {
@@ -73,13 +89,14 @@ pub(super) struct Scope {
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     type Output: Message + Default + Send + 'static;
     const METHOD: &'static str;
+    const PROTECTED: bool = false;
     fn request_id(&self) -> &str;
     async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status>;
     async fn execute(
         state: &Arc<ServerState>,
         request: Request<Self>,
     ) -> Result<Response<Self::Output>, Status>;
-    fn capture(response: &Self::Output) -> Result<Success, Status>;
+    fn capture(response: &Response<Self::Output>) -> Result<Success, Status>;
     async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status>;
 }
 
@@ -88,7 +105,20 @@ pub(super) async fn run<M: Mutation>(
     state: &Arc<ServerState>,
     request: Request<M>,
 ) -> Result<Response<M::Output>, Status> {
-    if request.get_ref().request_id().is_empty() {
+    let original = request
+        .extensions()
+        .get::<OriginalMutation>()
+        .map(|original| M::decode(original.0.as_slice()))
+        .transpose()
+        .map_err(|_| Status::internal("decode original mutation request"))?;
+    let original = original.as_ref().unwrap_or_else(|| request.get_ref());
+    if original.request_id() != request.get_ref().request_id() {
+        return Err(rpc_error::invalid_argument(
+            "request_id",
+            "interceptors must preserve the original request_id",
+        ));
+    }
+    if original.request_id().is_empty() {
         return M::execute(state, request).await;
     }
     if request.get_ref().encoded_len() > 4 * 1024 * 1024 {
@@ -101,7 +131,21 @@ pub(super) async fn run<M: Mutation>(
             "request admission requires a user principal",
         ));
     };
-    let scope = request.get_ref().authorize(state, &principal).await?;
+    let scope = original.authorize(state, &principal).await?;
+    let effective_scope = request.get_ref().authorize(state, &principal).await?;
+    let (payload_hash, protection) = if M::PROTECTED {
+        let key = fingerprint_key(state).await?;
+        (
+            key.fingerprint(original)?,
+            Some(Protection {
+                key_id: key.id(),
+                effective_payload_hash: key.fingerprint(request.get_ref())?,
+                effective_workspace_id: effective_scope.workspace_id,
+            }),
+        )
+    } else {
+        (fingerprint(original)?, None)
+    };
     let (provider, issuer) = match user.identity.provider {
         IdentityProvider::Oidc => (
             "oidc",
@@ -129,7 +173,6 @@ pub(super) async fn run<M: Mutation>(
         scope.name,
         request_id
     ]))?;
-    let payload_hash = fingerprint(request.get_ref())?;
     let permit = EXECUTORS.clone().try_acquire_owned().map_err(|_| {
         Status::resource_exhausted(
             "mutation admission workers are busy; no work was started by this call",
@@ -140,7 +183,16 @@ pub(super) async fn run<M: Mutation>(
     // must not drop the owner between durable admission and execution.
     tokio::spawn(async move {
         let _permit = permit;
-        execute_owned(&state, request, &key, &bucket, payload_hash, scope).await
+        execute_owned(
+            &state,
+            request,
+            &key,
+            &bucket,
+            payload_hash,
+            protection,
+            scope,
+        )
+        .await
     })
     .await
     .map_err(|_| uncertain())?
@@ -148,15 +200,17 @@ pub(super) async fn run<M: Mutation>(
 
 async fn execute_owned<M: Mutation>(
     state: &Arc<ServerState>,
-    request: Request<M>,
+    mut request: Request<M>,
     key: &str,
     bucket: &str,
     payload_hash: String,
+    protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
     let mut admission = Admission {
         format_version: 1,
         payload_hash,
+        protection,
         workspace_id: scope.workspace_id,
         success: None,
         completed_at_ms: None,
@@ -188,13 +242,22 @@ async fn execute_owned<M: Mutation>(
                     Err(error) => return Err(storage_error(error)),
                 }
             }
+            // A rotated/unavailable protection key must never turn the old ID
+            // into a new admission, or report a misleading payload mismatch.
+            if previous.protection.as_ref().map(|p| &p.key_id)
+                != admission.protection.as_ref().map(|p| &p.key_id)
+            {
+                return Err(replay_unavailable());
+            }
             if previous.payload_hash != admission.payload_hash {
                 return Err(rpc_error::failed_precondition(
                     "REQUEST_ID_PAYLOAD_MISMATCH",
                     "request_id was already used with a different payload",
                 ));
             }
-            if previous.workspace_id != admission.workspace_id {
+            if previous.workspace_id != admission.workspace_id
+                || previous.protection != admission.protection
+            {
                 return Err(replay_unavailable());
             }
             let success = previous.success.ok_or_else(uncertain)?;
@@ -239,10 +302,16 @@ async fn execute_owned<M: Mutation>(
         };
         // Any error or panic from here leaves the claim unresolved. Status codes
         // do not establish that a handler performed no effects.
-        let response = M::execute(state, request).await?;
-        admission.success = Some(M::capture(response.get_ref())?);
+        let facts = ordinary::Facts::default();
+        request.extensions_mut().insert(facts.clone());
+        let mut response = M::execute(state, request).await?;
+        response.extensions_mut().insert(facts);
+        admission.success = Some(M::capture(&response)?);
         admission.completed_at_ms = Some(current_time_ms());
         let payload = serde_json::to_vec(&admission).map_err(|_| uncertain())?;
+        if payload.len() > 64 * 1024 {
+            return Err(uncertain());
+        }
         state
             .store
             .put_if(
@@ -320,6 +389,50 @@ fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
     hash_json(&value)
 }
 
+struct FingerprintKey([u8; 32]);
+
+impl FingerprintKey {
+    fn id(&self) -> String {
+        format!("{:x}", Sha256::digest(self.0))
+    }
+
+    fn fingerprint<M: Mutation>(&self, request: &M) -> Result<String, Status> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0)
+            .map_err(|_| Status::internal("initialize mutation fingerprint"))?;
+        mac.update(fingerprint(request)?.as_bytes());
+        Ok(format!("{:x}", mac.finalize().into_bytes()))
+    }
+}
+
+// New adapters can contain credentials or arbitrary sandbox environment values.
+// A plain database hash would permit offline guesses. Reuse existing private
+// gateway material without introducing a database-stored key or new deployment
+// configuration. HA replicas must share that material; rotation fails closed.
+async fn fingerprint_key(state: &ServerState) -> Result<FingerprintKey, Status> {
+    let path = state
+        .config
+        .gateway_jwt
+        .as_ref()
+        .map(|jwt| &jwt.signing_key_path)
+        .or_else(|| state.config.tls.as_ref().map(|tls| &tls.key_path));
+    let unavailable = || {
+        rpc_error::failed_precondition(
+            "REQUEST_REPLAY_UNAVAILABLE",
+            "request_id on this method requires readable, stable gateway JWT or TLS private key material; no work was started by this call",
+        )
+    };
+    let bytes = tokio::fs::read(path.ok_or_else(unavailable)?)
+        .await
+        .map_err(|_| unavailable())?;
+    if bytes.is_empty() {
+        return Err(unavailable());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"openshell/mutation-fingerprint/v1\0");
+    hash.update(bytes);
+    Ok(FingerprintKey(hash.finalize().into()))
+}
+
 // Sort every map explicitly; do not depend on serde_json's preserve_order feature.
 fn hash_json(value: &serde_json::Value) -> Result<String, Status> {
     struct Canonical<'a>(&'a serde_json::Value);
@@ -355,7 +468,7 @@ fn uncertain() -> Status {
 fn replay_unavailable() -> Status {
     rpc_error::failed_precondition(
         "REQUEST_REPLAY_UNAVAILABLE",
-        "the original workspace or result no longer exists at its recorded version; this request was not executed again",
+        "the original scope, protected payload, or result is no longer replayable; this request was not executed again",
     )
 }
 
@@ -478,8 +591,8 @@ macro_rules! resource_mutation {
             ) -> Result<Response<Self::Output>, Status> {
                 $handler(state, request).await
             }
-            fn capture(response: &Self::Output) -> Result<Success, Status> {
-                resource_success(response.$field.as_ref())
+            fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
+                resource_success(response.get_ref().$field.as_ref())
             }
             async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
                 Ok($resp {
@@ -512,9 +625,9 @@ macro_rules! deletion_mutation {
             ) -> Result<Response<Self::Output>, Status> {
                 $handler(state, request).await
             }
-            fn capture(response: &Self::Output) -> Result<Success, Status> {
+            fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
                 Ok(Success::Deletion {
-                    outcome: response.outcome,
+                    outcome: response.get_ref().outcome,
                 })
             }
             async fn restore(_store: &Store, success: Success) -> Result<Self::Output, Status> {
@@ -587,3 +700,5 @@ deletion_mutation!(
 
 #[cfg(test)]
 mod tests;
+
+pub(super) mod ordinary;
