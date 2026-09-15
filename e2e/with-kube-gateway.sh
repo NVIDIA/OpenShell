@@ -149,6 +149,54 @@ kube_workload_ref() {
   return 1
 }
 
+# Verify the ConfigMap checksum causes a live gateway rollout. This belongs in
+# the harness, before port-forwards are established, because replacing a pod
+# necessarily interrupts any existing port-forward to it.
+verify_gateway_config_rollout() {
+  local workload_ref old_checksum new_checksum old_pod_uid new_pod_uid attempt
+  local pod_selector="app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/name=openshell"
+
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  old_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  old_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+  if [[ -z "${old_checksum}" || -z "${old_pod_uid}" ]]; then
+    echo "ERROR: gateway workload is missing its ConfigMap checksum or ready pod" >&2
+    return 1
+  fi
+
+  echo "Verifying ConfigMap-only gateway configuration rollout..."
+  helmctl upgrade "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+    --namespace "${NAMESPACE}" \
+    --reuse-values \
+    "${helm_values_args[@]}" \
+    --set "fullnameOverride=openshell" \
+    --set "image.repository=${REGISTRY_VALUE}/gateway" \
+    --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
+    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${helm_extra_args[@]}" \
+    "${helm_post_renderer_args[@]}" \
+    --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
+    --wait --timeout 5m
+
+  new_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  if [[ -z "${new_checksum}" || "${new_checksum}" == "${old_checksum}" ]]; then
+    echo "ERROR: ConfigMap-only gateway configuration change did not update workload checksum" >&2
+    return 1
+  fi
+  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=5m
+
+  for attempt in $(seq 1 60); do
+    new_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+    if [[ -n "${new_pod_uid}" && "${new_pod_uid}" != "${old_pod_uid}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: gateway workload rolled out without replacing its pod" >&2
+  return 1
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
   local pg_uri
@@ -1174,6 +1222,10 @@ else
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ "${OPENSHELL_E2E_KUBE_CONFIG_ROLLOUT:-0}" = "1" ]; then
+    verify_gateway_config_rollout || exit 1
+  fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \
