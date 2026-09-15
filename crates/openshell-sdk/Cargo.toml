@@ -10,17 +10,26 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+extension = [
+    "dep:jsonwebtoken",
+    "dep:serde_json",
+]
+
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 async-trait = "0.1"
 futures = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
 miette = { workspace = true }
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }

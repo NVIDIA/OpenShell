@@ -159,6 +159,7 @@ jobs:
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+          cargo fmt --manifest-path e2e/supervisor-middleware-fixture/Cargo.toml --all -- --check
 
       - name: Lint
         run: |
@@ -166,6 +167,7 @@ jobs:
           cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path e2e/supervisor-middleware-fixture/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
         env:

@@ -34,6 +34,7 @@ e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-supervisor-middleware = ["e2e-docker"]
 e2e-oidc-pkce = []
 e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
@@ -189,6 +190,11 @@ path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "supervisor_middleware"
+path = "tests/supervisor_middleware.rs"
+required-features = ["e2e-supervisor-middleware"]
+
+[[test]]
 name = "workspace_namespace_managed"
 path = "tests/workspace_namespace_managed.rs"
 required-features = ["e2e-kubernetes-workspace-managed"]
@@ -228,6 +234,9 @@ tonic-prost = "0.14"
 tower = "0.5"
 url = "2"
 nix = { version = "0.29", features = ["user"] }
+openshell-sdk = { path = "../../crates/openshell-sdk", features = ["extension"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
 
 [dev-dependencies]
 serial_test = "3"
