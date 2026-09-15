@@ -123,6 +123,11 @@ stream, but it does not inspect TLS SNI, HTTP `Host`, or another protocol-level
 destination. Compatible shared infrastructure can therefore let a client
 select another tenant, virtual host, or service behind the approved front door.
 
+An endpoint's `tls` field is either omitted, meaning auto-detect and terminate
+for inspection, or `skip`. Every other value fails shared L7 endpoint
+validation, so a policy cannot name a transport mode the proxy does not
+implement.
+
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by

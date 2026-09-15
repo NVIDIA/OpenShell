@@ -2089,6 +2089,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_rejects_unsupported_endpoint_tls() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "terminate".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unsupported tls value 'terminate'"));
+    }
+
+    #[test]
     fn validate_policy_safety_rejects_path_traversal() {
         use openshell_core::proto::FilesystemPolicy;
 

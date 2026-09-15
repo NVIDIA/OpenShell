@@ -732,7 +732,6 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     host: "example.com".to_string(),
                     ports: vec![443],
                     protocol: "rest".to_string(),
-                    tls: "terminate".to_string(),
                     enforcement: "enforce".to_string(),
                     access: "read-only".to_string(),
                     ..Default::default()

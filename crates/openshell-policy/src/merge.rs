@@ -697,7 +697,7 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
     if !proposed.protocol.is_empty() && !protocols_match(&loaded.protocol, &proposed.protocol) {
         return false;
     }
-    if !proposed.tls.is_empty() && effective_tls(&loaded.tls) != effective_tls(&proposed.tls) {
+    if !proposed.tls.is_empty() && loaded.tls != proposed.tls {
         return false;
     }
     if !proposed.enforcement.is_empty()
@@ -798,13 +798,6 @@ fn protocols_match(left: &str, right: &str) -> bool {
         left.eq_ignore_ascii_case("mcp") && right.eq_ignore_ascii_case("mcp")
     } else {
         left == right
-    }
-}
-
-fn effective_tls(value: &str) -> &str {
-    match value {
-        "" | "terminate" | "passthrough" => "auto",
-        value => value,
     }
 }
 
@@ -3537,7 +3530,6 @@ mod tests {
         assert!(!policy_covers_rule(&loaded, &different_body));
 
         let mut explicit_defaults = loaded_endpoint;
-        explicit_defaults.tls = "passthrough".to_string();
         explicit_defaults.enforcement = "audit".to_string();
         let runtime_defaults = rule_with_authorizations(
             "proposed",
@@ -3546,13 +3538,17 @@ mod tests {
         );
         assert!(policy_covers_rule(&loaded, &runtime_defaults));
 
-        explicit_defaults.tls = "terminate".to_string();
-        let legacy_terminate = rule_with_authorizations(
-            "proposed",
-            vec![explicit_defaults.clone()],
-            &["/usr/bin/client"],
-        );
-        assert!(policy_covers_rule(&loaded, &legacy_terminate));
+        // Coverage validates both sides, so a legacy spelling fails closed
+        // rather than comparing equal to the automatic default.
+        for legacy in ["terminate", "passthrough"] {
+            explicit_defaults.tls = legacy.to_string();
+            let legacy_rule = rule_with_authorizations(
+                "proposed",
+                vec![explicit_defaults.clone()],
+                &["/usr/bin/client"],
+            );
+            assert!(!policy_covers_rule(&loaded, &legacy_rule), "tls: {legacy}");
+        }
 
         explicit_defaults.tls = "skip".to_string();
         let skip_tls = rule_with_authorizations(

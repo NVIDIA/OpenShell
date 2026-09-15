@@ -31,7 +31,6 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:
@@ -39,7 +38,6 @@ endpoints:
   - host: beta.default.svc.cluster.local
     port: 80
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:

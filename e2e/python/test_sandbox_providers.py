@@ -185,7 +185,6 @@ def _native_inference_profile(
                 host="host.openshell.internal",
                 port=port,
                 protocol="rest",
-                tls="none",
                 enforcement="enforce",
                 rules=rules,
                 allowed_ips=[

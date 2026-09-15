@@ -98,7 +98,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -111,7 +110,7 @@ select it. These settings are required because `policy set` replaces the
 entire policy.
 The `network_policies` section is the interesting part: **curl may make
 GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS.
-Everything else is denied.** The proxy terminates TLS (`tls: terminate`)
+Everything else is denied.** The proxy auto-detects and terminates TLS
 to inspect each HTTP request and enforce the `read-only` access preset
 at the method level.
 

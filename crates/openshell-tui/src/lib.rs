@@ -1313,7 +1313,6 @@ fn render_policy_lines(
 
             // Rule header — include L7/TLS/allowed_ips annotation if any endpoint has it.
             let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
-            let has_tls_term = rule.endpoints.iter().any(|e| e.tls == "terminate");
             let has_allowed_ips = rule.endpoints.iter().any(|e| !e.allowed_ips.is_empty());
             let mut annotations = Vec::new();
             if has_l7 {
@@ -1326,9 +1325,6 @@ fn render_policy_lines(
                 {
                     annotations.push(format!("L7 {proto}"));
                 }
-            }
-            if has_tls_term {
-                annotations.push("TLS terminate".to_string());
             }
             if has_allowed_ips {
                 annotations.push("private IP".to_string());
