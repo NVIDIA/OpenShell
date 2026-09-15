@@ -850,6 +850,12 @@ mod tests {
             Ok(Response::new(InterceptorManifest {
                 name: "mock-profile-source".to_string(),
                 provider_profiles: self.advertises_profiles,
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                    "openshell/mock-profile-source",
+                    "test",
+                    [],
+                )),
                 ..InterceptorManifest::default()
             }))
         }

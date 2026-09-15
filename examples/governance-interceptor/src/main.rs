@@ -337,6 +337,12 @@ impl GovernanceInterceptorService {
                 ),
             ],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                "openshell/provider-governance",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 

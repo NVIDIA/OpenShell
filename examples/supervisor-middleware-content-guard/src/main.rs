@@ -17,7 +17,7 @@ use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseBlockDelivery,
     HttpResponseBodyMode, HttpResponseBodyResult, HttpResponseBodyTransform, HttpResponseEvent,
     HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
-    HttpResponseTrailersResult, MiddlewareBinding, MiddlewareManifest,
+    HttpResponseTrailersResult, MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult, WebSocketPreflightAction,
     WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
@@ -230,7 +230,7 @@ impl SupervisorMiddleware for ContentGuard {
 
     async fn describe(
         &self,
-        _request: Request<()>,
+        _request: Request<MiddlewareDescribeRequest>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
             name: MANIFEST_NAME.into(),
@@ -256,6 +256,12 @@ impl SupervisorMiddleware for ContentGuard {
                 },
             ],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                MANIFEST_NAME,
+                openshell_core::VERSION,
+                [],
+            )),
         }))
     }
 
@@ -678,10 +684,13 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_advertises_request_response_and_websocket_bindings() {
-        let manifest = SupervisorMiddleware::describe(&ContentGuard, Request::new(()))
-            .await
-            .expect("describe")
-            .into_inner();
+        let manifest = SupervisorMiddleware::describe(
+            &ContentGuard,
+            Request::new(MiddlewareDescribeRequest::default()),
+        )
+        .await
+        .expect("describe")
+        .into_inner();
 
         assert_eq!(manifest.bindings.len(), 3);
         assert_eq!(

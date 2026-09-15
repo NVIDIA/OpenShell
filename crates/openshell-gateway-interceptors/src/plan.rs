@@ -10,6 +10,9 @@ use openshell_core::config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
 };
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+};
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
     gateway_interceptor_client::GatewayInterceptorClient,
@@ -158,6 +161,7 @@ pub struct ExecutionPlan {
     bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>>,
     profile_sources: BTreeMap<String, GatewayInterceptorProfileSource>,
     routes: OpenShellRouteIndex,
+    negotiated_extensions: Vec<NegotiatedExtension>,
 }
 
 impl ExecutionPlan {
@@ -167,6 +171,7 @@ impl ExecutionPlan {
             bindings: BTreeMap::new(),
             profile_sources: BTreeMap::new(),
             routes,
+            negotiated_extensions: Vec::new(),
         }
     }
 
@@ -181,6 +186,7 @@ impl ExecutionPlan {
 
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
+        let mut negotiated_extensions = Vec::new();
 
         for config in configs {
             let channel = connect_endpoint(&config).await?;
@@ -208,22 +214,33 @@ impl ExecutionPlan {
                         .max_response_bytes
                         .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
                 );
-            let manifest =
-                tokio::time::timeout(timeout, client.describe(Request::new(DescribeRequest {})))
-                    .await
-                    .map_err(|_| {
-                        InterceptorError::Transport(format!(
-                            "Describe timed out for '{}'",
-                            config.name
-                        ))
-                    })?
-                    .map_err(|status| {
-                        InterceptorError::Transport(format!(
-                            "Describe failed for '{}': {status}",
-                            config.name
-                        ))
-                    })?
-                    .into_inner();
+            let gateway = gateway_metadata(ExtensionFamily::GatewayInterceptor);
+            let manifest = tokio::time::timeout(
+                timeout,
+                client.describe(Request::new(DescribeRequest {
+                    gateway: Some(gateway.clone()),
+                })),
+            )
+            .await
+            .map_err(|_| {
+                InterceptorError::Transport(format!("Describe timed out for '{}'", config.name))
+            })?
+            .map_err(|status| {
+                InterceptorError::Transport(format!(
+                    "Describe failed for '{}': {status}",
+                    config.name
+                ))
+            })?
+            .into_inner();
+            negotiated_extensions.push(
+                negotiate(
+                    ExtensionFamily::GatewayInterceptor,
+                    &config.name,
+                    &gateway,
+                    manifest.extension.clone(),
+                )
+                .map_err(|error| InterceptorError::Config(error.to_string()))?,
+            );
             validate_expected_audience(
                 &config,
                 &manifest.expected_audience,
@@ -326,6 +343,7 @@ impl ExecutionPlan {
             bindings,
             profile_sources,
             routes,
+            negotiated_extensions,
         })
     }
 
@@ -334,6 +352,10 @@ impl ExecutionPlan {
         interceptor_name: &str,
     ) -> Option<GatewayInterceptorProfileSource> {
         self.profile_sources.get(interceptor_name).cloned()
+    }
+
+    pub(crate) fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        &self.negotiated_extensions
     }
 
     pub(crate) fn is_empty(&self) -> bool {

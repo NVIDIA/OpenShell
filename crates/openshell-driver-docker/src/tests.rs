@@ -132,7 +132,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cert: PathBuf::from("/tmp/tls.crt"),
             key: PathBuf::from("/tmp/tls.key"),
         }),
-        daemon_version: "28.0.0".to_string(),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
@@ -283,7 +282,7 @@ async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
     let (mut client, shutdown, server) = standalone_traced_client().await;
 
     client
-        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest::default()))
         .await
         .expect("capabilities should succeed");
     client
@@ -436,7 +435,7 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
             otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
             otel.kind = "client"
         );
-        ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
+        ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest::default()))
             .instrument(gateway_span)
             .await?;
 

@@ -773,6 +773,8 @@ openshell gateway info --name production
 openshell status
 ```
 
+`openshell gateway info` reports the immutable startup snapshot for compute drivers, credential drivers, gateway interceptors, and supervisor middleware. Use each entry's protocol version, implementation version, supported capabilities, and gateway requirements when diagnosing extension skew; implementation versions do not identify underlying Docker, Kubernetes, or credential backends.
+
 Register or remove gateways:
 
 ```bash
