@@ -26,14 +26,18 @@ boundaries.
 The well-known time fields replace earlier public fields encoded as Unix
 milliseconds, integer seconds, or duration strings. Their names and protobuf
 tags changed, so clients generated from the old schema are not wire-compatible
-with a gateway generated from the new schema. Upgrade the gateway, CLI, and all
-SDK clients together.
+with a gateway generated from the new schema. Upgrade the gateway, CLI, all SDK
+clients, compute drivers, credential drivers, middleware services, and sandbox
+supervisors together. Mixing versions can silently discard fields whose tags
+changed. For example, the new gateway does not recognize an old credential
+driver's tag-3 expiry and would treat that credential as non-expiring.
 
 Before upgrading a gateway with persisted state:
 
 1. Stop all gateway replicas.
 2. Back up the SQLite database or PostgreSQL database.
-3. Upgrade every gateway replica and client from the same OpenShell release.
+3. Upgrade every gateway replica, client, driver, middleware service, and
+   sandbox supervisor from the same OpenShell release.
 4. Start one gateway replica and wait for startup to complete before starting
    the remaining replicas.
 
@@ -45,8 +49,10 @@ next-refresh timestamp. The database columns `created_at_ms` and
 
 If a legacy payload is malformed or outside protobuf time bounds, startup
 fails with the affected object type and ID and rolls back the transaction.
-Restore the backup or repair the reported record with the previous OpenShell
-version before retrying the upgrade.
+Legacy sandbox condition transition strings that are not valid RFC 3339 are
+dropped because earlier releases allowed arbitrary driver-provided strings.
+Restore the backup or repair any other reported record with the previous
+OpenShell version before retrying the upgrade.
 
 User-facing timeout options and gateway TOML settings keep their existing
 units. The CLI and SDKs convert those values at the protobuf boundary.

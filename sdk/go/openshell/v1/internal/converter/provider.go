@@ -83,7 +83,9 @@ func ProviderToProto(p *types.Provider) *dm.Provider {
 	if len(p.Spec.CredentialExpiresAt) > 0 {
 		result.CredentialExpirationTimes = make(map[string]*timestamppb.Timestamp, len(p.Spec.CredentialExpiresAt))
 		for k, t := range p.Spec.CredentialExpiresAt {
-			result.CredentialExpirationTimes[k] = TimestampFromTime(t)
+			if !t.IsZero() {
+				result.CredentialExpirationTimes[k] = TimestampFromTime(t)
+			}
 		}
 	}
 

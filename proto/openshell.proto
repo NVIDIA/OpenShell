@@ -1767,8 +1767,11 @@ message UpdateProviderRequest {
   reserved "credential_expires_at_ms";
   openshell.datamodel.v1.Provider provider = 1;
   // Optional per-credential expiry timestamps to merge into the provider.
-  // An absent map entry removes the expiry for that credential.
+  // Omitted keys are unchanged. Use clear_credential_expiration_keys to remove
+  // an existing expiry.
   map<string, google.protobuf.Timestamp> credential_expiration_times = 102;
+  // Credential keys whose existing expiry should be removed.
+  repeated string clear_credential_expiration_keys = 103;
   // Explicit workspace scope. The all-workspaces selection is invalid.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }

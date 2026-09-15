@@ -15,8 +15,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
 
-#[cfg(test)]
-const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
+pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
 use openshell_core::{
@@ -490,13 +489,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (282, 13)
+            (283, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (82, 9)
+            (83, 9)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (73, 9));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,

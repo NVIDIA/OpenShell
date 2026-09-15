@@ -6162,8 +6162,11 @@ type UpdateProviderRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Provider *datamodelv1.Provider  `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	// Optional per-credential expiry timestamps to merge into the provider.
-	// An absent map entry removes the expiry for that credential.
+	// Omitted keys are unchanged. Use clear_credential_expiration_keys to remove
+	// an existing expiry.
 	CredentialExpirationTimes map[string]*timestamppb.Timestamp `protobuf:"bytes,102,rep,name=credential_expiration_times,json=credentialExpirationTimes,proto3" json:"credential_expiration_times,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Credential keys whose existing expiry should be removed.
+	ClearCredentialExpirationKeys []string `protobuf:"bytes,103,rep,name=clear_credential_expiration_keys,json=clearCredentialExpirationKeys,proto3" json:"clear_credential_expiration_keys,omitempty"`
 	// Explicit workspace scope. The all-workspaces selection is invalid.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
@@ -6210,6 +6213,13 @@ func (x *UpdateProviderRequest) GetProvider() *datamodelv1.Provider {
 func (x *UpdateProviderRequest) GetCredentialExpirationTimes() map[string]*timestamppb.Timestamp {
 	if x != nil {
 		return x.CredentialExpirationTimes
+	}
+	return nil
+}
+
+func (x *UpdateProviderRequest) GetClearCredentialExpirationKeys() []string {
+	if x != nil {
+		return x.ClearCredentialExpirationKeys
 	}
 	return nil
 }
@@ -15131,10 +15141,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\xc9\x03\n" +
+	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\x92\x04\n" +
 	"\x15UpdateProviderRequest\x12<\n" +
 	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12\x82\x01\n" +
-	"\x1bcredential_expiration_times\x18f \x03(\v2B.openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntryR\x19credentialExpirationTimes\x12R\n" +
+	"\x1bcredential_expiration_times\x18f \x03(\v2B.openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntryR\x19credentialExpirationTimes\x12G\n" +
+	" clear_credential_expiration_keys\x18g \x03(\tR\x1dclearCredentialExpirationKeys\x12R\n" +
 	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x1ah\n" +
 	"\x1eCredentialExpirationTimesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x120\n" +

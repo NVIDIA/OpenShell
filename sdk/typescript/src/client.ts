@@ -34,7 +34,10 @@ import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
 function durationFromSeconds(seconds: number) {
-  return seconds > 0 ? durationFromMs(seconds * 1000) : undefined;
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    throw new RangeError('timeoutSecs must be a finite, non-negative number');
+  }
+  return seconds === 0 ? undefined : durationFromMs(seconds * 1000);
 }
 
 function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefined): string | undefined {

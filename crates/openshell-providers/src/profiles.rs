@@ -1261,14 +1261,8 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: refresh
-            .refresh_before
-            .as_ref()
-            .map_or(0, |value| value.seconds),
-        max_lifetime_seconds: refresh
-            .max_lifetime
-            .as_ref()
-            .map_or(0, |value| value.seconds),
+        refresh_before_seconds: whole_duration_seconds(refresh.refresh_before.as_ref()),
+        max_lifetime_seconds: whole_duration_seconds(refresh.max_lifetime.as_ref()),
         material: refresh
             .material
             .iter()
@@ -1287,6 +1281,21 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
                 credential: output.credential.clone(),
             })
             .collect(),
+    }
+}
+
+// Profile storage currently represents durations as whole seconds. Preserve the
+// validation signal for malformed, negative, or fractional protobuf durations
+// instead of silently truncating or normalizing them.
+fn whole_duration_seconds(value: Option<&prost_types::Duration>) -> i64 {
+    let Some(value) = value else {
+        return 0;
+    };
+    match openshell_core::time::duration_to_std(value) {
+        Ok(duration) if duration.subsec_nanos() == 0 => {
+            i64::try_from(duration.as_secs()).unwrap_or(-1)
+        }
+        Ok(_) | Err(_) => -1,
     }
 }
 
@@ -1337,10 +1346,7 @@ fn token_grant_from_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: token_grant
-            .cache_ttl
-            .as_ref()
-            .map_or(0, |value| value.seconds),
+        cache_ttl_seconds: whole_duration_seconds(token_grant.cache_ttl.as_ref()),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -2253,15 +2259,23 @@ pub fn validate_profile_set(
                 }
             }
 
-            if let Some(token_grant) = credential.token_grant.as_ref()
-                && let Err(message) = validate_token_grant_endpoint(&token_grant.token_endpoint)
-            {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.token_endpoint",
-                    message,
-                ));
+            if let Some(token_grant) = credential.token_grant.as_ref() {
+                if token_grant.cache_ttl_seconds < 0 {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.cache_ttl_seconds",
+                        "cache_ttl_seconds must be greater than or equal to 0",
+                    ));
+                }
+                if let Err(message) = validate_token_grant_endpoint(&token_grant.token_endpoint) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.token_endpoint",
+                        message,
+                    ));
+                }
             }
             diagnostics.extend(validate_token_grant_subject_token(
                 source,
@@ -3272,6 +3286,7 @@ mod tests {
         ProviderTypeProfile, builtin_profiles, is_mcp_diagnostic_field, normalize_profile_id,
         parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml, profile_to_json,
         profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
+        whole_duration_seconds,
     };
 
     fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
@@ -3279,6 +3294,31 @@ mod tests {
             .iter()
             .find(|profile| profile.id == id)
             .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+    }
+
+    #[test]
+    fn profile_duration_conversion_rejects_fractional_and_malformed_values() {
+        assert_eq!(
+            whole_duration_seconds(Some(&prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            })),
+            -1
+        );
+        assert_eq!(
+            whole_duration_seconds(Some(&prost_types::Duration {
+                seconds: 1,
+                nanos: -1,
+            })),
+            -1
+        );
+        assert_eq!(
+            whole_duration_seconds(Some(&prost_types::Duration {
+                seconds: 60,
+                nanos: 0,
+            })),
+            60
+        );
     }
 
     #[test]

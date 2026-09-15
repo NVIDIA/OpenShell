@@ -313,7 +313,7 @@ pub(super) async fn update_provider_record_with_catalog(
     workspace: &str,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    update_provider_record_validating(store, workspace, catalog, provider, None).await
+    update_provider_record_validating(store, workspace, catalog, provider, &[], None).await
 }
 
 async fn reject_refresh_owned_credential_updates(
@@ -361,6 +361,7 @@ async fn update_provider_record_validating(
     workspace: &str,
     catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
+    clear_credential_expiration_keys: &[String],
     credentials: Option<&crate::credentials::CredentialRuntime>,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
@@ -426,6 +427,14 @@ async fn update_provider_record_validating(
         .collect::<HashMap<_, _>>();
     candidate.credentials = merge_map(candidate.credentials, provider.credentials);
     candidate.config = merge_map(candidate.config, provider.config);
+    for key in clear_credential_expiration_keys {
+        if provider.credential_expiration_times.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "credential expiration for '{key}' cannot be both set and cleared"
+            )));
+        }
+        candidate.credential_expiration_times.remove(key);
+    }
     candidate.credential_expiration_times = merge_timestamp_map(
         candidate.credential_expiration_times,
         provider.credential_expiration_times,
@@ -3745,6 +3754,7 @@ pub(super) async fn handle_update_provider(
         &workspace,
         &catalog,
         provider,
+        &req.clear_credential_expiration_keys,
         Some(&state.credentials),
     )
     .await;
@@ -7432,7 +7442,8 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms).ok(),
+                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms)
+                    .ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7539,7 +7550,8 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms).ok(),
+                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms)
+                    .ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -8385,6 +8397,7 @@ mod tests {
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
+            &[],
             Some(&credentials),
         )
         .await
@@ -8422,6 +8435,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_provider_record_clears_credential_expiration_by_key() {
+        let store = test_store().await;
+        let mut provider = provider_with_values("legacy-provider", "legacy-custom");
+        provider.credential_expiration_times.insert(
+            "API_TOKEN".to_string(),
+            openshell_core::time::timestamp_from_millis(1_700_000_000_000).unwrap(),
+        );
+        create_provider_record(&store, "default", provider)
+            .await
+            .unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+
+        let updated = update_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "legacy-provider".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &["API_TOKEN".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !updated
+                .credential_expiration_times
+                .contains_key("API_TOKEN")
+        );
     }
 
     #[tokio::test]
@@ -8466,6 +8519,7 @@ mod tests {
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             },
+            &[],
             Some(&credentials),
         )
         .await
@@ -8531,6 +8585,7 @@ mod tests {
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             },
+            &[],
             Some(&credentials),
         )
         .await
@@ -8937,6 +8992,7 @@ mod tests {
                     "OPENAI_API_KEY",
                 )),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -9977,6 +10033,7 @@ mod tests {
                         ..Default::default()
                     }),
                     credential_expiration_times: HashMap::new(),
+                    clear_credential_expiration_keys: Vec::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -11819,6 +11876,7 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11868,6 +11926,7 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11923,6 +11982,7 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11993,6 +12053,7 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12070,6 +12131,7 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12146,6 +12208,7 @@ mod tests {
                     authed_request(UpdateProviderRequest {
                         provider: Some(updated),
                         credential_expiration_times: HashMap::new(),
+                        clear_credential_expiration_keys: Vec::new(),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
                         )),
@@ -12598,6 +12661,7 @@ mod tests {
                             ..Default::default()
                         }),
                         credential_expiration_times: HashMap::new(),
+                        clear_credential_expiration_keys: Vec::new(),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
                         )),

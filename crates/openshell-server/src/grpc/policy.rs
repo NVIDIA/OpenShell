@@ -4383,17 +4383,20 @@ pub(super) async fn handle_get_sandbox_logs(
 
     let buffer_total = tail.len() as u32;
 
+    let since_ms = req
+        .since_time
+        .as_ref()
+        .map(openshell_core::time::timestamp_to_millis)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?
+        .unwrap_or_default();
+
     let logs: Vec<SandboxLogLine> = tail
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
                 evt.payload
             {
-                let since_ms = req
-                    .since_time
-                    .as_ref()
-                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                    .unwrap_or_default();
                 let event_ms = log
                     .event_time
                     .as_ref()
@@ -6103,7 +6106,8 @@ fn policy_record_to_revision(
                 policy_hash: String::new(),
                 status: PolicyStatus::Failed.into(),
                 load_error,
-                created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms).ok(),
+                created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms)
+                    .ok(),
                 loaded_time: record
                     .loaded_at_ms
                     .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
@@ -8902,6 +8906,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_sandbox_logs_rejects_invalid_since_time() {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".to_string(),
+                name: "sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-id".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 253_402_300_800,
+                    nanos: 0,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn update_config_global_requires_platform_admin() {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
         use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
@@ -10183,18 +10219,18 @@ mod tests {
         let store = test_store().await;
 
         let make_stored_profile = |id: &str, workspace: &str, host: &str| StoredProviderProfile {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("profile-{id}-{workspace}"),
-                    name: id.to_string(),
-                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_time: None,
-                }),
-                profile: Some(openshell_core::proto::ProviderProfile {
-                    id: id.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("profile-{id}-{workspace}"),
+                name: id.to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: workspace.to_string(),
+                deletion_time: None,
+            }),
+            profile: Some(openshell_core::proto::ProviderProfile {
+                id: id.to_string(),
                 display_name: format!("{host} profile"),
                 endpoints: vec![NetworkEndpoint {
                     host: host.to_string(),

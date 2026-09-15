@@ -438,8 +438,7 @@ async fn run_single_session(
     config.ready_tx.send_replace(true);
 
     // Main loop: receive gateway messages + send heartbeats.
-    let mut heartbeat_interval =
-        tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {

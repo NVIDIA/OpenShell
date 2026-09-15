@@ -10,8 +10,11 @@ use std::sync::LazyLock;
 use super::{PersistenceError, PersistenceResult};
 
 static DESCRIPTORS: LazyLock<DescriptorPool> = LazyLock::new(|| {
-    DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)
-        .expect("the embedded protobuf descriptor set must be valid")
+    let mut pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)
+        .expect("the embedded public protobuf descriptor set must be valid");
+    pool.decode_file_descriptor_set(crate::storage_proto::STORAGE_FILE_DESCRIPTOR_SET)
+        .expect("the embedded storage protobuf descriptor set must be valid");
+    pool
 });
 
 #[derive(Clone, Copy)]
@@ -41,14 +44,14 @@ fn root_message_name(object_type: &str) -> Option<&'static str> {
         "provider" => Some("openshell.datamodel.v1.Provider"),
         "workspace" => Some("openshell.datamodel.v1.Workspace"),
         "workspace_member" => Some("openshell.v1.WorkspaceMember"),
-        "provider_profile" => Some("openshell.v1.StoredProviderProfile"),
+        "provider_profile" => Some("openshell.storage.v1.StoredProviderProfile"),
         "provider_credential_refresh_state" => {
-            Some("openshell.v1.StoredProviderCredentialRefreshState")
+            Some("openshell.storage.v1.StoredProviderCredentialRefreshState")
         }
         "service_endpoint" => Some("openshell.v1.ServiceEndpoint"),
         "ssh_session" => Some("openshell.v1.SshSession"),
-        "sandbox_policy" => Some("openshell.v1.PolicyRevisionPayload"),
-        "draft_policy_chunk" => Some("openshell.v1.DraftChunkPayload"),
+        "sandbox_policy" => Some("openshell.storage.v1.PolicyRevisionPayload"),
+        "draft_policy_chunk" => Some("openshell.storage.v1.DraftChunkPayload"),
         _ => None,
     }
 }
@@ -115,12 +118,14 @@ fn rewrite_legacy_field(
                 let value = std::str::from_utf8(payload).map_err(|error| {
                     PersistenceError::Decode(format!("legacy timestamp is not UTF-8: {error}"))
                 })?;
-                let timestamp: prost_types::Timestamp = value.parse().map_err(|error| {
-                    PersistenceError::Decode(format!("invalid legacy timestamp: {error}"))
-                })?;
-                openshell_core::time::validate_timestamp(&timestamp)
-                    .map_err(|error| PersistenceError::Decode(error.to_string()))?;
-                write_embedded(output, new_tag, &timestamp.encode_to_vec());
+                // Legacy sandbox conditions accepted arbitrary driver-provided
+                // strings. Preserve upgrade availability by dropping values
+                // that cannot be represented as protobuf timestamps.
+                if let Ok(timestamp) = value.parse::<prost_types::Timestamp>()
+                    && openshell_core::time::validate_timestamp(&timestamp).is_ok()
+                {
+                    write_embedded(output, new_tag, &timestamp.encode_to_vec());
+                }
             }
         }
         Conversion::DurationSeconds { new_tag } => {
@@ -320,7 +325,7 @@ fn require_wire_type(actual: u8, expected: u8) -> PersistenceResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::Provider;
+    use openshell_core::proto::{Provider, SandboxCondition};
     use std::collections::HashMap;
 
     #[derive(Clone, PartialEq, Message)]
@@ -343,6 +348,20 @@ mod tests {
         r#type: String,
         #[prost(map = "string, int64", tag = "5")]
         credential_expires_at_ms: HashMap<String, i64>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxCondition {
+        #[prost(string, tag = "1")]
+        r#type: String,
+        #[prost(string, tag = "2")]
+        status: String,
+        #[prost(string, tag = "3")]
+        reason: String,
+        #[prost(string, tag = "4")]
+        message: String,
+        #[prost(string, tag = "5")]
+        last_transition_time: String,
     }
 
     #[test]
@@ -412,13 +431,34 @@ mod tests {
     }
 
     #[test]
+    fn drops_non_rfc3339_legacy_condition_transition_time() {
+        let legacy = LegacySandboxCondition {
+            r#type: "Ready".into(),
+            status: "Unknown".into(),
+            reason: "DriverPending".into(),
+            message: String::new(),
+            last_transition_time: "driver-clock-pending".into(),
+        };
+        let descriptor = DESCRIPTORS
+            .get_message_by_name("openshell.v1.SandboxCondition")
+            .unwrap();
+
+        let migrated = rewrite_message(&descriptor, &legacy.encode_to_vec()).unwrap();
+        let condition = SandboxCondition::decode(migrated.as_slice()).unwrap();
+
+        assert_eq!(condition.r#type, "Ready");
+        assert!(condition.transition_time.is_none());
+    }
+
+    #[test]
     fn public_time_fields_use_well_known_types() {
         let private_storage_messages = [
-            "openshell.v1.StoredProviderCredentialRefreshState",
-            "openshell.v1.PolicyRevisionPayload",
-            "openshell.v1.DraftChunkPayload",
-            "openshell.v1.StoredPolicyRevision",
-            "openshell.v1.StoredDraftChunk",
+            "openshell.storage.v1.StoredProviderCredentialRefreshState",
+            "openshell.storage.v1.PolicyRevisionPayload",
+            "openshell.storage.v1.DraftChunkPayload",
+            "openshell.storage.v1.StoredPolicyRevision",
+            "openshell.storage.v1.StoredDraftChunk",
+            "openshell.internal.pagination.v1.ObjectCursor",
         ];
         let mut violations = Vec::new();
         for message in DESCRIPTORS.all_messages() {

@@ -1879,6 +1879,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }),
             credential_expiration_times: HashMap::default(),
             workspace_scope: Some(named_workspace_scope(workspace)),
+            clear_credential_expiration_keys: Vec::new(),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -2728,24 +2729,24 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .collect();
     app.sandbox_ages = sandboxes
         .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .and_then(|m| m.created_time.as_ref())
-                        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                        .map_or_else(|| "?".to_string(), format_age)
-                })
-                .collect();
-            app.sandbox_created = sandboxes
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_age)
+        })
+        .collect();
+    app.sandbox_created = sandboxes
         .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .and_then(|m| m.created_time.as_ref())
-                        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                        .map_or_else(|| "?".to_string(), format_timestamp)
-                })
-                .collect();
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_timestamp)
+        })
+        .collect();
 
     app.sandbox_policy_versions = sandboxes
         .iter()

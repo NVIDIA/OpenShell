@@ -2306,6 +2306,11 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let mut config_map = parse_key_value_pairs(config, "--config")?;
     let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
     credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
+    let clear_credential_expiration_keys = credential_expires_at_ms
+        .iter()
+        .filter_map(|(key, expires_at_ms)| (*expires_at_ms == 0).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    credential_expires_at_ms.retain(|_, expires_at_ms| *expires_at_ms != 0);
 
     if from_existing {
         let stored = existing.as_ref().expect("checked above");
@@ -2362,6 +2367,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                 .collect::<Result<HashMap<_, _>, _>>()
                 .into_diagnostic()?,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            clear_credential_expiration_keys,
         })
         .await
         .into_diagnostic()?;

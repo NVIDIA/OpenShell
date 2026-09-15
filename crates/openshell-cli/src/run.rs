@@ -77,6 +77,15 @@ fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
         .unwrap_or_default()
 }
 
+fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::Duration>> {
+    if timeout_seconds == 0 {
+        return Ok(None);
+    }
+    openshell_core::time::duration_from_std(Duration::from_secs(timeout_seconds.into()))
+        .map(Some)
+        .into_diagnostic()
+}
+
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
@@ -1798,12 +1807,7 @@ pub async fn sandbox_exec_grpc(
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
             environment: environment.clone(),
-            execution_timeout: Some(
-                openshell_core::time::duration_from_std(Duration::from_secs(
-                    timeout_seconds.into(),
-                ))
-                .into_diagnostic()?,
-            ),
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
             stdin: stdin_payload,
             tty,
             cols,
@@ -2188,12 +2192,7 @@ async fn sandbox_exec_interactive_grpc(
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
                 no_login_shell,
-                execution_timeout: Some(
-                    openshell_core::time::duration_from_std(Duration::from_secs(
-                        timeout_seconds.into(),
-                    ))
-                    .into_diagnostic()?,
-                ),
+                execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
                 tty: true,
                 cols,
@@ -2547,10 +2546,7 @@ fn sandbox_condition_display_lines(condition: &SandboxCondition) -> Vec<String> 
         condition.r#type, condition.status
     )];
     if let Some(transition_time) = &condition.transition_time {
-        lines.push(format!(
-            "Last transition: {}",
-            transition_time
-        ));
+        lines.push(format!("Last transition: {transition_time}"));
     }
     lines
 }
@@ -2897,7 +2893,9 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
         if metadata.created_time.is_some() {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(proto_timestamp_ms(metadata.created_time.as_ref()))),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    metadata.created_time.as_ref()
+                ))),
             );
         }
         if !metadata.labels.is_empty() {
@@ -6074,11 +6072,23 @@ mod tests {
         format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
         parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
+        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
+        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
+        service_url_for_gateway, workspace_member_to_json,
     };
+
+    #[test]
+    fn zero_exec_timeout_is_omitted() {
+        assert!(proto_execution_timeout(0).unwrap().is_none());
+        assert_eq!(
+            proto_execution_timeout(30).unwrap().unwrap(),
+            prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }
+        );
+    }
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,

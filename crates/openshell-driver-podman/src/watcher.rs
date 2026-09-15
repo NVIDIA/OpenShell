@@ -740,10 +740,7 @@ mod tests {
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, CONDITION_RUNNING);
         assert_eq!(cond.message, "Container is running");
-        assert_eq!(
-            cond.transition_time,
-            "2026-04-14T10:00:00Z".parse().ok()
-        );
+        assert_eq!(cond.transition_time, "2026-04-14T10:00:00Z".parse().ok());
     }
 
     #[test]

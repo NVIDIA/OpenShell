@@ -497,12 +497,12 @@ use openshell_core::proto::{
       ..Default::default()
   };
   ```
-- `SandboxLogLine` proto fields: `sandbox_id`, `timestamp_ms`, `level`, `target`, `message`, `source`, `fields` (HashMap<String, String>).
+- `SandboxLogLine` proto fields: `sandbox_id`, `event_time` (`Option<prost_types::Timestamp>`), `level`, `target`, `message`, `source`, `fields` (`HashMap<String, String>`).
 - Workspace-scoped request fields use `workspace_scope: Option<WorkspaceSelector>`.
   Select one workspace with `Some(workspace_selector(name))`. List requests that
   explicitly support cross-workspace access also accept
   `Some(all_workspaces_selector())`; do not use that marker on other requests.
-- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64),
+- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_time` (`Option<prost_types::Timestamp>`),
   `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
 - `ListSandboxesRequest` fields: `page_size` (i32), `page_token` (String),
   `label_selector` (String), `workspace_scope`.

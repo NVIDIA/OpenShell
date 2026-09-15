@@ -11,6 +11,7 @@ import (
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // --- ProfileCategory ---
@@ -203,6 +204,22 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, []string{"admin"}, cred.TokenGrant.AudienceOverrides[0].Scopes)
 }
 
+func TestProfileCredentialFromProto_RejectsInvalidOrFractionalDurations(t *testing.T) {
+	credential := ProfileCredentialFromProto(&pb.ProviderProfileCredential{
+		Refresh: &pb.ProviderCredentialRefresh{
+			RefreshBefore: &durationpb.Duration{Nanos: 500_000_000},
+			MaxLifetime:   &durationpb.Duration{Seconds: 1, Nanos: -1},
+		},
+		TokenGrant: &pb.ProviderCredentialTokenGrant{
+			CacheTtl: &durationpb.Duration{Seconds: 1, Nanos: -1},
+		},
+	})
+
+	assert.Equal(t, int64(-1), credential.Refresh.RefreshBeforeSeconds)
+	assert.Equal(t, int64(-1), credential.Refresh.MaxLifetimeSeconds)
+	assert.Equal(t, int64(-1), credential.TokenGrant.CacheTTLSeconds)
+}
+
 func TestProfileCredentialFromProto_DeepCopy(t *testing.T) {
 	proto := &pb.ProviderProfileCredential{
 		Name:    "KEY",
@@ -320,6 +337,20 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "urn:ietf:params:oauth:token-type:refresh_token", proto.TokenGrant.RequestedTokenType)
 	require.Len(t, proto.TokenGrant.AudienceOverrides, 1)
 	assert.Equal(t, "h", proto.TokenGrant.AudienceOverrides[0].Host)
+}
+
+func TestProfileCredentialToProto_PreservesNegativeDurationsForValidation(t *testing.T) {
+	proto := ProfileCredentialToProto(&v1.ProfileCredential{
+		Refresh: &v1.ProfileCredentialRefresh{
+			RefreshBeforeSeconds: -1,
+			MaxLifetimeSeconds:   -2,
+		},
+		TokenGrant: &v1.CredentialTokenGrant{CacheTTLSeconds: -3},
+	})
+
+	assert.Equal(t, int64(-1), proto.Refresh.RefreshBefore.GetSeconds())
+	assert.Equal(t, int64(-2), proto.Refresh.MaxLifetime.GetSeconds())
+	assert.Equal(t, int64(-3), proto.TokenGrant.CacheTtl.GetSeconds())
 }
 
 func TestProfileCredentialToProto_Nil(t *testing.T) {

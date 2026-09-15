@@ -144,6 +144,14 @@ func TestProviderToProto_Full(t *testing.T) {
 	assert.Equal(t, map[string]string{"k": "v"}, h.Metadata)
 }
 
+func TestProviderToProto_OmitsZeroCredentialExpiry(t *testing.T) {
+	result := ProviderToProto(&types.Provider{Spec: types.ProviderSpec{
+		CredentialExpiresAt: map[string]time.Time{"token": {}},
+	}})
+
+	assert.NotContains(t, result.CredentialExpirationTimes, "token")
+}
+
 func TestProviderFromProto_DeepCopyCredentialHandles(t *testing.T) {
 	proto := &dm.Provider{
 		Metadata: &dm.ObjectMeta{Name: "deep-copy-test"},
