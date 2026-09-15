@@ -603,7 +603,54 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
 
 #[tokio::test]
 async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
-    let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--no-keep", "--", "echo", "OK"]);
+    let name = format!("tty-{:015x}", rand::random::<u64>() & 0x0fff_ffff_ffff_ffff);
+    // Capture startup diagnostics before --no-keep removes a failed container.
+    // This is best-effort: the lifecycle assertions also run on other drivers.
+    let log_name = name.clone();
+    let diagnostics = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let containers = tokio::process::Command::new("docker")
+                    .args(["ps", "--all", "--quiet", "--filter"])
+                    .arg(format!("label=openshell.ai/sandbox-name={log_name}"))
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .ok()?;
+                if !containers.status.success() {
+                    return None;
+                }
+                let ids = String::from_utf8_lossy(&containers.stdout);
+                if let Some(id) = ids.split_whitespace().next() {
+                    let logs = tokio::process::Command::new("docker")
+                        .args(["logs", "--follow", id])
+                        .kill_on_drop(true)
+                        .output()
+                        .await
+                        .ok()?;
+                    return Some(normalize_output(&format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&logs.stdout),
+                        String::from_utf8_lossy(&logs.stderr)
+                    )));
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    });
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--name",
+        &name,
+        "--no-keep",
+        "--",
+        "echo",
+        "OK",
+    ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
@@ -611,7 +658,17 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
 
-    assert!(output.status.success(), "create failed:\n{combined}");
+    let startup_logs = if output.status.success() {
+        diagnostics.abort();
+        None
+    } else {
+        diagnostics.await.ok().flatten()
+    };
+    assert!(
+        output.status.success(),
+        "create failed:\n{combined}\nsupervisor logs:\n{}",
+        startup_logs.as_deref().unwrap_or("unavailable")
+    );
     assert!(
         combined.contains("OK"),
         "main output was not streamed:\n{combined}"

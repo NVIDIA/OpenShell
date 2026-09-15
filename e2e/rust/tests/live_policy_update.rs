@@ -593,114 +593,98 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     guard.cleanup().await;
 }
 
-/// An explicit local Rego/data override remains authoritative even when the
-/// sandbox has a gateway policy and that policy changes while it is running.
-/// Gateway polling must continue for settings and providers without replacing
-/// the locally loaded OPA engine.
+/// Gateway-managed activation cannot admit an unreported local Rego/data
+/// override. Reject it before the workload starts instead of silently bypassing
+/// the gateway's effective policy.
 #[cfg(feature = "e2e-docker")]
 #[tokio::test]
-async fn local_policy_override_survives_gateway_policy_polls() {
+async fn local_policy_override_is_rejected_before_gateway_managed_launch() {
+    use openshell_e2e::harness::container::ContainerEngine;
+
     let (_image_context, image) = write_local_override_image().expect("write local override image");
-
-    let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
-    let gateway_policy_a_path = gateway_policy_a_file
-        .path()
-        .to_str()
-        .expect("gateway policy A path should be utf-8")
-        .to_string();
-    let gateway_policy_b_file =
-        write_policy(&["example.com", "api.anthropic.com"]).expect("write gateway policy B");
-    let gateway_policy_b_path = gateway_policy_b_file
-        .path()
-        .to_str()
-        .expect("gateway policy B path should be utf-8")
-        .to_string();
-
-    let mut guard = SandboxGuard::create_keep_with_args(
-        &[
+    let gateway_policy = write_policy(&["example.com"]).expect("write gateway policy");
+    let name = format!("lo-{:016x}", rand::random::<u64>());
+    let mut guard = SandboxGuard::manage_existing(name.clone());
+    let create = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        run_cli(&[
+            "sandbox",
+            "create",
             "--name",
-            "e2e-lcl-pol-ovrd",
+            &name,
             "--from",
             image.tag(),
             "--policy",
-            &gateway_policy_a_path,
-            "--no-tty",
-        ],
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
+            gateway_policy.path().to_str().unwrap(),
+            "--detach",
+            "--",
+            "sh",
+            "-c",
+            "echo LOCAL_OVERRIDE_WORKLOAD_STARTED; exec sleep infinity",
+        ]),
     )
     .await
-    .expect("create sandbox with local policy override");
-
-    // Allow several one-second poll intervals. Before the fix, the first poll
-    // immediately reloaded gateway policy A over the local override.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let initial_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
+    .expect("unsupported local override must terminate startup");
     assert!(
-        initial_logs.success,
-        "fetch initial sandbox logs:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        initial_logs
-            .output
-            .contains("Loading OPA policy engine from local files"),
-        "sandbox should load the explicit local policy:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        !initial_logs.output.contains("Policy reloaded successfully"),
-        "the first gateway poll must not replace the local policy:\n{}",
-        initial_logs.output
+        !create.success,
+        "local override must not activate: {}",
+        create.output
     );
 
-    let update = run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &gateway_policy_b_path,
-    ])
-    .await;
     assert!(
-        update.success,
-        "publish gateway policy B:\n{}",
-        update.output
+        create.output.contains(&format!("Created sandbox: {name}")),
+        "creation must reach provisioning, not fail argument validation: {}",
+        create.output
     );
 
-    // A later gateway revision must also remain observational in local mode.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let updated_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
-    assert!(
-        updated_logs.success,
-        "fetch updated sandbox logs:\n{}",
-        updated_logs.output
+    // This failure occurs before the supervisor log stream is connected; inspect
+    // the backend directly so an unrelated provisioning failure cannot pass.
+    let engine = ContainerEngine::from_env().unwrap();
+    let containers = engine
+        .command()
+        .args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            &format!("label=openshell.ai/sandbox-name={name}"),
+        ])
+        .output()
+        .expect("find rejected sandbox container");
+    assert!(containers.status.success());
+    let ids = String::from_utf8(containers.stdout).unwrap();
+    let ids: Vec<_> = ids.split_whitespace().collect();
+    assert_eq!(ids.len(), 1, "expected one rejected container: {ids:?}");
+    let logs = engine
+        .command()
+        .args(["logs", ids[0]])
+        .output()
+        .expect("read supervisor failure");
+    assert!(logs.status.success());
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&logs.stdout),
+        String::from_utf8_lossy(&logs.stderr)
     );
     assert!(
-        !updated_logs.output.contains("Policy reloaded successfully"),
-        "gateway policy updates must not replace the local override:\n{}",
-        updated_logs.output
+        logs.contains("Local policy overrides cannot be combined with gateway-managed activation"),
+        "{logs}"
     );
-
+    assert!(
+        !logs.contains("LOCAL_OVERRIDE_WORKLOAD_STARTED"),
+        "workload must never start: {logs}"
+    );
+    let state = engine
+        .command()
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}",
+            ids[0],
+        ])
+        .output()
+        .expect("inspect rejected supervisor");
+    assert!(state.status.success());
+    assert_eq!(String::from_utf8_lossy(&state.stdout).trim(), "exited 1 0");
     guard.cleanup().await;
 }
