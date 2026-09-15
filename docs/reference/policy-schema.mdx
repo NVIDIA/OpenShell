@@ -34,6 +34,39 @@ network_middlewares: { ... }
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
+## Parsing and representation
+
+OpenShell uses one canonical authored-policy representation for YAML and JSON.
+Runtime policy loading and the policy prover both decode through the same
+bounded parser before projecting the document into their runtime-specific
+models. The parser requires `version: 1`, rejects duplicate mapping keys and
+YAML merge keys, and accepts one document of at most 4 MiB. It limits nesting
+to 64 levels, total AST nodes to 100,000, parser events to 300,000, cumulative
+scalar data to 4 MiB, alias expansions to 100 with a 5:1 alias-to-anchor ratio,
+and each mapping or sequence to 10,000 entries.
+
+Ordinary runtime policy uses the strict profile. Unknown keys in closed schema
+objects are rejected with their field path. The following maps are intentionally
+open user namespaces, so their keys are preserved as data: middleware `config`,
+query matcher names, GraphQL persisted-query names, and recursively nested MCP
+`params` names.
+
+The containment profile used by managed maximum-policy tooling retains unknown
+closed-object fields for a fail-closed support audit. It also recognizes
+top-level managed `metadata` and endpoint or allow-rule `review` annotations.
+Those annotations describe workflow, not authority, and ordinary runtime policy
+rejects them. Maximum-policy containment support lands separately from this
+schema boundary.
+
+An absent `filesystem_policy` resolves to the runtime-effective
+`include_workdir: true`. An explicitly present `filesystem_policy: {}` keeps
+`include_workdir: false`. During protobuf conversion, `ports` takes precedence
+over scalar `port`, one effective port serializes in compact scalar form, empty
+rule names fall back to their map key, and runtime-only provenance fields are
+omitted. Because proto3 scalar fields do not preserve presence, protobuf `version: 0` means omission. Canonical serialization materializes
+`version: 1`; any other unsupported protobuf version is rejected. A protobuf port above
+65535 is rejected rather than clamped.
+
 ## Version
 
 The version field identifies which schema the policy uses:
