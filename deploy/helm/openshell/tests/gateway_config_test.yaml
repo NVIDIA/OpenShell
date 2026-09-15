@@ -383,7 +383,6 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
 
->>>>>>> 5d569eab8 (test(helm): migrate gateway config scenarios)
   - it: configures managed SSH isolation with the gateway peer
     template: templates/gateway-config.yaml
     asserts:
@@ -715,7 +714,9 @@ tests:
       workload.kind: deployment
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      gatewayConfig:
+        openshell.gateway:
+          credential_drivers: [kubernetes-secrets]
     asserts:
       - equal:
           path: kind
@@ -770,7 +771,9 @@ tests:
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
       workload.allowMultiReplicaStatefulSet: true
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      gatewayConfig:
+        openshell.gateway:
+          credential_drivers: [kubernetes-secrets]
     asserts:
       - equal:
           path: kind

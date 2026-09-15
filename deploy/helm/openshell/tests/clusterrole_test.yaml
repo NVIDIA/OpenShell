@@ -17,7 +17,9 @@ tests:
 
   - it: grants managed namespace NetworkPolicy apply permissions
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
     asserts:
       - contains:
           path: rules
@@ -28,7 +30,9 @@ tests:
 
   - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
       networkPolicy.enabled: false
     asserts:
       - contains:
@@ -46,8 +50,11 @@ tests:
 
   - it: grants broad secret access when credential driver is enabled (operator)
     set:
-      server.drivers.kubernetes.workspaceMode: operator
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
+        openshell.gateway:
+          credential_drivers: [kubernetes-secrets]
     asserts:
       - contains:
           path: rules
@@ -58,7 +65,9 @@ tests:
 
   - it: restricts operator TLS sync to the configured secret
     set:
-      server.drivers.kubernetes.workspaceMode: operator
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
       server.tls.clientTlsSecretName: custom-client-tls
     asserts:
       - contains:
@@ -71,7 +80,9 @@ tests:
 
   - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
     set:
-      server.drivers.kubernetes.workspaceMode: operator
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
       server.disableTls: true
     asserts:
       - contains:
@@ -89,11 +100,11 @@ tests:
 
   - it: restricts managed copies to TLS and configured image-pull secrets
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+          image_pull_secrets: [registry-one, registry-two]
       server.tls.clientTlsSecretName: custom-client-tls
-      server.sandboxImagePullSecrets:
-        - name: registry-one
-        - name: registry-two
     asserts:
       - contains:
           path: rules
@@ -111,10 +122,11 @@ tests:
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+          image_pull_secrets: [registry-one]
       server.disableTls: true
-      server.sandboxImagePullSecrets:
-        - name: registry-one
     asserts:
       - contains:
           path: rules
@@ -132,7 +144,9 @@ tests:
 
   - it: omits secrets rule entirely in shared mode
     set:
-      server.drivers.kubernetes.workspaceMode: shared
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: shared
     asserts:
       - notContains:
           path: rules
