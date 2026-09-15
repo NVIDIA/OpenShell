@@ -753,7 +753,7 @@ if [ "${OIDC_MODE}" = "1" ]; then
   )
   case "${OIDC_ISSUER}" in
     http://127.*|http://\[::1\]*)
-      GATEWAY_ARGS+=(--oidc-dangerously-allow-insecure-http)
+      GATEWAY_ARGS+=(--oidc-dangerously-allow-insecure-http true)
       ;;
   esac
 else

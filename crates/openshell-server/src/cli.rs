@@ -1472,6 +1472,25 @@ mod tests {
     }
 
     #[test]
+    fn command_parses_oidc_insecure_http_acknowledgement_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--oidc-dangerously-allow-insecure-http",
+            "true",
+        ])
+        .expect("launcher-style boolean flag and value should parse");
+
+        assert!(cli.run.oidc_dangerously_allow_insecure_http);
+    }
+
+    #[test]
     fn command_reads_server_san_from_env() {
         let _lock = ENV_LOCK
             .lock()
