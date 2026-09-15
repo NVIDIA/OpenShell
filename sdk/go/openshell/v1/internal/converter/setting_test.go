@@ -666,10 +666,16 @@ func TestPolicyMergeOperationToProto_RemoveRule(t *testing.T) {
 }
 
 func TestPolicyMergeOperationToProto_AddDenyRules(t *testing.T) {
+	path := "/api"
 	op := &v1.PolicyMergeOperation{
 		AddDenyRules: &v1.AddDenyRules{
-			Host: "blocked.example.com",
-			Port: 443,
+			Target: &v1.L7RuleTarget{
+				RuleName: "blocked-api",
+				Host:     "blocked.example.com",
+				Ports:    []uint32{443, 8443},
+				Path:     &path,
+				Binaries: []v1.PolicyNetworkBinary{{Path: "/usr/bin/curl"}, {Path: "/usr/bin/wget"}},
+			},
 			DenyRules: []v1.L7DenyRule{
 				{
 					Method: "POST",
@@ -690,8 +696,16 @@ func TestPolicyMergeOperationToProto_AddDenyRules(t *testing.T) {
 	require.NotNil(t, pmo)
 	adr := pmo.GetAddDenyRules()
 	require.NotNil(t, adr, "expected AddDenyRules variant")
-	assert.Equal(t, "blocked.example.com", adr.GetHost())
-	assert.Equal(t, uint32(443), adr.GetPort())
+	require.NotNil(t, adr.GetTarget())
+	assert.Equal(t, "blocked-api", adr.GetTarget().GetRuleName())
+	assert.Equal(t, "blocked.example.com", adr.GetTarget().GetHost())
+	assert.Equal(t, []uint32{443, 8443}, adr.GetTarget().GetPorts())
+	require.NotNil(t, adr.GetTarget().Path)
+	assert.Equal(t, "/api", adr.GetTarget().GetPath())
+	require.Len(t, adr.GetTarget().GetBinaries(), 2)
+	assert.Equal(t, "/usr/bin/curl", adr.GetTarget().GetBinaries()[0].GetPath())
+	assert.Equal(t, "/usr/bin/wget", adr.GetTarget().GetBinaries()[1].GetPath())
+	assert.False(t, adr.GetTarget().GetAnyBinary())
 	require.Len(t, adr.GetDenyRules(), 2)
 	assert.Equal(t, "POST", adr.GetDenyRules()[0].GetMethod())
 	assert.Equal(t, "/admin", adr.GetDenyRules()[0].GetPath())
@@ -701,8 +715,12 @@ func TestPolicyMergeOperationToProto_AddDenyRules(t *testing.T) {
 func TestPolicyMergeOperationToProto_AddAllowRules(t *testing.T) {
 	op := &v1.PolicyMergeOperation{
 		AddAllowRules: &v1.AddAllowRules{
-			Host: "api.example.com",
-			Port: 443,
+			Target: &v1.L7RuleTarget{
+				RuleName:  "public-api",
+				Host:      "api.example.com",
+				Ports:     []uint32{443},
+				AnyBinary: true,
+			},
 			Rules: []v1.L7Rule{
 				{
 					Allow: &v1.L7Allow{
@@ -720,12 +738,99 @@ func TestPolicyMergeOperationToProto_AddAllowRules(t *testing.T) {
 	require.NotNil(t, pmo)
 	aar := pmo.GetAddAllowRules()
 	require.NotNil(t, aar, "expected AddAllowRules variant")
-	assert.Equal(t, "api.example.com", aar.GetHost())
-	assert.Equal(t, uint32(443), aar.GetPort())
+	require.NotNil(t, aar.GetTarget())
+	assert.Equal(t, "public-api", aar.GetTarget().GetRuleName())
+	assert.Equal(t, "api.example.com", aar.GetTarget().GetHost())
+	assert.Equal(t, []uint32{443}, aar.GetTarget().GetPorts())
+	assert.Nil(t, aar.GetTarget().Path)
+	assert.Empty(t, aar.GetTarget().GetBinaries())
+	assert.True(t, aar.GetTarget().GetAnyBinary())
 	require.Len(t, aar.GetRules(), 1)
 	require.NotNil(t, aar.GetRules()[0].GetAllow())
 	assert.Equal(t, "GET", aar.GetRules()[0].GetAllow().GetMethod())
 	assert.Equal(t, "/health", aar.GetRules()[0].GetAllow().GetPath())
+}
+
+func TestPolicyMergeOperationToProto_L7TargetDeepCopy(t *testing.T) {
+	for _, kind := range []string{"allow", "deny"} {
+		t.Run(kind, func(t *testing.T) {
+			path := ""
+			target := &v1.L7RuleTarget{
+				RuleName: "api",
+				Host:     "api.example.com",
+				Ports:    []uint32{443, 8443},
+				Path:     &path,
+				Binaries: []v1.PolicyNetworkBinary{{Path: "/usr/bin/curl"}},
+			}
+			op := &v1.PolicyMergeOperation{}
+			if kind == "allow" {
+				op.AddAllowRules = &v1.AddAllowRules{Target: target}
+			} else {
+				op.AddDenyRules = &v1.AddDenyRules{Target: target}
+			}
+			converted, err := PolicyMergeOperationToProto(op)
+			require.NoError(t, err)
+			wireTarget := converted.GetAddAllowRules().GetTarget()
+			if kind == "deny" {
+				wireTarget = converted.GetAddDenyRules().GetTarget()
+			}
+			require.NotNil(t, wireTarget)
+			require.NotNil(t, wireTarget.Path)
+			assert.Empty(t, *wireTarget.Path, "explicit empty path must retain presence")
+
+			// Editing the caller's declaration must not change the queued request.
+			target.Ports[0] = 80
+			target.Binaries[0].Path = "/usr/bin/python"
+			path = "/changed"
+			assert.Equal(t, []uint32{443, 8443}, wireTarget.GetPorts())
+			assert.Equal(t, "/usr/bin/curl", wireTarget.GetBinaries()[0].GetPath())
+			assert.Empty(t, *wireTarget.Path)
+
+			// Editing the wire request must not mutate the caller's objects either.
+			wireTarget.Ports[1] = 8080
+			wireTarget.Binaries[0].Path = "/usr/bin/node"
+			*wireTarget.Path = "/wire"
+			assert.Equal(t, []uint32{80, 8443}, target.Ports)
+			assert.Equal(t, "/usr/bin/python", target.Binaries[0].Path)
+			assert.Equal(t, "/changed", path)
+		})
+	}
+}
+
+func TestPolicyMergeOperationToProto_L7TargetDoesNotInferScope(t *testing.T) {
+	for _, kind := range []string{"allow", "deny"} {
+		for _, tc := range []struct {
+			name   string
+			target *v1.L7RuleTarget
+		}{
+			{name: "missing"},
+			{name: "omitted_scope", target: &v1.L7RuleTarget{RuleName: "api", Host: "api.example.com"}},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				op := &v1.PolicyMergeOperation{}
+				if kind == "allow" {
+					op.AddAllowRules = &v1.AddAllowRules{Target: tc.target}
+				} else {
+					op.AddDenyRules = &v1.AddDenyRules{Target: tc.target}
+				}
+				converted, err := PolicyMergeOperationToProto(op)
+				require.NoError(t, err)
+				target := converted.GetAddAllowRules().GetTarget()
+				if kind == "deny" {
+					target = converted.GetAddDenyRules().GetTarget()
+				}
+				if tc.target == nil {
+					assert.Nil(t, target)
+					return
+				}
+				require.NotNil(t, target)
+				assert.False(t, target.GetAnyBinary())
+				assert.Nil(t, target.GetBinaries())
+				assert.Nil(t, target.GetPorts())
+				assert.Nil(t, target.Path)
+			})
+		}
+	}
 }
 
 func TestPolicyMergeOperationToProto_RemoveBinary(t *testing.T) {

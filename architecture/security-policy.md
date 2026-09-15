@@ -210,6 +210,8 @@ ambiguity atomically, without creating an invalid revision or partially
 activating an update. Supervisor validation remains the defense-in-depth
 boundary for startup, concurrent changes, and sources outside those mutations.
 
+L7 allow and deny append operations carry an explicit rule target and the complete affected binary and port scope. The merge engine resolves one non-provider endpoint within that rule, optionally by exact endpoint path, and compares both scope sets before mutation. A partial declaration, ambiguous target, or changed scope rejects the batch before revision persistence. The declaration records operator intent; it does not grant policy-writing authority or change the stored binary and port sets.
+
 The `[openshell.gateway] policy_validation_failure_mode` configuration controls
 candidates rejected by supervisor runtime validation. Gateway preflight
 rejections never become generations and leave the active policy unchanged. The

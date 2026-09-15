@@ -677,7 +677,7 @@ When denied actions appear:
 
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+   `openshell policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 
    A rule authorizes every binary it lists to reach every endpoint it lists, so
    an update that adds a binary or an endpoint to an existing rule must declare
@@ -688,10 +688,7 @@ When denied actions appear:
    `--rule-name`; it stays on its own rule instead of folding into the broader
    one.
 
-   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
-   that host and port appears in more than one rule, or twice in one rule under
-   different paths, the update is rejected as ambiguous. Fall back to full YAML
-   replacement for those endpoints.
+   `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
 2. Use full YAML replacement for broad changes or non-network fields, including
    any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`

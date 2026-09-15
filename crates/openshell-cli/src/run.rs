@@ -4789,6 +4789,7 @@ pub async fn sandbox_policy_set(
     }
 }
 
+/// Preview or atomically submit explicitly scoped incremental policy operations.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_policy_update(
     server: &str,
@@ -4800,6 +4801,8 @@ pub async fn sandbox_policy_update(
     remove_rules: &[String],
     binaries: &[String],
     rule_name: Option<&str>,
+    any_binary: bool,
+    endpoint_path: Option<&str>,
     dry_run: bool,
     wait: bool,
     timeout_secs: u64,
@@ -4818,6 +4821,8 @@ pub async fn sandbox_policy_update(
         remove_rules,
         binaries,
         rule_name,
+        any_binary,
+        endpoint_path,
     )?;
 
     let mut client = grpc_client(server, tls).await?;

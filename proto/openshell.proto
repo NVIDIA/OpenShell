@@ -2296,16 +2296,32 @@ message RemoveNetworkRule {
   string rule_name = 1;
 }
 
+// Exact endpoint and complete authorization scope affected by an L7 append.
+// All ports and binaries must match the stored target; omitted scope is invalid.
+message L7RuleTarget {
+  string rule_name = 1;
+  string host = 2;
+  repeated uint32 ports = 3;
+  // An absent path requires a unique endpoint. An empty path selects an
+  // endpoint without a path selector. This is not the appended request path.
+  optional string path = 4;
+  // Declare either a nonempty binary list or any_binary, never both.
+  repeated openshell.sandbox.v1.NetworkBinary binaries = 5;
+  bool any_binary = 6;
+}
+
 message AddDenyRules {
-  string host = 1;
-  uint32 port = 2;
+  reserved 1, 2;
+  reserved "host", "port";
   repeated openshell.sandbox.v1.L7DenyRule deny_rules = 3;
+  L7RuleTarget target = 4;
 }
 
 message AddAllowRules {
-  string host = 1;
-  uint32 port = 2;
+  reserved 1, 2;
+  reserved "host", "port";
   repeated openshell.sandbox.v1.L7Rule rules = 3;
+  L7RuleTarget target = 4;
 }
 
 message RemoveNetworkBinary {

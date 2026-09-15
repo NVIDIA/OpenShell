@@ -119,7 +119,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "91025c34fadd69f2d96d5ad571f0e6e031490ff1f0ff3060b16021ae6633a81a";
+        "72dd1827c9255a8d6aad6b41c95d7b291856504ccbecf5cdf8facf1f1784ce2a";
     const DURABLE_SCHEMA_SHA256: &str =
         "568ec5637c504726b40a616d286457f41b5be2f4761872c749313e1ee16b5c85";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -490,7 +490,7 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (282, 13)
+            (283, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),

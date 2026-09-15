@@ -90,7 +90,8 @@ network_policies:
     Ok(file)
 }
 
-/// Build a minimal policy YAML with no network rules.
+/// Build a minimal policy YAML with no network rules. Both /bin and /usr
+/// are readable so shell entrypoints work on merged and unmerged images.
 fn write_empty_network_policy() -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
 
@@ -99,6 +100,7 @@ fn write_empty_network_policy() -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc
@@ -180,6 +182,172 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Read the effective policy through the same CLI boundary used by operators.
+async fn l7_scope_snapshot(name: &str) -> serde_json::Value {
+    let result = run_cli(&["policy", "get", name, "--full", "--output", "json"]).await;
+    assert!(result.success, "policy snapshot failed: {}", result.output);
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&result.output).expect("policy get returns JSON");
+    assert!(snapshot["version"].as_u64().is_some());
+    assert!(
+        snapshot["hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty())
+    );
+    assert!(snapshot["policy"]["network_policies"].is_object());
+    snapshot
+}
+
+/// Incomplete declarations reject without a revision; an explicit target
+/// changes only its endpoint even when another rule shares the host and ports.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn l7_append_target_scope_round_trip() {
+    let mut policy = write_empty_network_policy().expect("write base policy");
+    policy
+        .write_all(
+            br"
+network_policies:
+  internal_api:
+    name: internal_api
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/python3
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+      - host: other.example.com
+        port: 443
+        protocol: rest
+        access: read-only
+  sibling:
+    name: sibling
+    binaries:
+      - path: /usr/bin/wget
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+",
+        )
+        .expect("write scoped policy");
+    policy.flush().expect("flush scoped policy");
+    let path = policy.path().to_str().expect("UTF-8 policy path");
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", path, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create scoped-policy sandbox");
+    let before = l7_scope_snapshot(&guard.name).await;
+
+    // Check each independent axis with the other fully declared, so a guard
+    // requiring both mismatches at once cannot satisfy this regression.
+    for (ports, binaries) in [
+        (
+            "api.example.com:443:POST:/admin",
+            vec!["/usr/bin/curl", "/usr/bin/python3"],
+        ),
+        (
+            "api.example.com:443,8443:POST:/admin",
+            vec!["/usr/bin/curl"],
+        ),
+    ] {
+        let mut args = vec![
+            "policy",
+            "update",
+            &guard.name,
+            "--rule-name",
+            "internal_api",
+            "--add-allow",
+            ports,
+        ];
+        for binary in binaries {
+            args.extend(["--binary", binary]);
+        }
+        let rejected = run_cli(&args).await;
+        assert!(
+            !rejected.success,
+            "partial scope was accepted: {}",
+            rejected.output
+        );
+        let unchanged = l7_scope_snapshot(&guard.name).await;
+        for field in ["version", "hash", "policy"] {
+            assert_eq!(unchanged[field], before[field], "rejection changed {field}");
+        }
+    }
+
+    let common = [
+        "policy",
+        "update",
+        &guard.name,
+        "--rule-name",
+        "internal_api",
+        "--binary",
+        "/usr/bin/curl",
+        "--binary",
+        "/usr/bin/python3",
+    ];
+    let mut allow_args = common.to_vec();
+    allow_args.extend([
+        "--add-allow",
+        "api.example.com:443,8443:POST:/admin",
+        "--wait",
+    ]);
+    let accepted = run_cli(&allow_args).await;
+    assert!(
+        accepted.success,
+        "explicit allow failed: {}",
+        accepted.output
+    );
+    let after_allow = l7_scope_snapshot(&guard.name).await;
+    assert!(after_allow["version"].as_u64() > before["version"].as_u64());
+    assert_ne!(after_allow["hash"], before["hash"]);
+    let rules = &after_allow["policy"]["network_policies"];
+    assert_eq!(
+        rules["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert_eq!(
+        rules["internal_api"]["endpoints"][1],
+        before["policy"]["network_policies"]["internal_api"]["endpoints"][1]
+    );
+    assert!(
+        rules["internal_api"]["endpoints"][0]["rules"]
+            .as_array()
+            .expect("allow rules")
+            .iter()
+            .any(|rule| rule["allow"]["method"] == "POST" && rule["allow"]["path"] == "/admin")
+    );
+
+    let mut deny_args = common.to_vec();
+    deny_args.extend([
+        "--add-deny",
+        "api.example.com:443,8443:POST:/admin/private",
+        "--wait",
+    ]);
+    let denied = run_cli(&deny_args).await;
+    assert!(denied.success, "explicit deny failed: {}", denied.output);
+    let after_deny = l7_scope_snapshot(&guard.name).await;
+    assert!(after_deny["version"].as_u64() > after_allow["version"].as_u64());
+    assert_eq!(
+        after_deny["policy"]["network_policies"]["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert!(
+        after_deny["policy"]["network_policies"]["internal_api"]["endpoints"][0]["deny_rules"]
+            .as_array()
+            .expect("deny rules")
+            .iter()
+            .any(|rule| rule["method"] == "POST" && rule["path"] == "/admin/private")
+    );
+    guard.cleanup().await;
+}
 
 /// Test the full live policy update lifecycle:
 ///
