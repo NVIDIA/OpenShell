@@ -18,6 +18,8 @@ use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
 };
+use crate::tracing_bus::CursoredEvent;
+use crate::watch_cursor::WatchCursor;
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -53,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -75,6 +77,32 @@ use crate::persistence::current_time_ms;
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
+
+/// Terminal status for a resume cursor issued by a cursor space that is gone.
+///
+/// Retrying the same token fails identically, so the guidance has to be
+/// "restart without one" -- otherwise an SDK that reconnects on `OUT_OF_RANGE`
+/// spins. The token is not echoed back.
+const RESUME_SPACE_GONE: &str = "resume_after_cursor belongs to a cursor space that no longer \
+     exists; the gateway restarted or the sandbox's buffers were torn down. Restart the watch \
+     with an empty resume_after_cursor. Events published in the meantime are not recoverable.";
+
+/// Terminal status for a resume cursor ahead of everything its space issued.
+const RESUME_CURSOR_AHEAD: &str = "resume_after_cursor is ahead of every cursor this sandbox has \
+     issued. Restart the watch with an empty resume_after_cursor.";
+
+/// Whether `sandbox_id`'s cursor space is still the one that issued `epoch`.
+///
+/// A teardown retires the space and the next publish mints a replacement that
+/// renumbers from 1, so a surviving epoch is the only proof that a seq validated
+/// earlier still addresses the same numbering. Absent counts as changed: there
+/// is nothing left for the cursor to point into.
+fn cursor_space_is(state: &ServerState, sandbox_id: &str, epoch: uuid::Uuid) -> bool {
+    state
+        .tracing_log_bus
+        .cursor_space(sandbox_id)
+        .is_some_and(|space| space.epoch == epoch)
+}
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -1534,6 +1562,19 @@ pub(super) async fn handle_watch_sandbox(
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
 
+    // Decode the resume cursor before spawning the producer. A token this
+    // server could not have issued is pure input validation, in the same class
+    // as the `id is required` check above, so it fails the RPC rather than
+    // arriving as the first item of an otherwise-established stream.
+    let resume_after = if req.resume_after_cursor.is_empty() {
+        None
+    } else {
+        Some(
+            WatchCursor::parse(&req.resume_after_cursor)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?,
+        )
+    };
+
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
 
@@ -1593,6 +1634,8 @@ pub(super) async fn handle_watch_sandbox(
                                     sandbox.clone(),
                                 ),
                             ),
+                            // Status snapshots are re-read, not resumed by cursor.
+                            cursor: String::new(),
                         }))
                         .await;
 
@@ -1616,12 +1659,195 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
-            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
-            if follow_logs {
-                for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+            // Highest seq the tail/replay phase already handled, tracked per
+            // source. The broadcast receivers were subscribed before replay ran,
+            // so an event published during initialization can sit in both the
+            // replay buffer and a live receiver; the live loop suppresses events
+            // at or below its source's mark so each is delivered exactly once.
+            //
+            // The two marks must stay separate. Both buses number from one
+            // shared cursor space, but they are read at different instants and
+            // bounded independently (`log_tail_lines` vs `event_tail`, which has
+            // no default and so replays nothing unless the client asks). A
+            // single shared mark therefore lets the deeper source censor the
+            // shallower one: with the default `event_tail` of 0 the mark rises
+            // to the newest buffered log while no platform event was replayed at
+            // all, and every platform event published in the initialization
+            // window is dropped as a duplicate of something never sent. Keyed by
+            // source, an event is suppressed only if its own source's replay
+            // actually covered it.
+            //
+            // No unit test pins this. The only reachable window is between the
+            // subscribe above and the log tail read below -- an event published
+            // earlier is replayed rather than live, and one published later
+            // outranks the mark -- and the producer crosses that window with no
+            // await a test can wedge open. Reproducing it needs a seam in the
+            // producer, which is not worth adding to production code.
+            let resume_seq = resume_after.map_or(0, |resume| resume.seq);
+            let mut log_cutoff: u64 = resume_seq;
+            let mut platform_cutoff: u64 = resume_seq;
+
+            if let Some(resume) = resume_after {
+                // Resume: replay events strictly after the client's cursor from both
+                // resumable buses. Either bus reporting a trimmed range is an
+                // unrecoverable gap -> terminate with a documented status.
+                use openshell_core::proto::sandbox_stream_event::Payload;
+
+                // A cursor is only a position inside the space that issued it.
+                // A gateway restart, a bus teardown, or a reconnect landing on
+                // another replica starts a new space numbered from 1 with no
+                // record of the cursors the old one handed out. The buses then
+                // look merely empty, so `tail_after` reports no gap -- treating
+                // that as "caught up" would pin the cutoff to a stale number
+                // and silently swallow every live event beneath it. Comparing
+                // epochs answers "did this cursor come from *this* space?",
+                // which no numeric bound can.
+                match state.tracing_log_bus.cursor_space(&sandbox_id) {
+                    None => {
+                        let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
+                        return;
+                    }
+                    Some(space) if space.epoch != resume.epoch => {
+                        let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
+                        return;
+                    }
+                    // Right space, but ahead of anything it issued: only a
+                    // fabricated token gets here. Reject rather than accept a
+                    // cutoff no event can ever exceed.
+                    Some(space) if resume.seq > space.highest_seq => {
+                        let _ = tx
+                            .send(Err(Status::out_of_range(RESUME_CURSOR_AHEAD)))
+                            .await;
+                        return;
+                    }
+                    Some(_) => {}
+                }
+
+                let log_replay = if follow_logs {
+                    Some(state.tracing_log_bus.tail_after(&sandbox_id, resume.seq))
+                } else {
+                    None
+                };
+
+                let platform_replay = if follow_events {
+                    Some(
+                        state
+                            .tracing_log_bus
+                            .platform_event_bus
+                            .tail_after(&sandbox_id, resume.seq),
+                    )
+                } else {
+                    None
+                };
+
+                // Re-check the epoch now that both tails are in hand. The check
+                // above and each `tail_after` take their locks independently, so
+                // a teardown plus a republish can retire the validated space and
+                // install a replacement in between. The reads would then have
+                // applied the old space's seq to the new space's buffers, and
+                // `tail_after` -- which only knows numbers -- would report no gap
+                // while skipping every replacement event at or below it. The
+                // second look is cheap and runs before anything is emitted, so a
+                // space that moved under us ends the stream instead of serving a
+                // truncated replay.
+                //
+                // Ordering is unchanged: this takes only the allocator lock and
+                // releases it, never held across a bus lock.
+                if !cursor_space_is(&state, &sandbox_id, resume.epoch) {
+                    let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
+                    return;
+                }
+
+                // Gap check FIRST (borrows), before the merge moves the vecs.
+                for replay in [&log_replay, &platform_replay] {
+                    if let Some(Err(gap)) = replay {
+                        let _ = tx.send(Err(Status::out_of_range(format!(
+                                "resume cursor {} is no longer available; earliest resumable cursor is {}",
+                                gap.requested_after, gap.oldest_available
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+
+                // Merge both buses by shared seq, then emit ascending. Each
+                // source's mark comes from its own replay -- `tail_after`
+                // returns ascending, so its last entry is that source's high
+                // water. Marking every event the phase examined, not only the
+                // ones that survived the filters, keeps a filtered event's live
+                // duplicate suppressed: the live loop does not re-apply
+                // `log_since_ms` and would otherwise let it through.
+                let mut merged: Vec<CursoredEvent> = Vec::new();
+                if let Some(Ok(v)) = log_replay {
+                    if let Some(last) = v.last() {
+                        log_cutoff = log_cutoff.max(last.seq);
+                    }
+                    merged.extend(v);
+                }
+                if let Some(Ok(v)) = platform_replay {
+                    if let Some(last) = v.last() {
+                        platform_cutoff = platform_cutoff.max(last.seq);
+                    }
+                    merged.extend(v);
+                }
+
+                merged.sort_by_key(|c| c.seq);
+
+                for cursored in merged {
+                    if let Some(Payload::Log(ref log)) = cursored.event.payload {
+                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                            continue;
+                        }
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(cursored.event)).await.is_err() {
+                        return;
+                    }
+                }
+            } else {
+                // Initial tail, best-effort. Both buses draw from one shared
+                // cursor space, so draining each in its own pass would order the
+                // tail by source and only incidentally by cursor: every buffered
+                // log would precede every buffered platform event regardless of
+                // which was published first. Collect both windows, sort by the
+                // shared seq, and emit one ascending run -- the same shape the
+                // resume path above uses, and the order a client comparing
+                // cursors expects.
+                //
+                // The two windows are truncated independently (log_tail vs
+                // event_tail), so this merges whatever each bus retained; it
+                // does not align their depths.
+                let mut tail: Vec<CursoredEvent> = Vec::new();
+                if follow_logs {
+                    let logs = state.tracing_log_bus.tail(&sandbox_id, log_tail as usize);
+                    if let Some(last) = logs.last() {
+                        log_cutoff = log_cutoff.max(last.seq);
+                    }
+                    tail.extend(logs);
+                }
+                if follow_events {
+                    let events = state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .tail(&sandbox_id, event_tail as usize);
+                    if let Some(last) = events.last() {
+                        platform_cutoff = platform_cutoff.max(last.seq);
+                    }
+                    tail.extend(events);
+                }
+
+                tail.sort_by_key(|cursored| cursored.seq);
+
+                for cursored in tail {
+                    // Log filters; platform events carry no log fields and pass.
                     if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                         ref log,
-                    )) = evt.payload
+                    )) = cursored.event.payload
                     {
                         if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
                             continue;
@@ -1633,27 +1859,14 @@ pub(super) async fn handle_watch_sandbox(
                             continue;
                         }
                     }
-                    if tx.send(Ok(evt)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-
-            // Replay buffered platform events.
-            if follow_events {
-                for evt in state
-                    .tracing_log_bus
-                    .platform_event_bus
-                    .tail(&sandbox_id, event_tail as usize)
-                {
-                    if tx.send(Ok(evt)).await.is_err() {
+                    if tx.send(Ok(cursored.event)).await.is_err() {
                         return;
                     }
                 }
             }
 
             loop {
-                tokio::select! {
+                let first = tokio::select! {
                     () = tx.closed() => {
                         return;
                     }
@@ -1671,7 +1884,7 @@ pub(super) async fn handle_watch_sandbox(
                                             .supervisor_sessions
                                             .project_endpoint_status(&mut sandbox);
                                         state.sandbox_index.update_from_sandbox(&sandbox);
-                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())), cursor: String::new() })).await.is_err() {
                                             return;
                                         }
                                         if stop_on_terminal {
@@ -1690,56 +1903,128 @@ pub(super) async fn handle_watch_sandbox(
                                     }
                                 }
                             }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                // Lag is recoverable: surface a warning and keep streaming.
+                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                                 return;
                             }
                         }
+                        // Status snapshots carry cursor 0 and are outside the
+                        // resumable cursor space, so they never join a batch.
+                        continue;
                     }
+                    // Both resumable sources feed one cursor space, so neither
+                    // can be emitted on its own: `select!` picks an arbitrary
+                    // ready branch, which would emit a higher cursor ahead of a
+                    // lower one waiting on the other source. Take whichever woke
+                    // us as the start of a batch and merge below.
                     res = async {
                         match log_rx.as_mut() {
                             Some(rx) => rx.recv().await,
                             None => future::pending().await,
                         }
-                    } => {
-                        match res {
-                            Ok(evt) => {
-                                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
-                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                                        continue;
-                                    }
-                                    if !level_matches(&log.level, &log_min_level) {
-                                        continue;
-                                    }
-                                }
-                                if tx.send(Ok(evt)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                                return;
-                            }
-                        }
-                    }
+                    } => res,
                     res = async {
                         match platform_rx.as_mut() {
                             Some(rx) => rx.recv().await,
                             None => future::pending().await,
                         }
-                    } => {
-                        match res {
-                            Ok(evt) => {
-                                if tx.send(Ok(evt)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                                return;
+                    } => res,
+                };
+
+                let mut batch = Vec::new();
+                match first {
+                    Ok(evt) => batch.push(evt),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Lag is recoverable: surface a warning and keep streaming.
+                        if tx
+                            .send(Ok(crate::sandbox_watch::lag_warning_event(n)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
+                        return;
+                    }
+                }
+
+                // Drain what is already queued on both sources. Anything ready
+                // now was published before the event we just took, so sorting
+                // the batch restores cursor order without waiting on either
+                // source. Events published after this drain are not held back:
+                // strict global ordering would mean delaying every event to see
+                // whether a lower cursor still arrives.
+                let mut lagged = 0u64;
+                let mut closed = false;
+                for rx in [log_rx.as_mut(), platform_rx.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(evt) => batch.push(evt),
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            // Keep draining: the receiver is usable after a skip.
+                            Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                            Err(broadcast::error::TryRecvError::Closed) => {
+                                closed = true;
+                                break;
                             }
                         }
                     }
+                }
+
+                batch.sort_by_key(|cursored| cursored.seq);
+
+                for cursored in batch {
+                    // Skip events the tail/replay phase already handled, judged
+                    // against the mark for this event's own source. Bus events
+                    // always carry seq >= 1, so no sentinel is needed here:
+                    // non-resumable events never reach this batch.
+                    let is_log = matches!(
+                        cursored.event.payload,
+                        Some(openshell_core::proto::sandbox_stream_event::Payload::Log(_))
+                    );
+                    let cutoff = if is_log { log_cutoff } else { platform_cutoff };
+                    if cursored.seq <= cutoff {
+                        continue;
+                    }
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = cursored.event.payload
+                    {
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(cursored.event)).await.is_err() {
+                        return;
+                    }
+                }
+
+                if lagged > 0
+                    && tx
+                        .send(Ok(crate::sandbox_watch::lag_warning_event(lagged)))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                if closed {
+                    let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
+                    return;
                 }
             }
         },
@@ -3627,6 +3912,739 @@ mod tests {
             traced.spans_named("disconnected_watch_request").len(),
             1,
             "watch producer should release the request span after client disconnect"
+        );
+    }
+
+    /// Seed `n` log lines onto the log bus; cursors run 1..=n.
+    fn seed_log_lines(state: &ServerState, sandbox_id: &str, n: usize) {
+        for i in 0..n {
+            state
+                .tracing_log_bus
+                .publish_external(openshell_core::proto::SandboxLogLine {
+                    sandbox_id: sandbox_id.to_string(),
+                    timestamp_ms: i as i64,
+                    level: "INFO".to_string(),
+                    target: "test".to_string(),
+                    message: format!("line {i}"),
+                    source: "gateway".to_string(),
+                    ..Default::default()
+                });
+        }
+    }
+
+    fn seed_platform_event(state: &ServerState, sandbox_id: &str, reason: &str) {
+        state.tracing_log_bus.platform_event_bus.publish(
+            sandbox_id,
+            SandboxStreamEvent {
+                payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
+                    openshell_core::proto::PlatformEvent {
+                        timestamp_ms: 0,
+                        source: "test".to_string(),
+                        r#type: "Normal".to_string(),
+                        reason: reason.to_string(),
+                        message: reason.to_string(),
+                        metadata: HashMap::new(),
+                    },
+                )),
+                cursor: String::new(),
+            },
+        );
+    }
+
+    /// Build the token a client would hold for `seq` in this sandbox's *current*
+    /// cursor space. Capture it before any teardown to model a real reconnect.
+    fn cursor_token(state: &ServerState, sandbox_id: &str, seq: u64) -> String {
+        let space = state
+            .tracing_log_bus
+            .cursor_space(sandbox_id)
+            .expect("cursor space exists; publish before taking a token");
+        WatchCursor::new(space.epoch, seq).encode()
+    }
+
+    /// A well-formed token from an epoch this server never issued.
+    fn foreign_cursor(seq: u64) -> String {
+        WatchCursor::new(uuid::Uuid::new_v4(), seq).encode()
+    }
+
+    /// Sequence number carried by a delivered event. Panics on non-resumable
+    /// events, so a test that expects a log line cannot silently pass on a
+    /// snapshot.
+    fn seq_of(evt: &SandboxStreamEvent) -> u64 {
+        WatchCursor::parse(&evt.cursor)
+            .expect("resumable event must carry a valid cursor")
+            .seq
+    }
+
+    #[tokio::test]
+    async fn resume_replays_only_events_after_cursor() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("resumed", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Cursors 1,2,3.
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: cursor_token(&state, &id, 1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Snapshot first (status re-read, no cursor).
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(
+            snap.cursor.is_empty(),
+            "first event should be the status snapshot"
+        );
+
+        // Then only seqs 2 and 3; seq 1 already seen by the client.
+        let a = stream.next().await.unwrap().unwrap();
+        let b = stream.next().await.unwrap().unwrap();
+        assert_eq!(seq_of(&a), 2);
+        assert_eq!(seq_of(&b), 3);
+    }
+
+    #[tokio::test]
+    async fn resume_merges_log_and_platform_events_in_cursor_order() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("merged", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Interleave across the shared allocator: log=1, platform=2, log=3, platform=4.
+        seed_log_lines(&state, &id, 1); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        state
+            .tracing_log_bus
+            .publish_external(openshell_core::proto::SandboxLogLine {
+                sandbox_id: id.clone(),
+                timestamp_ms: 3,
+                level: "INFO".to_string(),
+                target: "test".to_string(),
+                message: "line 3".to_string(),
+                source: "gateway".to_string(),
+                ..Default::default()
+            }); // cursor 3
+        seed_platform_event(&state, &id, "e4"); // cursor 4
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                resume_after_cursor: cursor_token(&state, &id, 1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        // Merged from both buses, ascending by shared seq: 2,3,4.
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![2, 3, 4]);
+    }
+
+    /// The initial tail is the resume path's twin: it draws from the same two
+    /// buses over the same shared cursor space, so it owes the client the same
+    /// ascending order.
+    ///
+    /// Before the merge, each bus was drained in its own pass and the tail came
+    /// out grouped by source -- logs 1,3 then platform 2,4 -- so a client
+    /// tracking the highest cursor saw it go backwards mid-tail.
+    #[tokio::test]
+    async fn initial_tail_merges_log_and_platform_events_in_cursor_order() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("tailmerged", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Interleave across the shared allocator: log=1, platform=2, log=3, platform=4.
+        seed_log_lines(&state, &id, 1); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        state
+            .tracing_log_bus
+            .publish_external(openshell_core::proto::SandboxLogLine {
+                sandbox_id: id.clone(),
+                timestamp_ms: 3,
+                level: "INFO".to_string(),
+                target: "test".to_string(),
+                message: "line 3".to_string(),
+                source: "gateway".to_string(),
+                ..Default::default()
+            }); // cursor 3
+        seed_platform_event(&state, &id, "e4"); // cursor 4
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                // event_tail has no default; 0 would replay no platform events.
+                event_tail: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn live_delivery_orders_events_across_sources_by_cursor() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("liveorder", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Draining the snapshot proves the producer reached the live loop, so
+        // it is subscribed to both buses before anything below is published.
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        // Publish without awaiting in between. On the current-thread runtime
+        // the producer cannot interleave, so both channels hold ready events
+        // when it next polls -- the state where `select!` picks arbitrarily and
+        // would otherwise emit a log cursor ahead of a lower platform cursor.
+        for i in 0..5 {
+            seed_log_lines(&state, &id, 1); // odd cursors
+            seed_platform_event(&state, &id, &format!("e{i}")); // even cursors
+        }
+
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, (1..=10).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn resume_at_latest_cursor_suppresses_duplicates() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("nodup", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Cursors 1,2,3; client already saw through 3.
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: cursor_token(&state, &id, 3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        // No resumable events remain; the live loop yields nothing promptly.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(
+            next.is_err(),
+            "expected no further events after resume at latest cursor, got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_from_trimmed_cursor_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("gap", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Exceed the 2000-line tail so the earliest cursors are trimmed.
+        seed_log_lines(&state, &id, 2005);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                // Seq 2 was trimmed; this is an unrecoverable gap.
+                resume_after_cursor: cursor_token(&state, &id, 2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Snapshot still arrives first (fresh state), then the terminal gap status.
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let err = stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("trimmed cursor must terminate the stream");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(
+            err.message().contains('2'),
+            "gap status should report the requested cursor: {}",
+            err.message()
+        );
+
+        // Stream ends after the terminal status.
+        assert!(stream.next().await.is_none());
+    }
+
+    /// The guard behind the producer's post-replay epoch re-check.
+    ///
+    /// Validation and the two `tail_after` reads take their locks separately, so
+    /// a teardown plus a republish can swap the space in between and leave the
+    /// reads applying an old seq to a replacement's buffers -- `tail_after` only
+    /// compares numbers, so it reports no gap while skipping every replacement
+    /// event at or below that seq. The producer re-checks the epoch once both
+    /// tails are in hand and before emitting anything; this pins what that check
+    /// must answer.
+    ///
+    /// The interleaving itself is not reachable from a test: the producer runs
+    /// validation, both reads, and the re-check with no await in between, so
+    /// there is nothing to suspend it on.
+    #[tokio::test]
+    async fn cursor_space_is_rejects_a_replacement_space() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("respace", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1);
+        let original = state.tracing_log_bus.cursor_space(&id).unwrap().epoch;
+        assert!(cursor_space_is(&state, &id, original));
+
+        // Teardown alone leaves no space to point into.
+        state.tracing_log_bus.remove(&id);
+        assert!(state.tracing_log_bus.cursor_space(&id).is_none());
+        assert!(!cursor_space_is(&state, &id, original));
+
+        // The republish installs a replacement renumbered from 1. Its seqs
+        // overlap the retired space's, so only the epoch separates them.
+        seed_log_lines(&state, &id, 1);
+        let replacement = state.tracing_log_bus.cursor_space(&id).unwrap();
+        assert_ne!(replacement.epoch, original);
+        assert_eq!(replacement.highest_seq, 1);
+        assert!(!cursor_space_is(&state, &id, original));
+        assert!(cursor_space_is(&state, &id, replacement.epoch));
+    }
+
+    #[tokio::test]
+    async fn resume_from_reset_cursor_space_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("reset", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // The reported repro. Before cursors carried an epoch, a bare number
+        // was all the server had: 2 <= 3 passed the old "is this plausible?"
+        // bound, the tail replayed only seq 3, and the new space's seqs 1 and 2
+        // -- real, unseen events -- were silently swallowed as duplicates.
+        seed_log_lines(&state, &id, 2);
+        let retired_cursor = cursor_token(&state, &id, 2);
+
+        // Teardown retires the space; the next publish starts over at seq 1,
+        // indistinguishable by number from the client's view of a restart.
+        state.tracing_log_bus.remove(&id);
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: retired_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let item = stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("a cursor from a retired space must terminate the stream");
+        assert_eq!(item.code(), tonic::Code::OutOfRange, "{item:?}");
+        assert!(
+            item.message().contains("empty resume_after_cursor"),
+            "status must tell the client to restart without a cursor, not retry: {}",
+            item.message()
+        );
+
+        // Nothing from the new space may be delivered before the error: a
+        // partial stream would read as "here is everything after your cursor".
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_from_reset_cursor_space_rejected_when_new_space_is_shorter() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("reset-short", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // The shape the old numeric bound did catch (5 > 2), kept so it keeps
+        // passing -- but now it fails for the reason that generalizes.
+        seed_log_lines(&state, &id, 5);
+        let retired_cursor = cursor_token(&state, &id, 5);
+        state.tracing_log_bus.remove(&id);
+        seed_log_lines(&state, &id, 2);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: retired_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_from_reset_cursor_space_rejected_when_seq_is_within_new_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("reset-within", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Seq 1 sits comfortably inside the new space's 1..=3, so every numeric
+        // bound accepts it. Only the epoch distinguishes the two spaces. This is
+        // the assertion the pre-fix design structurally could not make.
+        seed_log_lines(&state, &id, 3);
+        let retired_cursor = cursor_token(&state, &id, 1);
+        state.tracing_log_bus.remove(&id);
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: retired_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_after_remove_without_republish_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("reset-empty", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // No space at all: nothing has been published since teardown. The buses
+        // look merely empty, so `tail_after` reports no gap -- "caught up" would
+        // be the wrong reading, because the client's events are gone.
+        seed_log_lines(&state, &id, 3);
+        let retired_cursor = cursor_token(&state, &id, 3);
+        state.tracing_log_bus.remove(&id);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: retired_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_cursor_from_another_sandbox_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let a = test_sandbox("epoch-a", Vec::new());
+        let b = test_sandbox("epoch-b", Vec::new());
+        state.store.put_message(&a).await.unwrap();
+        state.store.put_message(&b).await.unwrap();
+        let a_id = a.object_id().to_string();
+        let b_id = b.object_id().to_string();
+
+        // Epochs are per sandbox, not per process. A token valid for A must not
+        // address B's space, even though both are on seq 1..=3 right now.
+        seed_log_lines(&state, &a_id, 3);
+        seed_log_lines(&state, &b_id, 3);
+        let a_cursor = cursor_token(&state, &a_id, 1);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: b_id.clone(),
+                follow_logs: true,
+                resume_after_cursor: a_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_cursor_ahead_of_the_space_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("ahead", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 2);
+        // Right epoch, but a seq this space has never issued: only a fabricated
+        // token gets here. Accepting it would pin the cutoff above every future
+        // event and stall the stream silently.
+        let ahead = cursor_token(&state, &id, 99);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: ahead,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_malformed_cursor_rejects_invalid_argument() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("malformed", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 3);
+
+        // Input validation, so it fails the RPC before any stream exists rather
+        // than arriving as the first item of an apparently-healthy stream.
+        for raw in ["5", "v1:not-a-uuid:0", &foreign_cursor(1)[..40]] {
+            let err = handle_watch_sandbox(
+                &state,
+                authed_request(WatchSandboxRequest {
+                    id: id.clone(),
+                    follow_logs: true,
+                    resume_after_cursor: raw.to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("malformed cursor must fail the call");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{raw:?}: {err:?}");
+            assert!(
+                !err.message().contains(raw),
+                "status must not echo the client token: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_with_foreign_epoch_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("foreign", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 3);
+
+        // Well-formed, so it clears input validation, but from an epoch this
+        // gateway never minted -- the shape a reconnect to another replica
+        // takes.
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: foreign_cursor(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.unwrap().unwrap().cursor.is_empty());
+        let err = stream.next().await.unwrap().expect_err("out of range");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_delivers_each_event_once_during_init_race() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("race", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Seed events that land in the tail before the watch subscribes.
+        seed_log_lines(&state, &id, 5);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Publish more concurrently with producer initialization. Some of these
+        // can land after the broadcast subscription but before the tail read,
+        // putting them in both replay and the live receiver.
+        for i in 5..15 {
+            state
+                .tracing_log_bus
+                .publish_external(openshell_core::proto::SandboxLogLine {
+                    sandbox_id: id.clone(),
+                    timestamp_ms: i64::from(i),
+                    level: "INFO".to_string(),
+                    target: "test".to_string(),
+                    message: format!("line {i}"),
+                    source: "gateway".to_string(),
+                    ..Default::default()
+                });
+        }
+
+        let mut stream = response.into_inner();
+        let mut cursors = Vec::new();
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await
+        {
+            let evt = item.unwrap();
+            if !evt.cursor.is_empty() {
+                cursors.push(seq_of(&evt));
+            }
+        }
+
+        // Every delivered cursor is unique (no double delivery) and monotonically
+        // increasing (replay ordered, then live in cursor order for one source).
+        let mut sorted = cursors.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            cursors.len(),
+            "duplicate cursors delivered: {cursors:?}"
+        );
+        assert_eq!(
+            cursors, sorted,
+            "cursors not delivered in order: {cursors:?}"
         );
     }
 

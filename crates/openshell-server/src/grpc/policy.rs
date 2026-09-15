@@ -4371,7 +4371,7 @@ pub(super) async fn handle_get_sandbox_logs(
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
                 if req.since_ms > 0 && log.timestamp_ms < req.since_ms {
                     return None;

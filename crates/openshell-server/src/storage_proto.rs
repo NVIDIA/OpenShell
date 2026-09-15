@@ -118,8 +118,13 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
+    // Updated for the opaque watch cursor: `WatchSandboxRequest.resume_after_cursor`
+    // and `SandboxStreamEvent.cursor` changed from uint64 to string. Both fields
+    // are unreleased -- they were added on this branch -- so no client depends on
+    // the old type. The change adds no messages or enums, and leaves the durable
+    // and overlap fingerprints alone: neither field is part of a stored type.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "26a2882f1fc82741f4821da90fb9674c9b5d66991760398a93a90354b7349d83";
+        "ec7559e627553f586a177d7e9fa008a06766ebc6141e6c3ca535b5a994c57fde";
     const DURABLE_SCHEMA_SHA256: &str =
         "568ec5637c504726b40a616d286457f41b5be2f4761872c749313e1ee16b5c85";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
