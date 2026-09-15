@@ -184,7 +184,7 @@ impl OpenShell for TestOpenShell {
         );
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
-                version: 9,
+                version: 1,
                 network_policies: [
                     (
                         "user_api".to_string(),
@@ -455,7 +455,7 @@ impl OpenShell for TestOpenShell {
         assert!(!req.global);
 
         let policy = SandboxPolicy {
-            version: 7,
+            version: 1,
             network_policies: std::iter::once((
                 "api".to_string(),
                 NetworkPolicyRule {
