@@ -3393,6 +3393,7 @@ async fn handle_update_config_inner(
     principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
@@ -3402,6 +3403,7 @@ async fn handle_update_config_inner(
             ));
         }
         require_platform_admin(&state.admin_role, principal)?;
+        replay_facts.global()?;
         String::new()
     } else {
         let min_role = if sandbox_caller {
@@ -3659,6 +3661,7 @@ async fn handle_update_config_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
@@ -5040,6 +5043,7 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5068,6 +5072,7 @@ async fn handle_approve_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5195,6 +5200,7 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5221,6 +5227,7 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5305,6 +5312,7 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5330,6 +5338,7 @@ async fn handle_approve_all_draft_chunks_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let pending_chunks = state
         .store
@@ -5613,6 +5622,7 @@ pub(super) async fn handle_edit_draft_chunk(
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5642,6 +5652,7 @@ pub(super) async fn handle_edit_draft_chunk(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5694,6 +5705,7 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5720,6 +5732,7 @@ async fn handle_undo_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5791,6 +5804,7 @@ pub(super) async fn handle_clear_draft_chunks(
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5814,6 +5828,7 @@ pub(super) async fn handle_clear_draft_chunks(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let deleted = state
         .store
@@ -9184,6 +9199,7 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -9278,6 +9294,7 @@ mod tests {
         let error = handle_update_config(
             &state,
             Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -11225,6 +11242,7 @@ mod tests {
         let error = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "provider-ambiguity".to_string(),
                 provider_name: "candidate-provider".to_string(),
                 expected_resource_version: 0,
@@ -11490,6 +11508,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile),
                     source: "custom-policy.yaml".to_string(),
@@ -12542,6 +12561,7 @@ mod tests {
         handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(rotated_profile),
                     source: "custom-token.yaml".to_string(),
@@ -12701,6 +12721,7 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -12741,6 +12762,7 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -12793,6 +12815,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
@@ -12873,6 +12896,7 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -12916,6 +12940,7 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -13564,6 +13589,7 @@ mod tests {
         let skipped = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 include_security_flagged: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -13594,6 +13620,7 @@ mod tests {
         let approved = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 include_security_flagged: true,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -13672,6 +13699,7 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(private_rule),
@@ -13965,6 +13993,7 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(finding_rule),
@@ -14122,6 +14151,7 @@ mod tests {
         let approve = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14174,6 +14204,7 @@ mod tests {
         let undo = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14240,6 +14271,7 @@ mod tests {
         let cleared = handle_clear_draft_chunks(
             &state,
             authed_request(ClearDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -14345,6 +14377,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: guidance.to_string(),
@@ -15144,6 +15177,7 @@ mod tests {
         let error = handle_approve_draft_chunk(
             &state,
             with_user(Request::new(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -16551,6 +16585,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -16914,6 +16949,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id: second.accepted_chunk_ids[0].clone(),
                 reason: "redraft test".to_string(),
@@ -17383,6 +17419,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "scope too broad".to_string(),
@@ -17397,6 +17434,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17411,6 +17449,7 @@ mod tests {
         handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17554,6 +17593,7 @@ mod tests {
         let approve_err = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17569,6 +17609,7 @@ mod tests {
         let reject_err = handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "wrong sandbox".to_string(),
@@ -17584,6 +17625,7 @@ mod tests {
         let edit_err = handle_edit_draft_chunk(
             &state,
             authed_request(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(proposed_rule.clone()),
@@ -17599,6 +17641,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_a.object_name().to_string(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17613,6 +17656,7 @@ mod tests {
         let undo_err = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name,
                 chunk_id,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -19705,6 +19749,7 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -19803,6 +19848,7 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "annotated-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 setting_key: String::new(),
@@ -20835,6 +20881,7 @@ mod tests {
         let err = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -20936,6 +20983,7 @@ mod tests {
                 handle_update_config(
                     &state_clone,
                     authed_request(UpdateConfigRequest {
+                        request_id: String::new(),
                         name: "test-sandbox".to_string(),
                         policy: Some(new_policy),
                         setting_key: String::new(),

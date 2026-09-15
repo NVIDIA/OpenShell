@@ -109,6 +109,7 @@ pub async fn sandbox_provider_attach(
 
     let response = match client
         .attach_sandbox_provider(AttachSandboxProviderRequest {
+            request_id: String::new(),
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
@@ -165,6 +166,7 @@ pub async fn sandbox_provider_detach(
 
     let response = match client
         .detach_sandbox_provider(DetachSandboxProviderRequest {
+            request_id: String::new(),
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
@@ -477,6 +479,7 @@ async fn auto_create_provider(
     if let Some(exact_name) = preferred_name {
         // Explicit name: create with exactly that name, no retries.
         let request = CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -525,6 +528,7 @@ async fn auto_create_provider(
             };
 
             let request = CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(Provider {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
@@ -676,6 +680,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
 ) -> Result<()> {
     match client
         .delete_provider(DeleteProviderRequest {
+            request_id: String::new(),
             allow_missing: true,
             name: provider_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1107,6 +1112,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
     let response = client
         .create_provider(CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -1153,6 +1159,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
         if let Err(configure_err) = client
             .configure_provider_refresh(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key.clone(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
@@ -1178,6 +1185,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
         if let Err(rotate_err) = client
             .rotate_provider_credential(RotateProviderCredentialRequest {
+                request_id: String::new(),
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1601,6 +1609,7 @@ pub async fn provider_profile_import(
     if !items.is_empty() {
         let response = client
             .import_provider_profiles(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: items,
                 workspace: workspace.to_string(),
             })
@@ -1650,6 +1659,7 @@ pub async fn provider_profile_update(
             .map_or(0, |profile| profile.resource_version);
         let response = client
             .update_provider_profiles(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(item),
                 expected_resource_version,
                 id: id.to_string(),
@@ -1714,6 +1724,7 @@ pub async fn provider_profile_delete(
     for id in ids {
         let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 id: id.clone(),
                 workspace: workspace.to_string(),
@@ -1826,6 +1837,7 @@ pub async fn provider_refresh_config(
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            request_id: String::new(),
             provider: input.name.to_string(),
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
@@ -1863,6 +1875,7 @@ pub async fn provider_rotate(
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .rotate_provider_credential(RotateProviderCredentialRequest {
+            request_id: String::new(),
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1900,6 +1913,7 @@ pub async fn provider_refresh_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_provider_refresh(DeleteProviderRefreshRequest {
+            request_id: String::new(),
             allow_missing: true,
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
@@ -2337,6 +2351,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
 
     let response = client
         .update_provider(UpdateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2399,6 +2414,7 @@ pub async fn provider_delete(
     for name in names {
         let response = match client
             .delete_provider(DeleteProviderRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
