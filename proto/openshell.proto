@@ -1580,6 +1580,12 @@ message ExecSandboxRequest {
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
+
+  // Optional nonzero UUID for durable launch admission. Also applies to the
+  // initial ExecSandboxInteractive start message. Duplicates never relaunch,
+  // reattach, or replay output/stdin. Unconfirmed executions remain fenced;
+  // confirmed terminal executions retain the fence for 24 hours.
+  string request_id = 11;
 }
 
 // One stdout chunk from a sandbox exec.

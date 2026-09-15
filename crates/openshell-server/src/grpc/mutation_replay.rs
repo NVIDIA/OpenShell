@@ -78,6 +78,7 @@ pub(super) enum Success {
     Resource { id: String, version: u64 },
     Deletion { outcome: i32 },
     Ordinary(ordinary::Outcome),
+    StreamTerminal,
 }
 
 pub(super) struct Scope {
@@ -87,10 +88,15 @@ pub(super) struct Scope {
 
 #[tonic::async_trait]
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
-    type Output: Message + Default + Send + 'static;
+    type Output: Send + 'static;
     const METHOD: &'static str;
     const PROTECTED: bool = false;
+    // Streaming producers, not returned stream handles, confirm completion.
+    const DEFERRED: bool = false;
     fn request_id(&self) -> &str;
+    fn canonical_message(&self) -> Result<DynamicMessage, Status> {
+        decode_request_message(&format!("{}Request", Self::METHOD), self)
+    }
     async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status>;
     async fn execute(
         state: &Arc<ServerState>,
@@ -207,7 +213,7 @@ async fn execute_owned<M: Mutation>(
     protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
-    let mut admission = Admission {
+    let admission = Admission {
         format_version: 1,
         payload_hash,
         protection,
@@ -302,32 +308,70 @@ async fn execute_owned<M: Mutation>(
         };
         // Any error or panic from here leaves the claim unresolved. Status codes
         // do not establish that a handler performed no effects.
+        let completion = Completion {
+            store: state.store.clone(),
+            claim_id,
+            key: key.into(),
+            bucket: bucket.into(),
+            version,
+            admission: payload,
+        };
+        if M::DEFERRED {
+            request.extensions_mut().insert(completion.clone());
+        }
         let facts = ordinary::Facts::default();
         request.extensions_mut().insert(facts.clone());
         let mut response = M::execute(state, request).await?;
+        if M::DEFERRED {
+            return Ok(response);
+        }
         response.extensions_mut().insert(facts);
-        admission.success = Some(M::capture(&response)?);
+        completion.complete(M::capture(&response)?).await?;
+        return Ok(response);
+    }
+    Err(uncertain())
+}
+
+/// Only the admitted owner can finalize this exact incarnation of a claim.
+/// A dropped finalizer leaves a permanent unresolved admission, never a lease.
+#[derive(Clone)]
+pub(super) struct Completion {
+    store: Arc<Store>,
+    claim_id: String,
+    key: String,
+    bucket: String,
+    version: u64,
+    admission: Vec<u8>,
+}
+
+impl Completion {
+    pub(super) async fn stream_terminal(&self) -> Result<(), Status> {
+        self.complete(Success::StreamTerminal).await
+    }
+
+    async fn complete(&self, success: Success) -> Result<(), Status> {
+        let mut admission: Admission =
+            serde_json::from_slice(&self.admission).map_err(|_| uncertain())?;
+        admission.success = Some(success);
         admission.completed_at_ms = Some(current_time_ms());
         let payload = serde_json::to_vec(&admission).map_err(|_| uncertain())?;
         if payload.len() > 64 * 1024 {
             return Err(uncertain());
         }
-        state
-            .store
+        self.store
             .put_if(
                 OBJECT_TYPE,
-                &claim_id,
-                key,
-                bucket,
+                &self.claim_id,
+                &self.key,
+                &self.bucket,
                 &payload,
                 None,
-                WriteCondition::MatchResourceVersion(version),
+                WriteCondition::MatchResourceVersion(self.version),
             )
             .await
             .map_err(|_| uncertain())?;
-        return Ok(response);
+        Ok(())
     }
-    Err(uncertain())
 }
 
 async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
@@ -377,12 +421,16 @@ fn validate_request_id(value: &str) -> Result<String, Status> {
     Ok(id.hyphenated().to_string())
 }
 
-fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
+fn decode_request_message(name: &str, request: &impl Message) -> Result<DynamicMessage, Status> {
     let descriptor = DESCRIPTORS
-        .get_message_by_name(&format!("openshell.v1.{}Request", M::METHOD))
+        .get_message_by_name(&format!("openshell.v1.{name}"))
         .ok_or_else(|| Status::internal("mutation request descriptor missing"))?;
-    let mut message = DynamicMessage::decode(descriptor, request.encode_to_vec().as_slice())
-        .map_err(|_| Status::internal("decode mutation request"))?;
+    DynamicMessage::decode(descriptor, request.encode_to_vec().as_slice())
+        .map_err(|_| Status::internal("decode mutation request"))
+}
+
+fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
+    let mut message = request.canonical_message()?;
     message.clear_field_by_name("request_id");
     let value = serde_json::to_value(message)
         .map_err(|_| Status::internal("canonicalize mutation request"))?;
@@ -706,3 +754,4 @@ deletion_mutation!(
 mod tests;
 
 pub(super) mod ordinary;
+pub(super) mod streaming;

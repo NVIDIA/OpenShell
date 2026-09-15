@@ -377,7 +377,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
-        sandbox::handle_exec_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     type ForwardTcpStream =

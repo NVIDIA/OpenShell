@@ -90,7 +90,18 @@ in-memory extension. Replay reauthorizes original and current effective scopes,
 requires the same effective payload, and reruns current interceptor validation.
 Interceptors cannot mutate the request UUID. Server-marked replay suppresses
 post-commit observation, which remains best-effort rather than an outbox.
-Credential capabilities and streaming execution require separate contracts.
+Credential capabilities require separate contracts.
+
+Both exec RPCs share keyed admission but defer completion to the SSH producer.
+The initial interactive Start uses the exec request schema under a distinct RPC
+namespace; later stdin and resize frames are not replayable inputs. Admission
+precedes relay opening and hands its CAS-only finalizer to the owned producer,
+releasing the shared admission-worker permit after handoff. Only a confirmed
+remote exit records a terminal marker and starts 24-hour retention. Synthetic
+timeouts, disconnects without exit confirmation, and persistence failures leave
+permanent unresolved claims. Duplicates never launch, attach, or replay output:
+pending records report uncertainty, and terminal records report stream
+unavailability. Existing transport cancellation behavior remains unchanged.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
@@ -382,7 +393,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 13 enums
-(`5de04dd390599ebd165111df4f14c6dd05ae77aa748866a0e3ec1a22abd63133`).
+(`9fb5cb4b571bf7d63982bebe6306eedeebe08f21b6565b3b940d8651ccbff145`).
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
