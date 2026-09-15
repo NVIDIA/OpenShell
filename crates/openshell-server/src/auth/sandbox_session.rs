@@ -81,7 +81,11 @@ pub async fn authorize_persisted(
     let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     if !matches!(
         phase,
-        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Starting
+        SandboxPhase::Provisioning
+            | SandboxPhase::Ready
+            | SandboxPhase::Starting
+            | SandboxPhase::Completed
+            | SandboxPhase::Error
     ) {
         return Err(Status::failed_precondition(
             "sandbox runtime identity is not active",
@@ -112,21 +116,7 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use uuid::Uuid;
 
-    fn principal(auth_epoch: u64) -> AuthenticatedSandboxSession {
-        AuthenticatedSandboxSession {
-            sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
-            runtime_generation: SandboxGenerationId::parse("generation-a")
-                .expect("runtime generation"),
-            auth_epoch: CredentialEpoch::new(auth_epoch).expect("auth epoch"),
-            token_id: Uuid::new_v4(),
-            issued_at: 1,
-            expires_at: 2,
-        }
-    }
-
-    #[tokio::test]
-    async fn shared_identity_authorizes_every_replica_and_revokes_old_epochs() {
-        let store = Store::connect("sqlite::memory:").await.expect("store");
+    async fn persist_sandbox(store: &Store, phase: SandboxPhase) {
         let identity = PersistedSandboxIdentity {
             runtime_generation: SandboxGenerationId::parse("generation-a")
                 .expect("runtime generation"),
@@ -142,12 +132,30 @@ mod tests {
         let sandbox = Sandbox {
             metadata: Some(metadata),
             status: Some(SandboxStatus {
-                phase: SandboxPhase::Ready as i32,
+                phase: phase as i32,
                 ..Default::default()
             }),
             ..Default::default()
         };
         store.put_message(&sandbox).await.expect("persist sandbox");
+    }
+
+    fn principal(auth_epoch: u64) -> AuthenticatedSandboxSession {
+        AuthenticatedSandboxSession {
+            sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+            runtime_generation: SandboxGenerationId::parse("generation-a")
+                .expect("runtime generation"),
+            auth_epoch: CredentialEpoch::new(auth_epoch).expect("auth epoch"),
+            token_id: Uuid::new_v4(),
+            issued_at: 1,
+            expires_at: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_identity_authorizes_every_replica_and_revokes_old_epochs() {
+        let store = Store::connect("sqlite::memory:").await.expect("store");
+        persist_sandbox(&store, SandboxPhase::Ready).await;
 
         authorize_persisted(&store, &principal(1))
             .await
@@ -186,5 +194,17 @@ mod tests {
             .await
             .expect_err("stopped runtime must reject its token");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn terminal_runtime_remains_authorized_for_exit_delivery() {
+        for phase in [SandboxPhase::Completed, SandboxPhase::Error] {
+            let store = Store::connect("sqlite::memory:").await.expect("store");
+            persist_sandbox(&store, phase).await;
+
+            authorize_persisted(&store, &principal(1))
+                .await
+                .expect("terminal runtime can finish delivering exit state");
+        }
     }
 }

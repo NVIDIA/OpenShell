@@ -745,7 +745,7 @@ type RefreshSandboxTokenResponse struct {
 	SandboxExpiresAtMs int64 `protobuf:"varint,5,opt,name=sandbox_expires_at_ms,json=sandboxExpiresAtMs,proto3" json:"sandbox_expires_at_ms,omitempty"`
 	// Launch generation to which both refreshed credentials are bound.
 	SessionId string `protobuf:"bytes,6,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	// Monotonic Sandbox Protocol connection replacement order.
+	// Durable authorization epoch shared by the gateway and Sandbox Runtime.
 	CredentialEpoch uint64 `protobuf:"varint,7,opt,name=credential_epoch,json=credentialEpoch,proto3" json:"credential_epoch,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
