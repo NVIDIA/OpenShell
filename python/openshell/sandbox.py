@@ -28,7 +28,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
-from .errors import _error_mapping_channel
+from .errors import GatewayError, _error_mapping_channel
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -991,9 +991,10 @@ class SandboxClient:
             try:
                 self.get(sandbox_name, workspace=workspace)
             except grpc.RpcError as exc:
+                call = exc.raw_error if isinstance(exc, GatewayError) else exc
                 if (
-                    isinstance(exc, grpc.Call)
-                    and exc.code() == grpc.StatusCode.NOT_FOUND
+                    isinstance(call, grpc.Call)
+                    and call.code() == grpc.StatusCode.NOT_FOUND
                 ):
                     return
                 raise
@@ -1562,9 +1563,10 @@ class Sandbox:
                             workspace=self._workspace,
                         )
                 except grpc.RpcError as exc:
+                    call = exc.raw_error if isinstance(exc, GatewayError) else exc
                     if (
-                        not isinstance(exc, grpc.Call)
-                        or exc.code() != grpc.StatusCode.NOT_FOUND
+                        not isinstance(call, grpc.Call)
+                        or call.code() != grpc.StatusCode.NOT_FOUND
                     ):
                         raise
         finally:

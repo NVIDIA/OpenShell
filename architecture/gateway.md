@@ -59,6 +59,8 @@ write conflicts attach `google.rpc.ErrorInfo` with a stable reason and current
 version when available. `google.rpc.RetryInfo` expresses a minimum retry delay;
 it does not establish that a mutation is safe to repeat. SDKs retain the original
 transport status, metadata, and unknown details alongside decoded fields.
+Python cleanup inspects the original gRPC call beneath a typed error wrapper,
+preserving missing-resource handling without suppressing other failures.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:

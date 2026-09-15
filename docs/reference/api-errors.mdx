@@ -74,7 +74,11 @@ seconds. Absent or invalid delay details do not produce a suggested delay.
 
 Existing error codes and human-readable messages remain available. Python curated
 clients now raise `GatewayError`, which remains a `grpc.RpcError`; existing
-`except grpc.RpcError` handlers continue to work. Rust error variants now retain
+`except grpc.RpcError` handlers continue to work. `GatewayError` is not a
+`grpc.Call`. If your handler checks that interface, inspect `raw_error` before
+checking the status. The Python SDK's deletion wait and managed-sandbox cleanup
+use the original call to recognize `NOT_FOUND`; other failures still propagate.
+Rust error variants now retain
 status fields; use `..` when destructuring variants that do not need those fields.
 Go and TypeScript add typed detail fields to their existing error types.
 
