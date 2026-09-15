@@ -60,9 +60,11 @@ workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.
 
 Curated `list_*` methods return a lazy `Pager<T>`. Each `next_page()` call
-issues at most one RPC and returns a `Page<T>` with its opaque continuation
-token. The explicit `list_all_*` conveniences exhaust that pager; `page_size`
-always controls one gateway request, and `page_token` resumes a saved traversal.
+fetches one logical page and returns a `Page<T>` with its opaque continuation
+token. OIDC authentication can retry that page once after an `Unauthenticated`
+response. The explicit `list_all_*` conveniences exhaust that pager;
+`page_size` always controls one gateway request, and `page_token` resumes a
+saved traversal.
 
 ```rust
 let mut pages = client.list_sandboxes(ListOptions {

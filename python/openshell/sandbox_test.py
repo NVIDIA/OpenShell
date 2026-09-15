@@ -2610,6 +2610,16 @@ def test_pager_retries_same_token_after_fetch_error() -> None:
     assert tokens == ["resume", "resume"]
 
 
+def test_pager_rejects_a_repeated_continuation_token() -> None:
+    pager = Pager(
+        lambda token: Page(items=[1], next_page_token=token),
+        page_token="resume",
+    )
+
+    with pytest.raises(SandboxError, match="repeated continuation token"):
+        next(pager)
+
+
 def test_list_ids_forwards_label_selector() -> None:
     stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
     client = _client_with_fake_stub(stub)
