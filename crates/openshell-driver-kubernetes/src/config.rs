@@ -831,6 +831,67 @@ mod tests {
     }
 
     #[test]
+    fn image_pull_policy_rejects_newer_for_sandbox_and_supervisor_images() {
+        for (sandbox, supervisor) in [
+            (Some(ImagePullPolicy::Newer), None),
+            (None, Some(ImagePullPolicy::Newer)),
+        ] {
+            let cfg = KubernetesComputeConfig {
+                image_pull_policy: sandbox,
+                supervisor_image_pull_policy: supervisor,
+                ..KubernetesComputeConfig::default()
+            };
+            let error = cfg.validate_image_pull_policies().unwrap_err();
+            assert!(error.contains("supported only by the Podman"));
+        }
+    }
+
+    #[test]
+    fn toml_image_pull_policy_validation_rejects_invalid_kubernetes_values() {
+        for (field, value) in [
+            ("image_pull_policy", "Sometimes"),
+            ("supervisor_image_pull_policy", "Always"),
+        ] {
+            let error = toml::from_str::<KubernetesComputeConfig>(&format!("{field} = {value:?}"))
+                .expect_err("non-canonical image-pull-policy values must fail TOML parsing");
+            assert!(
+                error.to_string().contains(value),
+                "{field} = {value:?}: {error}"
+            );
+        }
+
+        for field in ["image_pull_policy", "supervisor_image_pull_policy"] {
+            let config: KubernetesComputeConfig = toml::from_str(&format!("{field} = \"newer\""))
+                .expect("the shared image-pull-policy vocabulary parses before driver validation");
+            let error = config
+                .validate_configuration()
+                .expect_err("Kubernetes must reject unsupported image-pull-policy values");
+            assert!(
+                error.contains("supported only by the Podman"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn serde_override_topology_sidecar() {
+        let json = serde_json::json!({
+            "topology": "sidecar"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.topology, SupervisorTopology::Sidecar);
+    }
+
+    #[test]
+    fn serde_override_topology_combined() {
+        let json = serde_json::json!({
+            "topology": "combined"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
     fn serde_rejects_sidecar_binary_identity_field() {
         let json = serde_json::json!({
             "sidecar": {

@@ -238,18 +238,6 @@ gatewayConfig:
 
 # Server configuration
 server:
-  # -- Operator-facing gateway name. Defaults to the chart fullname so all
-  # replicas in one installation share an identity. Set explicitly when one
-  # telemetry collector receives spans from multiple namespaces or clusters.
-  name: ""
-  # -- Gateway log level.
-  logLevel: info
-  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
-  otlp:
-    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
-    endpoint: ""
-    # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
-    serviceName: ""
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -396,11 +384,6 @@ server:
       tokenPath: ""
       # -- HTTP request timeout in seconds. Empty = driver default.
       timeoutSecs: ""
-  auth:
-    # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
-    # principal. Intended only for trusted local Skaffold/k3d development or a
-    # fully trusted fronting proxy. Leave false for shared or production clusters.
-    allowUnauthenticatedUsers: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
