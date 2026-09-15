@@ -120,6 +120,80 @@ fn unsupported_policy_returns_reason_and_three() {
 }
 
 #[test]
+fn unsupported_network_surfaces_fail_closed_at_the_cli_boundary() {
+    let cases = [
+        (
+            "l4",
+            "        path: /v1\n",
+            "mixes REST controls into L4 authority",
+        ),
+        (
+            "rest",
+            "        protocol: rest\n        enforcement: log\n        access: full\n",
+            "uses REST without enforced inspection",
+        ),
+        (
+            "graphql",
+            "        protocol: rest\n        enforcement: enforce\n        access: full\n        persisted_queries: allow-list\n",
+            "uses authority outside the initial model",
+        ),
+        (
+            "json-rpc",
+            "        protocol: rest\n        enforcement: enforce\n        access: full\n        json_rpc: {}\n",
+            "uses authority outside the initial model",
+        ),
+        (
+            "mcp",
+            "        protocol: rest\n        enforcement: enforce\n        access: full\n        mcp: {}\n",
+            "uses authority outside the initial model",
+        ),
+    ];
+
+    for (surface, endpoint_fields, expected_reason) in cases {
+        let path = std::env::temp_dir().join(format!(
+            "openshell-prover-unsupported-{surface}-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            format!(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n{endpoint_fields}    binaries: [{{ path: /usr/bin/curl }}]\n"
+            ),
+        )
+        .expect("write unsupported surface policy");
+
+        let output = run(&[
+            "check",
+            path.to_str().expect("UTF-8 temporary path"),
+            "--boundary",
+            fixture("boundary-empty.yaml").to_str().unwrap(),
+            "--output",
+            "json",
+        ]);
+        fs::remove_file(path).expect("remove unsupported surface policy");
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{surface} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+        assert_eq!(value["result"], "unsupported", "{surface}: {value}");
+        assert_eq!(
+            value["reason_code"], "unsupported_policy_shape",
+            "{surface}: {value}"
+        );
+        assert!(
+            value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(expected_reason)),
+            "{surface}: {value}"
+        );
+    }
+}
+
+#[test]
 fn underscore_host_exceeds_an_empty_boundary() {
     let output = check_json("candidate-underscore-host.yaml", "boundary-empty.yaml");
     assert_eq!(
