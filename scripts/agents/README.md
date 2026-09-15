@@ -116,7 +116,7 @@ bounded harness cycles. The harness must not sleep or poll indefinitely. Instead
 it performs one reconciliation cycle, then prints a final-line sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running. The agent will inspect them next cycle."}
 ```
 
 Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
@@ -131,6 +131,17 @@ retried indefinitely with bounded backoff; only `complete` and
 `terminal_failure` stop the supervisor. This keeps long-lived agents resilient
 to upstream model errors while leaving durable state ownership to the agent
 domain.
+
+The supervisor writes an atomic current snapshot to
+`/sandbox/.openshell-agent/status.json` and keeps the latest 100 supervisor
+transitions in `/sandbox/.openshell-agent/history.jsonl`. Each record identifies
+the cycle, supervisor state, harness exit code, and structured agent result.
+Agents should include a concise `notes` field in every result to capture their
+human-readable current diagnosis, notable issues or questions, and next useful
+action. The supervisor caps notes at 2,048 characters and records a diagnostic
+placeholder when an agent omits them. Override the state directory, history
+limit, or notes limit with `OPENSHELL_AGENT_STATE_DIR`,
+`OPENSHELL_AGENT_STATE_HISTORY_LIMIT`, or `OPENSHELL_AGENT_MAX_NOTES_LENGTH`.
 
 The shared runtime does not prescribe the durable state store. Gator uses GitHub
 labels, comments, reviews, and checks. Other agents can use a repository branch,

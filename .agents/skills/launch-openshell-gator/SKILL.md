@@ -289,6 +289,8 @@ Read that file directly. Important markers:
 - `openshell-agent: starting watch cycle` means the in-sandbox supervisor began a bounded cycle.
 - `OpenAI Codex v...` plus `model: ...` confirms the Codex CLI and model actually used.
 - `OPENSHELL_AGENT_RESULT {...}` is the bounded-cycle sentinel. In watch mode, the supervisor sleeps and relaunches after this line.
+- `/sandbox/.openshell-agent/status.json` is the atomic current state snapshot. Its `result.notes` field is Gator's plain-language diagnosis and next action for that cycle.
+- `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
 - `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
 
@@ -315,6 +317,11 @@ If `sandbox get` is not supported by the local CLI shape, use `openshell sandbox
 | `status=transient_failure` | Retryable infrastructure/auth/transport issue. | Let supervisor retry unless repeated failures hit the configured cap. |
 | `status=terminal_failure` | Unrecoverable or stale immutable payload. | Inspect the reason; rebuild/relaunch for `stale_gator_payload`. |
 | `status=complete` | Target closed, merged, or one-shot complete. | Delete sandbox if no longer needed. |
+
+Prefer the state snapshot over scraping transient `/tmp` cycle output. Use the
+history file to tell whether a failure is repeating or whether the supervisor
+has begun a fresh cycle. Runtime logs remain useful for full command output and
+transport diagnostics.
 
 ## Restarting A Gator
 
