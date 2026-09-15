@@ -13,7 +13,7 @@ use super::loss::{LossItem, add_loss};
 pub const DEFAULT_COMMAND: &str = "sh -lc \"echo OpenShell policy mapped to MXC; replace process.commandLine before running a real workload\"";
 
 /// Default MXC schema version emitted in `version`.
-pub const DEFAULT_MXC_VERSION: &str = "0.7.0-alpha";
+pub const DEFAULT_MXC_VERSION: &str = crate::mxc::MXC_SCHEMA_VERSION;
 
 /// Default MXC containment backend for the coarse mapping.
 pub const DEFAULT_CONTAINMENT: &str = "bubblewrap";

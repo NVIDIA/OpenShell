@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -543,7 +543,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3GatewayFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
@@ -555,6 +555,14 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
             -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
+}
+
+function Invoke-MxcRealTests([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
+        -LogName "test-$RustTarget-mxc-real.log"
 }
 
 function Get-Sha256([string] $Path) {
@@ -601,13 +609,13 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-precommit", "test-unsupported")) {
+if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "ci")) {
+if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -648,6 +656,11 @@ switch ($Action) {
     "test-unsupported" {
         foreach ($rustTarget in $targets) {
             Invoke-UnsupportedContractTests $rustTarget
+        }
+    }
+    "test-mxc-real" {
+        foreach ($rustTarget in $targets) {
+            Invoke-MxcRealTests $rustTarget
         }
     }
     "artifacts" {
