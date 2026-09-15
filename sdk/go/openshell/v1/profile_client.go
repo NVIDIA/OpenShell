@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -66,6 +67,11 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 	for i := range items {
 		pbItems[i] = converter.ProfileImportItemToProto(&items[i])
 	}
+	if profilesRequireStablePlaceholders(pbItems) {
+		if _, err := p.lint(ctx, workspace, pbItems); err != nil {
+			return nil, err
+		}
+	}
 
 	resp, err := p.client.ImportProviderProfiles(ctx, &pb.ImportProviderProfilesRequest{
 		Profiles:  pbItems,
@@ -95,9 +101,15 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 }
 
 func (p *profileClient) Update(ctx context.Context, workspace, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error) {
+	pbItem := converter.ProfileImportItemToProto(&item)
+	if items := []*pb.ProviderProfileImportItem{pbItem}; profilesRequireStablePlaceholders(items) {
+		if _, err := p.lint(ctx, workspace, items); err != nil {
+			return nil, err
+		}
+	}
 	resp, err := p.client.UpdateProviderProfiles(ctx, &pb.UpdateProviderProfilesRequest{
 		Id:                      id,
-		Profile:                 converter.ProfileImportItemToProto(&item),
+		Profile:                 pbItem,
 		ExpectedResourceVersion: expectedResourceVersion,
 		Workspace:               workspace,
 	})
@@ -125,12 +137,9 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 		pbItems[i] = converter.ProfileImportItemToProto(&items[i])
 	}
 
-	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
-	})
+	resp, err := p.lint(ctx, workspace, pbItems)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
 
 	result := &LintResult{
@@ -144,6 +153,30 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 	}
 
 	return result, nil
+}
+
+func profilesRequireStablePlaceholders(items []*pb.ProviderProfileImportItem) bool {
+	for _, item := range items {
+		for _, credential := range item.GetProfile().GetCredentials() {
+			if credential.GetStablePlaceholder() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Lint acknowledges feature support before an opt-in is persisted. Legacy
+// gateways can otherwise silently discard unknown credential fields.
+func (p *profileClient) lint(ctx context.Context, workspace string, items []*pb.ProviderProfileImportItem) (*pb.LintProviderProfilesResponse, error) {
+	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{Profiles: items, Workspace: workspace})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	if profilesRequireStablePlaceholders(items) && !resp.GetSupportsStablePlaceholder() {
+		return nil, fmt.Errorf("gateway does not support stable_placeholder; upgrade the gateway before enabling it")
+	}
+	return resp, nil
 }
 
 func (p *profileClient) Delete(ctx context.Context, workspace, id string) (bool, error) {

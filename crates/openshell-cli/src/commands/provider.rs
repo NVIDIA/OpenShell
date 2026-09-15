@@ -1578,6 +1578,9 @@ pub async fn provider_profile_import(
 
     let mut client = grpc_client(server, tls).await?;
     if !items.is_empty() {
+        if profiles_require_stable_placeholders(&items) {
+            lint_profile_items(&mut client, items.clone(), workspace).await?;
+        }
         let response = client
             .import_provider_profiles(ImportProviderProfilesRequest {
                 profiles: items,
@@ -1623,6 +1626,9 @@ pub async fn provider_profile_update(
 
     let mut client = grpc_client(server, tls).await?;
     if let Some(item) = items.pop() {
+        if profiles_require_stable_placeholders(std::slice::from_ref(&item)) {
+            lint_profile_items(&mut client, vec![item.clone()], workspace).await?;
+        }
         let expected_resource_version = item
             .profile
             .as_ref()
@@ -1662,14 +1668,7 @@ pub async fn provider_profile_lint(
 
     if !items.is_empty() {
         let mut client = grpc_client(server, tls).await?;
-        let response = client
-            .lint_provider_profiles(LintProviderProfilesRequest {
-                profiles: items,
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
+        let response = lint_profile_items(&mut client, items, workspace).await?;
         diagnostics.extend(response.diagnostics);
     }
 
@@ -1963,6 +1962,42 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
+}
+
+fn profiles_require_stable_placeholders(items: &[ProviderProfileImportItem]) -> bool {
+    items
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .any(|profile| {
+            profile
+                .credentials
+                .iter()
+                .any(|credential| credential.stable_placeholder)
+        })
+}
+
+// Check support before persisting an opt-in: older gateways discard unknown
+// credential fields and can otherwise report a successful revision-scoped import.
+async fn lint_profile_items(
+    client: &mut crate::tls::GrpcClient,
+    items: Vec<ProviderProfileImportItem>,
+    workspace: &str,
+) -> Result<openshell_core::proto::LintProviderProfilesResponse> {
+    let requires_stable = profiles_require_stable_placeholders(&items);
+    let response = client
+        .lint_provider_profiles(LintProviderProfilesRequest {
+            profiles: items,
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if requires_stable && !response.supports_stable_placeholder {
+        return Err(miette!(
+            "gateway does not support stable_placeholder; upgrade the gateway before enabling it"
+        ));
+    }
+    Ok(response)
 }
 
 fn load_profile_import_items(

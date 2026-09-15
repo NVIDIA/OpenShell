@@ -38,6 +38,7 @@ use super::validation::{validate_provider_fields, validate_provider_mutable_fiel
 use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
 
 const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
+const EXTERNAL_STABLE_PLACEHOLDER_EPOCH: &str = "external-stable-placeholder-v1";
 
 // ---------------------------------------------------------------------------
 // CRUD helpers
@@ -68,6 +69,7 @@ pub(super) struct ProviderEnvironment {
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
+    pub stable_placeholder_environment_keys: HashSet<String>,
 }
 
 /// Immutable provider records used to build one provider-environment response.
@@ -1117,6 +1119,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut expires = HashMap::new();
     let mut static_credential_bindings = HashMap::new();
     let mut static_credential_keys = HashSet::new();
+    let mut stable_placeholder_environment_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
     let registry = openshell_providers::ProviderRegistry::new();
@@ -1130,6 +1133,17 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             &provider.r#type,
             &provider.profile_workspace,
         );
+        let profile_stable_placeholder_keys = profile
+            .as_ref()
+            .map(|profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.stable_placeholder)
+                    .flat_map(|credential| credential.env_vars.iter().cloned())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let accepted_stored_credential_keys = profile.as_ref().map(|profile| {
             profile
                 .credentials
@@ -1256,6 +1270,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             key,
                             endpoints,
                             refresh_epochs.get(key).map(String::as_str),
+                            profile_stable_placeholder_keys.contains(key),
                         ),
                     );
                 }
@@ -1326,6 +1341,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             &key,
                             endpoints,
                             refresh_epochs.get(&key).map(String::as_str),
+                            profile_stable_placeholder_keys.contains(&key),
                         ),
                     );
                 }
@@ -1343,6 +1359,18 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
         inject_provider_plugin_environment(catalog, provider, &registry, &mut provider_env);
+        for key in profile_stable_placeholder_keys {
+            // A stable placeholder is emitted only when the binding carries
+            // the opaque handle that binds it to the sandbox, provider,
+            // credential key, and endpoint authorization.
+            if provider_env.contains_key(&key)
+                && static_credential_bindings
+                    .get(&key)
+                    .is_some_and(|binding| !binding.workload_credential_handle.is_empty())
+            {
+                stable_placeholder_environment_keys.insert(key);
+            }
+        }
         for (key, value) in provider_env {
             env.entry(key).or_insert(value);
         }
@@ -1354,6 +1382,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
         static_credential_bindings,
         static_credential_keys,
+        stable_placeholder_environment_keys,
     })
 }
 
@@ -1396,9 +1425,15 @@ fn static_credential_binding(
     key: &str,
     endpoints: &[StaticCredentialEndpointBinding],
     authorization_epoch: Option<&str>,
+    stable_external_placeholder: bool,
 ) -> StaticCredentialBinding {
+    // External stable placeholders do not have a refresh authorization epoch.
+    // A fixed domain value keeps their handle stable across value updates while
+    // the remaining handle inputs revoke it on identity or endpoint changes.
+    let handle_epoch = authorization_epoch
+        .or_else(|| stable_external_placeholder.then_some(EXTERNAL_STABLE_PLACEHOLDER_EPOCH));
     let workload_credential_handle = sandbox_id
-        .zip(authorization_epoch)
+        .zip(handle_epoch)
         .map(|(sandbox_id, epoch)| {
             derive_workload_credential_handle(sandbox_id, &record.object_id, key, epoch, endpoints)
         })
@@ -2922,6 +2957,7 @@ pub(super) async fn handle_lint_provider_profiles(
     Ok(Response::new(LintProviderProfilesResponse {
         diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
         valid,
+        supports_stable_placeholder: true,
     }))
 }
 
@@ -5062,6 +5098,7 @@ mod tests {
             description: String::new(),
             env_vars: Vec::new(),
             required: false,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "Authorization".to_string(),
             query_param: String::new(),
@@ -5766,6 +5803,7 @@ mod tests {
             description: String::new(),
             env_vars: vec![env_var.to_string()],
             required: true,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -5826,6 +5864,7 @@ mod tests {
             description: String::new(),
             env_vars: vec![env_var.to_string()],
             required,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -5841,6 +5880,7 @@ mod tests {
             description: String::new(),
             env_vars: Vec::new(),
             required: true,
+            stable_placeholder: false,
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
@@ -6490,6 +6530,7 @@ mod tests {
         .into_inner();
 
         assert!(!response.valid);
+        assert!(response.supports_stable_placeholder);
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.profile_id == "lint-bad"
                 && diagnostic.field == "endpoints[0]"
@@ -9157,6 +9198,7 @@ mod tests {
                             description: String::new(),
                             env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
                             required: true,
+                            stable_placeholder: false,
                             auth_style: "bearer".to_string(),
                             header_name: "authorization".to_string(),
                             query_param: String::new(),
@@ -9717,6 +9759,66 @@ mod tests {
                 .static_credential_bindings
                 .get("CLAUDE_API_KEY")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+    }
+
+    #[test]
+    fn external_stable_placeholder_binding_preserves_only_value_changes() {
+        let mut record = ProviderEnvironmentRecord {
+            name: "external-provider".to_string(),
+            object_id: "provider-instance-a".to_string(),
+            resource_version: 1,
+            provider: Provider::default(),
+            refresh_states: Vec::new(),
+        };
+        let endpoints = vec![StaticCredentialEndpointBinding {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+        }];
+        let external_binding =
+            |sandbox, record: &ProviderEnvironmentRecord, key, endpoints: &[_]| {
+                static_credential_binding(Some(sandbox), record, key, endpoints, None, true)
+            };
+        let initial = external_binding("sandbox-a", &record, "API_KEY", &endpoints);
+        assert!(!initial.workload_credential_handle.is_empty());
+        record.resource_version = 2;
+        record
+            .provider
+            .credentials
+            .insert("API_KEY".to_string(), "synthetic-new".to_string());
+        assert!(initial == external_binding("sandbox-a", &record, "API_KEY", &endpoints));
+        assert!(initial != external_binding("sandbox-b", &record, "API_KEY", &endpoints));
+        assert!(initial != external_binding("sandbox-a", &record, "OTHER_KEY", &endpoints));
+
+        for (host, port, path) in [
+            ("other.example.com", 443, "/v1/**"),
+            ("api.example.com", 8443, "/v1/**"),
+            ("api.example.com", 443, "/v2/**"),
+        ] {
+            let changed_endpoints = vec![StaticCredentialEndpointBinding {
+                host: host.to_string(),
+                port,
+                path: path.to_string(),
+            }];
+            assert!(
+                initial.workload_credential_handle
+                    != external_binding("sandbox-a", &record, "API_KEY", &changed_endpoints)
+                        .workload_credential_handle
+            );
+        }
+        record.object_id = "provider-instance-b".to_string();
+        assert!(
+            initial.workload_credential_handle
+                != external_binding("sandbox-a", &record, "API_KEY", &endpoints)
+                    .workload_credential_handle,
+            "recreating the same provider name must revoke the original handle"
+        );
+        assert!(
+            static_credential_binding(None, &record, "API_KEY", &endpoints, None, true)
+                .workload_credential_handle
+                .is_empty(),
+            "an external handle requires an authenticated sandbox binding"
         );
     }
 
@@ -10373,6 +10475,76 @@ mod tests {
                 .get("GCP_ADC_ACCESS_TOKEN")
                 .map(|binding| binding.endpoints.as_slice()),
             Some(policy_bindings["my-google-cloud"].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_placeholder_resolve_provider_env_marks_only_bound_profile_credentials() {
+        let store = test_store().await;
+        let mut profile = custom_profile("stable-placeholder-test");
+        let mut credential = static_credential("assertion", "EXTERNAL_ASSERTION", true);
+        credential.stable_placeholder = true;
+        profile.credentials = vec![credential];
+        let sources = ProviderProfileSources::from_test_profiles(vec![profile]);
+        let catalog = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("test profile catalog");
+        create_provider_record_with_catalog(
+            &store,
+            &catalog,
+            "default",
+            provider_with_credential_value(
+                "stable-provider",
+                "stable-placeholder-test",
+                "EXTERNAL_ASSERTION",
+                "assertion-v1",
+            ),
+        )
+        .await
+        .expect("provider with stable credential");
+
+        let records =
+            load_provider_environment_records(&store, "default", &["stable-provider".to_string()])
+                .await
+                .expect("provider records");
+        let policy_bindings = HashMap::from([(
+            "stable-provider".to_string(),
+            vec![StaticCredentialEndpointBinding {
+                host: "tools.example.com".to_string(),
+                port: 443,
+                path: "/mcp/**".to_string(),
+            }],
+        )]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(
+            &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .expect("test credential runtime");
+        let result =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                &store,
+                &catalog,
+                &records,
+                &policy_bindings,
+                &credentials,
+                Some("sandbox-id"),
+            )
+            .await
+            .expect("provider environment");
+
+        assert_eq!(
+            result
+                .stable_placeholder_environment_keys
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["EXTERNAL_ASSERTION".to_string()]
+        );
+        assert_eq!(
+            result.static_credential_bindings["EXTERNAL_ASSERTION"]
+                .workload_credential_handle
+                .len(),
+            64,
+            "external stable placeholders must use an identity-bound handle",
         );
     }
 

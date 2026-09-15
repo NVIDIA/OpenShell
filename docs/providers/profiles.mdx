@@ -319,6 +319,9 @@ credentials:
     description: API access token
     env_vars: [CUSTOM_API_TOKEN]
     required: true
+    # Optional mode for external credential updaters that need one opaque
+    # placeholder to survive value-only provider revisions.
+    stable_placeholder: false
 
     # Accepted values: basic, bearer, header, query, path.
     # These fields describe static credential placement.
@@ -645,6 +648,18 @@ Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestam
 OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
 
 The gateway sends a complete host, port, and path binding for every emitted static credential key. It derives bindings from profile endpoints or explicit sandbox policy endpoints for endpointless profiles. It withholds static credential keys from endpointless selected profiles that have no explicit policy binding. Supervisors reject other incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
+
+### Keep an Externally Updated Placeholder Stable
+
+Set `stable_placeholder: true` on a credential only when an external updater requires the workload to keep one opaque placeholder across value-only `provider update` revisions. Declare at least one `env_vars` alias for that credential. OpenShell still classifies the value as secret and resolves it only for hosts, ports, and paths in the credential's effective endpoint binding. An endpointless profile therefore needs an explicit sandbox-policy `credential_binding` before the gateway emits this metadata.
+
+The setting defaults to `false`, preserving existing revision-scoped behavior. Ordinary credentials continue to work with older gateways. To enable stable placeholders, use a supporting gateway, supervisor, and profile client. The CLI and Go SDK check gateway support before importing or updating an opted-in profile; a failed support check leaves the profile unchanged. Raw API clients must check `LintProviderProfilesResponse.supports_stable_placeholder` before enabling the setting.
+
+The gateway withholds opted-in credentials from supervisors that do not advertise support. Once a supervisor activates an external stable credential, a gateway response without support acknowledgment revokes static credentials instead of switching to revision-scoped delivery. This requirement survives failed refreshes and clears when an acknowledged snapshot removes the last external stable credential. Keep a supporting gateway for startup and supervisor reconstruction: older binaries can discard unknown profile fields, so an empty stable-key list on first contact does not prove support. Remove the opt-in and activate that change before downgrading the gateway.
+
+Use the environment value issued by the supervisor. Do not construct a resolver string or a canonical environment-name alias. Once the supervisor installs a value update, the next request from a process holding its original placeholder resolves the current value. Saving the provider update alone does not establish supervisor activation. Expiry or an activated detach prevents the placeholder from resolving a credential.
+
+The opaque placeholder is tied to the sandbox, provider instance, credential key, and effective endpoint binding. Updating only the credential value preserves the placeholder. Replacing the provider or changing its endpoint binding produces a new placeholder, so a running process cannot use its old placeholder for the replacement credential. Use the default `false` when value-only continuity is unnecessary. Profiles cannot combine `stable_placeholder: true` with gateway-managed refresh, credentials produced as another credential's refresh outputs, or `token_grant` because those credentials have a different lifecycle owner.
 
 ## Configure Credential Refresh
 

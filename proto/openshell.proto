@@ -1891,6 +1891,12 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Opt in to an opaque identity-bound environment placeholder for every env
+  // var declared by this credential. Use this only when an external credential
+  // updater requires one placeholder across value-only provider revisions.
+  // Gateway-managed refresh and token-grant credentials cannot opt in because
+  // they require identity-bearing handles for authorization-epoch revocation.
+  bool stable_placeholder = 11;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -2118,6 +2124,9 @@ message LintProviderProfilesRequest {
 message LintProviderProfilesResponse {
   repeated ProviderProfileDiagnostic diagnostics = 1;
   bool valid = 2;
+  // Clients enabling stable_placeholder check this before import or update,
+  // since older gateways silently discard unknown credential fields.
+  bool supports_stable_placeholder = 3;
 }
 
 // Delete provider response.
@@ -2146,6 +2155,10 @@ message GetSandboxProviderEnvironmentRequest {
   // provider credentials. Gateways withhold static credential material when
   // this capability is absent.
   bool supports_static_credential_bindings = 2;
+  // Whether the requesting supervisor understands stable external-placeholder
+  // metadata. Gateways withhold credentials that require this behavior when
+  // the capability is absent.
+  bool supports_stable_placeholder_environment_keys = 3;
 }
 
 // One network endpoint at which a static provider credential may be resolved.
@@ -2162,11 +2175,11 @@ message StaticCredentialBinding {
   // Supervisors use it to retain old revision placeholders only across
   // rotations of the same provider credential.
   string credential_identity = 2;
-  // Opaque gateway-issued handle for a refresh-managed credential identity
-  // epoch. When non-empty, supervisors keep the workload placeholder stable
-  // across access-token rotations and replace only the resolver value. The
-  // handle changes when the sandbox, provider, credential key, refresh
-  // authorization epoch, or endpoint authorization boundary changes.
+  // Opaque gateway-issued handle for a stable credential lifecycle. When
+  // non-empty, supervisors keep the workload placeholder stable across value
+  // updates and replace only the resolver value. The handle changes when the
+  // sandbox, provider, credential key, endpoint authorization, or an applicable
+  // refresh authorization epoch changes.
   string workload_credential_handle = 3;
 }
 
@@ -2190,6 +2203,15 @@ message GetSandboxProviderEnvironmentResponse {
   // Environment variables that contain provider configuration rather than
   // credentials and therefore do not require endpoint-scoped resolution.
   repeated string non_secret_environment_keys = 6;
+  // Credential environment variables whose opaque resolver handle remains
+  // stable across value-only provider revisions. These keys are still secrets;
+  // this metadata only selects the stable external-placeholder behavior.
+  repeated string stable_placeholder_environment_keys = 7;
+  // Supporting gateways always acknowledge the stable-placeholder delivery
+  // contract, including responses without opted-in credentials. Supervisors
+  // require acknowledgment for declared or previously activated external
+  // stable credentials; ordinary legacy delivery does not require it.
+  bool supports_stable_placeholder_environment_keys = 8;
 }
 
 message ExchangeProviderSubjectTokenRequest {

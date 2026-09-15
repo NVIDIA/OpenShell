@@ -6873,19 +6873,25 @@ func (x *ProviderCredentialTokenGrant) GetRequestedTokenType() string {
 
 // Provider credential declaration.
 type ProviderProfileCredential struct {
-	state         protoimpl.MessageState        `protogen:"open.v1"`
-	Name          string                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Description   string                        `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
-	EnvVars       []string                      `protobuf:"bytes,3,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty"`
-	Required      bool                          `protobuf:"varint,4,opt,name=required,proto3" json:"required,omitempty"`
-	AuthStyle     string                        `protobuf:"bytes,5,opt,name=auth_style,json=authStyle,proto3" json:"auth_style,omitempty"`
-	HeaderName    string                        `protobuf:"bytes,6,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
-	QueryParam    string                        `protobuf:"bytes,7,opt,name=query_param,json=queryParam,proto3" json:"query_param,omitempty"`
-	Refresh       *ProviderCredentialRefresh    `protobuf:"bytes,8,opt,name=refresh,proto3" json:"refresh,omitempty"`
-	PathTemplate  string                        `protobuf:"bytes,9,opt,name=path_template,json=pathTemplate,proto3" json:"path_template,omitempty"`
-	TokenGrant    *ProviderCredentialTokenGrant `protobuf:"bytes,10,opt,name=token_grant,json=tokenGrant,proto3" json:"token_grant,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState        `protogen:"open.v1"`
+	Name         string                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Description  string                        `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
+	EnvVars      []string                      `protobuf:"bytes,3,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty"`
+	Required     bool                          `protobuf:"varint,4,opt,name=required,proto3" json:"required,omitempty"`
+	AuthStyle    string                        `protobuf:"bytes,5,opt,name=auth_style,json=authStyle,proto3" json:"auth_style,omitempty"`
+	HeaderName   string                        `protobuf:"bytes,6,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
+	QueryParam   string                        `protobuf:"bytes,7,opt,name=query_param,json=queryParam,proto3" json:"query_param,omitempty"`
+	Refresh      *ProviderCredentialRefresh    `protobuf:"bytes,8,opt,name=refresh,proto3" json:"refresh,omitempty"`
+	PathTemplate string                        `protobuf:"bytes,9,opt,name=path_template,json=pathTemplate,proto3" json:"path_template,omitempty"`
+	TokenGrant   *ProviderCredentialTokenGrant `protobuf:"bytes,10,opt,name=token_grant,json=tokenGrant,proto3" json:"token_grant,omitempty"`
+	// Opt in to an opaque identity-bound environment placeholder for every env
+	// var declared by this credential. Use this only when an external credential
+	// updater requires one placeholder across value-only provider revisions.
+	// Gateway-managed refresh and token-grant credentials cannot opt in because
+	// they require identity-bearing handles for authorization-epoch revocation.
+	StablePlaceholder bool `protobuf:"varint,11,opt,name=stable_placeholder,json=stablePlaceholder,proto3" json:"stable_placeholder,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ProviderProfileCredential) Reset() {
@@ -6986,6 +6992,13 @@ func (x *ProviderProfileCredential) GetTokenGrant() *ProviderCredentialTokenGran
 		return x.TokenGrant
 	}
 	return nil
+}
+
+func (x *ProviderProfileCredential) GetStablePlaceholder() bool {
+	if x != nil {
+		return x.StablePlaceholder
+	}
+	return false
 }
 
 type ProviderCredentialRefreshMaterial struct {
@@ -8413,11 +8426,14 @@ func (x *LintProviderProfilesRequest) GetWorkspace() string {
 
 // Lint provider profiles response.
 type LintProviderProfilesResponse struct {
-	state         protoimpl.MessageState       `protogen:"open.v1"`
-	Diagnostics   []*ProviderProfileDiagnostic `protobuf:"bytes,1,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
-	Valid         bool                         `protobuf:"varint,2,opt,name=valid,proto3" json:"valid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState       `protogen:"open.v1"`
+	Diagnostics []*ProviderProfileDiagnostic `protobuf:"bytes,1,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
+	Valid       bool                         `protobuf:"varint,2,opt,name=valid,proto3" json:"valid,omitempty"`
+	// Clients enabling stable_placeholder check this before import or update,
+	// since older gateways silently discard unknown credential fields.
+	SupportsStablePlaceholder bool `protobuf:"varint,3,opt,name=supports_stable_placeholder,json=supportsStablePlaceholder,proto3" json:"supports_stable_placeholder,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *LintProviderProfilesResponse) Reset() {
@@ -8460,6 +8476,13 @@ func (x *LintProviderProfilesResponse) GetDiagnostics() []*ProviderProfileDiagno
 func (x *LintProviderProfilesResponse) GetValid() bool {
 	if x != nil {
 		return x.Valid
+	}
+	return false
+}
+
+func (x *LintProviderProfilesResponse) GetSupportsStablePlaceholder() bool {
+	if x != nil {
+		return x.SupportsStablePlaceholder
 	}
 	return false
 }
@@ -8618,8 +8641,12 @@ type GetSandboxProviderEnvironmentRequest struct {
 	// provider credentials. Gateways withhold static credential material when
 	// this capability is absent.
 	SupportsStaticCredentialBindings bool `protobuf:"varint,2,opt,name=supports_static_credential_bindings,json=supportsStaticCredentialBindings,proto3" json:"supports_static_credential_bindings,omitempty"`
-	unknownFields                    protoimpl.UnknownFields
-	sizeCache                        protoimpl.SizeCache
+	// Whether the requesting supervisor understands stable external-placeholder
+	// metadata. Gateways withhold credentials that require this behavior when
+	// the capability is absent.
+	SupportsStablePlaceholderEnvironmentKeys bool `protobuf:"varint,3,opt,name=supports_stable_placeholder_environment_keys,json=supportsStablePlaceholderEnvironmentKeys,proto3" json:"supports_stable_placeholder_environment_keys,omitempty"`
+	unknownFields                            protoimpl.UnknownFields
+	sizeCache                                protoimpl.SizeCache
 }
 
 func (x *GetSandboxProviderEnvironmentRequest) Reset() {
@@ -8662,6 +8689,13 @@ func (x *GetSandboxProviderEnvironmentRequest) GetSandboxId() string {
 func (x *GetSandboxProviderEnvironmentRequest) GetSupportsStaticCredentialBindings() bool {
 	if x != nil {
 		return x.SupportsStaticCredentialBindings
+	}
+	return false
+}
+
+func (x *GetSandboxProviderEnvironmentRequest) GetSupportsStablePlaceholderEnvironmentKeys() bool {
+	if x != nil {
+		return x.SupportsStablePlaceholderEnvironmentKeys
 	}
 	return false
 }
@@ -8735,11 +8769,11 @@ type StaticCredentialBinding struct {
 	// Supervisors use it to retain old revision placeholders only across
 	// rotations of the same provider credential.
 	CredentialIdentity string `protobuf:"bytes,2,opt,name=credential_identity,json=credentialIdentity,proto3" json:"credential_identity,omitempty"`
-	// Opaque gateway-issued handle for a refresh-managed credential identity
-	// epoch. When non-empty, supervisors keep the workload placeholder stable
-	// across access-token rotations and replace only the resolver value. The
-	// handle changes when the sandbox, provider, credential key, refresh
-	// authorization epoch, or endpoint authorization boundary changes.
+	// Opaque gateway-issued handle for a stable credential lifecycle. When
+	// non-empty, supervisors keep the workload placeholder stable across value
+	// updates and replace only the resolver value. The handle changes when the
+	// sandbox, provider, credential key, endpoint authorization, or an applicable
+	// refresh authorization epoch changes.
 	WorkloadCredentialHandle string `protobuf:"bytes,3,opt,name=workload_credential_handle,json=workloadCredentialHandle,proto3" json:"workload_credential_handle,omitempty"`
 	unknownFields            protoimpl.UnknownFields
 	sizeCache                protoimpl.SizeCache
@@ -8817,8 +8851,17 @@ type GetSandboxProviderEnvironmentResponse struct {
 	// Environment variables that contain provider configuration rather than
 	// credentials and therefore do not require endpoint-scoped resolution.
 	NonSecretEnvironmentKeys []string `protobuf:"bytes,6,rep,name=non_secret_environment_keys,json=nonSecretEnvironmentKeys,proto3" json:"non_secret_environment_keys,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// Credential environment variables whose opaque resolver handle remains
+	// stable across value-only provider revisions. These keys are still secrets;
+	// this metadata only selects the stable external-placeholder behavior.
+	StablePlaceholderEnvironmentKeys []string `protobuf:"bytes,7,rep,name=stable_placeholder_environment_keys,json=stablePlaceholderEnvironmentKeys,proto3" json:"stable_placeholder_environment_keys,omitempty"`
+	// Supporting gateways always acknowledge the stable-placeholder delivery
+	// contract, including responses without opted-in credentials. Supervisors
+	// require acknowledgment for declared or previously activated external
+	// stable credentials; ordinary legacy delivery does not require it.
+	SupportsStablePlaceholderEnvironmentKeys bool `protobuf:"varint,8,opt,name=supports_stable_placeholder_environment_keys,json=supportsStablePlaceholderEnvironmentKeys,proto3" json:"supports_stable_placeholder_environment_keys,omitempty"`
+	unknownFields                            protoimpl.UnknownFields
+	sizeCache                                protoimpl.SizeCache
 }
 
 func (x *GetSandboxProviderEnvironmentResponse) Reset() {
@@ -8891,6 +8934,20 @@ func (x *GetSandboxProviderEnvironmentResponse) GetNonSecretEnvironmentKeys() []
 		return x.NonSecretEnvironmentKeys
 	}
 	return nil
+}
+
+func (x *GetSandboxProviderEnvironmentResponse) GetStablePlaceholderEnvironmentKeys() []string {
+	if x != nil {
+		return x.StablePlaceholderEnvironmentKeys
+	}
+	return nil
+}
+
+func (x *GetSandboxProviderEnvironmentResponse) GetSupportsStablePlaceholderEnvironmentKeys() bool {
+	if x != nil {
+		return x.SupportsStablePlaceholderEnvironmentKeys
+	}
+	return false
 }
 
 type ExchangeProviderSubjectTokenRequest struct {
@@ -15151,7 +15208,7 @@ const file_openshell_proto_rawDesc = "" +
 	"grant_type\x18\b \x01(\x0e2..openshell.v1.ProviderCredentialTokenGrantTypeR\tgrantType\x12[\n" +
 	"\rsubject_token\x18\t \x01(\v26.openshell.v1.ProviderCredentialTokenGrantSubjectTokenR\fsubjectToken\x120\n" +
 	"\x14requested_token_type\x18\n" +
-	" \x01(\tR\x12requestedTokenType\"\x9e\x03\n" +
+	" \x01(\tR\x12requestedTokenType\"\xcd\x03\n" +
 	"\x19ProviderProfileCredential\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x19\n" +
@@ -15167,7 +15224,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\rpath_template\x18\t \x01(\tR\fpathTemplate\x12K\n" +
 	"\vtoken_grant\x18\n" +
 	" \x01(\v2*.openshell.v1.ProviderCredentialTokenGrantR\n" +
-	"tokenGrant\"\x8d\x01\n" +
+	"tokenGrant\x12-\n" +
+	"\x12stable_placeholder\x18\v \x01(\bR\x11stablePlaceholder\"\x8d\x01\n" +
 	"!ProviderCredentialRefreshMaterial\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x1a\n" +
@@ -15278,21 +15336,23 @@ const file_openshell_proto_rawDesc = "" +
 	"\aupdated\x18\x03 \x01(\bR\aupdated\"\x80\x01\n" +
 	"\x1bLintProviderProfilesRequest\x12C\n" +
 	"\bprofiles\x18\x01 \x03(\v2'.openshell.v1.ProviderProfileImportItemR\bprofiles\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\x7f\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xbf\x01\n" +
 	"\x1cLintProviderProfilesResponse\x12I\n" +
 	"\vdiagnostics\x18\x01 \x03(\v2'.openshell.v1.ProviderProfileDiagnosticR\vdiagnostics\x12\x14\n" +
-	"\x05valid\x18\x02 \x01(\bR\x05valid\"2\n" +
+	"\x05valid\x18\x02 \x01(\bR\x05valid\x12>\n" +
+	"\x1bsupports_stable_placeholder\x18\x03 \x01(\bR\x19supportsStablePlaceholder\"2\n" +
 	"\x16DeleteProviderResponse\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\"L\n" +
 	"\x1cDeleteProviderProfileRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"9\n" +
 	"\x1dDeleteProviderProfileResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x94\x01\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xf4\x01\n" +
 	"$GetSandboxProviderEnvironmentRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12M\n" +
-	"#supports_static_credential_bindings\x18\x02 \x01(\bR supportsStaticCredentialBindings\"]\n" +
+	"#supports_static_credential_bindings\x18\x02 \x01(\bR supportsStaticCredentialBindings\x12^\n" +
+	",supports_stable_placeholder_environment_keys\x18\x03 \x01(\bR(supportsStablePlaceholderEnvironmentKeys\"]\n" +
 	"\x1fStaticCredentialEndpointBinding\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +
@@ -15300,14 +15360,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\x17StaticCredentialBinding\x12K\n" +
 	"\tendpoints\x18\x01 \x03(\v2-.openshell.v1.StaticCredentialEndpointBindingR\tendpoints\x12/\n" +
 	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\x12<\n" +
-	"\x1aworkload_credential_handle\x18\x03 \x01(\tR\x18workloadCredentialHandle\"\x90\b\n" +
+	"\x1aworkload_credential_handle\x18\x03 \x01(\tR\x18workloadCredentialHandle\"\xbf\t\n" +
 	"%GetSandboxProviderEnvironmentResponse\x12l\n" +
 	"\venvironment\x18\x01 \x03(\v2D.openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntryB\x04\x88\xb5\x18\x01R\venvironment\x122\n" +
 	"\x15provider_env_revision\x18\x02 \x01(\x04R\x13providerEnvRevision\x12\x87\x01\n" +
 	"\x18credential_expires_at_ms\x18\x03 \x03(\v2N.openshell.v1.GetSandboxProviderEnvironmentResponse.CredentialExpiresAtMsEntryR\x15credentialExpiresAtMs\x12|\n" +
 	"\x13dynamic_credentials\x18\x04 \x03(\v2K.openshell.v1.GetSandboxProviderEnvironmentResponse.DynamicCredentialsEntryR\x12dynamicCredentials\x12\x8f\x01\n" +
 	"\x1astatic_credential_bindings\x18\x05 \x03(\v2Q.openshell.v1.GetSandboxProviderEnvironmentResponse.StaticCredentialBindingsEntryR\x18staticCredentialBindings\x12=\n" +
-	"\x1bnon_secret_environment_keys\x18\x06 \x03(\tR\x18nonSecretEnvironmentKeys\x1a>\n" +
+	"\x1bnon_secret_environment_keys\x18\x06 \x03(\tR\x18nonSecretEnvironmentKeys\x12M\n" +
+	"#stable_placeholder_environment_keys\x18\a \x03(\tR stablePlaceholderEnvironmentKeys\x12^\n" +
+	",supports_stable_placeholder_environment_keys\x18\b \x01(\bR(supportsStablePlaceholderEnvironmentKeys\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aH\n" +
