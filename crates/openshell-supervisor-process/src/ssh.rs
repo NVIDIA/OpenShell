@@ -1362,13 +1362,14 @@ fn spawn_pty_shell(
     }
 
     #[cfg(target_os = "linux")]
-    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    let mut child = managed_children::spawn_registered(
+        || crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd),
+        |child| Some(child.id()),
+    )?;
     #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1511,14 +1512,14 @@ fn spawn_pipe_exec(
     }
 
     #[cfg(target_os = "linux")]
-    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    let mut child = managed_children::spawn_registered(
+        || crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd),
+        |child| Some(child.id()),
+    )?;
     #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
-
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take().expect("stdout must be piped");
     let child_stderr = child.stderr.take().expect("stderr must be piped");
