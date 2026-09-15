@@ -200,6 +200,11 @@ macro_rules! request_id_middleware {
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
 
+/// Concurrent HTTP/2 streams allowed per connection. Sits above the
+/// per-replica pending relay budget so pooled peer connections are bounded by
+/// the relay caps rather than by the transport.
+const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 1024;
+
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
 pub struct MultiplexService {
@@ -307,10 +312,15 @@ impl MultiplexService {
         // it the gateway never PINGs them, so idle/half-dead connections linger and orphan
         // in-flight relay execs. The timer is required — hyper panics on the keepalive
         // interval without one.
+        //
+        // Peer relays from one replica now share a single pooled connection, so every
+        // forwarded session for every sandbox counts against this one limit. hyper's
+        // default of 200 would cap the whole replica pair below MAX_PENDING_RELAYS.
         builder
             .http2()
             .timer(TokioTimer::new())
             .adaptive_window(true)
+            .max_concurrent_streams(MAX_HTTP2_CONCURRENT_STREAMS)
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10));
 

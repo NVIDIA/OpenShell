@@ -46,6 +46,12 @@ const PEER_TLS_CA_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CA_FILE";
 const PEER_TLS_CERT_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CERT_FILE";
 const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
 const PEER_TLS_SERVER_NAME_ENV: &str = "OPENSHELL_PEER_TLS_SERVER_NAME";
+/// How long a resolved owner record is reused before rereading the store.
+/// Well below `OWNER_TTL` so a cache hit can never outlive the record itself.
+const OWNER_CACHE_TTL: Duration = Duration::from_secs(3);
+/// How long the projected peer `ServiceAccount` token is held in memory.
+/// The kubelet rotates the file hourly, so this only bounds staleness.
+const PEER_TOKEN_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Default)]
 struct PeerTlsClientConfig {
@@ -114,6 +120,120 @@ fn nonempty_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Reusable peer state: one HTTP/2 channel per peer endpoint, the projected
+/// `ServiceAccount` token, and recently resolved owner records.
+///
+/// Without this every forwarded relay paid a TLS handshake, a blocking token
+/// file read, and a store read.
+#[derive(Default)]
+pub struct PeerRouteCache {
+    channels: Mutex<HashMap<String, Channel>>,
+    token: Mutex<Option<CachedPeerToken>>,
+    owners: Mutex<HashMap<String, CachedOwner>>,
+}
+
+/// Hand-written so the cached `ServiceAccount` token is never formatted.
+impl std::fmt::Debug for PeerRouteCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerRouteCache").finish_non_exhaustive()
+    }
+}
+
+struct CachedPeerToken {
+    token: String,
+    refresh_at: Instant,
+}
+
+struct CachedOwner {
+    record: crate::supervisor_owner::OwnerRecord,
+    expires_at: Instant,
+}
+
+impl PeerRouteCache {
+    /// Cloning a `Channel` shares the existing connection, so concurrent relays
+    /// to the same peer multiplex as HTTP/2 streams instead of dialing again.
+    async fn channel(&self, endpoint: &str) -> Result<Channel, Status> {
+        let cached = self.channels.lock().unwrap().get(endpoint).cloned();
+        if let Some(channel) = cached {
+            return Ok(channel);
+        }
+
+        let connected = build_peer_channel(endpoint).await?;
+        let mut channels = self.channels.lock().unwrap();
+        // Two relays can miss together; keep whichever landed first so both
+        // end up on one connection and the loser's channel is dropped.
+        Ok(channels
+            .entry(endpoint.to_string())
+            .or_insert(connected)
+            .clone())
+    }
+
+    /// Drops a peer connection so the next relay redials. Needed when a pod is
+    /// replaced and its endpoint now points at a dead or recycled address.
+    fn evict_channel(&self, endpoint: &str) {
+        self.channels.lock().unwrap().remove(endpoint);
+    }
+
+    async fn peer_token(&self) -> Result<String, Status> {
+        let cached = self
+            .token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|cached| cached.refresh_at > Instant::now())
+            .map(|cached| cached.token.clone());
+        if let Some(token) = cached {
+            return Ok(token);
+        }
+
+        let loaded = tokio::task::spawn_blocking(
+            crate::auth::peer::load_peer_service_account_token_from_env,
+        )
+        .await
+        .map_err(|_| Status::internal("gateway peer token read task failed"))?
+        .map_err(|err| {
+            Status::failed_precondition(format!("gateway peer token load failed: {err}"))
+        })?
+        .ok_or_else(|| {
+            Status::failed_precondition("gateway peer ServiceAccount token is not configured")
+        })?;
+
+        *self.token.lock().unwrap() = Some(CachedPeerToken {
+            token: loaded.clone(),
+            refresh_at: Instant::now() + PEER_TOKEN_CACHE_TTL,
+        });
+        Ok(loaded)
+    }
+
+    fn cached_owner(&self, sandbox_id: &str) -> Option<crate::supervisor_owner::OwnerRecord> {
+        let now = Instant::now();
+        let mut owners = self.owners.lock().unwrap();
+        let entry = owners.get(sandbox_id)?;
+        if entry.expires_at <= now {
+            owners.remove(sandbox_id);
+            return None;
+        }
+        Some(entry.record.clone())
+    }
+
+    fn store_owner(&self, sandbox_id: &str, record: &crate::supervisor_owner::OwnerRecord) {
+        let now = Instant::now();
+        let mut owners = self.owners.lock().unwrap();
+        owners.retain(|_, entry| entry.expires_at > now);
+        owners.insert(
+            sandbox_id.to_string(),
+            CachedOwner {
+                record: record.clone(),
+                expires_at: now + OWNER_CACHE_TTL,
+            },
+        );
+    }
+
+    fn evict_owner(&self, sandbox_id: &str) {
+        self.owners.lock().unwrap().remove(sandbox_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -891,10 +1011,7 @@ pub async fn open_routed_relay_with_message(
             }
         }
 
-        if let Some(owner) = owner_index
-            .read(sandbox_id)
-            .await
-            .map_err(owner_error_to_status)?
+        if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
             && owner_is_fresh(&owner)
         {
             if owner.owner_replica_id == state.replica_id {
@@ -903,6 +1020,7 @@ pub async fn open_routed_relay_with_message(
                     owner_replica_id = %owner.owner_replica_id,
                     "supervisor owner record points at this replica but no local session is registered; retrying"
                 );
+                state.peer_routes.evict_owner(sandbox_id);
                 if Instant::now() + backoff > deadline {
                     return Err(Status::unavailable("supervisor session not connected"));
                 }
@@ -927,6 +1045,9 @@ pub async fn open_routed_relay_with_message(
                         error = %status,
                         "gateway peer owner relay open failed; retrying until session wait timeout"
                     );
+                    // The record may name a replaced pod, so retry against a
+                    // fresh read rather than the cached endpoint.
+                    state.peer_routes.evict_owner(sandbox_id);
                 }
             }
         }
@@ -937,6 +1058,26 @@ pub async fn open_routed_relay_with_message(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
     }
+}
+
+/// Reads the owning replica, reusing a recent result when one is cached.
+async fn resolve_owner(
+    state: &Arc<ServerState>,
+    owner_index: &SupervisorOwnerIndex,
+    sandbox_id: &str,
+) -> Result<Option<crate::supervisor_owner::OwnerRecord>, Status> {
+    if let Some(record) = state.peer_routes.cached_owner(sandbox_id) {
+        return Ok(Some(record));
+    }
+
+    let record = owner_index
+        .read(sandbox_id)
+        .await
+        .map_err(owner_error_to_status)?;
+    if let Some(record) = record.as_ref() {
+        state.peer_routes.store_owner(sandbox_id, record);
+    }
+    Ok(record)
 }
 
 fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
@@ -970,14 +1111,8 @@ async fn connect_peer_relay(
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
-    let token = crate::auth::peer::load_peer_service_account_token_from_env()
-        .map_err(|err| {
-            Status::failed_precondition(format!("gateway peer token load failed: {err}"))
-        })?
-        .ok_or_else(|| {
-            Status::failed_precondition("gateway peer ServiceAccount token is not configured")
-        })?;
-    let channel = build_peer_channel(owner_peer_endpoint).await?;
+    let token = state.peer_routes.peer_token().await?;
+    let channel = state.peer_routes.channel(owner_peer_endpoint).await?;
     let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
     let mut client = open_shell_client::OpenShellClient::with_interceptor(channel, interceptor);
 
@@ -996,7 +1131,10 @@ async fn connect_peer_relay(
     let response = client
         .peer_relay(ReceiverStream::new(out_rx))
         .await
-        .map_err(|err| Status::unavailable(format!("gateway peer relay RPC failed: {err}")))?;
+        .map_err(|err| {
+            state.peer_routes.evict_channel(owner_peer_endpoint);
+            Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
+        })?;
     let inbound = response.into_inner();
     let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
@@ -2290,5 +2428,85 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-fresh")
         );
+    }
+
+    fn owner_record(replica: &str) -> crate::supervisor_owner::OwnerRecord {
+        crate::supervisor_owner::OwnerRecord {
+            session_id: "session-a".to_string(),
+            supervisor_instance_id: "instance-a".to_string(),
+            connection_epoch: 1,
+            owner_replica_id: replica.to_string(),
+            owner_peer_endpoint: format!("http://{replica}:8080"),
+            connected_at_ms: 0,
+            updated_at_ms: openshell_core::time::now_ms(),
+            resource_version: 1,
+        }
+    }
+
+    #[test]
+    fn owner_cache_returns_stored_record() {
+        let cache = PeerRouteCache::default();
+        cache.store_owner("sbx-a", &owner_record("replica-a"));
+
+        let cached = cache
+            .cached_owner("sbx-a")
+            .expect("record should be cached");
+        assert_eq!(cached.owner_replica_id, "replica-a");
+    }
+
+    #[test]
+    fn owner_cache_misses_for_unknown_sandbox() {
+        let cache = PeerRouteCache::default();
+        cache.store_owner("sbx-a", &owner_record("replica-a"));
+
+        assert!(cache.cached_owner("sbx-b").is_none());
+    }
+
+    #[test]
+    fn evict_owner_forces_a_fresh_read() {
+        let cache = PeerRouteCache::default();
+        cache.store_owner("sbx-a", &owner_record("replica-a"));
+        cache.evict_owner("sbx-a");
+
+        assert!(cache.cached_owner("sbx-a").is_none());
+    }
+
+    #[test]
+    fn owner_cache_drops_entries_past_their_ttl() {
+        let cache = PeerRouteCache::default();
+        cache.owners.lock().unwrap().insert(
+            "sbx-a".to_string(),
+            CachedOwner {
+                record: owner_record("replica-a"),
+                expires_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            },
+        );
+
+        assert!(cache.cached_owner("sbx-a").is_none());
+        assert!(!cache.owners.lock().unwrap().contains_key("sbx-a"));
+    }
+
+    #[test]
+    fn owner_cache_ttl_stays_below_owner_record_ttl() {
+        // A cache hit must never extend the window in which a stale owner
+        // looks routable; `owner_is_fresh` is what enforces the real TTL.
+        assert!(OWNER_CACHE_TTL < OWNER_TTL);
+    }
+
+    #[tokio::test]
+    async fn evict_channel_removes_only_the_named_peer() {
+        let cache = PeerRouteCache::default();
+        let channel = Endpoint::from_static("http://10.0.0.1:8080").connect_lazy();
+        {
+            let mut channels = cache.channels.lock().unwrap();
+            channels.insert("http://10.0.0.1:8080".to_string(), channel.clone());
+            channels.insert("http://10.0.0.2:8080".to_string(), channel);
+        }
+
+        cache.evict_channel("http://10.0.0.1:8080");
+
+        let channels = cache.channels.lock().unwrap();
+        assert!(!channels.contains_key("http://10.0.0.1:8080"));
+        assert!(channels.contains_key("http://10.0.0.2:8080"));
     }
 }

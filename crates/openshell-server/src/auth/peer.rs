@@ -18,8 +18,11 @@ use k8s_openapi::api::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, PostParams};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tonic::Status;
 use tracing::{debug, info, warn};
 
@@ -37,6 +40,10 @@ pub const DEFAULT_PEER_SA_TOKEN_FILE: &str = "/var/run/secrets/openshell-peer/to
 /// Environment variable with comma-separated `key=value` pod labels required
 /// on authenticated gateway peer pods.
 pub const PEER_REQUIRED_POD_LABELS_ENV: &str = "OPENSHELL_PEER_POD_LABELS";
+/// Environment variable overriding how long a verified peer token is cached.
+pub const PEER_TOKEN_CACHE_TTL_SECS_ENV: &str = "OPENSHELL_PEER_TOKEN_CACHE_TTL_SECS";
+/// Default lifetime of a cached peer token verification.
+pub const DEFAULT_PEER_TOKEN_CACHE_TTL: Duration = Duration::from_secs(60);
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
@@ -249,6 +256,120 @@ impl GatewayPeerIdentityResolver for LiveGatewayPeerResolver {
             pod_uid: identity.pod_uid,
         }))
     }
+}
+
+struct CachedPeerIdentity {
+    identity: ResolvedGatewayPeerIdentity,
+    expires_at: Instant,
+}
+
+/// Caches verified peer identities so a burst of relays from the same replica
+/// costs one `TokenReview` plus one Pod GET instead of one of each per relay.
+///
+/// Only successful verifications are cached. An entry lives for `ttl` or until
+/// the token itself expires, whichever comes first.
+pub struct CachingGatewayPeerResolver {
+    inner: Arc<dyn GatewayPeerIdentityResolver>,
+    ttl: Duration,
+    entries: Mutex<HashMap<String, CachedPeerIdentity>>,
+}
+
+impl CachingGatewayPeerResolver {
+    pub fn new(inner: Arc<dyn GatewayPeerIdentityResolver>, ttl: Duration) -> Self {
+        Self {
+            inner,
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn cached(&self, key: &str) -> Option<ResolvedGatewayPeerIdentity> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get(key)?;
+        if entry.expires_at <= now {
+            entries.remove(key);
+            return None;
+        }
+        Some(entry.identity.clone())
+    }
+
+    fn store(&self, key: &str, identity: &ResolvedGatewayPeerIdentity, token: &str) {
+        let Some(lifetime) = self.entry_lifetime(token) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, entry| entry.expires_at > now);
+        entries.insert(
+            key.to_string(),
+            CachedPeerIdentity {
+                identity: identity.clone(),
+                expires_at: now + lifetime,
+            },
+        );
+    }
+
+    /// Never outlive the token. A token expiring in 5s is cached for 5s even
+    /// when `ttl` is longer, so a cache hit can't accept an expired token.
+    fn entry_lifetime(&self, token: &str) -> Option<Duration> {
+        let Some(expires_in) = jwt_expires_in(token) else {
+            return Some(self.ttl);
+        };
+        if expires_in.is_zero() {
+            return None;
+        }
+        Some(self.ttl.min(expires_in))
+    }
+}
+
+#[async_trait]
+impl GatewayPeerIdentityResolver for CachingGatewayPeerResolver {
+    async fn resolve(&self, token: &str) -> Result<Option<ResolvedGatewayPeerIdentity>, Status> {
+        let key = token_cache_key(token);
+        if let Some(identity) = self.cached(&key) {
+            return Ok(Some(identity));
+        }
+
+        let resolved = self.inner.resolve(token).await?;
+        if let Some(identity) = resolved.as_ref() {
+            self.store(&key, identity, token);
+        }
+        Ok(resolved)
+    }
+}
+
+/// Hashed so long-lived map keys never hold raw credentials.
+fn token_cache_key(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Reads `exp` from the JWT payload without verifying the signature —
+/// `TokenReview` already did that, this only bounds the cache entry.
+fn jwt_expires_in(token: &str) -> Option<Duration> {
+    use base64::Engine as _;
+
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp")?.as_i64()?;
+    let now_secs = openshell_core::time::now_ms() / 1_000;
+    Some(Duration::from_secs(
+        u64::try_from(exp.saturating_sub(now_secs)).unwrap_or(0),
+    ))
+}
+
+pub fn peer_token_cache_ttl_from_env() -> Duration {
+    std::env::var(PEER_TOKEN_CACHE_TTL_SECS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_PEER_TOKEN_CACHE_TTL, Duration::from_secs)
 }
 
 #[allow(clippy::result_large_err)]
@@ -575,6 +696,119 @@ mod tests {
         };
         assert_eq!(peer.replica_id, "openshell-0");
         assert_eq!(peer.pod_uid, "uid-a");
+    }
+
+    fn identity() -> ResolvedGatewayPeerIdentity {
+        ResolvedGatewayPeerIdentity {
+            pod_name: "openshell-0".to_string(),
+            pod_uid: "uid-a".to_string(),
+        }
+    }
+
+    /// Builds an unsigned JWT whose payload carries only `exp`. The cache reads
+    /// `exp` without verifying the signature, so the other segments are filler.
+    fn token_expiring_in(secs: i64) -> String {
+        use base64::Engine as _;
+        let exp = (openshell_core::time::now_ms() / 1_000) + secs;
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("header.{payload}.signature")
+    }
+
+    #[tokio::test]
+    async fn caching_resolver_reuses_a_verified_token() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let resolver = CachingGatewayPeerResolver::new(inner.clone(), Duration::from_secs(60));
+        let token = token_expiring_in(3600);
+
+        for _ in 0..5 {
+            let peer = resolver.resolve(&token).await.unwrap();
+            assert_eq!(peer.unwrap().pod_name, "openshell-0");
+        }
+
+        assert_eq!(
+            inner.seen_tokens.lock().unwrap().len(),
+            1,
+            "five relays with the same token must cost one TokenReview"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_resolver_verifies_each_distinct_token() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let resolver = CachingGatewayPeerResolver::new(inner.clone(), Duration::from_secs(60));
+
+        resolver.resolve(&token_expiring_in(3600)).await.unwrap();
+        resolver.resolve(&token_expiring_in(1800)).await.unwrap();
+
+        assert_eq!(inner.seen_tokens.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn caching_resolver_does_not_cache_a_rejected_token() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(None)));
+        let resolver = CachingGatewayPeerResolver::new(inner.clone(), Duration::from_secs(60));
+        let token = token_expiring_in(3600);
+
+        assert!(resolver.resolve(&token).await.unwrap().is_none());
+        assert!(resolver.resolve(&token).await.unwrap().is_none());
+
+        assert_eq!(
+            inner.seen_tokens.lock().unwrap().len(),
+            2,
+            "a rejection must be revalidated, never served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_resolver_does_not_cache_an_expired_token() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let resolver = CachingGatewayPeerResolver::new(inner.clone(), Duration::from_secs(60));
+        let token = token_expiring_in(-1);
+
+        resolver.resolve(&token).await.unwrap();
+        resolver.resolve(&token).await.unwrap();
+
+        assert_eq!(inner.seen_tokens.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn entry_lifetime_never_outlives_the_token() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let resolver = CachingGatewayPeerResolver::new(inner, Duration::from_secs(60));
+
+        let short = resolver
+            .entry_lifetime(&token_expiring_in(5))
+            .expect("a live token should be cacheable");
+        assert!(short <= Duration::from_secs(5));
+
+        let capped = resolver
+            .entry_lifetime(&token_expiring_in(3600))
+            .expect("a long-lived token should be cacheable");
+        assert_eq!(capped, Duration::from_secs(60));
+
+        assert!(resolver.entry_lifetime(&token_expiring_in(-1)).is_none());
+    }
+
+    #[test]
+    fn opaque_tokens_fall_back_to_the_configured_ttl() {
+        let inner = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(identity()))));
+        let resolver = CachingGatewayPeerResolver::new(inner, Duration::from_secs(30));
+
+        assert_eq!(
+            resolver.entry_lifetime("not-a-jwt"),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn token_cache_key_does_not_contain_the_token() {
+        let key = token_cache_key("super-secret-token");
+
+        assert!(!key.contains("super-secret-token"));
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, token_cache_key("super-secret-token"));
+        assert_ne!(key, token_cache_key("another-token"));
     }
 
     #[test]
