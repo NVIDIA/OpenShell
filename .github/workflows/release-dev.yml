@@ -89,6 +89,15 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
     secrets: inherit
 
+  build-prover:
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-prover-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+    secrets: inherit
+
   build-gateway:
     needs: compute-versions
     permissions:
@@ -120,7 +129,7 @@ jobs:
     secrets: inherit
 
   package-binaries:
-    needs: [build-cli, build-gateway, build-sandbox, build-vm-driver]
+    needs: [build-cli, build-prover, build-gateway, build-sandbox, build-vm-driver]
     permissions:
       actions: read
       contents: read
@@ -244,7 +253,7 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-cli, build-prover, build-gateway, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -264,7 +273,7 @@ jobs:
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-cli, build-gateway]
+    needs: [compute-versions, build-cli, build-prover, build-gateway]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ github.sha }}
@@ -326,6 +335,7 @@ jobs:
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends ./package-input/*.deb
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
           /usr/libexec/openshell/openshell-driver-vm --version
 
@@ -340,7 +350,11 @@ jobs:
         if: matrix.kind == 'rpm'
         run: |
           set -euo pipefail
-          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
+          dnf install -y \
+            ./package-input/openshell-[0-9]*.rpm \
+            ./package-input/openshell-gateway-*.rpm \
+            ./package-input/openshell-prover-*.rpm
+          openshell-prover --version
           LD_BIND_NOW=1 openshell-gateway --version
 
       - name: Download Python wheel artifact
@@ -410,6 +424,19 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download prover binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: prover-binary-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download prover checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prover-checksums
+          path: release/
+
       - name: Download wheel artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -459,6 +486,8 @@ jobs:
           move_one openshell-dev-aarch64.rpm release/openshell-[0-9]*.aarch64.rpm
           move_one openshell-gateway-dev-x86_64.rpm release/openshell-gateway-[0-9]*.x86_64.rpm
           move_one openshell-gateway-dev-aarch64.rpm release/openshell-gateway-[0-9]*.aarch64.rpm
+          move_one openshell-prover-dev-x86_64.rpm release/openshell-prover-[0-9]*.x86_64.rpm
+          move_one openshell-prover-dev-aarch64.rpm release/openshell-prover-[0-9]*.aarch64.rpm
 
           ls -la release/
 
@@ -607,11 +636,15 @@ jobs:
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
             release/*.whl
             release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
 
   release-helm:
     name: Release Helm Chart (OCI, dev)

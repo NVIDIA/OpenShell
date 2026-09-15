@@ -8,6 +8,22 @@ attached credential set + a binary capability registry as a Z3 SMT
 model, then runs reachability queries to detect credentialed-reach and
 capability changes a reviewer should be aware of.
 
+The crate also exposes an independent containment API for checking whether a
+fully composed candidate policy stays within an operator-supplied maximum. The
+`openshell-prover-cli` package wraps that API for local files. Containment and
+the legacy proposal-risk queries answer different questions; gateway callers
+continue to use the proposal-risk API until the managed-policy migration.
+
+The containment model accepts ASCII literals in network binary selectors,
+endpoint host and path selectors, and REST allow and deny method and path
+selectors. It returns `unsupported_policy_shape` when either policy uses a
+non-ASCII literal in one of those fields. This boundary does not apply to
+filesystem paths or unrelated policy text. Embedded NUL bytes in network
+selector fields are also unsupported. ASCII wildcards are modeled over the
+runtime match language and can therefore match non-ASCII runtime values. A
+solver string that cannot be decoded and validated exactly produces
+`invalid_witness` rather than counterexample evidence.
+
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
 chunk pass through (when the reviewer opts in via the
@@ -47,8 +63,8 @@ pub struct ExfilPath {
 }
 ```
 
-The gateway's `finding_delta` keys paths by `(category, binary,
-host:port, category, method)` so that adding a new method on an
+The gateway's `finding_delta` keys paths by `(finding query, binary,
+host:port, path category, method)` so that adding a new method on an
 already-reached host surfaces as exactly one new path (not the whole
 re-emission of the existing method set).
 
@@ -107,10 +123,12 @@ be additive — they don't displace existing categories.
 
 - A list of `Finding` values, one per fired category. Each finding's
   `query` field holds the category name.
-- The CLI renderer (`report::render_compact` / `render_report`) prints
-  human-readable output for the `openshell-prover` binary.
+- The legacy report renderers (`report::render_compact` / `render_report`)
+  format proposal-risk findings for terminal consumers.
 - The gateway calls `report::finding_shorthand` to build the
   `validation_result` string persisted on each draft chunk.
+- The containment API returns typed evidence to `openshell-prover-cli`, which
+  owns the standalone command's text and JSON formats and exit codes.
 
 ## Z3 model layout
 

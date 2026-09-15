@@ -173,6 +173,25 @@ jobs:
         run: |
           cargo nextest run --profile ci --workspace --features openshell-server/test-support
 
+      - name: Verify standalone policy prover package
+        if: matrix.system == 'x86_64-linux'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo test --locked -p openshell-prover-cli
+          cargo build --locked --release -p openshell-prover-cli --bin openshell-prover
+          cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
+          if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
+            echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
+            cat /tmp/openshell-prover-dependencies.txt >&2
+            exit 1
+          fi
+          target/release/openshell-prover check \
+            crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
+            --maximum crates/openshell-prover-cli/tests/fixtures/maximum.yaml \
+            --output json > /tmp/openshell-prover-result.json
+          grep -q '"result"[[:space:]]*:[[:space:]]*"within_max"' /tmp/openshell-prover-result.json
+
       - name: Verify telemetry can be compiled out
         run: |
           cargo build -p openshell-gateway --bin openshell-gateway

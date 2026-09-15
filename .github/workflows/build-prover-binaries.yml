@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Prover Binaries
+
+on:
+  workflow_call:
+    inputs:
+      cargo-version:
+        required: true
+        type: string
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-prover-cli
+      binary: openshell-prover
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      cargo-version: ${{ inputs.cargo-version }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+    secrets: inherit

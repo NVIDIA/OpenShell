@@ -1,0 +1,208 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Standalone Policy Prover"
+sidebar-title: "Policy Prover"
+description: "Install and use the standalone OpenShell policy prover to check a local candidate policy against a managed maximum."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Maximum, Containment, CI"
+position: 4
+---
+
+`openshell-prover` checks whether the authority in a local candidate policy is
+contained within a local maximum policy. The command reads files from the host
+and does not connect to an OpenShell gateway.
+
+The candidate must be the fully composed effective policy after the proposed
+change, including any provider-contributed authority. The maximum is an
+operator-owned ceiling. It does not grant authority by itself.
+
+## Install the Prover
+
+The standard OpenShell installer includes `openshell-prover`:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+openshell-prover --version
+```
+
+The prover remains independent of the gateway at runtime. If you only need the
+standalone binary, use the artifacts listed in the
+[Support Matrix](/reference/support-matrix#standalone-policy-prover). These
+artifacts and `openshell-prover-checksums-sha256.txt` are attached to
+[OpenShell releases](https://github.com/NVIDIA/OpenShell/releases).
+
+The release archive includes the solver linkage required by the executable.
+It does not require the main `openshell` command, a gateway configuration, or
+a separate Z3 installation.
+
+## Check a Policy Boundary
+
+Create `maximum.yaml` with this maximum policy:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+    - /etc
+  read_write:
+    - /tmp
+```
+
+Create `candidate.yaml` with this contained candidate:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+  read_write:
+    - /tmp
+```
+
+Run the check:
+
+```shell
+openshell-prover check candidate.yaml --maximum maximum.yaml
+```
+
+A contained candidate prints `result: within_max` and exits with status `0`.
+To see an exceeding result and its counterexample, replace `candidate.yaml`
+with a policy that makes `/etc` writable even though the maximum grants only
+read access:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+  read_write:
+    - /tmp
+    - /etc
+```
+
+```shell
+openshell-prover check candidate.yaml --maximum maximum.yaml
+```
+
+To check the current effective policy of an existing sandbox, export it without
+display metadata:
+
+```shell
+openshell sandbox get my-sandbox --policy-only > candidate.yaml
+openshell-prover check candidate.yaml --maximum maximum.yaml
+```
+
+This export includes provider-contributed rules. For a proposed change that is
+not active, supply the complete post-change effective policy. The standalone
+prover does not compose a base policy with provider rules.
+
+Use JSON when a script consumes the result:
+
+```shell
+openshell-prover check candidate.yaml \
+  --maximum maximum.yaml \
+  --output json
+```
+
+The JSON object includes the result, exit code, input paths, prover version,
+model version, checked policy version, and modeled domains. The documented
+semantics and environmental conditions for that scope are tied to its model
+version. An exceeding result also includes a filesystem or network
+counterexample. Automation should use `result` and `reason_code` instead of
+parsing the human-readable explanation.
+
+| Field | When populated |
+|---|---|
+| `counterexample` | An object for `exceeds_max`; otherwise `null`. |
+| `reason_code` | A stable identifier for an emitted `error`, `unsupported`, or `inconclusive` result; otherwise `null`. |
+| `reason` | A human-readable explanation paired with `reason_code`; otherwise `null`. |
+
+The stable reason codes are `invalid_input`, `unsupported_policy_shape`,
+`unresolved_workdir`, `unresolved_binary_path`,
+`unresolved_filesystem_path`, `solver_timeout`, `solver_unknown`,
+`resource_limit`, `invalid_witness`, and `cancelled`.
+
+The solver has a finite 10-second default budget. Set a different positive
+budget with an integer followed by `ms`, `s`, or `m`:
+
+```shell
+openshell-prover check candidate.yaml \
+  --maximum maximum.yaml \
+  --timeout 30s \
+  --output json
+```
+
+## Exit Codes
+
+| Exit | Result | Meaning |
+|---|---|---|
+| `0` | `within_max` | Containment was established for the reported model scope. |
+| `1` | `exceeds_max` | The candidate exceeds the maximum; inspect the counterexample. |
+| `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
+| `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
+| `130` | `inconclusive` when graceful handling completes | The user interrupted the command with Ctrl-C on Unix; a second or very early interruption may prevent output. |
+
+Only exit `0` means the verification succeeded. Treat unsupported and
+inconclusive results as failures in CI.
+
+## Interpretation and Limits
+
+The initial containment model covers filesystem paths, L4 network authority,
+and enforced REST method and path authority, including explicit REST denies.
+The result object reports the domains used for each check. Policies that use
+recognized authority outside that model return `unsupported` rather than
+silently ignoring it.
+
+Network binary selectors, endpoint host and path selectors, and REST allow and
+deny method and path selectors must use ASCII literals in both the candidate and
+maximum. A non-ASCII literal in one of these fields returns `unsupported` with
+`reason_code: unsupported_policy_shape`, including when it appears only in a
+deny. Embedded NUL bytes in these fields are also unsupported. This is a
+prover-model limitation, not a general policy validation rule: filesystem paths
+and unrelated policy text retain their existing Unicode behavior. ASCII
+wildcard selectors still cover non-ASCII runtime values matched by the policy
+engine.
+
+Containment means `Allowed(candidate)` is a subset of `Allowed(maximum)` under
+the reported model. It does not establish least privilege, automatic approval
+eligibility, semantic safety, or equivalence to a running sandbox's kernel
+state. In particular:
+
+- The command does not fetch the current sandbox policy or compose provider
+  rules. The caller must supply the effective candidate.
+- The command does not apply, approve, or persist a policy.
+- A policy inside a review-required region can pass containment and still
+  require human review.
+- Environment-dependent authority, such as an unresolved image workdir,
+  returns `unsupported` when the result depends on that missing context.
+- Binary comparisons that can change when an image resolves an exact selector
+  through a symlink return `unsupported`. This covers exact candidate grants
+  under maximum globs and exact maximum denies replaced by candidate globs.
+  Use matching exact canonical paths when possible.
+- Policies with overlapping L4 and enforced REST endpoints return
+  `unsupported` because inspection selection depends on the complete set of
+  matching runtime endpoint configurations.
+- Network containment checks both supported runtime configurations: binary
+  identity enforcement enabled and disabled. When enabled, grants and denies
+  match the executable or an ancestor identity. Network counterexamples report
+  the configuration and identities that expose the additional authority.
+- REST containment witnesses use canonical request methods and paths.
+- If a solver string cannot be decoded and validated faithfully, the command
+  returns `inconclusive` with `reason_code: invalid_witness` instead of emitting
+  a counterexample.
+- Both files are interpreted in the same sandbox filesystem namespace and
+  mount model, with stable path resolution when enforcement rules are created.
+  The CLI does not resolve sandbox paths against the host.
+- Filesystem containment supports removing grants and reducing write grants to
+  read-only grants at matching paths. A maximum grant for `/` also covers other
+  paths for the same access. Comparisons between different paths otherwise
+  return `unsupported` with `reason_code: unresolved_filesystem_path`: a lexical
+  child can resolve outside its parent through a symlink, and unrelated paths
+  can resolve to the same object. This includes narrowing `/tmp` to `/tmp/cache`.
+  If the maximum grants no access of the requested kind, adding that access
+  returns `exceeds_max`.
+
+Use the [Policy Schema Reference](/reference/policy-schema) for the full policy
+language. A successful prover result covers only the scope reported in its
+evidence.

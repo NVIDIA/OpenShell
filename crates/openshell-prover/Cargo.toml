@@ -23,5 +23,10 @@ owo-colors = { workspace = true }
 include_dir = { workspace = true }
 glob = { workspace = true }
 
+[dev-dependencies]
+openshell-core = { path = "../openshell-core" }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

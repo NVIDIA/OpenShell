@@ -138,6 +138,7 @@ k8s-openapi = { version = "0.24", features = ["v1_29"] }
 
 # IDs
 uuid = { version = "1.10", features = ["v4"] }
+signal-hook = "0.3"
 
 # SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
 z3 = "0.20"
