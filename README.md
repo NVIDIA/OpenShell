@@ -35,6 +35,43 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 
 The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
+**Prerelease artifacts:**
+
+Tagged prereleases are stored as GitHub Actions artifacts for 90 days. Use the GitHub CLI to find the release workflow run and download its release-shaped artifact set:
+
+```shell
+tag=v0.1.0-pre.1
+run_id=$(gh run list \
+  --repo NVIDIA/OpenShell \
+  --branch "$tag" \
+  --workflow release-tag.yml \
+  --json databaseId \
+  --jq '.[0].databaseId')
+
+gh run download "$run_id" \
+  --repo NVIDIA/OpenShell \
+  --name "openshell-$tag" \
+  --dir "$tag"
+```
+
+The downloaded directory contains the same kinds of files published with a stable release. Package managers encode the prerelease version in their native format. For example, the output includes:
+
+```text
+v0.1.0-pre.1/openshell_0.1.0~pre.1-1_arm64.deb
+v0.1.0-pre.1/openshell-0.1.0-0.pre.1.fc44.aarch64.rpm
+v0.1.0-pre.1/openshell-aarch64-unknown-linux-musl.tar.gz
+v0.1.0-pre.1/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
+v0.1.0-pre.1/openshell-checksums-sha256.txt
+```
+
+To download only the ARM64 Debian package instead, select its workflow artifact:
+
+```shell
+gh run download "$run_id" \
+  --repo NVIDIA/OpenShell \
+  --name deb-linux-arm64
+```
+
 The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
 
 ```bash
