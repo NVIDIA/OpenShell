@@ -93,8 +93,12 @@ be additive — they don't displace existing categories.
 
 ## Inputs
 
-- **Policy** — a `SandboxPolicy` proto, parsed via
-  `openshell-policy::parse_sandbox_policy`.
+- **Policy** — authored YAML decoded by `openshell-policy-schema` with the shared
+  fail-closed parser, then projected into the prover-only `PolicyModel`.
+  Missing `version` and unknown authored fields are rejected consistently with
+  runtime parsing. An absent `filesystem_policy` uses the runtime-effective
+  `include_workdir: true`; an explicitly present empty object remains `false`.
+  Explicit `protocol: tcp` is treated as L4, matching runtime classification.
 - **Credential set** — built from the sandbox's attached providers in
   `crates/openshell-server/src/grpc/policy.rs::build_credential_set_for_sandbox`.
   v1 captures presence only (host-coarse); no scope modeling.
@@ -102,6 +106,10 @@ be additive — they don't displace existing categories.
   `crates/openshell-prover/registry/binaries/*.yaml`. Each describes
   the binary's protocols, `bypasses_l7` flag, and `can_exfiltrate`
   capability.
+
+Accepted-risk files, credential descriptors, and binary registries are
+separate file formats. They continue to use their own serde definitions and do
+not form part of the authored policy schema.
 
 ## Outputs
 

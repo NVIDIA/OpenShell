@@ -21,6 +21,25 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+### Authored policy boundary
+
+`openshell-policy-schema` is the sole owner of the authored YAML and JSON
+representation. It preserves authored distinctions such as an absent
+`filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
+and applies parser budgets while noyalib constructs the document. It also owns
+pure language semantics such as access presets, MCP revision vocabulary,
+effective ports and rule names, protocol classification, and lexical policy
+path normalization.
+
+Consumers project that syntax into purpose-specific models. `openshell-policy`
+owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
+validation that depends on runtime components. The existing prover retains its
+risk model but uses the same fail-closed parser as the runtime. The parser
+requires `version: 1` and rejects managed annotations and every unknown field
+before any consumer-specific projection runs. There is no permissive parsing
+profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
+parameter names are open user-data maps rather than schema extensions.
+
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
 does not weaken the whole ruleset. When GPU devices are present, GPU baseline

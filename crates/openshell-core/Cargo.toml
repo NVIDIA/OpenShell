@@ -13,6 +13,7 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
