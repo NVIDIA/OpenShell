@@ -310,6 +310,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
 {{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
 {{- end -}}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) -}}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false — the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." -}}
+{{- end -}}
 {{- if not (or (eq $workloadKind "statefulset") (eq $workloadKind "deployment")) -}}
 {{- fail "workload.kind must be one of: statefulset, deployment." -}}
 {{- end -}}
