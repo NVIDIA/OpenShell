@@ -10,6 +10,14 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+mod endpoint_status;
+
+pub(super) use endpoint_status::handle_report_endpoint_status;
+pub use endpoint_status::{
+    invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
+    retry_endpoint_status_after_supervisor_disconnect,
+};
+
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
@@ -29,6 +37,7 @@ use crate::storage_proto::StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::policy_identity::{canonical_rule_bytes, deterministic_policy_hash};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -56,7 +65,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    VERSION,
+    GetResourceVersion, VERSION,
     endpoint_path::EndpointPathPattern,
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
@@ -2962,6 +2971,7 @@ async fn profile_provider_policy_layers_with_catalog(
 pub(super) struct CredentialedEndpointScope {
     host: String,
     ports: Vec<u32>,
+    path: String,
 }
 
 #[derive(Debug, Default)]
@@ -3018,6 +3028,7 @@ async fn provider_policy_context_with_catalog(
                 let scope = CredentialedEndpointScope {
                     host: endpoint.host.to_ascii_lowercase(),
                     ports: endpoint_ports(endpoint),
+                    path: canonical_endpoint_path(&endpoint.path),
                 };
                 if !credentialed_scopes.contains(&scope) {
                     credentialed_scopes.push(scope);
@@ -3061,6 +3072,7 @@ fn extend_credentialed_scopes_from_policy_bindings(
             let scope = CredentialedEndpointScope {
                 host: binding.host.to_ascii_lowercase(),
                 ports: vec![binding.port],
+                path: canonical_endpoint_path(&binding.path),
             };
             if !scopes.contains(&scope) {
                 scopes.push(scope);
@@ -3077,9 +3089,17 @@ fn endpoint_matches_credentialed_scope(
         return false;
     }
     let endpoint_ports = endpoint_ports(endpoint);
-    endpoint_ports.is_empty()
+    let port_matches = endpoint_ports.is_empty()
         || scope.ports.is_empty()
-        || endpoint_ports.iter().any(|port| scope.ports.contains(port))
+        || endpoint_ports.iter().any(|port| scope.ports.contains(port));
+    port_matches && path_pattern_covers(&scope.path, &canonical_endpoint_path(&endpoint.path))
+}
+
+fn canonical_endpoint_path(path: &str) -> String {
+    match path.trim() {
+        "" | "**" | "/**" => "/**".to_string(),
+        path => path.to_string(),
+    }
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
@@ -3454,6 +3474,10 @@ async fn handle_update_config_inner(
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
 
+            // Global policy determines the report's effective configuration.
+            // Serialize its writes after validation so a report cannot commit
+            // evidence derived from the policy this update has replaced.
+            let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -3551,6 +3575,13 @@ async fn handle_update_config_inner(
             validate_registered_setting_key(key)?;
         }
 
+        // Deleting global policy changes the report's effective configuration.
+        // Keep settings -> sandbox lock order for all global policy mutations.
+        let _sandbox_sync_guard = if key == POLICY_SETTING_KEY && req.delete_setting {
+            Some(state.compute.sandbox_sync_guard().await)
+        } else {
+            None
+        };
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -4252,18 +4283,42 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        // Update current_policy_version using CAS
-        // TODO: Accept expected_version from UpdateConfigRequest for proper client-driven CAS
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let version_to_set = req.version;
-        state
+        let sandbox = state
             .store
-            .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
-                sandbox.set_current_policy_version(version_to_set);
-            })
+            .get_message::<Sandbox>(&req.sandbox_id)
+            .await
+            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let endpoint_reset = endpoint_status::endpoint_status_reset_for_loaded_policy(
+            state.as_ref(),
+            &sandbox,
+            version,
+        )
+        .await?;
+        let expected_resource_version = sandbox.get_resource_version();
+        let version_to_set = req.version;
+        let updated = state
+            .store
+            .update_message_cas::<Sandbox, _>(
+                &req.sandbox_id,
+                expected_resource_version,
+                |sandbox| {
+                    sandbox.set_current_policy_version(version_to_set);
+                    if let Some(endpoints) = &endpoint_reset {
+                        endpoint_status::reconcile_endpoint_statuses(
+                            sandbox,
+                            endpoints,
+                            &HashSet::new(),
+                            "",
+                        );
+                    }
+                },
+            )
             .await
             .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
 
+        state.sandbox_index.update_from_sandbox(&updated);
         state.sandbox_watch_bus.notify(&req.sandbox_id);
     }
 
@@ -5785,203 +5840,6 @@ pub(super) async fn handle_get_draft_history(
 // Policy helper functions
 // ---------------------------------------------------------------------------
 
-fn append_canonical_bytes(out: &mut Vec<u8>, value: &[u8]) {
-    out.extend_from_slice(
-        &u64::try_from(value.len())
-            .expect("canonical value length fits in u64")
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(value);
-}
-
-fn append_canonical_message<M: Message>(out: &mut Vec<u8>, value: &M) {
-    append_canonical_bytes(out, &value.encode_to_vec());
-}
-
-fn append_sorted_message_map<M: Message>(
-    out: &mut Vec<u8>,
-    label: &[u8],
-    values: &HashMap<String, M>,
-) {
-    append_canonical_bytes(out, label);
-    let mut entries = values.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|(key, _)| key.as_str());
-    out.extend_from_slice(
-        &u64::try_from(entries.len())
-            .expect("canonical map length fits in u64")
-            .to_le_bytes(),
-    );
-    for (key, value) in entries {
-        append_canonical_bytes(out, key.as_bytes());
-        append_canonical_message(out, value);
-    }
-}
-
-/// Encode a policy rule without depending on randomized protobuf map order.
-fn canonical_rule_bytes(rule: &NetworkPolicyRule) -> Vec<u8> {
-    let mut map_free = rule.clone();
-    for endpoint in &mut map_free.endpoints {
-        endpoint.graphql_persisted_queries.clear();
-        for rule in &mut endpoint.rules {
-            if let Some(allow) = &mut rule.allow {
-                allow.query.clear();
-                allow.params.clear();
-            }
-        }
-        for deny in &mut endpoint.deny_rules {
-            deny.query.clear();
-            deny.params.clear();
-        }
-    }
-
-    let mut out = Vec::new();
-    append_canonical_message(&mut out, &map_free);
-    for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
-        out.extend_from_slice(
-            &u64::try_from(endpoint_index)
-                .expect("endpoint index fits in u64")
-                .to_le_bytes(),
-        );
-        append_sorted_message_map(
-            &mut out,
-            b"graphql_persisted_queries",
-            &endpoint.graphql_persisted_queries,
-        );
-        for (rule_index, rule) in endpoint.rules.iter().enumerate() {
-            out.extend_from_slice(
-                &u64::try_from(rule_index)
-                    .expect("rule index fits in u64")
-                    .to_le_bytes(),
-            );
-            if let Some(allow) = &rule.allow {
-                append_sorted_message_map(&mut out, b"allow_query", &allow.query);
-                append_sorted_message_map(&mut out, b"allow_params", &allow.params);
-            }
-        }
-        for (rule_index, deny) in endpoint.deny_rules.iter().enumerate() {
-            out.extend_from_slice(
-                &u64::try_from(rule_index)
-                    .expect("deny-rule index fits in u64")
-                    .to_le_bytes(),
-            );
-            append_sorted_message_map(&mut out, b"deny_query", &deny.query);
-            append_sorted_message_map(&mut out, b"deny_params", &deny.params);
-        }
-    }
-    out
-}
-
-fn canonical_struct_bytes(value: &prost_types::Struct) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut fields = value.fields.iter().collect::<Vec<_>>();
-    fields.sort_by_key(|(key, _)| key.as_str());
-    out.extend_from_slice(
-        &u64::try_from(fields.len())
-            .expect("struct field count fits in u64")
-            .to_le_bytes(),
-    );
-    for (key, value) in fields {
-        append_canonical_bytes(&mut out, key.as_bytes());
-        append_canonical_bytes(&mut out, &canonical_value_bytes(value));
-    }
-    out
-}
-
-fn canonical_value_bytes(value: &prost_types::Value) -> Vec<u8> {
-    use prost_types::value::Kind;
-
-    let mut out = Vec::new();
-    match &value.kind {
-        None => out.push(0),
-        Some(Kind::NullValue(value)) => {
-            out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Some(Kind::NumberValue(value)) => {
-            out.push(2);
-            out.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        Some(Kind::StringValue(value)) => {
-            out.push(3);
-            append_canonical_bytes(&mut out, value.as_bytes());
-        }
-        Some(Kind::BoolValue(value)) => {
-            out.push(4);
-            out.push(u8::from(*value));
-        }
-        Some(Kind::StructValue(value)) => {
-            out.push(5);
-            append_canonical_bytes(&mut out, &canonical_struct_bytes(value));
-        }
-        Some(Kind::ListValue(value)) => {
-            out.push(6);
-            out.extend_from_slice(
-                &u64::try_from(value.values.len())
-                    .expect("list length fits in u64")
-                    .to_le_bytes(),
-            );
-            for item in &value.values {
-                append_canonical_bytes(&mut out, &canonical_value_bytes(item));
-            }
-        }
-    }
-    out
-}
-
-fn canonical_middleware_bytes(
-    middleware: &openshell_core::proto::NetworkMiddlewareConfig,
-) -> Vec<u8> {
-    let mut map_free = middleware.clone();
-    map_free.config = None;
-    let mut out = Vec::new();
-    append_canonical_message(&mut out, &map_free);
-    if let Some(config) = &middleware.config {
-        append_canonical_bytes(&mut out, &canonical_struct_bytes(config));
-    }
-    out
-}
-
-fn canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
-    let mut map_free = policy.clone();
-    map_free.network_policies.clear();
-    map_free.network_middlewares.clear();
-    let mut out = Vec::new();
-    append_canonical_message(&mut out, &map_free);
-
-    let mut policy_entries = policy.network_policies.iter().collect::<Vec<_>>();
-    policy_entries.sort_by_key(|(key, _)| key.as_str());
-    append_canonical_bytes(&mut out, b"network_policies");
-    out.extend_from_slice(
-        &u64::try_from(policy_entries.len())
-            .expect("policy count fits in u64")
-            .to_le_bytes(),
-    );
-    for (key, rule) in policy_entries {
-        append_canonical_bytes(&mut out, key.as_bytes());
-        append_canonical_bytes(&mut out, &canonical_rule_bytes(rule));
-    }
-
-    let mut middleware_entries = policy.network_middlewares.iter().collect::<Vec<_>>();
-    middleware_entries.sort_by_key(|(key, _)| key.as_str());
-    append_canonical_bytes(&mut out, b"network_middlewares");
-    out.extend_from_slice(
-        &u64::try_from(middleware_entries.len())
-            .expect("middleware count fits in u64")
-            .to_le_bytes(),
-    );
-    for (key, middleware) in middleware_entries {
-        append_canonical_bytes(&mut out, key.as_bytes());
-        append_canonical_bytes(&mut out, &canonical_middleware_bytes(middleware));
-    }
-    out
-}
-
-/// Compute a deterministic SHA-256 hash of a `SandboxPolicy`, recursively
-/// sorting every protobuf map while preserving repeated-field order.
-fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
-    hex::encode(Sha256::digest(canonical_policy_bytes(policy)))
-}
-
 /// Rebuilds a policy revision's identity from its checked canonical payload.
 ///
 /// `PolicyRecord::policy_hash` is persisted metadata and cannot prove what the
@@ -7440,7 +7298,7 @@ mod tests {
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
     /// Use for tests that exercise sandbox-caller code paths.
     #[allow(dead_code)]
-    fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+    pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -7464,7 +7322,7 @@ mod tests {
         })
     }
 
-    fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
+    pub(super) fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_policies.insert(
             "mcp".to_string(),
@@ -8539,7 +8397,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_credentialed_stamping_matches_host_patterns_and_ports() {
+    fn provider_credentialed_stamping_matches_host_ports_and_paths() {
         let mut policy = ProtoSandboxPolicy {
             network_policies: HashMap::from([(
                 "test".to_string(),
@@ -8548,18 +8406,28 @@ mod tests {
                         NetworkEndpoint {
                             host: "api.example.com".to_string(),
                             port: 443,
+                            path: "/mcp/private/**".to_string(),
                             provider_credentialed: true,
                             ..Default::default()
                         },
                         NetworkEndpoint {
                             host: "api.example.com".to_string(),
                             port: 8443,
+                            path: "/mcp/private/**".to_string(),
                             provider_credentialed: true,
                             ..Default::default()
                         },
                         NetworkEndpoint {
                             host: "*.api.example.com".to_string(),
                             port: 443,
+                            path: "/mcp/private/**".to_string(),
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 443,
+                            path: "/mcp/public/**".to_string(),
                             provider_credentialed: true,
                             ..Default::default()
                         },
@@ -8572,6 +8440,7 @@ mod tests {
         let scopes = vec![CredentialedEndpointScope {
             host: "*.example.com".to_string(),
             ports: vec![443],
+            path: "/mcp/private/**".to_string(),
         }];
 
         clear_provider_credentialed_markers(&mut policy);
@@ -8581,6 +8450,7 @@ mod tests {
         assert!(endpoints[0].provider_credentialed);
         assert!(!endpoints[1].provider_credentialed);
         assert!(!endpoints[2].provider_credentialed);
+        assert!(!endpoints[3].provider_credentialed);
     }
 
     #[test]
@@ -8588,6 +8458,7 @@ mod tests {
         let mut scopes = vec![CredentialedEndpointScope {
             host: "profile.example.com".to_string(),
             ports: vec![443],
+            path: "/**".to_string(),
         }];
         let bindings = HashMap::from([
             (
@@ -8635,10 +8506,17 @@ mod tests {
                 CredentialedEndpointScope {
                     host: "profile.example.com".to_string(),
                     ports: vec![443],
+                    path: "/**".to_string(),
                 },
                 CredentialedEndpointScope {
                     host: "api.bound.example".to_string(),
                     ports: vec![8443],
+                    path: "/v1".to_string(),
+                },
+                CredentialedEndpointScope {
+                    host: "api.bound.example".to_string(),
+                    ports: vec![8443],
+                    path: "/v2".to_string(),
                 },
             ]
         );
@@ -9648,7 +9526,7 @@ mod tests {
         left
     }
 
-    fn test_sandbox(
+    pub(super) fn test_sandbox(
         id: &str,
         name: &str,
         policy: ProtoSandboxPolicy,

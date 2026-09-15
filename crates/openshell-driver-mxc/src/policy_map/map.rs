@@ -21,7 +21,7 @@ use super::config::{
 use super::loss::{LossItem, add_loss};
 
 /// Options controlling the generated MXC config. Fields not relevant to the
-/// coarse map (e.g. `proxy_redirect`) are reserved for the lossless split.
+/// coarse map (e.g. `proxy_redirect`) are reserved for the governed-egress split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
     /// MXC schema version written into `version`.
@@ -40,7 +40,7 @@ pub struct MxcMappingOptions {
     pub timeout_ms: u64,
     /// Emit `OpenShell` wildcard hosts into `allowedHosts` despite lossiness.
     pub allow_wildcards: bool,
-    /// Governed-egress redirect address (used by the lossless split, not the
+    /// Governed-egress redirect address (used by the governed-egress split, not the
     /// coarse map).
     pub proxy_redirect: Option<SocketAddr>,
 }
@@ -68,16 +68,16 @@ pub struct MxcMappingResult {
     pub loss: Vec<LossItem>,
 }
 
-/// Result of the lossless split: the MXC config carries filesystem grants and a
+/// Result of the governed-egress split: the MXC config carries filesystem grants and a
 /// proxy redirect; the full network policy is returned unchanged for the
 /// `OpenShell` CONNECT proxy to enforce.
 #[derive(Clone, Debug)]
 pub struct SplitPolicyResult {
     /// MXC `ContainerConfig` with filesystem grants and `network.proxy` redirect.
     ///
-    /// `network.allowedHosts` is empty — direct egress is blocked at the MXC
-    /// layer. All outbound connections flow through the proxy; the proxy enforces
-    /// the full `OpenShell` network policy.
+    /// Direct egress is blocked at the MXC layer. Unsupported host-list fields
+    /// are omitted; all outbound connections flow through the proxy, which
+    /// enforces the full `OpenShell` network policy.
     pub mxc_config: Value,
     /// Full `OpenShell` network policy preserved verbatim for the host CONNECT
     /// proxy. Only `network_policies` is populated; the proxy does not enforce
@@ -95,15 +95,16 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
     MxcMappingResult { config, loss }
 }
 
-/// Lossless split: map filesystem + containment to MXC, delegate network to the
+/// Governed-egress split: map filesystem + containment to MXC, delegate network to the
 /// `OpenShell` CONNECT proxy.
 ///
 /// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
-/// `opts.proxy_redirect` and leaves `allowedHosts` empty — direct
-/// egress is blocked at the MXC layer and all outbound connections flow through
-/// the proxy. [`SplitPolicyResult::proxy_policy`] carries the original
+/// `opts.proxy_redirect` and omits unsupported host-list fields. Direct egress
+/// is blocked at the MXC layer and all outbound connections flow through the
+/// proxy. [`SplitPolicyResult::proxy_policy`] carries the original
 /// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
-/// loss items are generated for the network side.
+/// loss items are generated for those rules. Network middleware is rejected
+/// until the host proxy can receive the gateway middleware service registry.
 ///
 /// Returns `None` if `opts.proxy_redirect` is not set. Use [`map_to_mxc`]
 /// for the standalone coarse path when no proxy is in the loop.
@@ -170,9 +171,23 @@ fn build_split_mxc_config(
             "The host proxy receives the trimmed policy and enforces network rules.",
         );
     }
+    if !policy.network_middlewares.is_empty() {
+        add_loss(
+            items,
+            "network_middlewares",
+            "error",
+            &format!(
+                "{} network middleware config(s) cannot be enforced because the MXC host proxy is not connected to the gateway middleware service registry.",
+                policy.network_middlewares.len()
+            ),
+            "network egress middleware",
+            "The MXC sandbox is rejected before launch instead of bypassing fail-open middleware or failing unrelated allowed traffic.",
+        );
+    }
 
     // Direct egress is blocked; all outbound flows through the OpenShell proxy.
-    // allowedHosts is intentionally empty — the proxy enforces the full policy.
+    // Released wxc-exec rejects allowedHosts and blockedHosts as unsupported,
+    // even when empty, so the proxy path omits both fields.
     //
     // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
     // {"host": ..., "port": ...} and every other shape is rejected — verified
@@ -191,11 +206,7 @@ fn build_split_mxc_config(
             "The redirect cannot be emitted; use a 127.0.0.1:PORT address.",
         );
     }
-    let mut network = json!({
-        "defaultPolicy": "block",
-        "allowedHosts": [],
-        "blockedHosts": [],
-    });
+    let mut network = json!({ "defaultPolicy": "block" });
     if proxy_supported && proxy_addr.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
         network["proxy"] = json!({ "localhost": proxy_addr.port() });
     }

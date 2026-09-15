@@ -121,14 +121,17 @@ mod tests {
     // Updated for the opaque watch cursor: `WatchSandboxRequest.resume_after_cursor`
     // and `SandboxStreamEvent.cursor` changed from uint64 to string. Both fields
     // are unreleased -- they were added on this branch -- so no client depends on
-    // the old type. Message and enum counts are unchanged, and the durable and
-    // overlap fingerprints are untouched: neither field is part of a stored type.
+    // the old type. The change adds no messages or enums, and leaves the durable
+    // and overlap fingerprints alone: neither field is part of a stored type.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "4c9eba0a0b3316fc4ef289a1982537cf3964995210489e5db7fc33072848d468";
+        "ec7559e627553f586a177d7e9fa008a06766ebc6141e6c3ca535b5a994c57fde";
     const DURABLE_SCHEMA_SHA256: &str =
-        "369b36511c2e38b9df9621704a00123516c7538d8ee89a499158d7de5cee1882";
+        "568ec5637c504726b40a616d286457f41b5be2f4761872c749313e1ee16b5c85";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
+        "f96d841e67da5c3443fa0aca15936dd14ac30d2e150ddf0439b0d195c4a0cfd9";
+    // A persisted Sandbox without endpoint status retains its lifecycle fields;
+    // the absent repeated field decodes empty and needs no database rewrite.
+    const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -452,14 +455,14 @@ mod tests {
             }
         }
         methods.sort();
-        assert_eq!(compiled_method_count, 100, "classify every compiled RPC");
-        assert_eq!(methods.len(), 74, "inventory every public gateway RPC");
+        assert_eq!(compiled_method_count, 101, "classify every compiled RPC");
+        assert_eq!(methods.len(), 75, "inventory every public gateway RPC");
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            74
+            75
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -492,13 +495,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (278, 12)
+            (282, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (81, 8)
+            (82, 9)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (71, 8));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
@@ -516,6 +519,28 @@ mod tests {
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {
         hex::decode(encoded).expect("checked-in legacy fixture must be valid hex")
+    }
+
+    #[test]
+    fn sandbox_payload_without_endpoint_status_decodes() {
+        use openshell_core::proto::{Sandbox, SandboxPhase};
+
+        let sandbox = Sandbox::decode(legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice())
+            .expect("stored sandbox without endpoint status must decode");
+        let metadata = sandbox.metadata.expect("sandbox metadata");
+        assert_eq!(metadata.id, "sandbox-id");
+        assert_eq!(metadata.name, "sandbox");
+        assert_eq!(metadata.workspace, "default");
+        let status = sandbox.status.expect("sandbox status");
+        assert_eq!(status.sandbox_name, "sandbox");
+        assert_eq!(status.phase(), SandboxPhase::Ready);
+        assert_eq!(status.current_policy_version, 7);
+        assert_eq!(status.main_process_instance_id, "supervisor-id");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "Ready");
+        assert_eq!(status.conditions[0].status, "True");
+        assert!(status.endpoint_statuses.is_empty());
     }
 
     #[test]

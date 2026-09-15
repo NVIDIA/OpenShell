@@ -419,6 +419,12 @@ server:
   oidc:
     # -- OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
     issuer: ""
+    # -- Development only: permit cleartext OIDC requests to numeric loopback
+    # addresses. This never permits HTTP to hostnames or non-loopback addresses.
+    dangerouslyAllowInsecureHttp: false
+    # -- Additional trusted HTTPS origins allowed to serve JWKS. The issuer
+    # origin is always allowed. Entries must not include a path or query.
+    jwksAllowedOrigins: []
     # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"

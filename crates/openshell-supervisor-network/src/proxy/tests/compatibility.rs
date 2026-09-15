@@ -61,6 +61,10 @@ fn assert_json_response(
 async fn destination_denials_preserve_adapter_specific_wire_contracts() {
     let cases = [
         (
+            DestinationDenialKind::Resolution,
+            "destination resolution failed",
+        ),
+        (
             DestinationDenialKind::TrustedGateway,
             "trusted-gateway check failed",
         ),
@@ -381,28 +385,27 @@ network_policies:
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn identity_required_mode_is_explicitly_unsupported_off_linux() {
+fn static_identity_is_supported_off_linux() {
     let engine = OpaEngine::from_strings(
         include_str!("../../../data/sandbox-policy.rego"),
         "network_policies: {}\n",
     )
     .unwrap();
+    let binary = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(binary.path(), b"agent").unwrap();
+    let identity = ProxyIdentityMode::static_binary(binary.path()).unwrap();
     let decision = authorize_egress_intent(
         crate::procfs::WorkloadProxyTcpConnection::new(
             "127.0.0.1:41000".parse().unwrap(),
             "127.0.0.1:3000".parse().unwrap(),
         ),
         &engine,
-        &BinaryIdentityCache::new(),
-        &AtomicU32::new(1),
+        &identity,
         EgressIntent::connect("target.example".to_string(), 443),
     );
 
     assert!(matches!(decision.action, NetworkAction::Deny { .. }));
-    assert_eq!(
-        decision.identity,
-        ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::UnsupportedPlatform)
-    );
+    assert_eq!(decision.identity, ProcessIdentityEvidence::Available);
 }
 
 #[test]
@@ -541,13 +544,18 @@ network_policies:
                                 Box::pin(handle_tcp_connection(
                                     stream,
                                     engine,
-                                    Arc::new(BinaryIdentityCache::new()),
-                                    Arc::new(AtomicU32::new(0)),
+                                    Arc::new(
+                                        ProxyIdentityMode::static_binary(
+                                            std::env::current_exe().unwrap(),
+                                        )
+                                        .unwrap(),
+                                    ),
                                     None,
                                     None,
                                     AgentProposals::default(),
                                     Arc::new(None),
                                     Arc::new(None),
+                                    None,
                                     None,
                                     None,
                                     None,

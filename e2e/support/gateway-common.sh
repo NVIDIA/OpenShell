@@ -190,6 +190,11 @@ e2e_write_gateway_oidc_config() {
 
   printf '[openshell.gateway.oidc]\n'
   printf 'issuer = %s\n'         "$(e2e_toml_string "${issuer}")"
+  case "${issuer}" in
+    http://127.*|http://\[::1\]*)
+      printf 'dangerously_allow_insecure_http = true\n'
+      ;;
+  esac
   printf 'audience = "openshell-cli"\n'
   printf 'jwks_ttl_secs = 60\n'
   printf 'roles_claim = "realm_access.roles"\n'

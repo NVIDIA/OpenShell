@@ -110,16 +110,13 @@ packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
-By default it enables the `z3-sys` prebuilt-release feature and pins Z3 4.16.0.
-On a clean target directory, `z3-sys` downloads the official static library for
-the selected Windows architecture instead of compiling Z3 through
-CMake/MSBuild. GitHub Actions supplies its read-only workflow token for the
-release lookup, and the Cargo target cache preserves the extracted library for
-subsequent runs. When
-`Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
-wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
-the full path to `z3.h`. Local clean builds use the unauthenticated GitHub API
-unless `READ_ONLY_GITHUB_TOKEN` is set.
+By default it enables bundled Z3 for reproducible Windows builds. `z3-sys`
+builds Z3 from source and links it into the release binaries, so copying
+`openshell-gateway.exe` and `openshell.exe` does not create an undeclared
+`libz3.dll` runtime dependency. When `Z3_LIBRARY_PATH_OVERRIDE` points at a
+directory containing `libz3.lib`, the wrapper uses that system Z3 instead and
+requires `Z3_SYS_Z3_HEADER` to point at the full path to `z3.h`. Binaries built
+against a dynamic system Z3 must be deployed with the matching `libz3.dll`.
 
 GitHub Actions layers the Cargo target cache with sccache's GitHub Actions
 backend. The target cache lets Cargo skip intact dependency builds; sccache
@@ -139,10 +136,10 @@ Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
 ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
 `clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
 the wrapper discovers and adds the Visual Studio-bundled Ninja to `PATH` for
-native dependencies. Z3 uses the official prebuilt ARM64 static library, so it
-does not inherit compiler settings from those native dependencies. Artifact
-hashing uses .NET SHA256 directly because module autoloading in the
-mise-launched Windows PowerShell process is not guaranteed.
+native dependencies. Bundled Z3 uses native MSVC `cl.exe` with the Visual
+Studio generator, while the crypto crates select `clang-cl`. Artifact hashing
+uses .NET SHA256 directly because module autoloading in the mise-launched
+Windows PowerShell process is not guaranteed.
 
 The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.

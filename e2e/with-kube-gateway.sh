@@ -202,6 +202,12 @@ cleanup_postgres_fixture() {
 deploy_vault_fixture() {
   echo "Deploying OpenBao fixture for Vault credential-driver validation..."
 
+  local openshift_flag="false"
+  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    echo "Enabling OpenBao chart OpenShift mode for restricted-v2 compatibility."
+    openshift_flag="true"
+  fi
+
   helmctl repo add openbao https://openbao.github.io/openbao-helm \
     >/dev/null 2>&1 || true
   helmctl repo update openbao >/dev/null
@@ -211,6 +217,7 @@ deploy_vault_fixture() {
     --set "server.dev.enabled=true" \
     --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
     --set "injector.enabled=false" \
+    --set "global.openshift=${openshift_flag}" \
     --wait --timeout 5m
   VAULT_FIXTURE_DEPLOYED=1
 
@@ -219,9 +226,59 @@ deploy_vault_fixture() {
     -l "app.kubernetes.io/name=openbao,component=server" \
     --timeout=300s
 
+  provision_vault_auth
+
   export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
   export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
   export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
+}
+
+# Run a `bao` command in the fixture pod. Tolerates the "path is already in use"
+# error from re-enabling a mount on rerun, but surfaces any other failure.
+openbao_exec() {
+  local out
+  if out="$(kctl -n "${VAULT_NAMESPACE}" exec "${VAULT_RELEASE_NAME}-0" -- \
+    env "BAO_TOKEN=${VAULT_DEV_ROOT_TOKEN}" bao "$@" 2>&1)"; then
+    [ -n "${out}" ] && printf '%s\n' "${out}"
+    return 0
+  fi
+  case "${out}" in
+    *"path is already in use"*) return 0 ;;
+    *) printf '%s\n' "${out}" >&2; return 1 ;;
+  esac
+}
+
+# Provision the KV store, Kubernetes auth method, storage policy, and login role
+# the gateway's Vault credential driver uses, so every provider-creating test in
+# the suite can authenticate. The role binds ServiceAccount `openshell` in the
+# gateway namespace, matching ci/values-credential-driver-vault.yaml.
+provision_vault_auth() {
+  echo "Provisioning OpenBao Kubernetes auth for the gateway service account..."
+
+  openbao_exec secrets enable -path=secret kv-v2 >/dev/null
+  openbao_exec auth enable kubernetes >/dev/null
+
+  openbao_exec write auth/kubernetes/config \
+    kubernetes_host=https://kubernetes.default.svc \
+    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+    >/dev/null
+
+  printf '%s\n' \
+    'path "secret/data/openshell/provider-credentials/*" {' \
+    '  capabilities = ["create", "read", "update", "delete"]' \
+    '}' \
+    'path "secret/metadata/openshell/provider-credentials/*" {' \
+    '  capabilities = ["read", "delete", "list"]' \
+    '}' \
+    | kctl -n "${VAULT_NAMESPACE}" exec -i "${VAULT_RELEASE_NAME}-0" -- \
+        env "BAO_TOKEN=${VAULT_DEV_ROOT_TOKEN}" \
+        bao policy write openshell-provider-storage - >/dev/null
+
+  openbao_exec write auth/kubernetes/role/openshell-gateway \
+    bound_service_account_names=openshell \
+    "bound_service_account_namespaces=${NAMESPACE}" \
+    policies=openshell-provider-storage \
+    ttl=1h >/dev/null
 }
 
 cleanup_vault_fixture() {
@@ -866,6 +923,16 @@ fi
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
   bash "${ROOT}/e2e/support/install-agent-sandbox.sh" --context "${KUBE_CONTEXT}"
 
+# Detect OpenShift up front so fixtures deployed below can apply SCC-compatible
+# handling; the gateway setup further down reuses this flag.
+if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
+  OPENSHIFT_DETECTED=1
+  if ! command -v oc >/dev/null 2>&1; then
+    echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
+    exit 2
+  fi
+fi
+
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
    && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
@@ -890,15 +957,9 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
-if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
-  OPENSHIFT_DETECTED=1
+if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   echo "OpenShift detected — applying SCC-compatible security context overrides."
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
-
-  if ! command -v oc >/dev/null 2>&1; then
-    echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
-    exit 2
-  fi
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
 

@@ -90,6 +90,8 @@ The same settings are available through environment variables:
 | Environment variable | Purpose | Default |
 |---|---|---|
 | `OPENSHELL_OIDC_ISSUER` | OIDC issuer URL. The gateway discovers `/.well-known/openid-configuration` from this URL. | None |
+| `OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP` | Development-only acknowledgement for HTTP issuers on numeric loopback addresses. HTTP hostnames and non-loopback addresses remain rejected. | `false` |
+| `OPENSHELL_OIDC_JWKS_ALLOWED_ORIGINS` | Comma-separated additional HTTPS origins trusted to serve JWKS. | Empty |
 | `OPENSHELL_OIDC_AUDIENCE` | Expected JWT `aud` claim. | `openshell-cli` |
 | `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. The gateway also refreshes on an unknown key ID. Must be greater than zero. | `3600` |
 | `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. | `realm_access.roles` |
@@ -104,11 +106,21 @@ server:
   oidc:
     issuer: https://idp.example.com/realms/openshell
     audience: openshell-cli
+    # Only needed when discovery returns a deliberately separate JWKS origin.
+    jwksAllowedOrigins:
+      - https://keys.example.com
     rolesClaim: realm_access.roles
     adminRole: openshell-admin
     userRole: openshell-user
     scopesClaim: ""
 ```
+
+The gateway requires HTTPS for OIDC discovery and JWKS retrieval, rejects
+redirects, and trusts the issuer origin for JWKS by default. Add a
+`jwksAllowedOrigins` entry only when the identity provider intentionally serves
+keys from another trusted origin. For local tests, numeric-loopback HTTP also
+requires `dangerouslyAllowInsecureHttp: true`; this setting never permits an
+HTTP hostname or non-loopback address.
 
 Register an OIDC gateway with the CLI:
 

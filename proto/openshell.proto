@@ -475,6 +475,14 @@ service OpenShell {
     };
   }
 
+  // Replace the gateway's observed tool server endpoint status for one sandbox.
+  rpc ReportEndpointStatus(ReportEndpointStatusRequest)
+      returns (ReportEndpointStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse) {
@@ -1065,9 +1073,13 @@ message SandboxStatus {
   // Presence indicates that the canonical main process exited. Exit code 0
   // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
+  // Last accepted network result for each configured tool server endpoint.
+  // Currently populated for MCP-over-HTTP endpoints. These passive results
+  // remain separate from sandbox lifecycle conditions and readiness.
+  repeated EndpointStatus endpoint_statuses = 10;
 }
 
-// User-facing sandbox condition derived from driver-native conditions.
+// User-facing sandbox condition derived from platform or gateway observations.
 message SandboxCondition {
   // Condition class, typically mirroring the underlying platform condition type.
   string type = 1;
@@ -1077,7 +1089,7 @@ message SandboxCondition {
   string reason = 3;
   // Human-readable condition message.
   string message = 4;
-  // Timestamp reported by the underlying platform for the last transition.
+  // RFC 3339 UTC timestamp supplied by the condition owner for the last transition.
   string last_transition_time = 5;
 }
 
@@ -3139,4 +3151,78 @@ message ExtensionServiceCredential {
   string token = 2 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the token, milliseconds since the epoch.
   int64 expires_at_ms = 3;
+}
+
+// Last observed network result for a configured external tool endpoint.
+// Results describe accepted traffic observations, not present availability.
+enum EndpointResult {
+  ENDPOINT_RESULT_UNSPECIFIED = 0;
+  // No exchange has been observed under the current configuration and session.
+  ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE = 1;
+  // An upstream HTTP status below 400 was received. Its body can still contain
+  // an MCP error; this result does not establish tool-call success.
+  ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED = 2;
+  // OpenShell policy denied the request locally.
+  ENDPOINT_RESULT_POLICY_DENIED = 3;
+  // An applicable OpenShell-managed credential was unavailable.
+  ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE = 4;
+  // TLS setup for the upstream connection failed.
+  ENDPOINT_RESULT_TLS_FAILED = 5;
+  // The upstream transport failed before an HTTP response arrived.
+  ENDPOINT_RESULT_TRANSPORT_FAILED = 6;
+  // The upstream service returned an HTTP rejection.
+  ENDPOINT_RESULT_UPSTREAM_REJECTED = 7;
+}
+
+// One redacted endpoint result in a supervisor's complete status report.
+message EndpointObservation {
+  // Stable identifier derived from the configured host, ports, and path.
+  string endpoint_id = 1;
+  // Latest result under the reported configuration and supervisor session.
+  EndpointResult result = 2;
+}
+
+// Complete endpoint status report for the caller's current configuration.
+message ReportEndpointStatusRequest {
+  // Sandbox id. Must match the authenticated sandbox principal.
+  string sandbox_id = 1;
+  // Hash from the active effective policy delivered by the gateway.
+  string policy_hash = 2;
+  // Provider environment revision delivered with the active configuration.
+  uint64 provider_env_revision = 3;
+  // Exactly one result for every distinct observed endpoint in the policy.
+  repeated EndpointObservation observations = 4;
+  // Endpoints with a new observation in this batch. Omitted endpoints retain
+  // their prior report time; an identical retry never advances report time.
+  repeated string observed_endpoint_ids = 5;
+  // Active ConnectSupervisor session that owns these observations.
+  string supervisor_session_id = 6;
+  // Monotonically increasing sequence within the authenticated session. Gaps
+  // are allowed when an inventory reset supersedes a frozen snapshot. Retrying
+  // a report preserves its complete body and sequence for idempotent acknowledgement.
+  uint64 report_sequence = 7;
+}
+
+// Empty acknowledgement for a persisted endpoint status report.
+message ReportEndpointStatusResponse {}
+
+// A configured endpoint and its last accepted network result in one record.
+// Address fields contain policy selectors, never request URLs or credentials.
+message EndpointStatus {
+  // Stable identifier for selecting this endpoint without parsing display text.
+  string endpoint_id = 1;
+  // Lowercase configured endpoint host.
+  string host = 2;
+  // Sorted, deduplicated effective endpoint ports. Validated endpoints have at
+  // least one port.
+  repeated uint32 ports = 3;
+  // Canonical configured path selector; an unrestricted path is /**.
+  string path = 4;
+  // Last accepted result, aggregated across configured callers and ports.
+  // NoObservedExchange retains the address and has no report timestamp.
+  EndpointResult last_result = 5;
+  // RFC 3339 UTC time when the gateway accepted the observation. This is not
+  // the request time: still-valid evidence can be reaccepted after a reset.
+  // Identical same-sequence retries do not advance it.
+  string last_reported_at = 6;
 }

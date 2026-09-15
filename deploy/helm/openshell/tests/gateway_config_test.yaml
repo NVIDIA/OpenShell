@@ -122,6 +122,20 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.otlp\]'
 
+  - it: renders OIDC transport security settings
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.dangerouslyAllowInsecureHttp: false
+      server.oidc.jwksAllowedOrigins[0]: https://keys.example.com
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^dangerously_allow_insecure_http\s*=\s*false$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^jwks_allowed_origins\s*=\s*\["https://keys.example.com"\]$'
+
   - it: treats a null OTLP map as disabled
     template: templates/gateway-config.yaml
     set:

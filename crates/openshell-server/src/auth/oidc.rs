@@ -19,6 +19,7 @@ use openshell_core::OidcConfig;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +52,11 @@ const STALE_KEY_GRACE_MULTIPLIER: u32 = 3;
 /// a burst or steady stream of unknown-`kid` lookups can amplify requests
 /// against the issuer's JWKS endpoint.
 const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// OIDC metadata is small. These limits bound memory consumption before JSON
+/// deserialization while leaving ample room for large enterprise key sets.
+const OIDC_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
+const JWKS_MAX_BYTES: usize = 1024 * 1024;
 
 /// Cached JWKS key set fetched from the OIDC issuer.
 ///
@@ -90,6 +96,176 @@ impl std::fmt::Debug for JwksCache {
 struct OidcDiscovery {
     issuer: String,
     jwks_uri: String,
+}
+
+fn is_numeric_loopback(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address.is_loopback(),
+        Ok(IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn validate_oidc_url(
+    value: &str,
+    description: &str,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value)
+        .map_err(|error| format!("{description} must be an absolute URL: {error}"))?;
+
+    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "{description} must include a host and must not include credentials"
+        ));
+    }
+
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http"
+            if dangerously_allow_insecure_http
+                && parsed.host_str().is_some_and(is_numeric_loopback) =>
+        {
+            Ok(parsed)
+        }
+        "http" if dangerously_allow_insecure_http => Err(format!(
+            "{description} may use insecure HTTP only with a numeric loopback address"
+        )),
+        "http" => Err(format!(
+            "{description} must use HTTPS; numeric-loopback HTTP requires the development-only dangerously_allow_insecure_http acknowledgement"
+        )),
+        scheme => Err(format!(
+            "{description} must use HTTPS, not the '{scheme}' scheme"
+        )),
+    }
+}
+
+fn validate_jwks_origin(
+    value: &str,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let origin = validate_oidc_url(
+        value,
+        "OIDC JWKS allowed origin",
+        dangerously_allow_insecure_http,
+    )?;
+    if origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some() {
+        return Err(format!(
+            "OIDC JWKS allowed origin '{value}' must not include a path, query, or fragment"
+        ));
+    }
+    Ok(origin)
+}
+
+fn validate_jwks_url(
+    value: &str,
+    issuer: &url::Url,
+    config: &OidcConfig,
+) -> Result<url::Url, String> {
+    let jwks = validate_oidc_url(
+        value,
+        "OIDC discovery jwks_uri",
+        config.dangerously_allow_insecure_http,
+    )?;
+    if jwks.fragment().is_some() {
+        return Err("OIDC discovery jwks_uri must not include a fragment".to_string());
+    }
+    if jwks.origin() == issuer.origin() {
+        return Ok(jwks);
+    }
+
+    for allowed in &config.jwks_allowed_origins {
+        let allowed = validate_jwks_origin(allowed, config.dangerously_allow_insecure_http)?;
+        if jwks.origin() == allowed.origin() {
+            return Ok(jwks);
+        }
+    }
+
+    Err(format!(
+        "OIDC discovery jwks_uri origin '{}' does not match issuer origin '{}'; add the JWKS origin to jwks_allowed_origins only if it is trusted",
+        jwks.origin().ascii_serialization(),
+        issuer.origin().ascii_serialization(),
+    ))
+}
+
+fn is_json_content_type(value: &reqwest::header::HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type
+            .to_ascii_lowercase()
+            .strip_prefix("application/")
+            .is_some_and(|subtype| subtype.ends_with("+json"))
+}
+
+async fn fetch_bounded_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &url::Url,
+    description: &str,
+    max_bytes: usize,
+) -> Result<T, String> {
+    let mut response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|error| format!("{description} request failed: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "{description} request returned HTTP {}",
+            response.status()
+        ));
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .is_some_and(is_json_content_type)
+    {
+        return Err(format!(
+            "{description} response must use an application/json or application/*+json content type"
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!(
+            "{description} response exceeds the {max_bytes}-byte limit"
+        ));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("{description} response body failed: {error}"))?
+    {
+        let next_length = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{description} response length overflow"))?;
+        if next_length > max_bytes {
+            return Err(format!(
+                "{description} response exceeds the {max_bytes}-byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("{description} response parse failed: {error}"))
 }
 
 /// JWKS key set.
@@ -399,6 +575,17 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+        Self::new_with_client(config, http).await
+    }
+
+    async fn new_with_client(config: &OidcConfig, http: Client) -> Result<Self, String> {
         if config.jwks_ttl_secs == 0 {
             return Err(
                 "jwks_ttl_secs must be greater than zero (0 would refresh on every request and \
@@ -407,27 +594,35 @@ impl JwksCache {
             );
         }
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let http = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+        let issuer_url = validate_oidc_url(
+            &config.issuer,
+            "OIDC issuer",
+            config.dangerously_allow_insecure_http,
+        )?;
+        if issuer_url.query().is_some() || issuer_url.fragment().is_some() {
+            return Err("OIDC issuer must not include a query or fragment".to_string());
+        }
+        // Validate every configured exception at startup, even when the
+        // discovery document ultimately uses the issuer origin.
+        for allowed in &config.jwks_allowed_origins {
+            validate_jwks_origin(allowed, config.dangerously_allow_insecure_http)?;
+        }
 
         // Discover JWKS URI from the OIDC discovery endpoint.
-        let discovery_url = format!(
+        let discovery_url = url::Url::parse(&format!(
             "{}/.well-known/openid-configuration",
             config.issuer.trim_end_matches('/')
-        );
+        ))
+        .map_err(|error| format!("failed to construct OIDC discovery URL: {error}"))?;
         info!(url = %discovery_url, "Discovering OIDC configuration");
 
-        let discovery: OidcDiscovery = http
-            .get(&discovery_url)
-            .send()
-            .await
-            .map_err(|e| format!("OIDC discovery request failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("OIDC discovery response parse failed: {e}"))?;
+        let discovery: OidcDiscovery = fetch_bounded_json(
+            &http,
+            &discovery_url,
+            "OIDC discovery",
+            OIDC_DISCOVERY_MAX_BYTES,
+        )
+        .await?;
 
         // Validate the discovery document's issuer matches our configured issuer.
         let expected = config.issuer.trim_end_matches('/');
@@ -438,11 +633,13 @@ impl JwksCache {
             ));
         }
 
-        info!(jwks_uri = %discovery.jwks_uri, "OIDC JWKS URI discovered");
+        let jwks_uri = validate_jwks_url(&discovery.jwks_uri, &issuer_url, config)?;
+
+        info!(jwks_uri = %jwks_uri, "OIDC JWKS URI discovered");
 
         let cache = Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
-            jwks_uri: discovery.jwks_uri,
+            jwks_uri: jwks_uri.to_string(),
             ttl: Duration::from_secs(config.jwks_ttl_secs),
             last_refresh: Arc::new(RwLock::new(
                 Instant::now()
@@ -474,15 +671,10 @@ impl JwksCache {
     async fn refresh_keys(&self) -> Result<(), String> {
         debug!(uri = %self.jwks_uri, "Refreshing JWKS keys");
 
-        let jwk_set: JwkSet = self
-            .http
-            .get(&self.jwks_uri)
-            .send()
-            .await
-            .map_err(|e| format!("JWKS fetch failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("JWKS parse failed: {e}"))?;
+        let jwks_uri = url::Url::parse(&self.jwks_uri)
+            .map_err(|error| format!("cached JWKS URI became invalid: {error}"))?;
+        let jwk_set: JwkSet =
+            fetch_bounded_json(&self.http, &jwks_uri, "JWKS", JWKS_MAX_BYTES).await?;
 
         let mut new_keys = HashMap::new();
         let mut poisoned_kids = HashSet::new();
@@ -716,6 +908,292 @@ impl Authenticator for OidcAuthenticator {
 mod tests {
     use super::*;
 
+    fn transport_test_config(issuer: impl Into<String>) -> OidcConfig {
+        OidcConfig {
+            issuer: issuer.into(),
+            dangerously_allow_insecure_http: false,
+            jwks_allowed_origins: Vec::new(),
+            audience: "test-audience".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "roles".to_string(),
+            admin_role: "admin".to_string(),
+            user_role: "user".to_string(),
+            scopes_claim: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_http_issuer_without_development_acknowledgement() {
+        let error = JwksCache::new(&transport_test_config("http://127.0.0.1:9/issuer"))
+            .await
+            .expect_err("cleartext issuers must fail before discovery");
+
+        assert!(
+            error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_non_loopback_http_even_when_acknowledged() {
+        let mut config = transport_test_config("http://192.0.2.1/issuer");
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("the escape hatch must remain limited to numeric loopback");
+
+        assert!(
+            error.contains("only with a numeric loopback"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn oidc_rejects_http_jwks_from_https_discovery() {
+        let issuer = url::Url::parse("https://idp.example.com/issuer").unwrap();
+        let config = transport_test_config(issuer.as_str());
+
+        let error = validate_jwks_url("http://idp.example.com/jwks", &issuer, &config)
+            .expect_err("HTTPS discovery must not establish an HTTP trust root");
+
+        assert!(
+            error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn oidc_rejects_cross_origin_jwks_unless_origin_is_allowlisted() {
+        let issuer = url::Url::parse("https://accounts.example.com/issuer").unwrap();
+        let mut config = transport_test_config(issuer.as_str());
+        let jwks = "https://keys.example.com/oauth/jwks";
+
+        let error = validate_jwks_url(jwks, &issuer, &config)
+            .expect_err("untrusted cross-origin JWKS must be rejected");
+        assert!(
+            error.contains("does not match issuer origin"),
+            "unexpected error: {error}"
+        );
+
+        config.jwks_allowed_origins = vec!["https://keys.example.com".to_string()];
+        assert_eq!(
+            validate_jwks_url(jwks, &issuer, &config)
+                .expect("an explicitly trusted origin should be accepted")
+                .as_str(),
+            jwks
+        );
+    }
+
+    #[test]
+    fn oidc_json_content_types_are_strict() {
+        use reqwest::header::HeaderValue;
+
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/json; charset=utf-8"
+        )));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/jwk-set+json"
+        )));
+        assert!(!is_json_content_type(&HeaderValue::from_static(
+            "text/html"
+        )));
+    }
+
+    #[tokio::test]
+    async fn oidc_loads_discovery_and_jwks_from_tls_idp_with_rotated_local_ca() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let old_ca_key = KeyPair::generate().unwrap();
+        let old_ca_cert = old_ca_params.self_signed(&old_ca_key).unwrap();
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let issuer = format!("https://localhost:{port}/issuer");
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks"),
+        })
+        .to_string();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kid": TEST_KID,
+                "kty": "RSA",
+                "n": TEST_RSA_KEY.modulus_b64,
+                "e": TEST_RSA_KEY.exponent_b64,
+            }],
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let mut responses_served = 0;
+            while responses_served < 2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    // A client with the retired CA aborts the TLS handshake.
+                    continue;
+                };
+                responses_served += 1;
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let body = if request.starts_with("GET /issuer/.well-known/openid-configuration ") {
+                    &discovery
+                } else if request.starts_with("GET /issuer/jwks ") {
+                    &jwks
+                } else {
+                    panic!("unexpected TLS IdP request: {request}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let old_client = Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(old_ca_cert.pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        old_client
+            .get(format!("{issuer}/.well-known/openid-configuration"))
+            .send()
+            .await
+            .expect_err("a client retaining only the retired CA must reject the IdP");
+
+        // Initialization succeeds after the client receives the rotated trust
+        // anchor, and both discovery and JWKS stay on the authenticated channel.
+        let client = Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let config = transport_test_config(issuer.clone());
+        let cache = JwksCache::new_with_client(&config, client)
+            .await
+            .expect("TLS discovery and JWKS should accept the rotated CA");
+
+        let token = mint_rs256(
+            &claims_for(&issuer, "test-audience", now_secs() + 3600),
+            TEST_KID,
+        );
+        cache
+            .validate_token(&token)
+            .await
+            .expect("the key loaded over TLS should validate tokens");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_redirected_discovery() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(302).append_header("location", "http://127.0.0.1:9"),
+            )
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("redirects must not move OIDC trust establishment");
+
+        assert!(
+            error.contains("HTTP 302"),
+            "unexpected redirect error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_oversized_discovery_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b' '; OIDC_DISCOVERY_MAX_BYTES + 1], "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("oversized metadata must be rejected before parsing");
+
+        assert!(
+            error.contains("exceeds the 65536-byte limit"),
+            "unexpected size error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_non_json_discovery_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "text/html"))
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("metadata with an unsafe media type must be rejected");
+
+        assert!(error.contains("content type"), "unexpected error: {error}");
+    }
+
     #[test]
     fn health_is_unauthenticated() {
         assert!(is_unauthenticated_method("/openshell.v1.OpenShell/Health"));
@@ -946,6 +1424,8 @@ mod tests {
 
         JwksCache::new(&OidcConfig {
             issuer,
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
             audience: TEST_AUDIENCE.to_owned(),
             jwks_ttl_secs: 3600,
             roles_claim: "realm_access.roles".to_owned(),
@@ -1283,6 +1763,8 @@ mod tests {
         fn test_oidc_config(issuer: &str) -> OidcConfig {
             OidcConfig {
                 issuer: issuer.to_string(),
+                dangerously_allow_insecure_http: true,
+                jwks_allowed_origins: Vec::new(),
                 audience: "test-audience".to_string(),
                 jwks_ttl_secs: 3600,
                 roles_claim: "roles".to_string(),

@@ -256,15 +256,19 @@ Key Helm values:
 
 ### Keycloak OIDC
 
-One-time setup — only needed once per cluster lifetime:
+Initial setup — rerun it whenever you want to rotate the development CA:
 
 ```bash
 mise run keycloak:k8s:setup
 ```
 
 This deploys Keycloak (`quay.io/keycloak/keycloak:24.0`) into the `keycloak` namespace,
-imports the openshell realm from `scripts/keycloak-realm.json`, and prints a port-forward
-command for acquiring tokens from the CLI.
+imports the openshell realm from `scripts/keycloak-realm.json`, generates a short-lived
+development TLS certificate, and publishes its trust anchor as the
+`openshell-keycloak-ca` ConfigMap in the OpenShell namespace. The command prints a
+port-forward command for acquiring tokens from the CLI. Rerunning setup rotates the
+development certificate and trust anchor; redeploy the gateway afterward so it reloads
+the mounted CA bundle.
 
 Then activate OIDC in the OpenShell Helm chart:
 1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
@@ -355,4 +359,4 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
-| `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy + realm import |
+| `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |

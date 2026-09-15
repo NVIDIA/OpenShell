@@ -544,10 +544,13 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state
+    let mut sandbox = state
         .compute
         .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
         .await?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
 
     info!(
         sandbox_id = %id,
@@ -715,7 +718,10 @@ pub(super) async fn handle_get_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
-    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let mut sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -766,12 +772,17 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
-    let page = state
+    let mut page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    // Project only the selected page so observation authority cannot change
+    // the store's ordering or continuation cursor.
+    for sandbox in &mut page.messages {
+        state.supervisor_sessions.project_endpoint_status(sandbox);
+    }
     Ok(Response::new(ListSandboxesResponse {
         sandboxes: page.messages,
         next_page_token,
@@ -1179,7 +1190,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached = Arc::new(AtomicBool::new(false));
     let attached_clone = attached.clone();
 
-    let sandbox = state
+    let mut sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1201,6 +1212,9 @@ pub(super) async fn handle_attach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
 
     let attached = attached.load(Ordering::Relaxed);
 
@@ -1278,7 +1292,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached = Arc::new(AtomicBool::new(false));
     let detached_clone = detached.clone();
 
-    let sandbox = state
+    let mut sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1300,6 +1314,9 @@ pub(super) async fn handle_detach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
 
     let detached = detached.load(Ordering::Relaxed);
 
@@ -1402,7 +1419,10 @@ async fn handle_stop_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    let mut sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -1446,7 +1466,10 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    let mut sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox);
     info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -1599,7 +1622,10 @@ pub(super) async fn handle_watch_sandbox(
 
             // Re-read the snapshot now that we have subscriptions active.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                Ok(Some(sandbox)) => {
+                Ok(Some(mut sandbox)) => {
+                    state
+                        .supervisor_sessions
+                        .project_endpoint_status(&mut sandbox);
                     state.sandbox_index.update_from_sandbox(&sandbox);
                     let _ = tx
                         .send(Ok(SandboxStreamEvent {
@@ -1853,7 +1879,10 @@ pub(super) async fn handle_watch_sandbox(
                         match res {
                             Ok(()) => {
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                    Ok(Some(sandbox)) => {
+                                    Ok(Some(mut sandbox)) => {
+                                        state
+                                            .supervisor_sessions
+                                            .project_endpoint_status(&mut sandbox);
                                         state.sandbox_index.update_from_sandbox(&sandbox);
                                         if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())), cursor: String::new() })).await.is_err() {
                                             return;
@@ -7336,6 +7365,110 @@ mod tests {
         assert_eq!(
             final_sandbox.metadata.as_ref().unwrap().resource_version,
             initial_version + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sandboxes_projects_endpoint_status_across_pages() {
+        use openshell_core::proto::{EndpointResult, EndpointStatus};
+
+        let state = test_server_state().await;
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:v1:tools".to_string(),
+            host: "tools.example.com".to_string(),
+            ports: vec![443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_at: "2026-09-15T01:00:00.000Z".to_string(),
+        };
+        for name in ["alpha", "beta", "gamma"] {
+            let mut sandbox = test_sandbox(name, Vec::new());
+            sandbox
+                .status
+                .as_mut()
+                .expect("sandbox status")
+                .endpoint_statuses = vec![endpoint.clone()];
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+
+        // Only alpha has a live observation authority; the other persisted
+        // results must be reset in responses, including on the second page.
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "sandbox-alpha".to_string(),
+            "session-alpha".to_string(),
+            session_tx,
+            shutdown_tx,
+        );
+        assert!(
+            state
+                .supervisor_sessions
+                .initialize_endpoint_status_authority("sandbox-alpha", "session-alpha")
+        );
+
+        let request = ListSandboxesRequest {
+            page_size: 2,
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        };
+        let first_page = handle_list_sandboxes(&state, authed_request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            first_page
+                .sandboxes
+                .iter()
+                .map(ObjectName::object_name)
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert!(!first_page.next_page_token.is_empty());
+        let second_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                page_token: first_page.next_page_token,
+                ..request
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(second_page.sandboxes.len(), 1);
+        assert_eq!(second_page.sandboxes[0].object_name(), "gamma");
+        assert!(second_page.next_page_token.is_empty());
+
+        let unknown = EndpointStatus {
+            last_result: EndpointResult::NoObservedExchange as i32,
+            last_reported_at: String::new(),
+            ..endpoint.clone()
+        };
+        for (sandbox, expected_endpoint) in [
+            (&first_page.sandboxes[0], &endpoint),
+            (&first_page.sandboxes[1], &unknown),
+            (&second_page.sandboxes[0], &unknown),
+        ] {
+            let status = sandbox.status.as_ref().expect("sandbox status");
+            assert_eq!(status.phase, SandboxPhase::Ready as i32);
+            assert_eq!(
+                status.endpoint_statuses.as_slice(),
+                std::slice::from_ref(expected_endpoint)
+            );
+        }
+        // Read-time projection must not erase persisted reports.
+        let persisted = state
+            .store
+            .get_message::<Sandbox>("sandbox-gamma")
+            .await
+            .unwrap()
+            .expect("persisted sandbox");
+        assert_eq!(
+            persisted
+                .status
+                .expect("persisted status")
+                .endpoint_statuses,
+            [endpoint]
         );
     }
 
