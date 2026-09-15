@@ -69,6 +69,11 @@ through the chart's supported environment-variable, file, or volume wiring.
 The gateway's normal precedence still applies: CLI flags and `OPENSHELL_*`
 environment variables override the mounted TOML file.
 
+The chart rejects the gateway's `database_url` file field and unambiguous
+inline credential or PEM private-key strings before rendering a ConfigMap.
+It validates Secret references as Kubernetes Secret names, but never reads or
+copies referenced Secret data into `gateway.toml`.
+
 The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
 are omitted; `null` array members are rejected because TOML has no equivalent.
 Strings, booleans, integers, and floats preserve their types. Scalar arrays

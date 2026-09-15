@@ -22,7 +22,14 @@ field must not require a Helm template change.
 {{- $root := index . 0 -}}
 {{- $value := index . 1 -}}
 {{- if kindIs "string" $value -}}
-{{- tpl $value $root | quote -}}
+{{- $rendered := tpl $value $root -}}
+{{- if regexMatch "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" $rendered -}}
+{{- fail "gatewayConfig must not contain an inline private key; provide it through a Secret-backed file mount" -}}
+{{- end -}}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@" $rendered -}}
+{{- fail "gatewayConfig must not contain inline URL credentials; provide them through a Secret-backed environment variable, file, or volume" -}}
+{{- end -}}
+{{- $rendered | quote -}}
 {{- else if or
     (kindIs "bool" $value)
     (kindIs "int" $value)
@@ -51,6 +58,9 @@ field must not require a Helm template change.
 {{- range $key := keys $table | sortAlpha -}}
 {{- $value := get $table $key -}}
 {{- if ne $value nil -}}
+{{- if eq $key "database_url" -}}
+{{- fail "gatewayConfig must not contain database_url; provide database credentials through the chart's Secret-backed OPENSHELL_DB_URL environment variable" -}}
+{{- end -}}
 {{- $entry := printf "%s = %s" (include "openshell.toml.key" $key) (include "openshell.toml.value" (list $root $value)) -}}
 {{- $entries = append $entries $entry -}}
 {{- end -}}
@@ -107,6 +117,9 @@ field must not require a Helm template change.
 {{- range $fieldName := keys $fields | sortAlpha }}
 {{- $value := get $fields $fieldName -}}
 {{- if ne $value nil }}
+{{- if eq $fieldName "database_url" -}}
+{{- fail "gatewayConfig must not contain database_url; provide database credentials through the chart's Secret-backed OPENSHELL_DB_URL environment variable" -}}
+{{- end -}}
 {{ printf "%s = %s\n" (include "openshell.toml.key" $fieldName) (include "openshell.toml.value" (list $root $value)) }}
 {{- end }}
 {{- end }}
