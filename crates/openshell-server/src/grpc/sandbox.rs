@@ -4287,7 +4287,11 @@ mod tests {
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    policy: Some(mcp_policy_with_versions(&[
+                        "2026-07-28",
+                        "2025-11-25",
+                        "2025-03-26",
+                    ])),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4315,7 +4319,7 @@ mod tests {
             .as_ref()
             .expect("MCP options")
             .versions;
-        assert_eq!(versions, &["2025-03-26", "2025-11-25"]);
+        assert_eq!(versions, &["2025-03-26", "2025-11-25", "2026-07-28"]);
     }
 
     #[tokio::test]
@@ -4502,7 +4506,7 @@ mod tests {
         let state = test_server_state().await;
         let cases: &[(&str, &[&str])] = &[
             ("mcp-duplicate-versions", &["2025-11-25", "2025-11-25"]),
-            ("mcp-unsupported-version", &["2026-07-28"]),
+            ("mcp-unsupported-version", &["2026-07-29"]),
         ];
 
         for &(sandbox_name, versions) in cases {

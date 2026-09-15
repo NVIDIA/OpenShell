@@ -4148,6 +4148,7 @@ where
         crate::l7::rest::RelayRequestOptions {
             resolver: options.secret_resolver,
             body_classifier: options.body_classifier,
+            mcp_request_validation: None,
             credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
@@ -4815,21 +4816,20 @@ async fn handle_forward_proxy(
                     crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
                 )
             };
-            // Forward HTTP shares the MCP transport gate with CONNECT before
-            // method authorization. Borrow the buffered request so checking
-            // the version does not copy the inspected body.
-            if !crate::l7::relay::enforce_mcp_protocol_version(
+            // Policy evaluation must use the selected revision's inspection,
+            // including method classification, just as the CONNECT relays do.
+            let Some(info) = crate::l7::relay::enforce_mcp_protocol_version(
                 &l7_config.config,
                 &jsonrpc_request,
-                &info,
+                info,
                 client,
                 &l7_ctx,
                 &telemetry_path,
             )
             .await?
-            {
+            else {
                 return Ok(());
-            }
+            };
             forward_request_bytes = jsonrpc_request.raw_header;
             Some(info)
         } else {
@@ -6008,14 +6008,38 @@ network_policies: {}
             return;
         };
 
-        for (body, version_header) in [
+        // Every case uses the complete forwarding and middleware path. Sessionless
+        // requests carry their own metadata, and subscription responses retain SSE bytes.
+        for (body, mcp_headers, response_content_type, response_body) in [
             (
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
                 "",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}"#,
             ),
             (
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
                 "MCP-Protocol-Version: 2025-11-25\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":3,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":3,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: echo\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"hello"}]}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n",
+                "text/event-stream",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
             ),
         ] {
             let upstream_listener = TcpListener::bind((upstream_ip, 0))
@@ -6039,12 +6063,20 @@ network_policies:
         port: {upstream_port}
         path: /mcp
         protocol: mcp
+        mcp_versions: ["2025-11-25", "2026-07-28"]
         enforcement: enforce
         rules:
           - allow:
               method: initialize
           - allow:
               method: tools/list
+          - allow:
+              method: server/discover
+          - allow:
+              method: tools/call
+              tool: echo
+          - allow:
+              method: subscriptions/listen
     binaries:
       - {{ path: "{executable}" }}
 "#,
@@ -6082,12 +6114,11 @@ network_policies:
                         break;
                     }
                 }
-                socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    )
-                    .await
-                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8(request).expect("UTF-8 MCP request")
             });
             let proxy_listener = TcpListener::bind("127.0.0.1:0")
@@ -6096,7 +6127,7 @@ network_policies:
             let proxy_address = proxy_listener.local_addr().unwrap();
             let target = format!("http://{upstream_ip}:{upstream_port}/mcp");
             let request = format!(
-                "POST {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nContent-Type: application/json\r\n{version_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{mcp_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
             );
             let client = tokio::spawn(async move {
@@ -6116,7 +6147,7 @@ network_policies:
                 ProxyIdentityMode::static_binary(executable.clone()).expect("hash test executable"),
             );
 
-            tokio::time::timeout(
+            Box::pin(tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 handle_forward_proxy(
                     "POST",
@@ -6135,7 +6166,7 @@ network_policies:
                     None,
                     None,
                 ),
-            )
+            ))
             .await
             .expect("MCP forwarding should complete")
             .expect("handle valid MCP request");
@@ -6143,16 +6174,33 @@ network_policies:
 
             let response = client.await.expect("join MCP client");
             assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            let response_header_end = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|end| end + 4)
+                .expect("response has HTTP headers");
+            assert_eq!(
+                &response[response_header_end..],
+                response_body.as_bytes(),
+                "MCP response bytes must reach the client unchanged"
+            );
+            let response_headers = std::str::from_utf8(&response[..response_header_end])
+                .expect("UTF-8 response headers");
+            assert!(
+                response_headers.contains(&format!("Content-Type: {response_content_type}\r\n"))
+            );
             let forwarded = upstream.await.expect("join MCP upstream");
             assert!(forwarded.starts_with("POST /mcp HTTP/1.1\r\n"));
-            if version_header.is_empty() {
+            if mcp_headers.is_empty() {
                 assert!(
                     !forwarded
                         .to_ascii_lowercase()
                         .contains("mcp-protocol-version:")
                 );
             } else {
-                assert!(forwarded.contains(version_header));
+                for header in mcp_headers.lines() {
+                    assert!(forwarded.contains(header), "missing forwarded {header}");
+                }
             }
         }
     }
@@ -6229,7 +6277,7 @@ network_policies:
         });
         let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
-        tokio::time::timeout(
+        Box::pin(tokio::time::timeout(
             std::time::Duration::from_secs(30),
             handle_forward_proxy(
                 "GET",
@@ -6250,7 +6298,7 @@ network_policies:
                 None,
                 None,
             ),
-        )
+        ))
         .await
         .expect("denied preflight must complete without an upstream response")
         .expect("handle denied plaintext WebSocket upgrade");
@@ -7267,6 +7315,8 @@ network_policies:
                 is_batch: false,
                 receive_stream: false,
                 has_response: true,
+                mcp_revision: None,
+                mcp_http_metadata: None,
                 error: None,
             }),
         };

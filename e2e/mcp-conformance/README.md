@@ -35,7 +35,11 @@ bridge at `host.openshell.internal` (the alias `e2e/with-docker-gateway.sh`
 attaches to the CI job container on the e2e network), at `host.docker.internal`
 on local Docker Desktop, or via `--add-host ...:host-gateway` on local Linux.
 
-The generated policy uses `protocol: mcp`, inserts the conformance runner's spec revision into the endpoint allowlist, and sets `mcp.allow_all_known_mcp_methods: true` so omitted rule methods use the endpoint MCP method profile. OpenShell enforces that allowlist on each non-initialize request using `MCP-Protocol-Version`, with `2025-03-26` as the missing-header fallback. The conformance runner selects the revision used by its client and server; OpenShell's request-version check does not yet provide complete revision-specific message parsing or response validation. The policy keeps OpenShell deny-by-default at the network boundary while allowing the upstream scenarios to exercise MCP behavior. The policy body lives in `policy-template.yaml`; the wrapper renders its MCP revision, host, port, and path placeholders from the upstream server URL.
+The generated policy uses `protocol: mcp`, inserts the conformance runner's spec revision into the endpoint allowlist, and sets `mcp.allow_all_known_mcp_methods: true` so omitted rule methods use the selected MCP method profile. The renderer accepts OpenShell's supported revisions, `2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`. The policy body lives in `policy-template.yaml`; the wrapper renders its MCP revision, host, port, and path placeholders from the upstream server URL.
+
+OpenShell checks each request against the policy revision and delegates JSON-RPC structure and MCP method, direction, message-kind, parameter, and metadata type checks to `tower-mcp-types`, pinned to `0.22.2`. These checks follow Tower's deserialization and inspection APIs and do not establish complete JSON-schema conformance. OpenShell owns revision allowlisting, HTTP/body consistency, request limits, and policy enforcement. For the 2025 revisions, a valid standalone `initialize` proposes a version; later requests select their revision through `MCP-Protocol-Version`, with `2025-03-26` as the missing-header fallback. The sessionless `2026-07-28` profile carries one JSON-RPC request or explicitly allowed extension notification per POST. Requests require per-request metadata and matching protocol-version, method, and applicable name headers. Extension notifications require an exact method allow rule and the version header, but no request metadata or method/name mirrors. Responses and SSE payloads are relayed without policy parsing. The conformance runner and its reference client exercise behavior beyond these request inspection checks.
+
+`OPENSHELL_MCP_CONFORMANCE_SPEC_VERSION` defaults to `2025-11-25`. The default scenarios in `e2e/mcp-conformance.sh` are `initialize`, `tools_call`, and `elicitation-sep1034-client-defaults`, selected for the pinned upstream fixture and this default revision. A passing default run does not establish `2026-07-28` conformance coverage. To exercise that revision through this harness, select an upstream fixture and scenario handlers that implement its sessionless request contract, then set the spec version and scenario list together.
 
 For local runs, the wrapper builds `openshell/supervisor:dev` automatically
 when no supervisor image override is set. Set `OPENSHELL_DOCKER_SUPERVISOR_IMAGE`
@@ -64,14 +68,6 @@ docker run --rm openshell-mcp-conformance-client:local \
   ./node_modules/.bin/tsx src/index.ts list --client --spec-version 2025-11-25
 ```
 
-Then confirm each scenario has a compatible handler in the pinned
-`examples/clients/typescript/everything-client.ts`. The default list skips
-opt-in scenarios, including auth/OAuth flows and the slow `sse-retry` scenario.
-Set `OPENSHELL_MCP_CONFORMANCE_SCENARIOS=sse-retry` or pass `sse-retry` as an
-argument to run it explicitly.
+Then confirm each scenario has a compatible handler in the pinned `examples/clients/typescript/everything-client.ts`. The default list skips opt-in scenarios, including auth/OAuth flows and the slow `sse-retry` scenario. Set `OPENSHELL_MCP_CONFORMANCE_SCENARIOS` to `sse-retry` or pass `sse-retry` as an argument to run it explicitly.
 
-The wrapper caches the pinned upstream checkout, the local conformance runner
-build, and the Docker client image. Set
-`OPENSHELL_MCP_CONFORMANCE_FORCE_REBUILD=1` to refresh those build artifacts, or
-`OPENSHELL_MCP_CONFORMANCE_DOCKER_PULL=1` to pull the client image base during a
-rebuild.
+The wrapper caches the pinned upstream checkout, the local conformance runner build, and the Docker client image. Set `OPENSHELL_MCP_CONFORMANCE_FORCE_REBUILD` to `1` to refresh those build artifacts, or `OPENSHELL_MCP_CONFORMANCE_DOCKER_PULL` to `1` to pull the client image base during a rebuild.
