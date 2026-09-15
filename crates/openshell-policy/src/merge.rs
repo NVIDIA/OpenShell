@@ -2895,6 +2895,8 @@ mod tests {
         for versions in [
             &["2025-03-26"][..],
             &["2025-03-26", DEFAULT_MCP_VERSION][..],
+            &["2026-07-28"][..],
+            &[DEFAULT_MCP_VERSION, "2026-07-28"][..],
         ] {
             let existing = rule_with_authorizations(
                 "existing",
@@ -2940,6 +2942,7 @@ mod tests {
         let existing = rule_with_authorizations(
             "existing",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -2951,6 +2954,7 @@ mod tests {
             vec![mcp_endpoint_with_versions(&[
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
                 "2025-03-26",
             ])],
             &["/usr/bin/new"],
@@ -2973,7 +2977,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -2984,6 +2988,7 @@ mod tests {
             rule_with_authorizations(
                 "mcp",
                 vec![mcp_endpoint_with_versions(&[
+                    "2026-07-28",
                     "2025-11-25",
                     "2025-03-26",
                     "2025-06-18",
@@ -3001,7 +3006,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3013,6 +3018,7 @@ mod tests {
                 "2025-03-26",
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
             ])],
             &["/usr/bin/client"],
         );
@@ -3027,6 +3033,7 @@ mod tests {
         let equivalent = rule_with_authorizations(
             "proposed",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
