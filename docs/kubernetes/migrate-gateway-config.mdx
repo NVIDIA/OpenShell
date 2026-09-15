@@ -1,0 +1,65 @@
+# Migrate Helm gateway configuration to `gatewayConfig`
+
+Chart schema v2 replaces application-specific Helm values with one non-secret
+`gatewayConfig` map. Its top-level keys are TOML tables; nested maps are TOML
+inline tables. Kubernetes resource references (Secrets, certificates, Services,
+and mounts) remain chart values.
+
+## Breaking upgrade
+
+Remove every application-only `server.*`, `supervisor.*`, and `upstreamProxy.*`
+setting before upgrading. There is no compatibility translation. Kubernetes pull
+policy spellings such as `Always` are not aliases: use `always`,
+`if_not_present`, or `never`. Do not put passwords, private keys, or
+`database_url` in `gatewayConfig`; use Secret-backed environment configuration.
+
+Keep `server.disableTls`, TLS Secret names, `server.externalDbSecret`,
+`server.sandboxNamespace`, `oidc.caConfigMapName`, certificate settings and
+Service settings: these own Kubernetes resources. The chart derives their
+runtime counterparts.
+
+## Mapping
+
+| Removed value | New location |
+| --- | --- |
+| `server.name`, `logLevel`, `enableLoopbackServiceHttp`, `policyValidationFailureMode` | `openshell.gateway.{name,log_level,enable_loopback_service_http,policy_validation_failure_mode}` |
+| `server.grpcRateLimit.{requests,windowSeconds}` | `openshell.gateway.{grpc_rate_limit_requests,grpc_rate_limit_window_seconds}` |
+| `server.otlp.{endpoint,serviceName}` | `openshell.gateway.otlp.{endpoint,service_name}` |
+| `server.auth.allowUnauthenticatedUsers` | `openshell.gateway.auth.allow_unauthenticated_users` |
+| `server.oidc.*` | `openshell.gateway.oidc` with snake_case keys |
+| `server.sandboxImage*`, workspace storage/runtime/AppArmor/user namespace settings | `openshell.drivers.kubernetes` |
+| `server.drivers.kubernetes.*` | `openshell.drivers.kubernetes` |
+| `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}` | `openshell.gateway.gateway_jwt` or `openshell.drivers.kubernetes.sa_token_ttl_secs` |
+| `supervisor.*` | `openshell.drivers.kubernetes` and `.sidecar` |
+| `upstreamProxy.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}` |
+| credential-driver runtime settings | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
+
+## Examples
+
+```yaml
+gatewayConfig:
+  openshell.gateway.oidc:
+    issuer: https://idp.example/realms/openshell
+    audience: openshell-cli
+    jwks_ttl_secs: 3600
+  openshell.gateway.otlp:
+    endpoint: http://otel-collector:4317
+    service_name: production-gateway
+  openshell.drivers.kubernetes:
+    default_image: registry.example/sandbox:latest
+    image_pull_policy: if_not_present
+    workspace_mode: managed
+    grpc_rate_limit_requests: null
+  openshell.gateway:
+    grpc_rate_limit_requests: 120
+    grpc_rate_limit_window_seconds: 60
+  openshell.credential_drivers.kubernetes-secrets:
+    namespace: provider-secrets
+```
+
+For Vault, set `openshell.gateway.credential_drivers: [vault]` and configure
+`openshell.credential_drivers.vault`. For a proxy, set `https_proxy` and the
+`proxy_auth_secret_name`/`proxy_auth_secret_key` references in the Kubernetes
+driver table. TLS remains Secret-backed; set `server.disableTls: true` only for
+trusted external termination. A null map field omits it; null array elements
+are invalid. Strings evaluate Helm `tpl`; other values do not.
