@@ -146,13 +146,14 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 	return result, nil
 }
 
-func (p *profileClient) Delete(ctx context.Context, workspace, id string) (bool, error) {
+func (p *profileClient) Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := p.client.DeleteProviderProfile(ctx, &pb.DeleteProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		AllowMissing: allowMissing(opts),
+		Id:           id,
+		Workspace:    workspace,
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

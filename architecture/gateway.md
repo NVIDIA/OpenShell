@@ -59,8 +59,8 @@ write conflicts attach `google.rpc.ErrorInfo` with a stable reason and current
 version when available. `google.rpc.RetryInfo` expresses a minimum retry delay;
 it does not establish that a mutation is safe to repeat. SDKs retain the original
 transport status, metadata, and unknown details alongside decoded fields.
-Python cleanup inspects the original gRPC call beneath a typed error wrapper,
-preserving missing-resource handling without suppressing other failures.
+SDK deletion waits recognize missing-resource status through typed error wrappers
+without suppressing other failures.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
@@ -367,6 +367,23 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The descriptor-derived test inventories the complete message and enum closure of the encoded durable roots and its intersection with the public RPC closure. The tables here record the reviewed roots and classifications.
+
+Public delete, membership-removal, and SSH-revocation responses use
+`DeletionOutcome`, not a transport-success boolean. `COMPLETED` establishes
+logical gateway deletion or revocation; it does not guarantee that downstream
+platform garbage collection has finished. Sandbox deletion returns `ACCEPTED`
+while its captured object ID remains in the store, and returns that ID so callers
+can distinguish the original sandbox from a same-name replacement. Identity-aware
+SDK deletion waits complete on absence or a different observed ID; name-only waits
+continue until the name is absent. The existing owned deletion worker continues
+after request cancellation.
+
+Missing targets return `NOT_FOUND` unless `allow_missing` explicitly requests
+`ALREADY_ABSENT`. Authorization, parent resolution, preconditions, and backend
+failures remain errors. Already-revoked sessions complete without another write
+after current authorization. The removed response booleans are reserved by name
+and number; this coordinated pre-1.0 API change does not alter durable schemas.
+It does not add request deduplication or identity preconditions for later retries.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|

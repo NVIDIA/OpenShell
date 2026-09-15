@@ -84,6 +84,34 @@ export interface Health {
   version: string;
 }
 
+export type DeletionOutcome = 'unspecified' | 'completed' | 'accepted' | 'already_absent' | 'unknown';
+
+export interface DeletionResult {
+  outcome: DeletionOutcome;
+  /** Original enum number, including values introduced by a newer gateway. */
+  rawOutcome: number;
+  /** Original sandbox UUID; absent if no target existed or this is not a sandbox deletion. */
+  sandboxId?: string;
+}
+
+export interface DeleteOptions extends SandboxWorkspaceOptions {
+  allowMissing?: boolean;
+}
+
+function deletionResult(response: { outcome: number; sandboxId?: string }): DeletionResult {
+  const names: Record<number, DeletionOutcome> = {
+    0: 'unspecified',
+    1: 'completed',
+    2: 'accepted',
+    3: 'already_absent',
+  };
+  return {
+    outcome: names[response.outcome] ?? 'unknown',
+    rawOutcome: response.outcome,
+    ...(response.sandboxId ? { sandboxId: response.sandboxId } : {}),
+  };
+}
+
 export interface SandboxSpec {
   name?: string;
   /** Workspace name. Omit for `default`; empty strings are invalid. */
@@ -258,6 +286,11 @@ export interface ExecInteractiveSession {
 export interface WaitOptions extends SandboxWorkspaceOptions {
   /** Abort the wait (and the in-flight poll RPC) early. */
   signal?: AbortSignal;
+}
+
+export interface WaitDeletedOptions extends WaitOptions {
+  /** Original ID from delete(). Complete on absence or a different ID; omit to wait for name absence. */
+  expectedSandboxId?: string;
 }
 
 export interface ForwardOptions extends SandboxWorkspaceOptions {
@@ -751,14 +784,15 @@ export class SandboxTemplateClient {
     return this.list(options).all();
   }
 
-  async delete(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<boolean> {
+  async delete(name: string, options?: DeleteOptions | null): Promise<DeletionResult> {
     if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
     try {
       const resp = await this.grpc.deleteSandboxTemplate({
+        allowMissing: options?.allowMissing ?? false,
         name,
         workspaceScope: workspaceScope(options),
       });
-      return resp.deleted;
+      return deletionResult(resp);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -885,10 +919,14 @@ export class SandboxClient {
     return this.list(options).all();
   }
 
-  async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {
+  async delete(name: string, options?: DeleteOptions | null): Promise<DeletionResult> {
     try {
-      const resp = await this.grpc.deleteSandbox({ name, workspaceScope: workspaceScope(options) });
-      return resp.deleted;
+      const resp = await this.grpc.deleteSandbox({
+        name,
+        workspaceScope: workspaceScope(options),
+        allowMissing: options?.allowMissing ?? false,
+      });
+      return deletionResult(resp);
     } catch (e) {
       throw fromConnect(e);
     }
@@ -923,9 +961,9 @@ export class SandboxClient {
     }
   }
 
-  // Poll until the sandbox is gone. Timeout and cancellation bound the returned
-  // promise the same way as waitReady.
-  async waitDeleted(name: string, timeoutSecs: number, options?: WaitOptions | null): Promise<void> {
+  // Poll until the sandbox is gone, or its name resolves to a different ID when
+  // expectedSandboxId is supplied. Timeout and cancellation work as in waitReady.
+  async waitDeleted(name: string, timeoutSecs: number, options?: WaitDeletedOptions | null): Promise<void> {
     const deadline = Date.now() + timeoutSecs * 1000;
     const signal = options?.signal;
     let delay = 250;
@@ -934,7 +972,8 @@ export class SandboxClient {
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
-        await this.get(name, { ...pollOptions, workspace: options?.workspace });
+        const ref = await this.get(name, { ...pollOptions, workspace: options?.workspace });
+        if (options?.expectedSandboxId !== undefined && ref.id !== options.expectedSandboxId) return;
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
         throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
@@ -1326,7 +1365,7 @@ export class SandboxClient {
       input.end();
       if (token !== undefined) {
         try {
-          await this.grpc.revokeSshSession({ token }, { signal });
+          await this.grpc.revokeSshSession({ token, allowMissing: true }, { signal });
         } catch {
           // Best-effort revoke; the token expires on its own regardless.
         }
@@ -1357,10 +1396,10 @@ export class SandboxClient {
     }
   }
 
-  async revokeSshSession(token: string): Promise<boolean> {
+  async revokeSshSession(token: string, options?: Pick<DeleteOptions, 'allowMissing'>): Promise<DeletionResult> {
     try {
-      const resp = await this.grpc.revokeSshSession({ token });
-      return resp.revoked;
+      const resp = await this.grpc.revokeSshSession({ token, allowMissing: options?.allowMissing ?? false });
+      return deletionResult(resp);
     } catch (e) {
       throw fromConnect(e);
     }

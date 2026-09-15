@@ -46,15 +46,16 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, EndpointResult, EndpointStatus, ExecSandboxRequest, ExposeServiceRequest,
-    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
-    GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
-    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
-    SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
+    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
+    ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
+    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
     exec_sandbox_event, tcp_forward_init,
@@ -1892,7 +1893,7 @@ pub async fn service_forward_tcp(
                         }
                     }
                     let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { token })
+                        .revoke_ssh_session(RevokeSshSessionRequest { allow_missing: true, token })
                         .await;
                 });
             }
@@ -2792,6 +2793,17 @@ pub async fn sandbox_template_list(
     Ok(())
 }
 
+pub(crate) fn deletion_completed(outcome: i32) -> Result<bool> {
+    use openshell_core::proto::DeletionOutcome;
+    match DeletionOutcome::try_from(outcome) {
+        Ok(DeletionOutcome::Completed) => Ok(true),
+        Ok(DeletionOutcome::AlreadyAbsent) => Ok(false),
+        _ => Err(miette!(
+            "gateway returned an unsupported deletion outcome: {outcome}"
+        )),
+    }
+}
+
 pub async fn sandbox_template_delete(
     server: &str,
     names: &[String],
@@ -2802,12 +2814,13 @@ pub async fn sandbox_template_delete(
     for name in names {
         let response = client
             .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
-        if response.into_inner().deleted {
+        if deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted sandbox template {name}", "✓".green().bold());
         } else {
             println!("Sandbox template {name} not found.");
@@ -3227,17 +3240,13 @@ pub async fn sandbox_delete(
 
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
             Ok(response) => response,
-            Err(status) if status.code() == Code::NotFound => {
-                clear_last_sandbox_if_matches(gateway, workspace, name);
-                println!("{} Sandbox {name} already deleted", "✓".green().bold());
-                continue;
-            }
             Err(status) => {
                 eprintln!(
                     "{} Failed to delete sandbox {name}: {status}",
@@ -3248,13 +3257,25 @@ pub async fn sandbox_delete(
             }
         };
 
-        let deleted = response.into_inner().deleted;
-        if deleted {
-            clear_last_sandbox_if_matches(gateway, workspace, name);
-            println!("{} Deleted sandbox {name}", "✓".green().bold());
-        } else {
-            println!("{} Sandbox {name} not found", "!".yellow());
+        match response.into_inner().outcome() {
+            DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
+            DeletionOutcome::Accepted => println!(
+                "{} Sandbox {name} deletion accepted; cleanup is pending",
+                "✓".green().bold()
+            ),
+            DeletionOutcome::AlreadyAbsent => {
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+            }
+            DeletionOutcome::Unspecified => {
+                eprintln!(
+                    "{} Unsupported deletion outcome for sandbox {name}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
         }
+        clear_last_sandbox_if_matches(gateway, workspace, name);
     }
 
     aggregate_delete_failures("sandbox", &failures)
@@ -3526,6 +3547,7 @@ pub async fn service_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_service(DeleteServiceRequest {
+            allow_missing: false,
             sandbox: sandbox.to_string(),
             service: service.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -3534,7 +3556,7 @@ pub async fn service_delete(
         .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
         .into_inner();
 
-    if !response.deleted {
+    if !deletion_completed(response.outcome)? {
         return Err(miette!("delete service failed: service endpoint not found"));
     }
 
@@ -3899,10 +3921,13 @@ pub async fn workspace_delete(server: &str, names: &[String], tls: &TlsOptions) 
     let mut client = grpc_client(server, tls).await?;
     for name in names {
         let response = client
-            .delete_workspace(DeleteWorkspaceRequest { name: name.clone() })
+            .delete_workspace(DeleteWorkspaceRequest {
+                allow_missing: false,
+                name: name.clone(),
+            })
             .await
             .into_diagnostic()?;
-        if response.into_inner().deleted {
+        if deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted workspace {name}", "✓".green().bold());
         } else {
             println!("{} Workspace {name} not found", "!".yellow());
@@ -3968,13 +3993,14 @@ pub async fn workspace_member_remove(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
+            allow_missing: true,
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    if response.into_inner().removed {
+    if deletion_completed(response.into_inner().outcome)? {
         println!(
             "{} Removed {} from workspace {}",
             "✓".green().bold(),

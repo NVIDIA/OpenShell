@@ -58,14 +58,15 @@ func (r *refreshClient) Rotate(ctx context.Context, workspace, provider, credent
 	return converter.RefreshStatusFromProto(resp.GetStatus()), nil
 }
 
-func (r *refreshClient) Delete(ctx context.Context, workspace, provider, credentialKey string) (bool, error) {
+func (r *refreshClient) Delete(ctx context.Context, workspace, provider, credentialKey string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := r.client.DeleteProviderRefresh(ctx, &pb.DeleteProviderRefreshRequest{
+		AllowMissing:   allowMissing(opts),
 		Provider:       provider,
 		CredentialKey:  credentialKey,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

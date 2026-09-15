@@ -17,6 +17,52 @@ use openshell_core::proto;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Missing targets are errors unless explicitly allowed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    pub allow_missing: bool,
+}
+
+/// A deletion acknowledgement is not necessarily completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeletionOutcome {
+    Unspecified,
+    Completed,
+    Accepted,
+    AlreadyAbsent,
+    Unknown(i32),
+}
+
+impl From<i32> for DeletionOutcome {
+    fn from(value: i32) -> Self {
+        match proto::DeletionOutcome::try_from(value) {
+            Ok(proto::DeletionOutcome::Unspecified) => Self::Unspecified,
+            Ok(proto::DeletionOutcome::Completed) => Self::Completed,
+            Ok(proto::DeletionOutcome::Accepted) => Self::Accepted,
+            Ok(proto::DeletionOutcome::AlreadyAbsent) => Self::AlreadyAbsent,
+            Err(_) => Self::Unknown(value),
+        }
+    }
+}
+
+#[test]
+fn deletion_outcomes_preserve_unknown_values() {
+    assert_eq!(DeletionOutcome::from(0), DeletionOutcome::Unspecified);
+    assert_eq!(DeletionOutcome::from(1), DeletionOutcome::Completed);
+    assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
+    assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
+    assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+/// Result for the original target, never a same-name replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionResult {
+    pub outcome: DeletionOutcome,
+    /// Present for sandbox deletions that found a target.
+    pub sandbox_id: Option<String>,
+}
+
 /// Gateway health snapshot.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
