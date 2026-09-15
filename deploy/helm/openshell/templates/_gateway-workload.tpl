@@ -9,6 +9,7 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $gatewayRuntimeConfig := get $gatewayConfig "openshell.gateway" | default dict -}}
 {{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
 {{- $kubernetesRuntimeConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
@@ -100,7 +101,7 @@ spec:
           value: /etc/openshell-tls/peer-client/tls.key
         {{- end }}
         {{- end }}
-        {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
+        {{- if not $hasExternalCredentialDriver }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
           valueFrom:
             secretKeyRef:
