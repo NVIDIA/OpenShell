@@ -77,7 +77,12 @@ seconds. Absent or invalid delay details do not produce a suggested delay.
 
 Existing error codes and human-readable messages remain available. Python curated
 clients now raise `GatewayError`, which remains a `grpc.RpcError`; existing
-`except grpc.RpcError` handlers continue to work. Rust error variants now retain
+`except grpc.RpcError` handlers continue to work. `GatewayError` is not a
+`grpc.Call`. If your handler checks that interface, inspect `raw_error` before
+checking the status, or call `GatewayError.code()` directly. Python deletion waits
+recognize `NOT_FOUND` through the wrapper; managed-sandbox cleanup requests
+`allow_missing=True` and handles the typed deletion outcome. Other failures still
+propagate. Rust error variants now retain
 status fields; use `..` when destructuring variants that do not need those fields.
 Go and TypeScript add typed detail fields to their existing error types.
 
@@ -105,6 +110,17 @@ The gateway scopes it to the authenticated identity provider, OIDC issuer,
 subject, RPC method, and requested workspace. Use the same identity, scope, ID,
 and payload when checking an admitted attempt. Map ordering does not affect the
 payload fingerprint; changed values or protobuf message presence do.
+
+For `CreateWorkspace` and `DeleteWorkspace`, the requested workspace is the
+request's `name`. The same caller can reuse an ID for the same method on different
+workspace names. Within one workspace name, a changed payload still returns
+`REQUEST_ID_PAYLOAD_MISMATCH`. Workspace deletion replay does not require the
+deleted workspace to exist and does not delete a same-name replacement.
+
+Pre-release gateways that used unscoped workspace admission require reconciliation
+before upgrading. Their workspace create/delete receipts do not replay under the
+corrected name-scoped namespace. Do not retry those IDs after upgrading without
+reconciling the original operations' effects.
 
 The gateway durably admits one owner before executing the mutation. Concurrent
 duplicates either replay its confirmed success or return
@@ -195,6 +211,19 @@ returns `COMPLETED` after authorization without changing its resource version.
 For an accepted deletion, poll or watch that identity. A same-name sandbox with a
 different ID is not the sandbox being deleted. Cancellation or a disconnected
 client does not stop the gateway's already-started deletion worker.
+
+Pass the deletion result's ID to the SDK wait helper to avoid following a
+same-name replacement.
+
+| SDK | Identity-aware deletion wait |
+|---|---|
+| Rust | `client.wait_deleted(name, timeout, result.sandbox_id.as_deref()).await?` on either the default or workspace-scoped client. |
+| Python | `client.wait_deleted(name, workspace=workspace, expected_sandbox_id=result.sandbox_id)`. Managed-sandbox cleanup supplies this automatically. |
+| TypeScript | `client.sandbox.waitDeleted(name, timeoutSecs, { workspace, expectedSandboxId: result.sandboxId })`. |
+
+These waits complete on `NOT_FOUND` or a different observed ID. Without an
+expected ID, they wait for the name to be absent. Existing Rust callers must add
+the third argument; use `None` to retain name-only behavior.
 
 `allow_missing` is not request deduplication. A later request by name can delete
 a newly created resource with that name. Do not blindly repeat a timed-out

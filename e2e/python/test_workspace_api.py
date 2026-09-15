@@ -78,6 +78,61 @@ def test_workspace_get_nonexistent_raises_not_found(
     assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
 
 
+def test_workspace_request_ids_are_scoped_to_each_target(
+    workspace_client: WorkspaceClient,
+) -> None:
+    names = [f"ws-scope-{uuid.uuid4().hex[:8]}" for _ in range(2)]
+    create_id = str(uuid.uuid4())
+    delete_id = str(uuid.uuid4())
+    stub = workspace_client._stub
+    originals = []
+    try:
+        for name in names:
+            request = openshell_pb2.CreateWorkspaceRequest(
+                name=name, request_id=create_id
+            )
+            response, call = stub.CreateWorkspace.with_call(request, timeout=20)
+            assert "openshell-replayed" not in dict(call.initial_metadata())
+            assert response.workspace.metadata.name == name
+            fetched = stub.GetWorkspace(
+                openshell_pb2.GetWorkspaceRequest(name=name), timeout=20
+            )
+            assert fetched.workspace.metadata.id == response.workspace.metadata.id
+            originals.append(response)
+        assert originals[0].workspace.metadata.id != originals[1].workspace.metadata.id
+
+        for name, original in zip(names, originals, strict=True):
+            replay, call = stub.CreateWorkspace.with_call(
+                openshell_pb2.CreateWorkspaceRequest(name=name, request_id=create_id),
+                timeout=20,
+            )
+            assert replay == original
+            assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+
+        for name in names:
+            request = openshell_pb2.DeleteWorkspaceRequest(
+                name=name, request_id=delete_id
+            )
+            response, call = stub.DeleteWorkspace.with_call(request, timeout=20)
+            assert "openshell-replayed" not in dict(call.initial_metadata())
+            assert response.outcome == openshell_pb2.DELETION_OUTCOME_COMPLETED
+            with pytest.raises(grpc.RpcError) as exc_info:
+                workspace_client.get(name)
+            assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+        for name in names:
+            replay, call = stub.DeleteWorkspace.with_call(
+                openshell_pb2.DeleteWorkspaceRequest(name=name, request_id=delete_id),
+                timeout=20,
+            )
+            assert replay.outcome == openshell_pb2.DELETION_OUTCOME_COMPLETED
+            assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+    finally:
+        for name in names:
+            with contextlib.suppress(Exception):
+                workspace_client.delete(name, allow_missing=True)
+
+
 def test_workspace_request_id_replays_without_deleting_replacement(
     workspace_client: WorkspaceClient,
 ) -> None:
@@ -109,7 +164,9 @@ def test_workspace_request_id_replays_without_deleting_replacement(
         )
         assert replacement.workspace.metadata.id != original.workspace.metadata.id
         assert stub.DeleteWorkspace(delete, timeout=20) == removed
-        fetched = stub.GetWorkspace(openshell_pb2.GetWorkspaceRequest(name=name), timeout=20)
+        fetched = stub.GetWorkspace(
+            openshell_pb2.GetWorkspaceRequest(name=name), timeout=20
+        )
         assert fetched.workspace.metadata.id == replacement.workspace.metadata.id
     finally:
         with contextlib.suppress(Exception):

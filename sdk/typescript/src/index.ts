@@ -46,6 +46,7 @@ export type {
   SettingValue,
   SshSession,
   UpdateConfigResult,
+  WaitDeletedOptions,
   WaitOptions,
   WorkspaceListScope,
 } from './client.js';
