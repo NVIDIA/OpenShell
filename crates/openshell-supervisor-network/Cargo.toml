@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
+openshell-crypto = { path = "../openshell-crypto" }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }

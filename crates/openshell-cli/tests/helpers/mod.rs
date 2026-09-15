@@ -125,7 +125,7 @@ pub use environment::{Environment, FixtureDir as TempDir, fixture_dir as tempdir
 /// Generate a self-signed CA certificate and its key pair.
 #[allow(dead_code)]
 pub fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
+    let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let cert = params.self_signed(&key_pair).unwrap();
@@ -137,7 +137,7 @@ pub fn build_ca() -> (Certificate, KeyPair) {
 /// Returns `(cert_pem, key_pem)`.
 #[allow(dead_code)]
 pub fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
+    let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
@@ -149,7 +149,7 @@ pub fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String)
 /// Returns `(cert_pem, key_pem)`.
 #[allow(dead_code)]
 pub fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
+    let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();

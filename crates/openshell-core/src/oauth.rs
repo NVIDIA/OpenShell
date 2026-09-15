@@ -52,7 +52,7 @@ impl TokenGrantClient {
     fn builder() -> reqwest::ClientBuilder {
         // A process may already have installed this provider. Installation is
         // idempotent for this caller and never relaxes peer authentication.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(30))

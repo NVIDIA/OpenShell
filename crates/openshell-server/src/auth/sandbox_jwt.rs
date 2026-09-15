@@ -16,7 +16,8 @@ use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header};
+use openshell_crypto::jwt::encode;
 pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,

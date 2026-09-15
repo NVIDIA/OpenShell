@@ -16,7 +16,6 @@ use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, SeverityId, StateId, StatusId};
 use rustls::ServerConfig;
-use rustls::crypto::aws_lc_rs::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -314,7 +313,7 @@ impl std::fmt::Debug for DualCertResolver {
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let signing_key = sign::any_supported_type(&key)
+    let signing_key = openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
@@ -377,7 +376,7 @@ fn build_server_config(
 
     // Validate the key type early — rustls defers this to handshake time,
     // which produces a cryptic error. A bad key type surfaces clearly here.
-    sign::any_supported_type(&key)
+    openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
 
     let resolver = build_cert_resolver(
@@ -487,7 +486,8 @@ mod tests {
     fn generate_server_cert(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, dir: &Path) {
         let server_params = CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
+        let server_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
         let server_cert = server_params
             .signed_by(&server_key, ca_cert, ca_key)
             .expect("failed to sign server cert");
@@ -900,7 +900,8 @@ mod tests {
         new_ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "new-ca");
-        let new_ca_key = KeyPair::generate().expect("failed to generate new CA key");
+        let new_ca_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate new CA key");
         let new_ca_cert = new_ca_params
             .self_signed(&new_ca_key)
             .expect("failed to sign new CA cert");
@@ -914,7 +915,8 @@ mod tests {
             .expect("reload with new CA should succeed");
 
         // Generate client cert signed by new CA, write to files
-        let client_key = KeyPair::generate().expect("failed to generate client key");
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate client key");
         let mut client_params =
             CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
         client_params
@@ -981,7 +983,8 @@ mod tests {
 
         // Verify old CA is no longer trusted: a client cert signed by the
         // initial CA should be rejected after rotation.
-        let old_client_key = KeyPair::generate().expect("failed to generate old client key");
+        let old_client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate old client key");
         let mut old_client_params = CertificateParams::new(Vec::<String>::new())
             .expect("failed to create old client params");
         old_client_params
@@ -1056,7 +1059,7 @@ mod tests {
     ) {
         let params =
             CertificateParams::new(vec![san.to_string()]).expect("failed to create cert params");
-        let key = KeyPair::generate().expect("failed to generate key");
+        let key = openshell_crypto::pki::generate_keypair().expect("failed to generate key");
         let cert = params
             .signed_by(&key, ca_cert, ca_key)
             .expect("failed to sign cert");

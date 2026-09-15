@@ -11,13 +11,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { path = "../openshell-crypto", features = ["tls-tonic"] }
 async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-policy-schema = { path = "../openshell-policy-schema" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
+tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
 tokio = { workspace = true }
