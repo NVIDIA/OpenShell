@@ -957,6 +957,7 @@ struct BoundaryClient {
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
+    mediation_open: tokio::sync::Mutex<()>,
     attach_request: std::sync::Mutex<Option<RequestEnvelope>>,
     confirm_request: std::sync::Mutex<Option<RequestEnvelope>>,
     reconnect: tokio::sync::Mutex<()>,
@@ -982,6 +983,7 @@ impl BoundaryClient {
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
+            mediation_open: tokio::sync::Mutex::new(()),
             attach_request: std::sync::Mutex::new(None),
             confirm_request: std::sync::Mutex::new(None),
             reconnect: tokio::sync::Mutex::new(()),
@@ -1352,12 +1354,18 @@ impl BoundaryClient {
     }
 
     async fn mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
-        let mut state = self.mediation.lock().await;
-        if let Some(session) = state.as_ref()
-            && session.is_healthy()
-        {
-            return Ok(session.clone());
+        if let Some(session) = self.healthy_mediation_session().await {
+            return Ok(session);
         }
+
+        // Serialize creation without holding the cached-session mutex. Opening
+        // a stream may rotate credentials or recover the physical connection;
+        // both paths clear the cache and must be free to acquire that mutex.
+        let _opening = self.mediation_open.lock().await;
+        if let Some(session) = self.healthy_mediation_session().await {
+            return Ok(session);
+        }
+
         // The boundary owns exclusive-lease retirement and bounds replacement
         // waiting. Never multiply that deadline with message-matching retries.
         let session = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -1378,8 +1386,17 @@ impl BoundaryClient {
         .map_err(|_| {
             BackendError::Unavailable("boundary mediation attach timed out".to_string())
         })??;
-        *state = Some(session.clone());
+        *self.mediation.lock().await = Some(session.clone());
         Ok(session)
+    }
+
+    async fn healthy_mediation_session(&self) -> Option<Arc<ClientMediationSession>> {
+        self.mediation
+            .lock()
+            .await
+            .as_ref()
+            .filter(|session| session.is_healthy())
+            .cloned()
     }
 
     async fn open_mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
@@ -1768,6 +1785,8 @@ mod tests {
         wait_for_half_close: bool,
         expected_token: String,
         requests: Arc<std::sync::atomic::AtomicUsize>,
+        mediation_failures: Arc<std::sync::atomic::AtomicUsize>,
+        mediation_ready: bool,
     }
 
     type TestGrpcStream = Pin<
@@ -1795,6 +1814,7 @@ mod tests {
             let mut inbound = request.into_inner();
             let wait_for_half_close = self.wait_for_half_close;
             let requests = self.requests.clone();
+            let mediation_ready = self.mediation_ready;
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -1836,6 +1856,7 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 evidence: Box::new(test_confirmation_evidence()),
                             },
+                            Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "a mediation session is already active".to_string(),
@@ -1895,6 +1916,17 @@ mod tests {
             &self,
             request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
+            if self
+                .mediation_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(tonic::Status::unavailable(
+                    "injected mediation transport failure",
+                ));
+            }
             self.exchange(request).await
         }
     }
@@ -1917,6 +1949,8 @@ mod tests {
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: requests.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1975,6 +2009,8 @@ mod tests {
                     wait_for_half_close: false,
                     expected_token: "a".repeat(32),
                     requests: server_requests.clone(),
+                    mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    mediation_ready: false,
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2015,6 +2051,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mediation_transport_failure_recovers_without_deadlocking_the_cache() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mediation_failures = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let server_config = certificate.server_config.clone();
+        let server_requests = requests.clone();
+        let server_failures = mediation_failures.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                let service = TestGrpcBoundary {
+                    wait_for_half_close: false,
+                    expected_token: "a".repeat(32),
+                    requests: server_requests.clone(),
+                    mediation_failures: server_failures.clone(),
+                    mediation_ready: true,
+                };
+                tokio::spawn(async move {
+                    tonic::transport::Server::builder()
+                        .add_service(IsolationBoundaryServer::new(service))
+                        .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
+                            TestTlsIo(Box::new(stream)),
+                        )]))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let client = BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        let attach = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            resource_claims: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(
+            client.call_idempotent(attach).await.unwrap(),
+            Response::Attached { .. }
+        ));
+        assert!(matches!(
+            client.call_idempotent(Request::Confirm).await.unwrap(),
+            Response::Confirmed { .. }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), client.mediation_session())
+            .await
+            .expect("mediation recovery must not deadlock")
+            .expect("mediation recovery must open a replacement session");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("replacement physical connection must be accepted")
+            .unwrap();
+        assert_eq!(mediation_failures.load(Ordering::Acquire), 0);
+        assert_eq!(requests.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
     async fn grpc_stream_preserves_response_after_request_half_close() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2023,6 +2124,8 @@ mod tests {
             wait_for_half_close: true,
             expected_token: "a".repeat(32),
             requests,
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2193,6 +2296,8 @@ mod tests {
             wait_for_half_close: false,
             expected_token,
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBoundaryServer::new(service))
@@ -2510,6 +2615,8 @@ mod tests {
             wait_for_half_close: false,
             expected_token: "a".repeat(32),
             requests: handled.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
         };
         let server = tokio::spawn(async move {
             loop {

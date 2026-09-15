@@ -2198,7 +2198,7 @@ impl DockerComputeDriver {
     /// the sandbox, and `Err(...)` for any Docker failure.
     #[tracing::instrument(
         name = "docker.start_sandbox",
-        skip(self),
+        skip_all,
         fields(
             otel.name = "docker.start_sandbox",
             otel.status_code = tracing::field::Empty,
