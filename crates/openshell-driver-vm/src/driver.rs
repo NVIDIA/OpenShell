@@ -10,10 +10,12 @@ use crate::lifecycle::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, remove_rootfs_image_file,
+    sandbox_guest_init_path, sandbox_guest_user_ids_from_image,
+    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
+#[cfg(test)]
+use crate::rootfs::{read_rootfs_image_file, stat_rootfs_image_file};
 use crate::runtime::VmBackend;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -31,7 +33,6 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
-use openshell_core::UpstreamProxyConfig;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -57,6 +58,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
+use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
 use openshell_vfio::SysfsRoot;
 use opentelemetry::trace::TraceContextExt as _;
 use prost::Message;
@@ -64,7 +66,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -163,6 +165,8 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
 const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+const GUEST_NETWORK_ADDITIONAL_CA_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
@@ -262,6 +266,33 @@ pub struct VmDriverConfig {
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
+    /// Gateway-owned normalized destination trust artifact path. This
+    /// internal launch input is not part of the VM driver TOML contract.
+    ///
+    /// The standalone VM driver reads this path exactly once during
+    /// construction, verifies it against the accompanying digest, and then
+    /// clears this input before accepting sandbox launches.
+    #[serde(skip)]
+    pub network_additional_ca_bundle: Option<PathBuf>,
+    /// Expected SHA-256 generation of [`Self::network_additional_ca_bundle`].
+    ///
+    /// This is intentionally delivered separately from the artifact bytes so
+    /// gateway-to-driver process startup never places CA material on argv or
+    /// in the environment.
+    #[serde(skip)]
+    pub network_additional_ca_digest: Option<String>,
+    /// Expected number of certificates in the gateway-normalized artifact.
+    #[serde(skip)]
+    pub network_additional_ca_certificate_count: Option<usize>,
+    /// Immutable startup snapshot of the gateway-owned destination trust.
+    ///
+    /// This is an internal constructor result, not a caller input. It remains
+    /// public only because the VM subprocess binary is a separate Rust crate;
+    /// [`VmDriver::new_with_extensions`] rejects caller-supplied values and
+    /// populates it after authenticating the artifact.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub network_additional_ca_snapshot: Option<NetworkSupervisorTrustBundle>,
     /// Corporate forward proxy settings delivered to the guest init script.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
@@ -315,6 +346,11 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field(
+                "network_additional_ca_bundle_configured",
+                &(self.network_additional_ca_snapshot.is_some()
+                    || self.network_additional_ca_bundle.is_some()),
+            )
             .field("gpu_enabled", &self.gpu_enabled)
             .field("gpu_mem_mib", &self.gpu_mem_mib)
             .field("gpu_vcpus", &self.gpu_vcpus)
@@ -378,6 +414,10 @@ impl Default for VmDriverConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            network_additional_ca_bundle: None,
+            network_additional_ca_digest: None,
+            network_additional_ca_certificate_count: None,
+            network_additional_ca_snapshot: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
@@ -406,6 +446,7 @@ impl VmDriverConfig {
 
     pub fn validate_runtime_security_config(&self) -> Result<(), String> {
         self.upstream_proxy.validate()?;
+        self.validate_network_additional_ca_startup_input()?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err("proxy_ca_bundle must not be empty when set".to_string());
@@ -423,6 +464,36 @@ impl VmDriverConfig {
             return Err("provider_spiffe_allow_guest_tcp is set but no provider_spiffe_workload_api_tcp_endpoint is configured".to_string());
         }
         Ok(())
+    }
+
+    /// Validate the all-or-nothing process-startup contract for destination
+    /// trust. A path without its gateway-issued identity would restore the
+    /// old mutable-path behavior, so partial inputs are always rejected.
+    fn validate_network_additional_ca_startup_input(&self) -> Result<(), String> {
+        match (
+            self.network_additional_ca_bundle.as_ref(),
+            self.network_additional_ca_digest.as_deref(),
+            self.network_additional_ca_certificate_count,
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(path), Some(digest), Some(certificate_count)) => {
+                if path.as_os_str().is_empty() {
+                    return Err("network_additional_ca_bundle must not be empty when set".to_string());
+                }
+                validate_network_additional_ca_digest(digest)?;
+                if certificate_count == 0 {
+                    return Err(
+                        "network_additional_ca_certificate_count must be greater than zero when set"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(
+                "network_additional_ca_bundle, network_additional_ca_digest, and network_additional_ca_certificate_count must be set together"
+                    .to_string(),
+            ),
+        }
     }
 
     pub fn validate_rootfs_tar_config(&self) -> Result<(), String> {
@@ -521,6 +592,210 @@ impl VmDriverConfig {
 
         Ok(Some(VmDriverTlsPaths { ca, cert, key }))
     }
+}
+
+/// Check that the gateway-provided generation has the only digest shape this
+/// child understands. The gateway currently emits lowercase SHA-256 digests;
+/// accepting another spelling would make the process-boundary contract less
+/// precise without adding any compatibility value.
+fn validate_network_additional_ca_digest(digest: &str) -> Result<(), String> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(
+            "network_additional_ca_digest must use the sha256:<64 lowercase hexadecimal characters> format"
+                .to_string(),
+        );
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(
+            "network_additional_ca_digest must use the sha256:<64 lowercase hexadecimal characters> format"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Read the gateway-owned artifact once, authenticate it, and turn it into the
+/// immutable snapshot that the driver uses for all later sandbox launches.
+///
+/// This is deliberately separate from the runtime overlay writer: after this
+/// function returns, a changed, removed, or replaced artifact path must have
+/// no effect on an already-started VM driver child.
+fn snapshot_network_additional_ca_bundle(
+    config: &VmDriverConfig,
+) -> Result<Option<NetworkSupervisorTrustBundle>, String> {
+    let startup_input = match (
+        config.network_additional_ca_bundle.as_deref(),
+        config.network_additional_ca_digest.as_deref(),
+        config.network_additional_ca_certificate_count,
+    ) {
+        (None, None, None) => return Ok(None),
+        (Some(path), Some(digest), Some(certificate_count)) => (path, digest, certificate_count),
+        _ => {
+            return Err(
+                "network_additional_ca_bundle, network_additional_ca_digest, and network_additional_ca_certificate_count must be set together"
+                    .to_string(),
+            );
+        }
+    };
+    let (path, expected_digest, expected_certificate_count) = startup_input;
+
+    if path.as_os_str().is_empty() {
+        return Err("network_additional_ca_bundle must not be empty when set".to_string());
+    }
+    validate_network_additional_ca_digest(expected_digest)?;
+    if expected_certificate_count == 0 {
+        return Err(
+            "network_additional_ca_certificate_count must be greater than zero when set"
+                .to_string(),
+        );
+    }
+
+    let normalized_pem = read_network_additional_ca_artifact(path)?;
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(&normalized_pem));
+    if actual_digest != expected_digest {
+        return Err(format!(
+            "network additional CA artifact '{}' does not match expected gateway trust digest {expected_digest}",
+            path.display()
+        ));
+    }
+
+    let actual_certificate_count = count_network_additional_ca_certificates(&normalized_pem, path)?;
+    if actual_certificate_count != expected_certificate_count {
+        return Err(format!(
+            "network additional CA artifact '{}' does not match expected gateway certificate count {expected_certificate_count}",
+            path.display()
+        ));
+    }
+
+    Ok(Some(NetworkSupervisorTrustBundle::new(
+        normalized_pem,
+        expected_certificate_count,
+        expected_digest.to_string(),
+        path.to_path_buf(),
+    )))
+}
+
+/// Read a gateway artifact through a single regular-file handle.
+///
+/// The pre-open and post-open checks, `O_NOFOLLOW`, and bounded read together
+/// ensure a path replacement cannot redirect the child to a symlink, special
+/// file, or unbounded input. The file handle is dropped before this function
+/// returns, so only normalized bytes survive child construction.
+fn read_network_additional_ca_artifact(path: &Path) -> Result<Vec<u8>, String> {
+    let limit = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "network additional CA artifact '{}' could not be read: {error}",
+            path.display()
+        )
+    })?;
+    if !path_metadata.file_type().is_file() {
+        return Err(format!(
+            "network additional CA artifact '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    if path_metadata.len() > limit as u64 {
+        return Err(format!(
+            "network additional CA artifact '{}' exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // `O_NONBLOCK` ensures a FIFO swapped in after the metadata check
+        // cannot stall child startup; the post-open regular-file check then
+        // rejects it. `O_NOFOLLOW` closes the corresponding symlink race.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        format!(
+            "network additional CA artifact '{}' could not be read: {error}",
+            path.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        format!(
+            "network additional CA artifact '{}' could not be read: {error}",
+            path.display()
+        )
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(format!(
+            "network additional CA artifact '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    if opened_metadata.len() > limit as u64 {
+        return Err(format!(
+            "network additional CA artifact '{}' exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+
+    let capacity = usize::try_from(opened_metadata.len()).map_err(|_| {
+        format!(
+            "network additional CA artifact '{}' exceeds the shared {limit}-byte limit",
+            path.display()
+        )
+    })?;
+    let mut normalized_pem = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut normalized_pem)
+        .map_err(|error| {
+            format!(
+                "network additional CA artifact '{}' could not be read: {error}",
+                path.display()
+            )
+        })?;
+    if normalized_pem.len() > limit {
+        return Err(format!(
+            "network additional CA artifact '{}' exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+    Ok(normalized_pem)
+}
+
+/// Count certificate blocks in a digest-authenticated normalized artifact.
+///
+/// The gateway's digest is the authority for the bytes. Counting separately
+/// makes the process boundary reject a mismatched metadata triple before a
+/// `NetworkSupervisorTrustBundle` is constructed.
+fn count_network_additional_ca_certificates(bytes: &[u8], path: &Path) -> Result<usize, String> {
+    let mut certificate_count = 0;
+    for item in rustls_pemfile::read_all(&mut Cursor::new(bytes)) {
+        match item.map_err(|error| {
+            format!(
+                "network additional CA artifact '{}' contains malformed PEM data: {error}",
+                path.display()
+            )
+        })? {
+            rustls_pemfile::Item::X509Certificate(_) => certificate_count += 1,
+            _ => {
+                return Err(format!(
+                    "network additional CA artifact '{}' contains a non-certificate PEM block",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if certificate_count == 0 {
+        return Err(format!(
+            "network additional CA artifact '{}' contains no PEM certificate blocks",
+            path.display()
+        ));
+    }
+    Ok(certificate_count)
 }
 
 fn validate_openshell_endpoint(endpoint: &str) -> Result<(), String> {
@@ -625,15 +900,33 @@ impl VmDriver {
     }
 
     pub async fn new_with_extensions(
-        config: VmDriverConfig,
+        mut config: VmDriverConfig,
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
+        if config.network_additional_ca_snapshot.is_some() {
+            return Err(
+                "network_additional_ca_snapshot is internal and must not be supplied to the VM driver constructor"
+                    .to_string(),
+            );
+        }
         config.validate_runtime_security_config()?;
         config.validate_rootfs_tar_config()?;
+
+        // The gateway-owned artifact is only a process-startup transport. Read
+        // and authenticate it before creating any sandbox state, then retain
+        // immutable normalized bytes for this driver's entire lifetime. In
+        // particular, do not leave a mutable host path for launch/relaunch
+        // code to consult after the child has started.
+        let network_additional_ca_snapshot = snapshot_network_additional_ca_bundle(&config)?;
+        config.network_additional_ca_bundle = None;
+        config.network_additional_ca_digest = None;
+        config.network_additional_ca_certificate_count = None;
+        config.network_additional_ca_snapshot = network_additional_ca_snapshot;
+
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -1229,7 +1522,13 @@ impl VmDriver {
 
         // Staged on every launch, including a restart onto a preserved
         // overlay, so the driver's copy always shadows the image layer.
-        if let Err(err) = inject_guest_upstream_proxy(&overlay_disk, &self.config).await {
+        if let Err(err) = inject_guest_supervisor_configuration(
+            &overlay_disk,
+            &self.config,
+            self.config.network_additional_ca_snapshot.as_ref(),
+        )
+        .await
+        {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
@@ -1473,11 +1772,16 @@ impl VmDriver {
         Ok(())
     }
 
-    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        snapshot: Option<&Sandbox>,
+    ) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
-        let (record_id, state_dir, already_running) = {
+        let (record_id, state_dir, record_snapshot, already_running) = {
             let registry = self.registry.lock().await;
             let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
                 entry
@@ -1487,12 +1791,30 @@ impl VmDriver {
                     .find(|(_, record)| record.snapshot.name == sandbox_name)
                     .ok_or_else(|| Status::not_found("sandbox not found"))?
             };
+            if !sandbox_id.is_empty() && sandbox_id != id {
+                return Err(Status::failed_precondition(
+                    "sandbox_id did not match the resolved sandbox",
+                ));
+            }
+            if !sandbox_name.is_empty() && sandbox_name != record.snapshot.name {
+                return Err(Status::failed_precondition(
+                    "sandbox_name did not match the resolved sandbox",
+                ));
+            }
             (
                 id.clone(),
                 record.state_dir.clone(),
+                record.snapshot.clone(),
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
         };
+        if let Some(snapshot) = snapshot
+            && (snapshot.id != record_id || snapshot.name != record_snapshot.name)
+        {
+            return Err(Status::failed_precondition(
+                "start sandbox snapshot identity did not match the persisted sandbox",
+            ));
+        }
         if already_running {
             return Ok(());
         }
@@ -3986,8 +4308,12 @@ impl ComputeDriver for VmDriver {
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
-            .await?;
+        self.start_sandbox(
+            &request.sandbox_id,
+            &request.sandbox_name,
+            request.sandbox.as_ref(),
+        )
+        .await?;
         Ok(Response::new(StartSandboxResponse {}))
     }
 
@@ -6208,7 +6534,10 @@ fn inject_guest_init_dropins(
 /// which sandbox spec/template environment and image `ENV` cannot influence.
 /// Credentials are never on argv — only the root-only guest path is passed;
 /// the supervisor reads the credential from that file.
-fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
+fn supervisor_cli_args(
+    config: &VmDriverConfig,
+    network_additional_ca_snapshot: Option<&NetworkSupervisorTrustBundle>,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = &config.upstream_proxy.https_proxy {
         args.push("--upstream-proxy".to_string());
@@ -6238,6 +6567,14 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
         args.push("--upstream-proxy-ca-bundle".to_string());
         // The guest path, never the gateway-host path the operator configured.
         args.push(GUEST_PROXY_CA_PATH.to_string());
+    }
+    // This is deliberately driven only by the immutable child-startup
+    // snapshot, not by the transient gateway artifact path.
+    if let Some(bundle) = network_additional_ca_snapshot {
+        args.push("--network-additional-ca-bundle".to_string());
+        args.push(GUEST_NETWORK_ADDITIONAL_CA_PATH.to_string());
+        args.push("--network-additional-ca-digest".to_string());
+        args.push(bundle.digest().to_string());
     }
     args
 }
@@ -6320,17 +6657,19 @@ async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
     })
 }
 
-/// Stage the corporate upstream-proxy configuration into the guest overlay.
+/// Stage operator-owned supervisor configuration into the guest overlay.
 ///
-/// Writes three files into the overlay upperdir the driver owns:
+/// Writes the proxy files, destination trust bundle, and driver-owned
+/// supervisor argument list into the overlay upperdir:
 ///
 /// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
 /// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
 ///   is not secret);
+/// * the destination CA at [`GUEST_NETWORK_ADDITIONAL_CA_PATH`], mode `0444`;
 /// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
 ///   `0644`.
 ///
-/// Both are written on every launch, empty when the corresponding
+/// The proxy files and argument marker are written on every launch, empty when the corresponding
 /// setting is absent. Writing rather than skipping is what makes the channel
 /// unforgeable: the upperdir copy always shadows the read-only image layer, so
 /// a sandbox image cannot supply its own arguments or credential by baking a
@@ -6343,9 +6682,10 @@ async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
 /// delivery the per-sandbox gateway JWT already uses. It is removed with the
 /// sandbox when the state directory is deleted.
 #[allow(clippy::result_large_err)]
-async fn inject_guest_upstream_proxy(
+async fn inject_guest_supervisor_configuration(
     overlay_disk: &Path,
     config: &VmDriverConfig,
+    network_additional_ca_snapshot: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<(), Status> {
     // Written whether or not they are configured. Writing empty files when
     // the operator removed a setting clears material a previous launch staged
@@ -6371,7 +6711,32 @@ async fn inject_guest_upstream_proxy(
     set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
         .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
 
-    let args = upstream_proxy_cli_args(config);
+    let network_ca_path = overlay_upper_path(GUEST_NETWORK_ADDITIONAL_CA_PATH);
+    if let Some(bundle) = network_additional_ca_snapshot {
+        // `bundle` was read, bounded, and digest-verified during child
+        // construction. Never re-open its artifact path here: this writes
+        // exactly the retained startup bytes on every launch and relaunch.
+        write_rootfs_image_file(overlay_disk, &network_ca_path, bundle.normalized_pem()).map_err(
+            |err| {
+                Status::internal(format!(
+                    "write VM guest network additional CA bundle: {err}"
+                ))
+            },
+        )?;
+        set_rootfs_image_file_mode(overlay_disk, &network_ca_path, 0o444).map_err(|err| {
+            Status::internal(format!(
+                "set VM guest network additional CA bundle mode: {err}"
+            ))
+        })?;
+    } else {
+        remove_rootfs_image_file(overlay_disk, &network_ca_path).map_err(|err| {
+            Status::internal(format!(
+                "remove VM guest network additional CA bundle: {err}"
+            ))
+        })?;
+    }
+
+    let args = supervisor_cli_args(config, network_additional_ca_snapshot);
     validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
     let guest_path = overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH);
     write_rootfs_image_file(
@@ -8485,7 +8850,7 @@ mod tests {
         );
 
         let err = driver
-            .start_sandbox(&sandbox.id, &sandbox.name)
+            .start_sandbox(&sandbox.id, &sandbox.name, None)
             .await
             .expect_err("start without an image should fail");
 
@@ -8508,6 +8873,46 @@ mod tests {
             .expect("stopped condition");
         assert_eq!(condition.r#type, "Stopped");
         assert_eq!(condition.status, "True");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_mismatched_snapshot_identity_without_replacing_persisted_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let persisted = Sandbox {
+            id: "sandbox-persisted".to_string(),
+            name: "persisted-name".to_string(),
+            ..Default::default()
+        };
+        driver.registry.lock().await.insert(
+            persisted.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox_snapshot(&persisted, stopped_condition(), false),
+                state_dir: temp.path().join("sandboxes").join(&persisted.id),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+        let mismatched = Sandbox {
+            id: persisted.id.clone(),
+            name: "replacement-name".to_string(),
+            ..Default::default()
+        };
+
+        let error = driver
+            .start_sandbox(&persisted.id, &persisted.name, Some(&mismatched))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let record = driver.registry.lock().await;
+        assert_eq!(
+            record.get(&persisted.id).unwrap().snapshot.name,
+            persisted.name
+        );
     }
 
     #[test]
@@ -10621,7 +11026,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_material_is_staged_inside_the_per_sandbox_overlay() {
+    fn operator_material_is_staged_inside_the_per_sandbox_overlay() {
         // Everything the driver stages lands in the overlay upperdir, which
         // lives in the sandbox's own state directory. That is what makes the
         // credential removable with the sandbox (remove_sandbox_state_dir
@@ -10630,11 +11035,14 @@ mod tests {
         for guest_path in [
             GUEST_UPSTREAM_PROXY_AUTH_PATH,
             GUEST_PROXY_CA_PATH,
+            GUEST_NETWORK_ADDITIONAL_CA_PATH,
             GUEST_SUPERVISOR_ARGS_PATH,
         ] {
             assert!(
-                guest_path.starts_with("/opt/openshell/"),
-                "{guest_path} must be under the reserved guest control root"
+                openshell_core::container_paths::CONTROL_ROOTS
+                    .iter()
+                    .any(|root| Path::new(guest_path).starts_with(root)),
+                "{guest_path} must be under a reserved guest control root"
             );
             assert_eq!(
                 overlay_upper_path(guest_path),
@@ -10646,7 +11054,7 @@ mod tests {
 
     #[test]
     fn upstream_proxy_args_are_empty_without_a_configured_proxy() {
-        assert!(upstream_proxy_cli_args(&VmDriverConfig::default()).is_empty());
+        assert!(supervisor_cli_args(&VmDriverConfig::default(), None).is_empty());
         // The file is still written, empty, so the guest cannot fall back to
         // an image-baked argument list.
         assert!(render_guest_supervisor_args(&[]).is_empty());
@@ -10659,7 +11067,7 @@ mod tests {
             Some("/etc/openshell/secrets/proxy-auth"),
         );
         config.proxy_ca_bundle = Some(PathBuf::from("/etc/openshell/tls/corp-ca.pem"));
-        let args = upstream_proxy_cli_args(&config);
+        let args = supervisor_cli_args(&config, None);
 
         // The credential and CA live at fixed guest paths; the gateway-host
         // paths the operator configured must never reach the guest argv.
@@ -10685,7 +11093,7 @@ mod tests {
     fn upstream_proxy_args_pass_only_explicit_opt_ins() {
         let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None);
         config.upstream_proxy.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
-        let args = upstream_proxy_cli_args(&config);
+        let args = supervisor_cli_args(&config, None);
         assert_eq!(
             args,
             vec![
@@ -10700,15 +11108,375 @@ mod tests {
         // supervisor side.
         config.upstream_proxy.proxy_connect_by_hostname = Some(false);
         assert!(
-            !upstream_proxy_cli_args(&config)
+            !supervisor_cli_args(&config, None)
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
         );
         config.upstream_proxy.proxy_connect_by_hostname = Some(true);
         assert!(
-            upstream_proxy_cli_args(&config)
+            supervisor_cli_args(&config, None)
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+    }
+
+    fn network_trust_digest(bytes: &[u8]) -> String {
+        format!("sha256:{}", compute_bytes_sha256_hex(bytes))
+    }
+
+    fn child_network_trust_config(
+        artifact: PathBuf,
+        state_dir: PathBuf,
+        normalized_pem: &[u8],
+        certificate_count: usize,
+    ) -> VmDriverConfig {
+        VmDriverConfig {
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            state_dir,
+            network_additional_ca_bundle: Some(artifact),
+            network_additional_ca_digest: Some(network_trust_digest(normalized_pem)),
+            network_additional_ca_certificate_count: Some(certificate_count),
+            ..Default::default()
+        }
+    }
+
+    fn generated_network_trust_pem(name: &str) -> String {
+        rcgen::generate_simple_self_signed(vec![name.to_string()])
+            .expect("generate destination trust fixture")
+            .cert
+            .pem()
+    }
+
+    fn pem_payload_marker(pem: &str) -> &str {
+        pem.lines()
+            .find(|line| !line.starts_with("-----") && !line.is_empty())
+            .expect("PEM fixture contains a payload line")
+    }
+
+    #[test]
+    fn network_trust_args_use_only_the_fixed_guest_path() {
+        let config = VmDriverConfig::default();
+        let snapshot = NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            PathBuf::from("/var/lib/openshell/network/additional-ca.crt"),
+        );
+        let args = supervisor_cli_args(&config, Some(&snapshot));
+        assert_eq!(
+            args,
+            [
+                "--network-additional-ca-bundle",
+                GUEST_NETWORK_ADDITIONAL_CA_PATH,
+                "--network-additional-ca-digest",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("/var/lib/openshell")));
+        assert!(!args.iter().any(|arg| arg == "OPENSHELL_TLS_CA"));
+    }
+
+    async fn expect_vm_driver_error(config: VmDriverConfig, expectation: &str) -> String {
+        match VmDriver::new(config).await {
+            Ok(_) => panic!("{expectation}"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn child_constructor_snapshots_verified_network_trust() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let artifact = temp.path().join("additional-ca.crt");
+        let pem = generated_network_trust_pem("snapshot.example");
+        fs::write(&artifact, &pem).expect("write gateway-owned artifact");
+
+        let driver = VmDriver::new(child_network_trust_config(
+            artifact.clone(),
+            temp.path().join("driver-state"),
+            pem.as_bytes(),
+            1,
+        ))
+        .await
+        .expect("child must accept the gateway artifact at startup");
+
+        let snapshot = driver
+            .config
+            .network_additional_ca_snapshot
+            .as_ref()
+            .expect("verified startup snapshot");
+        assert_eq!(snapshot.normalized_pem(), pem.as_bytes());
+        assert_eq!(snapshot.digest(), network_trust_digest(pem.as_bytes()));
+        assert_eq!(snapshot.certificate_count(), 1);
+        // The path/digest/count are process-startup transport only. Runtime
+        // configuration is driven solely by the retained immutable snapshot.
+        assert!(driver.config.network_additional_ca_bundle.is_none());
+        assert!(driver.config.network_additional_ca_digest.is_none());
+        assert!(
+            driver
+                .config
+                .network_additional_ca_certificate_count
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_constructor_rejects_substituted_valid_network_trust_bytes_without_leakage() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let artifact = temp.path().join("additional-ca.crt");
+        let expected = generated_network_trust_pem("expected.example");
+        let substituted = generated_network_trust_pem("substituted.example");
+        fs::write(&artifact, &substituted).expect("write substituted artifact");
+
+        let error = expect_vm_driver_error(
+            child_network_trust_config(
+                artifact.clone(),
+                temp.path().join("driver-state"),
+                expected.as_bytes(),
+                1,
+            ),
+            "a digest-mismatched but valid artifact must fail closed",
+        )
+        .await;
+        assert!(error.contains(&artifact.display().to_string()), "{error}");
+        assert!(error.contains("does not match expected gateway trust digest"));
+        assert!(!error.contains(pem_payload_marker(&expected)), "{error}");
+        assert!(!error.contains(pem_payload_marker(&substituted)), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_constructor_rejects_symlinked_network_trust_artifact_without_leakage() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let target = temp.path().join("target-ca.crt");
+        let artifact = temp.path().join("additional-ca.crt");
+        let pem = generated_network_trust_pem("symlink.example");
+        fs::write(&target, &pem).expect("write target artifact");
+        symlink(&target, &artifact).expect("create artifact symlink");
+
+        let error = expect_vm_driver_error(
+            child_network_trust_config(
+                artifact.clone(),
+                temp.path().join("driver-state"),
+                pem.as_bytes(),
+                1,
+            ),
+            "symlinked artifacts must fail closed",
+        )
+        .await;
+        assert!(error.contains(&artifact.display().to_string()), "{error}");
+        assert!(error.contains("is not a regular file"), "{error}");
+        assert!(!error.contains(pem_payload_marker(&pem)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn child_constructor_rejects_missing_network_trust_artifact_without_leakage() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let artifact = temp.path().join("missing-additional-ca.crt");
+        let pem = generated_network_trust_pem("missing.example");
+
+        let error = expect_vm_driver_error(
+            child_network_trust_config(
+                artifact.clone(),
+                temp.path().join("driver-state"),
+                pem.as_bytes(),
+                1,
+            ),
+            "missing artifacts must fail before the child starts",
+        )
+        .await;
+        assert!(error.contains(&artifact.display().to_string()), "{error}");
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(!error.contains(pem_payload_marker(&pem)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn child_constructor_rejects_wrong_network_trust_digest_without_leakage() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let artifact = temp.path().join("additional-ca.crt");
+        let pem = generated_network_trust_pem("wrong-digest.example");
+        fs::write(&artifact, &pem).expect("write artifact");
+        let mut config = child_network_trust_config(
+            artifact.clone(),
+            temp.path().join("driver-state"),
+            pem.as_bytes(),
+            1,
+        );
+        config.network_additional_ca_digest = Some(format!("sha256:{}", "0".repeat(64)));
+
+        let error = expect_vm_driver_error(config, "wrong expected digest must fail closed").await;
+        assert!(error.contains(&artifact.display().to_string()), "{error}");
+        assert!(error.contains("does not match expected gateway trust digest"));
+        assert!(!error.contains(pem_payload_marker(&pem)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn child_constructor_bounds_oversized_network_trust_without_leakage() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let artifact = temp.path().join("oversized-additional-ca.crt");
+        let sensitive_marker = "oversized-network-trust-material-must-not-appear".repeat(2);
+        let limit = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+        let mut oversized = vec![b'x'; limit + 1];
+        oversized[..sensitive_marker.len()].copy_from_slice(sensitive_marker.as_bytes());
+        fs::write(&artifact, &oversized).expect("write oversized artifact");
+
+        let error = expect_vm_driver_error(
+            child_network_trust_config(
+                artifact.clone(),
+                temp.path().join("driver-state"),
+                &oversized,
+                1,
+            ),
+            "oversized artifacts must fail before an unbounded read",
+        )
+        .await;
+        assert!(error.contains(&artifact.display().to_string()), "{error}");
+        assert!(
+            error.contains(&format!("shared {limit}-byte limit")),
+            "{error}"
+        );
+        assert!(!error.contains(&sensitive_marker), "{error}");
+    }
+
+    #[tokio::test]
+    async fn child_constructor_rejects_partial_network_trust_startup_input() {
+        let temp = tempfile::tempdir().expect("create child startup fixture");
+        let partial = VmDriverConfig {
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            state_dir: temp.path().join("driver-state"),
+            network_additional_ca_bundle: Some(temp.path().join("additional-ca.crt")),
+            ..Default::default()
+        };
+
+        let error = expect_vm_driver_error(
+            partial,
+            "a path without the gateway-issued digest/count must fail closed",
+        )
+        .await;
+        assert!(error.contains("network_additional_ca_bundle"), "{error}");
+        assert!(error.contains("must be set together"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_trust_launch_uses_retained_startup_bytes_and_new_none_child_clears_overlay() {
+        let temp = tempfile::tempdir().expect("create overlay fixture");
+        let source = temp.path().join("overlay-source");
+        let overlay = temp.path().join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create upperdir");
+        fs::create_dir_all(source.join("work")).expect("create workdir");
+        fs::create_dir_all(source.join("config")).expect("create config dir");
+        create_ext4_image_from_dir_with_size(&source, &overlay, 32 * 1024 * 1024)
+            .expect("create overlay image");
+
+        let first = generated_network_trust_pem("first.example");
+        let substituted = generated_network_trust_pem("substituted-after-start.example");
+        let artifact = temp.path().join("additional-ca.crt");
+        fs::write(&artifact, &first).expect("write startup artifact");
+        let with_trust = VmDriver::new(child_network_trust_config(
+            artifact.clone(),
+            temp.path().join("driver-with-trust"),
+            first.as_bytes(),
+            1,
+        ))
+        .await
+        .expect("construct child with startup trust snapshot");
+
+        // The child has already closed the artifact. Both a replacement and
+        // deletion must leave its launch/relaunch payload unchanged.
+        fs::write(&artifact, &substituted).expect("replace artifact after child startup");
+        fs::remove_file(&artifact).expect("remove artifact after child startup");
+        inject_guest_supervisor_configuration(
+            &overlay,
+            &with_trust.config,
+            with_trust.config.network_additional_ca_snapshot.as_ref(),
+        )
+        .await
+        .expect("first launch writes retained startup bytes");
+        let guest_path = overlay_upper_path(GUEST_NETWORK_ADDITIONAL_CA_PATH);
+        assert_eq!(
+            read_rootfs_image_file(&overlay, &guest_path).expect("read staged CA"),
+            first.as_bytes()
+        );
+        assert!(
+            stat_rootfs_image_file(&overlay, &guest_path)
+                .expect("stat staged CA")
+                .contains("Mode:  0444")
+        );
+        assert_eq!(
+            read_rootfs_image_file(&overlay, &overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH))
+                .expect("read supervisor args"),
+            render_guest_supervisor_args(&[
+                "--network-additional-ca-bundle".to_string(),
+                GUEST_NETWORK_ADDITIONAL_CA_PATH.to_string(),
+                "--network-additional-ca-digest".to_string(),
+                with_trust
+                    .config
+                    .network_additional_ca_snapshot
+                    .as_ref()
+                    .expect("retained snapshot")
+                    .digest()
+                    .to_string(),
+            ])
+        );
+
+        inject_guest_supervisor_configuration(
+            &overlay,
+            &with_trust.config,
+            with_trust.config.network_additional_ca_snapshot.as_ref(),
+        )
+        .await
+        .expect("relaunch writes the same retained startup bytes");
+        assert_eq!(
+            read_rootfs_image_file(&overlay, &guest_path).expect("read relaunched staged CA"),
+            first.as_bytes()
+        );
+
+        // Gateway configuration removal creates a new child with no snapshot.
+        // A launch against the preserved overlay must erase both the CA file
+        // and the associated supervisor argument.
+        let without_trust = VmDriver::new(VmDriverConfig {
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            state_dir: temp.path().join("driver-without-trust"),
+            ..Default::default()
+        })
+        .await
+        .expect("construct child with no network trust");
+        inject_guest_supervisor_configuration(
+            &overlay,
+            &without_trust.config,
+            without_trust.config.network_additional_ca_snapshot.as_ref(),
+        )
+        .await
+        .expect("new no-trust child clears preserved overlay state");
+        assert!(
+            read_rootfs_image_file(&overlay, &guest_path)
+                .expect("read cleared staged CA")
+                .is_empty()
+        );
+        assert!(
+            read_rootfs_image_file(&overlay, &overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH))
+                .expect("read cleared supervisor args")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn guest_init_uses_driver_authored_args_for_both_backends() {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        assert!(script.contains("args_file=\"$(root_path /opt/openshell/supervisor-args)\""));
+        assert!(script.contains("SUPERVISOR_EXTRA_ARGS+=(\"$arg\")"));
+        assert!(script.contains("set -- --workdir /sandbox"));
+
+        for backend in [VmBackend::Libkrun, VmBackend::Qemu] {
+            assert!(
+                matches!(backend, VmBackend::Libkrun | VmBackend::Qemu),
+                "both supported launch backends use the common guest init path"
+            );
+        }
+        assert_eq!(
+            sandbox_guest_init_path(),
+            "/srv/openshell-vm-sandbox-init.sh"
         );
     }
 

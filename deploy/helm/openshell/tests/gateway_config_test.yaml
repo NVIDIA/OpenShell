@@ -664,6 +664,25 @@ tests:
       - failedTemplate:
           errorPattern: "replicaCount > 1 requires server.externalDbSecret"
 
+  - it: renders writable ephemeral XDG state for gateway trust artifacts
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: XDG_STATE_HOME
+            value: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
+
   - it: renders a Deployment for external database-backed gateway workloads
     template: templates/deployment.yaml
     set:
@@ -701,6 +720,16 @@ tests:
               secretKeyRef:
                 name: my-pg-secret
                 key: uri
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-state
+            mountPath: /var/lib/openshell-state
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-state
+            emptyDir: {}
 
   - it: fails when a Deployment uses the default SQLite database
     template: templates/statefulset.yaml

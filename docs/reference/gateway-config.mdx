@@ -54,6 +54,9 @@ version = 2
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
 
+[openshell.supervisor.network]
+# ... shared network-supervisor destination trust ...
+
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
 
@@ -62,6 +65,97 @@ version = 2
 ```
 
 The gateway selector is `compute_driver = "<driver>"`. It accepts one scalar driver name. Omit it to retain auto-detection.
+
+## Additional Destination CAs
+
+Use the global supervisor network table to trust private certificate authorities
+for sandbox egress destinations:
+
+```toml
+[openshell.supervisor.network]
+additional_ca_cert_paths = [
+  "/etc/openshell/certs/private-root.pem",
+  "/etc/openshell/certs/private-intermediate.pem",
+]
+```
+
+The paths refer to files on the gateway host or in the gateway container. Each
+file must contain one or more PEM certificate blocks. Inline PEM, private keys,
+DER-only input, URLs, empty files, unrelated text, and mixed certificate/key
+files are unsupported. The gateway reads every file once at startup, validates
+all input, normalizes the certificates into one gateway-owned bundle, and fails
+startup with the field and source path when material is missing or unusable. It
+does not include certificate contents in diagnostics.
+
+The normalized certificates augment the default bundled, system, or native
+roots used for sandbox destination TLS. Normal certificate-chain and hostname
+verification remains enabled. A configured CA can authenticate every
+policy-permitted endpoint whose certificate chains to that CA and matches the
+requested hostname, so scope private CAs accordingly.
+
+This setting is separate from all other trust domains:
+
+- `proxy_ca_bundle` authenticates a configured corporate proxy and its TLS
+  interception path. It still requires the corresponding proxy setting.
+- `guest_tls_*`, `OPENSHELL_TLS_CA`, and Kubernetes client TLS Secrets
+  authenticate sandbox callbacks to the gateway.
+- `[openshell.gateway.tls]` configures the gateway listener.
+- OIDC, middleware, and interceptor CA settings authenticate their own
+  gateway-side connections.
+
+The in-process Docker and Podman drivers mount a gateway-owned artifact at
+`/etc/openshell-tls/network-additional-ca.crt`. The Kubernetes driver creates an
+immutable, content-addressed managed ConfigMap containing `ca.crt` in each
+target namespace and mounts it only at the combined or sidecar network-supervisor
+boundary. The VM driver writes the same path into each sandbox overlay. Every
+driver passes the protected bundle path and its gateway-issued SHA-256 digest to
+the supervisor. Before any network setup, the supervisor canonicalizes the
+mounted PEM and rejects bytes that do not match that expected generation.
+Remote and custom compute drivers reject this setting because the compute-driver
+protocol does not carry the normalized material.
+
+### Lifecycle and certificate rollover
+
+This is **global gateway configuration**, not a per-sandbox setting. Source
+files (or the Helm source ConfigMap) are read and normalized **only when the
+gateway starts**. Updating a source file or ConfigMap alone has no effect:
+OpenShell does not watch or hot-reload those sources, and it does not
+automatically restart sandbox consumers. A running supervisor retains the
+startup trust bundle it already loaded.
+
+To apply any addition, removal, or source update, the operator must:
+
+1. Update the source files or source ConfigMap.
+2. Restart or redeploy the gateway so it reads and normalizes the new source.
+3. Explicitly stop and then start **every affected sandbox**.
+
+Stop/start retains the sandbox identity and its supported durable workspace; it
+does not create a replacement sandbox. The restarted supervisor consumes the
+bundle staged from the restarted gateway's snapshot. Source normalization,
+driver delivery/reconciliation, and supervisor validation failures fail closed:
+they do not silently fall back to a previous or default trust bundle.
+
+Use this sequence for a non-disruptive private-CA rollover:
+
+1. Configure both the old and new roots.
+2. Restart or redeploy the gateway, then stop/start every affected sandbox.
+3. Rotate destination certificates to chain to the new root.
+4. Remove the old root, then repeat the gateway restart/redeploy and
+   stop/start sequence for every affected sandbox.
+
+For Helm, create an operator-owned ConfigMap with a `ca.crt` key and set
+`supervisor.network.additionalCaConfigMapName`. The chart mounts the source at
+`/etc/openshell-tls/network-additional-ca-source/ca.crt`, renders that path in
+the global table, and grants the Kubernetes driver ConfigMap `get` and `create`
+permissions for the selected workspace mode. These permissions cover the shared
+sandbox namespace in shared mode and are cluster-wide through the existing
+ClusterRoleBinding in managed and operator modes. Kubernetes RBAC cannot limit
+`create` by resource name or limit `get` to the digest-bearing name prefix. The
+chart does not grant ConfigMap `list`, `watch`, `patch`, `update`, or `delete`
+for this feature. Use a dedicated gateway service account and namespace-scoped
+bindings when this read boundary matters. Updating only the source ConfigMap
+does not trigger the gateway workload checksum, so explicitly restart or
+redeploy the gateway and then stop/start every affected sandbox.
 
 ## Migrate to schema version 2
 
@@ -170,6 +264,11 @@ provider_profile_sources = [
   { type = "builtin" },
   { type = "user" },
 ]
+
+# Additional private destination roots are global supervisor settings, not
+# compute-driver settings. The gateway reads certificate-only PEM at startup.
+[openshell.supervisor.network]
+additional_ca_cert_paths = ["/etc/openshell/certs/private-destination-ca.pem"]
 
 # Operator-run supervisor middleware. The gRPC endpoint must be reachable from
 # both the gateway and sandbox supervisors.

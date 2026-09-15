@@ -34,6 +34,7 @@ pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+pub mod network_trust;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod paths;
@@ -65,6 +66,7 @@ pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use network_trust::NetworkSupervisorTrustBundle;
 
 /// Build version string derived from git metadata.
 ///

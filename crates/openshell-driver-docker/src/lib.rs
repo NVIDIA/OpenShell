@@ -7,18 +7,19 @@
 
 pub mod otel_tracing;
 
-use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
-    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
-    MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, SystemInfo,
+    ContainerCreateBody, ContainerInspectResponse, ContainerState, ContainerStateStatusEnum,
+    ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings,
+    HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest,
+    NetworkingConfig, ProgressDetail, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, RenameContainerOptionsBuilder,
+    StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
+use bollard::{Docker, body_try_stream};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
@@ -34,6 +35,9 @@ use openshell_core::driver_utils::{
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
+};
+use openshell_core::network_trust::{
+    NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
 };
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
@@ -58,28 +62,37 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{
-    AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, UpstreamProxyConfig,
+    AppArmorProfile, Error, ImagePullPolicy, NetworkSupervisorTrustBundle, Result as CoreResult,
+    UpstreamProxyConfig,
 };
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
+use std::io::{SeekFrom, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex as StdMutex, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::io::AsyncReadExt as _;
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument as _, debug, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::Url;
+use uuid::Uuid;
 
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
@@ -92,6 +105,19 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+
+/// Docker labels have no length restriction comparable to Kubernetes labels,
+/// so this can hold the full `sha256:<hex>` startup generation.
+const DOCKER_SANDBOX_WORKSPACE_ROOT_LABEL: &str = "openshell.ai/docker-workspace-root";
+
+/// A stopped sandbox's writable workspace can contain source code and other
+/// private user data. Keep its transient Docker archive bounded and in an
+/// unlinked owner-only file rather than retaining it in process memory.
+const MAX_DOCKER_WORKSPACE_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DOCKER_WORKSPACE_ARCHIVE_CHUNK_BYTES: usize = 64 * 1024;
+const DOCKER_WORKSPACE_ARCHIVE_CHANNEL_CAPACITY: usize = 1;
+const MAX_CONCURRENT_DOCKER_WORKSPACE_ARCHIVES: usize = 1;
+const DOCKER_REPLACEMENT_NAME_ATTEMPTS: usize = 3;
 
 fn provisioning_span(
     parent: &opentelemetry::Context,
@@ -267,6 +293,10 @@ struct DockerDriverRuntimeConfig {
     log_level: String,
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
+    /// Gateway-owned normalized destination trust material. The driver keeps
+    /// the immutable startup snapshot so stopped-container reconciliation can
+    /// compare and verify its generation without reading user configuration.
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
@@ -299,6 +329,67 @@ pub struct DockerComputeDriver {
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     lifecycle_event_fences: DockerLifecycleEventFences,
+    /// A replacement briefly has both the old and new containers present.
+    /// A gate keyed by stable sandbox ID prevents concurrent starts from
+    /// racing that hand-off while allowing unrelated sandboxes to proceed.
+    start_operation_gates: Arc<DockerStartGateRegistry>,
+    /// Workspace export/filter pipelines are globally bounded because their
+    /// private archive files consume gateway temporary storage. The raw
+    /// daemon stream is filtered through a bounded channel, so each permit
+    /// accounts for at most one on-disk archive.
+    workspace_archive_transfers: Arc<Semaphore>,
+}
+
+/// Serializes full start/reconciliation transactions for one sandbox without
+/// retaining an entry for every sandbox ever started. A caller holds a strong
+/// reference to its gate while waiting and while executing; the registry keeps
+/// only a weak reference and prunes stale entries on subsequent lookups.
+#[derive(Debug, Default)]
+struct DockerStartGateRegistry {
+    gates: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl DockerStartGateRegistry {
+    async fn lock_for(&self, sandbox_id: &str, sandbox_name: &str) -> DockerStartGuard {
+        let key = if sandbox_id.is_empty() {
+            sandbox_name
+        } else {
+            sandbox_id
+        };
+        let gate = self.gate_for(key);
+        DockerStartGuard {
+            _guard: gate.lock_owned().await,
+        }
+    }
+
+    fn gate_for(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .expect("Docker start gate registry lock poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.gates
+            .lock()
+            .expect("Docker start gate registry lock poisoned")
+            .len()
+    }
+}
+
+/// Proof that this start/reconciliation transaction holds its sandbox gate.
+#[derive(Debug)]
+struct DockerStartGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Per-sandbox container exit timestamps that fence snapshots from an earlier run.
@@ -316,6 +407,11 @@ struct DockerLifecycleEventFences {
 struct DockerLifecycleFenceState {
     previous_finished_at: HashMap<String, String>,
     starts_in_progress: HashSet<String>,
+    /// Stable IDs of stopped containers successfully replaced during the
+    /// latest start. A poll may have captured one before removal and publish
+    /// it after the start transaction completes, when timestamp inspection is
+    /// no longer possible because that exact container no longer exists.
+    superseded_instance_ids: HashMap<String, HashSet<String>>,
 }
 
 impl DockerLifecycleEventFences {
@@ -369,6 +465,33 @@ impl DockerLifecycleEventFences {
             .cloned()
     }
 
+    fn record_superseded_instance(&self, sandbox_id: &str, instance_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .superseded_instance_ids
+            .entry(sandbox_id.to_string())
+            .or_default()
+            .insert(instance_id.to_string());
+    }
+
+    fn is_superseded_instance(&self, sandbox_id: &str, instance_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .superseded_instance_ids
+            .get(sandbox_id)
+            .is_some_and(|instances| instances.contains(instance_id))
+    }
+
+    fn clear_superseded_instances(&self, sandbox_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .superseded_instance_ids
+            .remove(sandbox_id);
+    }
+
     fn remove(&self, sandbox_id: &str) {
         let mut state = self
             .state
@@ -376,6 +499,7 @@ impl DockerLifecycleEventFences {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.previous_finished_at.remove(sandbox_id);
         state.starts_in_progress.remove(sandbox_id);
+        state.superseded_instance_ids.remove(sandbox_id);
     }
 }
 
@@ -402,6 +526,563 @@ struct DockerImageMetadata {
 struct DockerResourceLimits {
     nano_cpus: Option<i64>,
     memory_bytes: Option<i64>,
+}
+
+/// An anonymous owner-only file holding a Docker workspace archive. Keeping
+/// the file descriptor alive makes the archive unreachable by pathname and
+/// guarantees cleanup on every return path.
+struct DockerWorkspaceArchive {
+    file: std::fs::File,
+    byte_len: u64,
+}
+
+impl DockerWorkspaceArchive {
+    const fn len(&self) -> u64 {
+        self.byte_len
+    }
+
+    fn into_upload_stream(
+        self,
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        let file = tokio::fs::File::from_std(self.file);
+        futures::stream::try_unfold(file, |mut file| async move {
+            let mut buffer = vec![0_u8; DOCKER_WORKSPACE_ARCHIVE_CHUNK_BYTES];
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            buffer.truncate(read);
+            Ok(Some((Bytes::from(buffer), file)))
+        })
+    }
+}
+
+/// Archive failures deliberately retain no I/O, Docker, pathname, or archive
+/// payload text. Workspace archives can contain private user content and the
+/// API error must never echo it through an intermediary error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerWorkspaceArchiveError {
+    TemporaryStorage,
+    Download,
+    TooLarge { limit: u64 },
+    Write,
+    Rewind,
+    FilterTask,
+    InvalidTar,
+    CompressedTar,
+    UnsupportedTarFeature,
+    InvalidEntryPath,
+    UnexpectedRoot,
+    MissingRootDirectory,
+    UnsafeHardLink,
+}
+
+impl DockerWorkspaceArchiveError {
+    fn status(self) -> Status {
+        match self {
+            Self::TooLarge { limit } => Status::failed_precondition(format!(
+                "Docker sandbox workspace archive exceeds the strict {limit}-byte limit"
+            )),
+            Self::TemporaryStorage => Status::internal(
+                "could not create private Docker sandbox workspace archive storage",
+            ),
+            Self::Download => {
+                Status::internal("could not download Docker sandbox workspace archive")
+            }
+            Self::Write => {
+                Status::internal("could not write private Docker sandbox workspace archive")
+            }
+            Self::Rewind => {
+                Status::internal("could not rewind private Docker sandbox workspace archive")
+            }
+            Self::FilterTask => {
+                Status::internal("could not schedule Docker sandbox workspace archive filtering")
+            }
+            Self::InvalidTar => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: archive is malformed or truncated",
+            ),
+            Self::CompressedTar => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: compressed tar streams are not safely supported",
+            ),
+            Self::UnsupportedTarFeature => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: tar metadata extension cannot be preserved safely",
+            ),
+            Self::InvalidEntryPath => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: archive entry path is not normalized",
+            ),
+            Self::UnexpectedRoot => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: archive entry is outside the protected workspace root",
+            ),
+            Self::MissingRootDirectory => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: expected workspace root directory is missing",
+            ),
+            Self::UnsafeHardLink => Status::failed_precondition(
+                "could not filter Docker sandbox workspace archive: hard-link metadata cannot be preserved safely",
+            ),
+        }
+    }
+}
+
+/// A writer that refuses to let a repacked archive cross its hard byte bound.
+/// The shared flag lets the caller distinguish its deliberately injected write
+/// error from an ordinary temporary-file I/O failure without retaining either
+/// error text in a user-visible status.
+struct BoundedDockerArchiveWriter {
+    file: std::fs::File,
+    byte_len: u64,
+    limit: u64,
+    limit_exceeded: Arc<AtomicBool>,
+}
+
+impl BoundedDockerArchiveWriter {
+    fn new(file: std::fs::File, limit: u64, limit_exceeded: Arc<AtomicBool>) -> Self {
+        Self {
+            file,
+            byte_len: 0,
+            limit,
+            limit_exceeded,
+        }
+    }
+
+    fn into_parts(self) -> (std::fs::File, u64) {
+        (self.file, self.byte_len)
+    }
+}
+
+impl std::io::Write for BoundedDockerArchiveWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let byte_len = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        if byte_len > self.limit.saturating_sub(self.byte_len) {
+            self.limit_exceeded.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::other("Docker archive size limit exceeded"));
+        }
+        let written = self.file.write(buffer)?;
+        self.byte_len += u64::try_from(written).unwrap_or(u64::MAX);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Count a tar entry while it is copied so a malformed final entry cannot be
+/// retained with a header whose declared size exceeds its actual bytes.
+struct CountedDockerArchiveReader<'a, R> {
+    reader: &'a mut R,
+    byte_len: u64,
+}
+
+impl<R> std::io::Read for CountedDockerArchiveReader<'_, R>
+where
+    R: std::io::Read,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reader.read(buffer)?;
+        self.byte_len += u64::try_from(read).unwrap_or(u64::MAX);
+        Ok(read)
+    }
+}
+
+/// Components of a path from a tar header. They are bytes rather than host
+/// paths so filtering neither decodes user filenames nor follows symlinks.
+type DockerArchivePath = Vec<Vec<u8>>;
+
+struct DockerWorkspaceArchiveFilter {
+    archive_root: Vec<u8>,
+    excluded_mounts: Vec<DockerArchivePath>,
+}
+
+impl DockerWorkspaceArchiveFilter {
+    fn new(
+        workspace_root: &str,
+        excluded_mounts: Vec<DockerArchivePath>,
+    ) -> Result<Self, DockerWorkspaceArchiveError> {
+        let archive_root = workspace_root
+            .rsplit('/')
+            .next()
+            .filter(|component| !component.is_empty())
+            .map(str::as_bytes)
+            .map(ToOwned::to_owned)
+            .ok_or(DockerWorkspaceArchiveError::InvalidEntryPath)?;
+        Ok(Self {
+            archive_root,
+            excluded_mounts,
+        })
+    }
+
+    fn excludes(&self, path_under_root: &[Vec<u8>]) -> bool {
+        self.excluded_mounts.iter().any(|mount| {
+            path_under_root.len() >= mount.len()
+                && path_under_root
+                    .iter()
+                    .zip(mount)
+                    .all(|(path, mount)| path == mount)
+        })
+    }
+}
+
+/// Return normalized relative components without using host filesystem path
+/// resolution. Tar's slash-separated names are interpreted lexically only.
+fn docker_archive_path_components(
+    bytes: &[u8],
+) -> Result<DockerArchivePath, DockerWorkspaceArchiveError> {
+    if bytes.is_empty() || bytes.starts_with(b"/") {
+        return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+    }
+
+    // Docker emits a trailing slash for directory entries. Retain it in the
+    // copied header but remove one terminator for lexical comparison; a second
+    // slash remains an invalid empty component below.
+    let bytes = bytes.strip_suffix(b"/").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+    }
+
+    let mut components = Vec::new();
+    for component in bytes.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+        }
+        if matches!(component, b"." | b"..") {
+            return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+        }
+        components.push(component.to_vec());
+    }
+    if components.is_empty() {
+        return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+    }
+    Ok(components)
+}
+
+fn docker_workspace_archive_prefix_is_compressed(prefix: &[u8]) -> bool {
+    prefix.starts_with(&[0x1f, 0x8b])
+        || prefix.starts_with(b"BZh")
+        || prefix.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
+        || prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+}
+
+fn prefixed_docker_workspace_archive_reader<R>(
+    mut reader: R,
+) -> Result<impl std::io::Read, DockerWorkspaceArchiveError>
+where
+    R: std::io::Read,
+{
+    let mut prefix = Vec::with_capacity(6);
+    while prefix.len() < 6 {
+        let mut buffer = [0_u8; 6];
+        let read = reader
+            .read(&mut buffer[..6 - prefix.len()])
+            .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+        if read == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&buffer[..read]);
+    }
+    if docker_workspace_archive_prefix_is_compressed(&prefix) {
+        return Err(DockerWorkspaceArchiveError::CompressedTar);
+    }
+    Ok(std::io::Read::chain(std::io::Cursor::new(prefix), reader))
+}
+
+fn copy_docker_archive_entry<R>(
+    entry: &mut R,
+    expected_size: u64,
+    builder: &mut tar::Builder<BoundedDockerArchiveWriter>,
+    header: &tar::Header,
+    limit: u64,
+    limit_exceeded: &AtomicBool,
+) -> Result<(), DockerWorkspaceArchiveError>
+where
+    R: std::io::Read,
+{
+    let mut counted = CountedDockerArchiveReader {
+        reader: entry,
+        byte_len: 0,
+    };
+    builder.append(header, &mut counted).map_err(|_| {
+        if limit_exceeded.load(Ordering::Relaxed) {
+            DockerWorkspaceArchiveError::TooLarge { limit }
+        } else {
+            DockerWorkspaceArchiveError::Write
+        }
+    })?;
+    if counted.byte_len != expected_size {
+        return Err(DockerWorkspaceArchiveError::InvalidTar);
+    }
+    Ok(())
+}
+
+fn discard_docker_archive_entry<R>(
+    entry: &mut R,
+    expected_size: u64,
+) -> Result<(), DockerWorkspaceArchiveError>
+where
+    R: std::io::Read,
+{
+    let discarded = std::io::copy(entry, &mut std::io::sink())
+        .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+    if discarded != expected_size {
+        return Err(DockerWorkspaceArchiveError::InvalidTar);
+    }
+    Ok(())
+}
+
+/// Repack a daemon-provided workspace tar while omitting the durable
+/// sandbox's nested user mounts. Only standard entries whose raw headers can
+/// be copied byte-for-byte are accepted; extension records are rejected rather
+/// than silently dropping metadata or resolving a symlink on the gateway.
+#[cfg(test)]
+fn filter_docker_workspace_archive(
+    mut archive: DockerWorkspaceArchive,
+    filter: DockerWorkspaceArchiveFilter,
+    limit: u64,
+) -> Result<DockerWorkspaceArchive, DockerWorkspaceArchiveError> {
+    // `byte_len` is normally set while the daemon response is streamed, but
+    // enforce the cap again from the anonymous file itself before parsing.
+    // This keeps the parser bounded even if a future caller constructs an
+    // archive through a different path.
+    let input_len = archive
+        .file
+        .metadata()
+        .map_err(|_| DockerWorkspaceArchiveError::Rewind)?
+        .len();
+    if input_len > limit || archive.byte_len > limit {
+        return Err(DockerWorkspaceArchiveError::TooLarge { limit });
+    }
+    std::io::Seek::seek(&mut archive.file, SeekFrom::Start(0))
+        .map_err(|_| DockerWorkspaceArchiveError::Rewind)?;
+    filter_docker_workspace_archive_reader(archive.file, filter, limit)
+}
+
+fn filter_docker_workspace_archive_reader<R>(
+    reader: R,
+    filter: DockerWorkspaceArchiveFilter,
+    limit: u64,
+) -> Result<DockerWorkspaceArchive, DockerWorkspaceArchiveError>
+where
+    R: std::io::Read,
+{
+    let reader = prefixed_docker_workspace_archive_reader(reader)?;
+    let output = private_docker_workspace_archive_file()?;
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let writer = BoundedDockerArchiveWriter::new(output, limit, limit_exceeded.clone());
+    let mut builder = tar::Builder::new(writer);
+    let mut input = tar::Archive::new(reader);
+    let entries = input
+        .entries()
+        .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+    let mut root_seen = false;
+    let mut seen_paths = HashSet::new();
+
+    for entry in entries {
+        let mut entry = entry.map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+        if entry
+            .pax_extensions()
+            .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?
+            .is_some()
+        {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+
+        let header = entry.header().clone();
+        let entry_type = header.entry_type();
+        if !(entry_type.is_file()
+            || entry_type.is_dir()
+            || entry_type.is_symlink()
+            || entry_type.is_hard_link())
+        {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+        if entry_type.is_gnu_sparse() {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+
+        // `entries()` hides GNU/PAX long-name records. Copying the ordinary
+        // header in that case would silently truncate the effective path or
+        // link target, so reject it rather than rewriting metadata.
+        let entry_path = entry.path_bytes().into_owned();
+        if entry_path.as_slice() != header.path_bytes().as_ref() {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+        let entry_link = entry.link_name_bytes().map(std::borrow::Cow::into_owned);
+        let header_link = header.link_name_bytes().map(std::borrow::Cow::into_owned);
+        if entry_link != header_link {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+
+        let expected_size = header
+            .entry_size()
+            .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+        if entry.size() != expected_size {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+        let path = docker_archive_path_components(&entry_path)?;
+        if !seen_paths.insert(path.clone()) {
+            return Err(DockerWorkspaceArchiveError::InvalidEntryPath);
+        }
+        if path.first() != Some(&filter.archive_root) {
+            return Err(DockerWorkspaceArchiveError::UnexpectedRoot);
+        }
+        if path.len() == 1 {
+            if root_seen || !entry_type.is_dir() {
+                return Err(DockerWorkspaceArchiveError::MissingRootDirectory);
+            }
+            root_seen = true;
+        } else if !root_seen {
+            return Err(DockerWorkspaceArchiveError::MissingRootDirectory);
+        }
+
+        if entry_type.is_symlink() && entry_link.is_none() {
+            return Err(DockerWorkspaceArchiveError::UnsupportedTarFeature);
+        }
+        if entry_type.is_hard_link() {
+            let link = entry_link.ok_or(DockerWorkspaceArchiveError::UnsafeHardLink)?;
+            let link_path = docker_archive_path_components(&link)?;
+            if link_path.first() != Some(&filter.archive_root) || filter.excludes(&link_path[1..]) {
+                return Err(DockerWorkspaceArchiveError::UnsafeHardLink);
+            }
+        }
+
+        if filter.excludes(&path[1..]) {
+            discard_docker_archive_entry(&mut entry, expected_size)?;
+        } else {
+            copy_docker_archive_entry(
+                &mut entry,
+                expected_size,
+                &mut builder,
+                &header,
+                limit,
+                &limit_exceeded,
+            )?;
+        }
+    }
+
+    // Do not let the blocking parser return while the asynchronous producer
+    // still owns unread daemon bytes. Draining through EOF keeps the raw input
+    // bound authoritative and ensures the channel holds at most one chunk.
+    std::io::copy(&mut input.into_inner(), &mut std::io::sink())
+        .map_err(|_| DockerWorkspaceArchiveError::InvalidTar)?;
+    if !root_seen {
+        return Err(DockerWorkspaceArchiveError::MissingRootDirectory);
+    }
+    builder.finish().map_err(|_| {
+        if limit_exceeded.load(Ordering::Relaxed) {
+            DockerWorkspaceArchiveError::TooLarge { limit }
+        } else {
+            DockerWorkspaceArchiveError::Write
+        }
+    })?;
+    let writer = builder.into_inner().map_err(|_| {
+        if limit_exceeded.load(Ordering::Relaxed) {
+            DockerWorkspaceArchiveError::TooLarge { limit }
+        } else {
+            DockerWorkspaceArchiveError::Write
+        }
+    })?;
+    let (mut file, byte_len) = writer.into_parts();
+    file.flush()
+        .map_err(|_| DockerWorkspaceArchiveError::Write)?;
+    std::io::Seek::seek(&mut file, SeekFrom::Start(0))
+        .map_err(|_| DockerWorkspaceArchiveError::Rewind)?;
+    Ok(DockerWorkspaceArchive { file, byte_len })
+}
+
+struct DockerWorkspaceArchiveStreamReader {
+    receiver: mpsc::Receiver<Bytes>,
+    current: Bytes,
+    offset: usize,
+}
+
+impl DockerWorkspaceArchiveStreamReader {
+    fn new(receiver: mpsc::Receiver<Bytes>) -> Self {
+        Self {
+            receiver,
+            current: Bytes::new(),
+            offset: 0,
+        }
+    }
+}
+
+impl std::io::Read for DockerWorkspaceArchiveStreamReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        while self.offset == self.current.len() {
+            let Some(chunk) = self.receiver.blocking_recv() else {
+                return Ok(0);
+            };
+            self.current = chunk;
+            self.offset = 0;
+        }
+
+        let available = &self.current[self.offset..];
+        let read = available.len().min(buffer.len());
+        buffer[..read].copy_from_slice(&available[..read]);
+        self.offset += read;
+        Ok(read)
+    }
+}
+
+async fn download_and_filter_docker_workspace_archive<S, E>(
+    mut stream: S,
+    filter: DockerWorkspaceArchiveFilter,
+    limit: u64,
+) -> Result<DockerWorkspaceArchive, DockerWorkspaceArchiveError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    // Feed the blocking tar parser directly from the daemon stream. Only the
+    // filtered archive reaches disk; the bounded channel permits one raw
+    // response chunk in memory and applies backpressure to Docker.
+    let (sender, receiver) = mpsc::channel(DOCKER_WORKSPACE_ARCHIVE_CHANNEL_CAPACITY);
+    let filter_task = tokio::task::spawn_blocking(move || {
+        filter_docker_workspace_archive_reader(
+            DockerWorkspaceArchiveStreamReader::new(receiver),
+            filter,
+            limit,
+        )
+    });
+
+    let mut byte_len = 0_u64;
+    let producer_result = loop {
+        let Some(chunk) = stream.next().await else {
+            break Ok(());
+        };
+        let Ok(chunk) = chunk else {
+            break Err(DockerWorkspaceArchiveError::Download);
+        };
+        let Ok(chunk_len) = u64::try_from(chunk.len()) else {
+            break Err(DockerWorkspaceArchiveError::TooLarge { limit });
+        };
+        if chunk_len > limit.saturating_sub(byte_len) {
+            break Err(DockerWorkspaceArchiveError::TooLarge { limit });
+        }
+        byte_len += chunk_len;
+        if sender.send(chunk).await.is_err() {
+            // The parser already reached a more specific terminal result.
+            break Ok(());
+        }
+    };
+    drop(sender);
+
+    let filter_result = filter_task
+        .await
+        .map_err(|_| DockerWorkspaceArchiveError::FilterTask)?;
+    producer_result?;
+    filter_result
+}
+
+fn private_docker_workspace_archive_file() -> Result<std::fs::File, DockerWorkspaceArchiveError> {
+    let file = tempfile::tempfile().map_err(|_| DockerWorkspaceArchiveError::TemporaryStorage)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| DockerWorkspaceArchiveError::TemporaryStorage)?;
+    }
+    Ok(file)
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -542,6 +1223,7 @@ impl DockerComputeDriver {
         gateway_bind_address: SocketAddr,
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> CoreResult<Self> {
         docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
@@ -618,6 +1300,7 @@ impl DockerComputeDriver {
                 log_level: gateway_log_level.to_string(),
                 supervisor_bin,
                 guest_tls,
+                network_trust_bundle,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
@@ -635,6 +1318,10 @@ impl DockerComputeDriver {
                 gpu.wsl_all_gpu_fallback_enabled,
             )),
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
+            start_operation_gates: Arc::new(DockerStartGateRegistry::default()),
+            workspace_archive_transfers: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_DOCKER_WORKSPACE_ARCHIVES,
+            )),
         };
 
         let poll_driver = driver.clone();
@@ -1260,11 +1947,39 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
+        self.start_sandbox_with_snapshot(sandbox_id, sandbox_name, None)
+            .await
+    }
+
+    /// Start a sandbox using optional durable gateway provisioning input.
+    ///
+    /// A supplied snapshot is only used to rebuild an explicitly stopped
+    /// container whose gateway-owned startup generation changed. Existing
+    /// callers without a snapshot retain the historical ID/name-only start
+    /// semantics.
+    async fn start_sandbox_with_snapshot(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox: Option<&DriverSandbox>,
+    ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        if let Some(sandbox) = sandbox {
+            validate_start_snapshot_request_identity(sandbox_id, sandbox_name, sandbox)?;
+        }
+
+        // A replacement keeps the old stopped container while a temporary
+        // successor is created and populated. The gate spans the entire
+        // transaction, including archive transfer and recovery, but is keyed
+        // so a slow sandbox cannot serialize unrelated starts.
+        let _start_operation_guard = self
+            .start_operation_gates
+            .lock_for(sandbox_id, sandbox_name)
+            .await;
         self.lifecycle_event_fences.begin_start(sandbox_id);
         let result = self
-            .start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name)
+            .start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name, sandbox)
             .await;
         self.lifecycle_event_fences.finish_start(sandbox_id);
         span_status.finish(result)
@@ -1274,6 +1989,7 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        sandbox: Option<&DriverSandbox>,
     ) -> Result<bool, Status> {
         let Some(container) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
@@ -1284,18 +2000,68 @@ impl DockerComputeDriver {
         let Some(target) = summary_container_target(&container) else {
             return Ok(false);
         };
+
+        let Some(sandbox) = sandbox else {
+            return self
+                .start_summary_container(sandbox_id, &target, &container)
+                .await;
+        };
+
+        // The list response only locates a candidate. All decisions that can
+        // start or replace a container use a fresh inspection to prove the
+        // canonical name, ownership labels, state, and protected metadata.
+        let source = self
+            .inspect_durable_sandbox_source(&target, sandbox)
+            .await?;
+        if !matches!(
+            source.state,
+            ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::CREATED
+        ) {
+            // A live or otherwise non-startable sandbox is intentionally left
+            // untouched, even if its gateway-owned trust generation changed.
+            return Ok(true);
+        }
+
+        // A configured artifact is mounted directly into every Docker
+        // sandbox. Reverify it before either a normal start or a replacement
+        // so a changed host file cannot be consumed by a stopped container.
+        validate_docker_network_trust_artifact(self.config.network_trust_bundle.as_ref())?;
+
+        let desired_generation = docker_network_trust_generation(&self.config);
+        if source.trust_generation.as_deref() == Some(desired_generation) {
+            return self
+                .start_container_after_fencing(sandbox_id, &target, source.finished_at.as_deref())
+                .await;
+        }
+
+        // Docker's `created` state has never run and is not an explicit stop.
+        // Do not replace it based on a stale/missing generation marker: only
+        // an inspected Exited container may have its writable layer copied.
+        if source.state != ContainerStateStatusEnum::EXITED {
+            return Err(Status::failed_precondition(
+                "Docker sandbox trust reconciliation requires an explicitly stopped container",
+            ));
+        }
+
+        self.replace_stopped_sandbox_for_network_trust(sandbox_id, &target, sandbox, source)
+            .await
+    }
+
+    async fn start_summary_container(
+        &self,
+        sandbox_id: &str,
+        target: &str,
+        container: &ContainerSummary,
+    ) -> Result<bool, Status> {
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         if !container_state_needs_start(state) {
             return Ok(true);
         }
 
-        // Fence a poll that observed this stopped run but has not published it
-        // yet. Use Docker's transition timestamp so a later, genuine exit from
-        // the restarted container remains observable.
         let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             let inspected = self
                 .docker
-                .inspect_container(&target, None)
+                .inspect_container(target, None)
                 .await
                 .map_err(|err| internal_status("inspect docker sandbox before start", err))?;
             inspected
@@ -1306,16 +2072,525 @@ impl DockerComputeDriver {
         } else {
             None
         };
-        self.lifecycle_event_fences
-            .record_previous_exit(sandbox_id, previous_finished_at.as_deref());
+        self.start_container_after_fencing(sandbox_id, target, previous_finished_at.as_deref())
+            .await
+    }
 
-        match self.docker.start_container(&target, None).await {
+    async fn start_container_after_fencing(
+        &self,
+        sandbox_id: &str,
+        target: &str,
+        previous_finished_at: Option<&str>,
+    ) -> Result<bool, Status> {
+        // Fence a poll that observed this stopped run but has not published it
+        // yet. A later genuine exit has a different transition timestamp.
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, previous_finished_at);
+
+        match self.docker.start_container(target, None).await {
             Ok(()) => Ok(true),
-            // Already running — race with another start path or the
-            // restart policy. Treat as success.
+            // Already running — race with another start path or the restart
+            // policy. Treat this ordinary idempotency result as success.
             Err(err) if is_not_modified_error(&err) => Ok(true),
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("start docker sandbox container", err)),
+        }
+    }
+
+    /// Inspect only immutable identity/state metadata from a candidate. The
+    /// returned workspace root is derived exclusively from a driver-created
+    /// label (or the historical `/sandbox` fallback), never Container.Config's
+    /// mutable runtime command, working directory, or mounts.
+    async fn inspect_durable_sandbox_source(
+        &self,
+        target: &str,
+        sandbox: &DriverSandbox,
+    ) -> Result<DockerSandboxInspection, Status> {
+        let inspected = self
+            .docker
+            .inspect_container(target, None)
+            .await
+            .map_err(|_| {
+                Status::internal(
+                    "could not inspect Docker sandbox identity before trust reconciliation",
+                )
+            })?;
+        docker_sandbox_inspection_from_container(&inspected, sandbox, &self.config.sandbox_label)
+    }
+
+    /// Replace an owned, explicitly stopped container whose immutable
+    /// supervisor-start trust generation differs from the gateway's current
+    /// startup snapshot. The replacement body is generated only from durable
+    /// gateway input and current driver configuration; inspect data is never
+    /// used as configuration.
+    async fn replace_stopped_sandbox_for_network_trust(
+        &self,
+        sandbox_id: &str,
+        old_target: &str,
+        sandbox: &DriverSandbox,
+        source: DockerSandboxInspection,
+    ) -> Result<bool, Status> {
+        let desired_generation = docker_network_trust_generation(&self.config).to_string();
+        if source.state != ContainerStateStatusEnum::EXITED
+            || source.trust_generation.as_deref() == Some(desired_generation.as_str())
+        {
+            return Err(Status::failed_precondition(
+                "Docker sandbox changed before trust reconciliation could begin",
+            ));
+        }
+
+        let validated = Self::validated_sandbox(sandbox, &self.config)?;
+        // A public start snapshot deliberately omits the raw JWT. Reuse only
+        // its deterministic driver-owned token file, without reading or
+        // copying an old container's environment/mount configuration.
+        validate_existing_sandbox_token_file(sandbox_id, &self.config)?;
+        let nested_mounts = docker_workspace_nested_mount_destinations(
+            &validated.driver_config,
+            &source.workspace_root,
+        )?;
+        let archive_filter =
+            DockerWorkspaceArchiveFilter::new(&source.workspace_root, nested_mounts)
+                .map_err(DockerWorkspaceArchiveError::status)?;
+
+        // Export and validate the entire old workspace before a Docker image
+        // pull, replacement create, rename, remove, or start. Globally admit
+        // one archive pipeline at a time, then filter the bounded raw daemon
+        // stream directly into one anonymous private tempfile. Keep the
+        // permit through upload so no second on-disk archive overlaps it.
+        let workspace_archive_transfer = self
+            .workspace_archive_transfers
+            .acquire()
+            .await
+            .map_err(|_| Status::internal("Docker workspace archive admission is unavailable"))?;
+        let workspace_archive = self
+            .download_filtered_workspace_archive(old_target, &source.workspace_root, archive_filter)
+            .await?;
+
+        // All remaining launch preparation is still read-only with respect to
+        // the old sandbox. A reinspection after the potentially long archive
+        // transfer prevents a concurrently started/tampered source from ever
+        // reaching a name mutation.
+        let current_source = self
+            .inspect_durable_sandbox_source(old_target, sandbox)
+            .await?;
+        validate_replacement_source_unchanged(&current_source, &source, &desired_generation)?;
+        self.validate_user_volume_mounts_available(&validated.driver_config)
+            .await?;
+        let image = self
+            .ensure_image_available(sandbox_id, &validated.template.image)
+            .await?;
+        let replacement_workspace_root = docker_workspace_root(&image)?;
+        if replacement_workspace_root != source.workspace_root {
+            return Err(Status::failed_precondition(
+                "Docker replacement image workspace root differs from protected stopped sandbox metadata",
+            ));
+        }
+        let gpu_devices = self
+            .resolve_gpu_cdi_devices(
+                validated.gpu_requirements,
+                &validated.driver_config,
+                CdiGpuDefaultSelector::next_device_ids,
+            )
+            .await?;
+        let create_body = build_replacement_container_create_body_for_image(
+            sandbox,
+            &self.config,
+            &validated.driver_config,
+            gpu_devices.as_deref(),
+            &image,
+        )?;
+        let canonical_name = container_name_for_sandbox(sandbox);
+        let replacement_target = self
+            .create_prepared_replacement(&canonical_name, create_body)
+            .await?;
+
+        let archive_bytes = workspace_archive.len();
+        let restore = self
+            .docker
+            .upload_to_container(
+                &replacement_target,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path(workspace_archive_restore_parent(&source.workspace_root)?)
+                        // Refuse a type-changing overwrite during daemon-side
+                        // extraction of the filtered archive.
+                        .no_overwrite_dir_non_dir("true")
+                        // Preserve archive uid/gid headers rather than making
+                        // them match the destination container root user.
+                        .copy_uidgid("false")
+                        .build(),
+                ),
+                body_try_stream(workspace_archive.into_upload_stream()),
+            )
+            .await;
+        if restore.is_err() {
+            self.remove_unstarted_replacement(&replacement_target).await;
+            return Err(Status::internal(
+                "could not restore filtered Docker sandbox workspace into replacement container",
+            ));
+        }
+        drop(workspace_archive_transfer);
+        debug!(
+            sandbox_id,
+            workspace_archive_bytes = archive_bytes,
+            "prepared replacement Docker sandbox workspace archive"
+        );
+
+        // The source must remain the same explicitly stopped owned container
+        // through restore. Inspection is identity/state-only; no old runtime
+        // configuration is read or cloned.
+        let current_source = self
+            .inspect_durable_sandbox_source(old_target, sandbox)
+            .await?;
+        if let Err(error) =
+            validate_replacement_source_unchanged(&current_source, &source, &desired_generation)
+        {
+            self.remove_unstarted_replacement(&replacement_target).await;
+            return Err(error);
+        }
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, current_source.finished_at.as_deref());
+
+        let result = self
+            .swap_and_start_replacement(old_target, &canonical_name, &replacement_target)
+            .await;
+        if result.is_ok() {
+            // The polling loop may already hold an exit snapshot for the old
+            // ID. Retain that exact ID until the canonical successor snapshot
+            // is published; the removed container can no longer be inspected
+            // by timestamp to prove that its exit predates this start.
+            self.lifecycle_event_fences
+                .record_superseded_instance(sandbox_id, old_target);
+        }
+        result
+    }
+
+    /// Create an unstarted successor before touching the canonical source
+    /// name. Random UUID components make a collision impractical; bounded
+    /// retries still handle a stale failed operation without looping forever.
+    async fn create_prepared_replacement(
+        &self,
+        canonical_name: &str,
+        create_body: ContainerCreateBody,
+    ) -> Result<String, Status> {
+        for _ in 0..DOCKER_REPLACEMENT_NAME_ATTEMPTS {
+            let replacement_name = temporary_replacement_container_name(canonical_name);
+            match self
+                .docker
+                .create_container(
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(&replacement_name)
+                            .build(),
+                    ),
+                    create_body.clone(),
+                )
+                .await
+            {
+                Ok(replacement) if !replacement.id.is_empty() => {
+                    return Ok(replacement.id);
+                }
+                Ok(_) => {
+                    self.remove_unstarted_replacement(&replacement_name).await;
+                    return Err(Status::internal(
+                        "Docker did not return an ID for the replacement sandbox container",
+                    ));
+                }
+                Err(error) if is_conflict_error(&error) => {}
+                Err(_) => {
+                    return Err(Status::internal(
+                        "could not create unstarted Docker replacement sandbox container",
+                    ));
+                }
+            }
+        }
+        Err(Status::failed_precondition(
+            "could not reserve a temporary Docker replacement container name",
+        ))
+    }
+
+    async fn download_filtered_workspace_archive(
+        &self,
+        target: &str,
+        workspace_root: &str,
+        filter: DockerWorkspaceArchiveFilter,
+    ) -> Result<DockerWorkspaceArchive, Status> {
+        let stream = self.docker.download_from_container(
+            target,
+            Some(
+                DownloadFromContainerOptionsBuilder::default()
+                    .path(workspace_root)
+                    .build(),
+            ),
+        );
+        download_and_filter_docker_workspace_archive(
+            stream,
+            filter,
+            MAX_DOCKER_WORKSPACE_ARCHIVE_BYTES,
+        )
+        .await
+        .map_err(DockerWorkspaceArchiveError::status)
+    }
+
+    async fn remove_unstarted_replacement(&self, target: &str) {
+        match self
+            .docker
+            .remove_container(
+                target,
+                Some(
+                    RemoveContainerOptionsBuilder::default()
+                        .force(false)
+                        .v(false)
+                        .build(),
+                ),
+            )
+            .await
+        {
+            Ok(())
+            | Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(_) => warn!(
+                replacement_container = target,
+                "Failed to remove unstarted Docker replacement container"
+            ),
+        }
+    }
+
+    /// Inspect the IDs retained across a replacement operation. This is kept
+    /// deliberately narrower than normal durable-source inspection: recovery
+    /// needs only a name and state and must work after a name hand-off.
+    async fn inspect_replacement_recovery_container(
+        &self,
+        target: &str,
+    ) -> Result<Option<DockerReplacementRecoveryContainer>, Status> {
+        match self.docker.inspect_container(target, None).await {
+            Ok(container) => Ok(Some(DockerReplacementRecoveryContainer {
+                name: container.name.unwrap_or_default(),
+                state: container.state.and_then(|state| state.status),
+            })),
+            Err(error) if is_not_found_error(&error) => Ok(None),
+            Err(_) => Err(Status::internal(
+                "could not inspect Docker replacement recovery state",
+            )),
+        }
+    }
+
+    /// Compensate an uncertain rename or removal using stable IDs, never a
+    /// guessed name. It only removes the known successor after proving it is
+    /// stopped, always sends `force=false,v=false`, and verifies the result
+    /// rather than trusting an ambiguous daemon/transport response.
+    async fn rollback_replacement_swap(
+        &self,
+        old_target: &str,
+        canonical_name: &str,
+        replacement_target: &str,
+    ) -> Result<ReplacementRecovery, Status> {
+        let old = self
+            .inspect_replacement_recovery_container(old_target)
+            .await?;
+        let replacement = self
+            .inspect_replacement_recovery_container(replacement_target)
+            .await?;
+
+        let Some(old) = old else {
+            let Some(replacement) = replacement else {
+                return Err(Status::internal(
+                    "could not recover Docker replacement: neither stable container ID remains",
+                ));
+            };
+            // An ambiguous old-container removal is only recoverable by
+            // starting the successor when its stable ID proves it received
+            // the canonical name. Do not claim retryability for a temporary
+            // successor that would leave no canonical sandbox to retry.
+            if replacement.name.trim_start_matches('/') != canonical_name {
+                return Err(Status::internal(
+                    "could not recover Docker replacement: previous container disappeared without a canonical successor",
+                ));
+            }
+            if !matches!(
+                replacement.state,
+                Some(ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EXITED)
+            ) {
+                return Err(Status::failed_precondition(
+                    "could not recover Docker replacement: canonical successor is not safely stopped",
+                ));
+            }
+            return Ok(ReplacementRecovery::OldGone);
+        };
+        if old.state != Some(ContainerStateStatusEnum::EXITED) {
+            return Err(Status::failed_precondition(
+                "could not recover Docker replacement: previous container is no longer explicitly stopped",
+            ));
+        }
+
+        if let Some(replacement) = replacement {
+            if !matches!(
+                replacement.state,
+                Some(ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EXITED)
+            ) {
+                return Err(Status::failed_precondition(
+                    "could not recover Docker replacement: replacement container is not safely stopped",
+                ));
+            }
+            // The create response ID is stable even if the replacement rename
+            // was applied before its error reached us. Removing it by ID first
+            // frees the canonical name without touching volumes.
+            let _ = self
+                .docker
+                .remove_container(
+                    replacement_target,
+                    Some(
+                        RemoveContainerOptionsBuilder::default()
+                            .force(false)
+                            .v(false)
+                            .build(),
+                    ),
+                )
+                .await;
+            if self
+                .inspect_replacement_recovery_container(replacement_target)
+                .await?
+                .is_some()
+            {
+                return Err(Status::internal(
+                    "could not recover Docker replacement: stopped replacement remains after non-forced removal",
+                ));
+            }
+        }
+
+        if old.name.trim_start_matches('/') != canonical_name {
+            let _ = self
+                .docker
+                .rename_container(
+                    old_target,
+                    RenameContainerOptionsBuilder::default()
+                        .name(canonical_name)
+                        .build(),
+                )
+                .await;
+            let Some(old) = self
+                .inspect_replacement_recovery_container(old_target)
+                .await?
+            else {
+                return Err(Status::internal(
+                    "could not recover Docker replacement: previous container disappeared while restoring its name",
+                ));
+            };
+            if old.name.trim_start_matches('/') != canonical_name {
+                return Err(Status::internal(
+                    "could not recover Docker replacement: previous stopped container remains under a recovery name",
+                ));
+            }
+        }
+
+        Ok(ReplacementRecovery::OldRestored)
+    }
+
+    /// Atomically hand the canonical name from an old stopped source to its
+    /// restored successor. The old container is removed with `v=false` before
+    /// start, so a later start failure leaves the fully prepared replacement
+    /// stopped under the ordinary canonical name for retry.
+    async fn swap_and_start_replacement(
+        &self,
+        old_target: &str,
+        canonical_name: &str,
+        replacement_target: &str,
+    ) -> Result<bool, Status> {
+        let backup_name = temporary_replacement_backup_name(canonical_name);
+        if self
+            .docker
+            .rename_container(
+                old_target,
+                RenameContainerOptionsBuilder::default()
+                    .name(&backup_name)
+                    .build(),
+            )
+            .await
+            .is_err()
+        {
+            return Err(
+                match self
+                    .rollback_replacement_swap(old_target, canonical_name, replacement_target)
+                    .await
+                {
+                    Ok(ReplacementRecovery::OldRestored) => Status::internal(
+                        "could not rename stopped Docker sandbox before replacement; restored the original stopped sandbox",
+                    ),
+                    Ok(ReplacementRecovery::OldGone) => Status::internal(
+                        "could not rename stopped Docker sandbox before replacement; previous container was already removed",
+                    ),
+                    Err(status) => status,
+                },
+            );
+        }
+
+        if self
+            .docker
+            .rename_container(
+                replacement_target,
+                RenameContainerOptionsBuilder::default()
+                    .name(canonical_name)
+                    .build(),
+            )
+            .await
+            .is_err()
+        {
+            return Err(
+                match self
+                    .rollback_replacement_swap(old_target, canonical_name, replacement_target)
+                    .await
+                {
+                    Ok(ReplacementRecovery::OldRestored) => Status::internal(
+                        "could not rename prepared Docker replacement; restored the original stopped sandbox",
+                    ),
+                    Ok(ReplacementRecovery::OldGone) => Status::internal(
+                        "could not rename prepared Docker replacement; previous container was already removed",
+                    ),
+                    Err(status) => status,
+                },
+            );
+        }
+
+        if self
+            .docker
+            .remove_container(
+                old_target,
+                Some(
+                    RemoveContainerOptionsBuilder::default()
+                        .force(false)
+                        .v(false)
+                        .build(),
+                ),
+            )
+            .await
+            .is_err()
+        {
+            // A transport error is not proof that Docker retained the old
+            // stopped ID. Re-inspect both stable IDs before deciding whether
+            // to start the canonical successor or compensate the swap.
+            match self
+                .rollback_replacement_swap(old_target, canonical_name, replacement_target)
+                .await
+            {
+                Ok(ReplacementRecovery::OldGone) => {}
+                Ok(ReplacementRecovery::OldRestored) => {
+                    return Err(Status::internal(
+                        "could not confirm removal of the previous stopped Docker sandbox; restored the original stopped sandbox",
+                    ));
+                }
+                Err(status) => return Err(status),
+            }
+        }
+
+        match self.docker.start_container(canonical_name, None).await {
+            Ok(())
+            | Err(BollardError::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(true),
+            Err(_) => Err(Status::internal(
+                "could not start the restored Docker replacement sandbox; the replacement remains stopped for retry",
+            )),
         }
     }
 
@@ -1425,6 +2700,12 @@ impl DockerComputeDriver {
             .await?
             && let Some(sandbox) = sandbox_from_container_summary(&summary)
         {
+            if !driver_sandbox_reports_container_exit(&sandbox) {
+                // The canonical successor is now observable, so a later poll
+                // cannot legitimately rediscover a removed predecessor.
+                self.lifecycle_event_fences
+                    .clear_superseded_instances(sandbox_id);
+            }
             self.publish_sandbox_snapshot(sandbox);
         }
         Ok(())
@@ -1556,15 +2837,26 @@ impl DockerComputeDriver {
             );
             return true;
         }
-        let Some(previous_finished_at) = self.lifecycle_event_fences.previous_exit(&sandbox.id)
-        else {
-            return false;
-        };
         let Some(container_id) = sandbox
             .status
             .as_ref()
             .map(|status| status.instance_id.as_str())
             .filter(|container_id| !container_id.is_empty())
+        else {
+            return false;
+        };
+        if self
+            .lifecycle_event_fences
+            .is_superseded_instance(&sandbox.id, container_id)
+        {
+            debug!(
+                sandbox_id = %sandbox.id,
+                container_id,
+                "Ignoring Docker container exit snapshot for a replaced instance"
+            );
+            return true;
+        }
+        let Some(previous_finished_at) = self.lifecycle_event_fences.previous_exit(&sandbox.id)
         else {
             return false;
         };
@@ -2073,17 +3365,35 @@ impl ComputeDriver for DockerComputeDriver {
         span_status.finish(Ok(Response::new(StopSandboxResponse {})))
     }
 
+    #[tracing::instrument(
+        name = "docker.start_sandbox",
+        skip(self, request),
+        fields(
+            otel.name = "docker.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %request.get_ref().sandbox_id,
+            sandbox.name = %request.get_ref().sandbox_name,
+        )
+    )]
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
-        if !Self::start_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
-            return Err(Status::not_found("sandbox not found"));
+        if !Self::start_sandbox_with_snapshot(
+            self,
+            &request.sandbox_id,
+            &request.sandbox_name,
+            request.sandbox.as_ref(),
+        )
+        .await?
+        {
+            return span_status.finish(Err(Status::not_found("sandbox not found")));
         }
         self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
             .await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        span_status.finish(Ok(Response::new(StartSandboxResponse {})))
     }
 
     #[tracing::instrument(
@@ -2780,15 +4090,91 @@ fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
     args
 }
 
+fn docker_network_trust_cli_args(
+    network_trust_bundle: Option<&NetworkSupervisorTrustBundle>,
+) -> Vec<String> {
+    network_trust_bundle.map_or_else(Vec::new, |bundle| {
+        vec![
+            "--network-additional-ca-bundle".to_string(),
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+            "--network-additional-ca-digest".to_string(),
+            bundle.digest().to_string(),
+        ]
+    })
+}
+
+fn docker_network_trust_generation(config: &DockerDriverRuntimeConfig) -> &str {
+    config.network_trust_bundle.as_ref().map_or(
+        NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+        NetworkSupervisorTrustBundle::digest,
+    )
+}
+
+/// Revalidate the immutable gateway startup snapshot immediately before a
+/// container is built. The verifier deliberately emits only its path/digest,
+/// never certificate bytes.
+fn validate_docker_network_trust_artifact(
+    network_trust_bundle: Option<&NetworkSupervisorTrustBundle>,
+) -> Result<(), Status> {
+    let Some(bundle) = network_trust_bundle else {
+        return Ok(());
+    };
+    bundle.verify_artifact().map_err(|error| {
+        Status::failed_precondition(format!(
+            "gateway-owned network additional CA artifact failed validation: {error}"
+        ))
+    })
+}
+
+fn docker_network_trust_bind(bundle: &NetworkSupervisorTrustBundle) -> Result<String, Status> {
+    validate_docker_network_trust_artifact(Some(bundle))?;
+    let path = bundle.artifact_path();
+    let source = path.to_str().ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "network additional CA artifact path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    driver_mounts::validate_absolute_mount_source(source, "network additional CA artifact")
+        .map_err(Status::failed_precondition)?;
+    Ok(format!(
+        "{}:{NETWORK_ADDITIONAL_CA_BUNDLE_PATH}:ro,z",
+        path.display()
+    ))
+}
+
+fn sandbox_has_request_token(sandbox: &DriverSandbox) -> bool {
+    sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+}
+
+#[cfg(test)]
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+) -> Result<Vec<String>, Status> {
+    build_binds_with_sandbox_token_file(sandbox, config, sandbox_has_request_token(sandbox))
+}
+
+/// Build driver-owned bind mounts. `include_sandbox_token_file` is true for a
+/// stopped-container replacement because the gateway deliberately removes the
+/// bearer token from the durable public snapshot; the existing driver-owned
+/// token file is reused without reading or exposing its contents.
+fn build_binds_with_sandbox_token_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    include_sandbox_token_file: bool,
 ) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
         config.supervisor_bin.display(),
         SUPERVISOR_MOUNT_PATH
     )];
+    if let Some(network_trust_bundle) = config.network_trust_bundle.as_ref() {
+        binds.push(docker_network_trust_bind(network_trust_bundle)?);
+    }
     if let Some(tls) = &config.guest_tls {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
         binds.push(format!(
@@ -2798,11 +4184,7 @@ fn build_binds(
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    if sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| !spec.sandbox_token.is_empty())
-    {
+    if include_sandbox_token_file {
         binds.push(format!(
             "{}:{}:ro,z",
             sandbox_token_host_path(sandbox, config)?.display(),
@@ -2850,6 +4232,37 @@ fn sandbox_token_host_path_by_id(
             "resolve sandbox token state directory failed: {err}"
         ))
     })
+}
+
+/// A durable public start snapshot intentionally omits the sandbox JWT. Before
+/// rebuilding, ensure the original driver-owned bind source is still a regular
+/// file rather than letting Docker follow a substituted path or create a new
+/// empty source. The bearer is never read or included in diagnostics.
+fn validate_existing_sandbox_token_file(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    let path = sandbox_token_host_path_by_id(sandbox_id, config)?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        Status::failed_precondition(
+            "Docker stopped sandbox replacement requires its existing driver-owned authentication state",
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Status::failed_precondition(
+            "Docker stopped sandbox replacement authentication state is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Status::failed_precondition(
+                "Docker stopped sandbox replacement authentication state is not owner-restricted",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn write_sandbox_token_file(
@@ -2928,10 +4341,25 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     build_environment_for_oci_user(sandbox, config, "")
 }
 
+#[cfg(test)]
 fn build_environment_for_oci_user(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     oci_user: &str,
+) -> Vec<String> {
+    build_environment_for_oci_user_with_sandbox_token_file(
+        sandbox,
+        config,
+        oci_user,
+        sandbox_has_request_token(sandbox),
+    )
+}
+
+fn build_environment_for_oci_user_with_sandbox_token_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    oci_user: &str,
+    include_sandbox_token_file: bool,
 ) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
@@ -3040,9 +4468,7 @@ fn build_environment_for_oci_user(
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
-    if let Some(spec) = sandbox.spec.as_ref()
-        && !spec.sandbox_token.is_empty()
-    {
+    if include_sandbox_token_file {
         environment.insert(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
             SANDBOX_TOKEN_MOUNT_PATH.to_string(),
@@ -3149,6 +4575,44 @@ fn build_container_create_body_for_image(
     gpu_device_ids: Option<&[String]>,
     image: &DockerImageMetadata,
 ) -> Result<ContainerCreateBody, Status> {
+    build_container_create_body_for_image_with_sandbox_token_file(
+        sandbox,
+        config,
+        driver_config,
+        gpu_device_ids,
+        image,
+        sandbox_has_request_token(sandbox),
+    )
+}
+
+/// Build a replacement body from durable gateway input. Unlike an initial
+/// create request, a durable start snapshot deliberately has no raw JWT; its
+/// existing driver-owned token file is therefore mounted explicitly.
+fn build_replacement_container_create_body_for_image(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    driver_config: &DockerSandboxDriverConfig,
+    gpu_device_ids: Option<&[String]>,
+    image: &DockerImageMetadata,
+) -> Result<ContainerCreateBody, Status> {
+    build_container_create_body_for_image_with_sandbox_token_file(
+        sandbox,
+        config,
+        driver_config,
+        gpu_device_ids,
+        image,
+        true,
+    )
+}
+
+fn build_container_create_body_for_image_with_sandbox_token_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    driver_config: &DockerSandboxDriverConfig,
+    gpu_device_ids: Option<&[String]>,
+    image: &DockerImageMetadata,
+    include_sandbox_token_file: bool,
+) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
         .as_ref()
@@ -3208,6 +4672,22 @@ fn build_container_create_body_for_image(
         LABEL_SANDBOX_WORKSPACE.to_string(),
         sandbox.workspace.clone(),
     );
+    // Record the resolved container path as immutable driver metadata. The
+    // durable gateway snapshot intentionally contains no inspected OCI image
+    // configuration, so this lets a future stopped replacement reject a
+    // mutable image working-directory change instead of copying the wrong
+    // writable layer.
+    labels.insert(
+        DOCKER_SANDBOX_WORKSPACE_ROOT_LABEL.to_string(),
+        workspace_root.clone(),
+    );
+    // This protected label must overwrite any user-supplied template value.
+    // `none` is intentional: it differentiates a current no-CA sandbox from
+    // an old resource created before generation reconciliation existed.
+    labels.insert(
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
+        docker_network_trust_generation(config).to_string(),
+    );
     // The list/get/find paths filter by `config.sandbox_label`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
@@ -3223,13 +4703,21 @@ fn build_container_create_body_for_image(
         // The image workspace may need to be created or rejected by the
         // supervisor, so do not let the OCI runtime chdir there first.
         working_dir: Some("/".to_string()),
-        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
+        env: Some(build_environment_for_oci_user_with_sandbox_token_file(
+            sandbox,
+            config,
+            &image.user,
+            include_sandbox_token_file,
+        )),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Replace the image CMD with the supervisor's resolved workspace
         // argument so Docker cannot append inherited image arguments.
         cmd: {
             let mut args = vec!["--workdir".to_string(), workspace_root];
             args.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+            args.extend(docker_network_trust_cli_args(
+                config.network_trust_bundle.as_ref(),
+            ));
             Some(args)
         },
         labels: Some(labels),
@@ -3239,7 +4727,11 @@ fn build_container_create_body_for_image(
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
             binds: {
-                let mut binds = build_binds(sandbox, config)?;
+                let mut binds = build_binds_with_sandbox_token_file(
+                    sandbox,
+                    config,
+                    include_sandbox_token_file,
+                )?;
                 binds.extend(user_bind_strings);
                 Some(binds)
             },
@@ -3274,6 +4766,178 @@ fn build_container_create_body_for_image(
     })
 }
 
+/// Validate that gateway durable start input names exactly the resource in the
+/// lifecycle request. ID/name-only starts intentionally remain supported for
+/// independently versioned callers, but a rebuild must never pick a resource
+/// by just one mutable label.
+fn validate_start_snapshot_request_identity(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    sandbox: &DriverSandbox,
+) -> Result<(), Status> {
+    if sandbox.id != sandbox_id {
+        return Err(Status::invalid_argument(
+            "start sandbox snapshot identity does not match sandbox_id",
+        ));
+    }
+    if sandbox.name != sandbox_name {
+        return Err(Status::invalid_argument(
+            "start sandbox snapshot identity does not match sandbox_name",
+        ));
+    }
+    Ok(())
+}
+
+/// Require the labels that make a Docker container a resource of this driver,
+/// not merely a similarly named container. This is used after a list lookup and
+/// again after an inspect so an out-of-band relabel/rename cannot become a
+/// replacement source.
+fn validate_docker_managed_container_labels(
+    labels: &HashMap<String, String>,
+    sandbox: &DriverSandbox,
+    namespace: &str,
+) -> Result<(), Status> {
+    let expected = [
+        (LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE),
+        (LABEL_SANDBOX_NAMESPACE, namespace),
+        (LABEL_SANDBOX_ID, sandbox.id.as_str()),
+        (LABEL_SANDBOX_NAME, sandbox.name.as_str()),
+        (LABEL_SANDBOX_WORKSPACE, sandbox.workspace.as_str()),
+    ];
+    if expected
+        .into_iter()
+        .any(|(key, value)| labels.get(key).map(String::as_str) != Some(value))
+    {
+        return Err(Status::failed_precondition(
+            "resolved Docker container is not owned by the requested durable sandbox",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct DockerSandboxInspection {
+    state: ContainerStateStatusEnum,
+    finished_at: Option<String>,
+    trust_generation: Option<String>,
+    workspace_root: String,
+}
+
+/// Minimal state used only to resolve an ambiguous Docker response during the
+/// replacement name hand-off. Container IDs—not names—address these probes.
+struct DockerReplacementRecoveryContainer {
+    name: String,
+    state: Option<ContainerStateStatusEnum>,
+}
+
+#[derive(Clone, Copy)]
+enum ReplacementRecovery {
+    /// The old ID was absent after an uncertain old-container removal, so the
+    /// canonical successor is already the only viable container to start.
+    OldGone,
+    /// The successor was safely discarded and the stopped old ID is canonical.
+    OldRestored,
+}
+
+/// Extract only the protected, driver-owned metadata needed for a durable
+/// start. The inspected container's command, environment, working directory,
+/// image, and mount configuration are deliberately not used as input to a
+/// replacement.
+fn docker_sandbox_inspection_from_container(
+    container: &ContainerInspectResponse,
+    sandbox: &DriverSandbox,
+    namespace: &str,
+) -> Result<DockerSandboxInspection, Status> {
+    let labels = container
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "resolved Docker container did not report managed sandbox labels",
+            )
+        })?;
+    validate_docker_managed_container_labels(labels, sandbox, namespace)?;
+
+    let canonical_name = container_name_for_sandbox(sandbox);
+    let actual_name = container
+        .name
+        .as_deref()
+        .and_then(|name| name.strip_prefix('/').or(Some(name)));
+    if actual_name != Some(canonical_name.as_str()) {
+        return Err(Status::failed_precondition(
+            "resolved Docker container name does not match durable sandbox identity",
+        ));
+    }
+
+    let state = container
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "resolved Docker container did not report a container state",
+            )
+        })?;
+    Ok(DockerSandboxInspection {
+        finished_at: container
+            .state
+            .as_ref()
+            .filter(|state| state.status == Some(ContainerStateStatusEnum::EXITED))
+            .and_then(|state| state.finished_at.clone()),
+        state,
+        trust_generation: labels.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY).cloned(),
+        workspace_root: docker_workspace_root_from_protected_labels(labels)?,
+    })
+}
+
+/// Resolve a workspace archive root from a protected driver label. A missing
+/// label is the sole legacy case and deliberately means the old fixed
+/// `/sandbox`; an empty, root, or otherwise non-normalized label is rejected.
+fn docker_workspace_root_from_protected_labels(
+    labels: &HashMap<String, String>,
+) -> Result<String, Status> {
+    let Some(root) = labels.get(DOCKER_SANDBOX_WORKSPACE_ROOT_LABEL) else {
+        return Ok(driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string());
+    };
+    let normalized = driver_mounts::resolve_oci_workspace_root(root).map_err(|_| {
+        Status::failed_precondition(
+            "Docker sandbox protected workspace-root metadata is not a normalized workspace path",
+        )
+    })?;
+    if normalized != *root {
+        return Err(Status::failed_precondition(
+            "Docker sandbox protected workspace-root metadata is not a normalized workspace path",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_replacement_source_unchanged(
+    current: &DockerSandboxInspection,
+    original: &DockerSandboxInspection,
+    desired_generation: &str,
+) -> Result<(), Status> {
+    if current.state != ContainerStateStatusEnum::EXITED {
+        return Err(Status::failed_precondition(
+            "Docker sandbox is no longer explicitly stopped; refusing trust replacement",
+        ));
+    }
+    if current.workspace_root != original.workspace_root
+        || current.trust_generation != original.trust_generation
+    {
+        return Err(Status::failed_precondition(
+            "Docker sandbox protected metadata changed during trust reconciliation",
+        ));
+    }
+    if current.trust_generation.as_deref() == Some(desired_generation) {
+        return Err(Status::failed_precondition(
+            "Docker sandbox trust generation changed during reconciliation",
+        ));
+    }
+    Ok(())
+}
+
 /// Reject driver requests that arrive with neither a sandbox id nor a
 /// sandbox name. Without this guard, downstream label filters degenerate
 /// to "match every managed container in the namespace", which would let
@@ -3286,6 +4950,101 @@ fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn docker_workspace_root(image: &DockerImageMetadata) -> Result<String, Status> {
+    driver_mounts::resolve_oci_workspace_root(&image.working_dir)
+        .map_err(Status::failed_precondition)
+}
+
+/// Determine the nested user mount paths solely from the durable gateway
+/// snapshot. Docker's archive endpoint includes mounted content, so these
+/// paths are removed from the old writable-layer archive before it is restored
+/// into a replacement that reconstructs the mounts from the same snapshot.
+fn docker_workspace_nested_mount_destinations(
+    driver_config: &DockerSandboxDriverConfig,
+    workspace_root: &str,
+) -> Result<Vec<DockerArchivePath>, Status> {
+    let normalized_workspace_root = driver_mounts::normalize_mount_target(workspace_root);
+    let workspace = Path::new(&normalized_workspace_root);
+    let mut nested = Vec::new();
+
+    for mount in &driver_config.mounts {
+        let target = docker_driver_mount_target(mount);
+        driver_mounts::validate_container_mount_target(target).map_err(|_| {
+            Status::failed_precondition(
+                "Docker trust reconciliation requires valid durable user mount destinations",
+            )
+        })?;
+        // Create validation accepts a trailing slash. Normalize only for the
+        // semantic workspace and archive-path comparison below; validation
+        // above remains responsible for rejecting unsafe path segments.
+        let normalized = driver_mounts::normalize_mount_target(target);
+        let normalized_path = Path::new(&normalized);
+        if driver_mounts::path_is_or_under(workspace, normalized_path) {
+            return Err(Status::failed_precondition(
+                "Docker durable user mount masks the protected workspace root during trust reconciliation",
+            ));
+        }
+        if !driver_mounts::path_is_or_under(normalized_path, workspace) {
+            continue;
+        }
+
+        let relative = normalized
+            .strip_prefix(&normalized_workspace_root)
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "Docker durable user mount does not have an unambiguous protected workspace destination",
+                )
+            })?;
+        let components = docker_archive_path_components(relative.as_bytes()).map_err(|_| {
+            Status::failed_precondition(
+                "Docker trust reconciliation requires normalized nested user mount destinations",
+            )
+        })?;
+        nested.push(components);
+    }
+
+    nested.sort();
+    if nested.windows(2).any(|pair| {
+        pair[1].len() >= pair[0].len()
+            && pair[0]
+                .iter()
+                .zip(&pair[1])
+                .all(|(left, right)| left == right)
+    }) {
+        return Err(Status::failed_precondition(
+            "Docker durable nested user mount destinations overlap and cannot be reconciled safely",
+        ));
+    }
+    Ok(nested)
+}
+
+fn docker_driver_mount_target(mount: &DockerDriverMountConfig) -> &str {
+    match mount {
+        DockerDriverMountConfig::Bind { target, .. }
+        | DockerDriverMountConfig::Volume { target, .. }
+        | DockerDriverMountConfig::Tmpfs { target, .. }
+        | DockerDriverMountConfig::Image { target, .. } => target,
+    }
+}
+
+/// Docker rebases `GET /archive?path=<workspace>` to the workspace basename.
+/// Extract it into the parent to recreate that exact path without interpreting
+/// the archive locally.
+fn workspace_archive_restore_parent(workspace_root: &str) -> Result<&str, Status> {
+    if workspace_root == driver_mounts::DEFAULT_WORKSPACE_ROOT {
+        return Ok("/");
+    }
+    workspace_root.rsplit_once('/').map_or_else(
+        || {
+            Err(Status::failed_precondition(
+                "Docker workspace path has no archive restoration parent",
+            ))
+        },
+        |(parent, _)| Ok(if parent.is_empty() { "/" } else { parent }),
+    )
 }
 
 fn docker_container_openshell_endpoint(endpoint: &str, host: &str, port: u16) -> String {
@@ -3902,6 +5661,28 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
         name
     };
     format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
+}
+
+/// Derive a bounded collision-resistant temporary name without changing the
+/// durable container identity. The UUID never enters gateway state and avoids
+/// stale-name collisions across gateway processes as well as concurrent calls.
+fn temporary_replacement_container_name(canonical_name: &str) -> String {
+    temporary_replacement_name(canonical_name, "replacement")
+}
+
+fn temporary_replacement_backup_name(canonical_name: &str) -> String {
+    temporary_replacement_name(canonical_name, "backup")
+}
+
+fn temporary_replacement_name(canonical_name: &str, purpose: &str) -> String {
+    let suffix = format!("-reconcile-{purpose}-{}", Uuid::new_v4().simple());
+    let prefix_len = MAX_CONTAINER_NAME_LEN.saturating_sub(suffix.len());
+    // Canonical Docker names are ASCII after `sanitize_docker_name`, so byte
+    // truncation cannot split UTF-8 and preserves the length contract.
+    let prefix = trim_container_name_tail(
+        canonical_name[..canonical_name.len().min(prefix_len)].to_string(),
+    );
+    format!("{prefix}{suffix}")
 }
 
 /// Docker container names may not end with `-`, `.`, or `_`. Truncation can

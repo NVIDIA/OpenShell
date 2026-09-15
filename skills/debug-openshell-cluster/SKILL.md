@@ -326,6 +326,91 @@ kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
 
+#### Additional destination CA ConfigMap
+
+When `supervisor.network.additionalCaConfigMapName` is set, Helm must mount the
+**source** operator ConfigMap's `ca.crt` key into the gateway at
+`/etc/openshell-tls/network-additional-ca-source/ca.crt`. The rendered
+`gateway.toml` must contain the global (not Kubernetes-driver-local) setting:
+
+```toml
+[openshell.supervisor.network]
+additional_ca_cert_paths = ["/etc/openshell-tls/network-additional-ca-source/ca.crt"]
+```
+
+Inspect the source, render, and live gateway mount before inspecting sandbox
+pods:
+
+```bash
+helm -n openshell get values openshell | grep -A3 additionalCaConfigMapName
+kubectl -n openshell get configmap <source-configmap> -o jsonpath='{.data.ca\.crt}' >/dev/null
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A2 '^\[openshell.supervisor.network\]'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="network-additional-ca-source")]}{"\n"}'
+```
+
+At startup, the gateway normalizes the source once and stages a
+content-addressed, read-only artifact below
+`/var/lib/openshell-state/openshell/network-supervisor/`. The gateway workload
+sets `XDG_STATE_HOME=/var/lib/openshell-state` and mounts the writable
+`gateway-state` volume there. Check that wiring before debugging the driver:
+
+```bash
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.containers[0].env[?(@.name=="XDG_STATE_HOME")]}{"\n"}'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.containers[0].volumeMounts[?(@.name=="gateway-state")]}{"\n"}'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="gateway-state")]}{"\n"}'
+```
+
+At sandbox creation or restart, the Kubernetes driver creates or verifies an
+immutable, content-addressed ConfigMap in the target sandbox namespace. Its
+name binds the effective gateway identity and normalized trust digest. The
+managed ConfigMap must have `openshell.ai/managed-by=openshell`, the matching
+`openshell.ai/gateway-id` label, and an
+`openshell.ai/network-supervisor-trust-generation` annotation. Different trust
+generations intentionally coexist so running sandboxes retain their startup
+trust. The pod receives that expected digest as a protected supervisor argument.
+Both the sidecar `network-init` boundary and the long-running network supervisor
+canonicalize the read-only mounted PEM and fail before network setup if its
+digest differs, closing deletion/recreation races after the driver's API check.
+
+Kubernetes RBAC cannot restrict `create` by `resourceNames` or restrict `get`
+by a name prefix. When this feature is enabled, the chart grants the gateway
+service account ConfigMap `get`/`create` in the shared sandbox namespace. In
+managed/operator modes, the existing ClusterRoleBinding makes those permissions
+cluster-wide. It does not grant ConfigMap `list`, `watch`, `patch`, `update`, or
+`delete`. Prefer a dedicated gateway service account and namespace-scoped
+bindings when the read boundary matters. Check the objects and authorization:
+
+```bash
+kubectl -n <sandbox-namespace> get configmap \
+  -l openshell.ai/managed-by=openshell,openshell.ai/gateway-id=<effective-gateway-id> \
+  --show-labels
+kubectl auth can-i get configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i create configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i patch configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+kubectl auth can-i delete configmaps -n <sandbox-namespace> \
+  --as system:serviceaccount:openshell:<gateway-service-account>
+```
+
+A missing, mutable, unowned, wrong-generation, or wrong-data managed ConfigMap
+fails closed. Do not relabel or edit it blindly. Investigate the object owner;
+remove an invalid object only after confirming no sandbox uses it, then retry
+so the driver can recreate the exact generation. Diagnostics deliberately omit
+certificate contents; inspect the source object separately rather than copying
+PEM into logs or tickets.
+
+Changing source ConfigMap contents does not reload the gateway or a running
+supervisor: restart the gateway to reread/normalize it, then recreate or
+restart affected sandboxes. Removing the Helm setting means newly created or
+recreated sandbox pods have no additional-CA volume/mount, but existing running
+pods retain startup trust until restarted. The driver intentionally has no
+ConfigMap list/delete permission; unused managed generations can remain. After
+all sandboxes are migrated, use an operator identity to verify the generation
+annotation and pod references, then explicitly delete unused ConfigMaps in each
+applicable namespace. Do not add list/delete RBAC as a cleanup workaround.
+
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
 retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and

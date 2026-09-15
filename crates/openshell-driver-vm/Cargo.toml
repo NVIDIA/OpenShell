@@ -52,6 +52,7 @@ libloading = "0.8"
 tar = "0.4"
 flate2 = "1"
 sha2 = "0.10"
+rustls-pemfile = { workspace = true }
 zstd = "0.13"
 
 [features]
@@ -74,6 +75,7 @@ defaults-without-telemetry = []
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
 tempfile = "3"
+rcgen = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # smol-rs/polling drives the BSD/macOS parent-death detection in

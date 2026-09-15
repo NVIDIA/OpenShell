@@ -1206,7 +1206,7 @@ impl ComputeRuntime {
                 Ok(stopped)
             }
             Err(err) => {
-                self.recover_failed_lifecycle(&lifecycle_guard, &stopping, &previous, true)
+                self.recover_failed_lifecycle(&lifecycle_guard, &stopping, &previous, true, true)
                     .await;
                 Err(Status::new(
                     err.code(),
@@ -1317,6 +1317,24 @@ impl ComputeRuntime {
         starting: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
     ) -> Result<Sandbox, Status> {
+        // Rebuild requests are based exclusively on the durable public record
+        // which committed the `Starting` transition. This keeps startup
+        // reconciliation independent of mutable backend runtime inspection.
+        let driver_sandbox = match driver_sandbox_from_public(&starting, &self.driver_info.name) {
+            Ok(sandbox) => sandbox,
+            Err(status) => {
+                // No request reached the driver, so the durable `Starting`
+                // transition cannot represent an ambiguous backend outcome.
+                // Route this through lifecycle recovery to restore the exact
+                // pre-start snapshot, fenced by the transition revision.
+                self.recover_failed_lifecycle(&lifecycle_guard, &starting, &previous, false, false)
+                    .await;
+                return Err(Status::new(
+                    status.code(),
+                    format!("start sandbox failed: {}", status.message()),
+                ));
+            }
+        };
         let result = self
             .driver
             .call(
@@ -1325,11 +1343,13 @@ impl ComputeRuntime {
                 |driver| {
                     let sandbox_id = sandbox_id.clone();
                     let sandbox_name = sandbox_name.clone();
+                    let sandbox = driver_sandbox.clone();
                     async move {
                         driver
                             .start_sandbox(Request::new(StartSandboxRequest {
                                 sandbox_id,
                                 sandbox_name,
+                                sandbox: Some(sandbox),
                             }))
                             .await
                     }
@@ -1349,7 +1369,7 @@ impl ComputeRuntime {
                 Ok(latest)
             }
             Err(err) => {
-                self.recover_failed_lifecycle(&lifecycle_guard, &starting, &previous, false)
+                self.recover_failed_lifecycle(&lifecycle_guard, &starting, &previous, false, true)
                     .await;
                 Err(Status::new(
                     err.code(),
@@ -1365,13 +1385,24 @@ impl ComputeRuntime {
     /// A transport error can arrive after the runtime applied stop or start.
     /// The driver lookup deliberately runs without the process-wide lock; the
     /// exact transition resource version then fences the recovery write.
+    ///
+    /// When request construction fails before dispatch, the backend cannot
+    /// have changed. In that case skip the driver lookup and immediately
+    /// restore the exact pre-transition snapshot instead.
     async fn recover_failed_lifecycle(
         &self,
         lifecycle_guard: &SandboxLifecycleGuard,
         transition: &Sandbox,
         previous: &Sandbox,
         expected_stopped: bool,
+        driver_operation_was_dispatched: bool,
     ) {
+        if !driver_operation_was_dispatched {
+            let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+            self.restore_lifecycle_snapshot(transition, previous).await;
+            return;
+        }
+
         let sandbox_id = transition.object_id();
         let sandbox_name = transition.object_name();
         let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
@@ -2267,7 +2298,7 @@ impl ComputeRuntime {
         let mut failed = 0usize;
 
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -2290,6 +2321,29 @@ impl ComputeRuntime {
             }
 
             let sandbox_name = sandbox.object_name().to_string();
+            let driver_sandbox = match driver_sandbox_from_public(&sandbox, &self.driver_info.name)
+            {
+                Ok(driver_sandbox) => driver_sandbox,
+                Err(status) => {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        error = %status.message(),
+                        "Could not construct durable start input during gateway startup"
+                    );
+                    self.mark_sandbox_error(
+                        &lifecycle_guard,
+                        &sandbox,
+                        "StartInputInvalid",
+                        &format!(
+                            "Cannot start sandbox during gateway startup: {}",
+                            status.message()
+                        ),
+                    )
+                    .await;
+                    failed += 1;
+                    continue;
+                }
+            };
             match self
                 .driver
                 .call(
@@ -2298,11 +2352,13 @@ impl ComputeRuntime {
                     |driver| {
                         let sandbox_id = sandbox_id.clone();
                         let sandbox_name = sandbox_name.clone();
+                        let sandbox = driver_sandbox.clone();
                         async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
                                     sandbox_id,
                                     sandbox_name,
+                                    sandbox: Some(sandbox),
                                 }))
                                 .await
                         }
@@ -2341,6 +2397,7 @@ impl ComputeRuntime {
                     );
                     if !recoverable_error {
                         self.mark_sandbox_error(
+                            &lifecycle_guard,
                             &sandbox,
                             "BackendResourceMissing",
                             "Sandbox compute resource disappeared while the gateway was offline",
@@ -2358,6 +2415,7 @@ impl ComputeRuntime {
                     );
                     if !recoverable_error {
                         self.mark_sandbox_error(
+                            &lifecycle_guard,
                             &sandbox,
                             "StartFailed",
                             &format!(
@@ -2389,7 +2447,7 @@ impl ComputeRuntime {
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -2465,18 +2523,39 @@ impl ComputeRuntime {
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
+                    let driver_sandbox = match driver_sandbox_from_public(
+                        &sandbox,
+                        &self.driver_info.name,
+                    ) {
+                        Ok(driver_sandbox) => driver_sandbox,
+                        Err(status) => {
+                            warn!(sandbox_id = %sandbox.object_id(), error = %status.message(), "Could not construct durable start input during lifecycle recovery");
+                            self.mark_sandbox_error(
+                                &lifecycle_guard,
+                                &sandbox,
+                                "StartInputInvalid",
+                                &format!("Cannot recover sandbox start: {}", status.message()),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
                     if let Err(err) = self
                         .driver
                         .call(
                             openshell_otel::rpc::START_SANDBOX,
                             Some(&sandbox_id),
-                            |driver| async move {
-                                driver
-                                    .start_sandbox(Request::new(StartSandboxRequest {
-                                        sandbox_id: driver_sandbox_id,
-                                        sandbox_name,
-                                    }))
-                                    .await
+                            |driver| {
+                                let sandbox = driver_sandbox.clone();
+                                async move {
+                                    driver
+                                        .start_sandbox(Request::new(StartSandboxRequest {
+                                            sandbox_id: driver_sandbox_id,
+                                            sandbox_name,
+                                            sandbox: Some(sandbox),
+                                        }))
+                                        .await
+                                }
                             },
                         )
                         .await
@@ -2498,14 +2577,23 @@ impl ComputeRuntime {
             .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
     }
 
-    async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
-        let _guard = self.sync_lock.lock().await;
+    /// Persist a startup/recovery failure only if the exact sandbox snapshot
+    /// examined while holding its lifecycle gate is still current.
+    async fn mark_sandbox_error(
+        &self,
+        lifecycle_guard: &SandboxLifecycleGuard,
+        sandbox: &Sandbox,
+        reason: &str,
+        message: &str,
+    ) {
+        let _guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
         let sandbox_id = sandbox.object_id().to_string();
+        let expected_resource_version = sandbox_resource_version(sandbox);
         let reason = reason.to_string();
         let message = message.to_string();
         match self
             .store
-            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |s| {
+            .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |s| {
                 s.set_phase(SandboxPhase::Error as i32);
                 let name = s.object_name().to_string();
                 upsert_ready_condition(
@@ -5418,10 +5506,12 @@ mod tests {
         start_blocked: AtomicBool,
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
+        start_payloads: TestMutex<Vec<Option<DriverSandbox>>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         get_started: Notify,
         get_release: Semaphore,
         get_blocked: AtomicBool,
+        get_calls: AtomicUsize,
         get_outcome: TestMutex<ControlledGetOutcome>,
     }
 
@@ -5451,10 +5541,12 @@ mod tests {
                 start_blocked: AtomicBool::new(false),
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
+                start_payloads: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
+                get_calls: AtomicUsize::new(0),
                 get_outcome: TestMutex::new(ControlledGetOutcome::Missing),
             })
         }
@@ -5549,6 +5641,17 @@ mod tests {
                 .clone()
         }
 
+        fn start_payloads(&self) -> Vec<Option<DriverSandbox>> {
+            self.start_payloads
+                .lock()
+                .expect("start payloads lock poisoned")
+                .clone()
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
         fn send_event(&self, event: WatchSandboxesEvent) {
             self.watch_tx
                 .send(Ok(event))
@@ -5609,6 +5712,7 @@ mod tests {
             &self,
             _request: Request<GetSandboxRequest>,
         ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
             self.get_started.notify_one();
             if self.get_blocked.load(Ordering::SeqCst) {
                 self.get_release
@@ -5694,6 +5798,10 @@ mod tests {
                 .lock()
                 .expect("start requests lock poisoned")
                 .push((request.sandbox_id, request.sandbox_name));
+            self.start_payloads
+                .lock()
+                .expect("start payloads lock poisoned")
+                .push(request.sandbox);
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             self.start_started.notify_one();
             if self.start_blocked.load(Ordering::SeqCst) {
@@ -5851,6 +5959,29 @@ mod tests {
             ..Default::default()
         };
         sandbox.set_phase(phase as i32);
+        sandbox
+    }
+
+    fn malformed_driver_config_sandbox(
+        id: &str,
+        name: &str,
+        phase: SandboxPhase,
+        driver_name: &str,
+    ) -> Sandbox {
+        let mut sandbox = sandbox_record(id, name, phase);
+        sandbox.spec = Some(SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(prost_types::Struct {
+                    fields: std::iter::once((
+                        driver_name.to_string(),
+                        string_value("not-an-object"),
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         sandbox
     }
 
@@ -7105,6 +7236,19 @@ mod tests {
             .unwrap();
         assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
         assert_eq!(driver.start_calls(), 1);
+        let durable_start = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("durable Starting record");
+        assert_eq!(
+            driver.start_payloads(),
+            vec![Some(
+                driver_sandbox_from_public(&durable_start, "test-driver").unwrap()
+            )],
+            "explicit start must send the snapshot derived from its durable Starting record"
+        );
 
         let starting_again = runtime
             .start_sandbox("default", sandbox.object_name())
@@ -7259,6 +7403,61 @@ mod tests {
 
         assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
         assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_start_rolls_back_when_durable_payload_is_malformed() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = malformed_driver_config_sandbox(
+            "sb-malformed-explicit",
+            "malformed-explicit",
+            SandboxPhase::Stopped,
+            "test-driver",
+        );
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Stopped as i32,
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Stopped".to_string(),
+                message: "Sandbox compute is stopped".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .expect_err("malformed durable start input must fail");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("sandbox remains persisted after rollback");
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .expect("rollback preserves Ready condition");
+        assert_eq!(ready.reason, "Stopped");
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(
+            driver.get_calls(),
+            0,
+            "conversion failure must not call the driver"
+        );
     }
 
     #[tokio::test]
@@ -10571,6 +10770,148 @@ mod tests {
                 "sb-unspecified".to_string(),
             ]
         );
+        let payloads = driver.start_payloads();
+        assert_eq!(payloads.len(), 5);
+        for payload in payloads {
+            let payload = payload.expect("gateway startup must supply a durable snapshot");
+            assert_eq!(payload.workspace, "default");
+            assert!(
+                [
+                    ("sb-error-restart", "error-restart"),
+                    ("sb-prov", "prov"),
+                    ("sb-ready", "ready"),
+                    ("sb-unknown", "unknown"),
+                    ("sb-unspecified", "unspecified"),
+                ]
+                .contains(&(payload.id.as_str(), payload.name.as_str())),
+                "startup payload must be derived from an existing durable public record"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_recovery_sends_the_durable_start_snapshot() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        let mut starting = sandbox_record("sb-recovery", "recovery", SandboxPhase::Starting);
+        starting.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Starting".to_string(),
+                message: "durable test snapshot".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let expected = driver_sandbox_from_public(&starting, "arbitrary").unwrap();
+        runtime.store.put_message(&starting).await.unwrap();
+
+        runtime
+            .recover_persisted_lifecycle_transitions()
+            .await
+            .unwrap();
+
+        assert_eq!(driver.start_payloads(), vec![Some(expected)]);
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_marks_malformed_durable_start_input_as_error() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        let sandbox = malformed_driver_config_sandbox(
+            "sb-malformed-startup",
+            "malformed-startup",
+            SandboxPhase::Ready,
+            "arbitrary",
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.start_persisted_sandboxes().await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("sandbox remains persisted as a visible error");
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .expect("invalid start input produces a Ready condition");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "StartInputInvalid");
+        assert!(
+            ready
+                .message
+                .contains("template.driver_config.arbitrary must be an object")
+        );
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(
+            driver.get_calls(),
+            0,
+            "conversion failure must not call the driver"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_starting_recovery_marks_malformed_durable_start_input_as_error() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        let sandbox = malformed_driver_config_sandbox(
+            "sb-malformed-recovery",
+            "malformed-recovery",
+            SandboxPhase::Starting,
+            "arbitrary",
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .recover_persisted_lifecycle_transitions()
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("sandbox remains persisted as a visible error");
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .expect("invalid start input produces a Ready condition");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "StartInputInvalid");
+        assert!(
+            ready
+                .message
+                .contains("template.driver_config.arbitrary must be an object")
+        );
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(
+            driver.get_calls(),
+            0,
+            "conversion failure must not call the driver"
+        );
     }
 
     #[tokio::test]
@@ -11178,7 +11519,7 @@ mod tests {
         runtime.start_persisted_sandboxes().await.unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
+            [FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name, .. }]
                 if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
         ));
         driver.clear_calls();

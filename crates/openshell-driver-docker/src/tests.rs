@@ -18,8 +18,12 @@ use openshell_core::proto::compute::v1::{
     GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
     gateway_listener_requirement::Selector,
 };
+use std::collections::VecDeque;
 use std::fs;
+use std::io::{Read as _, Seek as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, LazyLock, Mutex};
 use tempfile::TempDir;
 
@@ -93,6 +97,24 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     }
 }
 
+fn test_network_trust_bundle(
+    artifact: PathBuf,
+    contents: &[u8],
+    generation: &str,
+) -> NetworkSupervisorTrustBundle {
+    if artifact.exists() {
+        #[cfg(unix)]
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o444)).unwrap();
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&artifact, permissions).unwrap();
+        }
+    }
+    NetworkSupervisorTrustBundle::new(contents.to_vec(), 1, generation, artifact)
+}
+
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
@@ -120,6 +142,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cert: PathBuf::from("/tmp/tls.crt"),
             key: PathBuf::from("/tmp/tls.key"),
         }),
+        network_trust_bundle: None,
         daemon_version: "28.0.0".to_string(),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
@@ -318,6 +341,10 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
             wsl_all_gpu_fallback_enabled,
         )),
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
+        start_operation_gates: Arc::new(DockerStartGateRegistry::default()),
+        workspace_archive_transfers: Arc::new(Semaphore::new(
+            MAX_CONCURRENT_DOCKER_WORKSPACE_ARCHIVES,
+        )),
     }
 }
 
@@ -380,6 +407,280 @@ async fn fake_docker_with_no_containers() -> (String, JoinHandle<()>) {
         }
     });
     (format!("http://{address}"), server)
+}
+
+#[derive(Clone)]
+struct DockerStubResponse {
+    status: hyper::StatusCode,
+    body: Bytes,
+}
+
+impl DockerStubResponse {
+    fn json(status: hyper::StatusCode, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: Bytes::from(body.into()),
+        }
+    }
+
+    fn archive(body: Vec<u8>) -> Self {
+        Self {
+            status: hyper::StatusCode::OK,
+            body: Bytes::from(body),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerStubRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// Run a deliberately small scripted Docker HTTP endpoint. The driver uses a
+/// real Bollard client against this server, which makes lifecycle ordering and
+/// archive upload options observable without a Docker daemon.
+async fn spawn_docker_stub(
+    responses: Vec<DockerStubResponse>,
+) -> (String, Arc<Mutex<Vec<DockerStubRequest>>>, JoinHandle<()>) {
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let request_log = Arc::new(Mutex::new(Vec::new()));
+    let response_queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let expected = response_queue
+        .lock()
+        .expect("Docker stub response queue should not be poisoned")
+        .len();
+    let task_request_log = request_log.clone();
+    let handle = tokio::spawn(async move {
+        for _ in 0..expected {
+            let (stream, _) = listener.accept().await.expect("Docker stub should accept");
+            let log = task_request_log.clone();
+            let queue = response_queue.clone();
+            let result = http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let log = log.clone();
+                        let queue = queue.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            let body = body
+                                .collect()
+                                .await
+                                .map_or_else(|_| Bytes::new(), http_body_util::Collected::to_bytes);
+                            let path = parts.uri.path_and_query().map_or_else(
+                                || parts.uri.path().to_string(),
+                                |path| path.as_str().to_string(),
+                            );
+                            log.lock()
+                                .expect("Docker stub request log should not be poisoned")
+                                .push(DockerStubRequest {
+                                    method: parts.method.to_string(),
+                                    path,
+                                    body: body.to_vec(),
+                                });
+                            let response = queue
+                                .lock()
+                                .expect("Docker stub response queue should not be poisoned")
+                                .pop_front()
+                                .expect("Docker stub response should exist");
+                            Ok::<_, Infallible>(
+                                hyper::Response::builder()
+                                    .status(response.status)
+                                    .header("connection", "close")
+                                    .body(Full::new(response.body))
+                                    .expect("Docker stub response should build"),
+                            )
+                        }
+                    }),
+                )
+                .await;
+            // A one-shot client can close immediately after response headers.
+            // Assertions on the collected requests decide whether it mattered.
+            let _ = result;
+        }
+    });
+    (format!("http://{address}"), request_log, handle)
+}
+
+/// A concurrent Docker stub used to prove a long archive transfer for one
+/// sandbox does not hold a driver-wide start lock.
+async fn spawn_archive_blocking_docker_stub() -> (
+    String,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    JoinHandle<()>,
+) {
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let archive_requested = Arc::new(tokio::sync::Notify::new());
+    let release_archive = Arc::new(tokio::sync::Notify::new());
+    let archive_fixture = docker_workspace_archive_fixture();
+    let task = tokio::spawn({
+        let archive_requested = archive_requested.clone();
+        let release_archive = release_archive.clone();
+        async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let archive_requested = archive_requested.clone();
+                let release_archive = release_archive.clone();
+                let archive_fixture = archive_fixture.clone();
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                                let archive_requested = archive_requested.clone();
+                                let release_archive = release_archive.clone();
+                                let archive_fixture = archive_fixture.clone();
+                                async move {
+                                    let (parts, body) = request.into_parts();
+                                    let _ = body.collect().await;
+                                    let path = parts.uri.path_and_query().map_or_else(
+                                        || parts.uri.path().to_string(),
+                                        |path| path.as_str().to_string(),
+                                    );
+                                    let response = if path.contains("/containers/a-id/archive") {
+                                        archive_requested.notify_waiters();
+                                        release_archive.notified().await;
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::OK)
+                                            .body(Full::new(Bytes::from(archive_fixture)))
+                                    } else if path.contains("/containers/json") {
+                                        let (id, name, generation) = if path.contains("sbx-a") {
+                                            ("a-id", "a", "A")
+                                        } else {
+                                            ("b-id", "b", "none")
+                                        };
+                                        let summary = serde_json::json!([{
+                                            "Id": id,
+                                            "Names": [if id == "a-id" {
+                                                "/openshell---a-sbx-a"
+                                            } else {
+                                                "/openshell---b-sbx-b"
+                                            }],
+                                            "State": "exited",
+                                            "Labels": docker_lifecycle_labels_for(
+                                                if id == "a-id" { "sbx-a" } else { "sbx-b" },
+                                                name,
+                                                generation,
+                                            ),
+                                        }]);
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::OK)
+                                            .body(Full::new(Bytes::from(summary.to_string())))
+                                    } else if path.contains("/containers/a-id/json") {
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::OK)
+                                            .body(Full::new(Bytes::from(serde_json::json!({
+                                                "Name": "/openshell---a-sbx-a",
+                                                "Config": { "Labels": docker_lifecycle_labels_for("sbx-a", "a", "A") },
+                                                "State": { "Status": "exited", "FinishedAt": "2026-01-01T00:00:00Z" },
+                                            }).to_string())))
+                                    } else if path.contains("/containers/b-id/json") {
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::OK)
+                                            .body(Full::new(Bytes::from(docker_lifecycle_inspect(
+                                                "openshell---b-sbx-b", "exited", "none",
+                                            ))))
+                                    } else if path.contains("/images/") {
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::OK)
+                                            .body(Full::new(Bytes::from(r#"{"Id":"image-id","Config":{"WorkingDir":"/sandbox"}}"#)))
+                                    } else if path.contains("/containers/create") {
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::CREATED)
+                                            .body(Full::new(Bytes::from(r#"{"Id":"new-a","Warnings":[]}"#)))
+                                    } else {
+                                        hyper::Response::builder()
+                                            .status(hyper::StatusCode::NO_CONTENT)
+                                            .body(Full::new(Bytes::new()))
+                                    };
+                                    Ok::<_, Infallible>(response.expect("Docker stub response should build"))
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        }
+    });
+    (
+        format!("http://{address}"),
+        archive_requested,
+        release_archive,
+        task,
+    )
+}
+
+fn docker_lifecycle_labels_for(id: &str, name: &str, generation: &str) -> serde_json::Value {
+    serde_json::json!({
+        LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+        LABEL_SANDBOX_NAMESPACE: "default",
+        LABEL_SANDBOX_ID: id,
+        LABEL_SANDBOX_NAME: name,
+        LABEL_SANDBOX_WORKSPACE: "",
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: generation,
+        DOCKER_SANDBOX_WORKSPACE_ROOT_LABEL: "/sandbox",
+    })
+}
+
+fn docker_lifecycle_labels(generation: &str) -> serde_json::Value {
+    docker_lifecycle_labels_for("sbx-123", "demo", generation)
+}
+
+fn docker_lifecycle_summary(state: &str, generation: &str) -> String {
+    serde_json::json!([{
+        "Id": "old-id",
+        "Names": ["/openshell---demo-sbx-123"],
+        "State": state,
+        "Labels": docker_lifecycle_labels(generation),
+    }])
+    .to_string()
+}
+
+fn docker_lifecycle_inspect(name: &str, state: &str, generation: &str) -> String {
+    serde_json::json!({
+        "Name": format!("/{name}"),
+        "Config": { "Labels": docker_lifecycle_labels(generation) },
+        "State": { "Status": state, "FinishedAt": "2026-01-01T00:00:00Z" },
+    })
+    .to_string()
+}
+
+fn docker_workspace_archive_fixture() -> Vec<u8> {
+    docker_workspace_archive_bytes(|builder| {
+        append_archive_directory(builder, "sandbox", 0o755);
+        append_archive_file(builder, "sandbox/source", b"source", 0o644);
+    })
+}
+
+fn test_driver_with_endpoint(
+    config: DockerDriverRuntimeConfig,
+    endpoint: &str,
+) -> DockerComputeDriver {
+    let mut driver = test_driver_with_config(config);
+    driver.docker = Arc::new(
+        Docker::connect_with_http(endpoint, 5, bollard::API_DEFAULT_VERSION)
+            .expect("construct Docker stub client"),
+    );
+    driver
 }
 
 async fn standalone_traced_client() -> (
@@ -2415,6 +2716,15 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
         create_body.cmd,
         Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
     );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|config| config.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .all(|bind| !bind.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)))
+    );
     assert_eq!(
         create_body
             .labels
@@ -2450,6 +2760,159 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
             .and_then(|endpoints| endpoints.get(DEFAULT_DOCKER_NETWORK_NAME)),
         Some(&EndpointSettings::default())
     );
+}
+
+#[test]
+fn configured_network_trust_adds_one_read_only_bind_and_operator_argument() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    let contents = b"normalized certificate fixture";
+    fs::write(&artifact, contents).unwrap();
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(
+        artifact.clone(),
+        contents,
+        "sha256:configured-network-trust",
+    ));
+
+    let create_body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let binds = create_body.host_config.unwrap().binds.unwrap();
+    let destination_binds = binds
+        .iter()
+        .filter(|bind| bind.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destination_binds,
+        vec![&format!(
+            "{}:{NETWORK_ADDITIONAL_CA_BUNDLE_PATH}:ro,z",
+            artifact.display()
+        )]
+    );
+
+    let command = create_body.cmd.unwrap();
+    let argument_positions = command
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            (argument == "--network-additional-ca-bundle").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(argument_positions, vec![2]);
+    assert_eq!(
+        command.get(argument_positions[0] + 1).map(String::as_str),
+        Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+    );
+    assert_eq!(
+        command.get(argument_positions[0] + 2).map(String::as_str),
+        Some("--network-additional-ca-digest")
+    );
+    assert_eq!(
+        command.get(argument_positions[0] + 3).map(String::as_str),
+        Some("sha256:configured-network-trust")
+    );
+    assert!(create_body.env.unwrap().iter().all(|entry| {
+        !entry.contains("NETWORK_ADDITIONAL_CA")
+            && !entry.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+    }));
+}
+
+#[test]
+fn user_command_and_environment_cannot_replace_network_trust_argument() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("normalized-additional-ca.crt");
+    let contents = b"normalized certificate fixture";
+    fs::write(&artifact, contents).unwrap();
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(
+        artifact,
+        contents,
+        "sha256:user-command-network-trust",
+    ));
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.command = vec![
+        "--network-additional-ca-bundle".to_string(),
+        "/tmp/user-controlled.crt".to_string(),
+    ];
+    spec.environment.insert(
+        "SSL_CERT_FILE".to_string(),
+        "/tmp/user-controlled.crt".to_string(),
+    );
+
+    let command = build_container_create_body(&sandbox, &config)
+        .unwrap()
+        .cmd
+        .unwrap();
+    let arguments = command
+        .windows(2)
+        .filter(|args| args[0] == "--network-additional-ca-bundle")
+        .collect::<Vec<_>>();
+    assert_eq!(arguments.len(), 1);
+    assert_eq!(arguments[0][1], NETWORK_ADDITIONAL_CA_BUNDLE_PATH);
+    let digest_index = command
+        .iter()
+        .position(|arg| arg == "--network-additional-ca-digest")
+        .expect("driver-owned digest argument");
+    assert_eq!(
+        command.get(digest_index + 1).map(String::as_str),
+        Some("sha256:user-command-network-trust")
+    );
+    assert!(!command.iter().any(|arg| arg == "/tmp/user-controlled.crt"));
+}
+
+#[test]
+fn user_mount_cannot_replace_network_trust_destination() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("user-ca.crt");
+    fs::write(&source, b"user-controlled fixture").unwrap();
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": source,
+            "target": NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+        }]
+    })));
+
+    let error = build_container_create_body(&sandbox, &config)
+        .expect_err("user mount must not mask network trust material");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("reserved OpenShell path"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn missing_network_trust_artifact_fails_container_spec_without_material() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing-additional-ca.crt");
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(
+        missing.clone(),
+        b"expected normalized certificate fixture",
+        "sha256:missing-network-trust",
+    ));
+
+    let error = build_container_create_body(&test_sandbox(), &config)
+        .expect_err("missing gateway-owned artifact must fail closed");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("gateway-owned network additional CA artifact failed validation")
+    );
+    assert!(error.message().contains(&missing.display().to_string()));
+    assert!(!error.message().contains("BEGIN CERTIFICATE"));
 }
 
 #[test]
@@ -3528,8 +3991,16 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
         Some(&new_exit),
     ));
 
+    fences.record_superseded_instance("sandbox-1", "old-container-id");
+    assert!(fences.is_superseded_instance("sandbox-1", "old-container-id"));
+    assert!(!fences.is_superseded_instance("sandbox-1", "new-container-id"));
+    fences.clear_superseded_instances("sandbox-1");
+    assert!(!fences.is_superseded_instance("sandbox-1", "old-container-id"));
+
+    fences.record_superseded_instance("sandbox-1", "old-container-id");
     fences.remove("sandbox-1");
     assert!(fences.previous_exit("sandbox-1").is_none());
+    assert!(!fences.is_superseded_instance("sandbox-1", "old-container-id"));
 }
 
 fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
@@ -4004,6 +4475,790 @@ async fn delete_sandbox_reclaims_token_file_when_container_and_pending_are_gone(
     .await;
 
     server.abort();
+}
+
+fn docker_workspace_archive_from_bytes(bytes: Vec<u8>) -> DockerWorkspaceArchive {
+    let mut file = private_docker_workspace_archive_file().unwrap();
+    file.write_all(&bytes).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    DockerWorkspaceArchive {
+        file,
+        byte_len: u64::try_from(bytes.len()).unwrap(),
+    }
+}
+
+fn append_archive_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(mode);
+    header.set_uid(123);
+    header.set_gid(456);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, std::io::empty())
+        .unwrap();
+}
+
+fn append_archive_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, body: &[u8], mode: u32) {
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(mode);
+    header.set_uid(123);
+    header.set_gid(456);
+    header.set_size(u64::try_from(body.len()).unwrap());
+    header.set_cksum();
+    builder.append_data(&mut header, path, body).unwrap();
+}
+
+fn append_archive_symlink(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_mode(0o777);
+    header.set_uid(123);
+    header.set_gid(456);
+    header.set_size(0);
+    header.set_link_name(target).unwrap();
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, std::io::empty())
+        .unwrap();
+}
+
+fn docker_workspace_archive_bytes(entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    entries(&mut builder);
+    builder.into_inner().unwrap()
+}
+
+fn rewrite_tar_header_path(bytes: &mut [u8], header_offset: usize, path: &[u8]) {
+    let header = &mut bytes[header_offset..header_offset + 512];
+    assert!(path.len() <= 100);
+    header[..100].fill(0);
+    header[..path.len()].copy_from_slice(path);
+    header[148..156].fill(b' ');
+    let checksum = header.iter().map(|byte| u32::from(*byte)).sum::<u32>();
+    let encoded = format!("{checksum:06o}\0 ");
+    header[148..156].copy_from_slice(encoded.as_bytes());
+}
+
+#[test]
+fn filter_docker_workspace_archive_preserves_safe_metadata_and_filters_nested_mounts() {
+    let bytes = docker_workspace_archive_bytes(|builder| {
+        append_archive_directory(builder, "sandbox", 0o750);
+        append_archive_directory(builder, "sandbox/keep", 0o755);
+        append_archive_file(builder, "sandbox/keep/file.txt", b"private source", 0o640);
+        append_archive_symlink(builder, "sandbox/keep/link", "file.txt");
+        append_archive_directory(builder, "sandbox/mounted", 0o755);
+        append_archive_file(builder, "sandbox/mounted/secret", b"MUST-NOT-COPY", 0o600);
+        append_archive_file(builder, "sandbox/sibling", b"retained", 0o644);
+    });
+    let archive = filter_docker_workspace_archive(
+        docker_workspace_archive_from_bytes(bytes),
+        DockerWorkspaceArchiveFilter::new("/sandbox", vec![vec![b"mounted".to_vec()]]).unwrap(),
+        1024 * 1024,
+    )
+    .unwrap();
+
+    let mut output = tar::Archive::new(archive.file);
+    let entries = output
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = entry.path_bytes().into_owned();
+            let header = entry.header().clone();
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents).unwrap();
+            (
+                path,
+                header.entry_type(),
+                header.mode().unwrap(),
+                header.uid().unwrap(),
+                header.gid().unwrap(),
+                header.link_name_bytes().map(std::borrow::Cow::into_owned),
+                contents,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 5);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.0.starts_with(b"sandbox/mounted"))
+    );
+    assert!(entries.iter().any(|entry| {
+        entry.0 == b"sandbox/keep/file.txt"
+            && entry.1.is_file()
+            && entry.2 == 0o640
+            && entry.3 == 123
+            && entry.4 == 456
+            && entry.6 == b"private source"
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.0 == b"sandbox/keep/link"
+            && entry.1.is_symlink()
+            && entry.5.as_deref() == Some(b"file.txt".as_slice())
+    }));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.0 == b"sandbox/sibling" && entry.6 == b"retained")
+    );
+}
+
+#[test]
+fn docker_workspace_nested_mounts_normalize_trailing_slash_for_archive_filtering() {
+    let driver_config: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/sandbox/cache/"}]
+    }))
+    .unwrap();
+    let nested = docker_workspace_nested_mount_destinations(&driver_config, "/sandbox").unwrap();
+    assert_eq!(nested, vec![vec![b"cache".to_vec()]]);
+
+    let archive = filter_docker_workspace_archive(
+        docker_workspace_archive_from_bytes(docker_workspace_archive_bytes(|builder| {
+            append_archive_directory(builder, "sandbox", 0o755);
+            append_archive_file(builder, "sandbox/cache/private", b"must-not-copy", 0o600);
+            append_archive_file(builder, "sandbox/sibling", b"retained", 0o644);
+        })),
+        DockerWorkspaceArchiveFilter::new("/sandbox", nested).unwrap(),
+        1024 * 1024,
+    )
+    .unwrap();
+    let paths = tar::Archive::new(archive.file)
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path_bytes().into_owned())
+        .collect::<Vec<_>>();
+    assert!(paths.iter().all(|path| !path.starts_with(b"sandbox/cache")));
+    assert!(paths.contains(&b"sandbox/sibling".to_vec()));
+}
+
+#[test]
+fn filter_docker_workspace_archive_rejects_unsafe_input_without_echoing_payload() {
+    let secret = b"PRIVATE-CA-BYTES-MUST-NOT-LEAK";
+    for path in ["../sandbox", "/sandbox", "sandbox//ambiguous"] {
+        let mut bytes = docker_workspace_archive_bytes(|builder| {
+            append_archive_directory(builder, "sandbox", 0o755);
+            append_archive_file(builder, "sandbox/safe-placeholder", secret, 0o600);
+        });
+        // `tar::Builder` correctly refuses unsafe names, so mutate the second
+        // raw header and checksum to model an untrusted Docker daemon response.
+        rewrite_tar_header_path(&mut bytes, 512, path.as_bytes());
+        let error = filter_docker_workspace_archive(
+            docker_workspace_archive_from_bytes(bytes),
+            DockerWorkspaceArchiveFilter::new("/sandbox", Vec::new()).unwrap(),
+            1024 * 1024,
+        )
+        .err()
+        .expect("unsafe archive must fail");
+        let status = error.status().to_string();
+        assert!(!status.contains("PRIVATE-CA-BYTES"));
+        assert!(!status.contains(path));
+    }
+
+    let compressed = docker_workspace_archive_from_bytes(vec![0x1f, 0x8b, 8, 0, 0, 0]);
+    assert_eq!(
+        filter_docker_workspace_archive(
+            compressed,
+            DockerWorkspaceArchiveFilter::new("/sandbox", Vec::new()).unwrap(),
+            1024
+        )
+        .err()
+        .expect("compressed archive must fail"),
+        DockerWorkspaceArchiveError::CompressedTar
+    );
+}
+
+#[test]
+fn filter_docker_workspace_archive_enforces_input_and_repacked_output_limits() {
+    let bytes = docker_workspace_archive_bytes(|builder| {
+        append_archive_directory(builder, "sandbox", 0o755);
+        append_archive_file(builder, "sandbox/file", b"data", 0o644);
+    });
+    let limit = u64::try_from(bytes.len() - 1).unwrap();
+    assert_eq!(
+        filter_docker_workspace_archive(
+            docker_workspace_archive_from_bytes(bytes),
+            DockerWorkspaceArchiveFilter::new("/sandbox", Vec::new()).unwrap(),
+            limit,
+        )
+        .err()
+        .expect("oversized archive must fail"),
+        DockerWorkspaceArchiveError::TooLarge { limit }
+    );
+
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let mut writer = BoundedDockerArchiveWriter::new(
+        private_docker_workspace_archive_file().unwrap(),
+        3,
+        exceeded.clone(),
+    );
+    assert_eq!(writer.write(b"123").unwrap(), 3);
+    assert!(writer.write(b"4").is_err());
+    assert!(exceeded.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn docker_workspace_archive_stream_filters_without_a_raw_temporary_archive() {
+    let bytes = docker_workspace_archive_bytes(|builder| {
+        append_archive_directory(builder, "sandbox", 0o755);
+        append_archive_file(builder, "sandbox/keep", b"retained", 0o644);
+        append_archive_file(builder, "sandbox/mounted/private", b"excluded", 0o600);
+    });
+    let chunks = bytes
+        .chunks(257)
+        .map(|chunk| Ok::<_, ()>(Bytes::copy_from_slice(chunk)))
+        .collect::<Vec<_>>();
+    let archive = download_and_filter_docker_workspace_archive(
+        futures::stream::iter(chunks),
+        DockerWorkspaceArchiveFilter::new("/sandbox", vec![vec![b"mounted".to_vec()]]).unwrap(),
+        1024 * 1024,
+    )
+    .await
+    .unwrap();
+
+    let paths = tar::Archive::new(archive.file)
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path_bytes().into_owned())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&b"sandbox/keep".to_vec()));
+    assert!(
+        paths
+            .iter()
+            .all(|path| !path.starts_with(b"sandbox/mounted"))
+    );
+}
+
+#[tokio::test]
+async fn docker_workspace_archive_stream_enforces_the_raw_input_limit() {
+    let bytes = docker_workspace_archive_bytes(|builder| {
+        append_archive_directory(builder, "sandbox", 0o755);
+        append_archive_file(builder, "sandbox/file", b"data", 0o644);
+    });
+    let limit = u64::try_from(bytes.len() - 1).unwrap();
+    let error = download_and_filter_docker_workspace_archive(
+        futures::stream::iter([Ok::<_, ()>(Bytes::from(bytes))]),
+        DockerWorkspaceArchiveFilter::new("/sandbox", Vec::new()).unwrap(),
+        limit,
+    )
+    .await
+    .err()
+    .expect("oversized raw stream must fail");
+    assert_eq!(error, DockerWorkspaceArchiveError::TooLarge { limit });
+}
+
+#[test]
+fn docker_workspace_archive_admission_is_shared_across_driver_clones() {
+    let driver = test_driver_with_config(runtime_config());
+    let clone = driver.clone();
+    let first = driver
+        .workspace_archive_transfers
+        .try_acquire()
+        .expect("first archive pipeline must be admitted");
+    assert!(clone.workspace_archive_transfers.try_acquire().is_err());
+    drop(first);
+    assert!(clone.workspace_archive_transfers.try_acquire().is_ok());
+}
+
+fn write_replacement_token(config: &DockerDriverRuntimeConfig) {
+    let token = sandbox_token_host_path_by_id("sbx-123", config).unwrap();
+    fs::create_dir_all(token.parent().unwrap()).unwrap();
+    fs::write(&token, "opaque-token").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+async fn docker_start_gate_registry_reclaims_unused_gates() {
+    let gates = DockerStartGateRegistry::default();
+    let guard = gates.lock_for("first", "demo").await;
+    assert_eq!(gates.entry_count(), 1);
+    drop(guard);
+    let second = gates.lock_for("second", "demo").await;
+    assert_eq!(gates.entry_count(), 1);
+    drop(second);
+}
+
+fn recovery_inspect(name: &str, state: &str) -> DockerStubResponse {
+    DockerStubResponse::json(
+        hyper::StatusCode::OK,
+        docker_lifecycle_inspect(name, state, "A"),
+    )
+}
+
+fn recovery_not_found() -> DockerStubResponse {
+    DockerStubResponse::json(hyper::StatusCode::NOT_FOUND, "")
+}
+
+fn assert_recovery_used_stable_id_inspections(requests: &[DockerStubRequest]) {
+    for id in ["old-id", "new-id"] {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.contains(&format!("/containers/{id}/json"))),
+            "recovery did not inspect stable {id}"
+        );
+    }
+}
+
+fn assert_recovery_removals_are_safe(requests: &[DockerStubRequest]) {
+    let removals = requests
+        .iter()
+        .filter(|request| request.method == "DELETE")
+        .collect::<Vec<_>>();
+    assert!(!removals.is_empty());
+    for request in removals {
+        assert!(request.path.contains("force=false"), "{:?}", request.path);
+        assert!(request.path.contains("v=false"), "{:?}", request.path);
+    }
+}
+
+async fn scripted_swap(
+    responses: Vec<DockerStubResponse>,
+) -> (Result<bool, Status>, Vec<DockerStubRequest>) {
+    let (endpoint, requests, server) = spawn_docker_stub(responses).await;
+    let result = test_driver_with_endpoint(runtime_config(), &endpoint)
+        .swap_and_start_replacement("old-id", "openshell---demo-sbx-123", "new-id")
+        .await;
+    let requests = requests.lock().unwrap().clone();
+    server.await.unwrap();
+    (result, requests)
+}
+
+#[tokio::test]
+async fn replacement_recovery_handles_old_rename_error_before_effect() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_inspect("openshell---demo-sbx-123", "exited"),
+        recovery_inspect("replacement-temp", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_not_found(),
+    ])
+    .await;
+    assert!(result.is_err());
+    assert_recovery_used_stable_id_inspections(&requests);
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/old-id/json"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/new-id/json"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/new-id?"))
+    );
+    assert_recovery_removals_are_safe(&requests);
+    assert!(!result.unwrap_err().message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn replacement_recovery_handles_old_rename_error_after_effect() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_inspect("backup-temp", "exited"),
+        recovery_inspect("replacement-temp", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_not_found(),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_inspect("openshell---demo-sbx-123", "exited"),
+    ])
+    .await;
+    assert!(result.is_err());
+    assert!(requests.iter().any(|request| {
+        request.path.contains("/containers/old-id/rename")
+            && request.path.contains("name=openshell---demo-sbx-123")
+    }));
+    assert_recovery_removals_are_safe(&requests);
+    assert!(!result.unwrap_err().message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn replacement_recovery_handles_replacement_rename_error_before_effect() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_inspect("backup-temp", "exited"),
+        recovery_inspect("replacement-temp", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_not_found(),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_inspect("openshell---demo-sbx-123", "exited"),
+    ])
+    .await;
+    assert!(result.is_err());
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/old-id/json"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/new-id/json"))
+    );
+    assert_recovery_removals_are_safe(&requests);
+    assert!(!result.unwrap_err().message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn replacement_recovery_handles_replacement_rename_error_after_effect() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_inspect("backup-temp", "exited"),
+        recovery_inspect("openshell---demo-sbx-123", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_not_found(),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_inspect("openshell---demo-sbx-123", "exited"),
+    ])
+    .await;
+    assert!(result.is_err());
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/containers/new-id/json"))
+    );
+    assert_recovery_removals_are_safe(&requests);
+    assert!(!result.unwrap_err().message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn replacement_recovery_restores_old_when_removal_error_retains_old() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_inspect("backup-temp", "exited"),
+        recovery_inspect("openshell---demo-sbx-123", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_not_found(),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        recovery_inspect("openshell---demo-sbx-123", "exited"),
+    ])
+    .await;
+    assert!(result.is_err());
+    assert_recovery_removals_are_safe(&requests);
+    assert!(!result.unwrap_err().message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn replacement_recovery_starts_canonical_successor_when_removal_error_lost_old() {
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_not_found(),
+        recovery_inspect("openshell---demo-sbx-123", "created"),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+    ])
+    .await;
+    assert!(result.unwrap());
+    assert!(requests.iter().any(|request| {
+        request
+            .path
+            .contains("/containers/openshell---demo-sbx-123/start")
+    }));
+    assert_recovery_removals_are_safe(&requests);
+}
+
+#[tokio::test]
+async fn replacement_recovery_refuses_to_claim_retry_when_old_is_gone_without_canonical_successor()
+{
+    let (result, requests) = scripted_swap(vec![
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+        DockerStubResponse::json(hyper::StatusCode::INTERNAL_SERVER_ERROR, "daemon detail"),
+        recovery_not_found(),
+        recovery_inspect("replacement-temp", "created"),
+    ])
+    .await;
+    let error = result.expect_err("temporary successor cannot be retried canonically");
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(error.message().contains("without a canonical successor"));
+    assert_recovery_used_stable_id_inspections(&requests);
+    assert!(requests.iter().all(|request| {
+        !request
+            .path
+            .contains("/containers/openshell---demo-sbx-123/start")
+    }));
+    assert!(!error.message().contains("daemon detail"));
+}
+
+#[tokio::test]
+async fn start_reconciliation_does_not_block_unrelated_sandbox_while_archive_download_waits() {
+    let state_dir = TempDir::new().unwrap();
+    let trust_dir = TempDir::new().unwrap();
+    let artifact = trust_dir.path().join("additional-ca.crt");
+    fs::write(&artifact, b"ca-B").unwrap();
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(artifact, b"ca-B", "B"));
+    let (endpoint, archive_requested, release_archive, server) =
+        spawn_archive_blocking_docker_stub().await;
+
+    Box::pin(temp_env::async_with_vars(
+        [("XDG_STATE_HOME", Some(state_dir.path()))],
+        async {
+            let driver = test_driver_with_endpoint(config.clone(), &endpoint);
+            let mut sandbox_a = test_sandbox();
+            sandbox_a.id = "sbx-a".to_string();
+            sandbox_a.name = "a".to_string();
+            let token = sandbox_token_host_path_by_id(&sandbox_a.id, &config).unwrap();
+            fs::create_dir_all(token.parent().unwrap()).unwrap();
+            fs::write(&token, "opaque-token").unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let start_a = tokio::spawn({
+                let driver = driver.clone();
+                async move {
+                    driver
+                        .start_sandbox_with_snapshot("sbx-a", "a", Some(&sandbox_a))
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), archive_requested.notified())
+                .await
+                .expect("sandbox A archive request should be blocked");
+
+            // Sandbox B uses the ordinary stopped-container path. Its completion
+            // before A's archive is released proves the keyed gate is not global.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), driver.start_sandbox("sbx-b", "b"))
+                    .await
+                    .expect("unrelated sandbox B start should not wait for A")
+                    .unwrap()
+            );
+            release_archive.notify_waiters();
+            assert!(start_a.await.unwrap().unwrap());
+        },
+    ))
+    .await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn trust_reconciliation_matching_generation_starts_in_place() {
+    let (endpoint, requests, server) = spawn_docker_stub(vec![
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_summary("exited", "none"),
+        ),
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_inspect("openshell---demo-sbx-123", "exited", "none"),
+        ),
+        DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+    ])
+    .await;
+    let driver = test_driver_with_endpoint(runtime_config(), &endpoint);
+
+    assert!(
+        driver
+            .start_sandbox_with_snapshot("sbx-123", "demo", Some(&test_sandbox()))
+            .await
+            .unwrap()
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].path.contains("/containers/old-id/start"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn trust_reconciliation_running_mismatch_does_not_mutate() {
+    let dir = TempDir::new().unwrap();
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(
+        dir.path().join("unread-artifact"),
+        b"ca-B",
+        "B",
+    ));
+    let (endpoint, requests, server) = spawn_docker_stub(vec![
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_summary("running", "A"),
+        ),
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_inspect("openshell---demo-sbx-123", "running", "A"),
+        ),
+    ])
+    .await;
+    let driver = test_driver_with_endpoint(config, &endpoint);
+
+    assert!(
+        driver
+            .start_sandbox_with_snapshot("sbx-123", "demo", Some(&test_sandbox()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn trust_reconciliation_tampered_artifact_fails_before_mutation() {
+    let dir = TempDir::new().unwrap();
+    let artifact = dir.path().join("additional-ca.crt");
+    fs::write(&artifact, b"tampered-ca").unwrap();
+    let mut config = runtime_config();
+    config.network_trust_bundle = Some(test_network_trust_bundle(artifact, b"expected-ca", "B"));
+    let (endpoint, requests, server) = spawn_docker_stub(vec![
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_summary("exited", "A"),
+        ),
+        DockerStubResponse::json(
+            hyper::StatusCode::OK,
+            docker_lifecycle_inspect("openshell---demo-sbx-123", "exited", "A"),
+        ),
+    ])
+    .await;
+    let driver = test_driver_with_endpoint(config, &endpoint);
+
+    let error = driver
+        .start_sandbox_with_snapshot("sbx-123", "demo", Some(&test_sandbox()))
+        .await
+        .expect_err("tampered trust artifact must prevent replacement");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(!error.message().contains("expected-ca"));
+    assert!(!error.message().contains("tampered-ca"));
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    server.await.unwrap();
+}
+
+fn assert_trust_replacement_order(
+    start_status: hyper::StatusCode,
+) -> Pin<Box<dyn Future<Output = Vec<DockerStubRequest>>>> {
+    Box::pin(async move {
+        let dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let artifact = dir.path().join("additional-ca.crt");
+        fs::write(&artifact, b"ca-B").unwrap();
+        let mut config = runtime_config();
+        config.network_trust_bundle = Some(test_network_trust_bundle(artifact, b"ca-B", "B"));
+        let responses = vec![
+            DockerStubResponse::json(
+                hyper::StatusCode::OK,
+                docker_lifecycle_summary("exited", "A"),
+            ),
+            DockerStubResponse::json(
+                hyper::StatusCode::OK,
+                docker_lifecycle_inspect("openshell---demo-sbx-123", "exited", "A"),
+            ),
+            DockerStubResponse::archive(docker_workspace_archive_fixture()),
+            DockerStubResponse::json(
+                hyper::StatusCode::OK,
+                docker_lifecycle_inspect("openshell---demo-sbx-123", "exited", "A"),
+            ),
+            DockerStubResponse::json(
+                hyper::StatusCode::OK,
+                r#"{"Id":"image-id","Config":{"WorkingDir":"/sandbox"}}"#,
+            ),
+            DockerStubResponse::json(
+                hyper::StatusCode::CREATED,
+                r#"{"Id":"new-id","Warnings":[]}"#,
+            ),
+            DockerStubResponse::json(hyper::StatusCode::OK, ""),
+            DockerStubResponse::json(
+                hyper::StatusCode::OK,
+                docker_lifecycle_inspect("openshell---demo-sbx-123", "exited", "A"),
+            ),
+            DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+            DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+            DockerStubResponse::json(hyper::StatusCode::NO_CONTENT, ""),
+            DockerStubResponse::json(start_status, ""),
+        ];
+        let (endpoint, requests, server) = spawn_docker_stub(responses).await;
+        Box::pin(temp_env::async_with_vars(
+            [("XDG_STATE_HOME", Some(state_dir.path()))],
+            async {
+                let driver = test_driver_with_endpoint(config.clone(), &endpoint);
+                write_replacement_token(&config);
+                let result = driver
+                    .start_sandbox_with_snapshot("sbx-123", "demo", Some(&test_sandbox()))
+                    .await;
+                if start_status.is_success() {
+                    assert!(result.unwrap());
+                } else {
+                    let error = result.expect_err("replacement start must fail");
+                    assert!(error.message().contains("replacement remains stopped"));
+                }
+            },
+        ))
+        .await;
+        let requests = requests.lock().unwrap().clone();
+        server.await.unwrap();
+        requests
+    })
+}
+
+#[tokio::test]
+async fn trust_replacement_restores_archive_before_swap_removal_and_start() {
+    let requests = assert_trust_replacement_order(hyper::StatusCode::NO_CONTENT).await;
+    let paths = requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect::<Vec<_>>();
+    let upload = paths
+        .iter()
+        .position(|path| path.contains("/containers/new-id/archive"))
+        .unwrap();
+    let first_rename = paths
+        .iter()
+        .position(|path| path.contains("/rename"))
+        .unwrap();
+    let remove = requests
+        .iter()
+        .position(|request| {
+            request.method == "DELETE" && request.path.contains("/containers/old-id")
+        })
+        .unwrap();
+    let start = paths
+        .iter()
+        .position(|path| path.contains("/containers/openshell---demo-sbx-123/start"))
+        .unwrap();
+    assert!(upload < first_rename && first_rename < remove && remove < start);
+    assert!(paths[upload].contains("path=%2F") || paths[upload].contains("path=/"));
+    assert!(paths[upload].contains("noOverwriteDirNonDir=true"));
+    assert!(paths[upload].contains("copyUIDGID=false"));
+}
+
+#[tokio::test]
+async fn trust_replacement_start_failure_keeps_canonical_successor_stopped() {
+    let requests = assert_trust_replacement_order(hyper::StatusCode::INTERNAL_SERVER_ERROR).await;
+    let paths = requests
+        .iter()
+        .map(|request| request.path.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .last()
+            .unwrap()
+            .contains("/containers/openshell---demo-sbx-123/start")
+    );
+    assert!(paths.iter().any(|path| path.contains("/containers/old-id")));
+}
+
+#[test]
+fn trust_generation_helper_covers_none_to_a_and_a_to_none() {
+    let config = runtime_config();
+    assert_eq!(
+        docker_network_trust_generation(&config),
+        NETWORK_SUPERVISOR_TRUST_GENERATION_NONE
+    );
+    let bundle = test_network_trust_bundle(PathBuf::from("/unread-in-unit-test"), b"A", "A");
+    let mut configured = config;
+    configured.network_trust_bundle = Some(bundle);
+    assert_eq!(docker_network_trust_generation(&configured), "A");
 }
 
 #[tokio::test]

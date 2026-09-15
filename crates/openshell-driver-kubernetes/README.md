@@ -113,6 +113,34 @@ namespace policy; the gateway receives only the verified sandbox ID.
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
 
+Additional sandbox destination roots use the global
+`[openshell.supervisor.network].additional_ca_cert_paths` setting rather than a
+Kubernetes driver key. Before sandbox creation, the in-process driver derives
+an immutable, content-addressed ConfigMap name from the gateway identity and
+normalized bundle generation in the selected shared, managed, or operator
+namespace. It creates the object when absent and handles a create conflict by
+rereading it. An existing object is accepted only when its managed-by and
+gateway-id labels, generation annotation, immutability, and exact `ca.crt` data
+match. The driver never patches or updates these ConfigMaps. The normalized PEM
+is bounded below Kubernetes's 1 MiB ConfigMap limit.
+
+Combined topology mounts it only in the agent container that runs network
+supervision. Sidecar topology mounts it only in `openshell-network`; workload
+and unrelated init containers do not receive it. The sidecar `network-init` and
+long-running network supervisor both receive the read-only
+`/etc/openshell-tls/network-additional-ca.crt` path and gateway-issued SHA-256
+digest. Each canonicalizes the mounted PEM and rejects a generation mismatch
+before network setup. This material augments destination trust and remains
+separate from callback mTLS Secrets and corporate-proxy trust.
+Running supervisors load it only at startup. When the global setting is removed,
+newly created or recreated pods receive no ConfigMap volume or mount; existing
+supervisors retain their startup material until restarted. The driver needs
+ConfigMap `get` and `create` in each target namespace but intentionally has no
+`list`, `watch`, `patch`, `update`, or `delete` permission. Unused generations
+can therefore remain. An operator with separate list/delete authority may use
+the managed-by and gateway-id labels to inventory them, but must verify that no
+Sandbox resource or pod volume references a generation before deleting it.
+
 The driver forwards the canonical main-process specification to the process
 supervisor and sets pod `restartPolicy: Never`. Main-process environment
 overrides stay local to that child; the sidecar bootstrap retains the unmodified

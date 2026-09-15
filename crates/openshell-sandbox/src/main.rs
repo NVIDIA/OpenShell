@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-use openshell_sandbox::run_sandbox;
+use openshell_sandbox::{run_sandbox, validate_network_additional_ca_args};
 
 /// Subcommand name used to self-copy the supervisor binary into a shared volume.
 ///
@@ -231,6 +231,17 @@ struct Args {
     /// re-signed upstream certificates and the sandbox trust bundle.
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
+
+    /// Driver-staged PEM roots that augment destination TLS trust. This is an
+    /// operator-owned argv input and deliberately has no environment alias.
+    #[arg(long)]
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
+
+    /// Gateway-issued SHA-256 digest for `--network-additional-ca-bundle`.
+    /// This protected argv input is required exactly when the bundle path is
+    /// set, and deliberately has no environment alias.
+    #[arg(long)]
+    network_additional_ca_digest: Option<String>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -441,8 +452,19 @@ fn run_network_init(
     proxy_primary_group_id: u32,
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
+    network_additional_ca_bundle: Option<&Path>,
+    network_additional_ca_digest: Option<&str>,
 ) -> Result<()> {
     validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
+
+    // `network-init` has no proxy listener, but it does install the bypass
+    // rules that authorize the long-running network supervisor. Authenticate
+    // its read-only CA mount before granting that bypass.
+    if let Some((path, digest)) = network_additional_ca_bundle.zip(network_additional_ca_digest) {
+        let _ = openshell_supervisor_network::l7::tls::read_and_verify_additional_ca_bundle(
+            path, digest,
+        )?;
+    }
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
@@ -501,6 +523,8 @@ fn run_network_init(
     _proxy_gid: u32,
     _sidecar_state_dir: &str,
     _sidecar_tls_dir: &str,
+    _network_additional_ca_bundle: Option<&Path>,
+    _network_additional_ca_digest: Option<&str>,
 ) -> Result<()> {
     Err(miette::miette!(
         "--mode=network-init is only supported on Linux"
@@ -536,6 +560,10 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    validate_network_additional_ca_args(
+        args.network_additional_ca_bundle.as_deref(),
+        args.network_additional_ca_digest.as_deref(),
+    )?;
 
     if args.mode.network_init {
         let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
@@ -544,6 +572,8 @@ fn main() -> Result<()> {
             proxy_gid,
             &args.sidecar_state_dir,
             &args.sidecar_tls_dir,
+            args.network_additional_ca_bundle.as_deref(),
+            args.network_additional_ca_digest.as_deref(),
         );
     }
 
@@ -712,6 +742,8 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            args.network_additional_ca_bundle,
+            args.network_additional_ca_digest,
         )
         .await
     });
@@ -750,6 +782,7 @@ fn resolve_default_command(command: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
@@ -848,6 +881,87 @@ mod tests {
     fn mode_rejects_empty_value() {
         let err = "".parse::<Mode>().unwrap_err();
         assert!(err.contains("at least one"));
+    }
+
+    #[test]
+    fn network_additional_ca_bundle_and_digest_are_operator_only_and_proxy_independent() {
+        let path = openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let args = Args::try_parse_from([
+            "openshell-sandbox",
+            "--network-additional-ca-bundle",
+            path,
+            "--network-additional-ca-digest",
+            &digest,
+        ])
+        .expect("dedicated destination trust arguments should parse");
+        validate_network_additional_ca_args(
+            args.network_additional_ca_bundle.as_deref(),
+            args.network_additional_ca_digest.as_deref(),
+        )
+        .expect("coherent destination trust arguments");
+        assert_eq!(
+            args.network_additional_ca_bundle.as_deref(),
+            Some(Path::new(path))
+        );
+        assert_eq!(
+            args.network_additional_ca_digest.as_deref(),
+            Some(digest.as_str())
+        );
+        assert!(args.upstream_proxy.is_none());
+        assert!(args.upstream_proxy_ca_bundle.is_none());
+
+        let command = Args::command();
+        for id in [
+            "network_additional_ca_bundle",
+            "network_additional_ca_digest",
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .expect("argument metadata");
+            assert!(
+                argument.get_env().is_none(),
+                "sandbox environment must not select destination trust material"
+            );
+        }
+    }
+
+    #[test]
+    fn network_additional_ca_args_reject_incoherent_or_malformed_cli_pairs() {
+        let path = openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+        assert!(validate_network_additional_ca_args(None, None).is_ok());
+
+        let path_only =
+            Args::try_parse_from(["openshell-sandbox", "--network-additional-ca-bundle", path])
+                .unwrap();
+        let digest_only = Args::try_parse_from([
+            "openshell-sandbox",
+            "--network-additional-ca-digest",
+            &format!("sha256:{}", "a".repeat(64)),
+        ])
+        .unwrap();
+        let malformed = Args::try_parse_from([
+            "openshell-sandbox",
+            "--network-additional-ca-bundle",
+            path,
+            "--network-additional-ca-digest",
+            "sha256:not-a-digest",
+        ])
+        .unwrap();
+
+        for (args, expected) in [
+            (path_only, "must be set together"),
+            (digest_only, "must be set together"),
+            (malformed, "lowercase hexadecimal"),
+        ] {
+            let error = validate_network_additional_ca_args(
+                args.network_additional_ca_bundle.as_deref(),
+                args.network_additional_ca_digest.as_deref(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[cfg(target_os = "linux")]

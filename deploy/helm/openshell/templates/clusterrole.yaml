@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{- $supervisorNetwork := .Values.supervisor.network | default dict }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -72,6 +73,23 @@ rules:
       - pods
     verbs:
       - get
+  {{- end }}
+  {{- if and (ne $workspaceMode "shared") (get $supervisorNetwork "additionalCaConfigMapName") }}
+  # The Kubernetes driver creates and verifies immutable, content-addressed
+  # destination-CA ConfigMaps. Kubernetes RBAC supports exact resourceNames
+  # only, not the digest-bearing name prefix, and CREATE cannot be restricted
+  # by resourceNames. This ClusterRole is bound cluster-wide in managed and
+  # operator modes, so keep the required capability to get/create only: the
+  # driver never lists, watches, patches, updates, or deletes these objects.
+  # Use a dedicated gateway service account and namespace-scoped bindings when
+  # this read boundary matters.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - create
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}

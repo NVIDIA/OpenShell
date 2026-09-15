@@ -124,6 +124,7 @@ pub async fn run_ssh_server(
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
@@ -177,6 +178,7 @@ pub async fn run_ssh_server(
                         netns_fd,
                         proxy_url,
                         ca_paths,
+                        tls_environment_mode,
                         provider_credentials,
                         user_environment,
                         resolved_identity,
@@ -343,6 +345,7 @@ async fn handle_connection(
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
@@ -369,6 +372,7 @@ async fn handle_connection(
         netns_fd,
         proxy_url,
         ca_file_paths,
+        tls_environment_mode,
         provider_credentials,
         user_environment,
         resolved_identity,
@@ -459,6 +463,7 @@ struct SshHandler {
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
@@ -492,6 +497,7 @@ impl SshHandler {
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
         resolved_identity: ResolvedProcessIdentity,
@@ -504,6 +510,7 @@ impl SshHandler {
             netns_fd,
             proxy_url,
             ca_file_paths,
+            tls_environment_mode,
             provider_credentials,
             user_environment,
             resolved_identity,
@@ -856,6 +863,7 @@ impl russh::server::Handler for SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
+                self.tls_environment_mode,
                 &self.provider_credentials.child_env_with_gcp_resolved(),
                 &self.user_environment,
                 self.resolved_identity,
@@ -1085,6 +1093,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
+                self.tls_environment_mode,
                 &provider_env,
                 &self.user_environment,
                 self.resolved_identity,
@@ -1106,6 +1115,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
+                self.tls_environment_mode,
                 &provider_env,
                 &self.user_environment,
                 self.resolved_identity,
@@ -1199,6 +1209,7 @@ fn apply_child_env(
     term: &str,
     proxy_url: Option<&str>,
     ca_file_paths: Option<&(PathBuf, PathBuf)>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
 ) {
@@ -1224,17 +1235,34 @@ fn apply_child_env(
         }
     }
 
-    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
-        for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-            cmd.env(key, value);
-        }
-    }
-
     for (key, value) in provider_env {
         if is_supervisor_only_env_var(key) {
             continue;
         }
         cmd.env(key, value);
+    }
+
+    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
+        // Provider credentials are injected above. Preserve caller-selected
+        // TLS values in direct/additional-CA mode before filling only gaps.
+        if matches!(
+            tls_environment_mode,
+            child_env::TlsEnvironmentMode::FillMissing
+        ) {
+            for (key, value) in user_environment {
+                if child_env::is_tls_environment_variable(key) {
+                    cmd.env(key, value);
+                }
+            }
+        }
+        for (key, value) in child_env::tls_env_vars_for_mode(
+            ca_cert_path,
+            combined_bundle_path,
+            tls_environment_mode,
+            user_environment,
+        ) {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -1281,6 +1309,7 @@ fn spawn_pty_shell(
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
@@ -1325,6 +1354,7 @@ fn spawn_pty_shell(
         term,
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
+        tls_environment_mode,
         provider_env,
         user_environment,
     );
@@ -1450,6 +1480,7 @@ fn spawn_pipe_exec(
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+    tls_environment_mode: child_env::TlsEnvironmentMode,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
@@ -1473,6 +1504,7 @@ fn spawn_pipe_exec(
         "dumb",
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
+        tls_environment_mode,
         provider_env,
         user_environment,
     );
@@ -2584,6 +2616,7 @@ mod tests {
             None,
             None,
             None,
+            child_env::TlsEnvironmentMode::ForceOpenShell,
             ProviderCredentialState::from_child_env_snapshot(0, HashMap::new()),
             HashMap::new(),
             ResolvedProcessIdentity::default(),

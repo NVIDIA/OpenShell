@@ -6,17 +6,18 @@
 use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+    OperatorNamespaceAllowlist, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    network_additional_ca_config_map_name, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    ServiceAccount, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
+    Secret, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -32,7 +33,6 @@ use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
-use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
     LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
@@ -53,6 +53,12 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::{
+    NetworkSupervisorTrustBundle, driver_mounts,
+    network_trust::{
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+    },
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -67,7 +73,13 @@ pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
+const NETWORK_ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-network-additional-ca";
 const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
+/// Kubernetes limits a `ConfigMap`'s key-plus-value data to 1 MiB. The shared
+/// boundary reserves space for `ca.crt`, so every supported driver enforces one
+/// deployable contract.
+const NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES: usize =
+    openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
@@ -288,12 +300,16 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     CLIENT_TLS_VOLUME_NAME,
     UPSTREAM_PROXY_AUTH_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+    NETWORK_ADDITIONAL_CA_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
     WORKSPACE_VOLUME_NAME,
 ];
 
-const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[
+    SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+];
 
 fn validate_kubernetes_driver_volumes(
     volumes: &[KubernetesDriverVolumeConfig],
@@ -411,6 +427,50 @@ fn validate_kubernetes_protected_path_conflicts(
     Ok(())
 }
 
+fn network_additional_ca_config_map(
+    namespace: &str,
+    name: &str,
+    gateway_id: &str,
+    bundle: &NetworkSupervisorTrustBundle,
+) -> Result<ConfigMap, KubernetesDriverError> {
+    if bundle.normalized_pem().len() > NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "normalized network additional CA material is too large for a Kubernetes ConfigMap ({} bytes; maximum {} bytes)",
+            bundle.normalized_pem().len(),
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES
+        )));
+    }
+    let pem = String::from_utf8(bundle.normalized_pem().to_vec()).map_err(|_| {
+        KubernetesDriverError::Precondition(
+            "normalized network additional CA material is not UTF-8 PEM".to_string(),
+        )
+    })?;
+    Ok(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                (LABEL_GATEWAY_ID.to_string(), gateway_id.to_string()),
+            ])),
+            annotations: Some(BTreeMap::from([(
+                NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
+                bundle.digest().to_string(),
+            )])),
+            ..Default::default()
+        },
+        immutable: Some(true),
+        data: Some(BTreeMap::from([(
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY.to_string(),
+            pem,
+        )])),
+        ..Default::default()
+    })
+}
+
 fn kubernetes_driver_volume_to_k8s(volume: &KubernetesDriverVolumeConfig) -> serde_json::Value {
     serde_json::to_value(Volume::from(volume)).expect("Volume serializes to JSON")
 }
@@ -463,6 +523,7 @@ pub struct KubernetesComputeDriver {
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -471,6 +532,13 @@ impl std::fmt::Debug for KubernetesComputeDriver {
             .field("namespace", &self.config.namespace)
             .field("default_image", &self.config.default_image)
             .field("grpc_endpoint", &self.config.grpc_endpoint)
+            .field(
+                "network_additional_ca",
+                &self
+                    .network_trust_bundle
+                    .as_ref()
+                    .map(|bundle| (bundle.certificate_count(), bundle.digest())),
+            )
             .finish()
     }
 }
@@ -490,16 +558,22 @@ impl KubernetesComputeDriver {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
             operator_allowlist: None,
+            network_trust_bundle: None,
         }
     }
 
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> Result<Self, KubernetesDriverError> {
         config
             .validate_configuration()
             .map_err(KubernetesDriverError::Precondition)?;
+        if let Some(bundle) = network_trust_bundle.as_ref() {
+            network_additional_ca_config_map_name(&config.gateway_id, bundle.digest())
+                .map_err(KubernetesDriverError::Precondition)?;
+        }
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -548,6 +622,7 @@ impl KubernetesComputeDriver {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
             operator_allowlist,
+            network_trust_bundle,
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -898,6 +973,230 @@ impl KubernetesComputeDriver {
             }
         }
 
+        Ok(())
+    }
+
+    /// Ensure the gateway-normalized destination trust bundle exists in the target namespace.
+    ///
+    /// Each bundle has a content-addressed, immutable `ConfigMap` name. Existing
+    /// objects are therefore only read and validated; this path never updates or
+    /// server-side-applies a map. Historic maps are intentionally retained: a
+    /// running pod can still reference an older trust generation, and deleting
+    /// it could break a later reschedule. Reference-aware garbage collection is
+    /// deliberately outside this lifecycle change.
+    async fn ensure_network_additional_ca_config_map(
+        &self,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(bundle) = self.network_trust_bundle.as_ref() else {
+            return Ok(());
+        };
+        // Re-read the gateway-owned artifact on every stopped resume as well as
+        // initial provisioning. The error type intentionally excludes PEM data.
+        Self::verify_network_additional_ca_artifact(bundle)?;
+        let name = network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest())
+            .map_err(KubernetesDriverError::Precondition)?;
+        let desired =
+            network_additional_ca_config_map(namespace, &name, &self.config.gateway_id, bundle)?;
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+
+        match self
+            .get_network_additional_ca_config_map(&api, &name, namespace)
+            .await?
+        {
+            Some(existing) => {
+                Self::validate_network_additional_ca_config_map(
+                    &existing,
+                    &name,
+                    namespace,
+                    &self.config.gateway_id,
+                    bundle,
+                )?;
+                debug!(namespace, config_map = %name, digest = bundle.digest(), "validated immutable network additional CA ConfigMap");
+            }
+            None => match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.create(&PostParams::default(), &desired),
+            )
+            .await
+            {
+                Ok(Ok(created)) => {
+                    // Admission may mutate a created object. Validate every
+                    // protected field before allowing it to be mounted by a pod.
+                    Self::validate_network_additional_ca_config_map(
+                        &created,
+                        &name,
+                        namespace,
+                        &self.config.gateway_id,
+                        bundle,
+                    )?;
+                    info!(namespace, config_map = %name, certificate_count = bundle.certificate_count(), digest = bundle.digest(), "created immutable network additional CA ConfigMap");
+                }
+                Ok(Err(KubeError::Api(error))) if error.code == 409 => {
+                    // Another gateway instance can win the GET/CREATE race. It
+                    // is safe only when the exact immutable artifact validates;
+                    // never try to mutate or adopt a conflicting object.
+                    let existing = self
+                        .get_network_additional_ca_config_map(&api, &name, namespace)
+                        .await?
+                        .ok_or_else(|| {
+                            KubernetesDriverError::Message(format!(
+                                "network additional CA ConfigMap {name} disappeared after a create conflict in namespace {namespace}"
+                            ))
+                        })?;
+                    Self::validate_network_additional_ca_config_map(
+                        &existing,
+                        &name,
+                        namespace,
+                        &self.config.gateway_id,
+                        bundle,
+                    )?;
+                    debug!(namespace, config_map = %name, digest = bundle.digest(), "validated raced immutable network additional CA ConfigMap");
+                }
+                // Do not include arbitrary API response text: admission webhooks
+                // can echo request fields, including certificate material.
+                Ok(Err(_)) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "failed to create network additional CA ConfigMap {name} in namespace {namespace}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timeout creating network additional CA ConfigMap {name} in namespace {namespace}"
+                    )));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Validate, but never recreate, the map claimed by an equal CR generation.
+    ///
+    /// Equality means this exact map was already part of the prior atomic CR
+    /// creation/template patch. Treating an absent map as a new create here
+    /// would hide deletion or tampering between stop and resume.
+    async fn validate_existing_network_additional_ca_config_map(
+        &self,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(bundle) = self.network_trust_bundle.as_ref() else {
+            return Ok(());
+        };
+        Self::verify_network_additional_ca_artifact(bundle)?;
+        let name = network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest())
+            .map_err(KubernetesDriverError::Precondition)?;
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let existing = self
+            .get_network_additional_ca_config_map(&api, &name, namespace)
+            .await?
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(format!(
+                    "network additional CA ConfigMap {name} in namespace {namespace} is missing for the recorded trust generation"
+                ))
+            })?;
+        Self::validate_network_additional_ca_config_map(
+            &existing,
+            &name,
+            namespace,
+            &self.config.gateway_id,
+            bundle,
+        )
+    }
+
+    fn verify_network_additional_ca_artifact(
+        bundle: &NetworkSupervisorTrustBundle,
+    ) -> Result<(), KubernetesDriverError> {
+        bundle.verify_artifact().map_err(|error| {
+            KubernetesDriverError::Precondition(format!(
+                "gateway-owned network additional CA artifact failed validation: {error}"
+            ))
+        })
+    }
+
+    async fn get_network_additional_ca_config_map(
+        &self,
+        api: &Api<ConfigMap>,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<ConfigMap>, KubernetesDriverError> {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name)).await {
+            Ok(Ok(config_map)) => Ok(config_map),
+            // Do not include arbitrary API response text: an admission proxy can
+            // reflect ConfigMap data in diagnostics.
+            Ok(Err(_)) => Err(KubernetesDriverError::Message(format!(
+                "failed to get network additional CA ConfigMap {name} in namespace {namespace}"
+            ))),
+            Err(_) => Err(KubernetesDriverError::Message(format!(
+                "timeout getting network additional CA ConfigMap {name} in namespace {namespace}"
+            ))),
+        }
+    }
+
+    fn validate_network_additional_ca_config_map(
+        config_map: &ConfigMap,
+        name: &str,
+        namespace: &str,
+        gateway_id: &str,
+        bundle: &NetworkSupervisorTrustBundle,
+    ) -> Result<(), KubernetesDriverError> {
+        if config_map.metadata.name.as_deref() != Some(name)
+            || config_map.metadata.namespace.as_deref() != Some(namespace)
+        {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} returned an unexpected identity"
+            )));
+        }
+
+        let labels = config_map.metadata.labels.as_ref();
+        if labels
+            .and_then(|labels| labels.get(LABEL_MANAGED_BY))
+            .map(String::as_str)
+            != Some(LABEL_MANAGED_BY_VALUE)
+            || labels
+                .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+                .map(String::as_str)
+                != Some(gateway_id)
+        {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} exists but is not owned by this gateway"
+            )));
+        }
+
+        if config_map.immutable != Some(true) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} is not immutable"
+            )));
+        }
+
+        let generation = config_map
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY))
+            .map(String::as_str);
+        if generation != Some(bundle.digest()) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} has an unexpected trust generation"
+            )));
+        }
+
+        let data = config_map.data.as_ref();
+        let exact_data = data.is_some_and(|data| {
+            data.len() == 1
+                && data
+                    .get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY)
+                    .map(String::as_bytes)
+                    == Some(bundle.normalized_pem())
+        });
+        let has_binary_data = config_map
+            .binary_data
+            .as_ref()
+            .is_some_and(|data| !data.is_empty());
+        if !exact_data || has_binary_data {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "network additional CA ConfigMap {name} in namespace {namespace} did not retain the exact gateway-normalized trust bundle"
+            )));
+        }
         Ok(())
     }
 
@@ -1486,6 +1785,8 @@ impl KubernetesComputeDriver {
         if self.config.is_multi_namespace() {
             self.ensure_tls_secret(&target_namespace).await?;
         }
+        self.ensure_network_additional_ca_config_map(&target_namespace)
+            .await?;
 
         info!(
             sandbox_id = %sandbox.id,
@@ -1516,6 +1817,14 @@ impl KubernetesComputeDriver {
             .config
             .supervisor_image_pull_policy
             .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let network_additional_ca_config_map_name = self
+            .network_trust_bundle
+            .as_ref()
+            .map(|bundle| {
+                network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest())
+            })
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         let params = SandboxPodParams {
@@ -1554,6 +1863,11 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
+            network_additional_ca_config_map_name: network_additional_ca_config_map_name.as_deref(),
+            network_additional_ca_digest: self
+                .network_trust_bundle
+                .as_ref()
+                .map(NetworkSupervisorTrustBundle::digest),
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
         };
@@ -1564,6 +1878,16 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        // This is gateway-owned metadata, not a user annotation. It is written
+        // on creation so a later stopped resume can compare exact startup
+        // trust generations, including an explicit `none` removal marker.
+        annotations.insert(
+            NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
+            self.network_trust_bundle.as_ref().map_or_else(
+                || NETWORK_SUPERVISOR_TRUST_GENERATION_NONE.to_string(),
+                |bundle| bundle.digest().to_string(),
+            ),
+        );
         add_trace_context_annotation(&mut annotations);
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
@@ -1700,12 +2024,333 @@ impl KubernetesComputeDriver {
         )
     )]
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+        self.start_sandbox_with_snapshot(sandbox_id, "", None).await
+    }
+
+    /// Resume a sandbox and, when the gateway supplied a durable provisioning
+    /// snapshot, reconcile gateway-owned startup material while the CR is
+    /// explicitly suspended.
+    ///
+    /// A running CR is intentionally left untouched. This is the boundary that
+    /// keeps a live supervisor on its startup trust snapshot until an operator
+    /// performs a stop followed by a start.
+    #[tracing::instrument(
+        name = "kubernetes.start_sandbox_with_snapshot",
+        skip(self, sandbox),
+        fields(
+            otel.name = "kubernetes.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
+    pub async fn start_sandbox_with_snapshot(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox: Option<&Sandbox>,
+    ) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let result = self
-            .patch_sandbox_operating_state(sandbox_id, true)
-            .await
-            .map(|_| ());
+        let result = async {
+            if let Some(sandbox) = sandbox
+                && !sandbox_name.is_empty()
+                && sandbox.name != sandbox_name
+            {
+                return Err(KubernetesDriverError::InvalidArgument(
+                    "start sandbox snapshot identity does not match sandbox_name".to_string(),
+                ));
+            }
+
+            let needs_resume = self
+                .reconcile_stopped_sandbox_network_trust(sandbox_id, sandbox)
+                .await?;
+            if needs_resume {
+                // Equal-generation reconciliation does not mutate the CR, so
+                // the ordinary operating-state patch remains sufficient.
+                self.patch_sandbox_operating_state(sandbox_id, true)
+                    .await
+                    .map(|_| ())
+            } else {
+                // A running CR is untouched. A changed-generation stopped CR
+                // is resumed atomically with its replacement template below.
+                Ok(())
+            }
+        }
+        .await;
         span_status.finish(result)
+    }
+
+    /// Reconcile a stopped, gateway-managed Sandbox CR's startup trust.
+    ///
+    /// Returns `true` when an equal-generation stopped CR still needs the
+    /// caller's ordinary operating-state patch. A running CR returns `false`
+    /// without mutation. A changed-generation stopped CR atomically installs
+    /// the replacement template and running state, then also returns `false`.
+    ///
+    /// The replacement template comes only from `sandbox` and current driver
+    /// configuration. In particular, it never clones a pod template or other
+    /// mutable runtime configuration from the old CR. PVC templates are not
+    /// touched, so the CR and durable workspace identity are retained. An
+    /// ID-only legacy start can resume an already-matching generation, but a
+    /// generation transition requires the durable provisioning snapshot.
+    async fn reconcile_stopped_sandbox_network_trust(
+        &self,
+        sandbox_id: &str,
+        sandbox: Option<&Sandbox>,
+    ) -> Result<bool, KubernetesDriverError> {
+        if sandbox.is_some_and(|sandbox| sandbox.id != sandbox_id) {
+            return Err(KubernetesDriverError::InvalidArgument(
+                "start sandbox snapshot identity does not match sandbox_id".to_string(),
+            ));
+        }
+
+        let lookup_api = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        let mut objects = list.items.into_iter();
+        let object = objects.next().ok_or(KubernetesDriverError::NotFound)?;
+        if objects.next().is_some() {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "multiple gateway-managed Kubernetes sandbox resources match sandbox {sandbox_id}"
+            )));
+        }
+
+        let labels = object.metadata.labels.as_ref();
+        let owned = labels
+            .and_then(|labels| labels.get(LABEL_MANAGED_BY))
+            .map(String::as_str)
+            == Some(LABEL_MANAGED_BY_VALUE)
+            && labels
+                .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+                .map(String::as_str)
+                == Some(self.config.gateway_id.as_str())
+            && labels
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+                .map(String::as_str)
+                == Some(sandbox_id)
+            && sandbox.is_none_or(|sandbox| {
+                labels
+                    .and_then(|labels| labels.get(LABEL_SANDBOX_NAME))
+                    .map(String::as_str)
+                    == Some(sandbox.name.as_str())
+            });
+        if !owned {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "resolved Kubernetes sandbox {sandbox_id} is not owned by this gateway"
+            )));
+        }
+
+        let namespace = object
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.config.namespace.clone());
+        let kube_name = object.metadata.name.clone().ok_or_else(|| {
+            KubernetesDriverError::Message("sandbox resource has no name".to_string())
+        })?;
+        let agent_sandbox_api = Self::agent_sandbox_api(
+            self.client.clone(),
+            &lookup_api.resource.version,
+            &namespace,
+        );
+
+        // Do not hot-reload a running supervisor, even if its marker is stale.
+        // A start request racing a controller resume must leave the running CR
+        // completely untouched: no trust read, ConfigMap validation, template
+        // mutation, or idempotent operating-state patch.
+        if !kubernetes_sandbox_is_explicitly_stopped(&agent_sandbox_api.resource.version, &object) {
+            debug!(
+                sandbox_id,
+                sandbox_api_version = %agent_sandbox_api.resource.version,
+                "leaving non-stopped Kubernetes sandbox unchanged"
+            );
+            return Ok(false);
+        }
+
+        let desired_generation = self.network_trust_bundle.as_ref().map_or(
+            NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+            NetworkSupervisorTrustBundle::digest,
+        );
+        let actual_generation = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY))
+            .map(String::as_str);
+
+        // A matching CR marker alone never authorizes a configured-trust
+        // resume. Verify the staged artifact and the exact immutable
+        // content-addressed ConfigMap before accepting equality or patching
+        // the operating state. With no configured trust there is no map to
+        // ensure, and an explicit `none` marker can resume directly.
+        if actual_generation == Some(desired_generation) {
+            if self.network_trust_bundle.is_some() {
+                self.validate_existing_network_additional_ca_config_map(&namespace)
+                    .await?;
+            }
+            return Ok(true);
+        }
+
+        // A changed generation creates or validates the new content-addressed
+        // immutable map before atomically referencing it from the CR template.
+        if self.network_trust_bundle.is_some() {
+            self.ensure_network_additional_ca_config_map(&namespace)
+                .await?;
+        }
+
+        let sandbox = sandbox.ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "a stopped Kubernetes sandbox with a changed trust generation requires a provisioning snapshot before it can start"
+                    .to_string(),
+            )
+        })?;
+
+        let (resolved_user_id, resolved_group_id, _namespace_annotations) =
+            self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let image_pull_policy = self
+            .config
+            .image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let supervisor_image_pull_policy = self
+            .config
+            .supervisor_image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let network_additional_ca_config_map_name = self
+            .network_trust_bundle
+            .as_ref()
+            .map(|bundle| {
+                network_additional_ca_config_map_name(&self.config.gateway_id, bundle.digest())
+            })
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let params = SandboxPodParams {
+            default_image: &self.config.default_image,
+            image_pull_policy,
+            image_pull_secrets: &self.config.image_pull_secrets,
+            supervisor_image: &self.config.supervisor_image,
+            supervisor_image_pull_policy,
+            supervisor_sideload_method: self.config.supervisor_sideload_method,
+            topology: self.config.topology,
+            proxy_uid: self.config.sidecar.proxy_uid,
+            process_binary_aware_network_policy: self
+                .config
+                .sidecar
+                .process_binary_aware_network_policy,
+            https_proxy: self.config.https_proxy.as_deref(),
+            no_proxy: self.config.no_proxy.as_deref(),
+            proxy_auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
+            proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
+            proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
+            proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            service_account_name: &self.config.service_account_name,
+            sandbox_id: &sandbox.id,
+            sandbox_name: &sandbox.name,
+            grpc_endpoint: &self.config.grpc_endpoint,
+            ssh_socket_path: self.ssh_socket_path(),
+            client_tls_secret_name: &self.config.client_tls_secret_name,
+            host_gateway_ip: &self.config.host_gateway_ip,
+            enable_user_namespaces: self.config.enable_user_namespaces,
+            app_armor_profile: self.config.app_armor_profile.as_ref(),
+            workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
+            default_runtime_class_name: &self.config.default_runtime_class_name,
+            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+            provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
+            provider_spiffe_workload_api_socket_path: &self
+                .config
+                .provider_spiffe_workload_api_socket_path,
+            network_additional_ca_config_map_name: network_additional_ca_config_map_name.as_deref(),
+            network_additional_ca_digest: self
+                .network_trust_bundle
+                .as_ref()
+                .map(NetworkSupervisorTrustBundle::digest),
+            sandbox_uid: resolved_user_id,
+            sandbox_gid: resolved_group_id,
+        };
+        validate_sidecar_proxy_identity(&params)?;
+        let desired = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+        let pod_template = desired
+            .get("spec")
+            .and_then(|spec| spec.get("podTemplate"))
+            .cloned()
+            .ok_or_else(|| {
+                KubernetesDriverError::Message(
+                    "generated Kubernetes sandbox spec is missing podTemplate".to_string(),
+                )
+            })?;
+        let resource_version = object.metadata.resource_version.clone().ok_or_else(|| {
+            KubernetesDriverError::Message("sandbox resource has no resourceVersion".to_string())
+        })?;
+        let mut replacement_spec = serde_json::json!({"podTemplate": pod_template});
+        let replacement_spec_object = replacement_spec.as_object_mut().ok_or_else(|| {
+            KubernetesDriverError::Message(
+                "generated Kubernetes sandbox replacement spec is invalid".to_string(),
+            )
+        })?;
+        if agent_sandbox_api.resource.version == SANDBOX_VERSION_V1BETA1 {
+            replacement_spec_object.insert(
+                "operatingMode".to_string(),
+                serde_json::Value::String("Running".to_string()),
+            );
+        } else {
+            replacement_spec_object.insert("replicas".to_string(), serde_json::json!(1));
+        }
+        let patch = serde_json::json!({
+            "metadata": {
+                // API-server resource-version fencing prevents a delayed start
+                // from overwriting an intervening operator/controller update.
+                "resourceVersion": resource_version,
+                "annotations": {NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: desired_generation},
+            },
+            // Arrays in a merge patch replace atomically, intentionally
+            // removing the old CA volume, mount, and supervisor argv when the
+            // configured trust source has been removed. Resume in this same
+            // patch so controller status updates cannot race a second patch.
+            "spec": replacement_spec,
+        });
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s reconciling Kubernetes sandbox startup trust",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+
+        info!(
+            sandbox_id,
+            namespace,
+            sandbox_api_version = %agent_sandbox_api.resource.version,
+            generation = desired_generation,
+            "reconciled and resumed stopped Kubernetes sandbox startup trust"
+        );
+        Ok(false)
     }
 
     async fn patch_sandbox_operating_state(
@@ -2873,6 +3518,7 @@ fn apply_supervisor_sideload_with_params(
             driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
         ];
         command.extend(upstream_proxy_cli_args(params));
+        command.extend(network_additional_ca_cli_args(params));
         container.insert("command".to_string(), serde_json::json!(command));
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -2905,6 +3551,15 @@ fn apply_supervisor_sideload_with_params(
             .as_array_mut();
         if let Some(env) = env {
             apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+        }
+        if has_network_additional_ca(params) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(network_additional_ca_volume_mount());
+            }
         }
         if has_upstream_proxy_credentials(params) {
             let volume_mounts = container
@@ -2960,6 +3615,37 @@ fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
     args
+}
+
+fn network_additional_ca_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    params
+        .network_additional_ca_config_map_name
+        .zip(params.network_additional_ca_digest)
+        .map(|(_, digest)| {
+            vec![
+                "--network-additional-ca-bundle".to_string(),
+                openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+                "--network-additional-ca-digest".to_string(),
+                digest.to_string(),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn has_network_additional_ca(params: &SandboxPodParams<'_>) -> bool {
+    params
+        .network_additional_ca_config_map_name
+        .zip(params.network_additional_ca_digest)
+        .is_some()
+}
+
+fn network_additional_ca_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+        "mountPath": openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+        "subPath": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+        "readOnly": true,
+    })
 }
 
 fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
@@ -3131,6 +3817,7 @@ fn supervisor_sidecar_container(
         .extend(
             upstream_proxy_cli_args(params)
                 .into_iter()
+                .chain(network_additional_ca_cli_args(params))
                 .map(serde_json::Value::String),
         );
     if let Some(policy) = params.supervisor_image_pull_policy {
@@ -3145,6 +3832,12 @@ fn supervisor_sidecar_container(
                 "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
                 "readOnly": true,
             }));
+    }
+    if has_network_additional_ca(params) {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(network_additional_ca_volume_mount());
     }
     if has_upstream_proxy_credentials(params) {
         container["volumeMounts"]
@@ -3196,6 +3889,20 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             sidecar_tls_volume_mount(),
         ]
     });
+    container["command"]
+        .as_array_mut()
+        .expect("network init command is an array")
+        .extend(
+            network_additional_ca_cli_args(params)
+                .into_iter()
+                .map(serde_json::Value::String),
+        );
+    if has_network_additional_ca(params) {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("network init volumeMounts is an array")
+            .push(network_additional_ca_volume_mount());
+    }
     if let Some(policy) = params.supervisor_image_pull_policy {
         container["imagePullPolicy"] = serde_json::json!(policy);
     }
@@ -3566,6 +4273,11 @@ struct SandboxPodParams<'a> {
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
+    network_additional_ca_config_map_name: Option<&'a str>,
+    /// Gateway-normalized digest that binds the read-only `ConfigMap` mount at
+    /// network-supervisor startup. It is paired with the `ConfigMap` name and
+    /// never derives from a sandbox-controlled source.
+    network_additional_ca_digest: Option<&'a str>,
     /// Resolved sandbox UID for supervisor `runAsUser` and env var.
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
@@ -3605,6 +4317,8 @@ impl Default for SandboxPodParams<'_> {
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
+            network_additional_ca_config_map_name: None,
+            network_additional_ca_digest: None,
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
         }
@@ -4038,6 +4752,19 @@ fn sandbox_template_to_k8s_with_validated_config(
             "csi": {
                 "driver": "csi.spiffe.io",
                 "readOnly": true
+            }
+        }));
+    }
+    if let Some(config_map_name) = params.network_additional_ca_config_map_name {
+        volumes.push(serde_json::json!({
+            "name": NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+            "configMap": {
+                "name": config_map_name,
+                "defaultMode": 0o444,
+                "items": [{
+                    "key": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+                    "path": NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY,
+                }]
             }
         }));
     }
@@ -4631,6 +5358,24 @@ fn next_stop_poll_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
 }
 
+/// Whether the CR's *desired* operating state is explicitly stopped.
+///
+/// This deliberately reads `spec`, rather than pod/status observations: a
+/// stopped pod can be transiently absent while a controller still intends to
+/// run it, and reconciling that case would hot-reload a live lifecycle intent.
+fn kubernetes_sandbox_is_explicitly_stopped(api_version: &str, object: &DynamicObject) -> bool {
+    let spec = object.data.get("spec");
+    if api_version == SANDBOX_VERSION_V1BETA1 {
+        return spec
+            .and_then(|spec| spec.get("operatingMode"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("Suspended"));
+    }
+    spec.and_then(|spec| spec.get("replicas"))
+        .and_then(serde_json::Value::as_i64)
+        == Some(0)
+}
+
 fn sandbox_operating_state_patch(
     api_version: &str,
     resource_version: &str,
@@ -4924,6 +5669,7 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -4931,9 +5677,12 @@ mod tests {
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
     use std::collections::BTreeSet;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
@@ -8766,6 +9515,1034 @@ mod tests {
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
         );
+    }
+
+    const TEST_NETWORK_CA: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\ntest-normalized-ca\n-----END CERTIFICATE-----\n";
+    const TEST_NETWORK_CA_DIGEST: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_network_trust_bundle() -> NetworkSupervisorTrustBundle {
+        static ARTIFACT: OnceLock<PathBuf> = OnceLock::new();
+        let artifact_path = ARTIFACT
+            .get_or_init(|| {
+                let path = std::env::temp_dir().join(format!(
+                    "openshell-kubernetes-network-ca-test-{}",
+                    std::process::id()
+                ));
+                std::fs::write(&path, TEST_NETWORK_CA).expect("write test trust artifact");
+                set_test_artifact_permissions(&path);
+                path
+            })
+            .clone();
+        NetworkSupervisorTrustBundle::new(
+            TEST_NETWORK_CA.to_vec(),
+            1,
+            TEST_NETWORK_CA_DIGEST,
+            artifact_path,
+        )
+    }
+
+    #[test]
+    fn network_additional_ca_config_map_contains_exact_immutable_generation_artifact() {
+        let bundle = test_network_trust_bundle();
+        let name = network_additional_ca_config_map_name("gateway-a", bundle.digest()).unwrap();
+        let config_map =
+            network_additional_ca_config_map("workspace-a", &name, "gateway-a", &bundle).unwrap();
+
+        assert_eq!(config_map.metadata.name.as_deref(), Some(name.as_str()));
+        assert_eq!(
+            config_map.metadata.namespace.as_deref(),
+            Some("workspace-a")
+        );
+        let labels = config_map.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).map(String::as_str),
+            Some(LABEL_MANAGED_BY_VALUE)
+        );
+        assert_eq!(
+            labels.get(LABEL_GATEWAY_ID).map(String::as_str),
+            Some("gateway-a")
+        );
+        assert_eq!(
+            config_map
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY))
+                .map(String::as_str),
+            Some(bundle.digest())
+        );
+        assert_eq!(config_map.immutable, Some(true));
+        assert_eq!(
+            config_map
+                .data
+                .as_ref()
+                .unwrap()
+                .get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY)
+                .map(String::as_bytes),
+            Some(bundle.normalized_pem())
+        );
+    }
+
+    fn assert_network_ca_command(command: &[serde_json::Value]) {
+        let bundle_pairs = command
+            .windows(2)
+            .filter(|pair| pair[0] == "--network-additional-ca-bundle")
+            .collect::<Vec<_>>();
+        assert_eq!(bundle_pairs.len(), 1);
+        assert_eq!(
+            bundle_pairs[0][1],
+            openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+        );
+        let digest_pairs = command
+            .windows(2)
+            .filter(|pair| pair[0] == "--network-additional-ca-digest")
+            .collect::<Vec<_>>();
+        assert_eq!(digest_pairs.len(), 1);
+        assert_eq!(digest_pairs[0][1], TEST_NETWORK_CA_DIGEST);
+    }
+
+    fn has_network_ca_mount(container: &serde_json::Value) -> bool {
+        container["volumeMounts"].as_array().is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                (mount["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME
+                    || mount["mountPath"]
+                        == openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
+                    && mount["readOnly"] == true
+            })
+        })
+    }
+
+    #[test]
+    fn combined_topology_mounts_network_ca_only_in_agent_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Combined,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            network_additional_ca_config_map_name: Some(
+                "openshell-network-additional-ca-gateway-a",
+            ),
+            network_additional_ca_digest: Some(TEST_NETWORK_CA_DIGEST),
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(has_network_ca_mount(agent));
+        assert_network_ca_command(agent["command"].as_array().unwrap());
+        for init in pod["spec"]["initContainers"].as_array().unwrap() {
+            assert!(!has_network_ca_mount(init));
+            assert!(
+                !init["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| { arg == "--network-additional-ca-bundle" })
+            );
+            assert!(
+                !init["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| { arg == "--network-additional-ca-digest" })
+            );
+        }
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(
+            volume["configMap"]["name"],
+            "openshell-network-additional-ca-gateway-a"
+        );
+        assert_eq!(
+            volume["configMap"]["items"][0]["key"],
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY
+        );
+    }
+
+    #[test]
+    fn sidecar_topology_mounts_network_ca_only_at_network_supervisor_boundary() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            network_additional_ca_config_map_name: Some(
+                "openshell-network-additional-ca-gateway-a",
+            ),
+            network_additional_ca_digest: Some(TEST_NETWORK_CA_DIGEST),
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert!(has_network_ca_mount(network));
+        assert_network_ca_command(network["command"].as_array().unwrap());
+
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(!has_network_ca_mount(agent));
+        assert!(
+            !agent["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| { arg == "--network-additional-ca-bundle" })
+        );
+        assert!(
+            !agent["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| { arg == "--network-additional-ca-digest" })
+        );
+        for init in pod["spec"]["initContainers"].as_array().unwrap() {
+            if init["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME {
+                // The privileged network-init boundary verifies the same
+                // read-only generation before it installs bypass rules.
+                assert!(has_network_ca_mount(init));
+                assert_network_ca_command(init["command"].as_array().unwrap());
+            } else {
+                assert!(!has_network_ca_mount(init));
+                assert!(
+                    !init["command"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|arg| { arg == "--network-additional-ca-bundle" })
+                );
+                assert!(
+                    !init["command"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|arg| { arg == "--network-additional-ca-digest" })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unset_network_ca_keeps_pod_spec_free_of_delivery_material() {
+        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+            let params = SandboxPodParams {
+                topology,
+                supervisor_image: "supervisor-image:latest",
+                sandbox_uid: 1500,
+                sandbox_gid: 1500,
+                ..SandboxPodParams::default()
+            };
+            let pod = sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            );
+            assert!(!pod.to_string().contains(NETWORK_ADDITIONAL_CA_VOLUME_NAME));
+            assert!(!pod.to_string().contains("--network-additional-ca-bundle"));
+            assert!(!pod.to_string().contains("--network-additional-ca-digest"));
+        }
+    }
+
+    fn network_ca_api_response(
+        status: u16,
+        body: serde_json::Value,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .unwrap()
+    }
+
+    fn network_ca_config_map_response(
+        namespace: &str,
+        gateway_id: &str,
+        bundle: &NetworkSupervisorTrustBundle,
+    ) -> serde_json::Value {
+        let name = network_additional_ca_config_map_name(gateway_id, bundle.digest()).unwrap();
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "immutable": true,
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {
+                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+                    LABEL_GATEWAY_ID: gateway_id
+                },
+                "annotations": {
+                    NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: bundle.digest()
+                }
+            },
+            "data": {
+                NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY: String::from_utf8_lossy(bundle.normalized_pem())
+            }
+        })
+    }
+
+    fn owned_network_ca_config_map() -> serde_json::Value {
+        network_ca_config_map_response("workspace-a", "gateway-a", &test_network_trust_bundle())
+    }
+
+    type NetworkCaRequests = Arc<Mutex<Vec<(http::Method, String)>>>;
+
+    fn network_ca_test_driver(
+        responses: Vec<http::Response<http_body_util::Full<bytes::Bytes>>>,
+    ) -> (KubernetesComputeDriver, NetworkCaRequests) {
+        use std::collections::VecDeque;
+
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let service_responses = Arc::clone(&responses);
+        let service_requests = Arc::clone(&requests);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let responses = Arc::clone(&service_responses);
+            let requests = Arc::clone(&service_requests);
+            async move {
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((request.method().clone(), request.uri().to_string()));
+                Ok::<_, std::convert::Infallible>(
+                    responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected Kubernetes API request"),
+                )
+            }
+        });
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            gateway_id: "gateway-a".to_string(),
+            ..KubernetesComputeConfig::default()
+        });
+        driver.client = Client::new(service, "default");
+        driver.network_trust_bundle = Some(test_network_trust_bundle());
+        (driver, requests)
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_creates_content_addressed_immutable_absent_object() {
+        let expected_name = network_additional_ca_config_map_name(
+            "gateway-a",
+            test_network_trust_bundle().digest(),
+        )
+        .unwrap();
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(
+                404,
+                serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+            ),
+            network_ca_api_response(201, owned_network_ca_config_map()),
+        ]);
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| &request.0)
+                .collect::<Vec<_>>(),
+            vec![&http::Method::GET, &http::Method::POST]
+        );
+        assert!(requests[0].1.contains(&expected_name));
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_validates_existing_immutable_object_without_mutation() {
+        let (driver, requests) = network_ca_test_driver(vec![network_ca_api_response(
+            200,
+            owned_network_ca_config_map(),
+        )]);
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, http::Method::GET);
+        assert!(
+            requests
+                .iter()
+                .all(|(method, _)| *method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_create_conflict_revalidates_without_ssa() {
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(
+                404,
+                serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+            ),
+            network_ca_api_response(
+                409,
+                serde_json::json!({"status":"Failure", "reason":"AlreadyExists", "code":409}),
+            ),
+            network_ca_api_response(200, owned_network_ca_config_map()),
+        ]);
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| &request.0)
+                .collect::<Vec<_>>(),
+            vec![&http::Method::GET, &http::Method::POST, &http::Method::GET]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|(method, _)| *method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_rejects_foreign_object_before_mutation() {
+        let mut missing_managed_by = owned_network_ca_config_map();
+        missing_managed_by["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(LABEL_MANAGED_BY);
+        let mut wrong_gateway = owned_network_ca_config_map();
+        wrong_gateway["metadata"]["labels"][LABEL_GATEWAY_ID] = serde_json::json!("other-gateway");
+
+        for foreign in [missing_managed_by, wrong_gateway] {
+            let (driver, requests) =
+                network_ca_test_driver(vec![network_ca_api_response(200, foreign)]);
+            let error = driver
+                .ensure_network_additional_ca_config_map("workspace-a")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not owned by this gateway"));
+            assert!(!error.to_string().contains("test-normalized-ca"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_rejects_admission_mutated_data_without_disclosure() {
+        let mut mutated = owned_network_ca_config_map();
+        mutated["data"][NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY] =
+            serde_json::json!("admission-replaced-data");
+
+        let (driver, requests) = network_ca_test_driver(vec![
+            network_ca_api_response(
+                404,
+                serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+            ),
+            network_ca_api_response(201, mutated),
+        ]);
+        let error = driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exact gateway-normalized"));
+        assert!(!error.to_string().contains("test-normalized-ca"));
+        assert!(!error.to_string().contains("admission-replaced-data"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn network_ca_config_map_api_failures_do_not_expose_certificate_bytes() {
+        for responses in [
+            vec![network_ca_api_response(
+                403,
+                serde_json::json!({"status":"Failure", "reason":"Forbidden", "code":403}),
+            )],
+            vec![
+                network_ca_api_response(
+                    404,
+                    serde_json::json!({"status":"Failure", "reason":"NotFound", "code":404}),
+                ),
+                network_ca_api_response(
+                    403,
+                    serde_json::json!({"status":"Failure", "reason":"Forbidden", "code":403}),
+                ),
+            ],
+        ] {
+            let (driver, _) = network_ca_test_driver(responses);
+            let error = driver
+                .ensure_network_additional_ca_config_map("workspace-a")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ConfigMap"));
+            assert!(!error.to_string().contains("test-normalized-ca"));
+        }
+    }
+
+    #[test]
+    fn network_ca_config_map_accepts_exact_shared_limit_with_key_overhead() {
+        let bundle = NetworkSupervisorTrustBundle::new(
+            vec![b'x'; NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES],
+            1,
+            "sha256:test-network-ca",
+            PathBuf::from("/gateway-owned/network-additional-ca.crt"),
+        );
+        let config_map =
+            network_additional_ca_config_map("workspace-a", "name", "gateway-a", &bundle).unwrap();
+        let value = config_map
+            .data
+            .as_ref()
+            .unwrap()
+            .get(NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY)
+            .unwrap();
+        assert_eq!(
+            NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY.len() + value.len(),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn network_ca_config_map_rejects_material_too_large_for_kubernetes() {
+        let bundle = NetworkSupervisorTrustBundle::new(
+            vec![b'x'; NETWORK_ADDITIONAL_CA_CONFIG_MAP_MAX_PEM_BYTES + 1],
+            1,
+            "sha256:test-network-ca",
+            PathBuf::from("/gateway-owned/network-additional-ca.crt"),
+        );
+        let error = network_additional_ca_config_map("workspace-a", "name", "gateway-a", &bundle)
+            .unwrap_err();
+        assert!(error.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn absent_network_ca_does_not_call_config_map_api() {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+            panic!("no Kubernetes API request expected without a network trust bundle");
+            #[allow(unreachable_code)]
+            Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Empty::<
+                bytes::Bytes,
+            >::new()))
+        });
+        let client = Client::new(service, "default");
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        driver.client = client;
+        driver
+            .ensure_network_additional_ca_config_map("workspace-a")
+            .await
+            .unwrap();
+    }
+
+    type RecordedKubeRequest = (http::Method, String, Option<serde_json::Value>);
+    type LifecycleRequests = Arc<Mutex<Vec<RecordedKubeRequest>>>;
+
+    fn lifecycle_test_driver(
+        bundle: Option<NetworkSupervisorTrustBundle>,
+        responses: Vec<http::Response<http_body_util::Full<bytes::Bytes>>>,
+    ) -> (KubernetesComputeDriver, LifecycleRequests) {
+        use http_body_util::BodyExt as _;
+        use std::collections::VecDeque;
+
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let service_responses = Arc::clone(&responses);
+        let service_requests = Arc::clone(&requests);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let responses = Arc::clone(&service_responses);
+            let requests = Arc::clone(&service_requests);
+            async move {
+                let method = request.method().clone();
+                let uri = request.uri().to_string();
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let body = (!bytes.is_empty()).then(|| {
+                    serde_json::from_slice(&bytes)
+                        .expect("Kubernetes client should send a JSON request body")
+                });
+                requests.lock().unwrap().push((method, uri, body));
+                Ok::<_, std::convert::Infallible>(
+                    responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected Kubernetes API request"),
+                )
+            }
+        });
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            gateway_id: "gateway-a".to_string(),
+            sandbox_uid: Some(1000),
+            ..KubernetesComputeConfig::default()
+        });
+        driver.client = Client::new(service, "default");
+        driver.network_trust_bundle = bundle;
+        (driver, requests)
+    }
+
+    static LIFECYCLE_ARTIFACT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    fn lifecycle_trust_bundle(generation: &str, contents: &[u8]) -> NetworkSupervisorTrustBundle {
+        let sequence = LIFECYCLE_ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "openshell-kubernetes-lifecycle-network-ca-{}-{}-{sequence}",
+            std::process::id(),
+            generation.replace(':', "-")
+        ));
+        std::fs::write(&path, contents).expect("write lifecycle trust artifact");
+        set_test_artifact_permissions(&path);
+        NetworkSupervisorTrustBundle::new(contents.to_vec(), 1, generation, path)
+    }
+
+    fn set_test_artifact_permissions(path: &Path) {
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+            .expect("make test trust artifact read-only");
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    fn lifecycle_sandbox() -> Sandbox {
+        Sandbox {
+            id: "sandbox-id".to_string(),
+            name: "sandbox-name".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "example.test/sandbox:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn lifecycle_sandbox_cr(
+        operating_mode: &str,
+        generation: &str,
+        resource_version: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": SANDBOX_KIND,
+            "metadata": {
+                "name": "sandbox-resource", "namespace": "default", "resourceVersion": resource_version,
+                "labels": {
+                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE, LABEL_GATEWAY_ID: "gateway-a",
+                    LABEL_SANDBOX_ID: "sandbox-id", LABEL_SANDBOX_NAME: "sandbox-name"
+                },
+                "annotations": {NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: generation}
+            },
+            "spec": {"operatingMode": operating_mode, "podTemplate": {"spec": {"containers": [{"name": "stale"}]}}}
+        })
+    }
+
+    fn lifecycle_sandbox_cr_v1alpha(
+        replicas: i64,
+        generation: &str,
+        resource_version: &str,
+    ) -> serde_json::Value {
+        let mut sandbox = lifecycle_sandbox_cr("ignored", generation, resource_version);
+        sandbox["apiVersion"] = serde_json::json!("agents.x-k8s.io/v1alpha1");
+        sandbox["spec"] = serde_json::json!({
+            "replicas": replicas, "podTemplate": {"spec": {"containers": [{"name": "stale"}]}}
+        });
+        sandbox
+    }
+
+    fn sandbox_list_response(
+        items: Vec<serde_json::Value>,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        network_ca_api_response(
+            200,
+            serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "SandboxList", "items": items,
+            }),
+        )
+    }
+
+    fn lifecycle_config_map(bundle: &NetworkSupervisorTrustBundle) -> serde_json::Value {
+        network_ca_config_map_response("default", "gateway-a", bundle)
+    }
+
+    fn agent_sandbox_patches(requests: &LifecycleRequests) -> Vec<serde_json::Value> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, uri, _)| {
+                *method == http::Method::PATCH && uri.contains("agents.x-k8s.io")
+            })
+            .filter_map(|(_, _, body)| body.clone())
+            .collect()
+    }
+
+    fn assert_template_has_network_ca(patch: &serde_json::Value, expected: bool) {
+        let rendered = patch["spec"]["podTemplate"].to_string();
+        assert_eq!(
+            rendered.contains(NETWORK_ADDITIONAL_CA_VOLUME_NAME),
+            expected,
+            "template network CA volume mismatch: {rendered}"
+        );
+        assert_eq!(
+            rendered.contains("--network-additional-ca-bundle"),
+            expected,
+            "template network CA argv mismatch: {rendered}"
+        );
+        assert_eq!(
+            rendered.contains("--network-additional-ca-digest"),
+            expected,
+            "template network CA digest argv mismatch: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_reconciles_network_ca_generation_a_to_b_and_fences_start() {
+        let ca_b = b"-----BEGIN CERTIFICATE-----\ngeneration-b\n-----END CERTIFICATE-----\n";
+        let bundle_b = lifecycle_trust_bundle("sha256:b", ca_b);
+        let expected_name =
+            network_additional_ca_config_map_name("gateway-a", bundle_b.digest()).unwrap();
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle_b.clone()),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_config_map(&bundle_b)),
+                network_ca_api_response(200, lifecycle_sandbox_cr("Suspended", "sha256:b", "43")),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:b", "43")]),
+                network_ca_api_response(200, lifecycle_sandbox_cr("Running", "sha256:b", "44")),
+            ],
+        );
+
+        driver
+            .start_sandbox_with_snapshot("sandbox-id", "sandbox-name", Some(&lifecycle_sandbox()))
+            .await
+            .unwrap();
+        let patches = agent_sandbox_patches(&requests);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0]["metadata"]["resourceVersion"], "42");
+        assert_eq!(
+            patches[0]["metadata"]["annotations"][NETWORK_SUPERVISOR_TRUST_GENERATION_KEY],
+            "sha256:b"
+        );
+        assert_template_has_network_ca(&patches[0], true);
+        assert!(patches[0].to_string().contains(&expected_name));
+        assert_eq!(patches[0]["spec"]["operatingMode"], "Running");
+    }
+
+    #[tokio::test]
+    async fn equal_generation_exact_immutable_map_succeeds_and_starts() {
+        let bundle = lifecycle_trust_bundle("sha256:a", TEST_NETWORK_CA);
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle.clone()),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_config_map(&bundle)),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_sandbox_cr("Running", "sha256:a", "43")),
+            ],
+        );
+        driver
+            .start_sandbox_with_snapshot("sandbox-id", "sandbox-name", Some(&lifecycle_sandbox()))
+            .await
+            .unwrap();
+        let patches = agent_sandbox_patches(&requests);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0]["spec"]["operatingMode"], "Running");
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _, _)| *method != http::Method::POST)
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_generation_missing_map_fails_without_recreating_or_starting() {
+        let bundle = lifecycle_trust_bundle("sha256:a", TEST_NETWORK_CA);
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(
+                    404,
+                    serde_json::json!({"status": "Failure", "reason": "NotFound", "code": 404}),
+                ),
+            ],
+        );
+        assert!(matches!(
+            driver
+                .start_sandbox_with_snapshot(
+                    "sandbox-id",
+                    "sandbox-name",
+                    Some(&lifecycle_sandbox())
+                )
+                .await,
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _, _)| *method != http::Method::POST
+                    && *method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_equal_generation_artifacts_prevent_operating_state_patch() {
+        let bundle = lifecycle_trust_bundle("sha256:a", TEST_NETWORK_CA);
+        let mut wrong_data = lifecycle_config_map(&bundle);
+        wrong_data["data"][NETWORK_ADDITIONAL_CA_CONFIG_MAP_KEY] = serde_json::json!("wrong");
+        let mut wrong_ownership = lifecycle_config_map(&bundle);
+        wrong_ownership["metadata"]["labels"][LABEL_GATEWAY_ID] = serde_json::json!("other");
+        let mut wrong_immutable = lifecycle_config_map(&bundle);
+        wrong_immutable["immutable"] = serde_json::json!(false);
+        let mut wrong_generation = lifecycle_config_map(&bundle);
+        wrong_generation["metadata"]["annotations"][NETWORK_SUPERVISOR_TRUST_GENERATION_KEY] =
+            serde_json::json!("sha256:other");
+        for invalid_map in [
+            wrong_data,
+            wrong_ownership,
+            wrong_immutable,
+            wrong_generation,
+        ] {
+            let (driver, requests) = lifecycle_test_driver(
+                Some(bundle.clone()),
+                vec![
+                    sandbox_list_response(vec![]),
+                    sandbox_list_response(vec![lifecycle_sandbox_cr(
+                        "Suspended",
+                        "sha256:a",
+                        "42",
+                    )]),
+                    network_ca_api_response(200, invalid_map),
+                ],
+            );
+            assert!(
+                driver
+                    .start_sandbox_with_snapshot(
+                        "sandbox-id",
+                        "sandbox-name",
+                        Some(&lifecycle_sandbox())
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(agent_sandbox_patches(&requests).is_empty());
+        }
+        std::fs::remove_file(bundle.artifact_path()).unwrap();
+        std::fs::write(bundle.artifact_path(), b"changed artifact").unwrap();
+        set_test_artifact_permissions(bundle.artifact_path());
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+            ],
+        );
+        assert!(
+            driver
+                .start_sandbox_with_snapshot(
+                    "sandbox-id",
+                    "sandbox-name",
+                    Some(&lifecycle_sandbox())
+                )
+                .await
+                .is_err()
+        );
+        assert!(agent_sandbox_patches(&requests).is_empty());
+
+        let missing_bundle = lifecycle_trust_bundle("sha256:missing", TEST_NETWORK_CA);
+        std::fs::remove_file(missing_bundle.artifact_path()).unwrap();
+        let (driver, requests) = lifecycle_test_driver(
+            Some(missing_bundle),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr(
+                    "Suspended",
+                    "sha256:missing",
+                    "42",
+                )]),
+            ],
+        );
+        assert!(
+            driver
+                .start_sandbox_with_snapshot(
+                    "sandbox-id",
+                    "sandbox-name",
+                    Some(&lifecycle_sandbox())
+                )
+                .await
+                .is_err()
+        );
+        assert!(agent_sandbox_patches(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopped_sandbox_reconciles_network_ca_generation_a_to_none() {
+        let (driver, requests) = lifecycle_test_driver(
+            None,
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_sandbox_cr("Suspended", "none", "43")),
+            ],
+        );
+        driver
+            .reconcile_stopped_sandbox_network_trust("sandbox-id", Some(&lifecycle_sandbox()))
+            .await
+            .unwrap();
+        let patches = agent_sandbox_patches(&requests);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0]["metadata"]["annotations"][NETWORK_SUPERVISOR_TRUST_GENERATION_KEY],
+            NETWORK_SUPERVISOR_TRUST_GENERATION_NONE
+        );
+        assert_template_has_network_ca(&patches[0], false);
+        assert_eq!(patches[0]["spec"]["operatingMode"], "Running");
+    }
+
+    #[tokio::test]
+    async fn v1alpha_stopped_replicas_zero_reconciles_but_positive_replicas_remain_untouched() {
+        let (stopped_driver, stopped_requests) = lifecycle_test_driver(
+            None,
+            vec![
+                network_ca_api_response(404, serde_json::json!({"code": 404})),
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr_v1alpha(0, "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_sandbox_cr_v1alpha(0, "none", "43")),
+            ],
+        );
+        assert!(
+            !stopped_driver
+                .reconcile_stopped_sandbox_network_trust("sandbox-id", Some(&lifecycle_sandbox()))
+                .await
+                .unwrap()
+        );
+        let stopped_patches = agent_sandbox_patches(&stopped_requests);
+        assert_eq!(stopped_patches.len(), 1);
+        assert_eq!(stopped_patches[0]["spec"]["replicas"], 1);
+
+        let bundle = lifecycle_trust_bundle("sha256:b", TEST_NETWORK_CA);
+        let (running_driver, running_requests) = lifecycle_test_driver(
+            Some(bundle),
+            vec![
+                network_ca_api_response(404, serde_json::json!({"code": 404})),
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr_v1alpha(1, "sha256:a", "42")]),
+            ],
+        );
+        assert!(
+            !running_driver
+                .reconcile_stopped_sandbox_network_trust("sandbox-id", Some(&lifecycle_sandbox()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            running_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, uri, _)| *method != http::Method::PATCH
+                    && !uri.contains("/configmaps/"))
+        );
+    }
+
+    #[tokio::test]
+    async fn template_patch_conflict_prevents_operating_state_patch() {
+        let bundle = lifecycle_trust_bundle("sha256:b", TEST_NETWORK_CA);
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle.clone()),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Suspended", "sha256:a", "42")]),
+                network_ca_api_response(200, lifecycle_config_map(&bundle)),
+                network_ca_api_response(409, serde_json::json!({"code": 409})),
+            ],
+        );
+        assert!(matches!(
+            driver
+                .start_sandbox_with_snapshot(
+                    "sandbox-id",
+                    "sandbox-name",
+                    Some(&lifecycle_sandbox())
+                )
+                .await,
+            Err(KubernetesDriverError::AlreadyExists)
+        ));
+        assert_eq!(agent_sandbox_patches(&requests).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_stopped_sandbox_reconciliation_does_not_mutate_template_or_config_map() {
+        let bundle = lifecycle_trust_bundle("sha256:b", TEST_NETWORK_CA);
+        let (driver, requests) = lifecycle_test_driver(
+            Some(bundle),
+            vec![
+                sandbox_list_response(vec![]),
+                sandbox_list_response(vec![lifecycle_sandbox_cr("Running", "sha256:a", "42")]),
+            ],
+        );
+        assert!(
+            !driver
+                .reconcile_stopped_sandbox_network_trust("sandbox-id", Some(&lifecycle_sandbox()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _, _)| *method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_mismatched_snapshot_identity_before_api_mutation() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let mut snapshot = lifecycle_sandbox();
+        snapshot.id = "other-id".to_string();
+        let error = driver
+            .reconcile_stopped_sandbox_network_trust("sandbox-id", Some(&snapshot))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, KubernetesDriverError::InvalidArgument(_)));
+        let snapshot = lifecycle_sandbox();
+        let error = driver
+            .start_sandbox_with_snapshot("sandbox-id", "other-name", Some(&snapshot))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, KubernetesDriverError::InvalidArgument(_)));
     }
 
     #[tokio::test]

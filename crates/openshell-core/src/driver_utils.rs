@@ -578,7 +578,7 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK)
             .open(path)
     };
     #[cfg(not(unix))]

@@ -96,7 +96,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.template.spec.volumes
-          count: 3
+          count: 4
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
@@ -115,7 +115,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.template.spec.volumes
-          count: 3
+          count: 4
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
@@ -132,7 +132,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.template.spec.volumes
-          count: 3
+          count: 4
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:

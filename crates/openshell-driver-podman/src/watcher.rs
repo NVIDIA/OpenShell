@@ -16,7 +16,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -43,6 +43,10 @@ pub type WatchStream =
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
     previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+    /// Exact container IDs the driver is deliberately removing while replacing
+    /// a stopped sandbox. A remove event for one of these IDs must not erase
+    /// the gateway's durable sandbox record.
+    intentional_removals: Arc<Mutex<HashSet<String>>>,
 }
 
 impl LifecycleEventFences {
@@ -66,6 +70,39 @@ impl LifecycleEventFences {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(sandbox_id);
+    }
+
+    /// Record an exact container ID before an intentional driver removal.
+    pub fn record_intentional_removal(&self, container_id: &str) {
+        self.intentional_removals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(container_id.to_string());
+    }
+
+    /// Clear an unconsumed intentional-removal fence when rollback proves the
+    /// original container remains the authoritative sandbox.
+    pub fn clear_intentional_removal(&self, container_id: &str) {
+        self.intentional_removals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(container_id);
+    }
+
+    /// Atomically consume a fence only for the matching Podman remove event.
+    fn consume_intentional_removal(&self, container_id: &str) -> bool {
+        self.intentional_removals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(container_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn intentional_removal_is_pending(&self, container_id: &str) -> bool {
+        self.intentional_removals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(container_id)
     }
 
     fn matches_previous_exit(
@@ -247,6 +284,10 @@ async fn map_podman_event(
     }
 
     match event.action.as_str() {
+        "remove" if lifecycle_event_fences.consume_intentional_removal(container_id) => {
+            debug!(sandbox_id, container_id = %container_id, "Ignoring intentional replacement removal event");
+            None
+        }
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
@@ -510,15 +551,78 @@ mod tests {
     use super::*;
 
     fn podman_event(action: &str, sandbox_id: &str, time_nano: i64) -> PodmanEvent {
+        podman_event_for_container(action, sandbox_id, "container-1", time_nano)
+    }
+
+    fn podman_event_for_container(
+        action: &str,
+        sandbox_id: &str,
+        container_id: &str,
+        time_nano: i64,
+    ) -> PodmanEvent {
         PodmanEvent {
             event_type: "container".to_string(),
             action: action.to_string(),
             actor: crate::client::EventActor {
-                id: "container-1".to_string(),
+                id: container_id.to_string(),
                 attributes: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
             },
             time_nano,
         }
+    }
+
+    #[tokio::test]
+    async fn intentional_replacement_removals_do_not_emit_deleted_but_unrelated_remove_does() {
+        let fences = LifecycleEventFences::default();
+        fences.record_intentional_removal("old-container");
+        fences.record_intentional_removal("replacement-container");
+        let client = PodmanClient::new(crate::test_utils::unique_socket_path("watch-removals"));
+
+        for container_id in ["old-container", "replacement-container"] {
+            assert!(
+                map_podman_event(
+                    &podman_event_for_container("remove", "sandbox-1", container_id, 1),
+                    &client,
+                    &fences,
+                )
+                .await
+                .is_none(),
+                "driver-recorded replacement removals must preserve the durable sandbox"
+            );
+        }
+
+        let event = map_podman_event(
+            &podman_event_for_container("remove", "sandbox-1", "external-container", 2),
+            &client,
+            &fences,
+        )
+        .await
+        .expect("an unrelated remove must still delete the sandbox");
+        assert!(matches!(
+            event.payload,
+            Some(watch_sandboxes_event::Payload::Deleted(_))
+        ));
+    }
+
+    #[test]
+    fn intentional_removal_fence_is_exact_and_consumed_once() {
+        let fences = LifecycleEventFences::default();
+        fences.record_intentional_removal("old-container");
+
+        assert!(!fences.consume_intentional_removal("unrelated-container"));
+        assert!(fences.consume_intentional_removal("old-container"));
+        assert!(
+            !fences.consume_intentional_removal("old-container"),
+            "matching removal fences must be consumed atomically"
+        );
+    }
+
+    #[test]
+    fn cleared_intentional_removal_fence_allows_normal_deletion() {
+        let fences = LifecycleEventFences::default();
+        fences.record_intentional_removal("old-container");
+        fences.clear_intentional_removal("old-container");
+        assert!(!fences.consume_intentional_removal("old-container"));
     }
 
     #[test]
