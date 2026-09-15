@@ -1274,6 +1274,7 @@ enum AcceptAction {
     },
 }
 
+#[cfg_attr(not(unix), allow(unused_variables, clippy::needless_pass_by_ref_mut))]
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
