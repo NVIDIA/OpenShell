@@ -55,6 +55,10 @@ pub enum MxcBackend {
 /// environment variables / CLI flags via the standard gateway precedence chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "MXC configuration exposes independent user-facing feature toggles."
+)]
 pub struct MxcComputeConfig {
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
@@ -858,7 +862,9 @@ async fn run_lifecycle(
     } else {
         None
     };
-    let host_proxy_ca_paths = host_proxy.as_ref().and_then(|proxy| proxy.ca_file_paths());
+    let host_proxy_ca_paths = host_proxy
+        .as_ref()
+        .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
     drop(reserved_proxy_listener.take());
     if let Some(addr) = proxy_addr {
         {
