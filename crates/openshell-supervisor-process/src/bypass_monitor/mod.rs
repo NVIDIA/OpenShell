@@ -159,6 +159,27 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
     }
 }
 
+/// Build a finding for a bypass-monitor failure that leaves REJECT rules active
+/// but removes diagnostic visibility into bypass attempts.
+fn bypass_monitor_unavailable_event(message: impl Into<String>) -> openshell_ocsf::OcsfEvent {
+    let message = message.into();
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .severity(SeverityId::Low)
+        .is_alert(false)
+        .confidence(ConfidenceId::High)
+        .finding_info(
+            FindingInfo::new(
+                "bypass-monitor-unavailable",
+                "Bypass Detection Monitor Unavailable",
+            )
+            .with_desc(&message),
+        )
+        .message(message)
+        .build()
+}
+
 /// Spawn the bypass monitor as a background tokio task.
 ///
 /// Uses `dmesg --follow` to tail the kernel ring buffer for nftables log
@@ -189,14 +210,10 @@ pub fn spawn(
         .status();
 
     if !dmesg_check.is_ok_and(|s| s.success()) {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .severity(SeverityId::Low)
-            .message(
-                "dmesg not available; bypass detection monitor will not run. \
-                 Bypass REJECT rules still provide fast-fail behavior.",
-            )
-            .build();
+        let event = bypass_monitor_unavailable_event(
+            "dmesg not available; bypass detection monitor will not run. \
+             Bypass REJECT rules still provide fast-fail behavior.",
+        );
         ocsf_emit!(event);
         return None;
     }
@@ -217,24 +234,18 @@ pub fn spawn(
         {
             Ok(c) => c,
             Err(e) => {
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .message(format!(
-                        "Failed to start dmesg --follow; bypass monitor will not run: {e}"
-                    ))
-                    .build();
+                let event = bypass_monitor_unavailable_event(format!(
+                    "Failed to start dmesg --follow; bypass monitor will not run: {e}"
+                ));
                 ocsf_emit!(event);
                 return;
             }
         };
 
         let Some(stdout) = child.stdout.take() else {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Other)
-                .severity(SeverityId::Low)
-                .message("dmesg --follow produced no stdout; bypass monitor will not run")
-                .build();
+            let event = bypass_monitor_unavailable_event(
+                "dmesg --follow produced no stdout; bypass monitor will not run",
+            );
             ocsf_emit!(event);
             return;
         };
