@@ -392,17 +392,15 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
         || combined.contains("not enabled")
     {
         // Extract the message if possible for a more useful skip reason.
-        let reason =
-            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
-                .map_or_else(
-                    |_| "backend_error (velocity keys not enabled)".to_string(),
-                    |value| {
-                        value["error"]["message"]
-                            .as_str()
-                            .unwrap_or("backend_error (E_NOTIMPL)")
-                            .to_string()
-                    },
-                );
+        let reason = serde_json::from_slice::<serde_json::Value>(&out.stdout).map_or_else(
+            |_| "backend_error (velocity keys not enabled)".to_string(),
+            |value| {
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap_or("backend_error (E_NOTIMPL)")
+                    .to_string()
+            },
+        );
         return Err(reason);
     }
 
