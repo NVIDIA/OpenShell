@@ -14,8 +14,9 @@ use super::authenticator::Authenticator;
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use openshell_core::OidcConfig;
+use openshell_crypto::jwt::decode;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -575,7 +576,7 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -1379,7 +1380,7 @@ mod tests {
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
             .expect("load RSA signing key");
-        jsonwebtoken::encode(&header, claims, &key).expect("sign RS256 token")
+        openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
     fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
@@ -1494,7 +1495,7 @@ mod tests {
         crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
-        let token = jsonwebtoken::encode(
+        let token = openshell_crypto::jwt::encode(
             &header,
             &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
             &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes())
@@ -1577,9 +1578,10 @@ mod tests {
         use super::*;
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use jsonwebtoken::{EncodingKey, Header, encode};
+        use jsonwebtoken::{EncodingKey, Header};
         use openshell_core::OidcConfig;
-        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
+        use openshell_crypto::jwt::encode;
+        use rcgen::{PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
         use rsa::traits::PublicKeyParts;
         use std::time::{SystemTime, UNIX_EPOCH};
         use wiremock::matchers::{method, path};
@@ -1684,12 +1686,12 @@ mod tests {
         fn ec_test_key(kid: &str, curve: &str) -> TestSigningKey {
             let (key_pair, algorithm, coord_len) = match curve {
                 "P-256" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
                     Algorithm::ES256,
                     32,
                 ),
                 "P-384" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
                     Algorithm::ES384,
                     48,
                 ),
@@ -1715,7 +1717,7 @@ mod tests {
         }
 
         fn ed25519_test_key(kid: &str) -> TestSigningKey {
-            let key_pair = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let key_pair = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
             let encoding_key =
                 EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).unwrap();
             let spki = key_pair.public_key_der();

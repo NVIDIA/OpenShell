@@ -129,7 +129,7 @@ impl SpiffeWorkloadApi {
             "iat": now,
             "exp": now + 3600,
         });
-        jsonwebtoken::encode(&header, &claims, &self.encoding_key)
+        openshell_crypto::jwt::encode(&header, &claims, &self.encoding_key)
             .map_err(|err| Status::internal(format!("sign JWT-SVID: {err}")))
     }
 }

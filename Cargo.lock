@@ -3981,10 +3981,10 @@ dependencies = [
  "bytes",
  "miette",
  "openshell-core",
+ "openshell-crypto",
  "rcgen",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -4016,6 +4016,7 @@ dependencies = [
  "oauth2",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-policy",
  "openshell-providers",
  "openshell-sdk",
@@ -4079,6 +4080,7 @@ dependencies = [
  "jsonwebtoken",
  "miette",
  "nix 0.29.0",
+ "openshell-crypto",
  "openshell-extension-core",
  "openshell-policy-schema",
  "prost",
@@ -4108,17 +4110,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-crypto"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "hyper-rustls",
+ "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-driver-db-credstore"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "aws-lc-rs",
  "base64 0.22.1",
  "futures",
  "openshell-core",
+ "openshell-crypto",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",
@@ -4178,6 +4197,7 @@ dependencies = [
  "miette",
  "notify",
  "openshell-core",
+ "openshell-crypto",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4212,6 +4232,7 @@ dependencies = [
  "kube",
  "miette",
  "openshell-core",
+ "openshell-crypto",
  "serde",
  "sha2 0.10.9",
  "tokio",
@@ -4291,6 +4312,7 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "openshell-crypto",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -4361,6 +4383,7 @@ version = "0.0.0"
 dependencies = [
  "http 1.4.0",
  "hyper-util",
+ "openshell-crypto",
  "rcgen",
  "rustls",
  "serde",
@@ -4631,6 +4654,7 @@ dependencies = [
  "miette",
  "oauth2",
  "openshell-core",
+ "openshell-crypto",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -4683,6 +4707,7 @@ dependencies = [
  "notify",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-crypto",
  "openshell-driver-db-credstore",
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-vault",
@@ -4839,6 +4864,7 @@ dependencies = [
  "noyalib",
  "openshell-binary-identity",
  "openshell-core",
+ "openshell-crypto",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
