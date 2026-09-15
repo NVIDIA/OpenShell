@@ -56,10 +56,8 @@ impl FileFingerprint {
 #[cfg(not(unix))]
 fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
     let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some((
-        duration.as_secs() as i64,
-        i64::from(duration.subsec_nanos()),
-    ))
+    let seconds = i64::try_from(duration.as_secs()).ok()?;
+    Some((seconds, i64::from(duration.subsec_nanos())))
 }
 
 impl PartialEq for FileFingerprint {

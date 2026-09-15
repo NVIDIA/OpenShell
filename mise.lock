@@ -22,6 +22,10 @@ url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Darwin-arm6
 url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772487"
 provenance = "minisign"
 
+[tools.buf."platforms.windows-arm64"]
+checksum = "sha256:79d7a18bddde96c248e5a606ba280708e71887a35939dee82cd49749740b77dc"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Windows-arm64.zip"
+
 [tools.buf."platforms.windows-x64"]
 checksum = "sha256:0332d8d1bf062c95a0418081b7e574551032ee72064af05e304e3a1454f8cf11"
 url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Windows-x86_64.zip"
@@ -49,6 +53,11 @@ url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/asset
 checksum = "sha256:d5255ead3ac861a11c785bf19d4f70f16e59ac8b9519c312da61213d3d57351d"
 url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324268695"
+
+[tools."github:EmbarkStudios/cargo-about"."platforms.windows-arm64"]
+checksum = "sha256:39d8f5498df1bc4c61b4c64067eb600d2432700a7a7b347ef479d147cc48b067"
+url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-aarch64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324269541"
 
 [tools."github:EmbarkStudios/cargo-about"."platforms.windows-x64"]
 checksum = "sha256:d5c38fb914bbad57c6a7d58c4847315bc3fe11efbe4fb51b3c515f997a56ceb7"
@@ -104,6 +113,11 @@ url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_dar
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001187"
 provenance = "github-attestations"
 
+[tools."github:anchore/syft"."platforms.windows-arm64"]
+checksum = "sha256:3ebcde4f1bdfd3149c4527b85279cfc725ba7660ccf54b68b51be06a9271808e"
+url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_arm64.zip"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001171"
+
 [tools."github:anchore/syft"."platforms.windows-x64"]
 checksum = "sha256:195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f47a"
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip"
@@ -128,6 +142,11 @@ url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/45206068
 checksum = "sha256:ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430960"
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060416"
+
+[tools."github:mozilla/sccache"."platforms.windows-arm64"]
+checksum = "sha256:6a715fe44d9b7a2cac15c256411ef232d3b6276e2421bd3be16ab32af71fbf88"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060703"
 
 [tools."github:mozilla/sccache"."platforms.windows-x64"]
 checksum = "sha256:b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0edf1b"
@@ -168,6 +187,12 @@ url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501885637"
 provenance = "github-attestations"
 
+[tools."github:nextest-rs/nextest"."platforms.windows-arm64"]
+checksum = "sha256:58c1637ba2396e6c556aa0092f9aa4388695594b8ddda5a4b8b39212574678ce"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501886128"
+provenance = "github-attestations"
+
 [tools."github:nextest-rs/nextest"."platforms.windows-x64"]
 checksum = "sha256:c670ba18e8731fd2eff33a47af33a0fa53d1afa6d0678344e82dc6f8fc7344ac"
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-pc-windows-msvc.zip"
@@ -193,6 +218,11 @@ checksum = "sha256:29caf036bdbb4e6f07afea31706b6f386cb5a4db9a46a3a8b462b9b78157e
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676922"
 
+[tools."github:rust-cross/cargo-zigbuild"."platforms.windows-arm64"]
+checksum = "sha256:f71b91912d79d8d71cd86d8ce73cc69c0615800bf34a86f6e1ac81b70084e5c5"
+url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676919"
+
 [tools."github:rust-cross/cargo-zigbuild"."platforms.windows-x64"]
 checksum = "sha256:675804464634cf068dc206e9fafc1bd4557ffcc0b1638a1ff246d899b776fe35"
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-x86_64-pc-windows-msvc.zip"
@@ -217,6 +247,11 @@ checksum = "sha256:92720fff2be27492ca7b216510a27e88a835b526e9e94e46bc36b502ba17d
 url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566625"
 
+[tools."github:rust-secure-code/cargo-auditable"."platforms.windows-arm64"]
+checksum = "sha256:621454ff8c7aba883c51b349bb418c7bc940733894e2bcc1df928899b7064180"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566624"
+
 [tools."github:rust-secure-code/cargo-auditable"."platforms.windows-x64"]
 checksum = "sha256:83a7d5955c7ac96ede5d896ac9ede5f7ecce9ece0e95d9e47acd766b09e2ef1b"
 url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-pc-windows-msvc.zip"
@@ -237,6 +272,10 @@ url = "https://dl.google.com/go/go1.26.7.linux-amd64.tar.gz"
 [tools.go."platforms.macos-arm64"]
 checksum = "sha256:020a1e8224811be75163e920bc77e0926a1390a6aeea19bdcf23f74b9d749f6d"
 url = "https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz"
+
+[tools.go."platforms.windows-arm64"]
+checksum = "sha256:6f1b08de9e2dd94f69c52e524ab6834737275253291e8fd7f1c12ed4eceeda89"
+url = "https://dl.google.com/go/go1.26.7.windows-arm64.zip"
 
 [tools.go."platforms.windows-x64"]
 checksum = "sha256:f4f534a486e4bc3387fa18f08208f2f854b7aaea8a08f2a2d829a914a05abb11"
@@ -277,6 +316,10 @@ url = "https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz"
 checksum = "sha256:f13f959015447b6bc309f9fd506509926543988a39035c088b52522ec95e2acb"
 url = "https://get.helm.sh/helm-v4.2.0-darwin-arm64.tar.gz"
 
+[tools.helm."platforms.windows-arm64"]
+checksum = "sha256:41b8c33f7bb5ed094412b50702e70014633383e2cc32efd60239afbfe9fdbc19"
+url = "https://get.helm.sh/helm-v4.2.0-windows-arm64.tar.gz"
+
 [tools.helm."platforms.windows-x64"]
 checksum = "sha256:34bf9659f8f04f3841a60131183b8e2acc44e260db4c93b889ff09718cacca6f"
 url = "https://get.helm.sh/helm-v4.2.0-windows-amd64.tar.gz"
@@ -299,6 +342,10 @@ url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/17832
 checksum = "sha256:2d8399db5b33d240d5f8985241bcf5483563150b968e3229823822979f3e4b8b"
 url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Darwin_arm64.tar.gz"
 url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/178327215"
+
+[tools.helm-docs."platforms.windows-arm64"]
+checksum = "sha256:c6a5f43e89837bd29749298ca27ed350ca8ee6ef64e25ce9653e709171dbbaa4"
+url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Windows_arm64.tar.gz"
 
 [tools.helm-docs."platforms.windows-x64"]
 checksum = "sha256:3c54fd78d99e2769cf83a0faf12cf6cd4de1cac6ed7bee8d908a2c8fc23f538c"
@@ -324,6 +371,10 @@ checksum = "sha256:8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0
 url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-darwin-arm64"
 url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450067"
 
+[tools.k3d."platforms.windows-arm64"]
+checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
+
 [tools.k3d."platforms.windows-x64"]
 checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
 url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
@@ -348,6 +399,10 @@ url = "https://dl.k8s.io/v1.36.1/bin/linux/amd64/kubectl"
 checksum = "sha256:9092778abaef3079449da4cd70ded0e4be112480c93efcdeace3155968d1d133"
 url = "https://dl.k8s.io/v1.36.1/bin/darwin/arm64/kubectl"
 
+[tools.kubectl."platforms.windows-arm64"]
+checksum = "sha256:606ab5d869b85c15acd2739dec16e74a589d535874875a62f23d0319c7c80fed"
+url = "https://dl.k8s.io/v1.36.1/bin/windows/arm64/kubectl.exe"
+
 [tools.kubectl."platforms.windows-x64"]
 checksum = "sha256:538f4229eee91a17b34724da7daade7687393d6988e33b723c6c306572c13900"
 url = "https://dl.k8s.io/v1.36.1/bin/windows/amd64/kubectl.exe"
@@ -367,6 +422,10 @@ url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-x64.tar.gz"
 [tools.node."platforms.macos-arm64"]
 checksum = "sha256:372331b969779ab5d15b949884fc6eaf88d5afe87bde8ba881d6400b9100ffc4"
 url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz"
+
+[tools.node."platforms.windows-arm64"]
+checksum = "sha256:c9eb7402eda26e2ba7e44b6727fc85a8de56c5095b1f71ebd3062892211aa116"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-win-arm64.zip"
 
 [tools.node."platforms.windows-x64"]
 checksum = "sha256:cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62"
@@ -395,6 +454,10 @@ checksum = "sha256:b9576b5fa1a1ef3fe13a8c91d9d8204b46545759bea5ae155cd6ba2ea4cda
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-osx-aarch_64.zip"
 url_api = "https://api.github.com/repos/protocolbuffers/protobuf/releases/assets/350795082"
 
+[tools.protoc."platforms.windows-arm64"]
+checksum = "sha256:1ebd7c87baffb9f1c47169b640872bf5fb1e4408079c691af527be9561d8f6f7"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-win64.zip"
+
 [tools.protoc."platforms.windows-x64"]
 checksum = "sha256:1ebd7c87baffb9f1c47169b640872bf5fb1e4408079c691af527be9561d8f6f7"
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-win64.zip"
@@ -422,6 +485,11 @@ checksum = "sha256:3a0373cc39fefd494754ef555267f245c720cddbaaabf63a7c9a4269f1e56
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.14.5+20260602-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
+[tools.python."platforms.windows-arm64"]
+checksum = "sha256:5efad489fd34d4e9c1f9c65ec43bd1764d9a8f5093d6dee44e9b1f3b500606bb"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.14.5+20260602-aarch64-pc-windows-msvc-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
 [tools.python."platforms.windows-x64"]
 checksum = "sha256:66b065143e538c07f069f764d831d8ffae95507907d4ca211304e6f3a056435c"
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.14.5+20260602-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
@@ -447,6 +515,9 @@ url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-a
 [tools.skaffold."platforms.macos-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
+[tools.skaffold."platforms.windows-arm64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-arm64.exe"
+
 [tools.skaffold."platforms.windows-x64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
@@ -468,6 +539,11 @@ provenance = "github-attestations"
 checksum = "sha256:ae738b5661a900579ec621d3918c0ef17bdec0da2a8a6d8b161137cd15f25414"
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491929"
+provenance = "github-attestations"
+
+[tools.uv."platforms.windows-arm64"]
+checksum = "sha256:4c1d55501869b3330d4aabf45ad6024ce2367e0f3af83344395702d272c22e88"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-windows-msvc.zip"
 provenance = "github-attestations"
 
 [tools.uv."platforms.windows-x64"]
@@ -498,6 +574,10 @@ url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_darwin_arm64
 url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028033"
 provenance = "cosign"
 
+[tools.yq."platforms.windows-arm64"]
+checksum = "sha256:9a0ec8f648b0749d3d71286df96384f358c0eeca486bbcdec04e747307021d3a"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_windows_arm64.exe"
+
 [tools.yq."platforms.windows-x64"]
 checksum = "sha256:ece3dd8bb50d39f93610506273ea262feb91e5c486bbddbb10abf91b2a6c0f14"
 url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_windows_amd64.exe"
@@ -519,6 +599,10 @@ url = "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz"
 [tools.zig."platforms.macos-arm64"]
 checksum = "sha256:39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
 url = "https://ziglang.org/download/0.14.1/zig-aarch64-macos-0.14.1.tar.xz"
+
+[tools.zig."platforms.windows-arm64"]
+checksum = "sha256:b5aac0ccc40dd91e8311b1f257717d8e3903b5fefb8f659de6d65a840ad1d0e7"
+url = "https://ziglang.org/download/0.14.1/zig-aarch64-windows-0.14.1.zip"
 
 [tools.zig."platforms.windows-x64"]
 checksum = "sha256:554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c"
