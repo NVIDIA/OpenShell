@@ -44,8 +44,10 @@ impl DriverIdentity {
     ) -> Result<Self> {
         // Resolved-identity drivers explicitly clear the OCI declaration so
         // an image-baked or user-supplied value cannot select the OCI path.
-        // Preserve an empty declaration when no resolved pair is present:
-        // Docker and Podman use that state to reject images without USER.
+        // Preserve an empty declaration when no resolved pair is present so a
+        // bare OCI path still rejects a USER-less image; container drivers now
+        // pair an empty declaration with a numeric default for USER-less images,
+        // which selects the resolved path here instead of rejecting.
         let oci_user = if oci_user.as_deref() == Some("") && (uid.is_some() || gid.is_some()) {
             None
         } else {

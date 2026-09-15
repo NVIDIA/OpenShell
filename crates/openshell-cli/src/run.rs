@@ -1234,11 +1234,8 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // Full image reference or community sandbox name — delegate to shared
-    // resolution in openshell-core.
-    Ok(ResolvedSource::Image(
-        openshell_core::image::resolve_community_image(value),
-    ))
+    // Explicit OCI image reference — passed through to the gateway unchanged.
+    Ok(ResolvedSource::Image(value.to_string()))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
