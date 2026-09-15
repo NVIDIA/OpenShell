@@ -16,7 +16,7 @@ use openshell_gateway_interceptors::{
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles, normalize_profile_id,
-    normalize_provider_type, validate_profile_set,
+    validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -470,23 +470,12 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.profile.clone())
     }
 
+    /// Resolve a profile by its exact normalized ID.
+    ///
+    /// Profiles are import-only, so a provider type names a profile the
+    /// operator imported. There is no alias fallback: an unimported ID is
+    /// absent, not a hint toward some other profile.
     fn scoped_type_profile_for_scope(
-        &self,
-        id: &str,
-        profile_workspace: &str,
-    ) -> Option<&ScopedProfileEntry> {
-        if let Some(entry) = self.exact_scoped_type_profile_for_scope(id, profile_workspace) {
-            return Some(entry);
-        }
-
-        let alias = normalize_provider_type(id)?;
-        if normalize_profile_id(id).as_deref() == Some(alias) {
-            return None;
-        }
-        self.exact_scoped_type_profile_for_scope(alias, profile_workspace)
-    }
-
-    fn exact_scoped_type_profile_for_scope(
         &self,
         id: &str,
         profile_workspace: &str,

@@ -497,7 +497,8 @@ type Provider struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Kubernetes-style metadata (id, name, labels, timestamps, resource version).
 	Metadata *ObjectMeta `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
-	// Canonical provider type slug (for example: "claude", "gitlab").
+	// ID of the provider profile this provider was created from, matched
+	// exactly (for example: "claude-code", "github").
 	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
 	// Secret values used for authentication.
 	Credentials map[string]string `protobuf:"bytes,3,rep,name=credentials,proto3" json:"credentials,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`

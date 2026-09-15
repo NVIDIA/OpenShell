@@ -13,7 +13,6 @@ mod providers;
 mod test_helpers;
 
 use std::collections::HashMap;
-use std::path::Path;
 
 pub use openshell_core::proto::Provider;
 
@@ -109,23 +108,11 @@ impl ProviderRegistry {
         self.plugins.get(id).map(Box::as_ref)
     }
 
-    /// Inject provider-specific env vars via the registered plugin.
+    /// Inject provider-specific config for a resolved profile ID.
     ///
-    /// Normalizes the provider type and delegates to the plugin's `inject_env`.
-    /// No-op if the provider type has no registered plugin or the plugin's
-    /// default implementation is a no-op.
-    pub fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
-        let normalized = normalize_provider_type(&provider.r#type);
-        if let Some(id) = normalized
-            && let Some(plugin) = self.get(id)
-        {
-            plugin.inject_env(provider, env);
-        }
-    }
-
-    /// Inject config for an already-resolved profile ID without alias
-    /// normalization. This prevents an exact custom profile whose ID resembles
-    /// a legacy alias from selecting an unrelated built-in compatibility plugin.
+    /// Plugins are selected by the exact ID of the profile the gateway
+    /// resolved. There is no alias table: a profile activates the plugin whose
+    /// ID it matches, and nothing else does.
     pub fn inject_env_for_profile_id(
         &self,
         provider: &Provider,
@@ -135,97 +122,5 @@ impl ProviderRegistry {
         if let Some(plugin) = self.get(profile_id) {
             plugin.inject_env(provider, env);
         }
-    }
-}
-
-#[must_use]
-pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
-    let normalized = input.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        "nvidia" => Some("nvidia"),
-        "deepinfra" => Some("deepinfra"),
-        "aws-bedrock" => Some("aws-bedrock"),
-        "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
-            Some("google-vertex-ai")
-        }
-        "claude" | "claude-code" | "claude_code" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "copilot" => Some("copilot"),
-        "gcp" | "google-cloud" => Some("google-cloud"),
-        "github" | "gh" => Some("github"),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn detect_provider_from_command(command: &[String]) -> Option<&'static str> {
-    let first = command.first()?;
-    let basename = Path::new(first)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(first);
-    normalize_provider_type(basename)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{detect_provider_from_command, normalize_provider_type};
-
-    #[test]
-    fn normalizes_known_provider_aliases() {
-        assert_eq!(normalize_provider_type("gh"), Some("github"));
-        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
-        assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
-        for retired in ["generic", "gitlab", "glab", "opencode", "outlook"] {
-            assert_eq!(normalize_provider_type(retired), None);
-        }
-        assert_eq!(normalize_provider_type("openai"), Some("openai"));
-        assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
-        assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
-        assert_eq!(normalize_provider_type("deepinfra"), Some("deepinfra"));
-        assert_eq!(normalize_provider_type("aws-bedrock"), Some("aws-bedrock"));
-        assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
-        for alias in [
-            "google-vertex-ai",
-            "vertex",
-            "vertex-ai",
-            "google-vertex",
-            "gcp-vertex",
-        ] {
-            assert_eq!(normalize_provider_type(alias), Some("google-vertex-ai"));
-        }
-        assert_eq!(normalize_provider_type("unknown"), None);
-    }
-
-    #[test]
-    fn detects_provider_from_command_token() {
-        assert_eq!(
-            detect_provider_from_command(&["claude".to_string()]),
-            Some("claude-code")
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/bin/glab".to_string()]),
-            None
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/bin/bash".to_string()]),
-            None
-        );
-        // Copilot standalone binary
-        assert_eq!(
-            detect_provider_from_command(&["copilot".to_string()]),
-            Some("copilot")
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/local/bin/copilot".to_string()]),
-            Some("copilot")
-        );
-        // gh alone still maps to github
-        assert_eq!(
-            detect_provider_from_command(&["gh".to_string()]),
-            Some("github")
-        );
     }
 }

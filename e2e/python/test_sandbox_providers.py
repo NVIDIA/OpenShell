@@ -312,7 +312,7 @@ def test_provider_credentials_available_as_env_vars(
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -751,7 +751,7 @@ def test_credentials_not_in_persisted_spec_environment(
     with provider(
         sandbox_client._stub,
         name="e2e-test-no-persist",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(

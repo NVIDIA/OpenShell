@@ -166,7 +166,7 @@ async fn user_can_create_sandbox_with_inferred_provider_command() {
             "oidc-inferred-cmd",
             "--no-tty",
             "--",
-            "claude",
+            "claude-code",
         ],
     )
     .await;

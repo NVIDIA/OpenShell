@@ -29,9 +29,8 @@ use openshell_core::proto::{
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
-    ProviderTypeProfile, RealDiscoveryContext, discover_from_profile, normalize_profile_id,
-    normalize_provider_type, parse_profile_json, parse_profile_yaml, profile_to_json,
-    profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    ProviderTypeProfile, RealDiscoveryContext, discover_from_profile, parse_profile_json,
+    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -860,38 +859,27 @@ pub async fn fetch_provider_profile_catalog(
         .collect())
 }
 
+/// Fetch one provider profile from the gateway by its exact ID.
+///
+/// Profiles are import-only, so an ID the gateway does not serve is absent
+/// rather than an alias for something else.
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
     workspace: &str,
 ) -> Result<ProviderProfile> {
     let requested = provider_type.trim();
-    let response = match fetch_provider_profile_exact(client, requested, workspace).await {
-        Ok(response) => response,
-        Err(status) if status.code() == Code::NotFound => {
-            let Some(alias) = normalize_provider_type(requested)
-                .filter(|alias| normalize_profile_id(requested).as_deref() != Some(*alias))
-            else {
-                return Err(miette::miette!(
+    fetch_provider_profile_exact(client, requested, workspace)
+        .await
+        .map_err(|status| {
+            if status.code() == Code::NotFound {
+                miette::miette!(
                     "provider profile '{requested}' not found; import a matching profile before using this provider type"
-                ));
-            };
-            fetch_provider_profile_exact(client, alias, workspace)
-                .await
-                .map_err(|fallback_status| {
-                    if fallback_status.code() == Code::NotFound {
-                        miette::miette!(
-                            "provider profile '{requested}' not found; import a matching profile before using this provider type"
-                        )
-                    } else {
-                        provider_profile_lookup_error(&fallback_status)
-                    }
-                })?
-        }
-        Err(status) => return Err(provider_profile_lookup_error(&status)),
-    };
-
-    Ok(response)
+                )
+            } else {
+                provider_profile_lookup_error(&status)
+            }
+        })
 }
 
 async fn fetch_provider_profile_exact(
