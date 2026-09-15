@@ -12,6 +12,9 @@ configMapGenerator:
     files:
       - token-issuer.js
       - protected-service.js
+  - name: openshell-spiffe-token-demo-helper
+    files:
+      - spiffe-helper.conf
 
 resources:
   - workloads.yaml

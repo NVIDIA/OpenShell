@@ -14,11 +14,20 @@ PROVIDER_NAME="${PROVIDER_NAME:-spiffe-token-demo}"
 PROFILE_ID="${PROFILE_ID:-spiffe-token-demo}"
 PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-8097}"
 GATEWAY_ENDPOINT="${GATEWAY_ENDPOINT:-http://127.0.0.1:${PORT_FORWARD_PORT}}"
+GATEWAY_NAME="${GATEWAY_NAME:-}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 ACCESS_TOKEN_SECRET="${ACCESS_TOKEN_SECRET:-$(openssl rand -hex 32)}"
 
+# Optional `--gateway <name>` selector, shared by the OS array and cleanup.
+GATEWAY_ARGS=()
+if [[ -n "$GATEWAY_NAME" ]]; then
+    GATEWAY_ARGS=(--gateway "$GATEWAY_NAME")
+fi
+
+# Only isolate config when no gateway is named; a named gateway must resolve
+# from the caller's real config (registration and stored TLS bundle).
 TEMP_CONFIG_HOME=""
-if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then
+if [[ -z "${XDG_CONFIG_HOME:-}" && -z "$GATEWAY_NAME" ]]; then
     TEMP_CONFIG_HOME="$(mktemp -d)"
     export XDG_CONFIG_HOME="$TEMP_CONFIG_HOME"
 fi
@@ -27,7 +36,7 @@ PF_PID=""
 
 cleanup() {
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
-        openshell --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
+        openshell "${GATEWAY_ARGS[@]}" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
     fi
     if [[ -n "$PF_PID" ]]; then
         kill "$PF_PID" >/dev/null 2>&1 || true
@@ -89,7 +98,7 @@ sandbox_curl_until() {
     exit 1
 }
 
-OS=(openshell --gateway-endpoint "$GATEWAY_ENDPOINT")
+OS=(openshell "${GATEWAY_ARGS[@]}" --gateway-endpoint "$GATEWAY_ENDPOINT")
 
 printf "\n$ kubectl -n default create secret generic openshell-spiffe-token-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
 kubectl -n default create secret generic openshell-spiffe-token-demo \
