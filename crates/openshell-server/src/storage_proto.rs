@@ -119,14 +119,17 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a207369ee6924602c9b0b62f8fc9bc7ecb37e79fd2ecdd5733504860cfc1e8b7";
+        "2cd8648b5c76e12824f966144b092fb380e90a41d6ea5936b4ea61bbe8e74240";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d6c4061fccd310d39e4315a5b57b599a0e4a117d94e8011022023818b74c29bb";
+        "cc18d855acaa08c97efcdf0c0dcec79be27036b72381f75e732f096ecfa96ed4";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "05add438ba041defc98d791038ae593d3f09352677cae43f2276d494205ce415";
+        "f96d841e67da5c3443fa0aca15936dd14ac30d2e150ddf0439b0d195c4a0cfd9";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
+    // A persisted Sandbox without endpoint status retains its lifecycle fields;
+    // the absent repeated field decodes empty and needs no database rewrite.
+    const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -450,14 +453,14 @@ mod tests {
             }
         }
         methods.sort();
-        assert_eq!(compiled_method_count, 100, "classify every compiled RPC");
-        assert_eq!(methods.len(), 74, "inventory every public gateway RPC");
+        assert_eq!(compiled_method_count, 101, "classify every compiled RPC");
+        assert_eq!(methods.len(), 75, "inventory every public gateway RPC");
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            74
+            75
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -490,13 +493,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (278, 12)
+            (282, 13)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (81, 8)
+            (82, 9)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (71, 8));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
@@ -531,6 +534,28 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
+    fn sandbox_payload_without_endpoint_status_decodes() {
+        use openshell_core::proto::{Sandbox, SandboxPhase};
+
+        let sandbox = Sandbox::decode(legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice())
+            .expect("stored sandbox without endpoint status must decode");
+        let metadata = sandbox.metadata.expect("sandbox metadata");
+        assert_eq!(metadata.id, "sandbox-id");
+        assert_eq!(metadata.name, "sandbox");
+        assert_eq!(metadata.workspace, "default");
+        let status = sandbox.status.expect("sandbox status");
+        assert_eq!(status.sandbox_name, "sandbox");
+        assert_eq!(status.phase(), SandboxPhase::Ready);
+        assert_eq!(status.current_policy_version, 7);
+        assert_eq!(status.main_process_instance_id, "supervisor-id");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "Ready");
+        assert_eq!(status.conditions[0].status, "True");
+        assert!(status.endpoint_statuses.is_empty());
     }
 
     #[test]

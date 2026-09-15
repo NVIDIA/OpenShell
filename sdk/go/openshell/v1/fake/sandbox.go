@@ -6,6 +6,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -231,6 +232,11 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		conds := make([]types.SandboxCondition, len(s.Conditions))
 		copy(conds, s.Conditions)
 		s.Conditions = conds
+	}
+	// Callers may mutate endpoint snapshots without changing the fake's storage.
+	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
+	for i := range s.EndpointStatuses {
+		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
 	}
 	return s
 }

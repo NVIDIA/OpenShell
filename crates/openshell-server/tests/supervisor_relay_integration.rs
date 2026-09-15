@@ -48,6 +48,15 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
     async fn begin_rootfs_tar_staging(
         &self,
         _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,

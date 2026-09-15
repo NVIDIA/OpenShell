@@ -22,13 +22,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::endpoint_status::{EndpointResult, EndpointStatusSnapshot};
 use crate::proto::{
-    DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
+    DenialSummary, EndpointObservation as ProtoEndpointObservation,
+    EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
+    GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, open_shell_client::OpenShellClient, workspace_selector,
+    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    open_shell_client::OpenShellClient, workspace_selector,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -1325,6 +1328,55 @@ impl CachedOpenShellClient {
                 version,
                 status: status.into(),
                 load_error: error_msg.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        Ok(())
+    }
+
+    /// Report the latest network results for all configured tool endpoints.
+    ///
+    /// The shared snapshot contains only endpoint identifiers, typed results,
+    /// and the endpoints observed in the current batch, so this RPC cannot
+    /// accidentally attach request or credential material to public status.
+    pub async fn report_endpoint_status(
+        &self,
+        sandbox_id: &str,
+        snapshot: &EndpointStatusSnapshot,
+    ) -> Result<()> {
+        let observations = snapshot
+            .endpoints
+            .iter()
+            .map(|endpoint| ProtoEndpointObservation {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                result: match endpoint.result {
+                    EndpointResult::NoObservedExchange => ProtoEndpointResult::NoObservedExchange,
+                    EndpointResult::HttpResponseReceived => {
+                        ProtoEndpointResult::HttpResponseReceived
+                    }
+                    EndpointResult::PolicyDenied => ProtoEndpointResult::PolicyDenied,
+                    EndpointResult::CredentialUnavailable => {
+                        ProtoEndpointResult::CredentialUnavailable
+                    }
+                    EndpointResult::TlsFailed => ProtoEndpointResult::TlsFailed,
+                    EndpointResult::TransportFailed => ProtoEndpointResult::TransportFailed,
+                    EndpointResult::UpstreamRejected => ProtoEndpointResult::UpstreamRejected,
+                }
+                .into(),
+            })
+            .collect();
+
+        self.client
+            .clone()
+            .report_endpoint_status(ReportEndpointStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                policy_hash: snapshot.config_version.policy_hash.clone(),
+                provider_env_revision: snapshot.config_version.provider_env_revision,
+                observations,
+                observed_endpoint_ids: snapshot.observed_endpoint_ids.clone(),
+                supervisor_session_id: snapshot.supervisor_session_id.clone(),
+                report_sequence: snapshot.report_sequence,
             })
             .await
             .into_diagnostic()?;

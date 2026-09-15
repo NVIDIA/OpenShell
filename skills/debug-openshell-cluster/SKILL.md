@@ -215,6 +215,7 @@ Common findings:
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
+- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
 - On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
   Homebrew gateway bound to `[::1]:17670` indicate that the Docker
   `host-gateway` IPv4 route has no matching callback listener. Current releases

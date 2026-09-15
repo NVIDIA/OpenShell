@@ -157,6 +157,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(proto::ReportEndpointStatusResponse {}))
+    }
+
     async fn begin_rootfs_tar_staging(
         &self,
         _request: tonic::Request<proto::BeginRootfsTarStagingRequest>,

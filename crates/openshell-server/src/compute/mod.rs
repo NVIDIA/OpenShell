@@ -4253,6 +4253,7 @@ fn public_status_from_driver(
         current_policy_version,
         main_process_instance_id: String::new(),
         exit_code: None,
+        endpoint_statuses: Vec::new(),
     }
 }
 
@@ -4262,6 +4263,13 @@ fn apply_driver_snapshot(
     session_connected: bool,
     driver_reports_runtime_readiness: bool,
 ) {
+    // Endpoint results belong to the gateway. A driver reports infrastructure
+    // and runtime state, so a full driver snapshot must preserve these records.
+    let endpoint_statuses = sandbox
+        .status
+        .as_ref()
+        .map(|status| status.endpoint_statuses.clone())
+        .unwrap_or_default();
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
@@ -4338,6 +4346,7 @@ fn apply_driver_snapshot(
 
     if let Some(status) = status.as_mut() {
         status.phase = phase as i32;
+        status.endpoint_statuses = endpoint_statuses;
     }
 
     if let Some(status) = status.as_mut()
@@ -6394,6 +6403,38 @@ mod tests {
                 deleting: false,
             }),
         }
+    }
+
+    #[test]
+    fn driver_snapshot_preserves_endpoint_failure_and_ready_phase() {
+        let mut sandbox = sandbox_record("sandbox-id", "sandbox-name", SandboxPhase::Ready);
+        let endpoint = openshell_core::proto::EndpointStatus {
+            endpoint_id: "endpoint:v1:gateway".to_string(),
+            host: "api.example.com".to_string(),
+            ports: vec![443],
+            path: "/mcp".to_string(),
+            last_result: openshell_core::proto::EndpointResult::TransportFailed as i32,
+            last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+        };
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-name".to_string(),
+            phase: SandboxPhase::Ready as i32,
+            endpoint_statuses: vec![endpoint.clone()],
+            ..Default::default()
+        });
+        let incoming = ready_driver_sandbox("sandbox-id", "sandbox-name");
+
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+
+        assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+        let status = sandbox.status.expect("driver status applied");
+        assert_eq!(status.endpoint_statuses, vec![endpoint]);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| { condition.r#type == "Ready" && condition.status == "True" })
+        );
     }
 
     fn sandbox_watch_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
