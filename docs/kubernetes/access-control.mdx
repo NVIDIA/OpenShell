@@ -23,7 +23,7 @@ For how the CLI resolves gateways and stores credentials, refer to [Gateway Auth
 
 Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID to the gateway. The gateway verifies the sandbox still exists and mints its own sandbox JWT.
 
-Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
+Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 
 Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `openshell.ai/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
 
@@ -31,15 +31,23 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIF
 
 ## OIDC User Authentication
 
-Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint. It accepts JWTs signed with RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, or EdDSA (Ed25519) keys published in the issuer JWKS. Okta tenants that sign access tokens with ES256 work without additional gateway configuration.
+Set `gatewayConfig.openshell.gateway.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint. It accepts JWTs signed with RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, or EdDSA (Ed25519) keys published in the issuer JWKS. Okta tenants that sign access tokens with ES256 work without additional gateway configuration.
+
+Create `oidc-values.yaml`:
+
+```yaml
+gatewayConfig:
+  openshell.gateway.oidc:
+    issuer: https://your-idp.example.com/realms/openshell
+    audience: openshell-cli
+```
 
 ```shell
 helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli \
+  --values oidc-values.yaml \
   --set server.tls.clientCaSecretName=""
 ```
 
@@ -51,16 +59,13 @@ The `audience` value must match the client ID configured in your identity provid
 
 | Value | Default | Purpose |
 |---|---|---|
-| `server.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
-| `server.oidc.dangerouslyAllowInsecureHttp` | `false` | Development-only acknowledgement for numeric-loopback HTTP. It does not allow cluster-service or remote HTTP issuers. |
-| `server.oidc.jwksAllowedOrigins` | `[]` | Additional trusted HTTPS origins allowed to serve JWKS. |
-| `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`. |
-| `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
-| `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
-| `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
-| `server.oidc.adminRole` | `""` | Role name that grants admin access. |
-| `server.oidc.userRole` | `""` | Role name that grants standard user access. |
-| `server.oidc.scopesClaim` | `""` | Dot-separated path to the scopes array in JWT claims. |
+| `gatewayConfig.openshell.gateway.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
+| `gatewayConfig.openshell.gateway.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
+| `gatewayConfig.openshell.gateway.oidc.jwks_ttl_secs` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
+| `gatewayConfig.openshell.gateway.oidc.roles_claim` | `""` | Dot-separated path to the roles array in JWT claims. |
+| `gatewayConfig.openshell.gateway.oidc.admin_role` | `""` | Role name that grants admin access. |
+| `gatewayConfig.openshell.gateway.oidc.user_role` | `""` | Role name that grants standard user access. |
+| `gatewayConfig.openshell.gateway.oidc.scopes_claim` | `""` | Dot-separated path to the scopes array in JWT claims. |
 
 The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
 limits response sizes, requires a JSON media type, and rejects a `jwks_uri` on
@@ -69,7 +74,7 @@ a different origin unless that origin appears in `jwksAllowedOrigins`. Use
 
 ### Auth-only mode vs. RBAC mode
 
-Leave both `adminRole` and `userRole` empty to use auth-only mode: any request with a valid JWT from the configured issuer is accepted, but no role distinction is enforced.
+Leave both `admin_role` and `user_role` empty to use auth-only mode: any request with a valid JWT from the configured issuer is accepted, but no role distinction is enforced.
 
 Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
 
@@ -78,15 +83,23 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli \
-  --set server.tls.clientCaSecretName="" \
-  --set server.oidc.rolesClaim=realm_access.roles \
-  --set server.oidc.adminRole=openshell-admin \
-  --set server.oidc.userRole=openshell-user
+  --values oidc-rbac-values.yaml \
+  --set server.tls.clientCaSecretName=""
 ```
 
-Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported.
+Create `oidc-rbac-values.yaml` with the OIDC values above plus:
+
+```yaml
+gatewayConfig:
+  openshell.gateway.oidc:
+    issuer: https://your-idp.example.com/realms/openshell
+    audience: openshell-cli
+    roles_claim: realm_access.roles
+    admin_role: openshell-admin
+    user_role: openshell-user
+```
+
+Both `admin_role` and `user_role` must be set, or both must be empty. Setting only one is not supported.
 
 OIDC RBAC is method-level authorization. It controls which API operations a caller can perform, but provider and sandbox records are not owned by individual OIDC subjects. In shared clusters, treat provider credentials as gateway-wide resources and use separate gateways or external tenancy controls when users must not see or attach each other's providers and sandboxes.
 
@@ -107,7 +120,15 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.auth.allowUnauthenticatedUsers=true
+  --values reverse-proxy-values.yaml
+```
+
+Create `reverse-proxy-values.yaml`:
+
+```yaml
+gatewayConfig:
+  openshell.gateway.auth:
+    allow_unauthenticated_users: true
 ```
 
 The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
@@ -116,9 +137,10 @@ When the gateway terminates TLS directly and callers connect without client cert
 
 To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
 
-```shell
-  --set server.disableTls=true \
-  --set server.auth.allowUnauthenticatedUsers=true
+```yaml
+gatewayConfig:
+  openshell.gateway.auth:
+    allow_unauthenticated_users: true
 ```
 
 <Warning>

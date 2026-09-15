@@ -154,7 +154,7 @@ tests:
     template: templates/statefulset.yaml
     set:
       server.disableTls: true
-      server.oidc.caConfigMapName: openshell-oidc-ca
+      oidc.caConfigMapName: openshell-oidc-ca
       gatewayConfig:
         openshell.gateway.oidc:
           issuer: https://issuer.example.com
