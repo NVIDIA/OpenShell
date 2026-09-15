@@ -13,7 +13,7 @@ use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -358,7 +358,7 @@ pub fn write_ca_files(
     std::fs::create_dir_all(output_dir).into_diagnostic()?;
 
     let ca_cert_path = output_dir.join("openshell-ca.pem");
-    std::fs::write(&ca_cert_path, ca.cert_pem()).into_diagnostic()?;
+    write_tls_output(&ca_cert_path, ca.cert_pem().as_bytes())?;
 
     // Combine system CAs with our sandbox CA
     let mut combined = system_ca_bundle.to_string();
@@ -368,9 +368,53 @@ pub fn write_ca_files(
     combined.push_str(ca.cert_pem());
 
     let combined_path = output_dir.join("ca-bundle.pem");
-    std::fs::write(&combined_path, &combined).into_diagnostic()?;
+    write_tls_output(&combined_path, combined.as_bytes())?;
 
     Ok((ca_cert_path, combined_path))
+}
+
+fn write_tls_output(path: &Path, contents: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(miette!(
+                "refusing to replace symlinked TLS output {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(miette!(
+                "refusing to replace non-file TLS output {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| miette!("TLS output has no parent: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("create temporary TLS output in {}", parent.display()))?;
+    temporary
+        .write_all(contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("write temporary TLS output for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sync temporary TLS output for {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        miette!(
+            "atomically install TLS output {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 /// Load PEM-encoded certificates from a string into a root certificate store.
@@ -629,6 +673,28 @@ mod tests {
             rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_ca_files_rejects_symlinked_outputs() {
+        use std::os::unix::fs::symlink;
+
+        for output_name in ["openshell-ca.pem", "ca-bundle.pem"] {
+            let ca = SandboxCa::generate().expect("generate CA");
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let sentinel = dir.path().join("sentinel");
+            std::fs::write(&sentinel, b"unchanged").expect("write sentinel");
+            symlink(&sentinel, dir.path().join(output_name)).expect("create output symlink");
+
+            let error = write_ca_files(&ca, dir.path(), "")
+                .expect_err("symlinked TLS output must be rejected");
+            assert!(error.to_string().contains("symlinked TLS output"));
+            assert_eq!(
+                std::fs::read(&sentinel).expect("read sentinel"),
+                b"unchanged"
+            );
+        }
     }
 
     #[test]

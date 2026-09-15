@@ -1509,6 +1509,7 @@ async fn mint_next_runtime_authentication(
     let next = crate::auth::sandbox_session::PersistedSandboxIdentity {
         runtime_generation: current.runtime_generation,
         auth_epoch: next_epoch,
+        gateway_token_id: uuid::Uuid::new_v4(),
     };
     let authentication = authority.mint_persisted_launch(sandbox.object_id(), &next)?;
     state

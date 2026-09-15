@@ -35,6 +35,7 @@ rustls = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
@@ -52,7 +53,6 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 [dev-dependencies]
 futures = { workspace = true }
 temp-env = "0.3"
-tempfile = "3"
 tokio-tungstenite = { workspace = true }
 
 [lints]

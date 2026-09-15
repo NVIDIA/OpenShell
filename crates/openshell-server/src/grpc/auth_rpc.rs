@@ -9,8 +9,9 @@
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
-//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Older tokens remain valid
-//! until their own `exp` and are bounded by the configured short TTL.
+//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Refresh atomically advances
+//! the sandbox's credential lineage, so a successfully consumed bearer cannot
+//! be used again.
 
 use crate::ServerState;
 use crate::auth::identity::IdentityProvider;
@@ -167,7 +168,9 @@ pub async fn handle_refresh_sandbox_token(
     }
     let identity =
         crate::auth::sandbox_session::authorize_persisted(&state.store, &principal).await?;
-    let authentication = session_authority.mint_persisted_launch(&sandbox.sandbox_id, &identity)?;
+    let successor = identity.next_gateway_token();
+    let authentication =
+        session_authority.mint_persisted_launch(&sandbox.sandbox_id, &successor)?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -203,6 +206,8 @@ pub async fn handle_refresh_sandbox_token(
             &available,
         )?
     };
+    crate::auth::sandbox_session::rotate_gateway_token(&state.store, &principal, &successor)
+        .await?;
     info!(
         sandbox_id = %sandbox.sandbox_id,
         "renewed gateway sandbox JWT"
@@ -427,7 +432,7 @@ mod tests {
     async fn authorize_refresh(
         state: &ServerState,
         request: &mut Request<RefreshSandboxTokenRequest>,
-    ) {
+    ) -> String {
         let sandbox = state
             .store
             .get_message::<Sandbox>("sandbox-a")
@@ -444,12 +449,19 @@ mod tests {
             .expect("session authority")
             .mint_persisted_launch("sandbox-a", &identity)
             .expect("active authentication");
-        let value = format!(
-            "Bearer {}",
-            authentication.supervisor.gateway_token.expose_secret()
-        )
-        .parse()
-        .expect("authorization metadata");
+        let token = authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string();
+        set_refresh_authorization(request, &token);
+        token
+    }
+
+    fn set_refresh_authorization(request: &mut Request<RefreshSandboxTokenRequest>, token: &str) {
+        let value = format!("Bearer {token}")
+            .parse()
+            .expect("authorization metadata");
         request.metadata_mut().insert("authorization", value);
     }
 
@@ -484,13 +496,77 @@ mod tests {
             extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
-        authorize_refresh(&state, &mut req).await;
+        let _ = authorize_refresh(&state, &mut req).await;
         let resp = handle_refresh_sandbox_token(&state, req)
             .await
             .expect("refresh OK")
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expires_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_a_consumed_gateway_bearer() {
+        let state = state_with_issuer().await;
+        let request = || {
+            let mut request = Request::new(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            });
+            request
+                .extensions_mut()
+                .insert(sandbox_principal("sandbox-a"));
+            request
+        };
+
+        let mut first_request = request();
+        let first = authorize_refresh(&state, &mut first_request).await;
+        let second = handle_refresh_sandbox_token(&state, first_request)
+            .await
+            .expect("first refresh")
+            .into_inner()
+            .token;
+
+        let mut second_request = request();
+        set_refresh_authorization(&mut second_request, &second);
+        handle_refresh_sandbox_token(&state, second_request)
+            .await
+            .expect("successor refresh");
+
+        let mut replay = request();
+        replay.get_mut().extension_service_names = vec!["content-guard".to_string()];
+        set_refresh_authorization(&mut replay, &first);
+        let error = handle_refresh_sandbox_token(&state, replay)
+            .await
+            .expect_err("consumed predecessor must not mint fresh credentials");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_does_not_consume_the_gateway_bearer() {
+        let state = state_with_issuer().await;
+        let mut rejected = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: vec!["unknown-service".to_string()],
+        });
+        rejected
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        let current = authorize_refresh(&state, &mut rejected).await;
+
+        let error = handle_refresh_sandbox_token(&state, rejected)
+            .await
+            .expect_err("unknown extension service must be rejected");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut retry = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        retry
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        set_refresh_authorization(&mut retry, &current);
+        handle_refresh_sandbox_token(&state, retry)
+            .await
+            .expect("failed refresh must leave its bearer current");
     }
 
     #[tokio::test]
@@ -713,6 +789,7 @@ mod tests {
                 )
                 .expect("runtime generation"),
                 auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_token_id: uuid::Uuid::new_v4(),
             },
         )
         .await;

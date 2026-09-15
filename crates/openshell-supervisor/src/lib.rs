@@ -284,6 +284,143 @@ fn shared_ssh_socket_value(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
+struct PreparedNetworkProxyTlsDir {
+    path: std::path::PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+
+fn prepare_network_proxy_tls_dir(
+    requested: Option<std::path::PathBuf>,
+) -> Result<PreparedNetworkProxyTlsDir> {
+    let Some(requested) = requested else {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("openshell-supervisor-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let temporary = builder
+            .tempdir()
+            .into_diagnostic()
+            .wrap_err("create private network-proxy TLS directory")?;
+        return Ok(PreparedNetworkProxyTlsDir {
+            path: temporary.path().to_path_buf(),
+            _temporary: Some(temporary),
+        });
+    };
+
+    match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(miette::miette!(
+                "network-proxy TLS directory must not be a symlink: {}",
+                requested.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(miette::miette!(
+                "network-proxy TLS path is not a directory: {}",
+                requested.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+                    .create(&requested)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!(
+                            "create private network-proxy TLS directory {}",
+                            requested.display()
+                        )
+                    })?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(&requested)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "create private network-proxy TLS directory {}",
+                        requested.display()
+                    )
+                })?;
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+
+    let path = requested
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "resolve network-proxy TLS directory {}",
+                requested.display()
+            )
+        })?;
+    validate_network_proxy_tls_dir(&path)?;
+    Ok(PreparedNetworkProxyTlsDir {
+        path,
+        _temporary: None,
+    })
+}
+
+#[cfg(unix)]
+fn validate_network_proxy_tls_dir(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    for (index, component) in path.ancestors().enumerate() {
+        let metadata = std::fs::metadata(component)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("inspect TLS directory component {}", component.display()))?;
+        let mode = metadata.mode();
+        if !metadata.is_dir() {
+            return Err(miette::miette!(
+                "TLS directory component is not a directory: {}",
+                component.display()
+            ));
+        }
+        if metadata.uid() != 0 && metadata.uid() != effective_uid {
+            return Err(miette::miette!(
+                "TLS directory component is owned by an untrusted user: {}",
+                component.display()
+            ));
+        }
+        if index == 0 {
+            if metadata.uid() != effective_uid || mode & 0o022 != 0 {
+                return Err(miette::miette!(
+                    "network-proxy TLS directory must be owned by the current user and not group- or world-writable: {}",
+                    component.display()
+                ));
+            }
+        } else if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(miette::miette!(
+                "TLS directory has an untrusted writable ancestor: {}",
+                component.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_network_proxy_tls_dir(path: &std::path::Path) -> Result<()> {
+    if !path.is_dir() {
+        return Err(miette::miette!(
+            "network-proxy TLS path is not a directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Run the supervisor as an explicit HTTP/CONNECT network proxy.
 ///
 /// This role deliberately bypasses the Isolation Backend: it does not attach
@@ -349,9 +486,7 @@ pub async fn run_network_proxy(
         std::collections::HashMap::new(),
     );
     let (_, workspace_rx) = tokio::sync::watch::channel(String::new());
-    let tls_dir = tls_dir.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("openshell-supervisor-{}", std::process::id()))
-    });
+    let tls_dir = prepare_network_proxy_tls_dir(tls_dir)?;
     let mut networking = openshell_supervisor_network::run::run_networking(
         &policy,
         None,
@@ -369,7 +504,7 @@ pub async fn run_network_proxy(
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
-        Some(&tls_dir),
+        Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
         None,
@@ -4195,6 +4330,34 @@ mod tests {
         assert!(shared_ssh_socket_value("TRUE"));
         assert!(!shared_ssh_socket_value("0"));
         assert!(!shared_ssh_socket_value("yes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_proxy_tls_directory_is_private_and_not_symlinked() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let automatic = prepare_network_proxy_tls_dir(None).expect("private default directory");
+        let mode = std::fs::metadata(&automatic.path)
+            .expect("default directory metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("target directory");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("private target permissions");
+        let link = root.path().join("link");
+        symlink(&target, &link).expect("TLS directory symlink");
+        assert!(prepare_network_proxy_tls_dir(Some(link)).is_err());
+
+        let writable = root.path().join("writable");
+        std::fs::create_dir(&writable).expect("writable directory");
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777))
+            .expect("writable permissions");
+        assert!(prepare_network_proxy_tls_dir(Some(writable)).is_err());
     }
 
     #[tokio::test]

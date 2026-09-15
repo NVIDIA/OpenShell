@@ -529,9 +529,23 @@ mod session {
             &self,
             identity: &SandboxRuntimeIdentity,
         ) -> Result<MintedSessionTokenPair, SessionJwtError> {
+            self.mint_pair_with_gateway_token_id(identity, Uuid::new_v4())
+        }
+
+        /// Mint a token pair whose gateway-facing credential has a caller-owned
+        /// lineage identifier.
+        ///
+        /// The gateway persists this identifier before returning the token so
+        /// refresh can reject every superseded bearer across all replicas. The
+        /// Sandbox Protocol credential remains independently identified.
+        pub fn mint_pair_with_gateway_token_id(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            gateway_token_id: Uuid,
+        ) -> Result<MintedSessionTokenPair, SessionJwtError> {
             Ok(MintedSessionTokenPair {
-                gateway: self.mint(SessionTokenProfile::Gateway, identity)?,
-                sandbox: self.mint(SessionTokenProfile::Sandbox, identity)?,
+                gateway: self.mint(SessionTokenProfile::Gateway, identity, gateway_token_id)?,
+                sandbox: self.mint(SessionTokenProfile::Sandbox, identity, Uuid::new_v4())?,
                 auth_epoch: identity.auth_epoch,
             })
         }
@@ -540,12 +554,12 @@ mod session {
             &self,
             profile: SessionTokenProfile,
             identity: &SandboxRuntimeIdentity,
+            token_id: Uuid,
         ) -> Result<MintedSessionToken, SessionJwtError> {
             let issued_at = self.clock.now_unix_seconds();
             let expires_at = issued_at.saturating_add(
                 i64::try_from(self.ttl.as_secs()).map_err(|_| SessionJwtError::InvalidLifetime)?,
             );
-            let token_id = Uuid::new_v4();
             let claims = SessionClaims {
                 iss: self.issuer.clone(),
                 sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", identity.sandbox_id),

@@ -185,6 +185,7 @@ impl SandboxSessionJwtAuthority {
             sandbox_id,
             identity.runtime_generation.clone(),
             identity.auth_epoch,
+            identity.gateway_token_id,
         )
     }
 
@@ -194,6 +195,7 @@ impl SandboxSessionJwtAuthority {
         sandbox_id: &str,
         runtime_generation: SandboxGenerationId,
         auth_epoch: CredentialEpoch,
+        gateway_token_id: uuid::Uuid,
     ) -> Result<SandboxLaunchAuthentication, Status> {
         let identity = SandboxRuntimeIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
@@ -201,10 +203,13 @@ impl SandboxSessionJwtAuthority {
             runtime_generation: runtime_generation.clone(),
             auth_epoch,
         };
-        let pair = self.issuer.mint_pair(&identity).map_err(|error| {
-            warn!(%error, "failed to mint launch-scoped sandbox credentials");
-            Status::internal("failed to mint sandbox launch credentials")
-        })?;
+        let pair = self
+            .issuer
+            .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
+            .map_err(|error| {
+                warn!(%error, "failed to mint launch-scoped sandbox credentials");
+                Status::internal("failed to mint sandbox launch credentials")
+            })?;
         Ok(SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
                 session_id: SandboxSessionId::new(),
