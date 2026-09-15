@@ -1072,43 +1072,6 @@ pub enum ComputeDriverInstance {
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
 
-/// Type-erased tracing layer contributed by a compiled compute driver.
-pub type ComputeDriverTracingLayer =
-    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
-
-/// Shutdown callback for resources owned by a compute-driver tracing layer.
-pub type ComputeDriverTracingShutdown =
-    Box<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
-
-/// Optional process-wide tracing integration supplied by a compiled driver.
-#[derive(Default)]
-pub struct ComputeDriverTracingSetup {
-    layer: Option<ComputeDriverTracingLayer>,
-    shutdown: Option<ComputeDriverTracingShutdown>,
-    error: Option<String>,
-    target_prefix: Option<&'static str>,
-}
-
-impl ComputeDriverTracingSetup {
-    #[must_use]
-    pub fn new(
-        layer: Option<ComputeDriverTracingLayer>,
-        shutdown: Option<ComputeDriverTracingShutdown>,
-        error: Option<String>,
-        target_prefix: Option<&'static str>,
-    ) -> Self {
-        Self {
-            layer,
-            shutdown,
-            error,
-            target_prefix,
-        }
-    }
-}
-
-/// Factory for a compiled driver's optional tracing integration.
-pub type ComputeDriverTracingFactory = fn(Option<&str>, Option<&str>) -> ComputeDriverTracingSetup;
-
 /// Type-erased dynamic TCP forward capability.
 ///
 /// Optionally contributed by a
