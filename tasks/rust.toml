@@ -91,5 +91,5 @@ run = [
 
 ["crypto:check"]
 description = "Check first-party crypto backend boundaries"
-run = "bash tasks/scripts/check-crypto-boundary.sh"
+run = "uv run --no-project python tasks/scripts/check_crypto_boundary.py"
 hide = true

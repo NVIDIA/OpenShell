@@ -37,6 +37,8 @@ that crate instead of naming a backend. Process-default initialization preserves
 existing embedder providers; context capability reporting does not attest those
 globals or dependency-owned crypto. OpenSSL and strict FIPS operation are separate
 follow-up work. The crate README defines extension and coverage boundaries.
+The `crypto:check` lint uses the managed Python toolchain and Git on all platforms
+to reject direct backend references outside the facade.
 
 SQLx uses AWS-LC with native certificate roots.
  The server enables
