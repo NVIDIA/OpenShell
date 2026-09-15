@@ -4019,7 +4019,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]
@@ -4055,6 +4054,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -4510,6 +4510,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "clap",
  "futures",
  "futures-util",

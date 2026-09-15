@@ -3720,6 +3720,10 @@ pub(super) async fn handle_update_provider(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // Provider material contributes to the route-report configuration epoch.
+    // Serialize its mutation with route-status validation so a report derived
+    // from the prior revision cannot commit after this update.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",

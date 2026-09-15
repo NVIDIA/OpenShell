@@ -22,6 +22,7 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::persistence::ObjectId;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,8 +62,31 @@ struct LiveSession {
     /// Set after the supervisor confirms that every expected foreground
     /// attachment has closed and terminal output delivery is complete.
     terminal_delivery_finalized: bool,
+    /// Becomes true only after the gateway durably resets endpoint status for
+    /// this session and before it sends `SessionAccepted`.
+    endpoint_status_initialized: bool,
+    /// Last tool server endpoint-status batch committed for this authenticated session.
+    ///
+    /// The cursor is session authority state, not public sandbox status. A
+    /// gateway restart invalidates every session and startup reconciliation
+    /// resets any persisted endpoint result before requests are served.
+    endpoint_report_cursor: Option<EndpointReportCursor>,
     #[allow(dead_code)]
     connected_at: Instant,
+}
+
+/// Idempotency state for tool server endpoint-status reports from one live supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndpointReportCursor {
+    /// Active effective policy represented by the accepted report sequence.
+    pub(crate) policy_hash: String,
+    /// Provider environment revision represented by the accepted sequence.
+    pub(crate) provider_env_revision: u64,
+    /// Last accepted sequence in this session; superseded snapshots may leave gaps.
+    pub(crate) report_sequence: u64,
+    /// Digest of the accepted request, used to reject a different body that
+    /// reuses an already committed sequence number.
+    pub(crate) report_digest: [u8; 32],
 }
 
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
@@ -129,6 +153,8 @@ impl SupervisorSessionRegistry {
                 tx,
                 shutdown,
                 terminal_delivery_finalized: false,
+                endpoint_status_initialized: false,
+                endpoint_report_cursor: None,
                 connected_at: Instant::now(),
             },
         );
@@ -167,7 +193,7 @@ impl SupervisorSessionRegistry {
     /// This guards against the supersede race: an old session's task may
     /// finish long after a new session has taken its place. The old task's
     /// cleanup must not evict the new registration.
-    fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> Option<bool> {
+    pub(crate) fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> Option<bool> {
         let mut sessions = self.sessions.lock().unwrap();
         let is_current = sessions
             .get(sandbox_id)
@@ -239,6 +265,107 @@ impl SupervisorSessionRegistry {
             .unwrap()
             .get(sandbox_id)
             .is_some_and(|session| session.session_id == session_id)
+    }
+
+    /// Mark the current session as the observation authority after its
+    /// public endpoint results have been durably reset.
+    pub(crate) fn initialize_endpoint_status_authority(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
+            return false;
+        };
+        session.endpoint_status_initialized = true;
+        true
+    }
+
+    /// Return whether the named session has completed endpoint status
+    /// initialization and still owns reporting authority.
+    pub(crate) fn is_endpoint_status_authority(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| {
+                session.session_id == session_id && session.endpoint_status_initialized
+            })
+    }
+
+    /// Fail closed when projecting persisted endpoint status without a live,
+    /// initialized observation authority in the current gateway process.
+    pub(crate) fn project_endpoint_status(&self, sandbox: &mut Sandbox) {
+        let sandbox_id = sandbox.object_id();
+        let has_authority = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.endpoint_status_initialized);
+        if has_authority {
+            return;
+        }
+        let Some(status) = sandbox.status.as_mut() else {
+            return;
+        };
+        // Status without its live observation authority is unknown. Keep the
+        // configured address so a caller can still identify each endpoint.
+        for endpoint in &mut status.endpoint_statuses {
+            endpoint.last_result = openshell_core::proto::EndpointResult::NoObservedExchange as i32;
+            endpoint.last_reported_at.clear();
+        }
+    }
+
+    /// Return the active supervisor session identifier for gateway-owned
+    /// status reconciliation.
+    pub fn current_session_id(&self, sandbox_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .map(|session| session.session_id.clone())
+    }
+
+    /// Return the endpoint report cursor only when `session_id` still owns the
+    /// sandbox. Replacement sessions never inherit predecessor sequencing.
+    pub(crate) fn endpoint_report_cursor(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Option<EndpointReportCursor> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+            .and_then(|session| session.endpoint_report_cursor.clone())
+    }
+
+    /// Record a committed endpoint report for the current session.
+    ///
+    /// Returns `false` when a reconnect replaced the caller while its storage
+    /// write was in flight. The replacement performs its own pre-acknowledgment
+    /// reset, so it remains the sole observation authority.
+    pub(crate) fn commit_endpoint_report_cursor(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        cursor: EndpointReportCursor,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
+            return false;
+        };
+        session.endpoint_report_cursor = Some(cursor);
+        true
     }
 
     fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {
@@ -769,6 +896,30 @@ pub async fn handle_connect_supervisor(
         );
     }
 
+    // A replacement stream is a new observation authority. Reset its endpoint
+    // results before acknowledging the session so it cannot inherit evidence
+    // reported by the superseded stream.
+    if let Err(error) = crate::grpc::policy::reset_endpoint_status_for_supervisor_session(
+        state,
+        &sandbox_id,
+        &session_id,
+    )
+    .await
+    {
+        state
+            .supervisor_sessions
+            .remove_if_current(&sandbox_id, &session_id);
+        return Err(error);
+    }
+    if !state
+        .supervisor_sessions
+        .initialize_endpoint_status_authority(&sandbox_id, &session_id)
+    {
+        return Err(Status::failed_precondition(
+            "supervisor session was replaced during endpoint status initialization",
+        ));
+    }
+
     // Step 3: Send SessionAccepted.
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
@@ -828,6 +979,12 @@ pub async fn handle_connect_supervisor(
             state_clone
                 .telemetry
                 .sandbox_session_disconnected(&sandbox_id_clone);
+            tokio::spawn(
+                crate::grpc::policy::retry_endpoint_status_after_supervisor_disconnect(
+                    Arc::clone(&state_clone),
+                    sandbox_id_clone.clone(),
+                ),
+            );
             if let Err(err) = state_clone
                 .compute
                 .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
@@ -1080,6 +1237,64 @@ mod tests {
             },
             created_at,
         }
+    }
+
+    #[test]
+    fn endpoint_status_projection_requires_initialized_live_authority() {
+        use openshell_core::proto::{
+            EndpointResult, EndpointStatus, SandboxCondition, SandboxStatus,
+        };
+
+        let registry = SupervisorSessionRegistry::new();
+        let mut sandbox = sandbox_record("sandbox-1", "sandbox-1");
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:v1:test".to_string(),
+            host: "api.example.com".to_string(),
+            ports: vec![443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+        };
+        let ready = SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "True".to_string(),
+            ..Default::default()
+        };
+        sandbox.status = Some(SandboxStatus {
+            endpoint_statuses: vec![endpoint.clone()],
+            conditions: vec![ready.clone()],
+            ..Default::default()
+        });
+        let unknown = EndpointStatus {
+            last_result: EndpointResult::NoObservedExchange as i32,
+            last_reported_at: String::new(),
+            ..endpoint.clone()
+        };
+
+        let mut without_session = sandbox.clone();
+        registry.project_endpoint_status(&mut without_session);
+        let projected_status = without_session.status.expect("status");
+        assert_eq!(projected_status.endpoint_statuses, vec![unknown.clone()]);
+        assert_eq!(projected_status.conditions, vec![ready.clone()]);
+
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        registry.register(
+            "sandbox-1".to_string(),
+            "session-1".to_string(),
+            session_tx,
+            make_shutdown(),
+        );
+        let mut before_initialization = sandbox.clone();
+        registry.project_endpoint_status(&mut before_initialization);
+        let uninitialized_status = before_initialization.status.expect("status");
+        assert_eq!(uninitialized_status.endpoint_statuses, vec![unknown]);
+        assert_eq!(uninitialized_status.conditions, vec![ready.clone()]);
+
+        assert!(registry.initialize_endpoint_status_authority("sandbox-1", "session-1"));
+        registry.project_endpoint_status(&mut sandbox);
+        let initialized_status = sandbox.status.expect("status");
+        assert_eq!(initialized_status.endpoint_statuses, vec![endpoint]);
+        assert_eq!(initialized_status.conditions, vec![ready]);
     }
 
     fn sandbox_principal(sandbox_id: &str) -> Principal {

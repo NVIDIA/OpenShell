@@ -24,6 +24,24 @@ type SandboxStatus = types.SandboxStatus
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 
+// EndpointStatus holds a configured tool endpoint and its last accepted network result.
+type EndpointStatus = types.EndpointStatus
+
+// EndpointResult classifies the last accepted network result for a tool endpoint.
+type EndpointResult = types.EndpointResult
+
+// EndpointResult values describe passive observations of actual traffic.
+const (
+	EndpointUnspecified           = types.EndpointUnspecified
+	EndpointNoObservedExchange    = types.EndpointNoObservedExchange
+	EndpointHTTPResponseReceived  = types.EndpointHTTPResponseReceived
+	EndpointPolicyDenied          = types.EndpointPolicyDenied
+	EndpointCredentialUnavailable = types.EndpointCredentialUnavailable
+	EndpointTLSFailed             = types.EndpointTLSFailed
+	EndpointTransportFailed       = types.EndpointTransportFailed
+	EndpointUpstreamRejected      = types.EndpointUpstreamRejected
+)
+
 // AttachProviderResult holds the result of attaching a provider to a sandbox.
 type AttachProviderResult = types.AttachProviderResult
 

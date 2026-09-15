@@ -5,6 +5,7 @@ package converter
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
@@ -113,9 +114,41 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastTransitionTime: c.GetLastTransitionTime(),
 		})
 	}
+	for _, endpoint := range status.GetEndpointStatuses() {
+		result.EndpointStatuses = append(result.EndpointStatuses, types.EndpointStatus{
+			EndpointID:     endpoint.GetEndpointId(),
+			Host:           endpoint.GetHost(),
+			Ports:          slices.Clone(endpoint.GetPorts()),
+			Path:           endpoint.GetPath(),
+			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
+			LastReportedAt: endpoint.GetLastReportedAt(),
+		})
+	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 
 	return result
+}
+
+func endpointResultFromProto(result pb.EndpointResult) types.EndpointResult {
+	switch result {
+	case pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE:
+		return types.EndpointNoObservedExchange
+	case pb.EndpointResult_ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED:
+		return types.EndpointHTTPResponseReceived
+	case pb.EndpointResult_ENDPOINT_RESULT_POLICY_DENIED:
+		return types.EndpointPolicyDenied
+	case pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE:
+		return types.EndpointCredentialUnavailable
+	case pb.EndpointResult_ENDPOINT_RESULT_TLS_FAILED:
+		return types.EndpointTLSFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED:
+		return types.EndpointTransportFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_UPSTREAM_REJECTED:
+		return types.EndpointUpstreamRejected
+	default:
+		// Unknown wire values must not imply an observation or a successful call.
+		return types.EndpointUnspecified
+	}
 }
 
 // SandboxPhaseFromProto converts a proto SandboxPhase to an SDK SandboxPhase.

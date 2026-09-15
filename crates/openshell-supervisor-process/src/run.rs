@@ -81,6 +81,7 @@ pub async fn run_process(
     entrypoint_pid: Arc<AtomicU32>,
     entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<(u32, String)>>,
     sidecar_exit_tx: Option<tokio::sync::mpsc::Sender<SidecarExitReport>>,
+    supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -377,7 +378,10 @@ pub async fn run_process(
             ssh_netns_fd,
             None,
             Arc::clone(&supervisor_terminating),
-            main_instance_id.clone(),
+            crate::supervisor_session::SessionRuntimeContext {
+                instance_id: main_instance_id.clone(),
+                session_id_updates: supervisor_session_updates,
+            },
         );
         info!("supervisor session task spawned");
         Some(task)

@@ -28,7 +28,7 @@ use openshell_ocsf::{
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
@@ -266,6 +266,14 @@ fn map_session_stream_message<T>(
     }
 }
 
+/// Runtime identity and status channel shared with a supervisor session task.
+pub struct SessionRuntimeContext {
+    /// Identifies the local supervisor process across gateway reconnects.
+    pub instance_id: String,
+    /// Publishes the currently accepted gateway session to sibling reporters.
+    pub session_id_updates: Option<watch::Sender<Option<String>>>,
+}
+
 /// Spawn the supervisor session task.
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
@@ -277,7 +285,7 @@ pub fn spawn(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
-    instance_id: String,
+    runtime: SessionRuntimeContext,
 ) -> tokio::task::JoinHandle<()> {
     let config = SessionConfig {
         endpoint,
@@ -286,7 +294,8 @@ pub fn spawn(
         netns_fd,
         expected_ssh_peer_pid,
         terminating,
-        instance_id,
+        instance_id: runtime.instance_id,
+        session_id_updates: runtime.session_id_updates,
     };
     tokio::spawn(run_session_loop(config))
 }
@@ -299,6 +308,9 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    /// Publishes the currently accepted session to sibling control-plane
+    /// reporters. `None` means no session is authorized to send observations.
+    session_id_updates: Option<watch::Sender<Option<String>>>,
 }
 
 async fn run_session_loop(config: SessionConfig) {
@@ -308,7 +320,11 @@ async fn run_session_loop(config: SessionConfig) {
     loop {
         attempt += 1;
 
-        match run_single_session(&config).await {
+        let result = run_single_session(&config).await;
+        if let Some(updates) = &config.session_id_updates {
+            updates.send_replace(None);
+        }
+        match result {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -381,6 +397,9 @@ async fn run_single_session(
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
+    if let Some(updates) = &config.session_id_updates {
+        updates.send_replace(Some(accepted.session_id.clone()));
+    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         &config.endpoint,

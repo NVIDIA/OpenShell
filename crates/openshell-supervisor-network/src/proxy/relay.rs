@@ -8,6 +8,7 @@ use crate::l7::relay::L7EvalContext;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
+use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proto::ProviderProfileCredential;
 use openshell_core::secrets::SecretResolver;
 use std::collections::HashMap;
@@ -37,15 +38,23 @@ pub(super) struct RelayContext<'a> {
     middleware_engine: &'a OpaEngine,
 }
 
+/// Non-blocking observation channels attached to an authorized HTTP relay.
+pub(super) struct RelaySignals {
+    /// Receives general sandbox network activity.
+    pub(super) activity: Option<ActivitySender>,
+    /// Receives terminal tool server results for endpoint status reporting.
+    pub(super) endpoint_observation: Option<EndpointObservationSender>,
+}
+
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     workspace: String,
+    signals: RelaySignals,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
@@ -83,13 +92,14 @@ pub(super) fn http_context(
         provider_credentials,
         provider_credential_revision: None,
         body_classifier: None,
-        activity_tx,
+        activity_tx: signals.activity,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
         workspace,
+        endpoint_observation_tx: signals.endpoint_observation,
     }
 }
 
@@ -360,6 +370,7 @@ mod tests {
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
+            endpoint_observation_tx: None,
         }
     }
 
@@ -405,6 +416,8 @@ mod tests {
             configs: vec![super::super::L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
                     protocol: crate::l7::L7Protocol::Rest,
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     path: "/**".to_string(),
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,

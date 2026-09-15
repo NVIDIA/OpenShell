@@ -26,6 +26,7 @@ use openshell_ocsf::{
 
 use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
+use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proposals::AgentProposals;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -200,6 +201,7 @@ pub async fn run_networking(
     openshell_endpoint: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
@@ -455,6 +457,7 @@ pub async fn run_networking(
             activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
+            endpoint_observation_tx,
         )
         .await?;
         Some(proxy_handle)
