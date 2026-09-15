@@ -4,6 +4,31 @@
 use openshell_crypto::{
     Capabilities, CryptoBackend, CryptoContext, CryptoError, Digest, ProtocolBackend, aead::Sealed,
 };
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
+
+static JWT_SIGNERS: AtomicUsize = AtomicUsize::new(0);
+static JWT_VERIFIERS: AtomicUsize = AtomicUsize::new(0);
+static JWT_PROVIDER: LazyLock<jsonwebtoken::crypto::CryptoProvider> = LazyLock::new(|| {
+    let mut provider = CryptoContext::default().backend().jwt_provider().clone();
+    provider.signer_factory = |algorithm, key| {
+        JWT_SIGNERS.fetch_add(1, Ordering::SeqCst);
+        (CryptoContext::default()
+            .backend()
+            .jwt_provider()
+            .signer_factory)(algorithm, key)
+    };
+    provider.verifier_factory = |algorithm, key| {
+        JWT_VERIFIERS.fetch_add(1, Ordering::SeqCst);
+        (CryptoContext::default()
+            .backend()
+            .jwt_provider()
+            .verifier_factory)(algorithm, key)
+    };
+    provider
+});
 
 struct TestBackend(CryptoContext);
 impl CryptoBackend for TestBackend {
@@ -39,7 +64,7 @@ impl ProtocolBackend for TestBackend {
         Err(rcgen::Error::KeyGenerationUnavailable)
     }
     fn jwt_provider(&self) -> &'static jsonwebtoken::crypto::CryptoProvider {
-        self.0.backend().jwt_provider()
+        &JWT_PROVIDER
     }
 }
 
@@ -54,6 +79,24 @@ fn selected_context_controls_application_adapters_and_cannot_be_replaced() {
         Err(CryptoError::Random)
     );
     assert!(openshell_crypto::pki::generate_keypair().is_err());
+    // A plain round trip could pass with the default backend. Instrument both
+    // factories to prove that JWT operations use the selected context instead.
+    let claims = serde_json::json!({"sub": "sandbox", "exp": 4_000_000_000_u64});
+    let token = openshell_crypto::jwt::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(b"test-context-secret"),
+    )
+    .unwrap();
+    assert_eq!(JWT_SIGNERS.load(Ordering::SeqCst), 1);
+    let decoded = openshell_crypto::jwt::decode::<serde_json::Value>(
+        &token,
+        &jsonwebtoken::DecodingKey::from_secret(b"test-context-secret"),
+        &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+    )
+    .unwrap();
+    assert_eq!(decoded.claims, claims);
+    assert_eq!(JWT_VERIFIERS.load(Ordering::SeqCst), 1);
     assert_eq!(
         openshell_crypto::tls::ensure_default_provider()
             .cipher_suites
