@@ -587,7 +587,9 @@ pub async fn sandbox_create(
             None => (None, None),
         }
     };
-    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
+    let inferred_types: Vec<String> = inferred_provider_type(command, &profile_catalog)
+        .into_iter()
+        .collect();
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,

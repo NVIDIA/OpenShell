@@ -29,9 +29,9 @@ use openshell_core::proto::{
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
-    ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
-    normalize_profile_id, normalize_provider_type, parse_profile_json, parse_profile_yaml,
-    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    ProviderTypeProfile, RealDiscoveryContext, discover_from_profile, normalize_profile_id,
+    normalize_provider_type, parse_profile_json, parse_profile_yaml, profile_to_json,
+    profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -322,9 +322,61 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     output
 }
 
-/// Return the provider type inferred from the trailing command, if any.
-pub fn inferred_provider_type(command: &[String]) -> Option<String> {
-    detect_provider_from_command(command).map(str::to_string)
+/// Return the provider profile inferred from the trailing command, if any.
+///
+/// Inference resolves through the gateway's catalog: the command's basename is
+/// matched against each profile's ID and against the basenames of the binaries
+/// the profile authorizes. A profile that names `/usr/bin/claude` is the profile
+/// for running `claude`.
+///
+/// The catalog is the authority. A profile that declares a binary claims the
+/// command that runs it — narrowing that is the profile's job, not the CLI's,
+/// which is why no command is special-cased here.
+///
+/// The match must be unique. Several profiles authorize `curl`, so `curl`
+/// infers nothing and the user names one with `--provider`. An empty catalog
+/// infers nothing.
+pub fn inferred_provider_type(
+    command: &[String],
+    profiles: &[ProviderTypeProfile],
+) -> Option<String> {
+    let first = command.first()?;
+    let basename = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first);
+    if basename.is_empty() {
+        return None;
+    }
+
+    let mut matched: Option<&str> = None;
+    for profile in profiles {
+        if !profile_claims_command(profile, basename) {
+            continue;
+        }
+        match matched {
+            // More than one profile claims this command; an explicit
+            // --provider is the only unambiguous answer.
+            Some(existing) if existing != profile.id => return None,
+            Some(_) => {}
+            None => matched = Some(&profile.id),
+        }
+    }
+    matched.map(str::to_string)
+}
+
+fn profile_claims_command(profile: &ProviderTypeProfile, basename: &str) -> bool {
+    if profile.id.eq_ignore_ascii_case(basename) {
+        return true;
+    }
+    profile.binaries.iter().any(|binary| {
+        Path::new(&binary.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            // A glob in the final segment names no single command, so it cannot
+            // attribute one.
+            .is_some_and(|name| !name.contains('*') && name.eq_ignore_ascii_case(basename))
+    })
 }
 
 /// Ensure all required providers exist.
@@ -2761,40 +2813,76 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn inferred_provider_type_returns_type_for_known_command() {
-        let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
-        assert_eq!(result, Some("claude-code".to_string()));
+    /// Stands in for the catalog a connected gateway would publish.
+    fn catalog() -> &'static [ProviderTypeProfile] {
+        static CATALOG: std::sync::OnceLock<Vec<ProviderTypeProfile>> = std::sync::OnceLock::new();
+        CATALOG
+            .get_or_init(openshell_providers::example_profiles::load_all)
+            .as_slice()
+    }
+
+    fn infer(command: &[&str]) -> Option<String> {
+        let command = command.iter().map(ToString::to_string).collect::<Vec<_>>();
+        inferred_provider_type(&command, catalog())
     }
 
     #[test]
-    fn inferred_provider_type_returns_none_for_unknown_command() {
-        let result = inferred_provider_type(&["bash".to_string()]);
-        assert_eq!(result, None);
+    fn inferred_provider_type_matches_a_profile_binary() {
+        // claude-code is the only profile authorizing /usr/bin/claude.
+        assert_eq!(
+            infer(&["claude", "--help"]),
+            Some("claude-code".to_string())
+        );
+        assert_eq!(
+            infer(&["/usr/local/bin/claude"]),
+            Some("claude-code".to_string())
+        );
+        // gh and git both belong to github.
+        assert_eq!(infer(&["gh"]), Some("github".to_string()));
+        assert_eq!(infer(&["git"]), Some("github".to_string()));
     }
 
     #[test]
-    fn inferred_provider_type_returns_none_for_empty_command() {
-        let result = inferred_provider_type(&[]);
-        assert_eq!(result, None);
+    fn inferred_provider_type_matches_a_profile_id() {
+        assert_eq!(infer(&["codex"]), Some("codex".to_string()));
     }
 
     #[test]
-    fn inferred_provider_type_normalizes_aliases() {
-        // Retired legacy types are not inferred, even when a custom profile
-        // with the same ID could be imported and attached explicitly.
-        let result = inferred_provider_type(&["glab".to_string()]);
-        assert_eq!(result, None);
-
-        // `gh` should resolve to `github`
-        let result = inferred_provider_type(&["gh".to_string()]);
-        assert_eq!(result, Some("github".to_string()));
+    fn inferred_provider_type_returns_none_for_unclaimed_command() {
+        // A retired legacy type has no profile, so nothing claims it.
+        assert_eq!(infer(&["glab"]), None);
+        assert_eq!(infer(&["vim"]), None);
     }
 
     #[test]
-    fn inferred_provider_type_handles_full_path() {
-        let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
-        assert_eq!(result, Some("claude-code".to_string()));
+    fn inferred_provider_type_honors_whatever_a_profile_declares() {
+        // `binaries` is the operator's authorization statement, so a profile
+        // that declares a binary claims the command that runs it — including
+        // binaries a reader might not expect. aws-s3 declares /bin/bash, so it
+        // claims `bash`; narrowing that belongs in the profile, not here.
+        assert_eq!(infer(&["bash"]), Some("aws-s3".to_string()));
+        assert_eq!(infer(&["wget"]), Some("cursor".to_string()));
+        assert_eq!(infer(&["pip"]), Some("pypi".to_string()));
+    }
+
+    #[test]
+    fn inferred_provider_type_declines_when_several_profiles_claim_it() {
+        // Six profiles authorize curl; two authorize python3. The CLI cannot
+        // pick, so the user names one with --provider.
+        assert_eq!(infer(&["curl"]), None);
+        assert_eq!(infer(&["python3"]), None);
+    }
+
+    #[test]
+    fn inferred_provider_type_returns_none_for_empty_command_or_catalog() {
+        assert_eq!(inferred_provider_type(&[], catalog()), None);
+        assert_eq!(inferred_provider_type(&["claude".to_string()], &[]), None);
+    }
+
+    #[test]
+    fn inferred_provider_type_ignores_glob_binary_segments() {
+        // pypi authorizes /sandbox/.uv/python/**, which names no single command.
+        assert_eq!(infer(&["**"]), None);
     }
 
     #[test]
