@@ -19,7 +19,7 @@ workload:
   allowMultiReplicaStatefulSet: false
 
 image:
-  # -- Gateway image repository.
+  # -- Gateway image repository or complete tagged/digest-pinned image reference. Complete references are used as-is.
   repository: ghcr.io/nvidia/openshell/gateway
   # -- Gateway image pull policy.
   pullPolicy: IfNotPresent
@@ -31,7 +31,7 @@ image:
 # the gateway. Changing the repository or setting a tag enables a Helm override.
 supervisor:
   image:
-    # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
+    # -- Supervisor image repository or complete tagged/digest-pinned image reference. A repository uses the effective gateway image tag unless tag is also set.
     repository: ghcr.io/nvidia/openshell/supervisor
     # -- Sandbox supervisor pull policy. Leave unset to use the Kubernetes
     # image default. Prefer always, if_not_present, or never; the chart also

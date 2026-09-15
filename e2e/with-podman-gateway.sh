@@ -14,6 +14,10 @@
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
 #
+# Supervisor image overrides:
+#   SUPERVISOR_IMAGE=... (common test-wrapper override)
+#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#
 # Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
 # Podman sandbox stop timeout. The harness default is intentionally shorter
 # than the production driver default to keep CI teardown bounded.
@@ -325,6 +329,16 @@ resolve_podman_supervisor_image() {
     return 0
   fi
 
+  if [ -n "${SUPERVISOR_IMAGE:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -z "${IMAGE_TAG:-}" ] \
+       && ! e2e_image_reference_is_complete "${SUPERVISOR_IMAGE}"; then
+      echo "ERROR: IMAGE_TAG must be set in CI when SUPERVISOR_IMAGE is repository-only." >&2
+      exit 2
+    fi
+    printf '%s\n' "$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
   if [ -n "${CI:-}" ]; then
     if [ -z "${IMAGE_TAG:-}" ]; then
       echo "ERROR: IMAGE_TAG must be set in CI when no Podman supervisor image override is provided." >&2
@@ -346,6 +360,11 @@ ensure_podman_supervisor_image() {
     local dockerfile=${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}
     local context="${WORKDIR}/supervisor-image" arch
     case "${image}" in
+      *@*)
+        echo "ERROR: supplied supervisor binaries cannot be built to a digest-pinned image reference: ${image}" >&2
+        echo "       Use a tagged image reference when building from OPENSHELL_E2E_SUPERVISOR_BIN." >&2
+        exit 2
+        ;;
       *:dev|*:latest)
         echo "ERROR: supplied supervisor binaries require a unique versioned image tag, not ${image}." >&2
         exit 2
@@ -429,7 +448,7 @@ ensure_podman_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -505,7 +524,11 @@ fi
 # isolated XDG store where this image was built. Address the local image by its
 # immutable manifest digest so policy=missing cannot resolve a mutable tag or
 # contact a registry for a different artifact.
-SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE%:*}"
+SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE%%@*}"
+last_component="${SUPERVISOR_IMAGE_REPOSITORY##*/}"
+if [[ "${last_component}" == *:* ]]; then
+  SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE_REPOSITORY%:*}"
+fi
 SUPERVISOR_RUNTIME_IMAGE="${SUPERVISOR_IMAGE_REPOSITORY}@${SUPERVISOR_IMAGE_DIGEST}"
 if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: supervisor runtime image is not digest-pinned: ${SUPERVISOR_RUNTIME_IMAGE}" >&2

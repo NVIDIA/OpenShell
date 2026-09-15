@@ -17,6 +17,10 @@
 # Sandbox image overrides:
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
+# Supervisor image overrides:
+#   SUPERVISOR_IMAGE=... (common test-wrapper override)
+#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   OPENSHELL_DOCKER_SUPERVISOR_IMAGE=... (Docker-specific override)
 #
 # The default community sandbox image uses :latest. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to
@@ -323,6 +327,16 @@ resolve_docker_supervisor_image() {
     return 0
   fi
 
+  if [ -n "${SUPERVISOR_IMAGE:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -z "${IMAGE_TAG:-}" ] \
+       && ! e2e_image_reference_is_complete "${SUPERVISOR_IMAGE}"; then
+      echo "ERROR: IMAGE_TAG must be set in CI when SUPERVISOR_IMAGE is repository-only." >&2
+      exit 2
+    fi
+    printf '%s\n' "$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
   if [ -n "${CI:-}" ]; then
     if [ -z "${IMAGE_TAG:-}" ]; then
       echo "ERROR: IMAGE_TAG must be set in CI when no Docker supervisor image override is provided." >&2
@@ -397,7 +411,7 @@ ensure_docker_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 

@@ -37,6 +37,24 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?compute_driver\s*=\s*"kubernetes"'
 
+  - it: preserves a complete tagged gateway image reference
+    template: templates/statefulset.yaml
+    set:
+      image.repository: registry.example/gateway:branch
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example/gateway:branch
+
+  - it: preserves a complete digest-pinned supervisor image reference
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.repository: registry.example/supervisor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'registry\.example/supervisor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
