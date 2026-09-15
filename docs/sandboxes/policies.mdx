@@ -609,7 +609,10 @@ openshell policy set --global --policy ./global-policy.yaml
 
 When a global policy is configured:
 
-- The global payload supplies the dynamic policy fields for all sandboxes.
+- The global payload replaces every sandbox's complete effective policy,
+  including static sections such as `filesystem_policy`, `landlock`, and
+  `process`, not only the dynamic `network_policies` and
+  `network_middlewares` fields.
 - Each sandbox keeps the startup-only `ui` section from its own creation policy;
   a global policy containing `ui` is rejected.
 - Sandbox-level policy updates are rejected until the global policy is removed.

@@ -318,6 +318,50 @@ fn append_provider_child_env(
     );
 }
 
+/// Rejects provider credential environment keys that would collide once
+/// injected into the sandbox process, before any staging or launch happens.
+///
+/// Windows environment variables are case-insensitive, so two provider keys
+/// that differ only by case (or shadow one of the reserved TLS trust keys
+/// `append_tls_env_vars` injects later) would otherwise merge or get silently
+/// overwritten with no diagnostic, leaving the sandbox with an ambiguous,
+/// wrong, or missing credential.
+fn validate_provider_child_env_keys(
+    provider_credentials: Option<&ProviderCredentialState>,
+) -> Result<(), tonic::Status> {
+    let Some(provider_credentials) = provider_credentials else {
+        return Ok(());
+    };
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut collisions: Vec<String> = Vec::new();
+    let mut keys = provider_credentials
+        .child_env_with_gcp_resolved()
+        .into_keys()
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    for key in keys {
+        let folded = key.to_ascii_uppercase();
+        if TLS_ENV_KEYS.iter().any(|reserved| folded == *reserved) {
+            collisions.push(format!("{key} (reserved for TLS trust configuration)"));
+            continue;
+        }
+        if let Some(existing) = seen.insert(folded, key.clone())
+            && existing != key
+        {
+            collisions.push(format!("{key} (collides with {existing})"));
+        }
+    }
+    if collisions.is_empty() {
+        Ok(())
+    } else {
+        Err(tonic::Status::failed_precondition(format!(
+            "provider credential environment keys are ambiguous on Windows (case-insensitive) \
+             or reserved: {}",
+            collisions.join(", ")
+        )))
+    }
+}
+
 fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr>, tonic::Status> {
     if !config.egress_proxy {
         return Ok(None);
@@ -588,6 +632,7 @@ impl MxcComputeBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&sandbox_id);
+        validate_provider_child_env_keys(provider_credentials.as_ref())?;
 
         Self::validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
@@ -1477,6 +1522,52 @@ mod lifecycle_tests {
         assert!(!env.iter().any(|entry| entry == "github_token=agent-value"));
         assert!(env.contains(&format!("GITHUB_TOKEN={placeholder}")));
         assert!(!env.iter().any(|entry| entry.contains("raw-test-token")));
+    }
+
+    #[test]
+    fn provider_child_env_keys_reject_case_insensitive_collision() {
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([
+                ("github_token".to_string(), "a".to_string()),
+                ("GITHUB_TOKEN".to_string(), "b".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec!["github_token".to_string(), "GITHUB_TOKEN".to_string()],
+        )
+        .expect("valid provider credential state");
+
+        let error = validate_provider_child_env_keys(Some(&credentials))
+            .expect_err("case-colliding provider keys must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("collides"));
+    }
+
+    #[test]
+    fn provider_child_env_keys_reject_tls_reserved_name() {
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("SSL_CERT_FILE".to_string(), "not-a-ca-bundle".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec!["SSL_CERT_FILE".to_string()],
+        )
+        .expect("valid provider credential state");
+
+        let error = validate_provider_child_env_keys(Some(&credentials))
+            .expect_err("TLS-reserved provider keys must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("reserved for TLS"));
+    }
+
+    #[test]
+    fn provider_child_env_keys_allow_distinct_names() {
+        let credentials = github_provider_credentials();
+        validate_provider_child_env_keys(Some(&credentials))
+            .expect("non-colliding, non-reserved provider keys are allowed");
     }
 
     #[tokio::test]
