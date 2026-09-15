@@ -2767,7 +2767,7 @@ impl KubernetesComputeDriver {
 
     #[tracing::instrument(
         name = "kubernetes.start_sandbox",
-        skip(self),
+        skip_all,
         fields(
             otel.name = "kubernetes.start_sandbox",
             otel.status_code = tracing::field::Empty,
@@ -6852,6 +6852,46 @@ mod tests {
             span.status,
             opentelemetry::trace::Status::Error { .. }
         ));
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_span_does_not_capture_launch_authentication() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+
+        driver
+            .start_sandbox(
+                "sandbox-1",
+                "invalid-generation",
+                b"secret-launch-authentication",
+            )
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("invalid generation must fail before contacting Kubernetes");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "kubernetes.start_sandbox")
+            .expect("start operation span");
+        assert!(span.attributes.iter().all(|attribute| {
+            !matches!(
+                attribute.key.as_str(),
+                "launch_authentication" | "encoded_authentication"
+            )
+        }));
         provider.shutdown().unwrap();
     }
 

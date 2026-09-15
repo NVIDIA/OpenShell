@@ -441,6 +441,7 @@ mod linux {
     ) -> Result<(), String> {
         let (connection_shutdown, connection_closed) = tokio::sync::watch::channel(());
         runtime.register_connection(connection_id, connection_shutdown.clone());
+        let connection_expiry = Arc::new(ConnectionExpiry::new(connection_shutdown.clone()));
         let incoming = tokio_stream::StreamExt::chain(
             tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
                 stream,
@@ -466,7 +467,7 @@ mod linux {
                 IsolationBoundaryServer::new(GrpcBoundaryService {
                     runtime: runtime.clone(),
                     connection_id,
-                    connection_shutdown,
+                    connection_expiry,
                     connection_closed,
                 })
                 .max_decoding_message_size(64 * 1024)
@@ -542,8 +543,75 @@ mod linux {
     struct GrpcBoundaryService {
         runtime: Arc<BoundaryRuntime>,
         connection_id: SandboxConnectionId,
-        connection_shutdown: tokio::sync::watch::Sender<()>,
+        connection_expiry: Arc<ConnectionExpiry>,
         connection_closed: tokio::sync::watch::Receiver<()>,
+    }
+
+    struct ConnectionExpiry {
+        deadline: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+        worker: tokio::task::AbortHandle,
+    }
+
+    impl ConnectionExpiry {
+        fn new(connection_shutdown: tokio::sync::watch::Sender<()>) -> Self {
+            let (deadline, deadline_updates) = tokio::sync::watch::channel(None);
+            let worker = tokio::spawn(run_connection_expiry(deadline_updates, connection_shutdown))
+                .abort_handle();
+            Self { deadline, worker }
+        }
+
+        fn update(&self, expires_at: i64) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let expires_at = u64::try_from(expires_at).unwrap_or_default();
+            self.update_deadline(
+                tokio::time::Instant::now() + Duration::from_secs(expires_at.saturating_sub(now)),
+            );
+        }
+
+        fn update_deadline(&self, deadline: tokio::time::Instant) {
+            let _ = self.deadline.send_if_modified(|current| {
+                if *current == Some(deadline) {
+                    false
+                } else {
+                    *current = Some(deadline);
+                    true
+                }
+            });
+        }
+    }
+
+    impl Drop for ConnectionExpiry {
+        fn drop(&mut self) {
+            self.worker.abort();
+        }
+    }
+
+    async fn run_connection_expiry(
+        mut deadline_updates: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+        connection_shutdown: tokio::sync::watch::Sender<()>,
+    ) {
+        loop {
+            let deadline = *deadline_updates.borrow_and_update();
+            let Some(deadline) = deadline else {
+                if deadline_updates.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ = connection_shutdown.send(());
+                    return;
+                }
+                result = deadline_updates.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
@@ -560,7 +628,8 @@ mod linux {
             let principal = self
                 .runtime
                 .authenticate_request(self.connection_id, request.metadata())?;
-            self.expire_connection_at(principal.session().expires_at);
+            self.connection_expiry
+                .update(principal.session().expires_at);
             let (stream, response) =
                 bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
@@ -583,7 +652,8 @@ mod linux {
             let principal = self
                 .runtime
                 .authenticate_request(self.connection_id, request.metadata())?;
-            self.expire_connection_at(principal.session().expires_at);
+            self.connection_expiry
+                .update(principal.session().expires_at);
             let (stream, response) =
                 bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
@@ -593,21 +663,6 @@ mod linux {
                 }
             });
             Ok(tonic::Response::new(response))
-        }
-    }
-
-    impl GrpcBoundaryService {
-        fn expire_connection_at(&self, expires_at: i64) {
-            let shutdown = self.connection_shutdown.clone();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs());
-            let expires_at = u64::try_from(expires_at).unwrap_or_default();
-            let delay = Duration::from_secs(expires_at.saturating_sub(now));
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = shutdown.send(());
-            });
         }
     }
 
@@ -3615,6 +3670,25 @@ mod linux {
                 .expect("test boundary runtime"),
             );
             (runtime, token)
+        }
+
+        #[tokio::test]
+        async fn connection_expiry_uses_one_updateable_deadline() {
+            let (shutdown, mut closed) = tokio::sync::watch::channel(());
+            let expiry = ConnectionExpiry::new(shutdown);
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(200));
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                    .await
+                    .is_err(),
+                "replacing the deadline must cancel the earlier expiry"
+            );
+            tokio::time::timeout(Duration::from_millis(250), closed.changed())
+                .await
+                .expect("updated connection deadline must fire")
+                .expect("expiry worker must keep the shutdown channel open");
         }
 
         #[tokio::test(flavor = "multi_thread")]
