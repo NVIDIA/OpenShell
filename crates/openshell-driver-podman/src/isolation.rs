@@ -185,6 +185,7 @@ pub fn bootstrap_archives(
         generation: runtime_generation.clone(),
         session_id,
         session_rotation: launch_authentication.supervisor.session_rotation,
+        auth_epoch: launch_authentication.supervisor.auth_epoch,
         gateway_id: launch_authentication.gateway_id.clone(),
         verification_keys,
         listener: BoundaryListener::Unix {
@@ -335,12 +336,11 @@ mod tests {
                 )
                 .unwrap(),
                 session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
-                predecessor_session_id: None,
+                auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
-                credential_epoch: CredentialEpoch::new(1).unwrap(),
             },
             gateway_id: "gateway-test".to_string(),
             verification_keys: vec![SessionVerificationKey {

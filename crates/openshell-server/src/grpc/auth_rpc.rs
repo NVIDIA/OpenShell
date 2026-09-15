@@ -146,8 +146,6 @@ pub async fn handle_refresh_sandbox_token(
         .as_ref()
         .ok_or_else(|| Status::unavailable("sandbox session minting is not configured"))?;
 
-    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
-
     let authorization_values = request.metadata().get_all("authorization");
     let mut authorization_values = authorization_values.iter();
     let authorization = authorization_values
@@ -161,14 +159,15 @@ pub async fn handle_refresh_sandbox_token(
         .ok()
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
-    let gateway_token = openshell_core::jwt::SecretJwt::parse(gateway_token)
-        .map_err(|error| Status::unauthenticated(error.to_string()))?;
-
-    let authentication = state.sandbox_auth_sessions.refresh(
-        &sandbox.sandbox_id,
-        &gateway_token,
-        session_authority,
-    )?;
+    let principal = session_authority.verify_gateway_token(gateway_token)?;
+    if principal.sandbox_id.as_str() != sandbox.sandbox_id {
+        return Err(Status::unauthenticated(
+            "gateway token does not match the authenticated sandbox",
+        ));
+    }
+    let identity =
+        crate::auth::sandbox_session::authorize_persisted(&state.store, &principal).await?;
+    let authentication = session_authority.mint_persisted_launch(&sandbox.sandbox_id, &identity)?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -229,8 +228,8 @@ pub async fn handle_refresh_sandbox_token(
             .supervisor
             .sandbox_expires_at
             .saturating_mul(1000),
-        session_id: authentication.supervisor.session_id.to_string(),
-        credential_epoch: authentication.supervisor.credential_epoch.get(),
+        session_id: authentication.supervisor.runtime_generation.to_string(),
+        credential_epoch: authentication.supervisor.auth_epoch.get(),
     }))
 }
 
@@ -379,20 +378,19 @@ mod tests {
             )
             .expect("session authority"),
         );
-        let authentication = authority
-            .mint_initial_launch("sandbox-a")
-            .expect("launch authentication");
-        state
-            .sandbox_auth_sessions
-            .activate("sandbox-a", &authentication, &authority)
-            .expect("active session");
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .expect("runtime identity");
         state.sandbox_session_jwt_authority = Some(authority);
         let state = Arc::new(state);
-        insert_sandbox(&state, "sandbox-a").await;
+        insert_sandbox(&state, "sandbox-a", &identity).await;
         state
     }
 
-    async fn insert_sandbox(state: &Arc<ServerState>, sandbox_id: &str) {
+    async fn insert_sandbox(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) {
         let mut sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: sandbox_id.to_string(),
@@ -410,6 +408,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        identity.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
     }
@@ -425,10 +424,25 @@ mod tests {
         })
     }
 
-    fn authorize_refresh(state: &ServerState, request: &mut Request<RefreshSandboxTokenRequest>) {
+    async fn authorize_refresh(
+        state: &ServerState,
+        request: &mut Request<RefreshSandboxTokenRequest>,
+    ) {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .expect("load sandbox")
+            .expect("sandbox");
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.expect("metadata").annotations,
+        )
+        .expect("persisted identity");
         let authentication = state
-            .sandbox_auth_sessions
-            .authentication("sandbox-a")
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .expect("session authority")
+            .mint_persisted_launch("sandbox-a", &identity)
             .expect("active authentication");
         let value = format!(
             "Bearer {}",
@@ -470,7 +484,7 @@ mod tests {
             extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
-        authorize_refresh(&state, &mut req);
+        authorize_refresh(&state, &mut req).await;
         let resp = handle_refresh_sandbox_token(&state, req)
             .await
             .expect("refresh OK")
@@ -577,7 +591,7 @@ mod tests {
         let err = handle_refresh_sandbox_token(&state, req)
             .await
             .expect_err("missing sandbox must not refresh");
-        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -690,7 +704,18 @@ mod tests {
             Arc::new(SupervisorSessionRegistry::new()),
             None,
         ));
-        insert_sandbox(&state, "sandbox-a").await;
+        insert_sandbox(
+            &state,
+            "sandbox-a",
+            &crate::auth::sandbox_session::PersistedSandboxIdentity {
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .expect("runtime generation"),
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+            },
+        )
+        .await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
         });

@@ -1350,10 +1350,8 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         launch_authentication: Vec<u8>,
     ) -> Result<Sandbox, Status> {
-        let generation_id =
-            openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
-                sandbox_resource_version(&starting),
-            )
+        let generation_id = sandbox_runtime_generation(&starting)
+            .map_err(Status::failed_precondition)?
             .into_string();
         let result = self
             .driver
@@ -2359,10 +2357,15 @@ impl ComputeRuntime {
             }
 
             let sandbox_name = sandbox.object_name().to_string();
-            let generation_id = openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
-                sandbox_resource_version(&sandbox),
-            )
-            .into_string();
+            let generation_id = match sandbox_runtime_generation(&sandbox) {
+                Ok(generation) => generation.into_string(),
+                Err(error) => {
+                    warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                    authentication_failed(sandbox.object_id());
+                    failed += 1;
+                    continue;
+                }
+            };
             let launch_authentication = match launch_authentication_for(&sandbox).await {
                 Ok(authentication) => authentication,
                 Err(err) => {
@@ -2573,10 +2576,13 @@ impl ComputeRuntime {
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
-                    let generation_id = openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
-                        sandbox_resource_version(&sandbox),
-                    )
-                    .into_string();
+                    let generation_id = match sandbox_runtime_generation(&sandbox) {
+                        Ok(generation) => generation.into_string(),
+                        Err(error) => {
+                            warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                            continue;
+                        }
+                    };
                     if let Err(err) = self
                         .driver
                         .call(
@@ -4410,6 +4416,19 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+fn sandbox_runtime_generation(
+    sandbox: &Sandbox,
+) -> Result<openshell_core::sandbox_generation::SandboxGenerationId, String> {
+    let persisted = sandbox.metadata.as_ref().and_then(|metadata| {
+        metadata
+            .annotations
+            .get(crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION)
+    });
+    let value = persisted.ok_or_else(|| "sandbox runtime generation is missing".to_string())?;
+    openshell_core::sandbox_generation::SandboxGenerationId::parse(value.clone())
+        .map_err(|error| error.to_string())
+}
+
 fn public_status_from_driver(
     status: &DriverSandboxStatus,
     phase: SandboxPhase,
@@ -6056,6 +6075,15 @@ mod tests {
     }
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
+        let mut annotations = HashMap::new();
+        crate::auth::sandbox_session::PersistedSandboxIdentity {
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                format!("test-{id}"),
+            )
+            .expect("test runtime generation"),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
+        }
+        .write(&mut annotations);
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
@@ -6063,7 +6091,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
-                annotations: HashMap::new(),
+                annotations,
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),

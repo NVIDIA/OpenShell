@@ -2280,10 +2280,9 @@ impl DockerComputeDriver {
                 return Ok(true);
             }
 
-            // A gateway restart creates a fresh supervisor session. Rotate
-            // only the supervisor-facing credentials: the running sandbox
-            // keeps its TLS identity and process tree, then accepts the new
-            // gateway-signed session after the old supervisor disconnects.
+            // A gateway restart refreshes the supervisor-facing credentials.
+            // The running sandbox keeps its driver-owned channel identity,
+            // TLS identity, and process tree.
             self.stop_control_process(resolved_sandbox_id).await;
             refresh_docker_supervisor_authentication(
                 resolved_sandbox_id,
@@ -4399,6 +4398,7 @@ async fn prepare_docker_boundary_files(
             .to_string(),
         session_id,
         session_rotation: launch_authentication.supervisor.session_rotation,
+        auth_epoch: launch_authentication.supervisor.auth_epoch,
         gateway_id: launch_authentication.gateway_id,
         verification_keys,
         container_id: container_id.to_string(),
@@ -4597,6 +4597,7 @@ async fn refresh_docker_boundary_authentication(
     boundary_config.session_id = session_id;
     boundary_config.generation = authentication.supervisor.runtime_generation.to_string();
     boundary_config.session_rotation = authentication.supervisor.session_rotation;
+    boundary_config.auth_epoch = authentication.supervisor.auth_epoch;
     boundary_config.gateway_id = authentication.gateway_id;
     boundary_config.verification_keys =
         gateway_verification_keys(&authentication.verification_keys)?;
@@ -4647,13 +4648,11 @@ async fn refresh_docker_supervisor_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
-    else {
+    let Some(runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await? else {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
         ));
     };
-    runtime_descriptor.session_id = authentication.supervisor.session_id;
     let descriptor = runtime_descriptor
         .backend_descriptor()
         .map_err(|error| Status::internal(error.to_string()))?;

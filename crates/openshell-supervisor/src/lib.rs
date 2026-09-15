@@ -628,9 +628,9 @@ pub async fn run_sandbox(
     let runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
         serde_json::from_slice(&backend_descriptor.payload)
             .map_err(|error| miette::miette!("decode sandbox runtime descriptor: {error}"))?;
-    if auth_bundle.session_id != runtime_descriptor.session_id {
+    if auth_bundle.runtime_generation.as_str() != runtime_descriptor.generation {
         return Err(miette::miette!(
-            "supervisor authentication bundle does not match runtime session"
+            "supervisor authentication bundle does not match runtime generation"
         ));
     }
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;

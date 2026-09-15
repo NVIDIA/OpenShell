@@ -799,7 +799,7 @@ message RefreshSandboxTokenResponse {
   int64 sandbox_expires_at_ms = 5;
   // Launch generation to which both refreshed credentials are bound.
   string session_id = 6;
-  // Monotonic Sandbox Protocol connection replacement order.
+  // Durable authorization epoch shared by the gateway and Sandbox Runtime.
   uint64 credential_epoch = 7;
 }
 

@@ -944,7 +944,7 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
                 authority,
-                state.sandbox_auth_sessions.clone(),
+                state.store.clone(),
             ),
         ));
     }

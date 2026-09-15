@@ -52,6 +52,13 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn begin_recovery_window(
+    deadline: &mut Option<tokio::time::Instant>,
+    failure_time: tokio::time::Instant,
+) -> tokio::time::Instant {
+    *deadline.get_or_insert(failure_time + CONNECT_RETRY_TIMEOUT)
+}
+
 /// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
@@ -1041,14 +1048,16 @@ impl BoundaryClient {
 
     async fn call_wait(&self, request: Request) -> Result<Response, BackendError> {
         let envelope = Self::prepare_request(request)?;
-        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
+        let mut recovery_deadline = None;
         loop {
             match self.exchange_envelope(&envelope).await {
                 Ok(response) => return Ok(response),
-                Err(BackendError::Unavailable(message))
-                    if is_transport_unavailable(&message)
-                        && tokio::time::Instant::now() < deadline =>
-                {
+                Err(BackendError::Unavailable(message)) if is_transport_unavailable(&message) => {
+                    let deadline =
+                        begin_recovery_window(&mut recovery_deadline, tokio::time::Instant::now());
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(BackendError::Unavailable(message));
+                    }
                     self.recover_after_unavailable().await?;
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
@@ -2048,6 +2057,18 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.load(Ordering::Acquire), 2);
         assert_eq!(requests.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn wait_recovery_window_begins_at_transport_failure() {
+        let wait_started = tokio::time::Instant::now();
+        let failure_time = wait_started + CONNECT_RETRY_TIMEOUT + Duration::from_secs(5);
+        let mut deadline = None;
+
+        assert_eq!(
+            begin_recovery_window(&mut deadline, failure_time),
+            failure_time + CONNECT_RETRY_TIMEOUT
+        );
     }
 
     #[tokio::test]

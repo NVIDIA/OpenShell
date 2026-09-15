@@ -23,6 +23,7 @@ pub struct VmBoundarySpec {
     pub generation: String,
     pub session_id: openshell_core::SandboxSessionId,
     pub session_rotation: openshell_core::jwt::SessionRotation,
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
     pub gateway_id: String,
     pub verification_keys: Vec<GatewayVerificationKey>,
     pub image_identity: String,
@@ -66,6 +67,7 @@ impl VmBoundarySpec {
                 generation: self.generation.clone(),
                 session_id: self.session_id,
                 session_rotation: self.session_rotation,
+                auth_epoch: self.auth_epoch,
                 gateway_id: self.gateway_id,
                 verification_keys: self.verification_keys,
                 listener: BoundaryListener::Vsock {
@@ -113,6 +115,7 @@ mod tests {
             generation: "generation-1".to_string(),
             session_id,
             session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
             gateway_id: "gateway-1".to_string(),
             verification_keys: vec![GatewayVerificationKey {
                 key_id: "key-1".to_string(),

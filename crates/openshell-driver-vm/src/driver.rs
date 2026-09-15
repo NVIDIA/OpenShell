@@ -1488,6 +1488,7 @@ impl VmDriver {
                 .to_string(),
             session_id,
             session_rotation: launch_authentication.supervisor.session_rotation,
+            auth_epoch: launch_authentication.supervisor.auth_epoch,
             gateway_id: launch_authentication.gateway_id.clone(),
             verification_keys,
             image_identity,
@@ -8598,8 +8599,7 @@ mod tests {
 
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
         use openshell_core::jwt::{
-            CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
-            SupervisorAuthBundle,
+            SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey, SupervisorAuthBundle,
         };
 
         let session_id = openshell_core::SandboxSessionId::new();
@@ -8612,12 +8612,11 @@ mod tests {
                 .expect("runtime generation"),
                 session_rotation: openshell_core::jwt::SessionRotation::new(1)
                     .expect("session rotation"),
-                predecessor_session_id: None,
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
                 gateway_token: SecretJwt::parse(format!("gateway-{label}")).expect("gateway token"),
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
-                credential_epoch: CredentialEpoch::new(1).expect("credential epoch"),
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {

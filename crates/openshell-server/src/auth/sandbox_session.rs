@@ -1,95 +1,53 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Authoritative launch-scoped sandbox authentication state.
+//! Durable sandbox runtime identity used to authorize session JWTs.
 
 use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Mutex;
 
-use openshell_core::SandboxSessionId;
-use openshell_core::jwt::{
-    CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionJwtError, SessionRotation,
-};
+use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
+use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::sandbox_generation::SandboxGenerationId;
-use uuid::Uuid;
+use tonic::Status;
 
-use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
+use crate::persistence::Store;
 
 pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
-pub const SESSION_ID_ANNOTATION: &str = "internal.openshell.ai/session-id";
-pub const SESSION_ROTATION_ANNOTATION: &str = "internal.openshell.ai/session-rotation";
-pub const PREDECESSOR_SESSION_ID_ANNOTATION: &str = "internal.openshell.ai/predecessor-session-id";
-pub const SESSION_PENDING_ANNOTATION: &str = "internal.openshell.ai/session-pending";
+pub const AUTH_EPOCH_ANNOTATION: &str = "internal.openshell.ai/auth-epoch";
 
+/// The complete durable authorization identity for one sandbox runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PersistedSessionLineage {
+pub struct PersistedSandboxIdentity {
     pub runtime_generation: SandboxGenerationId,
-    pub session_id: SandboxSessionId,
-    pub session_rotation: SessionRotation,
-    pub predecessor_session_id: Option<SandboxSessionId>,
-    pub pending: bool,
+    pub auth_epoch: CredentialEpoch,
 }
 
-impl PersistedSessionLineage {
-    pub fn from_authentication(
-        authentication: &SandboxLaunchAuthentication,
-        pending: bool,
-    ) -> Self {
-        Self {
-            runtime_generation: authentication.supervisor.runtime_generation.clone(),
-            session_id: authentication.supervisor.session_id,
-            session_rotation: authentication.supervisor.session_rotation,
-            predecessor_session_id: authentication.supervisor.predecessor_session_id,
-            pending,
-        }
+impl PersistedSandboxIdentity {
+    pub fn new() -> Result<Self, SessionJwtError> {
+        Ok(Self {
+            runtime_generation: SandboxGenerationId::parse(uuid::Uuid::new_v4().to_string())
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?,
+            auth_epoch: CredentialEpoch::new(1)?,
+        })
     }
 
     pub fn read(annotations: &HashMap<String, String>) -> Result<Self, SessionJwtError> {
         let runtime_generation = annotations
             .get(RUNTIME_GENERATION_ANNOTATION)
-            .ok_or(SessionJwtError::MissingSessionLineage)
+            .ok_or(SessionJwtError::MissingRuntimeIdentity)
             .and_then(|value| {
                 SandboxGenerationId::parse(value.clone())
-                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
+                    .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)
             })?;
-        let session_id = annotations
-            .get(SESSION_ID_ANNOTATION)
-            .ok_or(SessionJwtError::MissingSessionLineage)
-            .and_then(|value| {
-                SandboxSessionId::from_str(value)
-                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
-            })?;
-        let session_rotation = annotations
-            .get(SESSION_ROTATION_ANNOTATION)
-            .ok_or(SessionJwtError::MissingSessionLineage)
-            .and_then(|value| {
-                value
-                    .parse::<u64>()
-                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
-            })
-            .and_then(SessionRotation::new)?;
-        let predecessor_session_id = annotations
-            .get(PREDECESSOR_SESSION_ID_ANNOTATION)
-            .map(|value| {
-                SandboxSessionId::from_str(value)
-                    .map_err(|_| SessionJwtError::InvalidSessionLineage)
-            })
-            .transpose()?;
-        let pending = annotations
-            .get(SESSION_PENDING_ANNOTATION)
-            .ok_or(SessionJwtError::MissingSessionLineage)?
-            .parse::<bool>()
-            .map_err(|_| SessionJwtError::InvalidSessionLineage)?;
-        if (session_rotation.get() == 1) != predecessor_session_id.is_none() {
-            return Err(SessionJwtError::InvalidSessionLineage);
-        }
+        let auth_epoch = annotations
+            .get(AUTH_EPOCH_ANNOTATION)
+            .ok_or(SessionJwtError::MissingRuntimeIdentity)?
+            .parse::<u64>()
+            .map_err(|_| SessionJwtError::InvalidCredentialEpoch)
+            .and_then(CredentialEpoch::new)?;
         Ok(Self {
             runtime_generation,
-            session_id,
-            session_rotation,
-            predecessor_session_id,
-            pending,
+            auth_epoch,
         })
     }
 
@@ -99,285 +57,134 @@ impl PersistedSessionLineage {
             self.runtime_generation.to_string(),
         );
         annotations.insert(
-            SESSION_ID_ANNOTATION.to_string(),
-            self.session_id.to_string(),
-        );
-        annotations.insert(
-            SESSION_ROTATION_ANNOTATION.to_string(),
-            self.session_rotation.get().to_string(),
-        );
-        match self.predecessor_session_id {
-            Some(predecessor) => {
-                annotations.insert(
-                    PREDECESSOR_SESSION_ID_ANNOTATION.to_string(),
-                    predecessor.to_string(),
-                );
-            }
-            None => {
-                annotations.remove(PREDECESSOR_SESSION_ID_ANNOTATION);
-            }
-        }
-        annotations.insert(
-            SESSION_PENDING_ANNOTATION.to_string(),
-            self.pending.to_string(),
+            AUTH_EPOCH_ANNOTATION.to_string(),
+            self.auth_epoch.get().to_string(),
         );
     }
 }
 
-#[derive(Clone)]
-struct RefreshResult {
-    consumed_token_id: Uuid,
-    authentication: SandboxLaunchAuthentication,
-}
+/// Load the authoritative runtime identity and compare it with a signed JWT.
+///
+/// Every gateway replica performs this check against shared persistence. No
+/// raw token, token ID, or refresh lineage needs to be replicated.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_persisted(
+    store: &Store,
+    principal: &AuthenticatedSandboxSession,
+) -> Result<PersistedSandboxIdentity, Status> {
+    let sandbox = store
+        .get_message::<Sandbox>(principal.sandbox_id.as_str())
+        .await
+        .map_err(|error| Status::unavailable(format!("load sandbox identity failed: {error}")))?
+        .ok_or_else(|| Status::unauthenticated("sandbox identity does not exist"))?;
 
-#[derive(Clone)]
-struct ActiveSession {
-    session_id: SandboxSessionId,
-    runtime_generation: SandboxGenerationId,
-    session_rotation: SessionRotation,
-    predecessor_session_id: Option<SandboxSessionId>,
-    credential_epoch: CredentialEpoch,
-    current_gateway_token_id: Uuid,
-    active: bool,
-    last_refresh: Option<RefreshResult>,
-    authentication: SandboxLaunchAuthentication,
-}
-
-/// One active launch generation per sandbox.
-#[derive(Default)]
-pub struct SandboxSessionRegistry {
-    sessions: Mutex<HashMap<String, ActiveSession>>,
-}
-
-impl std::fmt::Debug for SandboxSessionRegistry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SandboxSessionRegistry")
-            .finish_non_exhaustive()
-    }
-}
-
-impl SandboxSessionRegistry {
-    /// Authorize a cryptographically verified gateway-profile session token.
-    ///
-    /// Ordinary supervisor RPCs accept only the currently active token. The
-    /// refresh RPC may replay the immediately consumed token so a lost refresh
-    /// response can be retried without extending any older credential.
-    #[allow(clippy::result_large_err)]
-    pub fn authorize(
-        &self,
-        principal: &openshell_core::jwt::AuthenticatedSandboxSession,
-        allow_last_refresh: bool,
-    ) -> Result<(), tonic::Status> {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session = sessions
-            .get(principal.sandbox_id.as_str())
-            .filter(|session| session.active)
-            .ok_or_else(|| tonic::Status::failed_precondition("sandbox session is not active"))?;
-        if principal.session_id != session.session_id
-            || principal.runtime_generation != session.runtime_generation
-            || principal.session_rotation != session.session_rotation
-            || principal.predecessor_session_id != session.predecessor_session_id
-            || principal.credential_epoch.is_some()
-        {
-            return Err(tonic::Status::unauthenticated(
-                "gateway session does not match the active sandbox generation",
-            ));
-        }
-        let current = principal.token_id == session.current_gateway_token_id;
-        let retry = allow_last_refresh
-            && session
-                .last_refresh
-                .as_ref()
-                .is_some_and(|refresh| refresh.consumed_token_id == principal.token_id);
-        if !current && !retry {
-            return Err(tonic::Status::unauthenticated(
-                "gateway session token has been replaced",
-            ));
-        }
-        Ok(())
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    if !matches!(
+        phase,
+        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Starting
+    ) {
+        return Err(Status::failed_precondition(
+            "sandbox runtime identity is not active",
+        ));
     }
 
-    pub fn activate(
-        &self,
-        sandbox_id: &str,
-        authentication: &SandboxLaunchAuthentication,
-        authority: &SandboxSessionJwtAuthority,
-    ) -> Result<(), SessionJwtError> {
-        authentication.validate()?;
-        let principal = authority
-            .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())
-            .map_err(|_| SessionJwtError::InvalidToken)?;
-        if principal.session_id != authentication.supervisor.session_id
-            || principal.runtime_generation != authentication.supervisor.runtime_generation
-            || principal.session_rotation != authentication.supervisor.session_rotation
-            || principal.predecessor_session_id != authentication.supervisor.predecessor_session_id
-            || principal.credential_epoch.is_some()
-        {
-            return Err(SessionJwtError::ProfileMismatch);
-        }
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                sandbox_id.to_string(),
-                ActiveSession {
-                    session_id: authentication.supervisor.session_id,
-                    runtime_generation: authentication.supervisor.runtime_generation.clone(),
-                    session_rotation: authentication.supervisor.session_rotation,
-                    predecessor_session_id: authentication.supervisor.predecessor_session_id,
-                    credential_epoch: authentication.supervisor.credential_epoch,
-                    current_gateway_token_id: principal.token_id,
-                    active: true,
-                    last_refresh: None,
-                    authentication: authentication.clone(),
-                },
-            );
-        Ok(())
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::unauthenticated("sandbox identity metadata is missing"))?;
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+        .map_err(|_| Status::unauthenticated("sandbox runtime identity is invalid"))?;
+    if principal.runtime_generation != identity.runtime_generation
+        || principal.auth_epoch != identity.auth_epoch
+    {
+        return Err(Status::unauthenticated(
+            "gateway token does not match the active sandbox identity",
+        ));
     }
-
-    pub fn current(&self, sandbox_id: &str) -> Option<(SandboxSessionId, CredentialEpoch)> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(sandbox_id)
-            .filter(|session| session.active)
-            .map(|session| (session.session_id, session.credential_epoch))
-    }
-
-    pub fn authentication(&self, sandbox_id: &str) -> Option<SandboxLaunchAuthentication> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(sandbox_id)
-            .filter(|session| session.active)
-            .map(|session| session.authentication.clone())
-    }
-
-    pub fn deactivate(&self, sandbox_id: &str) {
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(sandbox_id)
-        {
-            session.active = false;
-        }
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn refresh(
-        &self,
-        sandbox_id: &str,
-        presented_token: &SecretJwt,
-        authority: &SandboxSessionJwtAuthority,
-    ) -> Result<SandboxLaunchAuthentication, tonic::Status> {
-        let principal = authority.verify_gateway_token(presented_token.expose_secret())?;
-        let mut sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session = sessions
-            .get_mut(sandbox_id)
-            .ok_or_else(|| tonic::Status::failed_precondition("sandbox session is not active"))?;
-        if !session.active || principal.session_id != session.session_id {
-            return Err(tonic::Status::failed_precondition(
-                "sandbox session is not active",
-            ));
-        }
-        if let Some(previous) = &session.last_refresh
-            && previous.consumed_token_id == principal.token_id
-        {
-            return Ok(previous.authentication.clone());
-        }
-        if principal.token_id != session.current_gateway_token_id {
-            return Err(tonic::Status::unauthenticated(
-                "gateway session token has already been replaced",
-            ));
-        }
-        let next_epoch = session
-            .credential_epoch
-            .get()
-            .checked_add(1)
-            .and_then(|value| CredentialEpoch::new(value).ok())
-            .ok_or_else(|| tonic::Status::internal("sandbox credential epoch overflow"))?;
-        let authentication = authority.mint_launch(
-            sandbox_id,
-            session.session_id,
-            session.runtime_generation.clone(),
-            session.session_rotation,
-            session.predecessor_session_id,
-            next_epoch,
-        )?;
-        let next_principal = authority
-            .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())?;
-        session.credential_epoch = next_epoch;
-        session.current_gateway_token_id = next_principal.token_id;
-        session.authentication = authentication.clone();
-        session.last_refresh = Some(RefreshResult {
-            consumed_token_id: principal.token_id,
-            authentication: authentication.clone(),
-        });
-        Ok(authentication)
-    }
+    Ok(identity)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use openshell_bootstrap::jwt::generate_jwt_key;
-
     use super::*;
+    use openshell_core::jwt::SandboxId;
+    use openshell_core::proto::SandboxStatus;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use uuid::Uuid;
 
-    #[test]
-    fn authorization_tracks_active_token_and_refresh_retry() {
-        let key = generate_jwt_key().expect("JWT key");
-        let authority = SandboxSessionJwtAuthority::from_pem(
-            key.signing_key_pem.as_bytes(),
-            key.public_key_pem.as_bytes(),
-            key.kid,
-            "gateway-a",
-            Duration::from_hours(1),
-        )
-        .expect("session authority");
-        let registry = SandboxSessionRegistry::default();
-        let authentication = authority
-            .mint_initial_launch("sandbox-a")
-            .expect("launch authentication");
-        registry
-            .activate("sandbox-a", &authentication, &authority)
-            .expect("activate session");
+    fn principal(auth_epoch: u64) -> AuthenticatedSandboxSession {
+        AuthenticatedSandboxSession {
+            sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+            runtime_generation: SandboxGenerationId::parse("generation-a")
+                .expect("runtime generation"),
+            auth_epoch: CredentialEpoch::new(auth_epoch).expect("auth epoch"),
+            token_id: Uuid::new_v4(),
+            issued_at: 1,
+            expires_at: 2,
+        }
+    }
 
-        let original = authority
-            .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())
-            .expect("original principal");
-        registry
-            .authorize(&original, false)
-            .expect("current token is authorized");
+    #[tokio::test]
+    async fn shared_identity_authorizes_every_replica_and_revokes_old_epochs() {
+        let store = Store::connect("sqlite::memory:").await.expect("store");
+        let identity = PersistedSandboxIdentity {
+            runtime_generation: SandboxGenerationId::parse("generation-a")
+                .expect("runtime generation"),
+            auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+        };
+        let mut metadata = ObjectMeta {
+            id: "sandbox-a".to_string(),
+            name: "sandbox-a".to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        };
+        identity.write(&mut metadata.annotations);
+        let sandbox = Sandbox {
+            metadata: Some(metadata),
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Ready as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.expect("persist sandbox");
 
-        let refreshed = registry
-            .refresh(
-                "sandbox-a",
-                &authentication.supervisor.gateway_token,
-                &authority,
-            )
-            .expect("refresh session");
-        assert!(registry.authorize(&original, false).is_err());
-        registry
-            .authorize(&original, true)
-            .expect("immediately consumed token can retry refresh");
-        let current = authority
-            .verify_gateway_token(refreshed.supervisor.gateway_token.expose_secret())
-            .expect("refreshed principal");
-        registry
-            .authorize(&current, false)
-            .expect("refreshed token is authorized");
+        authorize_persisted(&store, &principal(1))
+            .await
+            .expect("first replica authorizes from persistence");
+        authorize_persisted(&store, &principal(1))
+            .await
+            .expect("second replica authorizes without local state");
 
-        registry.deactivate("sandbox-a");
-        assert!(registry.authorize(&current, false).is_err());
+        store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
+                let next = PersistedSandboxIdentity {
+                    runtime_generation: SandboxGenerationId::parse("generation-a")
+                        .expect("runtime generation"),
+                    auth_epoch: CredentialEpoch::new(2).expect("auth epoch"),
+                };
+                next.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
+            })
+            .await
+            .expect("advance auth epoch");
+
+        let error = authorize_persisted(&store, &principal(1))
+            .await
+            .expect_err("old epoch must be revoked on every replica");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        authorize_persisted(&store, &principal(2))
+            .await
+            .expect("new epoch is active");
+
+        store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
+                sandbox.set_phase(SandboxPhase::Stopped as i32);
+            })
+            .await
+            .expect("stop sandbox");
+        let error = authorize_persisted(&store, &principal(2))
+            .await
+            .expect_err("stopped runtime must reject its token");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 }

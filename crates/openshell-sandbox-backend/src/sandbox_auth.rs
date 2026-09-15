@@ -5,10 +5,8 @@
 
 use std::sync::Mutex;
 
-use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
     AuthenticatedSandboxSession, CredentialEpoch, SandboxId, SessionJwtError, SessionJwtVerifier,
-    SessionRotation,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
 use tonic::metadata::MetadataMap;
@@ -58,6 +56,7 @@ pub struct SandboxProtocolAuthenticator {
     verifier: SessionJwtVerifier,
     expected_sandbox_id: SandboxId,
     expected_runtime_generation: SandboxGenerationId,
+    expected_auth_epoch: CredentialEpoch,
 }
 
 impl std::fmt::Debug for SandboxProtocolAuthenticator {
@@ -70,6 +69,7 @@ impl std::fmt::Debug for SandboxProtocolAuthenticator {
                 "expected_runtime_generation",
                 &self.expected_runtime_generation,
             )
+            .field("expected_auth_epoch", &self.expected_auth_epoch)
             .finish()
     }
 }
@@ -80,11 +80,13 @@ impl SandboxProtocolAuthenticator {
         verifier: SessionJwtVerifier,
         expected_sandbox_id: SandboxId,
         expected_runtime_generation: SandboxGenerationId,
+        expected_auth_epoch: CredentialEpoch,
     ) -> Self {
         Self {
             verifier,
             expected_sandbox_id,
             expected_runtime_generation,
+            expected_auth_epoch,
         }
     }
 
@@ -112,6 +114,9 @@ impl SandboxProtocolAuthenticator {
         if session.runtime_generation != self.expected_runtime_generation {
             return Err(SandboxAuthError::WrongRuntimeGeneration);
         }
+        if session.auth_epoch != self.expected_auth_epoch {
+            return Err(SandboxAuthError::StaleCredentialEpoch);
+        }
         Ok(SandboxProtocolPrincipal {
             connection_id,
             session,
@@ -130,9 +135,6 @@ struct ConnectionState {
     active: Option<ActiveConnection>,
     pending: Option<ActiveConnection>,
     highest_epoch: Option<CredentialEpoch>,
-    session_id: SandboxSessionId,
-    session_rotation: SessionRotation,
-    retired_sessions: std::collections::HashSet<SandboxSessionId>,
     supervisor_instance_id: Option<crate::boundary_protocol::SupervisorInstanceId>,
     terminal: bool,
 }
@@ -145,15 +147,15 @@ pub struct SandboxConnectionRegistry {
 
 impl SandboxConnectionRegistry {
     #[must_use]
-    pub fn new(session_id: SandboxSessionId, session_rotation: SessionRotation) -> Self {
+    pub fn new(
+        _session_id: openshell_core::SandboxSessionId,
+        _session_rotation: openshell_core::jwt::SessionRotation,
+    ) -> Self {
         Self {
             state: Mutex::new(ConnectionState {
                 active: None,
                 pending: None,
                 highest_epoch: None,
-                session_id,
-                session_rotation,
-                retired_sessions: std::collections::HashSet::new(),
                 supervisor_instance_id: None,
                 terminal: false,
             }),
@@ -169,44 +171,13 @@ impl SandboxConnectionRegistry {
         principal: &SandboxProtocolPrincipal,
         supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     ) -> Result<Option<SandboxConnectionId>, SandboxAuthError> {
-        let epoch = principal
-            .session
-            .credential_epoch
-            .ok_or(SandboxAuthError::MissingCredentialEpoch)?;
+        let epoch = principal.session.auth_epoch;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.terminal {
             return Err(SandboxAuthError::TerminalSession);
-        }
-        let session_id = principal.session.session_id;
-        if state.retired_sessions.contains(&session_id) {
-            return Err(SandboxAuthError::WrongSession);
-        }
-        if state.session_id == session_id {
-            if principal.session.session_rotation != state.session_rotation {
-                return Err(SandboxAuthError::StaleSessionRotation);
-            }
-        } else {
-            // A replacement is an explicit signed successor of the current
-            // session. It may take over only after the previous physical
-            // connection has gone away.
-            let expected_rotation = state.session_rotation.successor()?;
-            if principal.session.predecessor_session_id != Some(state.session_id)
-                || principal.session.session_rotation != expected_rotation
-            {
-                return Err(SandboxAuthError::WrongSession);
-            }
-            if state.active.is_some() || state.pending.is_some() {
-                return Err(SandboxAuthError::WrongSession);
-            }
-            let retired_session_id = state.session_id;
-            state.retired_sessions.insert(retired_session_id);
-            state.session_id = session_id;
-            state.session_rotation = expected_rotation;
-            state.supervisor_instance_id = None;
-            state.highest_epoch = None;
         }
         match state.supervisor_instance_id {
             Some(expected) if expected != supervisor_instance_id => {
@@ -364,14 +335,8 @@ pub enum SandboxAuthError {
     Jwt(#[from] SessionJwtError),
     #[error("authenticated sandbox identity does not match this runtime")]
     WrongSandbox,
-    #[error("authenticated sandbox session does not match this runtime")]
-    WrongSession,
     #[error("authenticated runtime generation does not match this sandbox runtime")]
     WrongRuntimeGeneration,
-    #[error("sandbox session rotation is stale")]
-    StaleSessionRotation,
-    #[error("Sandbox Protocol token is missing its credential epoch")]
-    MissingCredentialEpoch,
     #[error("Sandbox Protocol credential epoch is stale or already active")]
     StaleCredentialEpoch,
     #[error("sandbox runtime is already bound to another supervisor process")]
@@ -387,8 +352,8 @@ mod tests {
     use std::sync::Arc;
 
     use openshell_core::jwt::{
-        DEFAULT_SESSION_TOKEN_TTL, JwtClock, SandboxSessionIdentity, SessionJwtIssuer,
-        SessionRotation, SessionTokenProfile, SessionVerificationKey,
+        DEFAULT_SESSION_TOKEN_TTL, JwtClock, SandboxRuntimeIdentity, SessionJwtIssuer,
+        SessionTokenProfile, SessionVerificationKey,
     };
     use openshell_core::sandbox_generation::SandboxGenerationId;
     use rcgen::{KeyPair, PKCS_ED25519};
@@ -406,33 +371,6 @@ mod tests {
 
     fn fixture(
         epoch: u64,
-    ) -> (
-        SandboxProtocolAuthenticator,
-        openshell_core::jwt::MintedSessionToken,
-    ) {
-        fixture_for_session(epoch, SandboxSessionId::new())
-    }
-
-    fn fixture_for_session(
-        epoch: u64,
-        session_id: SandboxSessionId,
-    ) -> (
-        SandboxProtocolAuthenticator,
-        openshell_core::jwt::MintedSessionToken,
-    ) {
-        fixture_for_lineage(
-            epoch,
-            session_id,
-            SessionRotation::new(1).expect("rotation"),
-            None,
-        )
-    }
-
-    fn fixture_for_lineage(
-        epoch: u64,
-        session_id: SandboxSessionId,
-        session_rotation: SessionRotation,
-        predecessor_session_id: Option<SandboxSessionId>,
     ) -> (
         SandboxProtocolAuthenticator,
         openshell_core::jwt::MintedSessionToken,
@@ -460,17 +398,12 @@ mod tests {
         )
         .expect("verifier");
         let token = issuer
-            .mint_pair(
-                &SandboxSessionIdentity {
-                    sandbox_id: sandbox_id.clone(),
-                    session_id,
-                    runtime_generation: SandboxGenerationId::parse("generation-1")
-                        .expect("runtime generation"),
-                    session_rotation,
-                    predecessor_session_id,
-                },
-                CredentialEpoch::new(epoch).expect("epoch"),
-            )
+            .mint_pair(&SandboxRuntimeIdentity {
+                sandbox_id: sandbox_id.clone(),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                auth_epoch: CredentialEpoch::new(epoch).expect("epoch"),
+            })
             .expect("token pair")
             .sandbox;
         (
@@ -478,15 +411,16 @@ mod tests {
                 verifier,
                 sandbox_id,
                 SandboxGenerationId::parse("generation-1").expect("runtime generation"),
+                CredentialEpoch::new(epoch).expect("epoch"),
             ),
             token,
         )
     }
 
-    fn registry_for(principal: &SandboxProtocolPrincipal) -> SandboxConnectionRegistry {
+    fn registry_for(_principal: &SandboxProtocolPrincipal) -> SandboxConnectionRegistry {
         SandboxConnectionRegistry::new(
-            principal.session.session_id,
-            principal.session.session_rotation,
+            openshell_core::SandboxSessionId::new(),
+            openshell_core::jwt::SessionRotation::new(1).expect("rotation"),
         )
     }
 
@@ -578,13 +512,12 @@ mod tests {
 
     #[test]
     fn replacement_does_not_displace_active_connection_before_confirm() {
-        let session_id = SandboxSessionId::new();
-        let (first_authenticator, first_token) = fixture_for_session(1, session_id);
+        let (first_authenticator, first_token) = fixture(1);
         let first_id = SandboxConnectionId::new();
         let first = first_authenticator
             .authenticate(first_id, &metadata(first_token.token.expose_secret()))
             .expect("first principal");
-        let (replacement_authenticator, replacement_token) = fixture_for_session(2, session_id);
+        let (replacement_authenticator, replacement_token) = fixture(2);
         let replacement_id = SandboxConnectionId::new();
         let replacement = replacement_authenticator
             .authenticate(
@@ -616,103 +549,5 @@ mod tests {
         registry
             .require_active(&replacement)
             .expect("replacement became active");
-    }
-
-    #[test]
-    fn unrelated_session_cannot_claim_configured_idle_runtime() {
-        let configured_session = SandboxSessionId::new();
-        let unrelated_session = SandboxSessionId::new();
-        let (authenticator, token) = fixture_for_session(1, unrelated_session);
-        let principal = authenticator
-            .authenticate(
-                SandboxConnectionId::new(),
-                &metadata(token.token.expose_secret()),
-            )
-            .expect("unrelated principal");
-        let registry = SandboxConnectionRegistry::new(
-            configured_session,
-            SessionRotation::new(1).expect("rotation"),
-        );
-        assert_eq!(
-            registry.attach(
-                &principal,
-                crate::boundary_protocol::SupervisorInstanceId::new(),
-            ),
-            Err(SandboxAuthError::WrongSession)
-        );
-    }
-
-    #[test]
-    fn new_gateway_session_rekeys_after_the_old_connection_disconnects() {
-        let first_session = SandboxSessionId::new();
-        let (first_authenticator, first_token) = fixture_for_session(1, first_session);
-        let first_id = SandboxConnectionId::new();
-        let first = first_authenticator
-            .authenticate(first_id, &metadata(first_token.token.expose_secret()))
-            .expect("first principal");
-        let registry = registry_for(&first);
-        let first_instance = crate::boundary_protocol::SupervisorInstanceId::new();
-        registry
-            .attach(&first, first_instance)
-            .expect("attach first");
-        registry.confirm(&first).expect("confirm first");
-
-        let unrelated_session = SandboxSessionId::new();
-        let (unrelated_authenticator, unrelated_token) = fixture_for_lineage(
-            1,
-            unrelated_session,
-            SessionRotation::new(2).expect("rotation"),
-            Some(SandboxSessionId::new()),
-        );
-        let unrelated_id = SandboxConnectionId::new();
-        let unrelated = unrelated_authenticator
-            .authenticate(
-                unrelated_id,
-                &metadata(unrelated_token.token.expose_secret()),
-            )
-            .expect("unrelated principal");
-        assert_eq!(
-            registry.attach(
-                &unrelated,
-                crate::boundary_protocol::SupervisorInstanceId::new()
-            ),
-            Err(SandboxAuthError::WrongSession)
-        );
-
-        let replacement_session = SandboxSessionId::new();
-        let (replacement_authenticator, replacement_token) = fixture_for_lineage(
-            1,
-            replacement_session,
-            SessionRotation::new(2).expect("rotation"),
-            Some(first_session),
-        );
-        let replacement_id = SandboxConnectionId::new();
-        let replacement = replacement_authenticator
-            .authenticate(
-                replacement_id,
-                &metadata(replacement_token.token.expose_secret()),
-            )
-            .expect("replacement principal");
-        let replacement_instance = crate::boundary_protocol::SupervisorInstanceId::new();
-        assert_eq!(
-            registry.attach(&replacement, replacement_instance),
-            Err(SandboxAuthError::WrongSession)
-        );
-
-        assert!(registry.disconnect(first_id));
-        assert_eq!(
-            registry.attach(&unrelated, replacement_instance),
-            Err(SandboxAuthError::WrongSession)
-        );
-        assert_eq!(
-            registry.attach(&replacement, replacement_instance),
-            Ok(None)
-        );
-        registry.confirm(&replacement).expect("confirm replacement");
-        assert!(registry.disconnect(replacement_id));
-        assert_eq!(
-            registry.attach(&first, first_instance),
-            Err(SandboxAuthError::WrongSession)
-        );
     }
 }
