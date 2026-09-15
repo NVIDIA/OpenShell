@@ -68,7 +68,7 @@ impl HostPythonFixture {
         // Bind to 127.0.0.1 for the readiness probe even though the fixture
         // listens on 0.0.0.0: the guest reaches it through gvproxy's NAT to
         // the host loopback, so loopback reachability is what matters.
-        wait_for_port("127.0.0.1", port, Duration::from_secs(60))
+        wait_for_port("127.0.0.1", port, Duration::from_mins(1))
             .await
             .map_err(|err| {
                 format!(

@@ -49,7 +49,7 @@ use spiffe::WorkloadApiClient;
 /// Token cache shared across all provider token grants.
 static TOKEN_CACHE: LazyLock<TokenCache> = LazyLock::new(TokenCache::new);
 static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(30))

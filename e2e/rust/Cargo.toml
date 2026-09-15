@@ -11,7 +11,7 @@ name = "openshell-e2e"
 description = "End-to-end tests for the OpenShell CLI"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.94"
 license = "Apache-2.0"
 publish = false
 
@@ -204,6 +204,7 @@ path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
 [dependencies]
+openshell-crypto = { path = "../../crates/openshell-crypto" }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
@@ -211,7 +212,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = "10"
 prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

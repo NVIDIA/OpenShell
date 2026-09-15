@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use serial_test::serial;
 use tokio::time::timeout;
 
-const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 const CDI_GPU_DEVICE_PREFIX: &str = "nvidia.com/gpu=";
 const GPU_PROBE_IMAGE_ENV: &str = "OPENSHELL_E2E_GPU_PROBE_IMAGE";

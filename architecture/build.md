@@ -30,7 +30,16 @@ AWS-LC, including the CLI and standalone examples. Native and cross-build
 environments must provide the C toolchain required by aws-lc-sys; the Nix
 development shells provide static AWS-LC libraries.
 
-SQLx uses AWS-LC with native certificate roots. The server enables
+First-party crypto selection lives in `openshell-crypto`: backend-neutral
+primitive traits and protocol adapters preserve existing TLS, PKI, JWT, and
+credential-storage behavior. Application crates enable integration features on
+that crate instead of naming a backend. Process-default initialization preserves
+existing embedder providers; context capability reporting does not attest those
+globals or dependency-owned crypto. OpenSSL and strict FIPS operation are separate
+follow-up work. The crate README defines extension and coverage boundaries.
+
+SQLx uses AWS-LC with native certificate roots.
+ The server enables
 `sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
 that root selection independently of the crypto provider. Credential storage
 continues to use the same AES-256-GCM envelope format across backend changes.

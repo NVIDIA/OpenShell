@@ -15,6 +15,7 @@ name = "openshell-driver-vault"
 path = "src/main.rs"
 
 [dependencies]
+openshell-crypto = { path = "../openshell-crypto" }
 openshell-core = { path = "../openshell-core", default-features = false }
 
 clap = { workspace = true }

@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-crypto"
+description = "Crypto backend contract and protocol adapters for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Dependencies that select their own provider must be configured as well as
+# first-party calls. Consumers enable these integration features, never a backend.
+tls-tonic = ["dep:tonic", "tonic/tls-aws-lc"]
+tls-hyper = ["dep:hyper-rustls", "hyper-rustls/aws-lc-rs"]
+tls-kube = ["dep:kube", "dep:k8s-openapi", "kube/aws-lc-rs"]
+tls-sqlx = ["dep:sqlx", "sqlx/tls-rustls-aws-lc-rs"]
+
+[dependencies]
+tonic = { workspace = true, optional = true }
+hyper-rustls = { version = "0.27", default-features = false, optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+
+aws-lc-rs = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

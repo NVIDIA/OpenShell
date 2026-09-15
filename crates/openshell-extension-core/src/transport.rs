@@ -192,7 +192,7 @@ mod tests {
     use std::future::{Ready, ready};
     use std::task::{Context, Poll};
 
-    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::body::Body;
@@ -292,12 +292,12 @@ mod tests {
 
     #[tokio::test]
     async fn custom_ca_verifies_certificate_and_hostname() {
-        let ca_key = KeyPair::generate().unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca = ca_params.self_signed(&ca_key).unwrap();
 
-        let server_key = KeyPair::generate().unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let server_cert = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
@@ -331,7 +331,7 @@ mod tests {
             Err(TransportError::Connect(_))
         ));
 
-        let rogue_key = KeyPair::generate().unwrap();
+        let rogue_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut rogue_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         rogue_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let rogue_ca = rogue_params.self_signed(&rogue_key).unwrap();

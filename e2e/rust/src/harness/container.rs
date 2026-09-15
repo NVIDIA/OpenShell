@@ -221,7 +221,7 @@ impl ContainerHttpServer {
     async fn wait_until_ready(&self) -> Result<(), String> {
         let container_id = self.container_id.clone();
         let engine = self.engine.clone();
-        timeout(Duration::from_secs(60), async move {
+        timeout(Duration::from_mins(1), async move {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -326,7 +326,7 @@ impl HostSupportContainer {
     }
 
     async fn wait_until_listening(&self, container_port: u16) -> Result<(), String> {
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -447,7 +447,7 @@ impl SupportContainer {
         let probe = format!(
             "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
         );
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;

@@ -183,7 +183,7 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        openshell_crypto::tls::provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

@@ -570,7 +570,7 @@ impl GatewayProxyConfig {
             let _ = writeln!(extra, "no_proxy = \"{no_proxy}\"");
         }
         let guard = Self::apply_raw(&extra)?;
-        wait_for_healthy(Duration::from_secs(120)).await?;
+        wait_for_healthy(Duration::from_mins(2)).await?;
         Ok(guard)
     }
 
@@ -589,7 +589,7 @@ impl GatewayProxyConfig {
             .ok_or_else(|| "managed gateway metadata disappeared".to_string())?;
         gateway.stop()?;
         gateway.start()?;
-        wait_for_healthy(Duration::from_secs(120)).await?;
+        wait_for_healthy(Duration::from_mins(2)).await?;
         self.restored = true;
         Ok(())
     }
