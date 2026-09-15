@@ -3273,29 +3273,8 @@ mod tests {
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
-    use crate::provider_profile_sources::ProviderProfileSources;
-    use openshell_core::GatewayProviderProfileSourceConfig;
     use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-
-    async fn test_server_state_with_user_only_github_profile() -> Arc<ServerState> {
-        let mut state = test_server_state().await;
-        Arc::get_mut(&mut state)
-            .expect("test server state should be uniquely owned")
-            .provider_profile_sources =
-            ProviderProfileSources::from_config(&[GatewayProviderProfileSourceConfig::User], None)
-                .expect("user-only provider profile source configuration should be valid");
-
-        let github_profile = openshell_providers::example_profiles::load("github").to_proto();
-        state
-            .store
-            .put_message(&crate::provider_profile_sources::stored_provider_profile(
-                github_profile,
-            ))
-            .await
-            .expect("store user-managed github profile");
-        state
-    }
 
     // ---- shell_escape ----
 
@@ -3902,7 +3881,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_sandbox_provider_uses_configured_provider_profile_sources() {
-        let state = test_server_state_with_user_only_github_profile().await;
+        let state = test_server_state().await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -4347,7 +4326,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_sandbox_uses_configured_provider_profile_sources() {
-        let state = test_server_state_with_user_only_github_profile().await;
+        let state = test_server_state().await;
 
         let response = handle_create_sandbox(
             &state,

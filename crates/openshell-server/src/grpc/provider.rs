@@ -5541,30 +5541,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_provider_profile_rejects_built_in_and_missing_profiles() {
-        let state = test_server_state().await;
+    async fn update_provider_profile_rejects_source_managed_and_missing_profiles() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
 
-        let built_in = handle_update_provider_profiles(
+        let source_managed = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
                 request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
-                    profile: Some(custom_profile("github")),
-                    source: "github.yaml".to_string(),
+                    profile: Some(custom_profile("vended-api")),
+                    source: "vended-api.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
-                id: "github".to_string(),
+                id: "vended-api".to_string(),
                 workspace: "default".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(!built_in.updated);
-        assert!(built_in.diagnostics.iter().any(|diagnostic| {
+        assert!(!source_managed.updated);
+        assert!(source_managed.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("managed by source 'builtin' and cannot be updated")
+                .contains("managed by source 'test' and cannot be updated")
         }));
 
         let missing = handle_update_provider_profiles(
@@ -5868,6 +5868,20 @@ mod tests {
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
+    }
+
+    /// A test state whose catalog carries one source-managed profile beside the
+    /// user-managed source.
+    ///
+    /// Provider profiles are import-only, so the only profiles a gateway cannot
+    /// edit are the ones a non-user source vends. This models that shape.
+    async fn test_server_state_with_source_managed_profile(id: &str) -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("test server state should be uniquely owned")
+            .provider_profile_sources =
+            ProviderProfileSources::from_test_profiles_with_user_source(vec![custom_profile(id)]);
+        state
     }
 
     fn custom_profile(id: &str) -> ProviderProfile {
@@ -6436,15 +6450,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_provider_profile_rejects_builtin_overwrite() {
-        let state = test_server_state().await;
+    async fn import_provider_profile_rejects_source_managed_overwrite() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
                 request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
-                    profile: Some(custom_profile("github")),
-                    source: "github.yaml".to_string(),
+                    profile: Some(custom_profile("vended-api")),
+                    source: "vended-api.yaml".to_string(),
                 }],
                 workspace: "default".to_string(),
             }),
@@ -6458,7 +6472,7 @@ mod tests {
             response
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("managed by source 'builtin'"))
+                .any(|diagnostic| diagnostic.message.contains("managed by source 'test'"))
         );
     }
 
@@ -6842,8 +6856,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_provider_profile_rejects_builtin_and_provider_referenced_profiles() {
-        let state = test_server_state().await;
+    async fn delete_provider_profile_rejects_source_managed_and_provider_referenced_profiles() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
@@ -6858,18 +6872,18 @@ mod tests {
         .await
         .unwrap();
 
-        let builtin_err = handle_delete_provider_profile(
+        let source_managed_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
                 request_id: String::new(),
                 allow_missing: false,
-                id: "github".to_string(),
+                id: "vended-api".to_string(),
                 workspace: "default".to_string(),
             }),
         )
         .await
         .unwrap_err();
-        assert_eq!(builtin_err.code(), Code::FailedPrecondition);
+        assert_eq!(source_managed_err.code(), Code::FailedPrecondition);
 
         create_provider_record(
             state.store.as_ref(),
@@ -14746,12 +14760,13 @@ mod tests {
         assert_eq!(user_profile.source, "user");
         assert_eq!(user_profile.scope, "workspace");
 
-        let builtin = resp
+        let platform_profile = resp
             .profiles
             .iter()
-            .find(|p| p.source == "builtin")
-            .expect("builtin profiles should appear");
-        assert!(builtin.scope.is_empty());
+            .find(|p| p.id == "github")
+            .expect("imported platform profile should appear in list");
+        assert_eq!(platform_profile.source, "user");
+        assert_eq!(platform_profile.scope, "platform");
     }
 
     #[tokio::test]

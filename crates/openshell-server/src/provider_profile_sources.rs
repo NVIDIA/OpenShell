@@ -337,6 +337,18 @@ impl ProviderProfileSources {
         }
     }
 
+    /// A source-managed catalog composed with the user-managed source.
+    ///
+    /// Models the shape an operator gets from an interceptor-vended catalog:
+    /// the interceptor's profiles are read-only through the profile APIs, while
+    /// imported profiles beside them are not.
+    #[cfg(test)]
+    pub(crate) fn from_test_profiles_with_user_source(profiles: Vec<ProviderProfile>) -> Self {
+        let mut sources = Self::from_test_profiles(profiles).sources;
+        sources.push(Arc::new(UserProviderProfileSource));
+        Self { sources }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_snapshot_sequence(
         snapshots: Vec<(String, Vec<ProviderProfile>)>,
