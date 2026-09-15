@@ -13,13 +13,14 @@ pub struct AwsLc;
 struct Sha256(digest::Context);
 
 impl Digest for Sha256 {
-    fn update(&mut self, bytes: &[u8]) {
+    fn update(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
         self.0.update(bytes);
+        Ok(())
     }
-    fn finish(self: Box<Self>) -> [u8; 32] {
+    fn finish(self: Box<Self>) -> Result<[u8; 32], CryptoError> {
         let mut output = [0; 32];
         output.copy_from_slice(self.0.finish().as_ref());
-        output
+        Ok(output)
     }
 }
 
@@ -38,8 +39,8 @@ impl CryptoBackend for AwsLc {
             .fill(output)
             .map_err(|_| CryptoError::Random)
     }
-    fn sha256_digest(&self) -> Box<dyn Digest> {
-        Box::new(Sha256(digest::Context::new(&digest::SHA256)))
+    fn sha256_digest(&self) -> Result<Box<dyn Digest>, CryptoError> {
+        Ok(Box::new(Sha256(digest::Context::new(&digest::SHA256))))
     }
     fn seal(
         &self,
