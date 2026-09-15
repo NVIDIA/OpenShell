@@ -561,6 +561,35 @@ struct SandboxRecord {
     deleting: bool,
 }
 
+/// Resolve a lifecycle request to a registry key.
+///
+/// A non-empty `sandbox_id` is authoritative: resolution uses that id alone and
+/// never falls back to the name, so a request for an already-removed sandbox
+/// reports absence instead of matching a same-named sandbox in another
+/// workspace. Only a caller that supplies no id resolves by name, and because
+/// sandbox names are unique per workspace rather than globally, a name matching
+/// more than one record is rejected instead of decided by iteration order.
+fn resolve_record_id(
+    registry: &HashMap<String, SandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(registry.get_key_value(sandbox_id).map(|(id, _)| id.clone()));
+    }
+
+    let mut matches = registry
+        .iter()
+        .filter(|(_, record)| record.snapshot.name == sandbox_name);
+    let first = matches.next().map(|(id, _)| id.clone());
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(format!(
+            "sandbox_name {sandbox_name} matched more than one sandbox; supply sandbox_id"
+        )));
+    }
+    Ok(first)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayPreparation {
     Fresh,
@@ -1405,14 +1434,7 @@ impl VmDriver {
         }
         let record_id = {
             let registry = self.registry.lock().await;
-            if registry.contains_key(sandbox_id) {
-                Some(sandbox_id.to_string())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_record_id(&registry, sandbox_id, sandbox_name)?
         }
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -1479,16 +1501,13 @@ impl VmDriver {
         }
         let (record_id, state_dir, already_running) = {
             let registry = self.registry.lock().await;
-            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
-                entry
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?
-            };
+            let id = resolve_record_id(&registry, sandbox_id, sandbox_name)?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let record = registry
+                .get(&id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
             (
-                id.clone(),
+                id,
                 record.state_dir.clone(),
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
@@ -1544,14 +1563,7 @@ impl VmDriver {
 
         let record_id = {
             let registry = self.registry.lock().await;
-            if let Some((id, _record)) = registry.get_key_value(sandbox_id) {
-                Some(id.clone())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_record_id(&registry, sandbox_id, sandbox_name)?
         };
 
         let Some(record_id) = record_id else {
@@ -11000,5 +11012,186 @@ mod tests {
             .unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    /// Register a stopped, process-free record whose id, name, and workspace are
+    /// set independently.
+    ///
+    /// The other test helpers reuse one string for both id and name, so a test
+    /// built on them cannot express the cross-workspace name collision that
+    /// lifecycle resolution has to tolerate.
+    async fn insert_named_record(
+        driver: &VmDriver,
+        id: &str,
+        name: &str,
+        workspace: &str,
+    ) -> PathBuf {
+        let state_dir = sandbox_state_dir(&driver.config.state_dir, id).unwrap();
+        create_private_dir_all(&state_dir).await.unwrap();
+        driver.registry.lock().await.insert(
+            id.to_string(),
+            SandboxRecord {
+                snapshot: Sandbox {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    workspace: workspace.to_string(),
+                    ..Default::default()
+                },
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+        state_dir
+    }
+
+    fn resolution_test_driver(state_dir: &Path) -> VmDriver {
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver
+    }
+
+    #[tokio::test]
+    async fn stop_targets_the_requested_id_when_two_workspaces_share_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        driver
+            .stop_sandbox("vm-beta", "demo")
+            .await
+            .expect("stop by id should be accepted");
+
+        assert!(
+            beta.join(SANDBOX_STOPPED_FILE).exists(),
+            "the requested sandbox should have been stopped"
+        );
+        assert!(
+            !alpha.join(SANDBOX_STOPPED_FILE).exists(),
+            "the same-named sandbox in another workspace must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_targets_the_requested_id_when_two_workspaces_share_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        let response = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("delete by id should be accepted");
+
+        assert!(response.deleted);
+        let registry = driver.registry.lock().await;
+        assert!(!registry.contains_key("vm-beta"));
+        assert!(
+            registry.contains_key("vm-alpha"),
+            "the same-named sandbox in another workspace must survive"
+        );
+        assert!(alpha.exists(), "the surviving sandbox must keep its state");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_delete_does_not_fall_back_to_a_same_named_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        let first = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("the first delete should be accepted");
+        assert!(first.deleted);
+
+        // Delete is idempotent, so a retry carrying the same id and name is
+        // ordinary caller behavior. The id is gone from the registry by now, and
+        // resolving it by name instead would destroy the sandbox in `alpha`.
+        let second = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("a repeated delete should be accepted");
+
+        assert!(
+            !second.deleted,
+            "a repeated delete must report that nothing was removed"
+        );
+        assert!(
+            driver.registry.lock().await.contains_key("vm-alpha"),
+            "a repeated delete must not remove a same-named sandbox in another workspace"
+        );
+        assert!(alpha.exists(), "the surviving sandbox must keep its state");
+    }
+
+    #[tokio::test]
+    async fn stop_and_start_reject_an_absent_id_that_shares_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+
+        let stop_error = driver
+            .stop_sandbox("vm-absent", "demo")
+            .await
+            .expect_err("a supplied id that is not registered must not resolve by name");
+        assert_eq!(stop_error.code(), Code::NotFound);
+
+        let start_error = driver
+            .start_sandbox("vm-absent", "demo")
+            .await
+            .expect_err("a supplied id that is not registered must not resolve by name");
+        assert_eq!(start_error.code(), Code::NotFound);
+
+        assert!(
+            !alpha.join(SANDBOX_STOPPED_FILE).exists(),
+            "the same-named sandbox must not have been touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_only_request_matching_two_sandboxes_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        // Without an id the driver has nothing to disambiguate with: the request
+        // carries no workspace, and picking by iteration order would stop or
+        // delete an arbitrary one of the two.
+        for error in [
+            driver.stop_sandbox("", "demo").await.unwrap_err(),
+            driver.start_sandbox("", "demo").await.unwrap_err(),
+            driver.delete_sandbox("", "demo").await.unwrap_err(),
+        ] {
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains("matched more than one sandbox"));
+        }
+
+        let registry = driver.registry.lock().await;
+        assert!(registry.contains_key("vm-alpha"));
+        assert!(registry.contains_key("vm-beta"));
+        assert!(!alpha.join(SANDBOX_STOPPED_FILE).exists());
+        assert!(!beta.join(SANDBOX_STOPPED_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_name_only_request_still_resolves_a_unique_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "other", "beta").await;
+
+        driver
+            .stop_sandbox("", "demo")
+            .await
+            .expect("an unambiguous name-only stop should still resolve");
+
+        assert!(alpha.join(SANDBOX_STOPPED_FILE).exists());
     }
 }
