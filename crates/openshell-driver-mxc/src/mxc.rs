@@ -85,6 +85,8 @@ pub struct MxcProcessContainer {
 #[serde(rename_all = "camelCase")]
 pub struct MxcProcess {
     pub command_line: String,
+    #[serde(skip)]
+    pub argv: Vec<String>,
     pub cwd: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
@@ -538,23 +540,30 @@ impl WxcExecInvoker {
         let cmd_norm = mock_normalize(&process.command_line);
         let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
 
-        let mut cmd = Command::new("cmd");
+        let mut cmd = if in_policy {
+            debug!(command = %process.command_line, "mock exec: in-policy, running agent");
+            let executable = process
+                .argv
+                .first()
+                .expect("validated MXC process command must contain an executable");
+            let mut cmd = Command::new(executable);
+            cmd.args(&process.argv[1..]);
+            if !process.cwd.is_empty() {
+                cmd.current_dir(&process.cwd);
+            }
+            cmd
+        } else {
+            debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/c").arg(
+                "echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1",
+            );
+            cmd
+        };
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-        if in_policy {
-            debug!(command = %process.command_line, "mock exec: in-policy, running agent");
-            // `command_line` is already encoded with Windows quoting rules.
-            // Pass it raw so this mock matches wxc-exec/CreateProcess instead
-            // of asking Rust to quote the entire command as one cmd.exe argv.
-            cmd.raw_arg(format!("/d /s /c \"{}\"", process.command_line));
-        } else {
-            debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
-            cmd.arg("/c").arg(
-                "echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1",
-            );
-        }
         let child = cmd.spawn()?;
         Ok(child)
     }
@@ -799,6 +808,7 @@ mod tests {
         let pc = MxcProcessContainer::default();
         let process = MxcProcess {
             command_line: "cmd /c exit 0".into(),
+            argv: vec!["cmd".into(), "/c".into(), "exit 0".into()],
             cwd: "C:\\work\\demo".into(),
             env: Vec::new(),
             timeout: 0,
