@@ -6,5 +6,5 @@
 gatewayConfig:
   openshell.drivers.kubernetes:
     image_pull_secrets:
-      - name: e2e-regcred
+      - e2e-regcred
     workspace_mode: managed

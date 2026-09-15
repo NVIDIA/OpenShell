@@ -15,11 +15,13 @@ tests:
           path: metadata.name
           value: openshell-node-reader-my-namespace
 
-  - it: grants managed namespace NetworkPolicy apply permissions
+  - it: grants managed namespace NetworkPolicy apply permissions when managed SSH ingress is enabled
     set:
       gatewayConfig:
         openshell.drivers.kubernetes:
           workspace_mode: managed
+        openshell.drivers.kubernetes.managed_ssh_ingress:
+          enabled: true
     asserts:
       - contains:
           path: rules
@@ -33,7 +35,8 @@ tests:
       gatewayConfig:
         openshell.drivers.kubernetes:
           workspace_mode: managed
-      networkPolicy.enabled: false
+        openshell.drivers.kubernetes.managed_ssh_ingress:
+          enabled: false
     asserts:
       - contains:
           path: rules
@@ -42,6 +45,22 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["create", "get"]
       - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
+  - it: grants managed NetworkPolicy permissions independently of the shared-namespace policy toggle
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+        openshell.drivers.kubernetes.managed_ssh_ingress:
+          enabled: true
+      networkPolicy.enabled: false
+    asserts:
+      - contains:
           path: rules
           content:
             apiGroups: ["networking.k8s.io"]
