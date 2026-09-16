@@ -34,3 +34,18 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.securityContext
+
+  - it: derives host aliases from server.hostGatewayIP and not gatewayConfig
+    template: templates/statefulset.yaml
+    set:
+      server.hostGatewayIP: 10.23.45.67
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          host_gateway_ip: 192.0.2.1
+    asserts:
+      - equal:
+          path: spec.template.spec.hostAliases[0].ip
+          value: 10.23.45.67
+      - contains:
+          path: spec.template.spec.hostAliases[0].hostnames
+          content: host.openshell.internal

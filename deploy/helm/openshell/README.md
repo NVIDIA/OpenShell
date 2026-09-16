@@ -128,9 +128,37 @@ database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
 
-Use `kubernetes-secrets` or `vault` instead when credentials should live in a
-cluster or external secret backend. Enabling one external credential driver
-disables the default credential-storage key-encryption key Secret and env injection.
+Use `gatewayConfig` to select `kubernetes-secrets` or `vault` when credentials
+should live in a cluster or external secret backend. Selecting an external
+credential driver disables the default credential-storage key-encryption-key
+Secret and environment injection. The map is rendered directly as gateway TOML,
+so it uses the gateway's snake_case field names:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    credential_drivers:
+      - vault
+  openshell.credential_drivers.vault:
+    address: http://vault.vault.svc.cluster.local:8200
+    mount: secret
+    kv_version: "2"
+    auth_method: kubernetes
+    role: openshell-gateway
+```
+
+> `gatewayConfig` must contain only non-secret values. Helm serializes unknown
+> fields generically and cannot determine whether an arbitrary string, such as
+> `api_token`, is confidential. Do not put passwords, tokens, private keys,
+> database URLs, or other secret material in this map. Use Secret-backed
+> environment variables, files, volumes, or gateway credential drivers instead.
+> The chart rejects known unsafe forms such as `database_url`, inline URL
+> credentials, and PEM private keys; it is not a general secret scanner.
+
+For the Kubernetes Secret driver, use
+`openshell.credential_drivers.kubernetes-secrets.namespace` in the same map.
+The chart derives any required RBAC from the selected driver; use a dedicated
+namespace to limit access to OpenShell-managed Secrets.
 
 #### OpenShift
 

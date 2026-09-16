@@ -66,6 +66,11 @@ gateway option does not require a chart template change.
 Secret material never belongs in `gatewayConfig` or the ConfigMap. Database
 URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
 through the chart's supported environment-variable, file, or volume wiring.
+Helm serializes unknown fields generically, so it cannot determine whether an
+arbitrary string such as `api_token` is confidential. It rejects
+`database_url`, inline URL credentials, and PEM private keys, but is not a
+general secret scanner; operators must keep all secret material out of this
+map.
 The gateway's normal precedence still applies: CLI flags and `OPENSHELL_*`
 environment variables override the mounted TOML file.
 
@@ -106,13 +111,12 @@ knob from silently surviving as a second source of truth.
 | Application-only | `server.otlp.endpoint`, `server.otlp.serviceName`, `server.auth.allowUnauthenticatedUsers`, `server.oidc.{issuer,audience,jwksTtl,rolesClaim,adminRole,userRole,scopesClaim}` | `openshell.gateway.{otlp,auth,oidc}`. Empty optional tables are not rendered. |
 | Application-only | `server.sandboxImage`, `server.sandboxImagePullPolicy`, `server.sandboxImagePullSecrets`, `server.workspaceDefaultStorageSize`, `server.workspaceStorageClass`, `server.defaultRuntimeClassName`, `server.enableUserNamespaces`, `server.appArmorProfile` | `openshell.drivers.kubernetes`; image and AppArmor defaults are in `gatewayConfig`. |
 | Application-only | `server.drivers.kubernetes.{workspaceMode,operatorNamespaceLabel,operatorNamespaceFile}`, `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}`, `supervisor.{topology,image.pullPolicy}`, `supervisor.sidecar.{proxyUid,processBinaryAwareNetworkPolicy}` | `openshell.drivers.kubernetes`, `.managed_ssh_ingress`, `.sidecar`, and `openshell.gateway.gateway_jwt`. |
-| Application-only | `upstreamProxy.{url,noProxy,authSecret.name,authSecret.key,authAllowInsecure,connectByHostname}`, `server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace`, `server.credentialDrivers.vault.{address,mount,kvVersion,authMethod,role,kubernetesAuthMount,serviceAccountTokenPath,tokenPath,timeoutSecs}` | The corresponding `openshell.drivers.kubernetes` or `openshell.credential_drivers.*` table. Secret names and keys remain references, never Secret data. |
+| Application-only | `upstreamProxy.{url,noProxy,authSecret.name,authSecret.key,authAllowInsecure,connectByHostname}`, `server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace`, `server.credentialDrivers.vault.{address,mount,kvVersion,authMethod,role,kubernetesAuthMount,serviceAccountTokenPath,tokenPath,timeoutSecs}`, `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | The corresponding `openshell.drivers.kubernetes` or `openshell.credential_drivers.*` table. Credential-driver and SPIFFE runtime configuration selects any required Helm resources; Secret names and keys remain references, never Secret data. |
 | Deployment-only | `server.dbUrl`, `server.externalDbSecret` | Gateway process args and `OPENSHELL_DB_URL` Secret reference. They are never TOML. |
 | Deployment-only | `server.credentialStorage.existingSecret`, `server.sandboxJwt.signingSecretName`, `server.tls.certSecretName`, `server.tls.clientCaSecretName` | Secret creation, mounting, and environment wiring. TOML contains only stable paths or an environment-variable name. |
 | Dual-use | `service.{port,healthPort,metricsPort}`, `server.disableTls`, `server.tls.clientTlsSecretName` | The chart owns the Service, workload ports, mounts, and Secret references; `gatewayConfig` derives listener addresses and runtime references from them. |
 | Dual-use | `certManager.{enabled,serverIssuerRef.name,serverDnsNames}`, `pkiInitJob.{enabled,serverDnsNames}` | Certificate resources and mounts remain chart-owned; the TLS table and server SANs are derived from their selected certificate source. |
-| Dual-use | `networkPolicy.enabled`, `server.hostGatewayIP`, `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | The chart owns NetworkPolicies, pod host aliases, CSI mounts, and process environment; runtime fields are derived from the same values. |
-| Dual-use | `server.credentialDrivers.{kubernetesSecrets.enabled,vault.enabled}` | The chart owns Secret/RBAC resources and derives the gateway credential-driver selection and configuration tables. |
+| Dual-use | `networkPolicy.enabled`, `server.hostGatewayIP` | The chart owns NetworkPolicies and pod host aliases. `server.hostGatewayIP` is the sole input for both host aliases and the derived `host_gateway_ip` runtime field. |
 
 ## Protocol and Auth
 

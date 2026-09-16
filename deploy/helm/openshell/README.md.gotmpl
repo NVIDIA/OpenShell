@@ -145,6 +145,14 @@ gatewayConfig:
     role: openshell-gateway
 ```
 
+> `gatewayConfig` must contain only non-secret values. Helm serializes unknown
+> fields generically and cannot determine whether an arbitrary string, such as
+> `api_token`, is confidential. Do not put passwords, tokens, private keys,
+> database URLs, or other secret material in this map. Use Secret-backed
+> environment variables, files, volumes, or gateway credential drivers instead.
+> The chart rejects known unsafe forms such as `database_url`, inline URL
+> credentials, and PEM private keys; it is not a general secret scanner.
+
 For the Kubernetes Secret driver, use
 `openshell.credential_drivers.kubernetes-secrets.namespace` in the same map.
 The chart derives any required RBAC from the selected driver; use a dedicated
