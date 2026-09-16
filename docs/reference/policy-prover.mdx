@@ -45,8 +45,6 @@ filesystem_policy:
   read_only:
     - /usr
     - /etc
-  read_write:
-    - /tmp
 ```
 
 Create `candidate.yaml` with this contained candidate:
@@ -56,8 +54,6 @@ version: 1
 filesystem_policy:
   read_only:
     - /usr
-  read_write:
-    - /tmp
 ```
 
 Run the check:
@@ -68,8 +64,8 @@ openshell-prover check candidate.yaml --boundary boundary.yaml
 
 A contained candidate prints `result: within_boundary` and exits with status `0`.
 To see an exceeding result and its counterexample, replace `candidate.yaml`
-with a policy that makes `/etc` writable even though the boundary grants only
-read access:
+with a policy that grants writes to `/tmp`. The boundary grants no write
+access:
 
 ```yaml
 version: 1
@@ -78,7 +74,6 @@ filesystem_policy:
     - /usr
   read_write:
     - /tmp
-    - /etc
 ```
 
 ```shell

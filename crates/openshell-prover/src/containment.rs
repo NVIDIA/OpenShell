@@ -1086,6 +1086,8 @@ fn unresolved_workdir_reason(
     None
 }
 
+// The glob crate rejects some runtime-supported patterns (for example `cu**`).
+// Its parse errors cannot rule out overlap in either symlink uncertainty guard.
 fn has_ambiguous_candidate_binary_path(
     boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
@@ -1103,7 +1105,7 @@ fn has_ambiguous_candidate_binary_path(
                     ) && candidate_rule.binaries.iter().any(|candidate_binary| {
                         !candidate_binary.path.contains('*')
                             && glob::Pattern::new(&boundary_binary.path)
-                                .is_ok_and(|pattern| pattern.matches(&candidate_binary.path))
+                                .map_or(true, |pattern| pattern.matches(&candidate_binary.path))
                             && !boundary.network_policies.values().any(|exact_rule| {
                                 endpoint_authority_sets_equal(
                                     &candidate_rule.endpoints,
@@ -1155,7 +1157,7 @@ fn unresolved_exact_deny_symlink(
                             candidate_binary.path.contains('*')
                                 && candidate_binary.path != "/**"
                                 && glob::Pattern::new(&candidate_binary.path)
-                                    .is_ok_and(|pattern| pattern.matches(&boundary_binary.path))
+                                    .map_or(true, |pattern| pattern.matches(&boundary_binary.path))
                         })
                 })
             })
@@ -2134,14 +2136,16 @@ mod tests {
         let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
         );
-        let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: '/venv/bin/*' }]\n",
+        for pattern in ["/venv/bin/*", "/venv/bin/py**", "/venv/bin/**thon"] {
+            let candidate = parse(
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
         );
-        assert!(matches!(
-            check_within_boundary(&boundary, &candidate, options()),
-            CheckResult::Unsupported(ref evidence)
-                if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
-        ));
+            assert!(matches!(
+                check_within_boundary(&boundary, &candidate, options()),
+                CheckResult::Unsupported(ref evidence)
+                    if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
+            ));
+        }
     }
 
     #[test]
@@ -2274,21 +2278,23 @@ mod tests {
 
     #[test]
     fn exact_binary_under_a_boundary_glob_requires_image_resolution() {
-        let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*3' }]\n",
+        for pattern in ["/usr/bin/*3", "/usr/bin/py**", "/usr/bin/**3"] {
+            let boundary = parse(
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
         );
-        let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
-        );
-        let result = check_within_boundary(&boundary, &candidate, options());
-        assert!(
-            matches!(
-                result,
-                CheckResult::Unsupported(ref evidence)
-                    if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
-            ),
-            "{result:?}"
-        );
+            let candidate = parse(
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
+            );
+            let result = check_within_boundary(&boundary, &candidate, options());
+            assert!(
+                matches!(
+                    result,
+                    CheckResult::Unsupported(ref evidence)
+                        if evidence.reason_code() == ReasonCode::UnresolvedBinaryPath
+                ),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
