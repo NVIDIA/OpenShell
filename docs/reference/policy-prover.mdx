@@ -154,6 +154,12 @@ The result object reports the domains used for each check. Policies that use
 recognized authority outside that model return `unsupported` rather than
 silently ignoring it.
 
+Both inputs use the same bounded YAML/JSON parser and authored policy schema as
+OpenShell. Unknown fields, duplicate keys, malformed field types, and unsupported
+managed `metadata` or `review` annotations return `error` with
+`reason_code: invalid_input` and exit `2`. Schema-valid controls outside the
+containment model return `unsupported` and exit `3`.
+
 Network binary selectors, endpoint host and path selectors, and REST allow and
 deny method and path selectors must use ASCII literals in both the candidate and
 boundary. A non-ASCII literal in one of these fields returns `unsupported` with
@@ -172,8 +178,6 @@ state. In particular:
 - The command does not fetch the current sandbox policy or compose provider
   rules. The caller must supply the effective candidate.
 - The command does not apply, approve, or persist a policy.
-- A policy inside a review-required region can pass containment and still
-  require human review.
 - Environment-dependent authority, such as an unresolved image workdir,
   returns `unsupported` when the result depends on that missing context.
 - Binary comparisons that can change when an image resolves an exact selector

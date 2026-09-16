@@ -4,8 +4,8 @@
 //! Sound, deliberately narrow policy-containment checks.
 //!
 //! This module is independent of the legacy proposal-risk model. It parses the
-//! authority-bearing fields it understands and fails closed when another field
-//! could affect the result.
+//! canonical authored schema and fails closed when authority falls outside its
+//! supported containment model.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,19 +14,17 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-use serde_yml::Value;
+use openshell_policy_schema::{
+    AccessPreset, FilesystemPolicy, L7Allow as Allow, L7DenyRule as DenyRule, LandlockPolicy,
+    NetworkBinary as Binary, NetworkEndpoint as Endpoint, NetworkMiddleware,
+    NetworkPolicyRule as NetworkRule, PolicyDocument, ProcessPolicy,
+};
 use z3::ast::{Ast, Bool, Int, Regexp, String as Z3String};
 use z3::{Context, Params, SatResult, Solver};
 
-const READ_ONLY_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
-const READ_WRITE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"];
 const LAYER_L4: &str = "l4";
 const LAYER_REST: &str = "rest";
 const WORKDIR_SYMBOL: &str = "<OCI_WORKDIR>";
-const MAX_POLICY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_YAML_DEPTH: usize = 64;
-const MAX_YAML_NODES: usize = 100_000;
 
 /// Parser error for a containment input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,169 +38,24 @@ impl fmt::Display for ParsePolicyError {
 
 impl std::error::Error for ParsePolicyError {}
 
-/// Policy representation used by boundary checking.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// Policy representation used by boundary checking, projected from the canonical
+/// authored schema. Construction always goes through the shared bounded parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainmentPolicy {
-    version: u32,
-    #[serde(default)]
     filesystem_policy: FilesystemPolicy,
-    #[serde(default)]
     network_policies: BTreeMap<String, NetworkRule>,
-    #[serde(default)]
-    landlock: Option<Value>,
-    #[serde(default)]
-    process: Option<Value>,
-    #[serde(default)]
-    network_middlewares: BTreeMap<String, Value>,
-    // Managed-boundary metadata changes workflow, not authority. Retain it in
-    // the parsed representation without letting it alter containment.
-    #[serde(default)]
-    metadata: Option<ManagedPolicyMetadata>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
+    landlock: Option<LandlockPolicy>,
+    process: Option<ProcessPolicy>,
+    network_middlewares: BTreeMap<String, NetworkMiddleware>,
 }
 
-impl ContainmentPolicy {
-    /// Managed-boundary metadata retained from the input, when present.
-    #[must_use]
-    pub const fn metadata(&self) -> Option<&ManagedPolicyMetadata> {
-        self.metadata.as_ref()
-    }
+trait ContainmentEndpoint {
+    fn protocol_kind(&self) -> Protocol;
 }
 
-/// Workflow metadata carried by a managed-boundary document.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct ManagedPolicyMetadata {
-    #[serde(default)]
-    pub policy_id: String,
-    #[serde(default)]
-    pub version: u64,
-    #[serde(default)]
-    pub allowed_modes: Vec<String>,
-    #[serde(default)]
-    pub default_mode: String,
-    #[serde(default)]
-    pub audit_label: String,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct FilesystemPolicy {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default)]
-    read_only: Vec<String>,
-    #[serde(default)]
-    read_write: Vec<String>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-impl Default for FilesystemPolicy {
-    fn default() -> Self {
-        Self {
-            // Match the runtime default when `filesystem_policy` is absent.
-            // Serde still uses `false` for an omitted `include_workdir` field
-            // inside an explicitly present filesystem policy.
-            include_workdir: true,
-            read_only: Vec::new(),
-            read_write: Vec::new(),
-            extra: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct NetworkRule {
-    #[serde(default, rename = "name")]
-    _name: String,
-    #[serde(default)]
-    endpoints: Vec<Endpoint>,
-    #[serde(default)]
-    binaries: Vec<Binary>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct Binary {
-    path: String,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "The endpoint parser accounts for independent policy-schema toggles."
-)]
-struct Endpoint {
-    #[serde(default)]
-    host: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    port: u16,
-    #[serde(default)]
-    ports: Vec<u16>,
-    #[serde(default)]
-    protocol: String,
-    #[serde(default)]
-    tls: String,
-    #[serde(default)]
-    enforcement: String,
-    #[serde(default)]
-    access: String,
-    #[serde(default)]
-    rules: Vec<AllowRule>,
-    #[serde(default)]
-    deny_rules: Vec<DenyRule>,
-    #[serde(default)]
-    allowed_ips: Vec<String>,
-    #[serde(default)]
-    review: Review,
-    #[serde(default)]
-    allow_encoded_slash: bool,
-    #[serde(default)]
-    websocket_credential_rewrite: bool,
-    #[serde(default)]
-    request_body_credential_rewrite: bool,
-    #[serde(default)]
-    allow_uninspected_credentials: bool,
-    #[serde(default)]
-    persisted_queries: String,
-    #[serde(default)]
-    graphql_persisted_queries: BTreeMap<String, Value>,
-    #[serde(default)]
-    graphql_max_body_bytes: u32,
-    #[serde(default)]
-    credential_signing: String,
-    #[serde(default)]
-    signing_service: String,
-    #[serde(default)]
-    signing_region: String,
-    #[serde(default)]
-    credential_binding: Option<Value>,
-    #[serde(default)]
-    json_rpc: Option<Value>,
-    #[serde(default)]
-    mcp: Option<Value>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-impl Endpoint {
-    fn effective_ports(&self) -> Vec<u16> {
-        if self.ports.is_empty() {
-            (self.port != 0).then_some(self.port).into_iter().collect()
-        } else {
-            self.ports.clone()
-        }
-    }
-
+impl ContainmentEndpoint for Endpoint {
     fn protocol_kind(&self) -> Protocol {
-        if self.protocol.is_empty() || self.protocol.eq_ignore_ascii_case("tcp") {
+        if self.is_l4() {
             Protocol::L4
         } else {
             Protocol::Rest
@@ -210,122 +63,27 @@ impl Endpoint {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct AllowRule {
-    allow: Allow,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct Allow {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
-    #[serde(default)]
-    review: Review,
-    #[serde(default)]
-    query: BTreeMap<String, Value>,
-    #[serde(default)]
-    operation_type: String,
-    #[serde(default)]
-    operation_name: String,
-    #[serde(default)]
-    fields: Vec<String>,
-    #[serde(default)]
-    tool: Option<Value>,
-    #[serde(default)]
-    params: BTreeMap<String, Value>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-struct DenyRule {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
-    #[serde(default)]
-    query: BTreeMap<String, Value>,
-    #[serde(default)]
-    operation_type: String,
-    #[serde(default)]
-    operation_name: String,
-    #[serde(default)]
-    fields: Vec<String>,
-    #[serde(default)]
-    tool: Option<Value>,
-    #[serde(default)]
-    params: BTreeMap<String, Value>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-struct Review {
-    #[serde(default, rename = "required")]
-    _required: bool,
-    #[serde(default, rename = "reason")]
-    _reason: String,
-    #[serde(flatten)]
-    extra: BTreeMap<String, Value>,
-}
-
-/// Parse one captured YAML input for containment checking.
+/// Parse one captured YAML or JSON input using the canonical authored schema.
 pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyError> {
-    if source.len() > MAX_POLICY_BYTES {
-        return Err(ParsePolicyError(format!(
-            "policy exceeds the {MAX_POLICY_BYTES}-byte input limit"
-        )));
-    }
-    let value: Value = serde_yml::from_str(source)
-        .map_err(|error| ParsePolicyError(format!("invalid policy YAML: {error}")))?;
-    validate_yaml_shape(&value)?;
-    let mut policy: ContainmentPolicy = serde_yml::from_str(source)
-        .map_err(|error| ParsePolicyError(format!("invalid policy YAML: {error}")))?;
-    if policy.version != 1 {
-        return Err(ParsePolicyError(format!(
-            "unsupported policy version {}; expected version 1",
-            policy.version
-        )));
-    }
-    normalize_filesystem_paths(&mut policy.filesystem_policy)?;
-    Ok(policy)
-}
-
-fn validate_yaml_shape(root: &Value) -> Result<(), ParsePolicyError> {
-    let mut stack = vec![(root, 0_usize)];
-    let mut nodes = 0_usize;
-    while let Some((value, depth)) = stack.pop() {
-        nodes += 1;
-        if nodes > MAX_YAML_NODES {
-            return Err(ParsePolicyError(format!(
-                "policy exceeds the {MAX_YAML_NODES}-node YAML limit"
-            )));
-        }
-        if depth > MAX_YAML_DEPTH {
-            return Err(ParsePolicyError(format!(
-                "policy exceeds the {MAX_YAML_DEPTH}-level YAML depth limit"
-            )));
-        }
-        match value {
-            Value::Sequence(values) => {
-                stack.extend(values.iter().map(|value| (value, depth + 1)));
-            }
-            Value::Mapping(values) => {
-                stack.extend(values.values().map(|value| (value, depth + 1)));
-            }
-            Value::Tagged(value) => stack.push((value.value(), depth + 1)),
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-        }
-    }
-    Ok(())
+    let document = openshell_policy_schema::parse_policy(source)
+        .map_err(|error| ParsePolicyError(format!("invalid policy: {error:#}")))?;
+    let mut filesystem_policy = document.effective_filesystem_policy();
+    normalize_filesystem_paths(&mut filesystem_policy)?;
+    let PolicyDocument {
+        version: _,
+        filesystem_policy: _,
+        network_policies,
+        landlock,
+        process,
+        network_middlewares,
+    } = document;
+    Ok(ContainmentPolicy {
+        filesystem_policy,
+        network_policies,
+        landlock,
+        process,
+        network_middlewares,
+    })
 }
 
 fn normalize_filesystem_paths(policy: &mut FilesystemPolicy) -> Result<(), ParsePolicyError> {
@@ -341,23 +99,12 @@ fn normalize_path(path: &str) -> Result<String, ParsePolicyError> {
             "filesystem path '{path}' must be absolute"
         )));
     }
-    let mut parts = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                return Err(ParsePolicyError(format!(
-                    "filesystem path '{path}' contains an unsupported '..' segment"
-                )));
-            }
-            value => parts.push(value),
-        }
+    if path.split('/').any(|part| part == "..") {
+        return Err(ParsePolicyError(format!(
+            "filesystem path '{path}' contains an unsupported '..' segment"
+        )));
     }
-    Ok(if parts.is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/{}", parts.join("/"))
-    })
+    Ok(openshell_policy_schema::normalize_path(path))
 }
 
 /// Per-invocation solver limits. These never modify Z3 global parameters.
@@ -598,13 +345,13 @@ fn check_within_boundary_inner(
     options: CheckOptions,
     cancelled: Option<&AtomicBool>,
 ) -> CheckResult {
-    if let Err(feature) = validate_supported_policy(PolicySide::Boundary, boundary) {
+    if let Err(feature) = validate_supported_policy(boundary) {
         return unsupported(
             feature.reason_code,
             format!("boundary policy {}", feature.detail),
         );
     }
-    if let Err(feature) = validate_supported_policy(PolicySide::Candidate, candidate) {
+    if let Err(feature) = validate_supported_policy(candidate) {
         return unsupported(
             feature.reason_code,
             format!("candidate policy {}", feature.detail),
@@ -1022,11 +769,10 @@ fn endpoint_denies(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
 }
 
 fn rest_endpoint_allows(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
-    match endpoint.access.as_str() {
-        "read-only" => methods_match(action, READ_ONLY_METHODS, "**"),
-        "read-write" => methods_match(action, READ_WRITE_METHODS, "**"),
-        "full" => any_method_matches(action, "**"),
-        _ => bool_or(
+    match AccessPreset::parse(&endpoint.access) {
+        Some(AccessPreset::Full) => any_method_matches(action, "**"),
+        Some(preset) => methods_match(action, preset.methods("rest"), "**"),
+        None => bool_or(
             endpoint
                 .rules
                 .iter()
@@ -1449,14 +1195,6 @@ fn endpoint_authority_may_overlap(left: &Endpoint, right: &Endpoint) -> bool {
 fn endpoint_authority_equal(left: &Endpoint, right: &Endpoint) -> bool {
     let mut left = left.clone();
     let mut right = right.clone();
-    left.review = Review::default();
-    right.review = Review::default();
-    for rule in &mut left.rules {
-        rule.allow.review = Review::default();
-    }
-    for rule in &mut right.rules {
-        rule.allow.review = Review::default();
-    }
     let rules_equal = left.rules.iter().all(|rule| right.rules.contains(rule))
         && right.rules.iter().all(|rule| left.rules.contains(rule));
     let denies_equal = left
@@ -1530,12 +1268,6 @@ fn path_is_covered(candidate: &str, boundary_paths: &[String]) -> bool {
         .any(|boundary| boundary == "/" || candidate == boundary)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PolicySide {
-    Boundary,
-    Candidate,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnsupportedFeature {
     reason_code: ReasonCode,
@@ -1551,42 +1283,15 @@ impl UnsupportedFeature {
     }
 }
 
-fn validate_supported_policy(
-    side: PolicySide,
-    policy: &ContainmentPolicy,
-) -> Result<(), UnsupportedFeature> {
-    validate_supported_common_policy(side, policy)?;
-    validate_supported_filesystem(&policy.filesystem_policy)?;
+fn validate_supported_policy(policy: &ContainmentPolicy) -> Result<(), UnsupportedFeature> {
+    validate_supported_common_policy(policy)?;
     for (rule_name, rule) in &policy.network_policies {
         validate_supported_network_rule(rule_name, rule)?;
     }
     validate_no_cross_protocol_overlap(policy)
 }
 
-fn validate_supported_common_policy(
-    side: PolicySide,
-    policy: &ContainmentPolicy,
-) -> Result<(), UnsupportedFeature> {
-    if !policy.extra.is_empty() {
-        return Err(UnsupportedFeature::policy_shape(format!(
-            "uses unsupported top-level fields: {}",
-            keys(&policy.extra)
-        )));
-    }
-    if side == PolicySide::Candidate && policy.metadata.is_some() {
-        return Err(UnsupportedFeature::policy_shape(
-            "contains managed-boundary metadata",
-        ));
-    }
-    if policy
-        .metadata
-        .as_ref()
-        .is_some_and(|metadata| !metadata.extra.is_empty())
-    {
-        return Err(UnsupportedFeature::policy_shape(
-            "uses unsupported managed-metadata fields",
-        ));
-    }
+fn validate_supported_common_policy(policy: &ContainmentPolicy) -> Result<(), UnsupportedFeature> {
     if policy.landlock.is_some()
         || policy.process.is_some()
         || !policy.network_middlewares.is_empty()
@@ -1598,25 +1303,10 @@ fn validate_supported_common_policy(
     Ok(())
 }
 
-fn validate_supported_filesystem(policy: &FilesystemPolicy) -> Result<(), UnsupportedFeature> {
-    if !policy.extra.is_empty() {
-        return Err(UnsupportedFeature::policy_shape(format!(
-            "uses unsupported filesystem fields: {}",
-            keys(&policy.extra)
-        )));
-    }
-    Ok(())
-}
-
 fn validate_supported_network_rule(
     rule_name: &str,
     rule: &NetworkRule,
 ) -> Result<(), UnsupportedFeature> {
-    if !rule.extra.is_empty() {
-        return Err(UnsupportedFeature::policy_shape(format!(
-            "rule '{rule_name}' uses unsupported fields"
-        )));
-    }
     for binary in &rule.binaries {
         validate_supported_binary(rule_name, binary)?;
     }
@@ -1634,7 +1324,6 @@ fn validate_supported_binary(rule_name: &str, binary: &Binary) -> Result<(), Uns
     }
     if binary.path.is_empty()
         || !is_canonical_pattern_path(&binary.path)
-        || !binary.extra.is_empty()
         || unsupported_glob(&binary.path)
     {
         return Err(UnsupportedFeature::policy_shape(format!(
@@ -1705,14 +1394,12 @@ fn validate_supported_endpoint_extensions(
     context: &str,
     endpoint: &Endpoint,
 ) -> Result<(), UnsupportedFeature> {
-    if !endpoint.extra.is_empty()
-        || !endpoint.allowed_ips.is_empty()
+    if !endpoint.allowed_ips.is_empty()
         || !matches!(endpoint.tls.as_str(), "" | "terminate" | "passthrough")
         || endpoint.allow_encoded_slash
         || endpoint.websocket_credential_rewrite
         || endpoint.request_body_credential_rewrite
         || endpoint.allow_uninspected_credentials
-        || !endpoint.review.extra.is_empty()
     {
         return unsupported_endpoint_extension(context);
     }
@@ -1813,11 +1500,7 @@ fn validate_supported_rest(context: &str, endpoint: &Endpoint) -> Result<(), Uns
     }
     if (!endpoint.access.is_empty() && !endpoint.rules.is_empty())
         || (endpoint.access.is_empty() && endpoint.rules.is_empty())
-        || (!endpoint.access.is_empty()
-            && !matches!(
-                endpoint.access.as_str(),
-                "read-only" | "read-write" | "full"
-            ))
+        || (!endpoint.access.is_empty() && AccessPreset::parse(&endpoint.access).is_none())
     {
         return Err(UnsupportedFeature::policy_shape(format!(
             "{context} has an unsupported REST allow shape"
@@ -1834,7 +1517,7 @@ fn validate_supported_rest(context: &str, endpoint: &Endpoint) -> Result<(), Uns
                 "{context} REST allow path {reason}"
             )));
         }
-        if !rule.extra.is_empty() || unsupported_allow(&rule.allow) {
+        if unsupported_allow(&rule.allow) {
             return Err(UnsupportedFeature::policy_shape(format!(
                 "{context} uses an unsupported REST allow rule"
             )));
@@ -1979,8 +1662,6 @@ fn unsupported_allow(rule: &Allow) -> bool {
         || !rule.fields.is_empty()
         || rule.tool.is_some()
         || !rule.params.is_empty()
-        || !rule.extra.is_empty()
-        || !rule.review.extra.is_empty()
         || (!rule.path.is_empty() && !rule.path.starts_with('/'))
         || (!rule.path.is_empty() && !is_canonical_pattern_path(&rule.path))
         || unsupported_glob(&rule.path)
@@ -1995,7 +1676,6 @@ fn unsupported_deny(rule: &DenyRule) -> bool {
         || !rule.fields.is_empty()
         || rule.tool.is_some()
         || !rule.params.is_empty()
-        || !rule.extra.is_empty()
         || (!rule.path.is_empty() && !rule.path.starts_with('/'))
         || (!rule.path.is_empty() && !is_canonical_pattern_path(&rule.path))
         || unsupported_glob(&rule.path)
@@ -2005,10 +1685,6 @@ fn is_canonical_pattern_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.contains("//")
         && !path.split('/').any(|segment| matches!(segment, "." | ".."))
-}
-
-fn keys(values: &BTreeMap<String, Value>) -> String {
-    values.keys().cloned().collect::<Vec<_>>().join(", ")
 }
 
 fn unsupported_glob(pattern: &str) -> bool {
@@ -2559,11 +2235,7 @@ mod tests {
 
     #[test]
     fn unknown_and_environment_dependent_shapes_fail_closed() {
-        let unknown = parse("version: 1\nfuture_authority: true\n");
-        assert!(matches!(
-            check_within_boundary(&unknown, &unknown, options()),
-            CheckResult::Unsupported(_)
-        ));
+        assert!(parse_policy_str("version: 1\nfuture_authority: true\n").is_err());
         let workdir = parse("version: 1\nfilesystem_policy: { include_workdir: true }\n");
         let empty = parse("version: 1\nfilesystem_policy: {}\n");
         assert!(matches!(
@@ -2582,7 +2254,7 @@ mod tests {
     #[test]
     fn mcp_authority_fails_closed_in_both_inputs() {
         let mcp = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        mcp: {}\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: mcp\n        enforcement: enforce\n        access: full\n        mcp: {}\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let empty = parse("version: 1\n");
         for (boundary, candidate, side) in [(&mcp, &empty, "boundary"), (&empty, &mcp, "candidate")]
@@ -2744,15 +2416,10 @@ mod tests {
     }
 
     #[test]
-    fn removed_binary_harness_field_is_unsupported() {
-        let policy = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl, harness: true }]\n",
-        );
-        assert!(matches!(
-            check_within_boundary(&policy, &policy, options()),
-            CheckResult::Unsupported(ref evidence)
-                if evidence.reason_code() == ReasonCode::UnsupportedPolicyShape
-        ));
+    fn removed_binary_harness_field_is_invalid_input() {
+        assert!(parse_policy_str(
+            "version: 1\nnetwork_policies:\n  n:\n    binaries: [{ path: /usr/bin/curl, harness: true }]\n"
+        ).is_err());
     }
 
     #[test]
@@ -2763,10 +2430,9 @@ mod tests {
             candidate.network_policies.insert(
                 format!("rule-{index}"),
                 NetworkRule {
-                    _name: String::new(),
+                    name: String::new(),
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
-                    extra: BTreeMap::new(),
                 },
             );
         }
@@ -2778,15 +2444,35 @@ mod tests {
     }
 
     #[test]
+    fn shared_schema_preserves_filesystem_presence_and_json_inputs() {
+        let absent = parse(r#"{"version":1}"#);
+        let empty = parse(r#"{"version":1,"filesystem_policy":{}}"#);
+        assert!(absent.filesystem_policy.include_workdir);
+        assert!(!empty.filesystem_policy.include_workdir);
+        assert!(matches!(
+            check_within_boundary(&empty, &absent, options()),
+            CheckResult::Unsupported(ref evidence)
+                if evidence.reason_code() == ReasonCode::UnresolvedWorkdir
+        ));
+        let normalized = parse("version: 1\nfilesystem_policy: { read_only: ['/usr//./lib/'] }\n");
+        assert_eq!(normalized.filesystem_policy.read_only, ["/usr/lib"]);
+    }
+
+    #[test]
     fn invalid_version_and_relative_path_are_input_errors() {
         assert!(parse_policy_str("version: 2\n").is_err());
         assert!(parse_policy_str("version: 1\nfilesystem_policy: { read_only: [tmp] }\n").is_err());
         assert!(parse_policy_str("version: 1\nversion: 1\n").is_err());
         let mut deep = String::from("version: 1\nfuture:\n");
-        for depth in 0..=MAX_YAML_DEPTH {
+        for depth in 0..=openshell_policy_schema::ParseLimits::default().max_depth {
             writeln!(deep, "{}level-{depth}:", "  ".repeat(depth + 1)).unwrap();
         }
-        writeln!(deep, "{}true", "  ".repeat(MAX_YAML_DEPTH + 2)).unwrap();
+        writeln!(
+            deep,
+            "{}true",
+            "  ".repeat(openshell_policy_schema::ParseLimits::default().max_depth + 2)
+        )
+        .unwrap();
         assert!(parse_policy_str(&deep).is_err());
     }
 
@@ -2812,20 +2498,17 @@ mod tests {
     }
 
     #[test]
-    fn review_reason_and_deprecated_tls_spelling_do_not_change_authority() {
+    fn deprecated_tls_spelling_does_not_change_authority() {
         let boundary = parse(
-            "version: 1\nmetadata: { policy_id: ceiling, version: 7, allowed_modes: [ask], default_mode: ask, audit_label: production }\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n        review: { required: true, reason: sensitive }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**', review: { required: true, reason: inspect } }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**' }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
             CheckResult::Within(_)
         ));
-        let metadata = boundary.metadata().expect("managed metadata retained");
-        assert_eq!(metadata.policy_id, "ceiling");
-        assert_eq!(metadata.version, 7);
     }
 
     #[test]

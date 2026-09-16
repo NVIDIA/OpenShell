@@ -144,7 +144,7 @@ fn unsupported_network_surfaces_fail_closed_at_the_cli_boundary() {
         ),
         (
             "mcp",
-            "        protocol: rest\n        enforcement: enforce\n        access: full\n        mcp: {}\n",
+            "        protocol: mcp\n        enforcement: enforce\n        access: full\n        mcp: {}\n",
             "uses authority outside the initial model",
         ),
     ];
@@ -191,6 +191,45 @@ fn unsupported_network_surfaces_fail_closed_at_the_cli_boundary() {
             "{surface}: {value}"
         );
     }
+}
+
+#[test]
+fn canonical_schema_errors_fail_closed_in_both_inputs() {
+    let cases = [
+        "version: 1\nmetadata: { policy_id: boundary }\n",
+        "version: 1\nfilesystem_policy: null\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443, review: { required: true } }]\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ rules: [{ allow: { method: GET, review: {} } }] }]\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ credential_binding: { provider: demo, future: true } }]\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ protocol: rest, mcp: {} }]\n",
+        r#"{"version":1,"version":1}"#,
+        r#"{"version":1,"future_authority":true}"#,
+    ];
+    let path = std::env::temp_dir().join(format!(
+        "openshell-prover-schema-errors-{}.yaml",
+        std::process::id()
+    ));
+    let empty = fixture("boundary-empty.yaml");
+    for source in cases {
+        fs::write(&path, source).expect("write invalid authored policy");
+        for (candidate, boundary) in [(&path, &empty), (&empty, &path)] {
+            let output = run(&[
+                "check",
+                candidate.to_str().unwrap(),
+                "--boundary",
+                boundary.to_str().unwrap(),
+                "--output",
+                "json",
+            ]);
+            assert_eq!(output.status.code(), Some(2), "source={source}");
+            assert!(output.stderr.is_empty());
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["result"], "error");
+            assert_eq!(value["reason_code"], "invalid_input");
+            assert!(value["counterexample"].is_null());
+        }
+    }
+    fs::remove_file(path).expect("remove invalid authored policy");
 }
 
 #[test]

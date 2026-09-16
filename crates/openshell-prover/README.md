@@ -14,6 +14,11 @@ fully composed candidate policy stays within an operator-supplied boundary. The
 the legacy proposal-risk queries answer different questions; gateway callers
 continue to use the proposal-risk API until the managed-policy migration.
 
+Both prover entrypoints use the bounded `openshell-policy-schema` parser.
+Containment rejects unknown fields and managed `metadata`/`review` annotations
+as invalid input, then checks schema-valid controls against its supported model.
+It uses shared filesystem defaults, port selection, and access-preset semantics.
+
 The containment model accepts ASCII literals in network binary selectors,
 endpoint host and path selectors, and REST allow and deny method and path
 selectors. It returns `unsupported_policy_shape` when either policy uses a

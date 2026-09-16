@@ -33,8 +33,9 @@ path normalization.
 
 Consumers project that syntax into purpose-specific models. `openshell-policy`
 owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
-validation that depends on runtime components. The existing prover retains its
-risk model but uses the same fail-closed parser as the runtime. The parser
+validation that depends on runtime components. Both the proposal-risk prover and
+standalone containment checker project the shared schema into their own models
+using the same fail-closed parser as the runtime. The parser
 requires `version: 1` and rejects managed annotations and every unknown field
 before any consumer-specific projection runs. There is no permissive parsing
 profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
