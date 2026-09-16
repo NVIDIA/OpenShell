@@ -41,8 +41,6 @@ globals or dependency-owned crypto. OpenSSL and strict FIPS operation are separa
 follow-up work. The crate README defines extension and coverage boundaries.
 Digest operations propagate backend failures through JWT and credential key-ID
 generation rather than requiring infallible provider operations.
-The `crypto:check` lint uses the managed Python toolchain and Git on all platforms
-to reject direct backend references outside the facade.
 
 SQLx uses AWS-LC with native certificate roots.
  The server enables
