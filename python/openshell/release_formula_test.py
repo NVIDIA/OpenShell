@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_default_driver(
+def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     tmp_path: Path,
 ) -> None:
     release_dir = tmp_path / "release"
@@ -42,7 +42,9 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
             str(repo_root / "tasks/scripts/release.py"),
             "generate-homebrew-formula",
             "--release-tag",
-            "v0.0.10",
+            "pre-0.1.0",
+            "--version",
+            "0.1.0-pre.3",
             "--release-dir",
             str(release_dir),
             "--output",
@@ -54,8 +56,9 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     formula = output.read_text(encoding="utf-8")
     assert (
         "https://github.com/NVIDIA/OpenShell/releases/download/"
-        "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
+        "pre-0.1.0/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
+    assert 'version "0.1.0-pre.3"' in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
     assert (
         "https://github.com/NVIDIA/OpenShell/releases/download/"

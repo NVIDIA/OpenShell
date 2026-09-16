@@ -49,6 +49,9 @@ jobs:
       # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
       source_sha: ${{ steps.v.outputs.source_sha }}
       is_prerelease: ${{ steps.v.outputs.is_prerelease }}
+      published_release_tag: ${{ steps.v.outputs.published_release_tag }}
+      prerelease_train: ${{ steps.v.outputs.prerelease_train }}
+      prerelease_chart: ${{ steps.v.outputs.prerelease_chart }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,14 +71,24 @@ jobs:
           set -euo pipefail
           if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
             is_prerelease=true
+            semver="${RELEASE_TAG#v}"
+            prerelease_train="${semver%-pre.*}"
+            published_release_tag="pre-${prerelease_train}"
+            prerelease_chart="${prerelease_train}-pre"
           elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             is_prerelease=false
+            published_release_tag="${RELEASE_TAG}"
+            prerelease_train=""
+            prerelease_chart=""
           else
             echo "Unsupported release tag: ${RELEASE_TAG}" >&2
             exit 1
           fi
           {
             echo "is_prerelease=${is_prerelease}"
+            echo "published_release_tag=${published_release_tag}"
+            echo "prerelease_train=${prerelease_train}"
+            echo "prerelease_chart=${prerelease_chart}"
             echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
             echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
             echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
@@ -184,19 +197,22 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            CHANNEL_TAG="${{ needs.compute-versions.outputs.published_release_tag }}"
+          else
+            CHANNEL_TAG="latest"
+          fi
           for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
               "${REGISTRY}/${component}:${SOURCE_TAG}"
-            if [[ "${IS_PRERELEASE}" != "true" ]]; then
-              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
-              docker buildx imagetools create \
-                --prefer-index=false \
-                -t "${REGISTRY}/${component}:latest" \
-                "${REGISTRY}/${component}:${SOURCE_TAG}"
-            fi
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${CHANNEL_TAG}..."
+            docker buildx imagetools create \
+              --prefer-index=false \
+              -t "${REGISTRY}/${component}:${CHANNEL_TAG}" \
+              "${REGISTRY}/${component}:${SOURCE_TAG}"
           done
 
   build-python-wheel:
@@ -410,7 +426,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 tasks/scripts/release.py generate-homebrew-formula \
-            --release-tag "${RELEASE_TAG}" \
+            --release-tag "${{ needs.compute-versions.outputs.published_release_tag }}" \
+            --version "${{ needs.compute-versions.outputs.semver }}" \
             --release-dir release \
             --output release/openshell.rb
           cat release/openshell.rb
@@ -446,6 +463,45 @@ jobs:
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
               }
             }
+
+      - name: Prune assets from rolling prerelease
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PUBLISHED_RELEASE_TAG: ${{ needs.compute-versions.outputs.published_release_tag }}
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag: process.env.PUBLISHED_RELEASE_TAG,
+              });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`No existing ${process.env.PUBLISHED_RELEASE_TAG} release; skipping asset pruning.`);
+                return;
+              }
+              throw err;
+            }
+            for (const asset of release.data.assets) {
+              core.info(`Deleting rolling prerelease asset: ${asset.name}`);
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+            }
+
+      - name: Move rolling prerelease tag
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        env:
+          PUBLISHED_RELEASE_TAG: ${{ needs.compute-versions.outputs.published_release_tag }}
+          SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa "${PUBLISHED_RELEASE_TAG}" -m "Latest qualified ${PUBLISHED_RELEASE_TAG} candidate" "${SOURCE_SHA}"
+          git push --force origin "${PUBLISHED_RELEASE_TAG}"
 
       - name: Create GitHub Release
         if: needs.compute-versions.outputs.is_prerelease != 'true'
@@ -492,14 +548,48 @@ jobs:
             release/openshell-supervisor-checksums-sha256.txt
             release/openshell-prover-checksums-sha256.txt
 
-      - name: Upload pre-release artifacts
+      - name: Create or update rolling prerelease
         if: needs.compute-versions.outputs.is_prerelease == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          name: openshell-${{ env.RELEASE_TAG }}
-          path: release/
-          retention-days: 90
-          if-no-files-found: error
+          name: OpenShell ${{ needs.compute-versions.outputs.published_release_tag }}
+          prerelease: true
+          tag_name: ${{ needs.compute-versions.outputs.published_release_tag }}
+          target_commitish: ${{ needs.compute-versions.outputs.source_sha }}
+          body: |
+            Latest qualified candidate for OpenShell ${{ needs.compute-versions.outputs.prerelease_train }}.
+
+            This rolling release currently contains `${{ env.RELEASE_TAG }}` and may change before the stable release.
+
+            ### Quick install
+
+            ```bash
+            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ needs.compute-versions.outputs.published_release_tag }} sh
+            ```
+
+          files: |
+            release/openshell-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell_*.deb
+            release/openshell-*.rpm
+            release/*.snap
+            release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-apple-darwin.tar.gz
+            release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/*.whl
+            release/openshell.rb
+            release/openshell-checksums-sha256.txt
+            release/openshell-gateway-checksums-sha256.txt
+            release/openshell-sandbox-checksums-sha256.txt
+            release/openshell-supervisor-checksums-sha256.txt
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs
@@ -578,6 +668,70 @@ jobs:
           chart-version: ${{ needs.compute-versions.outputs.semver }}
           app-version: ${{ needs.compute-versions.outputs.semver }}
           release-kind: public
+
+      - name: Publish rolling prerelease chart
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: ${{ needs.compute-versions.outputs.prerelease_chart }}
+          app-version: ${{ needs.compute-versions.outputs.published_release_tag }}
+          release-kind: prerelease
+
+  smoke-published-prerelease:
+    name: Smoke Published Prerelease
+    needs: [compute-versions, release, release-helm]
+    if: needs.compute-versions.outputs.is_prerelease == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-canary.yml
+    with:
+      install-version: ${{ needs.compute-versions.outputs.published_release_tag }}
+      chart-version: ${{ needs.compute-versions.outputs.prerelease_chart }}
+      release-run-id: ${{ github.run_id }}
+
+  retire-prerelease-channel:
+    name: Retire Prerelease Channel
+    needs: [compute-versions, release, release-helm]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete rolling prerelease release and tag
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PRERELEASE_TAG: pre-${{ needs.compute-versions.outputs.semver }}
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            try {
+              const release = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag: process.env.PRERELEASE_TAG,
+              });
+              await github.rest.repos.deleteRelease({
+                owner,
+                repo,
+                release_id: release.data.id,
+              });
+              core.info(`Deleted ${process.env.PRERELEASE_TAG} release.`);
+            } catch (err) {
+              if (err.status !== 404) throw err;
+              core.info(`No ${process.env.PRERELEASE_TAG} release to delete.`);
+            }
+            try {
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref: `tags/${process.env.PRERELEASE_TAG}`,
+              });
+              core.info(`Deleted ${process.env.PRERELEASE_TAG} tag.`);
+            } catch (err) {
+              if (err.status !== 404 && err.status !== 422) throw err;
+              core.info(`No ${process.env.PRERELEASE_TAG} tag to delete.`);
+            }
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

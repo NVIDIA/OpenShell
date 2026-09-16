@@ -1,6 +1,23 @@
 name: Release Canary
 
 on:
+  workflow_call:
+    inputs:
+      install-version:
+        description: "GitHub release channel to install"
+        required: false
+        type: string
+        default: ""
+      chart-version:
+        description: "Published Helm chart version to install"
+        required: false
+        type: string
+        default: "0.0.0-dev"
+      release-run-id:
+        description: "Release workflow run ID whose Snap artifact to test"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       release-dev-run-id:
@@ -20,13 +37,14 @@ defaults:
     shell: bash
 
 env:
-  OPENSHELL_VERSION: dev
+  OPENSHELL_VERSION: ${{ inputs.install-version || 'dev' }}
   OPENSHELL_TELEMETRY_ENABLED: "false"
+  CHART_VERSION: ${{ inputs.chart-version || '0.0.0-dev' }}
 
 jobs:
   macos:
     name: macOS Homebrew
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
@@ -47,7 +65,7 @@ jobs:
 
   ubuntu:
     name: Ubuntu Docker
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -75,7 +93,7 @@ jobs:
 
   fedora:
     name: Fedora RPM
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     env:
@@ -175,7 +193,7 @@ jobs:
 
   ubuntu-snap:
     name: Ubuntu Snap
-    if: ${{ github.event.workflow_run.conclusion == 'success' || inputs.release-dev-run-id != '' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || inputs.release-dev-run-id != '' || inputs.release-run-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -197,7 +215,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.release-dev-run-id || github.event.workflow_run.id }}
+          run-id: ${{ inputs.release-run-id || inputs.release-dev-run-id || github.event.workflow_run.id }}
           pattern: snap-linux-amd64
           path: release/
           merge-multiple: true
@@ -255,7 +273,7 @@ jobs:
 
   kubernetes:
     name: Kubernetes Helm (kind)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -289,7 +307,7 @@ jobs:
         run: |
           set -euo pipefail
           helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
-            --version 0.0.0-dev \
+            --version "$CHART_VERSION" \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
             --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \

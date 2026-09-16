@@ -292,22 +292,23 @@ Agent implementation is human-directed: a user may request a phase directly, or 
 
 ## Prerelease and development builds
 
-Use a tagged prerelease to evaluate an upcoming release, or use the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
+Use a prerelease candidate to evaluate an upcoming release, or use the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
 
-Tagged prerelease artifacts are retained for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias selects the highest prerelease version with a successful release workflow:
+The `pre` alias installs the latest qualified candidate from the newest active release train. Prereleases are public and do not require GitHub authentication:
 
 ```shell
-gh auth login
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
   OPENSHELL_VERSION=pre sh
 ```
 
-Set the full tag to install a specific prerelease:
+Select a release train explicitly when more than one is active:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
-  OPENSHELL_VERSION=v0.1.0-pre.1 sh
+  OPENSHELL_VERSION=pre-0.1.0 sh
 ```
+
+The rolling `pre-0.1.0` release advances only for a candidate that passes release validation. Post-publication canaries then exercise the Debian, RPM, Homebrew, Snap, and Helm installation paths. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`.
 
 The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
 
@@ -319,10 +320,15 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 For Kubernetes, select the corresponding Helm chart version. Helm chart versions omit the leading `v` from release tags:
 
 ```shell
-# Tagged prerelease
+# Latest qualified candidate in the 0.1.0 train
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.1.0-pre.1
+  --version 0.1.0-pre
+
+# Pin an exact candidate
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.1.0-pre.3
 
 # Rolling development build
 helm upgrade --install openshell \
@@ -330,7 +336,7 @@ helm upgrade --install openshell \
   --version 0.0.0-dev
 ```
 
-Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
+Prerelease charts publish both a floating `<version>-pre` version and immutable `<version>-pre.N` versions. Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
 
 ## Contributing
 

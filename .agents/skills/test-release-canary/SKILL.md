@@ -1,32 +1,33 @@
 ---
 name: test-release-canary
-description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published OpenShell artifacts (install.sh on macOS/Ubuntu/Fedora, Helm chart on kind) after each Release Dev publish. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
+description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published OpenShell artifacts (install.sh on macOS/Ubuntu/Fedora, Snap, and Helm on kind) after Release Dev and prerelease publications. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
 metadata:
   internal: true
 ---
 
 # Test Release Canary
 
-The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the artifacts a `Release Dev` run just published. It is the last automated checkpoint before tagging a public release: if the canary is red, the published `dev` artifacts do not install on a stock environment.
+The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests published OpenShell artifacts. It runs after Release Dev and is also called by Release Tag after a prerelease candidate publishes. If the canary is red, the selected channel does not install on a stock environment.
 
 ## What the canary verifies
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap` | `ubuntu-latest` | Installs the Release Dev Snap, connects its interfaces, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
+| `macos` | `macos-latest-xlarge` | Installs the selected Homebrew release, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu` | `ubuntu-latest` | Installs the selected Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `fedora` | `fedora:latest` container | Installs the selected RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap` | `ubuntu-latest` | Installs the Snap artifact from the calling release run, connects its interfaces, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `kubernetes` | `ubuntu-latest` + kind | Installs the caller-selected Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
 `OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
 Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
-The workflow sets `OPENSHELL_VERSION=dev`, so every `install.sh` job consumes the
-rolling dev release produced by the triggering workflow. Kubernetes pins the
-matching `0.0.0-dev` chart and `:dev` images.
+After Release Dev, the workflow sets `OPENSHELL_VERSION=dev` and pins the
+matching `0.0.0-dev` chart and `:dev` images. After a prerelease publication,
+the caller supplies the rolling `pre-X.Y.Z` install channel and `<version>-pre`
+Helm chart, so every job exercises the newly published candidate.
 
 The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
@@ -39,10 +40,11 @@ verify that job directly when diagnosing SDK publication failures.
 
 ## Trigger paths
 
-The workflow has two triggers:
+The workflow has three triggers:
 
 ```yaml
 on:
+  workflow_call:
   workflow_dispatch:
   workflow_run:
     workflows: ["Release Dev"]
@@ -50,6 +52,7 @@ on:
 ```
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
+- **Reusable.** A successful prerelease publication in Release Tag calls the canary with its rolling install channel, floating Helm version, and release run ID. This smoke-tests Debian, RPM, Homebrew, Snap, and Helm after publication.
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. To include `ubuntu-snap`, supply `release-dev-run-id` for a successful Release Dev run whose Snap artifact should be tested; without it, that job is skipped because no artifact is available.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
@@ -96,7 +99,7 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
-To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
+To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). Reusable callers can select a published chart with the `chart-version` input and its matching CLI release with `install-version`.
 
 ## Local kind reproduction
 
