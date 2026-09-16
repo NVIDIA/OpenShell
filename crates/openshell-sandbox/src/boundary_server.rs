@@ -303,8 +303,8 @@ mod linux {
         }
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
-            .driver_fence
-            .validate()
+            .outer_fence
+            .validate(&config.generation)
             .map_err(|error| error.to_string())?;
         for (claim, path) in &config.resource_claim_files {
             if !config.resource_claims.contains_key(claim) {
@@ -2348,7 +2348,7 @@ mod linux {
                 properties,
                 authenticated_supervisor: true,
                 session_id: self.config.session_id,
-                driver_fence: self.config.driver_fence.clone(),
+                outer_fence: self.config.outer_fence.clone(),
                 runtime_exit_terminates_workload: true,
                 resource_claims: self.config.resource_claims.clone(),
                 backend_audit,
@@ -3715,7 +3715,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
             let debug = format!("{config:?}");
@@ -3866,7 +3866,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -4268,11 +4268,12 @@ mod linux {
             .unwrap()
         }
 
-        fn test_driver_fence() -> openshell_isolation_interface::contract::DriverFenceEvidence {
-            openshell_isolation_interface::contract::DriverFenceEvidence::Vm {
-                generation: "generation-1".to_string(),
-                network_device_count: 0,
-            }
+        fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
+            openshell_isolation_interface::contract::OuterFenceGuarantees::confirmed(
+                "generation-1",
+                b"test-vm-fence",
+            )
+            .unwrap()
         }
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {
@@ -4420,7 +4421,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -4455,7 +4456,7 @@ mod linux {
                     pod_uid_path,
                 )]),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -4495,7 +4496,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -4670,7 +4671,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -4988,7 +4989,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),

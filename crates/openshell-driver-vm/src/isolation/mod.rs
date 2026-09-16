@@ -9,13 +9,34 @@
 //! the common control and boundary behavior.
 
 use openshell_isolation_interface::contract::{
-    BackendError, DriverFenceEvidence, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+
+#[derive(Serialize)]
+struct VmOuterFenceEvidence<'a> {
+    generation: &'a str,
+    network_device_count: u32,
+}
+
+impl VmOuterFenceEvidence<'_> {
+    fn project(&self) -> Result<OuterFenceGuarantees, BackendError> {
+        if self.generation.is_empty() || self.network_device_count != 0 {
+            return Err(BackendError::Descriptor(
+                "VM outer fence evidence is incomplete".to_string(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode VM outer fence evidence: {error}"))
+        })?;
+        OuterFenceGuarantees::confirmed(self.generation, &encoded)
+    }
+}
 
 /// Driver-owned inputs that bind one VM generation to one supervisor boundary.
 pub struct VmBoundarySpec {
@@ -57,10 +78,11 @@ impl VmBoundarySpec {
             ("vm.generation".to_string(), self.generation.clone()),
             ("vm.image_identity".to_string(), self.image_identity),
         ]);
-        let driver_fence = DriverFenceEvidence::Vm {
-            generation: self.generation.clone(),
+        let outer_fence = VmOuterFenceEvidence {
+            generation: &self.generation,
             network_device_count: 0,
-        };
+        }
+        .project()?;
         Ok(VmBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -77,7 +99,7 @@ impl VmBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: workload_identity.clone(),
-                driver_fence: driver_fence.clone(),
+                outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -92,7 +114,7 @@ impl VmBoundarySpec {
                 // after crossing the authenticated boundary channel.
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
-                driver_fence,
+                outer_fence,
             },
         })
     }
@@ -155,14 +177,14 @@ mod tests {
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
         assert_eq!(
-            provisioned.boundary_config.driver_fence,
-            provisioned.runtime_descriptor.driver_fence
+            provisioned.boundary_config.outer_fence,
+            provisioned.runtime_descriptor.outer_fence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .driver_fence
-                .validate()
+                .outer_fence
+                .validate("generation-1")
                 .is_ok()
         );
     }

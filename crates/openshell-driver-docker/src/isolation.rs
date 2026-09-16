@@ -11,12 +11,39 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct DockerOuterFenceEvidence<'a> {
+    container_id: &'a str,
+    network_mode: &'static str,
+    unexpected_networks: &'a [String],
+}
+
+impl DockerOuterFenceEvidence<'_> {
+    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
+        if self.container_id.is_empty()
+            || self.network_mode != "none"
+            || !self.unexpected_networks.is_empty()
+        {
+            return Err(BackendError::Descriptor(
+                "Docker outer fence evidence is incomplete".to_string(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode Docker outer fence evidence: {error}"))
+        })?;
+        OuterFenceGuarantees::confirmed(generation, &encoded)
+    }
+}
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
 pub struct DockerBoundarySpec {
@@ -48,8 +75,7 @@ pub struct DockerBoundaryProvisioning {
 impl DockerBoundarySpec {
     /// Produce both sides of the common protocol from the same immutable
     /// Docker coordinates so attach cannot bind a different container.
-    #[must_use]
-    pub fn provision(self) -> DockerBoundaryProvisioning {
+    pub fn provision(self) -> Result<DockerBoundaryProvisioning, BackendError> {
         let mut resource_claims = BTreeMap::from([
             ("docker.container_id".to_string(), self.container_id),
             ("docker.image_identity".to_string(), self.image_identity),
@@ -57,12 +83,14 @@ impl DockerBoundarySpec {
         if self.gpu_requested {
             resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
         }
-        let driver_fence = DriverFenceEvidence::Docker {
-            container_id: resource_claims["docker.container_id"].clone(),
-            network_mode: "none".to_string(),
-            unexpected_networks: Vec::new(),
-        };
-        DockerBoundaryProvisioning {
+        let unexpected_networks = Vec::new();
+        let outer_fence = DockerOuterFenceEvidence {
+            container_id: &resource_claims["docker.container_id"],
+            network_mode: "none",
+            unexpected_networks: &unexpected_networks,
+        }
+        .project(&self.generation)?;
+        Ok(DockerBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
                 generation: self.generation.clone(),
@@ -78,7 +106,7 @@ impl DockerBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: self.workload_identity.clone(),
-                driver_fence: driver_fence.clone(),
+                outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -92,9 +120,9 @@ impl DockerBoundarySpec {
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
-                driver_fence,
+                outer_fence,
             },
-        }
+        })
     }
 }
 
@@ -143,7 +171,8 @@ mod tests {
             .unwrap(),
             child_env: HashMap::new(),
         }
-        .provision();
+        .provision()
+        .unwrap();
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
@@ -158,14 +187,14 @@ mod tests {
             "true"
         );
         assert_eq!(
-            provisioned.boundary_config.driver_fence,
-            provisioned.runtime_descriptor.driver_fence
+            provisioned.boundary_config.outer_fence,
+            provisioned.runtime_descriptor.outer_fence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .driver_fence
-                .validate()
+                .outer_fence
+                .validate("generation-1")
                 .is_ok()
         );
     }

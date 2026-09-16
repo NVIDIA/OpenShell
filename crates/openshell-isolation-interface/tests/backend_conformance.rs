@@ -380,10 +380,8 @@ fn confirmation() -> BoundaryConfirmation {
         },
         authenticated_supervisor: true,
         session_id: SandboxSessionId::new(),
-        driver_fence: DriverFenceEvidence::Vm {
-            generation: "generation-1".to_string(),
-            network_device_count: 0,
-        },
+        outer_fence: OuterFenceGuarantees::confirmed("generation-1", b"mock-fence-evidence")
+            .unwrap(),
         runtime_exit_terminates_workload: true,
         resource_claims: BTreeMap::new(),
         backend_audit: serde_json::json!({"backend": "mock"}),
@@ -391,34 +389,33 @@ fn confirmation() -> BoundaryConfirmation {
 }
 
 #[test]
-fn driver_fence_evidence_is_backend_specific_and_fail_closed() {
-    let docker = DriverFenceEvidence::Docker {
-        container_id: "sha256:container".to_string(),
-        network_mode: "none".to_string(),
-        unexpected_networks: Vec::new(),
-    };
-    let kubernetes = DriverFenceEvidence::Kubernetes {
-        network_policy_uid: "policy-uid".to_string(),
-        network_policy_resource_version: "42".to_string(),
-        ingress_isolated: true,
-        egress_isolated: true,
-        egress_rule_count: 0,
-    };
-    let vm = DriverFenceEvidence::Vm {
-        generation: "generation-1".to_string(),
-        network_device_count: 0,
-    };
+fn outer_fence_guarantees_are_backend_neutral_and_fail_closed() {
+    let fence = OuterFenceGuarantees::confirmed("generation-1", b"native-driver-evidence").unwrap();
+    assert!(fence.validate("generation-1").is_ok());
+    assert_ne!(
+        fence.evidence_digest,
+        OuterFenceGuarantees::confirmed("generation-2", b"native-driver-evidence")
+            .unwrap()
+            .evidence_digest
+    );
 
-    assert!(docker.validate().is_ok());
-    assert!(kubernetes.validate().is_ok());
-    assert!(vm.validate().is_ok());
+    let mut wrong_generation = fence.clone();
+    wrong_generation.generation = "generation-2".to_string();
+    assert!(wrong_generation.validate("generation-1").is_err());
 
-    let drifted = DriverFenceEvidence::Docker {
-        container_id: "sha256:container".to_string(),
-        network_mode: "bridge".to_string(),
-        unexpected_networks: vec!["bridge".to_string()],
-    };
-    assert!(drifted.validate().is_err());
+    for guarantee in [
+        OuterFenceGuarantee::DefaultDenyEgress,
+        OuterFenceGuarantee::NoUnmanagedEgressPath,
+        OuterFenceGuarantee::RevocationVerified,
+        OuterFenceGuarantee::ControllerLossFailsClosed,
+    ] {
+        let mut incomplete = fence.clone();
+        incomplete.established.remove(&guarantee);
+        assert!(incomplete.validate("generation-1").is_err());
+    }
+
+    assert!(OuterFenceGuarantees::confirmed("", b"evidence").is_err());
+    assert!(OuterFenceGuarantees::confirmed("generation-1", b"").is_err());
 }
 
 /// The backend-independent supervisor sequence. Identical for every backend:

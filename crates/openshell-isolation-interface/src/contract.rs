@@ -31,7 +31,7 @@
 //! The contract is transport-neutral. Compute drivers keep runtime placement
 //! and coordination details behind these interfaces.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -386,89 +386,81 @@ pub trait BoundBoundary: Send {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
 }
 
-/// Driver-owned evidence that the mandatory outer network fence is installed.
+/// Backend-neutral guarantees established by the compute driver's outer fence.
 ///
-/// The sandbox cannot observe the Docker daemon, Kubernetes API, or VM device
-/// model directly. Drivers therefore bind the exact fence they validated into
-/// both protected bootstrap halves. The sandbox reports that value back during
-/// confirmation, and the supervisor rejects any mismatch before agent launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "backend", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum DriverFenceEvidence {
-    Docker {
-        container_id: String,
-        network_mode: String,
-        unexpected_networks: Vec<String>,
-    },
-    Podman {
-        container_id: String,
-        network_mode: String,
-        unexpected_networks: Vec<String>,
-    },
-    Kubernetes {
-        network_policy_uid: String,
-        network_policy_resource_version: String,
-        ingress_isolated: bool,
-        egress_isolated: bool,
-        egress_rule_count: u32,
-    },
-    Vm {
-        generation: String,
-        network_device_count: u32,
-    },
+/// Each driver owns its native evidence schema and the code that validates it.
+/// After validation, the driver projects that evidence into these guarantees
+/// and supplies a digest that binds the original evidence to this generation.
+/// The common runtime only validates and compares this projection; it never
+/// interprets runtime- or accelerator-specific fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OuterFenceGuarantee {
+    /// No workload packet can leave without an explicit mediated decision.
+    DefaultDenyEgress,
+    /// The driver found no network path outside the mediated boundary.
+    NoUnmanagedEgressPath,
+    /// Previously granted access can be revoked by the driver-owned fence.
+    RevocationVerified,
+    /// Loss of the driver or its controller does not open network access.
+    ControllerLossFailsClosed,
 }
 
-impl DriverFenceEvidence {
-    #[must_use]
-    pub const fn driver_name(&self) -> &'static str {
-        match self {
-            Self::Docker { .. } => "docker",
-            Self::Podman { .. } => "podman",
-            Self::Kubernetes { .. } => "kubernetes",
-            Self::Vm { .. } => "vm",
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OuterFenceGuarantees {
+    /// Sandbox generation for which the evidence was collected.
+    pub generation: String,
+    /// Complete set of normalized guarantees established by the driver.
+    pub established: BTreeSet<OuterFenceGuarantee>,
+    /// Commitment to the driver-owned native evidence used for this projection.
+    pub evidence_digest: Sha256Digest,
+}
+
+impl OuterFenceGuarantees {
+    /// Construct guarantees after the driver has validated its native evidence.
+    pub fn confirmed(
+        generation: impl Into<String>,
+        native_evidence: &[u8],
+    ) -> Result<Self, BackendError> {
+        let generation = generation.into();
+        if generation.is_empty() || native_evidence.is_empty() {
+            return Err(BackendError::Descriptor(
+                "outer fence generation and native evidence are required".to_string(),
+            ));
         }
+        let mut binding = Vec::with_capacity(8 + generation.len() + native_evidence.len());
+        binding.extend_from_slice(&(generation.len() as u64).to_be_bytes());
+        binding.extend_from_slice(generation.as_bytes());
+        binding.extend_from_slice(native_evidence);
+        Ok(Self {
+            generation,
+            established: BTreeSet::from([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::NoUnmanagedEgressPath,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]),
+            evidence_digest: Sha256Digest::compute(&binding),
+        })
     }
 
-    /// Validate the concrete outer-fence properties reported by the compute driver.
-    pub fn validate(&self) -> Result<(), BackendError> {
-        let valid = match self {
-            Self::Docker {
-                container_id,
-                network_mode,
-                unexpected_networks,
-            }
-            | Self::Podman {
-                container_id,
-                network_mode,
-                unexpected_networks,
-            } => {
-                !container_id.is_empty() && network_mode == "none" && unexpected_networks.is_empty()
-            }
-            Self::Kubernetes {
-                network_policy_uid,
-                network_policy_resource_version,
-                ingress_isolated,
-                egress_isolated,
-                egress_rule_count,
-            } => {
-                !network_policy_uid.is_empty()
-                    && !network_policy_resource_version.is_empty()
-                    && *ingress_isolated
-                    && *egress_isolated
-                    && *egress_rule_count == 0
-            }
-            Self::Vm {
-                generation,
-                network_device_count,
-            } => !generation.is_empty() && *network_device_count == 0,
-        };
-        if valid {
+    /// Validate the common guarantees against the admitted generation.
+    pub fn validate(&self, expected_generation: &str) -> Result<(), BackendError> {
+        let required = BTreeSet::from([
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ]);
+        let complete = !self.generation.is_empty()
+            && self.generation == expected_generation
+            && self.established == required;
+        if complete {
             Ok(())
         } else {
-            Err(BackendError::Confirm(format!(
-                "{} driver fence evidence is incomplete",
-                self.driver_name()
-            )))
+            Err(BackendError::Confirm(
+                "outer fence guarantees are incomplete or bound to another generation".to_string(),
+            ))
         }
     }
 }
@@ -536,7 +528,7 @@ pub struct BoundaryConfirmation {
     pub properties: BoundaryProperties,
     pub authenticated_supervisor: bool,
     pub session_id: SandboxSessionId,
-    pub driver_fence: DriverFenceEvidence,
+    pub outer_fence: OuterFenceGuarantees,
     /// The driver-owned containment primitive terminates the workload when its
     /// Sandbox Runtime exits.
     pub runtime_exit_terminates_workload: bool,
@@ -547,7 +539,7 @@ pub struct BoundaryConfirmation {
 impl BoundaryConfirmation {
     /// Validate common security properties and immutable launch binding.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
-        self.driver_fence.validate()?;
+        self.outer_fence.validate(&self.generation)?;
         self.properties.validate()?;
         let complete = &self.identity == expected
             && self.authenticated_supervisor
@@ -874,6 +866,12 @@ impl From<Sha256Digest> for String {
 }
 
 impl Sha256Digest {
+    fn compute(bytes: &[u8]) -> Self {
+        use sha2::{Digest as _, Sha256};
+
+        Self(Sha256::digest(bytes).into())
+    }
+
     /// Return the raw digest bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {

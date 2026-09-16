@@ -24,7 +24,7 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, DriverFenceEvidence, EnforcedProperty, ExecSpec,
+    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, OuterFenceGuarantees,
     ResolveError,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
@@ -426,8 +426,8 @@ pub struct SandboxRuntimeDescriptor {
     /// example pod UID, VM generation, or container ID).
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
-    /// Concrete outer-fence evidence validated by the driver.
-    pub driver_fence: DriverFenceEvidence,
+    /// Backend-neutral projection of the driver-validated outer fence.
+    pub outer_fence: OuterFenceGuarantees,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -441,7 +441,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
-            .field("driver_fence", &self.driver_fence)
+            .field("outer_fence", &self.outer_fence)
             .finish()
     }
 }
@@ -494,8 +494,8 @@ pub struct BoundaryConfig {
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Concrete outer-fence evidence validated by the driver.
-    pub driver_fence: DriverFenceEvidence,
+    /// Backend-neutral projection of the driver-validated outer fence.
+    pub outer_fence: OuterFenceGuarantees,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
@@ -523,7 +523,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
-            .field("driver_fence", &self.driver_fence)
+            .field("outer_fence", &self.outer_fence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
