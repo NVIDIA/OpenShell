@@ -99,20 +99,49 @@ field must not require a Helm template change.
 {{- define "openshell.gatewayConfigToml" -}}
 {{- $root := . -}}
 {{- $config := deepCopy (.Values.gatewayConfig | default dict) -}}
-{{- if .Values.server.disableTls -}}
-{{- $gateway := get $config "openshell.gateway" | default dict -}}
-{{- $_ := set $gateway "disable_tls" true -}}
-{{- $_ := set $config "openshell.gateway" $gateway -}}
-{{- $_ := unset $config "openshell.gateway.tls" -}}
+{{/* Kubernetes packaging owns host aliases. Do not permit a second runtime
+source to make sandbox callback hostnames disagree with the pod spec. */}}
 {{- $kubernetes := get $config "openshell.drivers.kubernetes" | default dict -}}
+{{- if .Values.server.hostGatewayIP -}}
+{{- $_ := set $kubernetes "host_gateway_ip" .Values.server.hostGatewayIP -}}
+{{- else -}}
+{{- $_ := unset $kubernetes "host_gateway_ip" -}}
+{{- end -}}
+{{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
+
+{{/* TLS resources, mounts, and their corresponding runtime fields have one
+owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
+{{- $gateway := get $config "openshell.gateway" | default dict -}}
+{{- $_ := set $gateway "disable_tls" .Values.server.disableTls -}}
+{{- $_ := set $config "openshell.gateway" $gateway -}}
+{{- if .Values.server.disableTls -}}
+{{- $_ := unset $config "openshell.gateway.tls" -}}
 {{- $_ := unset $kubernetes "client_tls_secret_name" -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
+{{- else -}}
+{{- if .Values.server.tls.clientTlsSecretName -}}
+{{- $_ := set $kubernetes "client_tls_secret_name" .Values.server.tls.clientTlsSecretName -}}
+{{- else -}}
+{{- $_ := unset $kubernetes "client_tls_secret_name" -}}
 {{- end -}}
-{{- if and (not .Values.server.disableTls) .Values.certManager.serverIssuerRef.name -}}
+{{- $_ := set $config "openshell.drivers.kubernetes" $kubernetes -}}
 {{- $gatewayTls := get $config "openshell.gateway.tls" | default dict -}}
+{{- $_ := set $gatewayTls "cert_path" "/etc/openshell-tls/server/tls.crt" -}}
+{{- $_ := set $gatewayTls "key_path" "/etc/openshell-tls/server/tls.key" -}}
+{{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" -}}
+{{- $_ := set $gatewayTls "client_ca_path" "/etc/openshell-tls/client-ca/ca.crt" -}}
+{{- else -}}
+{{- $_ := unset $gatewayTls "client_ca_path" -}}
+{{- end -}}
+{{- if .Values.certManager.serverIssuerRef.name -}}
 {{- $_ := set $gatewayTls "external_cert_path" "/etc/openshell-tls/server-external/tls.crt" -}}
 {{- $_ := set $gatewayTls "external_key_path" "/etc/openshell-tls/server-external/tls.key" -}}
 {{- $_ := set $gatewayTls "external_server_names" (deepCopy (.Values.certManager.serverDnsNames | default list)) -}}
+{{- else -}}
+{{- $_ := unset $gatewayTls "external_cert_path" -}}
+{{- $_ := unset $gatewayTls "external_key_path" -}}
+{{- $_ := unset $gatewayTls "external_server_names" -}}
+{{- end -}}
 {{- $_ := set $config "openshell.gateway.tls" $gatewayTls -}}
 {{- end -}}
 {{- range $tableName := keys $config | sortAlpha -}}
