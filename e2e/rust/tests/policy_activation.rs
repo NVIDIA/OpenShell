@@ -79,6 +79,10 @@ async fn cli_ok(args: &[&str]) {
 }
 
 fn container_id(engine: &ContainerEngine, name: &str) -> String {
+    role_container_id(engine, name, "sandbox")
+}
+
+fn role_container_id(engine: &ContainerEngine, name: &str, role: &str) -> String {
     let output = engine
         .command()
         .args([
@@ -86,6 +90,8 @@ fn container_id(engine: &ContainerEngine, name: &str) -> String {
             "--quiet",
             "--filter",
             &format!("label=openshell.ai/sandbox-name={name}"),
+            "--filter",
+            &format!("label=openshell.ai/isolation-role={role}"),
         ])
         .output()
         .expect("find sandbox container");
@@ -95,7 +101,7 @@ fn container_id(engine: &ContainerEngine, name: &str) -> String {
     assert_eq!(
         ids.len(),
         1,
-        "expected one running sandbox container: {ids:?}"
+        "expected one running {role} container: {ids:?}"
     );
     ids[0].to_string()
 }
@@ -278,13 +284,18 @@ binaries:
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let container = container_id(&engine, &resources.sandbox);
+    let supervisor = role_container_id(&engine, &resources.sandbox, "supervisor");
     assert_marker(&engine, &container, false);
     // Repeated observation distinguishes a stable gate from a crash/relaunch loop.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(container_id(&engine, &resources.sandbox), container);
+    assert_eq!(
+        role_container_id(&engine, &resources.sandbox, "supervisor"),
+        supervisor
+    );
     let restarts = engine
         .command()
-        .args(["inspect", "--format", "{{.RestartCount}}", &container])
+        .args(["inspect", "--format", "{{.RestartCount}}", &supervisor])
         .output()
         .expect("inspect supervisor restart count");
     assert!(restarts.status.success());
