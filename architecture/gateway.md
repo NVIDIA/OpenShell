@@ -277,9 +277,12 @@ both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Each successful refresh atomically stores the
-new gateway-token ID in that sandbox record, invalidating the consumed bearer
-across every gateway replica. Short `gateway_jwt.ttl_secs` lifetimes still bound
-the exposure of a current bearer that has not yet been refreshed.
+new gateway-token ID in that sandbox record. The immediately consumed bearer
+can recover that same successor for 30 seconds when the request matches, but it
+cannot authorize ordinary RPCs or choose another successor. Advancing the
+successor removes that retry path across every gateway replica. Short
+`gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
+that has not yet been refreshed.
 Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
 single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
 Kubernetes and other shared deployments should set a positive TTL. Explicit

@@ -6083,6 +6083,7 @@ mod tests {
             .expect("test runtime generation"),
             auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test auth epoch"),
             gateway_token_id: uuid::Uuid::new_v4(),
+            refresh_replay: None,
         }
         .write(&mut annotations);
         let mut sandbox = Sandbox {

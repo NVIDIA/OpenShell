@@ -543,9 +543,35 @@ mod session {
             identity: &SandboxRuntimeIdentity,
             gateway_token_id: Uuid,
         ) -> Result<MintedSessionTokenPair, SessionJwtError> {
+            self.mint_pair_with_token_metadata(
+                identity,
+                gateway_token_id,
+                Uuid::new_v4(),
+                self.clock.now_unix_seconds(),
+            )
+        }
+
+        /// Mint a reproducible token pair for a persisted refresh successor.
+        pub fn mint_pair_with_token_metadata(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            gateway_token_id: Uuid,
+            sandbox_token_id: Uuid,
+            issued_at: i64,
+        ) -> Result<MintedSessionTokenPair, SessionJwtError> {
             Ok(MintedSessionTokenPair {
-                gateway: self.mint(SessionTokenProfile::Gateway, identity, gateway_token_id)?,
-                sandbox: self.mint(SessionTokenProfile::Sandbox, identity, Uuid::new_v4())?,
+                gateway: self.mint(
+                    SessionTokenProfile::Gateway,
+                    identity,
+                    gateway_token_id,
+                    issued_at,
+                )?,
+                sandbox: self.mint(
+                    SessionTokenProfile::Sandbox,
+                    identity,
+                    sandbox_token_id,
+                    issued_at,
+                )?,
                 auth_epoch: identity.auth_epoch,
             })
         }
@@ -555,8 +581,8 @@ mod session {
             profile: SessionTokenProfile,
             identity: &SandboxRuntimeIdentity,
             token_id: Uuid,
+            issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let issued_at = self.clock.now_unix_seconds();
             let expires_at = issued_at.saturating_add(
                 i64::try_from(self.ttl.as_secs()).map_err(|_| SessionJwtError::InvalidLifetime)?,
             );

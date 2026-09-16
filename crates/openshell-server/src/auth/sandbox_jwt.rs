@@ -181,11 +181,16 @@ impl SandboxSessionJwtAuthority {
         sandbox_id: &str,
         identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
     ) -> Result<SandboxLaunchAuthentication, Status> {
-        self.mint_launch(
+        let token_metadata = identity
+            .refresh_replay
+            .as_ref()
+            .map(|replay| (replay.sandbox_token_id(), replay.issued_at));
+        self.mint_launch_with_metadata(
             sandbox_id,
             identity.runtime_generation.clone(),
             identity.auth_epoch,
             identity.gateway_token_id,
+            token_metadata,
         )
     }
 
@@ -197,15 +202,45 @@ impl SandboxSessionJwtAuthority {
         auth_epoch: CredentialEpoch,
         gateway_token_id: uuid::Uuid,
     ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch_with_metadata(
+            sandbox_id,
+            runtime_generation,
+            auth_epoch,
+            gateway_token_id,
+            None,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mint_launch_with_metadata(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        gateway_token_id: uuid::Uuid,
+        token_metadata: Option<(uuid::Uuid, i64)>,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
         let identity = SandboxRuntimeIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
                 .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
             runtime_generation: runtime_generation.clone(),
             auth_epoch,
         };
-        let pair = self
-            .issuer
-            .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
+        let pair = token_metadata
+            .map_or_else(
+                || {
+                    self.issuer
+                        .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
+                },
+                |(sandbox_token_id, issued_at)| {
+                    self.issuer.mint_pair_with_token_metadata(
+                        &identity,
+                        gateway_token_id,
+                        sandbox_token_id,
+                        issued_at,
+                    )
+                },
+            )
             .map_err(|error| {
                 warn!(%error, "failed to mint launch-scoped sandbox credentials");
                 Status::internal("failed to mint sandbox launch credentials")
@@ -263,7 +298,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
     async fn authenticate(
         &self,
         headers: &http::HeaderMap,
-        _path: &str,
+        path: &str,
     ) -> Result<Option<Principal>, Status> {
         let Some(token) = headers
             .get("authorization")
@@ -279,7 +314,12 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
             return Ok(None);
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
-        crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
+        // Refresh performs its own lineage check so the immediately consumed
+        // bearer can recover an already-committed successor after a lost
+        // response. Every other RPC accepts only the current bearer.
+        if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
+            crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
+        }
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: authenticated.sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
@@ -357,6 +397,26 @@ impl SandboxJwtIssuer {
         sandbox_id: Option<&str>,
         ttl: Duration,
     ) -> Result<MintedToken, Status> {
+        self.mint_extension_token_with_metadata(
+            audience,
+            caller_kind,
+            sandbox_id,
+            ttl,
+            now_secs(),
+            uuid::Uuid::new_v4(),
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn mint_extension_token_with_metadata(
+        &self,
+        audience: &ExtensionAudience,
+        caller_kind: ExtensionCallerKind,
+        sandbox_id: Option<&str>,
+        ttl: Duration,
+        issued_at: i64,
+        token_id: uuid::Uuid,
+    ) -> Result<MintedToken, Status> {
         if audience.as_str() == self.audience {
             return Err(Status::invalid_argument(
                 "extension audience must not equal the gateway sandbox audience",
@@ -386,15 +446,14 @@ impl SandboxJwtIssuer {
             }
         };
 
-        let now = now_secs();
-        let exp = now.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
+        let exp = issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
         let claims = ExtensionJwtClaims {
             iss: self.issuer.clone(),
             aud: audience.as_str().to_string(),
             sub,
-            iat: now,
+            iat: issued_at,
             exp,
-            jti: uuid::Uuid::new_v4().to_string(),
+            jti: token_id.to_string(),
             caller_kind,
             sandbox_id,
         };
