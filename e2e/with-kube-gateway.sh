@@ -1072,7 +1072,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
-  helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+  helm_extra_args+=(--set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.host_gateway_ip=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
