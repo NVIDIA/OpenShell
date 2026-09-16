@@ -4,7 +4,7 @@
 
 # Gather VM runtime artifacts from local sources and compress for embedding.
 #
-# This script collects libkrun, libkrunfw, gvproxy, and the guest OCI unpacker
+# This script collects libkrun, libkrunfw, and the guest OCI unpacker
 # from local sources or pinned releases and compresses them with zstd for
 # embedding into the openshell-driver-vm binary.
 #
@@ -28,7 +28,6 @@ ROOT="$(vm_lib_root)"
 
 # Source pins for runtime tool versions.
 source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
-GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
 UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
@@ -72,12 +71,12 @@ _check_compressed_artifacts() {
     platform="$(uname -s)-$(uname -m)"
     case "$platform" in
         Darwin-arm64)
-            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
+            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
         Linux-*)
-            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
+            for f in libkrun.so.zst libkrunfw.so.5.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
@@ -224,25 +223,13 @@ case "$(uname -s)-$(uname -m)" in
       cp "$WORK_DIR/libkrunfw.dylib" "$WORK_DIR/libkrunfw.5.dylib"
     fi
     
-    # gvproxy - prefer Podman, fall back to Homebrew
-    if [ -x /opt/podman/bin/gvproxy ]; then
-      cp /opt/podman/bin/gvproxy "$WORK_DIR/"
-      echo "    Using gvproxy from Podman"
-    elif [ -x "${BREW_PREFIX}/bin/gvproxy" ]; then
-      cp "${BREW_PREFIX}/bin/gvproxy" "$WORK_DIR/"
-      echo "    Using gvproxy from Homebrew"
-    else
-      echo "Error: gvproxy not found. Install Podman Desktop or run: brew install gvproxy" >&2
-      exit 1
-    fi
     download_umoci_for_guest "$WORK_DIR/umoci" "arm64"
     ;;
     
   Linux-*)
     ARCH="$(uname -m)"
     case "$ARCH" in
-      aarch64) GVPROXY_ARCH="arm64" ;;
-      x86_64)  GVPROXY_ARCH="amd64" ;;
+      aarch64|x86_64) ;;
       *)
         echo "Error: Unsupported Linux architecture: ${ARCH}" >&2
         exit 1
@@ -274,13 +261,6 @@ case "$(uname -s)-$(uname -m)" in
       fi
     fi
 
-    # Download gvproxy if not present
-    if [ ! -f "$WORK_DIR/gvproxy" ]; then
-      echo "    Downloading gvproxy for linux-${GVPROXY_ARCH}..."
-      curl -fsSL -o "$WORK_DIR/gvproxy" \
-        "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-${GVPROXY_ARCH}"
-      chmod +x "$WORK_DIR/gvproxy"
-    fi
     download_umoci_for_guest "$WORK_DIR/umoci" "$ARCH"
     ;;
     

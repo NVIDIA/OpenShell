@@ -3,7 +3,7 @@
 
 //! Shared test helpers for openshell-driver-podman unit tests.
 
-use http_body_util::Full;
+use http_body_util::{BodyExt as _, Full};
 use hyper::StatusCode;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -20,21 +20,28 @@ use tokio::net::UnixListener;
 #[derive(Clone)]
 pub struct StubResponse {
     pub status: StatusCode,
-    pub body: String,
+    pub body: Bytes,
     pub delay: Duration,
+    pub archive_members: Option<Vec<PathBuf>>,
 }
 
 impl StubResponse {
-    pub fn new(status: StatusCode, body: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, body: impl Into<Bytes>) -> Self {
         Self {
             status,
             body: body.into(),
             delay: Duration::ZERO,
+            archive_members: None,
         }
     }
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    pub fn with_archive_members(mut self, members: &[&str]) -> Self {
+        self.archive_members = Some(members.iter().map(PathBuf::from).collect());
         self
     }
 }
@@ -88,7 +95,7 @@ pub fn spawn_podman_stub(
             let result = http1::Builder::new()
                 .serve_connection(
                     TokioIo::new(stream),
-                    service_fn(move |req| {
+                    service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let log = log.clone();
                         let queue = queue.clone();
                         async move {
@@ -104,11 +111,22 @@ pub fn spawn_podman_stub(
                                 .expect("response queue lock should not be poisoned")
                                 .pop_front()
                                 .expect("stub response should exist");
+                            if let Some(expected_members) = &response.archive_members {
+                                assert_eq!(req.method(), hyper::Method::PUT);
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let mut archive = tar::Archive::new(body.as_ref());
+                                let members: Vec<_> = archive
+                                    .entries()
+                                    .unwrap()
+                                    .map(|entry| entry.unwrap().path().unwrap().into_owned())
+                                    .collect();
+                                assert_eq!(&members, expected_members);
+                            }
                             tokio::time::sleep(response.delay).await;
                             Ok::<_, Infallible>(
                                 hyper::Response::builder()
                                     .status(response.status)
-                                    .body(Full::new(Bytes::from(response.body)))
+                                    .body(Full::new(response.body))
                                     .expect("stub response should build"),
                             )
                         }

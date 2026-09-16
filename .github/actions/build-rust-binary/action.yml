@@ -29,6 +29,10 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
+  interpreter:
+    description: Expected ELF program interpreter, "none" for static, or "skip"
+    required: false
+    default: skip
 
 runs:
   using: composite
@@ -71,11 +75,24 @@ runs:
       env:
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_INTERPRETER: ${{ inputs.interpreter }}
       run: |
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
         # Confirm the binary runs and reports the expected name.
-        target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} --version | grep -q "^${INPUTS_BINARY} "
+        "$binary" --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
-        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+        SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+        if [ "$INPUTS_INTERPRETER" != skip ]; then
+          actual_interpreter="$(readelf -l "$binary" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
+          expected_interpreter="$INPUTS_INTERPRETER"
+          if [ "$expected_interpreter" = none ]; then
+            expected_interpreter=""
+          fi
+          if [ "$actual_interpreter" != "$expected_interpreter" ]; then
+            echo "error: expected interpreter '${expected_interpreter:-<none>}', got '${actual_interpreter:-<none>}'" >&2
+            exit 1
+          fi
+        fi
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -62,6 +62,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
       OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ${{ format('ghcr.io/nvidia/openshell/sandbox:{0}', inputs.image-tag) }}
       OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

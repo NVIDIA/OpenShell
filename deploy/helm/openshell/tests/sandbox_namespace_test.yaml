@@ -62,6 +62,12 @@ tests:
       - equal:
           path: metadata.namespace
           value: other-ns
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
 
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml

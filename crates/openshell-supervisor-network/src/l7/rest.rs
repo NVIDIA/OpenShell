@@ -3337,6 +3337,8 @@ where
     // so this fallback can never become a false successful observation.
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
+    let http_10_closes_by_default =
+        response_is_http_10(&header_str) && !parse_connection_keep_alive(&header_str);
     let event_stream = response_is_event_stream(&header_str);
     let body_length = parse_body_length(&header_str)?;
 
@@ -3398,12 +3400,12 @@ where
     // No explicit framing (no Content-Length, no Transfer-Encoding).
     // Per RFC 7230 §3.3.3 the body is delimited by connection close.
     if matches!(body_length, BodyLength::None) {
-        if server_wants_close || event_stream {
+        if server_wants_close || http_10_closes_by_default || event_stream {
             // Server indicated it will close, or this is a streaming response
             // such as SSE where the body is intentionally delimited by EOF.
             let before_end = &buf[..header_end - 2];
             client.write_all(before_end).await.into_diagnostic()?;
-            if server_wants_close {
+            if server_wants_close || http_10_closes_by_default {
                 client
                     .write_all(b"Connection: close\r\n\r\n")
                     .await
@@ -3422,6 +3424,7 @@ where
                 relay_until_eof(upstream, client).await?;
             }
             client.flush().await.into_diagnostic()?;
+            client.shutdown().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
@@ -3505,6 +3508,24 @@ fn parse_connection_close(headers: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if an HTTP/1.0 response opts into a persistent connection.
+fn parse_connection_keep_alive(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("connection:")
+            .is_some_and(|value| value.split(',').any(|token| token.trim() == "keep-alive"))
+    })
+}
+
+fn response_is_http_10(headers: &str) -> bool {
+    headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        == Some("HTTP/1.0")
 }
 
 fn response_is_event_stream(headers: &str) -> bool {
@@ -5973,6 +5994,17 @@ mod tests {
     }
 
     #[test]
+    fn test_http_10_connection_persistence() {
+        let default_close = "HTTP/1.0 200 OK\r\nServer: test\r\n\r\n";
+        assert!(response_is_http_10(default_close));
+        assert!(!parse_connection_keep_alive(default_close));
+
+        let keep_alive = "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n";
+        assert!(response_is_http_10(keep_alive));
+        assert!(parse_connection_keep_alive(keep_alive));
+    }
+
+    #[test]
     fn test_response_is_event_stream() {
         assert!(response_is_event_stream(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
@@ -6040,6 +6072,42 @@ mod tests {
             received_str.contains("hello world"),
             "body should be forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_response_http_10_without_framing_reads_until_eof() {
+        let response = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        assert!(matches!(
+            result.expect("relay_response should succeed"),
+            RelayOutcome::Consumed
+        ));
+
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received = String::from_utf8_lossy(&received);
+        assert!(received.contains("Connection: close"));
+        assert!(received.contains("{\"ok\":true}"));
     }
 
     #[tokio::test]

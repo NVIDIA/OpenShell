@@ -159,14 +159,20 @@ Paths listed in `read_only` receive read-only access.
 Paths listed in `read_write` receive full access.
 All other paths are inaccessible.
 
-Landlock setup runs in two phases. The parent supervisor probes the kernel ABI and opens the configured path file descriptors before forking. The child then applies the ruleset with `restrict_self()` after privilege drop. At startup, OpenShell emits the selected ABI version and the applied read-only and read-write rule counts so you can confirm what the kernel accepted.
+The sandbox installs a mandatory Landlock baseline before running agent code.
+It requires ABI 3 or newer, introduced in Linux 6.2, so denied writes include
+file truncation. The baseline hides the private channel and bootstrap root from
+the agent by granting access only to explicitly opened, permitted root children;
+it never grants the filesystem root or follows a root-level symlink when
+constructing that allowlist. Startup fails if this baseline cannot be enforced.
+The configured filesystem policy adds restrictions on top of the baseline.
 
 | Aspect | Detail |
 |---|---|
-| Default | `compatibility: best_effort`. Uses the highest kernel ABI available. Missing paths are skipped. If the kernel does not support Landlock or any configured path cannot be opened, the sandbox continues without those restrictions and emits a High-severity OCSF `DetectionFinding`. |
-| What you can change | Set `compatibility: hard_requirement` to abort sandbox startup if Landlock is unavailable or any configured path cannot be opened. |
-| Risk if relaxed | On kernels without Landlock (pre-5.13), or when all paths fail to open, the sandbox runs without kernel-level filesystem restrictions. The agent can access any file the process user can access. |
-| Recommendation | Use `best_effort` for development. Use `hard_requirement` in environments where any gap in filesystem isolation is unacceptable. Treat High-severity Landlock findings as a signal to investigate the host kernel or the image. Run on Ubuntu 22.04+ or any kernel 5.13+ for Landlock support. |
+| Default | The mandatory baseline always requires Landlock ABI 3 or newer. The additional filesystem policy defaults to `compatibility: best_effort`, which may skip unavailable policy paths and emits a High-severity OCSF `DetectionFinding` when that policy cannot be fully applied. |
+| What you can change | Set `compatibility: hard_requirement` to reject startup when the additional filesystem policy cannot be applied. Neither setting relaxes the private-file baseline. |
+| Risk if relaxed | A skipped additional policy can expose otherwise permitted image or workspace files to the agent. It cannot grant access to files excluded by the mandatory baseline. |
+| Recommendation | Require Linux 6.2 or newer with Landlock enabled, or a qualified distribution backport providing ABI 3. Use `hard_requirement` where all configured filesystem restrictions must apply. Investigate High-severity Landlock findings rather than treating them as a supported degraded security mode. |
 
 ### Read-Only vs Read-Write Paths
 

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Download pre-built VM kernel runtime artifacts from the vm-runtime GitHub
+# Download pre-built VM kernel runtime artifacts from the capability-free
+# vm-runtime GitHub
 # Release and stage them for the openshell-driver-vm cargo build.
 #
 # This script is used by driver release CI and can also be used locally

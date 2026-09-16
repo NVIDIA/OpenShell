@@ -1,0 +1,128 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Kubernetes Sandbox Runtime"
+sidebar-title: "Sandbox runtime"
+description: "Understand how Kubernetes places and protects the sandbox runtime and supervisor."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Network Policy, Seccomp, Landlock"
+position: 2
+---
+
+OpenShell runs each Kubernetes sandbox as two separately scheduled workloads.
+The sandbox owns the agent process. The supervisor owns gateway credentials,
+policy decisions, and upstream connections.
+
+## Understand the Components
+
+The Kubernetes driver always uses this placement:
+
+```mermaid
+flowchart LR
+  Gateway[OpenShell gateway]
+  Supervisor[Supervisor Pod]
+  Sandbox[Sandbox workload Pod]
+  Agent[Agent processes]
+  External[External services]
+
+  Gateway <-->|JWT-authenticated session| Supervisor
+  Supervisor <-->|TLS and bootstrap token| Sandbox
+  Sandbox --> Agent
+  Supervisor --> External
+```
+
+`openshell-sandbox` runs as PID 1 in the workload container. It launches the
+agent, applies Landlock and child seccomp filters, identifies the process behind
+each network operation, and relays approved streams. `openshell-supervisor` runs
+in a directly managed Pod. It authenticates to the gateway, evaluates policy,
+handles L7 and provider transformations, and opens upstream connections.
+
+Both containers run as the same namespace-resolved non-root UID and GID. Their
+Pod specs set `allowPrivilegeEscalation: false`, drop every Linux capability,
+and use `RuntimeDefault` seccomp. The sandbox installs an additional nested
+seccomp user-notification filter without requesting a capability. Startup fails
+closed if the runtime blocks the required seccomp or Landlock operations.
+
+The supervisor Pod points directly to the Sandbox resource with a non-controller
+owner reference. Kubernetes therefore removes it when the Sandbox is deleted,
+while the Agent Sandbox controller remains the sole controller of the workload
+Pod.
+
+## Enforce Network Isolation
+
+The driver creates one workload fence per sandbox namespace before it releases
+any workload Pod:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      openshell.ai/boundary-role: workload
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              openshell.ai/boundary-role: supervisor
+      ports:
+        - protocol: TCP
+          port: 5500
+  egress: []
+```
+
+The empty egress list blocks direct DNS, gateway, node, metadata, and Internet
+connections from every OpenShell workload in the namespace. The ingress rule
+allows OpenShell supervisor Pods to reach sandbox TLS listeners. TLS, JWT
+claims, session generation, and recorded Pod UIDs—not the NetworkPolicy—bind a
+supervisor to its exact sandbox. Supervisors can reach cluster DNS, the gateway,
+and policy-approved upstream destinations unless another namespace policy
+restricts them.
+
+Kubernetes policies are additive. Keep sandbox namespaces under administrative
+control so another principal cannot add permissive policies, create Pods with
+OpenShell labels, or read bootstrap Secrets. Set
+`supervisor.sandboxRuntime.networkPolicyEnforced: true` only after you verify that the
+cluster CNI enforces both ingress and egress policies for these namespaces.
+
+## Bootstrap a Sandbox
+
+The driver creates each sandbox generation in a fail-closed order:
+
+1. Create and validate the workload egress fence.
+2. Create the Sandbox resource with a scheduling gate.
+3. Inspect the admitted Pod identity, security context, DNS settings, and
+   generation-specific Secret reference.
+4. Create a gated supervisor Pod and separate immutable Secrets for sandbox and
+   supervisor trust material.
+5. Remove both scheduling gates.
+6. Publish readiness only after the supervisor attaches, confirms enforcement,
+   and registers the gateway relay.
+
+The trusted sandbox init container copies its Secret into a memory-backed
+volume. The main container never mounts the projected Secret and removes the
+staged bootstrap before it launches untrusted code. The supervisor receives an
+audience-bound Kubernetes token, exchanges it for a sandbox-scoped JWT, and
+keeps gateway and provider credentials outside the workload Pod.
+
+Stopping a sandbox removes both the workload and supervisor Pods. Starting it
+creates a new generation with new Secrets and a replacement supervisor Pod
+while preserving the workspace PVC. The namespace-wide workload fence remains
+in place across sandbox generations.
+
+## Check Cluster Requirements
+
+This architecture requires the following cluster behavior:
+
+- Linux nodes and a container runtime that permits an unprivileged process to
+  install a nested seccomp user-notification filter under `RuntimeDefault`.
+- Landlock enabled and usable by the non-root sandbox process.
+- A CNI that enforces `networking.k8s.io/v1` ingress and egress policies,
+  including node-local and metadata destinations.
+- Support for Pod scheduling gates and the safe
+  `net.ipv4.ip_unprivileged_port_start=0` sysctl.
+- Administrative control of sandbox namespaces and OpenShell role labels.
+
+OpenShell actively probes the Linux primitives and validates the admitted Pod
+before starting the agent. Treat a failed probe or changed security posture as
+an unsupported runtime, not a degraded mode.
