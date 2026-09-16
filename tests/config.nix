@@ -68,7 +68,7 @@ let
           inputs = {
             openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
             openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
-            openshell_supervisor_image = "../target/openshell-supervisor-tmachine.tar";
+            openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
           };
         };
       }
@@ -88,7 +88,7 @@ let
           inputs = {
             openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
             openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
-            openshell_supervisor_image = "../target/openshell-supervisor-tmachine.tar";
+            openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
           };
         };
       }
