@@ -26,7 +26,7 @@ field must not require a Helm template change.
 {{- if regexMatch "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" $rendered -}}
 {{- fail "gatewayConfig must not contain an inline private key; provide it through a Secret-backed file mount" -}}
 {{- end -}}
-{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@" $rendered -}}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]*:[^/@[:space:]]+@" $rendered -}}
 {{- fail "gatewayConfig must not contain inline URL credentials; provide them through a Secret-backed environment variable, file, or volume" -}}
 {{- end -}}
 {{- $rendered | quote -}}
