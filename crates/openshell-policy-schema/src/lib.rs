@@ -483,11 +483,15 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-// Unknown fields are collected only to produce fail-closed diagnostics.
+const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
+
+// Unknown fields are inspected only to produce fail-closed diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnknownField {
     path: String,
 }
+
+type InspectionResult<T = ()> = std::result::Result<T, UnknownField>;
 
 /// Resource budgets enforced while noyalib builds the YAML document.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -546,8 +550,7 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     let value: serde_yml::Value = serde_yml::from_str_with_config(source, &parser_config(limits))
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
-    let unknown_fields = collect_unknown_fields(&value);
-    if let Some(unknown_field) = unknown_fields.first() {
+    if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
     let policy: PolicyDocument = serde_yml::from_value(&value)
@@ -644,8 +647,11 @@ fn validate_policy(document: &PolicyDocument) -> Result<()> {
     Ok(())
 }
 
-fn collect_unknown_fields(root: &serde_yml::Value) -> Vec<UnknownField> {
-    let mut unknown_fields = Vec::new();
+fn find_unknown_field(root: &serde_yml::Value) -> Option<UnknownField> {
+    inspect_document(root).err()
+}
+
+fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
     let Some(root) = inspect_closed(
         root,
         "",
@@ -657,52 +663,35 @@ fn collect_unknown_fields(root: &serde_yml::Value) -> Vec<UnknownField> {
             "network_policies",
             "network_middlewares",
         ],
-        &mut unknown_fields,
-    ) else {
-        return unknown_fields;
+    )?
+    else {
+        return Ok(());
     };
 
     inspect_named(
         root.get("filesystem_policy"),
         "filesystem_policy",
         &["include_workdir", "read_only", "read_write"],
-        &mut unknown_fields,
-    );
-    inspect_named(
-        root.get("landlock"),
-        "landlock",
-        &["compatibility"],
-        &mut unknown_fields,
-    );
+    )?;
+    inspect_named(root.get("landlock"), "landlock", &["compatibility"])?;
     inspect_named(
         root.get("process"),
         "process",
         &["run_as_user", "run_as_group"],
-        &mut unknown_fields,
-    );
+    )?;
 
     for (name, rule) in open_map(root.get("network_policies")) {
         let path = join("network_policies", name);
-        if let Some(rule) = inspect_closed(
-            rule,
-            &path,
-            &["name", "endpoints", "binaries"],
-            &mut unknown_fields,
-        ) {
+        if let Some(rule) = inspect_closed(rule, &path, &["name", "endpoints", "binaries"])? {
             for (index, endpoint) in sequence(rule.get("endpoints")).iter().enumerate() {
-                inspect_endpoint(
-                    endpoint,
-                    &format!("{path}.endpoints[{index}]"),
-                    &mut unknown_fields,
-                );
+                inspect_endpoint(endpoint, &join(&path, &format!("endpoints[{index}]")))?;
             }
             for (index, binary) in sequence(rule.get("binaries")).iter().enumerate() {
                 inspect_closed(
                     binary,
-                    &format!("{path}.binaries[{index}]"),
+                    &join(&path, &format!("binaries[{index}]")),
                     &["path"],
-                    &mut unknown_fields,
-                );
+                )?;
             }
         }
     }
@@ -720,21 +709,19 @@ fn collect_unknown_fields(root: &serde_yml::Value) -> Vec<UnknownField> {
                 "on_error",
                 "endpoints",
             ],
-            &mut unknown_fields,
-        ) {
+        )? {
             inspect_named(
                 middleware.get("endpoints"),
                 &join(&path, "endpoints"),
                 &["include", "exclude"],
-                &mut unknown_fields,
-            );
+            )?;
             // `config` is deliberately an open user-data map.
         }
     }
-    unknown_fields
+    Ok(())
 }
 
-fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
+fn inspect_endpoint(value: &serde_yml::Value, path: &str) -> InspectionResult {
     let Some(endpoint) = inspect_closed(
         value,
         path,
@@ -764,22 +751,20 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownF
             "json_rpc",
             "mcp",
         ],
-        out,
-    ) else {
-        return;
+    )?
+    else {
+        return Ok(());
     };
     inspect_named(
         endpoint.get("credential_binding"),
         &join(path, "credential_binding"),
         &["provider"],
-        out,
-    );
+    )?;
     inspect_named(
         endpoint.get("json_rpc"),
         &join(path, "json_rpc"),
         &["max_body_bytes"],
-        out,
-    );
+    )?;
     inspect_named(
         endpoint.get("mcp"),
         &join(path, "mcp"),
@@ -789,28 +774,27 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownF
             "strict_tool_names",
             "allow_all_known_mcp_methods",
         ],
-        out,
-    );
+    )?;
     for (name, operation) in open_map(endpoint.get("graphql_persisted_queries")) {
         inspect_closed(
             operation,
             &join(&join(path, "graphql_persisted_queries"), name),
             &["operation_type", "operation_name", "fields"],
-            out,
-        );
+        )?;
     }
     for (index, rule) in sequence(endpoint.get("rules")).iter().enumerate() {
-        let rule_path = format!("{path}.rules[{index}]");
-        if let Some(rule) = inspect_closed(rule, &rule_path, &["allow"], out) {
-            inspect_allow(rule.get("allow"), &join(&rule_path, "allow"), out);
+        let rule_path = join(path, &format!("rules[{index}]"));
+        if let Some(rule) = inspect_closed(rule, &rule_path, &["allow"])? {
+            inspect_allow(rule.get("allow"), &join(&rule_path, "allow"))?;
         }
     }
     for (index, deny) in sequence(endpoint.get("deny_rules")).iter().enumerate() {
-        inspect_allow(Some(deny), &format!("{path}.deny_rules[{index}]"), out);
+        inspect_allow(Some(deny), &join(path, &format!("deny_rules[{index}]")))?;
     }
+    Ok(())
 }
 
-fn inspect_allow(value: Option<&serde_yml::Value>, path: &str, out: &mut Vec<UnknownField>) {
+fn inspect_allow(value: Option<&serde_yml::Value>, path: &str) -> InspectionResult {
     let allowed = vec![
         "method",
         "path",
@@ -822,67 +806,79 @@ fn inspect_allow(value: Option<&serde_yml::Value>, path: &str, out: &mut Vec<Unk
         "tool",
         "params",
     ];
-    let Some(value) = value else { return };
-    let Some(rule) = inspect_closed(value, path, &allowed, out) else {
-        return;
+    let Some(value) = value else { return Ok(()) };
+    let Some(rule) = inspect_closed(value, path, &allowed)? else {
+        return Ok(());
     };
     for (name, matcher) in open_map(rule.get("query")) {
-        inspect_matcher(matcher, &join(&join(path, "query"), name), out);
+        inspect_matcher(matcher, &join(&join(path, "query"), name))?;
     }
     if let Some(matcher) = rule.get("tool") {
-        inspect_matcher(matcher, &join(path, "tool"), out);
+        inspect_matcher(matcher, &join(path, "tool"))?;
     }
     for (name, matcher) in open_map(rule.get("params")) {
-        inspect_parameter(matcher, &join(&join(path, "params"), name), out);
+        inspect_parameter(matcher, &join(&join(path, "params"), name))?;
     }
+    Ok(())
 }
 
-fn inspect_matcher(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
+fn inspect_matcher(value: &serde_yml::Value, path: &str) -> InspectionResult {
     if value.as_mapping().is_some() {
-        inspect_closed(value, path, &["any"], out);
+        inspect_closed(value, path, &["any"])?;
     }
+    Ok(())
 }
 
-fn inspect_parameter(value: &serde_yml::Value, path: &str, out: &mut Vec<UnknownField>) {
+fn inspect_parameter(value: &serde_yml::Value, path: &str) -> InspectionResult {
     let Some(mapping) = value.as_mapping() else {
-        return;
+        return Ok(());
     };
-    if mapping.contains_key("any") {
-        inspect_closed(value, path, &["any"], out);
-        return;
+    if is_any_matcher(mapping) {
+        return Ok(());
     }
     // Nested MCP parameter keys form an open recursive namespace.
     for (name, child) in string_entries(mapping) {
-        inspect_parameter(child, &join(path, name), out);
+        inspect_parameter(child, &join(path, name))?;
     }
+    Ok(())
+}
+
+fn is_any_matcher(mapping: &serde_yml::Mapping) -> bool {
+    mapping.len() == 1
+        && mapping.get("any").is_some_and(|value| {
+            value
+                .as_sequence()
+                .is_some_and(|values| values.iter().all(serde_yml::Value::is_string))
+        })
 }
 
 fn inspect_named(
     value: Option<&serde_yml::Value>,
     path: &str,
     allowed: &[&str],
-    out: &mut Vec<UnknownField>,
-) {
+) -> InspectionResult {
     if let Some(value) = value {
-        inspect_closed(value, path, allowed, out);
+        inspect_closed(value, path, allowed)?;
     }
+    Ok(())
 }
 
 fn inspect_closed<'a>(
     value: &'a serde_yml::Value,
     path: &str,
     allowed: &[&str],
-    out: &mut Vec<UnknownField>,
-) -> Option<&'a serde_yml::Mapping> {
-    let mapping = value.as_mapping()?;
+) -> InspectionResult<Option<&'a serde_yml::Mapping>> {
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(None);
+    };
     for (name, _value) in string_entries(mapping) {
         if !allowed.contains(&name) {
-            out.push(UnknownField {
+            return Err(UnknownField {
                 path: join(path, name),
             });
         }
     }
-    Some(mapping)
+    Ok(Some(mapping))
 }
 
 fn string_entries(mapping: &serde_yml::Mapping) -> impl Iterator<Item = (&str, &serde_yml::Value)> {
@@ -903,11 +899,20 @@ fn sequence(value: Option<&serde_yml::Value>) -> &[serde_yml::Value] {
 }
 
 fn join(parent: &str, child: &str) -> String {
-    if parent.is_empty() {
+    let mut path = if parent.is_empty() {
         child.to_owned()
     } else {
         format!("{parent}.{child}")
+    };
+    if path.len() > MAX_UNKNOWN_FIELD_PATH_BYTES {
+        let mut end = MAX_UNKNOWN_FIELD_PATH_BYTES - 3;
+        while !path.is_char_boundary(end) {
+            end -= 1;
+        }
+        path.truncate(end);
+        path.push_str("...");
     }
+    path
 }
 
 /// Serialize the authored representation to YAML.
@@ -1100,6 +1105,7 @@ pub fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn requires_version_one() {
@@ -1264,6 +1270,60 @@ network_policies:
                     leaf: "value-*"
 "#;
         parse_policy(source).unwrap();
+    }
+
+    #[test]
+    fn accepts_any_as_an_open_mcp_parameter_name() {
+        let source = r#"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp: {}
+        rules:
+          - allow:
+              method: tools/call
+              params:
+                arguments:
+                  any: "first"
+                  other: "second"
+"#;
+
+        let policy = parse_policy(source).expect("open MCP parameter names must parse");
+        let params = &policy.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .params;
+        let ParameterMatcher::Object(arguments) = &params["arguments"] else {
+            panic!("arguments must remain an open parameter object");
+        };
+        assert!(matches!(
+            arguments["any"],
+            ParameterMatcher::Matcher(QueryMatcher::Glob(ref value)) if value == "first"
+        ));
+        assert!(matches!(
+            arguments["other"],
+            ParameterMatcher::Matcher(QueryMatcher::Glob(ref value)) if value == "second"
+        ));
+    }
+
+    #[test]
+    fn bounds_unknown_field_diagnostics_for_wide_maps_under_long_keys() {
+        let policy_name = "é".repeat(2_000);
+        let mut unknown_fields = String::new();
+        for index in 0..2_000 {
+            writeln!(unknown_fields, "      unknown_{index}: true")
+                .expect("writing to a string cannot fail");
+        }
+        let source = format!("version: 1\nnetwork_policies:\n  {policy_name}:\n{unknown_fields}");
+
+        let error = parse_policy(&source).expect_err("unknown fields must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("unknown field 'network_policies."));
+        assert!(message.contains("...' in authored policy"));
+        assert!(message.len() <= MAX_UNKNOWN_FIELD_PATH_BYTES + 50);
     }
 
     #[test]

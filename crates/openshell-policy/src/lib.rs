@@ -4594,6 +4594,45 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_any_as_an_mcp_parameter_name() {
+        let yaml = r#"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp: {}
+        rules:
+          - allow:
+              method: tools/call
+              params:
+                arguments:
+                  any: "first"
+                  other: "second"
+"#;
+
+        let proto = parse_sandbox_policy(yaml).expect("authored policy must parse");
+        let params = &proto.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow rule")
+            .params;
+        assert_eq!(params["arguments.any"].glob, "first");
+        assert_eq!(params["arguments.other"].glob, "second");
+
+        let serialized = serialize_sandbox_policy(&proto).expect("protobuf policy must serialize");
+        assert!(serialized.contains("arguments:"));
+        assert!(serialized.contains("any: first"));
+        assert!(serialized.contains("other: second"));
+
+        let reparsed =
+            parse_sandbox_policy(&serialized).expect("serialized protobuf policy must parse again");
+        assert_eq!(reparsed, proto);
+    }
+
+    #[test]
     fn parse_rejects_unsupported_json_rpc_config_fields() {
         let yaml = r"
 version: 1
