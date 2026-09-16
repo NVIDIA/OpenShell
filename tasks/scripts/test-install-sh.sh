@@ -108,7 +108,7 @@ echo "install.sh libc preflight tests passed"
 assert_package_format_detection() {
   local name=$1
   local snapd=$2
-  local native_docker=$3
+  local docker=$3
   local dpkg=$4
   local rpm=$5
   local expected=$6
@@ -116,9 +116,9 @@ assert_package_format_detection() {
   local result
   if ! result="$(
     has_snapd() { [ "$snapd" = "1" ]; }
-    has_native_docker() { [ "$native_docker" = "1" ]; }
     has_cmd() {
       case "$1" in
+        docker) [ "$docker" = "1" ] ;;
         dpkg) [ "$dpkg" = "1" ] ;;
         rpm) [ "$rpm" = "1" ] ;;
         *) return 1 ;;
@@ -138,12 +138,20 @@ assert_package_format_detection() {
 }
 
 assert_package_format_detection \
-  "prefers snap when snapd and no native docker" \
-  1 0 1 1 "snap"
+  "prefers snap when snapd and docker are available" \
+  1 1 1 1 "snap"
 
 assert_package_format_detection \
-  "skips snap when native docker present" \
-  1 1 1 0 "deb"
+  "uses rpm when snapd is available without docker" \
+  1 0 1 1 "rpm"
+
+assert_package_format_detection \
+  "provisions docker through snap when rpm is unavailable" \
+  1 0 1 0 "snap"
+
+assert_package_format_detection \
+  "provisions docker through snap without another package manager" \
+  1 0 0 0 "snap"
 
 assert_package_format_detection \
   "skips snap when snapd absent" \
@@ -156,7 +164,6 @@ assert_package_format_detection \
 # Host with no snapd, no dpkg, no rpm must error.
 if (
   has_snapd() { return 1; }
-  has_native_docker() { return 1; }
   has_cmd() { return 1; }
   linux_package_method
 ) >"$out" 2>"$err"; then
@@ -188,6 +195,104 @@ EOF
 
 if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-prover)" != "openshell-prover-dev-x86_64.rpm" ]; then
   echo "FAIL: RPM prover package selection" >&2
+  exit 1
+fi
+
+assert_snap_install_flow() {
+  local name=$1
+  local docker_present=$2
+  local expected=$3
+  local calls
+
+  if ! calls="$(
+    has_cmd() {
+      case "$1" in
+        snap) return 0 ;;
+        docker) [ "$docker_present" = "1" ] ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    as_root() { printf 'root:%s\n' "$*"; }
+    set_linux_target_runtime_dir() { :; }
+    wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
+    register_local_gateway_snap() { printf '%s\n' "register:gateway"; }
+    wait_for_local_gateway_listener_snap() { printf '%s\n' "wait:gateway-listener"; }
+    wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
+    info() { :; }
+    export TARGET_USER=test-user
+    install_linux_snap
+  )"; then
+    echo "FAIL: ${name}: call failed" >&2
+    exit 1
+  fi
+
+  if [ "$calls" != "$expected" ]; then
+    echo "FAIL: ${name}: unexpected command sequence" >&2
+    echo "Expected:" >&2
+    printf '%s\n' "$expected" >&2
+    echo "Actual:" >&2
+    printf '%s\n' "$calls" >&2
+    exit 1
+  fi
+}
+
+assert_snap_install_flow \
+  "existing docker is reused" \
+  1 \
+  "wait:docker
+root:snap install openshell
+register:gateway
+wait:gateway-listener
+wait:gateway-status"
+
+assert_snap_install_flow \
+  "missing docker is installed before openshell" \
+  0 \
+  "root:snap install docker
+wait:docker
+root:snap install openshell
+register:gateway
+wait:gateway-listener
+wait:gateway-status"
+
+assert_docker_readiness() {
+  local attempts_file="${tmpdir}/docker-attempts"
+  printf '0\n' > "$attempts_file"
+
+  docker() {
+    local attempts
+    attempts="$(<"$attempts_file")"
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > "$attempts_file"
+    [ "$attempts" -ge 3 ]
+  }
+  sleep() { :; }
+  info() { :; }
+
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_docker_daemon
+  local attempts
+  attempts="$(<"$attempts_file")"
+  [ "$attempts" -eq 3 ] || {
+    echo "FAIL: Docker readiness expected 3 attempts, got ${attempts}" >&2
+    exit 1
+  }
+}
+
+assert_docker_readiness
+
+if (
+  docker() { return 1; }
+  sleep() { :; }
+  info() { :; }
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_docker_daemon
+) >"$out" 2>"$err"; then
+  echo "FAIL: Docker readiness timeout should fail" >&2
+  exit 1
+fi
+
+if ! grep -Fq "Docker daemon did not become reachable within 2s" "$err"; then
+  echo "FAIL: missing Docker readiness timeout error" >&2
+  cat "$err" >&2 || true
   exit 1
 fi
 

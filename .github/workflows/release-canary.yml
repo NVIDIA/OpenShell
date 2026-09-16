@@ -45,41 +45,6 @@ jobs:
           openshell sandbox exec --name "$sandbox" --no-tty -- true
           openshell sandbox delete "$sandbox"
 
-  ubuntu-deb-native-docker:
-    name: Ubuntu (native Docker)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # TODO: Once snapd 2.77 is released to latest/stable, the openshell snap
-    # will be able to connect to system Docker via the docker interface,
-    # removing the requirement for the docker snap. At that point,
-    # install.sh should select snap here even with native Docker present.
-    # Rename this job to `ubuntu-snap-native-docker`, replace the dpkg
-    # assertion below with `snap list openshell`.
-    steps:
-      - name: Ensure Docker
-        run: |
-          if ! command -v docker >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y docker.io
-          fi
-          sudo systemctl start docker || sudo service docker start
-          mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_COMPUTE_DRIVER=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
-            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
-          docker info
-
-      - name: Install and check status
-        run: |
-          set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
-          # Expected to fail once snapd 2.77 is in latest/stable, at which
-          # point install.sh should select snap instead of deb here.
-          dpkg -l openshell | grep '^ii'
-          openshell --version
-          systemctl --user is-active openshell-gateway
-          openshell status
-
   ubuntu-deb:
     name: Ubuntu Debian package
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
@@ -199,8 +164,8 @@ jobs:
           sudo snap logs openshell.gateway -n=300
           sudo ss -ltnp '( sport = :17670 )'
 
-  ubuntu-snap-without-docker:
-    name: Ubuntu without Docker preinstalled
+  ubuntu-snap-existing-docker:
+    name: Ubuntu Snap with native Docker preinstalled
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -214,7 +179,48 @@ jobs:
           sudo systemctl start snapd
           sudo snap wait system seed.loaded
 
-      - name: Remove native Docker
+      - name: Ensure Docker
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl start docker || sudo service docker start
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_COMPUTE_DRIVER=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
+          docker info
+
+      - name: Install and check status
+        run: |
+          set -euo pipefail
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          snap list openshell
+          if snap list docker >/dev/null 2>&1; then
+            echo "install.sh unexpectedly installed the docker snap" >&2
+            exit 1
+          fi
+          snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
+          openshell --version
+          sudo snap services openshell
+          openshell status
+
+  ubuntu-snap-provision-docker:
+    name: Ubuntu Snap without Docker preinstalled
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Ensure snapd
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+      - name: Remove existing native Docker
         run: |
           set -euo pipefail
           sudo systemctl stop docker.service docker.socket 2>/dev/null || true
@@ -226,7 +232,10 @@ jobs:
         run: |
           set -euo pipefail
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          snap list docker
           snap list openshell
+          docker info
+          snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
           sudo snap services openshell
           openshell status

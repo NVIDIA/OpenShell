@@ -59,11 +59,15 @@ NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager. When snapd is
-    available and no native Docker Engine is installed, the installer prefers
-    the Snap path. macOS installs the release Homebrew formula on Apple Silicon
-    and starts a brew services-backed local gateway.
+    Linux installs the snap, the DEB package, or the RPM package depending on
+    the host package manager. The snap is preferred when snapd is available,
+    except on RPM-based systems where Docker is not installed, where instead
+    the RPM package and the Podman runtime are used. On other systems with
+    snapd but no Docker preinstalled, it installs the Docker snap before the
+    OpenShell snap.
+
+    macOS installs the release Homebrew formula on Apple Silicon and starts a
+    brew services-backed local gateway.
 EOF
 }
 
@@ -79,10 +83,6 @@ require_cmd() {
 
 has_snapd() {
   has_cmd snap && systemctl is-active --quiet snapd.socket 2>/dev/null
-}
-
-has_native_docker() {
-  has_cmd docker && ! snap list docker >/dev/null 2>&1
 }
 
 download() {
@@ -488,8 +488,12 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  if has_snapd && ! has_native_docker; then
-    echo "snap"
+  if has_snapd; then
+    if has_cmd docker || ! has_cmd rpm; then
+      echo "snap"
+    else
+      echo "rpm"
+    fi
   elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
@@ -993,16 +997,14 @@ install_linux_snap() {
   require_cmd snap
   set_linux_target_runtime_dir
 
-  # Docker snap must be installed before openshell so that the
-  # openshell:docker -> docker:docker-daemon interface connection
-  # can succeed. The docker-daemon slot doesn't exist until the
-  # Docker snap itself is present.
-  if ! snap list docker >/dev/null 2>&1; then
-    info "docker snap not found, installing..."
+  if ! has_cmd docker; then
+    info "Docker not found, installing the docker snap..."
     as_root snap install docker
   else
-    info "docker snap already present"
+    info "using existing Docker installation"
   fi
+
+  wait_for_docker_daemon
 
   info "installing openshell snap..."
   as_root snap install openshell
@@ -1012,6 +1014,25 @@ install_linux_snap() {
   register_local_gateway_snap
   wait_for_local_gateway_listener_snap
   wait_for_local_gateway_status
+}
+
+wait_for_docker_daemon() {
+  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+
+  info "waiting for Docker daemon to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(docker info 2>&1)"; then
+      info "Docker daemon is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  error "Docker daemon did not become reachable within ${_timeout}s"
 }
 
 register_local_gateway_snap() {

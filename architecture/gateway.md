@@ -901,6 +901,22 @@ cert-manager takes precedence over built-in TLS generation and the chart still
 renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can
 disable both `pkiInitJob.enabled` and `certManager.enabled`.
 
+## Stable Installation Boundary
+
+`install.sh` is non-interactive and selects Linux packaging from available host
+infrastructure:
+
+- Without usable snapd, it installs DEB packages when `dpkg` is available and
+  otherwise installs RPM packages when `rpm` is available.
+- With snapd and a `docker` command, it installs the OpenShell Snap.
+- With snapd but no `docker` command, it prefers RPM packages when available;
+  the RPM installation provisions Podman. If RPM is unavailable, it installs
+  the Docker Snap, waits for `docker info` to succeed, and then installs the
+  OpenShell Snap.
+
+Store-installed OpenShell Snaps auto-connect `openshell:docker` to the system
+`:docker` slot. This interface does not depend on how Docker was packaged.
+
 ## Configuration
 
 The gateway reads its configuration from three sources, merged in this
