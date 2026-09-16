@@ -46,35 +46,32 @@
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
         tmachineRuntimePkgs = if pkgs.stdenv.hostPlatform.isDarwin then testGuestPkgs else pkgs;
-        commonDevShellPackages =
-          with pkgs;
-          [
-            actionlint
-            cargo-auditable
-            cargo-deny
-            cargo-nextest
-            # Assemble Debian artifacts on macOS and Linux.
-            dpkg
-            # Build and inspect ext4 images in VM driver tests.
-            e2fsprogs
-            git
-            # Required to find packages.
-            pkg-config
-            # Coverage.
-            lcov
-            kubernetes-helm
-            syft
-            trivy
-            uv
-            yq-go
-            zizmor
-            zstd
-          ]
-          ++ [
-            pkgs.ansible
-            pkgs.sshpass
-            testMachines.package
-          ];
+        commonDevShellPackages = with pkgs; [
+          actionlint
+          cargo-auditable
+          cargo-deny
+          cargo-nextest
+          # Assemble Debian artifacts on macOS and Linux.
+          dpkg
+          # Build and inspect ext4 images in VM driver tests.
+          e2fsprogs
+          git
+          # Required to find packages.
+          pkg-config
+          # Coverage.
+          lcov
+          kubernetes-helm
+          syft
+          trivy
+          uv
+          yq-go
+          zizmor
+          zstd
+        ];
+        commonDevShell = {
+          packages = [ rustToolchain ] ++ commonDevShellPackages;
+          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+        };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -158,14 +155,23 @@
           tmachine-unwrapped = testMachines.unwrapped;
         };
 
-        devShells.default = pkgs.mkShellNoCC {
-          packages = [ rustToolchain ] ++ commonDevShellPackages;
+        devShells = {
+          default = pkgs.mkShellNoCC commonDevShell;
 
-          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+          testing = pkgs.mkShellNoCC (
+            commonDevShell
+            // {
+              packages = commonDevShell.packages ++ [
+                pkgs.ansible
+                pkgs.sshpass
+                testMachines.package
+              ];
 
-          shellHook = ''
-            export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
-          '';
+              shellHook = ''
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+              '';
+            }
+          );
         };
 
         formatter = treefmtEval.config.build.wrapper;
