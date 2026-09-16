@@ -4048,7 +4048,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-extension-core",
- "openshell-policy-parser",
+ "openshell-policy-schema",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -4448,14 +4448,14 @@ dependencies = [
  "hickory-proto",
  "miette",
  "openshell-core",
- "openshell-policy-parser",
+ "openshell-policy-schema",
  "prost-types",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "openshell-policy-parser"
+name = "openshell-policy-schema"
 version = "0.0.0"
 dependencies = [
  "miette",
@@ -4472,7 +4472,7 @@ dependencies = [
  "include_dir",
  "miette",
  "noyalib",
- "openshell-policy-parser",
+ "openshell-policy-schema",
  "owo-colors",
  "serde",
  "z3",

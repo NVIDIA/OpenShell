@@ -13,7 +13,7 @@ repository.workspace = true
 [dependencies]
 hickory-proto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
-openshell-policy-parser = { path = "../openshell-policy-parser" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 miette = { workspace = true }

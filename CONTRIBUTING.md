@@ -458,7 +458,7 @@ These are the primary `mise` tasks for day-to-day development:
 | Path            | Purpose                                       |
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
-| `crates/openshell-policy-parser/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |

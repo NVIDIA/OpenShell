@@ -6,7 +6,7 @@
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
 //! The canonical authored representation and bounded parser live in
-//! `openshell-policy-parser`; this crate adapts that representation to the
+//! `openshell-policy-schema`; this crate adapts that representation to the
 //! runtime protobuf model and owns runtime-dependent validation.
 
 mod compose;
@@ -48,10 +48,10 @@ pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
 pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
-// The authored serde tree lives in `openshell-policy-parser`. These local
+// The authored serde tree lives in `openshell-policy-schema`. These local
 // aliases keep the protobuf adapter readable while exposing consumer-facing
 // names from the schema crate.
-use openshell_policy_parser::{
+use openshell_policy_schema::{
     AnyMatcher as QueryAnyDef, FilesystemPolicy as FilesystemDef,
     GraphqlOperation as GraphqlOperationDef, JsonRpcConfig as JsonRpcConfigDef,
     L7Allow as L7AllowDef, L7DenyRule as L7DenyRuleDef, L7Rule as L7RuleDef,
@@ -113,7 +113,7 @@ pub fn l7_config_alias_runtime_fields(
     match stanza {
         L7ConfigStanza::JsonRpc => {
             let JsonRpcConfigDef { max_body_bytes } =
-                openshell_policy_parser::parse_json_rpc_config(value)?;
+                openshell_policy_schema::parse_json_rpc_config(value)?;
             let mut fields = Vec::new();
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
@@ -121,7 +121,7 @@ pub fn l7_config_alias_runtime_fields(
             Ok(fields)
         }
         L7ConfigStanza::Mcp => {
-            let config = openshell_policy_parser::parse_mcp_config(value)?;
+            let config = openshell_policy_schema::parse_mcp_config(value)?;
             let McpConfigDef {
                 versions,
                 max_body_bytes,
@@ -839,15 +839,15 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // actionable MCP diagnostics the top-level user-facing error.
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_parser::parse_policy(yaml)?;
+    let raw = openshell_policy_schema::parse_policy(yaml)?;
     to_proto(raw)
 }
 
 /// Parse a sandbox policy from a regular file using the shared bounded reader.
 pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_parser::parse_policy_file(
+    let raw = openshell_policy_schema::parse_policy_file(
         path,
-        openshell_policy_parser::ParseLimits::default(),
+        openshell_policy_schema::ParseLimits::default(),
     )?;
     to_proto(raw)
 }
@@ -862,7 +862,7 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
-    openshell_policy_parser::serialize_policy(&yaml_repr)
+    openshell_policy_schema::serialize_policy(&yaml_repr)
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -874,7 +874,7 @@ pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
-    openshell_policy_parser::policy_to_json_value(&json_repr)
+    openshell_policy_schema::policy_to_json_value(&json_repr)
 }
 
 fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
@@ -1883,7 +1883,7 @@ fn truncate_for_display(s: &str) -> String {
 ///
 /// Re-exported from `openshell-core` so existing call sites
 /// (`openshell_policy::normalize_path`) keep resolving.
-pub use openshell_policy_parser::normalize_path;
+pub use openshell_policy_schema::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Tests

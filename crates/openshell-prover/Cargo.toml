@@ -16,7 +16,7 @@ prebuilt-z3 = ["z3/gh-release"]
 
 [dependencies]
 z3 = { workspace = true }
-openshell-policy-parser = { path = "../openshell-policy-parser" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 serde = { workspace = true }
 serde_yml = { workspace = true }
 miette = { workspace = true }

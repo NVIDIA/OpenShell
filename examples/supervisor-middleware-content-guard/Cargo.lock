@@ -1041,7 +1041,7 @@ dependencies = [
  "miette",
  "nix",
  "openshell-extension-core",
- "openshell-policy-parser",
+ "openshell-policy-schema",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -1076,7 +1076,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-policy-parser"
+name = "openshell-policy-schema"
 version = "0.0.0"
 dependencies = [
  "miette",

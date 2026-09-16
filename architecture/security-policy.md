@@ -23,7 +23,7 @@ dynamic and can be hot-reloaded when the new policy validates successfully.
 
 ### Authored policy boundary
 
-`openshell-policy-parser` is the sole owner of the authored YAML and JSON
+`openshell-policy-schema` is the sole owner of the authored YAML and JSON
 representation. It preserves authored distinctions such as an absent
 `filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
 and applies parser budgets while noyalib constructs the document. It also owns

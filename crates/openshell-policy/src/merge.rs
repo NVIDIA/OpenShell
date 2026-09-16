@@ -2064,7 +2064,7 @@ fn expand_existing_access(
 }
 
 fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
-    let methods = openshell_policy_parser::expand_access_preset(protocol, access)?;
+    let methods = openshell_policy_schema::expand_access_preset(protocol, access)?;
 
     Some(
         methods
