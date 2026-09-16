@@ -69,6 +69,20 @@ pub struct OpenShellRuntimeBackend {
 }
 
 impl OpenShellRuntimeBackend {
+    /// Read the workload image policy over the authenticated boundary before admission.
+    pub async fn discover_policy(
+        descriptor: SandboxRuntimeDescriptor,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    ) -> Result<(Option<String>, bool), BackendError> {
+        let client = BoundaryClient::new(descriptor, bearer);
+        match client.call_idempotent(Request::DiscoverPolicy).await? {
+            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
+            _ => Err(BackendError::Descriptor(
+                "expected image policy discovery response".to_string(),
+            )),
+        }
+    }
+
     pub fn new(
         ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
         provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
@@ -1074,7 +1088,7 @@ impl BoundaryClient {
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
-        let timeout = if remember_attach {
+        let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
             ATTACH_REQUEST_TIMEOUT
         } else {
             REQUEST_TIMEOUT
@@ -1999,6 +2013,10 @@ mod tests {
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
                         response: match envelope.request {
+                            Request::DiscoverPolicy => Response::ImagePolicy {
+                                yaml: None,
+                                invalid: false,
+                            },
                             Request::Attach { .. } => Response::Attached {
                                 snapshot: crate::boundary_protocol::SessionSnapshotWire {
                                     generation: "test-generation".to_string(),

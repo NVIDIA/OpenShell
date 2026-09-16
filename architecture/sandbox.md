@@ -642,8 +642,8 @@ so it cannot replace the configuration captured for that launch. Restart resets
 admission and requires a fresh accepted configuration. Permanent gateway errors
 and exhausted transient retries terminate startup; each RPC attempt has a
 10-second deadline, including acceptance reports; only acknowledged configuration
-rejections wait indefinitely for repair. Process-sidecar discovery uses the
-existing sidecar readiness timeout.
+rejections wait indefinitely for repair. Image discovery uses the authenticated
+sandbox boundary control request deadline.
 
 Policy and provider refreshes are prepared before publication. Publication
 invalidates prior policy guards before exposing new provider material and swaps
@@ -651,11 +651,13 @@ the policy under the same publication locks. Rejected candidates cannot install
 their credentials alongside the previous policy. Existing runtime fail-closed
 checks remain necessary for in-flight traffic and invalid live updates.
 
-In sidecar topology, the authenticated process supervisor supplies discovery
-from the workload image over the existing control socket. The network supervisor
-withholds bootstrap until admission succeeds, then sends the accepted policy and
-child environment together. Subsequent configuration messages carry both parts
-and an ordered generation; older messages cannot restore stale child credentials.
+The supervisor reads the workload image policy through an authenticated,
+read-only `DiscoverPolicy` boundary request before attaching or launching the
+workload. The boundary reads only the well-known policy paths, bounds the response,
+and distinguishes missing policy from unreadable or invalid content. The supervisor
+validates this candidate with gateway provider composition and obtains admission
+before `Attach`, `Confirm`, networking startup, and `StartAgent`. Workload image
+environment variables cannot configure the isolated supervisor.
 
 ## Policy Revision Acknowledgement
 

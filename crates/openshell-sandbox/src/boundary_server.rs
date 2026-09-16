@@ -1537,12 +1537,53 @@ mod linux {
                 .map_err(|error| tonic::Status::unauthenticated(error.to_string()))
         }
 
+        fn discover_image_policy() -> Response {
+            Self::discover_image_policy_from_paths(&[
+                openshell_policy::CONTAINER_POLICY_PATH,
+                openshell_policy::LEGACY_CONTAINER_POLICY_PATH,
+            ])
+        }
+
+        fn discover_image_policy_from_paths(paths: &[&str]) -> Response {
+            use std::io::Read as _;
+            for path in paths {
+                match std::fs::File::open(path) {
+                    Ok(file) => {
+                        let mut yaml = String::new();
+                        if file.take(1_048_577).read_to_string(&mut yaml).is_err()
+                            || yaml.len() > 1_048_576
+                        {
+                            return Response::ImagePolicy {
+                                yaml: None,
+                                invalid: true,
+                            };
+                        }
+                        return Response::ImagePolicy {
+                            yaml: Some(yaml),
+                            invalid: false,
+                        };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        return Response::ImagePolicy {
+                            yaml: None,
+                            invalid: true,
+                        };
+                    }
+                }
+            }
+            Response::ImagePolicy {
+                yaml: None,
+                invalid: false,
+            }
+        }
+
         fn authorize_request(
             &self,
             principal: &SandboxProtocolPrincipal,
             request: &Request,
         ) -> Result<(), String> {
-            if matches!(request, Request::Attach { .. }) {
+            if matches!(request, Request::Attach { .. } | Request::DiscoverPolicy) {
                 return Ok(());
             }
             if matches!(request, Request::Confirm) {
@@ -1830,6 +1871,7 @@ mod linux {
             let request_id = envelope.request_id;
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
+                Request::DiscoverPolicy => Self::discover_image_policy(),
                 Request::Attach {
                     supervisor_instance_id: _,
                     policy,
@@ -4256,6 +4298,46 @@ mod linux {
                 NetworkBroker::start_for_test(listener).expect("start test network broker"),
                 launcher,
             )
+        }
+
+        #[test]
+        fn image_discovery_preserves_invalid_content_and_bounds_reads() {
+            let directory = tempfile::tempdir().unwrap();
+            let primary = directory.path().join("policy.yaml");
+            let legacy = directory.path().join("legacy.yaml");
+            let paths = [primary.to_str().unwrap(), legacy.to_str().unwrap()];
+            assert_eq!(
+                BoundaryRuntime::discover_image_policy_from_paths(&paths),
+                Response::ImagePolicy {
+                    yaml: None,
+                    invalid: false
+                }
+            );
+            std::fs::write(&legacy, "legacy policy").unwrap();
+            assert_eq!(
+                BoundaryRuntime::discover_image_policy_from_paths(&paths),
+                Response::ImagePolicy {
+                    yaml: Some("legacy policy".to_string()),
+                    invalid: false
+                }
+            );
+            // Parsing belongs to admission; malformed primary content must never fall back.
+            std::fs::write(&primary, "not: [valid yaml").unwrap();
+            assert_eq!(
+                BoundaryRuntime::discover_image_policy_from_paths(&paths),
+                Response::ImagePolicy {
+                    yaml: Some("not: [valid yaml".to_string()),
+                    invalid: false
+                }
+            );
+            std::fs::write(&primary, vec![b'x'; 1_048_577]).unwrap();
+            assert_eq!(
+                BoundaryRuntime::discover_image_policy_from_paths(&paths),
+                Response::ImagePolicy {
+                    yaml: None,
+                    invalid: true
+                }
+            );
         }
 
         #[test]

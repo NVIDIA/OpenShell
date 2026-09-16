@@ -51,6 +51,7 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
