@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       install-version:
-        description: "GitHub release channel to install"
+        description: "Release version or artifact-backed prerelease to install"
         required: false
         type: string
         default: ""
@@ -37,6 +37,7 @@ defaults:
     shell: bash
 
 env:
+  GH_TOKEN: ${{ github.token }}
   OPENSHELL_VERSION: ${{ inputs.install-version || 'dev' }}
   OPENSHELL_TELEMETRY_ENABLED: "false"
   CHART_VERSION: ${{ inputs.chart-version || '0.0.0-dev' }}
@@ -111,7 +112,7 @@ jobs:
             --tmpfs /tmp \
             --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
             fedora:latest \
-            bash -lc 'dnf install -y curl dbus-daemon podman systemd && exec /usr/sbin/init'
+            bash -lc 'dnf install -y curl dbus-daemon gh podman systemd && exec /usr/sbin/init'
 
           for _ in $(seq 1 120); do
             if docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
@@ -169,6 +170,7 @@ jobs:
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            GH_TOKEN="$GH_TOKEN" \
             OPENSHELL_VERSION="$OPENSHELL_VERSION" \
             OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
             CANARY_SANDBOX="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

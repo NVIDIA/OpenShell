@@ -308,7 +308,6 @@ def _asset_url(release_tag: str, filename: str) -> str:
 def render_homebrew_formula(
     *,
     release_tag: str,
-    version: str | None = None,
     cli_sha256: str,
     gateway_sha256: str,
     driver_vm_sha256: str,
@@ -317,7 +316,7 @@ def render_homebrew_formula(
     if not _RELEASE_TAG_RE.fullmatch(release_tag):
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
-    version = version or release_tag.removeprefix("v")
+    version = release_tag.removeprefix("v")
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -496,7 +495,6 @@ end
 def generate_homebrew_formula(
     *,
     release_tag: str,
-    version: str | None,
     release_dir: Path,
     output: Path,
 ) -> None:
@@ -509,7 +507,6 @@ def generate_homebrew_formula(
 
     formula = render_homebrew_formula(
         release_tag=release_tag,
-        version=version,
         cli_sha256=_required_checksum(checksums, HOMEBREW_CLI_ASSET, checksums_path),
         gateway_sha256=_required_checksum(
             gateway_checksums,
@@ -577,10 +574,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="GitHub release tag that owns the formula assets.",
     )
     formula_parser.add_argument(
-        "--version",
-        help="Version recorded in the formula (defaults to the release tag without v).",
-    )
-    formula_parser.add_argument(
         "--release-dir",
         type=Path,
         required=True,
@@ -624,7 +617,6 @@ def main() -> None:
     elif args.command == "generate-homebrew-formula":
         generate_homebrew_formula(
             release_tag=args.release_tag,
-            version=args.version,
             release_dir=args.release_dir,
             output=args.output,
         )

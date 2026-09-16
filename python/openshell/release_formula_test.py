@@ -42,9 +42,7 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
             str(repo_root / "tasks/scripts/release.py"),
             "generate-homebrew-formula",
             "--release-tag",
-            "pre-0.1.0",
-            "--version",
-            "0.1.0-pre.3",
+            "v0.1.0-pre.3",
             "--release-dir",
             str(release_dir),
             "--output",
@@ -56,7 +54,7 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     formula = output.read_text(encoding="utf-8")
     assert (
         "https://github.com/NVIDIA/OpenShell/releases/download/"
-        "pre-0.1.0/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
+        "v0.1.0-pre.3/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'version "0.1.0-pre.3"' in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
