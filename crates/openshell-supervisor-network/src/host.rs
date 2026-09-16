@@ -6,7 +6,7 @@
 //!
 //! MXC uses this on Windows: MXC's `network.proxy` redirects sandbox egress to a
 //! per-sandbox loopback listener in the gateway process, and this module starts
-//! the existing OpenShell CONNECT proxy against the trimmed network-only
+//! the existing `OpenShell` CONNECT proxy against the trimmed network-only
 //! `SandboxPolicy`.
 
 use std::net::SocketAddr;
@@ -36,7 +36,7 @@ use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 
-/// Configuration for a host-side OpenShell CONNECT proxy.
+/// Configuration for a host-side `OpenShell` CONNECT proxy.
 pub struct HostProxyConfig {
     /// Exact socket the compute driver will redirect sandbox egress to.
     pub bind_addr: SocketAddr,
