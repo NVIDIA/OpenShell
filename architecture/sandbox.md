@@ -381,6 +381,8 @@ enhancement and out of scope.) Workload proxy variables are removed from the
 protected launch environment; transparent socket mediation does not depend on
 them.
 
+The canonical main process receives the declared workload environment before
+supervisor-only values are stripped and provider placeholders are injected.
 Template environment is treated like user-provided sandbox environment. It can
 shape the workload child, but it cannot override driver-controlled identity,
 gateway callback, TLS, relay socket, proxy, provider, or supervisor coordination
