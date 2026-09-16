@@ -193,6 +193,8 @@ same effective configuration path.
 
 The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
 
+After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
+
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;
