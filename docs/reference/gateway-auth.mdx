@@ -47,8 +47,14 @@ Set these environment variables before starting the gateway:
 
 For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost`, `127.0.0.1`, and `::1` in the certificate SANs when users connect to a local gateway through loopback.
 
-Package-managed local gateways generate this bundle automatically for the `openshell` gateway name. Homebrew registers `https://localhost:17670`; Debian and RPM use `https://127.0.0.1:17670`.
-When you register a package-managed local gateway with `openshell gateway add <endpoint> --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
+Homebrew, Debian, and RPM local gateways generate this bundle automatically for
+the `openshell` gateway name. Homebrew registers
+`https://localhost:17670`; Debian and RPM use
+`https://127.0.0.1:17670`. When you register one of these gateways with
+`openshell gateway add <endpoint> --local --name openshell`, the CLI refreshes
+its mTLS bundle from the package-managed TLS directory. The OpenShell Snap does
+not generate an mTLS client bundle by default; its gateway uses plaintext HTTP
+on the loopback-only `http://127.0.0.1:17670` endpoint.
 On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
 
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
@@ -270,7 +276,12 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 ### Plaintext
 
-When a gateway is deployed with `server.disableTls=true`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+When a gateway is deployed with `server.disableTls=true`, TLS is disabled
+entirely. The CLI connects over plain HTTP/2. This mode is intended for local
+port-forwarding or gateways behind a trusted reverse proxy or tunnel that
+handles TLS termination externally. The OpenShell Snap also uses plaintext by
+default: its wrapper sets `OPENSHELL_DISABLE_TLS=true` and the gateway remains
+bound to the loopback-only `127.0.0.1:17670` listener.
 
 Register a plaintext gateway with an explicit `http://` endpoint:
 

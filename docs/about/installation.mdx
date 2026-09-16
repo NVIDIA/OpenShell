@@ -104,7 +104,10 @@ The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
 systemd service. The gateway listens on `http://127.0.0.1:17670` and
 stores its database at `$SNAP_COMMON/gateway.db` (typically
 `/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
-when you need to override gateway settings.
+when you need to override gateway settings. The Snap wrapper sets
+`OPENSHELL_DISABLE_TLS=true` by default, so the Snap does not generate or
+install an mTLS client bundle. The plaintext listener remains bound to loopback
+and is not exposed on other host interfaces by default.
 
 The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
 typically `~/snap/openshell/common`. Gateway registrations live under
