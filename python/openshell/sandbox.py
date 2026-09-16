@@ -37,6 +37,8 @@ _ClientCallDetailsBase = namedtuple(
 )
 
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
+_PAGER_MAX_CONSUMED_TOKENS = 10_000
+_PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
 T = TypeVar("T")
 
 
@@ -49,12 +51,17 @@ class Page(Generic[T]):
 
 
 class Pager(Generic[T]):
-    """Lazy, single-pass iterator over the continuation-token contract."""
+    """Lazy, single-pass iterator over the continuation-token contract.
+
+    The repeated-token guard has bounded memory and raises ``SandboxError`` if
+    the traversal exceeds that guard's token-count or byte budget.
+    """
 
     def __init__(self, fetch: Callable[[str], Page[T]], page_token: str = "") -> None:
         self._fetch = fetch
         self._page_token: str | None = page_token
         self._consumed_page_tokens: set[str] = set()
+        self._consumed_page_token_bytes = 0
 
     def __iter__(self) -> Pager[T]:
         return self
@@ -65,7 +72,15 @@ class Pager(Generic[T]):
         page_token = self._page_token
         page = self._fetch(page_token)
         if page_token:
+            token_bytes = len(page_token.encode("utf-8"))
+            if (
+                len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
+                or self._consumed_page_token_bytes + token_bytes
+                > _PAGER_MAX_CONSUMED_TOKEN_BYTES
+            ):
+                raise SandboxError("pager continuation token history limit exceeded")
             self._consumed_page_tokens.add(page_token)
+            self._consumed_page_token_bytes += token_bytes
         next_page_token = page.next_page_token
         if next_page_token and next_page_token in self._consumed_page_tokens:
             raise SandboxError("pager received a repeated continuation token")
