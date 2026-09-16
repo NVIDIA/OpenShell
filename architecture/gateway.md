@@ -53,6 +53,15 @@ The gateway validates this requirement before constructing the selected driver.
 
 ## Protocol and Auth
 
+Gateway validation and concurrency errors use the standard rich gRPC error
+envelope. Shared field validators attach `google.rpc.BadRequest`, and conditional
+write conflicts attach `google.rpc.ErrorInfo` with a stable reason and current
+version when available. `google.rpc.RetryInfo` expresses a minimum retry delay;
+it does not establish that a mutation is safe to repeat. SDKs retain the original
+transport status, metadata, and unknown details alongside decoded fields.
+SDK deletion waits recognize missing-resource status through typed error wrappers
+without suppressing other failures.
+
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
 clients present a certificate signed by the local deployment CA, and the
@@ -267,8 +276,13 @@ controlling Sandbox CR. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
-the sandbox record still exists. Older tokens are not server-revoked; shared
-deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+the sandbox record still exists. Each successful refresh atomically stores the
+new gateway-token ID in that sandbox record. The immediately consumed bearer
+can recover that same successor for 30 seconds when the request matches, but it
+cannot authorize ordinary RPCs or choose another successor. Advancing the
+successor removes that retry path across every gateway replica. Short
+`gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
+that has not yet been refreshed.
 Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
 single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
 Kubernetes and other shared deployments should set a positive TTL. Explicit
@@ -348,16 +362,36 @@ Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
 generates these types separately, so the public descriptor set and the Rust,
 Go, Python, and TypeScript client generation inputs do not advertise them.
+When a frozen scalar storage field cannot distinguish absence from its zero
+value, gateway-owned object metadata annotations carry that presence bit rather
+than extending the frozen message.
 
 | Storage classification | Protobuf messages | Durable use |
 |---|---|---|
-| Encoded storage roots | `StoredProviderCredentialRefreshState`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. |
+| Encoded storage roots | `StoredProviderCredentialRefreshStateV2`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. The frozen V1 refresh state remains available only for transactional upgrade decoding. |
 | Nested storage-only type | `StoredRefreshMaterialDeletion` | Repeated child records inside provider refresh state. |
 | SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
 | Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The descriptor-derived test inventories the complete message and enum closure of the encoded durable roots and its intersection with the public RPC closure. The tables here record the reviewed roots and classifications.
+
+Public delete, membership-removal, and SSH-revocation responses use
+`DeletionOutcome`, not a transport-success boolean. `COMPLETED` establishes
+logical gateway deletion or revocation; it does not guarantee that downstream
+platform garbage collection has finished. Sandbox deletion returns `ACCEPTED`
+while its captured object ID remains in the store, and returns that ID so callers
+can distinguish the original sandbox from a same-name replacement. Identity-aware
+SDK deletion waits complete on absence or a different observed ID; name-only waits
+continue until the name is absent. The existing owned deletion worker continues
+after request cancellation.
+
+Missing targets return `NOT_FOUND` unless `allow_missing` explicitly requests
+`ALREADY_ABSENT`. Authorization, parent resolution, preconditions, and backend
+failures remain errors. Already-revoked sessions complete without another write
+after current authorization. The removed response booleans are reserved by name
+and number; this coordinated pre-1.0 API change does not alter durable schemas.
+It does not add request deduplication or identity preconditions for later retries.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
@@ -431,6 +465,19 @@ For in-memory SQLite, the adapter retains a dedicated keepalive connection for
 the store lifetime. Operational connection replacement therefore preserves the
 shared in-memory schema and objects instead of creating an empty database.
 
+Public protobuf APIs represent absolute times with `google.protobuf.Timestamp`
+and elapsed time with `google.protobuf.Duration`. The integer
+`created_at_ms` and `updated_at_ms` database columns are intentionally internal
+bookkeeping values, not part of that public convention. On startup, both
+storage backends transactionally rewrite legacy scalar time fields inside
+protobuf payloads before serving requests. A malformed affected payload aborts
+and rolls back startup migration. Legacy driver-provided condition strings that
+cannot be represented as timestamps are dropped so an accepted historical
+value cannot make the upgraded gateway unavailable.
+Gateway and Sandbox Protocol token responses follow the same convention: a
+present expiration timestamp carries the absolute deadline, while absence means
+the issued token does not expire.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is
@@ -456,6 +503,12 @@ credential driver is configured, gateways use server-owned encrypted database
 credential storage for defense in depth. Multi-replica deployments can use that
 default with a shared database and shared key-encryption key, or opt into an
 external backend such as Vault or Kubernetes Secrets.
+
+The Vault credential driver requires HTTPS for every non-loopback backend,
+never follows HTTP redirects, and keeps standard certificate hostname
+verification enabled. Operators can add private Vault trust roots with a PEM
+CA bundle; the driver does not replace platform roots or expose a certificate
+verification bypass.
 
 Sandbox workload templates are workspace-scoped gateway resources. Workspace
 admins create and delete them; workspace users can read and list them. A
@@ -893,7 +946,7 @@ system entry instead of pretending to delete package-manager owned state.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration. Local Docker, Podman, and VM callback endpoints can
   be derived from their fixed host aliases. Kubernetes requires an explicit
-  endpoint from deployment topology; Helm renders it from the gateway Service
+  endpoint from driver placement; Helm renders it from the gateway Service
   name and namespace rather than inferring it from sandbox placement.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback

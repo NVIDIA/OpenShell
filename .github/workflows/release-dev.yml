@@ -99,18 +99,18 @@ jobs:
       image-tag: dev
     secrets: inherit
 
-  build-sandbox:
+  build-runtimes:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-sandbox-binaries.yml
+    uses: ./.github/workflows/build-runtime-binaries.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: dev
     secrets: inherit
 
   build-vm-driver:
-    needs: [compute-versions, build-sandbox]
+    needs: [compute-versions, build-runtimes]
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
@@ -120,7 +120,7 @@ jobs:
     secrets: inherit
 
   package-binaries:
-    needs: [build-cli, build-gateway, build-sandbox, build-vm-driver]
+    needs: [build-cli, build-gateway, build-runtimes, build-vm-driver]
     permissions:
       actions: read
       contents: read
@@ -138,20 +138,32 @@ jobs:
       target-suffix: unknown-linux-gnu
     secrets: inherit
 
+  build-sandbox-image:
+    needs: build-runtimes
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+    secrets: inherit
+
   build-supervisor-image:
-    needs: build-sandbox
+    needs: build-runtimes
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: supervisor
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
+      binary: openshell-supervisor
+      target-suffix: unknown-linux-gnu
     secrets: inherit
 
   docker-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -163,7 +175,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -185,7 +197,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway-image, build-supervisor-image, release-dev]
+    needs: [build-gateway-image, build-sandbox-image, build-supervisor-image, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -196,7 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway supervisor; do
+          for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
               --prefer-index=false \
@@ -253,7 +265,7 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-cli, build-gateway, build-sandbox]
+    needs: [compute-versions, build-cli, build-gateway, build-runtimes]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
@@ -281,6 +293,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: ubuntu-20.04-binaries-amd64
+            runner: linux-amd64-cpu8
+            image: ubuntu:20.04
+            kind: binary
+            artifact_arch: amd64
+            target: x86_64-unknown-linux-gnu
+            sandbox_target: x86_64-unknown-linux-musl
+          - name: ubuntu-20.04-binaries-arm64
+            runner: linux-arm64-cpu8
+            image: ubuntu:20.04
+            kind: binary
+            artifact_arch: arm64
+            target: aarch64-unknown-linux-gnu
+            sandbox_target: aarch64-unknown-linux-musl
           - name: ubuntu-22.04-deb-amd64
             runner: linux-amd64-cpu8
             image: ubuntu:22.04
@@ -313,6 +339,30 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
+      - name: Download sandbox binary artifact
+        if: matrix.kind == 'binary'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sandbox-binary-linux-${{ matrix.artifact_arch }}
+          path: runtime-input/
+
+      - name: Download supervisor binary artifact
+        if: matrix.kind == 'binary'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: supervisor-binary-linux-${{ matrix.artifact_arch }}
+          path: runtime-input/
+
+      - name: Smoke runtime binary artifacts
+        if: matrix.kind == 'binary'
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-bin
+          tar -xzf "runtime-input/openshell-sandbox-${{ matrix.sandbox_target }}.tar.gz" -C runtime-bin
+          tar -xzf "runtime-input/openshell-supervisor-${{ matrix.target }}.tar.gz" -C runtime-bin
+          runtime-bin/openshell-sandbox --version
+          LD_BIND_NOW=1 runtime-bin/openshell-supervisor --version
+
       - name: Download Debian package artifact
         if: matrix.kind == 'deb'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -403,6 +453,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download sandbox binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sandbox-binary-*
+          path: release/
+          merge-multiple: true
+
       - name: Download VM driver artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -479,7 +536,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum \
+          sha256sum -- \
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
@@ -490,15 +547,19 @@ jobs:
             openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
-          sha256sum \
+          sha256sum -- \
             openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
             openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
             openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
           cat openshell-gateway-checksums-sha256.txt
-          sha256sum \
+          sha256sum -- \
             openshell-sandbox-x86_64-unknown-linux-musl.tar.gz \
             openshell-sandbox-aarch64-unknown-linux-musl.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
+          sha256sum -- \
+            openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz > openshell-supervisor-checksums-sha256.txt
+          cat openshell-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
         run: |
@@ -604,6 +665,8 @@ jobs:
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
@@ -612,6 +675,7 @@ jobs:
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
+            release/openshell-supervisor-checksums-sha256.txt
 
   release-helm:
     name: Release Helm Chart (OCI, dev)

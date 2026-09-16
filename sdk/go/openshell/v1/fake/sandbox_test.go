@@ -215,7 +215,7 @@ func TestSandbox_Delete(t *testing.T) {
 
 	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
 
-	err := sc.Delete(ctx, "default", "test-sb")
+	_, err := sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
 
 	_, err = sc.Get(ctx, "default", "test-sb")
@@ -227,8 +227,8 @@ func TestSandbox_Delete_Idempotent(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	// Delete non-existent sandbox should not error
-	err := sc.Delete(ctx, "default", "nonexistent")
+	// Explicitly allow a missing target.
+	_, err := sc.Delete(ctx, "default", "nonexistent", types.DeleteOptions{AllowMissing: true})
 	require.NoError(t, err)
 }
 
@@ -417,7 +417,7 @@ func TestSandbox_Watch_DeletedOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	err = sc.Delete(ctx, "default", "test-sb")
+	_, err = sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
 
 	select {
@@ -523,7 +523,7 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	_ = sc.Delete(ctx, "default", "test-sb")
+	_, _ = sc.Delete(ctx, "default", "test-sb")
 
 	select {
 	case ev := <-w.ResultChan():
@@ -569,7 +569,7 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 				_, _ = sc.Get(ctx, "default", name)
 				_, _ = sc.ListAll(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
-				_ = sc.Delete(ctx, "default", name)
+				_, _ = sc.Delete(ctx, "default", name)
 			}
 		}(i)
 	}

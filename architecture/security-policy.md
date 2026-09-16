@@ -32,6 +32,25 @@ mapper rejects those otherwise-unenforceable combinations.
 Filesystem, process, and UI policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+### Authored policy boundary
+
+`openshell-policy-schema` is the sole owner of the authored YAML and JSON
+representation. It preserves authored distinctions such as an absent
+`filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
+and applies parser budgets while noyalib constructs the document. It also owns
+pure language semantics such as access presets, MCP revision vocabulary,
+effective ports and rule names, protocol classification, and lexical policy
+path normalization.
+
+Consumers project that syntax into purpose-specific models. `openshell-policy`
+owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
+validation that depends on runtime components. The existing prover retains its
+risk model but uses the same fail-closed parser as the runtime. The parser
+requires `version: 1` and rejects managed annotations and every unknown field
+before any consumer-specific projection runs. There is no permissive parsing
+profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
+parameter names are open user-data maps rather than schema extensions.
+
 The UI schema names portable capabilities rather than Windows primitives:
 graphical output, directional clipboard access, and synthetic input. The
 configured compute driver advertises whether it completely enforces this
@@ -196,13 +215,15 @@ policy without provenance applies neither the raw-tunnel refusal nor the
 WebSocket binary-frame refusal. The request-body backstop still applies, because
 it keys off the presence of a secret resolver rather than endpoint provenance.
 
-Two paths load a policy without provenance. A supervisor booting from a
-container-image policy is a bounded window: that policy is resynchronized to the
-gateway, which then serves a stamped effective policy. An explicit local Rego and
-data override is permanent, because gateway revisions are observed for settings
-and providers but never replace the local policy. When that override is combined
-with injected provider credentials, the supervisor emits a high-severity
-detection finding at startup naming the inactive controls.
+Two supervisor-local paths load a policy without provenance. A supervisor
+booting from an explicitly provisioned policy file has a bounded window before
+that policy is resynchronized to the gateway, which then serves a stamped
+effective policy. An explicit supervisor Rego and data override is permanent,
+because gateway revisions are observed for settings and providers but never
+replace the local policy. Workload-image files and environment variables cannot
+configure the separately isolated supervisor. When a supervisor override is
+combined with injected provider credentials, the supervisor emits a
+high-severity detection finding at startup naming the inactive controls.
 
 ## Live Updates
 
@@ -212,6 +233,8 @@ gateway-global policy overrides and provider-profile policy layers. The
 supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
+
+The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
 
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and

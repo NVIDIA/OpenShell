@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Resolve tmachine UID
+  ansible.builtin.command:
+    argv:
+      - id
+      - -u
+      - tmachine
+  changed_when: false
+  register: openshell_tmachine_uid
+
+- name: Check Docker socket
+  become: true
+  ansible.builtin.stat:
+    path: /var/run/docker.sock
+  register: openshell_docker_socket
+
+- name: Check rootful Podman socket
+  become: true
+  ansible.builtin.stat:
+    path: /run/podman/podman.sock
+  register: openshell_rootful_podman_socket
+
+- name: Check rootless Podman socket
+  become: true
+  ansible.builtin.stat:
+    path: "/run/user/{{ openshell_tmachine_uid.stdout }}/podman/podman.sock"
+  register: openshell_rootless_podman_socket
+
+- name: Require exactly one container runtime socket
+  ansible.builtin.assert:
+    that:
+      - >-
+        (openshell_docker_socket.stat.exists | int)
+        + (openshell_rootful_podman_socket.stat.exists | int)
+        + (openshell_rootless_podman_socket.stat.exists | int) == 1
+    fail_msg: Expected exactly one Docker or Podman socket
+
+- name: Select container runtime
+  ansible.builtin.set_fact:
+    openshell_gateway_driver: "{{ 'docker' if openshell_docker_socket.stat.exists else 'podman' }}"
+    openshell_gateway_user: "{{ 'root' if openshell_rootful_podman_socket.stat.exists else 'tmachine' }}"
+    openshell_gateway_home: "{{ '/root' if openshell_rootful_podman_socket.stat.exists else '/home/tmachine' }}"
+    openshell_gateway_uid: "{{ '0' if openshell_rootful_podman_socket.stat.exists else openshell_tmachine_uid.stdout }}"
+    openshell_gateway_bind_address: "{{ '127.0.0.1:17670' if openshell_docker_socket.stat.exists else '0.0.0.0:17670' }}"
+    openshell_runtime_socket: >-
+      {{ '/var/run/docker.sock' if openshell_docker_socket.stat.exists
+         else '/run/podman/podman.sock' if openshell_rootful_podman_socket.stat.exists
+         else '/run/user/' ~ openshell_tmachine_uid.stdout ~ '/podman/podman.sock' }}

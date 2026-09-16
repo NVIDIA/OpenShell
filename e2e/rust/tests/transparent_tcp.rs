@@ -356,7 +356,7 @@ print('transparent-tcp-e2e-ok')
 
     let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
         logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}"))
-            && logs.contains("transparent_tcp_port_mismatch")
+            && logs.contains("Denied staged transparent connection")
     })
     .await
     .expect("wait for sandbox logs");
@@ -364,7 +364,10 @@ print('transparent-tcp-e2e-ok')
         logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}")),
         "{logs}"
     );
-    assert!(logs.contains("transparent_tcp_port_mismatch"), "{logs}");
+    assert!(
+        logs.contains("Denied staged transparent connection"),
+        "{logs}"
+    );
 
     sandbox.cleanup().await;
 }

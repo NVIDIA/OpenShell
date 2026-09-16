@@ -45,6 +45,7 @@
           overlays = [ (import rust-overlay) ];
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
+        tmachineRuntimePkgs = if pkgs.stdenv.hostPlatform.isDarwin then testGuestPkgs else pkgs;
         commonDevShellPackages = with pkgs; [
           actionlint
           cargo-auditable
@@ -67,6 +68,10 @@
           zizmor
           zstd
         ];
+        commonDevShell = {
+          packages = [ rustToolchain ] ++ commonDevShellPackages;
+          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+        };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -114,17 +119,63 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
+        testMachines = import ./tests/config.nix {
+          inherit pkgs toolchains;
+          qemuPkgs = tmachineRuntimePkgs;
+          firmwarePkgs = tmachineRuntimePkgs;
+        };
+        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
       in
       {
-        apps.test-guest = testGuest.app;
-        apps.test-guest-cache = testGuest.cacheApp;
+        apps = {
+          build-artifacts = {
+            type = "app";
+            program = "${artifacts.all}/bin/build-artifacts";
+          };
+          build-artifacts-binaries = {
+            type = "app";
+            program = "${artifacts.binaries}/bin/build-artifacts-binaries";
+          };
+          build-artifacts-test-archives = {
+            type = "app";
+            program = "${artifacts.conformanceCliArchive}/bin/build-openshell-conformance-test-archive";
+          };
+          build-artifacts-helm = {
+            type = "app";
+            program = "${artifacts.helm}/bin/build-artifacts-helm";
+          };
+          build-artifacts-images = {
+            type = "app";
+            program = "${artifacts.images}/bin/build-artifacts-images";
+          };
+          test-guest = testGuest.app;
+          test-guest-cache = testGuest.cacheApp;
+        };
 
-        packages.vm-runtime = vmRuntime;
+        packages = {
+          vm-runtime = vmRuntime;
+          tmachine = testMachines.package;
+          tmachine-config = testMachines.config;
+          tmachine-unwrapped = testMachines.unwrapped;
+        };
 
-        devShells.default = pkgs.mkShellNoCC {
-          packages = [ rustToolchain ] ++ commonDevShellPackages;
+        devShells = {
+          default = pkgs.mkShellNoCC commonDevShell;
 
-          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+          testing = pkgs.mkShellNoCC (
+            commonDevShell
+            // {
+              packages = commonDevShell.packages ++ [
+                pkgs.ansible
+                pkgs.sshpass
+                testMachines.package
+              ];
+
+              shellHook = ''
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+              '';
+            }
+          );
         };
 
         formatter = treefmtEval.config.build.wrapper;

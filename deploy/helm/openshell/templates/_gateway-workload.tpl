@@ -119,6 +119,11 @@ spec:
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
         {{- end }}
+        {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+        - name: vault-ca
+          mountPath: /etc/openshell-tls/vault-ca
+          readOnly: true
+        {{- end }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
         - name: spiffe-workload-api
           mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
@@ -195,6 +200,14 @@ spec:
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}
+    {{- end }}
+    {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+    - name: vault-ca
+      configMap:
+        name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
     {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     - name: spiffe-workload-api

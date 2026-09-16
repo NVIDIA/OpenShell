@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Share vendored-schema assertions with producer regression tests.
+test-support = []
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 serde = { workspace = true }

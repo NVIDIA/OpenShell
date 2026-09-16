@@ -56,7 +56,7 @@ on:
         description: "mise version to install on the bare Kubernetes e2e runner"
         required: false
         type: string
-        default: "v2026.4.25"
+        default: "v2026.9.9"
       gateway-artifact:
         description: "Optional prebuilt gateway artifact used to compose a local test image"
         required: false
@@ -76,7 +76,7 @@ on:
         description: "Space-separated published images to preload into kind"
         required: false
         type: string
-        default: "gateway supervisor"
+        default: "gateway sandbox supervisor"
 
 permissions:
   actions: read

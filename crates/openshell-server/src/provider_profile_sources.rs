@@ -200,10 +200,14 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
     ) -> Result<ProviderProfileSnapshot, Status> {
         let InterceptorProfileSnapshot { revision, profiles } =
             Self::snapshot(self).await.map_err(|err| {
-                Status::unavailable(format!(
-                    "provider profile source '{}' snapshot failed: {err}",
-                    self.source_id()
-                ))
+                openshell_core::rpc_error::unavailable(
+                    "PROFILE_SOURCE_UNAVAILABLE",
+                    format!(
+                        "provider profile source '{}' snapshot failed: {err}",
+                        self.source_id()
+                    ),
+                    std::time::Duration::from_secs(1),
+                )
             })?;
         let profiles = profiles
             .into_iter()
@@ -776,12 +780,12 @@ pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfil
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile.id.clone(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: String::new(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         profile: Some(profile),
     }
@@ -1634,12 +1638,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: proto.id.clone(),
-                created_at_ms: now_ms,
+                created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: workspace.to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(proto),
         }

@@ -22,6 +22,7 @@ CANDIDATE_SHA = "2" * 40
 IMAGE_ID = "3" * 64
 IMAGE_DIGEST = f"sha256:{'4' * 64}"
 RUNTIME_IMAGE = f"localhost/openshell/supervisor@{IMAGE_DIGEST}"
+BOUNDARY_IMAGE = f"localhost/openshell/sandbox@{IMAGE_DIGEST}"
 BASE_RUNTIME_IMAGE = f"docker.io/library/alpine@{IMAGE_DIGEST}"
 
 
@@ -126,6 +127,7 @@ socket_path = "/tmp/{variant}.sock"
             "sandbox_image_id": IMAGE_ID,
             "sandbox_image_digest": IMAGE_DIGEST,
             "sandbox_runtime_image": "example.invalid/sandbox@" + IMAGE_DIGEST,
+            "sandbox_boundary_image": BOUNDARY_IMAGE,
             "sandbox_client_image_alias": "example.invalid/sandbox:latest",
             "sandbox_client_image_alias_id": IMAGE_ID,
             "gateway_sha256_before_execution": result["gateway_sha256"],
@@ -146,6 +148,7 @@ socket_path = "/tmp/{variant}.sock"
             "external_driver_proxy": False,
             "external_driver_app_armor": False,
             "external_driver_environment": {
+                "XDG_DATA_HOME": f"/tmp/{variant}-driver-data",
                 "OPENSHELL_COMPUTE_DRIVER_SOCKET": f"/tmp/{variant}.sock",
                 "OPENSHELL_PODMAN_SOCKET": f"/tmp/{variant}-podman.sock",
                 "OPENSHELL_SANDBOX_IMAGE": "example.invalid/sandbox@" + IMAGE_DIGEST,
@@ -155,6 +158,7 @@ socket_path = "/tmp/{variant}.sock"
                 "OPENSHELL_GATEWAY_PORT": 18181,
                 "OPENSHELL_NETWORK_NAME": f"{variant}-network",
                 "OPENSHELL_STOP_TIMEOUT": 15,
+                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": BOUNDARY_IMAGE,
                 "OPENSHELL_SUPERVISOR_IMAGE": RUNTIME_IMAGE,
                 "OPENSHELL_PODMAN_TLS_CA": {
                     "path": f"/tmp/{variant}-pki/ca.crt",
@@ -178,7 +182,7 @@ socket_path = "/tmp/{variant}.sock"
     (results_dir / f"{variant}.log").write_text(
         f"CLI conformance run ID: fixture\n"
         f"gateway preflight connected: gateway=fixture, authentication=authenticated\n"
-        f"{lifecycle}\n{RUNTIME_IMAGE} {BASE_RUNTIME_IMAGE} example.invalid/sandbox@{IMAGE_DIGEST} example.invalid/sandbox:latest "
+        f"{lifecycle}\n{RUNTIME_IMAGE} {BOUNDARY_IMAGE} {BASE_RUNTIME_IMAGE} example.invalid/sandbox@{IMAGE_DIGEST} example.invalid/sandbox:latest "
         f'{IMAGE_ID} {IMAGE_DIGEST} {package_hash}\n"passed": true\n',
         encoding="utf-8",
     )

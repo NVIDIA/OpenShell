@@ -30,9 +30,9 @@ gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="
 gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
 ```
 
-If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof"}` so the supervisor retries soon.
+If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof","notes":"GitHub transport failed after policy allowed the request. The supervisor should retry without changing the PR state."}` so the supervisor retries soon.
 
-If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed"}` so the supervisor retries after the operator or provider issue clears.
+If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed","notes":"The reviewer did not produce usable feedback, so no PR state was changed. The supervisor should retry the review."}` so the supervisor retries after the operator or provider issue clears.
 
 ## Authority Rules
 
@@ -181,7 +181,7 @@ Thread resolution is required housekeeping for an addressed inline finding,
 not a new review disposition, and does not consume the one-disposition-per-head
 SHA slot. If GitHub does not confirm every requested resolution, do not advance
 the Gator state or post the follow-up disposition. Return
-`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed"}`
+`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed","notes":"GitHub did not confirm every requested Gator thread resolution. Retry reconciliation before advancing the PR state."}`
 and retry the reconciliation later.
 
 ## Labels
@@ -382,7 +382,7 @@ For closed-unmerged PRs:
 
 For closed or merged PRs that have no active `gator:*` label and already have a monitoring-complete gator comment, take no GitHub write action.
 
-In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged"}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed"}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
+In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged","notes":"The monitored PR was merged, so Gator monitoring is complete."}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed","notes":"The monitored PR was closed without merging, so Gator monitoring is complete."}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
 
 ## Watch Loop Rules
 
@@ -391,10 +391,10 @@ Every gator state is a watch state. On each invocation, determine the current st
 When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running on the current head. Gator will inspect the results next cycle."}
 ```
 
-Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
+Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. Every sentinel must include `notes`: one or two concise, plain-language sentences that summarize the current diagnosis, identify any notable issue or unanswered question, and state the next useful action or owner. Make the notes understandable when read aloud. Do not repeat mechanical metadata, dump raw logs, or include secrets. The supervisor will persist the result, sleep, and invoke the harness again with fresh GitHub state.
 
 When not running under supervised watch mode, do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
 
@@ -920,6 +920,8 @@ Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavio
 
 Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
 
+Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
+
 After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
 
 If a mirror is missing or stale and you have maintainer authority, post:
@@ -964,6 +966,7 @@ Required gates include at least:
 - `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
 - `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+- Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
 

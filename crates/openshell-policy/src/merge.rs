@@ -2064,21 +2064,14 @@ fn expand_existing_access(
 }
 
 fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
-    let methods = match (protocol, access) {
-        (_, "full") => vec!["*"],
-        ("websocket", "read-only") => vec!["GET"],
-        ("websocket", "read-write") => vec!["GET", "WEBSOCKET_TEXT"],
-        (_, "read-only") => vec!["GET", "HEAD", "OPTIONS"],
-        (_, "read-write") => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
-        _ => return None,
-    };
+    let methods = openshell_policy_schema::expand_access_preset(protocol, access)?;
 
     Some(
         methods
-            .into_iter()
+            .iter()
             .map(|method| L7Rule {
                 allow: Some(L7Allow {
-                    method: method.to_string(),
+                    method: (*method).to_string(),
                     path: "**".to_string(),
                     command: String::new(),
                     query: HashMap::default(),

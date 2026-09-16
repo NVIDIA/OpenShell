@@ -12,6 +12,7 @@ package sandboxv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	reflect "reflect"
 	sync "sync"
@@ -806,7 +807,6 @@ type NetworkEndpoint struct {
 	// When non-empty, the SSRF internal-IP check is replaced by an allowlist check:
 	//   - If host is also set: domain must resolve to an IP in this list.
 	//   - If host is empty: any domain is allowed as long as it resolves to an IP in this list.
-	//
 	// Supports exact IPs ("10.0.5.20") and CIDR notation ("10.0.5.0/24").
 	// Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) are always blocked
 	// regardless of this field.
@@ -2092,10 +2092,9 @@ type SupervisorMiddlewareService struct {
 	// Operator-owned logical payload limit applied to every binding exposed by
 	// the service. This caps HTTP bodies and complete WebSocket messages.
 	MaxPayloadBytes uint64 `protobuf:"varint,3,opt,name=max_payload_bytes,json=maxPayloadBytes,proto3" json:"max_payload_bytes,omitempty"`
-	// Default RPC timeout for this service. Empty uses the platform default of
-	// 500ms. Values use an integer with an `ms` or `s` suffix and must be
-	// between 10ms and 30s.
-	Timeout string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	// Default RPC timeout for this service. Absence uses the platform default of
+	// 500ms. Values must be between 10ms and 30s.
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,104,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// PEM-encoded trust roots loaded by the gateway from the operator-configured
 	// tls_ca_cert_path. Empty uses the platform trust store.
 	TlsCaCertPem []byte `protobuf:"bytes,5,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
@@ -2163,11 +2162,11 @@ func (x *SupervisorMiddlewareService) GetMaxPayloadBytes() uint64 {
 	return 0
 }
 
-func (x *SupervisorMiddlewareService) GetTimeout() string {
+func (x *SupervisorMiddlewareService) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.Timeout
+		return x.RequestTimeout
 	}
-	return ""
+	return nil
 }
 
 func (x *SupervisorMiddlewareService) GetTlsCaCertPem() []byte {
@@ -2195,7 +2194,7 @@ var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
 	"\n" +
-	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\"\xd8\x05\n" +
+	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\"\xd8\x05\n" +
 	"\rSandboxPolicy\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12F\n" +
 	"\n" +
@@ -2368,15 +2367,15 @@ const file_sandbox_proto_rawDesc = "" +
 	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
-	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12\x18\n" +
-	"\atimeout\x18\x04 \x01(\tR\atimeout\x12%\n" +
+	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12B\n" +
+	"\x0frequest_timeout\x18h \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12%\n" +
 	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
 	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
-	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport*\xb0\x01\n" +
+	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransportJ\x04\b\x04\x10\x05R\atimeout*\xb0\x01\n" +
 	"\x11UiClipboardAccess\x12#\n" +
 	"\x1fUI_CLIPBOARD_ACCESS_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18UI_CLIPBOARD_ACCESS_NONE\x10\x01\x12\x1c\n" +
@@ -2444,6 +2443,7 @@ var file_sandbox_proto_goTypes = []any{
 	nil,                                 // 34: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
 	nil,                                 // 35: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	(*structpb.Struct)(nil),             // 36: google.protobuf.Struct
+	(*durationpb.Duration)(nil),         // 37: google.protobuf.Duration
 }
 var file_sandbox_proto_depIdxs = []int32{
 	4,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
@@ -2474,20 +2474,21 @@ var file_sandbox_proto_depIdxs = []int32{
 	35, // 25: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	2,  // 26: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
 	26, // 27: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	8,  // 28: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	9,  // 29: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
-	14, // 30: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	18, // 31: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	18, // 32: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	18, // 33: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	18, // 34: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	23, // 35: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	24, // 36: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	37, // [37:37] is the sub-list for method output_type
-	37, // [37:37] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	37, // 28: openshell.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
+	8,  // 29: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	9,  // 30: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
+	14, // 31: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
+	18, // 32: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	18, // 33: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	18, // 34: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	18, // 35: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	23, // 36: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
+	24, // 37: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	38, // [38:38] is the sub-list for method output_type
+	38, // [38:38] is the sub-list for method input_type
+	38, // [38:38] is the sub-list for extension type_name
+	38, // [38:38] is the sub-list for extension extendee
+	0,  // [0:38] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }

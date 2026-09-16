@@ -420,7 +420,7 @@ fn dryrun_rejects_unknown_containment() {
 }
 
 /// The most important dry-run test: build a typed Windows policy, run
-/// `split_policy` (proxy_redirect 127.0.0.1:18080, containment
+/// `split_policy` (`proxy_redirect` 127.0.0.1:18080, containment
 /// "processcontainer"), and verify the resulting config with `--dry-run`.
 ///
 /// This proves that the mapper's emitted JSON is accepted by the real binary —
@@ -494,10 +494,7 @@ fn dryrun_accepts_split_policy_output() {
 fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     // Abort early if the mock env var is set — a stale OPENSHELL_MXC_MOCK_WXC
     // would silently turn this "real" run back into a mock run.
-    if std::env::var("OPENSHELL_MXC_MOCK_WXC")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|value| value == "1") {
         return Err(
             "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
                 .to_string(),
@@ -543,16 +540,17 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
         || combined.contains("not enabled")
     {
         // Extract the message if possible for a more useful skip reason.
-        let reason = if let Ok(v) =
+        let reason =
             serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
-        {
-            v["error"]["message"]
-                .as_str()
-                .unwrap_or("backend_error (E_NOTIMPL)")
-                .to_string()
-        } else {
-            "backend_error (velocity keys not enabled)".to_string()
-        };
+                .map_or_else(
+                    |_| "backend_error (velocity keys not enabled)".to_string(),
+                    |value| {
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap_or("backend_error (E_NOTIMPL)")
+                            .to_string()
+                    },
+                );
         return Err(reason);
     }
 
@@ -569,7 +567,7 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
 }
 
 /// Probe the released binary's live `network.proxy` support separately from
-/// ordinary ProcessContainer support. Some builds accept the proxy JSON during
+/// ordinary `ProcessContainer` support. Some builds accept the proxy JSON during
 /// `--dry-run` but return `ERROR_INVALID_PARAMETER` from the live launcher.
 fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
     let (_tempdir, temp_path) = temp_fixture();
@@ -620,15 +618,12 @@ fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
     ))
 }
 
-/// Probe the isolation_session backend.
+/// Probe the `isolation_session` backend.
 ///
 /// Attempts a `provision` phase. Returns `Ok(sandbox_id)` when live, or
 /// `Err(reason)` when the backend is unavailable (caller prints SKIP).
 fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
-    if std::env::var("OPENSHELL_MXC_MOCK_WXC")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|value| value == "1") {
         return Err(
             "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
                 .to_string(),
@@ -815,9 +810,9 @@ fn pc_oneshot_in_policy_write_succeeds() {
     );
 }
 
-/// Run an HTTPS request through the real driver and ProcessContainer. The
+/// Run an HTTPS request through the real driver and `ProcessContainer`. The
 /// workload explicitly reads the injected bundle before curl uses it, proving
-/// that the driver's internal TLS share is reachable from the AppContainer.
+/// that the driver's internal TLS share is reachable from the `AppContainer`.
 #[tokio::test]
 #[ignore = "requires real wxc-exec and outbound HTTPS"]
 async fn pc_https_egress_reads_injected_ca_bundle() {
@@ -890,10 +885,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: cmd_string,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: cmd_string }],
             },
         )]),
         ..Default::default()
@@ -968,7 +960,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
 }
 
 /// Write to a path OUTSIDE the granted dir; assert exit non-zero and file absent.
-/// This is the genuine OS default-deny proof — the AppContainer blocks the write
+/// This is the genuine OS default-deny proof — the `AppContainer` blocks the write
 /// without requiring any host ACL lockdown. The mock can only fake this.
 #[test]
 #[ignore = "requires real wxc-exec"]
@@ -1038,7 +1030,7 @@ fn pc_oneshot_out_of_policy_write_denied() {
 
 // ── Isolation session enforcement tests ──────────────────────────────────────
 
-/// Full isolation_session round trip: provision → start → exec → stop →
+/// Full `isolation_session` round trip: provision → start → exec → stop →
 /// deprovision. `deprovision` runs in a drop-guard even on panic so the
 /// single-session backend is never left orphaned.
 #[test]

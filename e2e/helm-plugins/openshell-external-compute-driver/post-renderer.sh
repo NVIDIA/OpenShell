@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Helm post-renderer for the external Kubernetes compute-driver smoke test.
-# It keeps the test-only sidecar and Unix socket plumbing out of the chart.
+# It keeps the test-only external-driver container and Unix socket plumbing out
+# of the chart.
 
 set -euo pipefail
 

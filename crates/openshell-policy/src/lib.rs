@@ -5,9 +5,9 @@
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
-//! The serde types here are the **single canonical representation** of the YAML
-//! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
-//! these types, ensuring round-trip fidelity.
+//! The canonical authored representation and bounded parser live in
+//! `openshell-policy-schema`; this crate adapts that representation to the
+//! runtime protobuf model and owns runtime-dependent validation.
 
 mod compose;
 mod l7_validate;
@@ -31,7 +31,6 @@ use openshell_core::proto::{
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy, UiClipboardAccess, UiPolicy,
 };
-use serde::{Deserialize, Deserializer, Serialize};
 
 pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
@@ -49,291 +48,41 @@ pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
 pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
-// ---------------------------------------------------------------------------
-// YAML serde types (canonical — used for both parsing and serialization)
-// ---------------------------------------------------------------------------
+// The authored serde tree lives in `openshell-policy-schema`. These local
+// aliases keep the protobuf adapter readable while exposing consumer-facing
+// names from the schema crate.
+use openshell_policy_schema::{
+    AnyMatcher as QueryAnyDef, FilesystemPolicy as FilesystemDef,
+    GraphqlOperation as GraphqlOperationDef, JsonRpcConfig as JsonRpcConfigDef,
+    L7Allow as L7AllowDef, L7DenyRule as L7DenyRuleDef, L7Rule as L7RuleDef,
+    LandlockCompatibility as LandlockCompatibilityDef, LandlockPolicy as LandlockDef,
+    MCP_VERSION_REMEDIATION, McpConfig as McpConfigDef, NetworkBinary as NetworkBinaryDef,
+    NetworkCredentialBinding as NetworkCredentialBindingDef, NetworkEndpoint as NetworkEndpointDef,
+    NetworkPolicyRule as NetworkPolicyRuleDef, ParameterMatcher as ParamMatcherDef,
+    PolicyDocument as PolicyFile, ProcessPolicy as ProcessDef, QueryMatcher as QueryMatcherDef,
+    UiClipboardAccess as UiClipboardAccessDef, UiPolicy as UiDef,
+};
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    filesystem_policy: Option<FilesystemDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    landlock: Option<LandlockDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process: Option<ProcessDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ui: Option<UiDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_middlewares: BTreeMap<String, middleware::NetworkMiddlewareConfigDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesystemDef {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_only: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LandlockCompatibilityDef {
-    #[default]
-    BestEffort,
-    HardRequirement,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LandlockDef {
-    #[serde(default)]
-    compatibility: LandlockCompatibilityDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_group: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UiDef {
-    #[serde(default, skip_serializing_if = "is_false")]
-    allow_graphical_ui: bool,
-    #[serde(default, skip_serializing_if = "UiClipboardAccessDef::is_none")]
-    clipboard: UiClipboardAccessDef,
-    #[serde(default, skip_serializing_if = "is_false")]
-    allow_input_injection: bool,
-}
-
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum UiClipboardAccessDef {
-    #[default]
-    None,
-    Read,
-    Write,
-    All,
-}
-
-impl UiClipboardAccessDef {
-    // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    const fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    const fn to_proto(self) -> UiClipboardAccess {
-        match self {
-            Self::None => UiClipboardAccess::None,
-            Self::Read => UiClipboardAccess::Read,
-            Self::Write => UiClipboardAccess::Write,
-            Self::All => UiClipboardAccess::All,
-        }
-    }
-
-    fn from_proto(value: i32) -> Self {
-        match UiClipboardAccess::try_from(value).unwrap_or(UiClipboardAccess::Unspecified) {
-            UiClipboardAccess::Unspecified | UiClipboardAccess::None => Self::None,
-            UiClipboardAccess::Read => Self::Read,
-            UiClipboardAccess::Write => Self::Write,
-            UiClipboardAccess::All => Self::All,
-        }
+const fn ui_clipboard_to_proto(value: UiClipboardAccessDef) -> UiClipboardAccess {
+    match value {
+        UiClipboardAccessDef::None => UiClipboardAccess::None,
+        UiClipboardAccessDef::Read => UiClipboardAccess::Read,
+        UiClipboardAccessDef::Write => UiClipboardAccess::Write,
+        UiClipboardAccessDef::All => UiClipboardAccess::All,
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkPolicyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    endpoints: Vec<NetworkEndpointDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "Endpoint DTO mirrors independent policy schema toggles."
-)]
-struct NetworkEndpointDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    host: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    /// Single port (backwards compat). Mutually exclusive with `ports`.
-    /// Uses `u16` to reject invalid values >65535 at parse time.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    port: u16,
-    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u16>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    enforcement: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    access: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<L7RuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_ips: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deny_rules: Vec<L7DenyRuleDef>,
-    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
-    /// rather than rejected by the L7 path canonicalizer. Required for
-    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
-    /// Defaults to false (strict).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_encoded_slash: bool,
-    /// When true, client-to-server WebSocket text messages on this REST
-    /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
-    /// Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    websocket_credential_rewrite: bool,
-    /// When true, supported textual REST request bodies rewrite credential
-    /// placeholders before forwarding upstream. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    request_body_credential_rewrite: bool,
-    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
-    /// inspect or rewrite. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_uninspected_credentials: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    persisted_queries: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    graphql_max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    credential_signing: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    signing_service: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    signing_region: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    credential_binding: Option<NetworkCredentialBindingDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    json_rpc: Option<JsonRpcConfigDef>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    mcp: Option<McpConfigDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkCredentialBindingDef {
-    provider: String,
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(v: &u16) -> bool {
-    *v == 0
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
-fn deserialize_non_null_optional_field<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    // Serde skips this function when the field is absent because the field has
-    // `default`. When it is present, deserialize `T` directly so an explicit
-    // YAML or JSON null is rejected instead of collapsing into omission.
-    T::deserialize(deserializer).map(Some)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonRpcConfigDef {
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    max_body_bytes: u32,
+fn ui_clipboard_from_proto(value: i32) -> UiClipboardAccessDef {
+    match UiClipboardAccess::try_from(value).unwrap_or(UiClipboardAccess::Unspecified) {
+        UiClipboardAccess::Unspecified | UiClipboardAccess::None => UiClipboardAccessDef::None,
+        UiClipboardAccess::Read => UiClipboardAccessDef::Read,
+        UiClipboardAccess::Write => UiClipboardAccessDef::Write,
+        UiClipboardAccess::All => UiClipboardAccessDef::All,
+    }
 }
 
 fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
     (max_body_bytes > 0).then_some(JsonRpcConfigDef { max_body_bytes })
-}
-
-// MCP rides the same HTTP/JSON-RPC inspection machinery at runtime, but it
-// gets its own policy stanza so user-authored YAML can name the primary
-// protocol instead of treating MCP as generic JSON-RPC.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct McpConfigDef {
-    // Presence is retained until authored-policy validation so an omitted
-    // allowlist can select the pinned default while an explicit empty list is
-    // rejected as an authoring mistake.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    versions: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    strict_tool_names: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    allow_all_known_mcp_methods: Option<bool>,
-}
-
-const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision, use an exact supported revision, or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
-
-fn validate_authored_mcp_versions(versions: Option<&[String]>, context: &str) -> Result<()> {
-    let Some(versions) = versions else {
-        return Ok(());
-    };
-    if versions.is_empty() {
-        return Err(miette::miette!(
-            "{context} has an empty mcp.versions list; omit mcp.versions to use the pinned default revision"
-        ));
-    }
-
-    let mut seen = BTreeSet::new();
-    for value in versions {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !seen.insert(version) {
-            return Err(miette::miette!(
-                "{context} has duplicate protocol version '{value}'"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn mcp_config_from_proto(max_body_bytes: u32, mcp: Option<&McpOptions>) -> Option<McpConfigDef> {
@@ -374,22 +123,16 @@ impl L7ConfigStanza {
     }
 }
 
-/// Parse an L7 nested config stanza and return the flattened runtime fields
-/// consumed by the supervisor policy engine.
-///
-/// The stanza schema stays tied to this crate's canonical serde definitions, so
-/// adding a new supported field requires updating this conversion next to the
-/// type that parses it. MCP revision fields are validated and materialized
-/// before the alias is flattened so both runtime ingress paths receive the
-/// same canonical allowlist.
+/// Parse an L7 config fragment using the canonical schema and return runtime
+/// fields consumed by the supervisor policy engine.
 pub fn l7_config_alias_runtime_fields(
     stanza: L7ConfigStanza,
     value: serde_json::Value,
 ) -> Result<Vec<(&'static str, serde_json::Value)>> {
     match stanza {
         L7ConfigStanza::JsonRpc => {
-            let JsonRpcConfigDef { max_body_bytes } = serde_json::from_value(value)
-                .map_err(|error| miette::miette!("invalid json_rpc config: {error}"))?;
+            let JsonRpcConfigDef { max_body_bytes } =
+                openshell_policy_schema::parse_json_rpc_config(value)?;
             let mut fields = Vec::new();
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
@@ -397,9 +140,7 @@ pub fn l7_config_alias_runtime_fields(
             Ok(fields)
         }
         L7ConfigStanza::Mcp => {
-            let config: McpConfigDef = serde_json::from_value(value)
-                .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
-            validate_authored_mcp_versions(config.versions.as_deref(), "invalid mcp config")?;
+            let config = openshell_policy_schema::parse_mcp_config(value)?;
             let McpConfigDef {
                 versions,
                 max_body_bytes,
@@ -408,126 +149,20 @@ pub fn l7_config_alias_runtime_fields(
             } = config;
             let mut versions = versions.unwrap_or_else(default_mcp_versions);
             canonicalize_mcp_versions(&mut versions);
-            let mut fields = Vec::new();
-            fields.push(("mcp_versions", serde_json::json!(versions)));
+            let mut fields = vec![("mcp_versions", serde_json::json!(versions))];
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
             }
-            if let Some(strict_tool_names) = strict_tool_names {
-                fields.push((
-                    "mcp_strict_tool_names",
-                    serde_json::json!(strict_tool_names),
-                ));
+            if let Some(value) = strict_tool_names {
+                fields.push(("mcp_strict_tool_names", serde_json::json!(value)));
             }
-            if let Some(allow_all_known_mcp_methods) = allow_all_known_mcp_methods {
-                fields.push((
-                    "mcp_allow_all_known_mcp_methods",
-                    serde_json::json!(allow_all_known_mcp_methods),
-                ));
+            if let Some(value) = allow_all_known_mcp_methods {
+                fields.push(("mcp_allow_all_known_mcp_methods", serde_json::json!(value)));
             }
             Ok(fields)
         }
     }
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlOperationDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7AllowDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum QueryMatcherDef {
-    // Short form: `query: { repo: "NVIDIA/*" }`.
-    Glob(String),
-    // Expanded form: `query: { repo: { any: ["NVIDIA/*", "openai/*"] } }`.
-    Any(QueryAnyDef),
-}
-
-// MCP params can be authored as nested maps in YAML, but the runtime matcher
-// map remains flat so the Rego policy can share query-param matching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum ParamMatcherDef {
-    Matcher(QueryMatcherDef),
-    Object(BTreeMap<String, Self>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryAnyDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    any: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7DenyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-}
-
-// ---------------------------------------------------------------------------
-// YAML → proto conversion
-// ---------------------------------------------------------------------------
-
 fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
     match matcher {
         QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
@@ -985,7 +620,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         ui: raw.ui.map(|ui| UiPolicy {
             allow_graphical_ui: ui.allow_graphical_ui,
-            clipboard: ui.clipboard.to_proto() as i32,
+            clipboard: ui_clipboard_to_proto(ui.clipboard) as i32,
             allow_input_injection: ui.allow_input_injection,
         }),
         network_policies,
@@ -1033,28 +668,44 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
 
     let ui = policy.ui.as_ref().map(|ui| UiDef {
         allow_graphical_ui: ui.allow_graphical_ui,
-        clipboard: UiClipboardAccessDef::from_proto(ui.clipboard),
+        clipboard: ui_clipboard_from_proto(ui.clipboard),
         allow_input_injection: ui.allow_input_injection,
     });
 
     let network_policies = policy
         .network_policies
         .iter()
-        .map(|(key, rule)| {
+        .map(|(key, rule)| -> Result<_> {
             let yaml_rule = NetworkPolicyRuleDef {
                 name: rule.name.clone(),
                 endpoints: rule
                     .endpoints
                     .iter()
-                    .map(|e| {
+                    .map(|e| -> Result<_> {
                         // Use compact form: if ports has exactly 1 element,
                         // emit port (scalar). If >1, emit ports (array).
-                        // Proto uses u32; YAML uses u16. Clamp at boundary.
-                        let clamp = |v: u32| -> u16 { v.min(65535) as u16 };
+                        // Proto uses u32; authored ports are u16. Reject an
+                        // invalid protobuf value instead of silently clamping.
+                        let checked = |value: u32| {
+                            u16::try_from(value).map_err(|_| {
+                                miette::miette!(
+                                    "cannot serialize endpoint '{}': port {value} exceeds {}",
+                                    e.host,
+                                    u16::MAX
+                                )
+                            })
+                        };
                         let (port, ports) = if e.ports.len() > 1 {
-                            (0, e.ports.iter().map(|&p| clamp(p)).collect())
+                            (
+                                0,
+                                e.ports
+                                    .iter()
+                                    .copied()
+                                    .map(checked)
+                                    .collect::<Result<Vec<_>>>()?,
+                            )
                         } else {
-                            (clamp(e.ports.first().copied().unwrap_or(e.port)), vec![])
+                            (checked(e.ports.first().copied().unwrap_or(e.port))?, vec![])
                         };
                         let protocol = e.protocol.clone();
                         let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
@@ -1088,7 +739,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                         } else {
                             (json_rpc_config_from_proto(e.json_rpc_max_body_bytes), None)
                         };
-                        NetworkEndpointDef {
+                        Ok(NetworkEndpointDef {
                             host: e.host.clone(),
                             path: e.path.clone(),
                             port,
@@ -1130,9 +781,9 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             }),
                             json_rpc,
                             mcp,
-                        }
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 binaries: rule
                     .binaries
                     .iter()
@@ -1141,14 +792,21 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                     })
                     .collect(),
             };
-            (key.clone(), yaml_rule)
+            Ok((key.clone(), yaml_rule))
         })
-        .collect();
+        .collect::<Result<BTreeMap<_, _>>>()?;
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
 
     Ok(PolicyFile {
-        version: policy.version,
+        // Proto3 scalar fields do not preserve presence. Treat zero as an
+        // omitted authored version and materialize the only supported schema
+        // version in canonical output.
+        version: if policy.version == 0 {
+            1
+        } else {
+            policy.version
+        },
         filesystem_policy,
         landlock,
         process,
@@ -1210,43 +868,18 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // Validate raw authored values and their relationship to the endpoint protocol
 // before conversion. Keeping validation outside the Serde error wrapper makes
 // actionable MCP diagnostics the top-level user-facing error.
-fn validate_mcp_version_schema(policy: &PolicyFile) -> Result<()> {
-    for (policy_key, rule) in &policy.network_policies {
-        let policy_name = if rule.name.is_empty() {
-            policy_key
-        } else {
-            &rule.name
-        };
-        for endpoint in &rule.endpoints {
-            if is_mcp_protocol(&endpoint.protocol) {
-                let context = format!(
-                    "network policy '{policy_name}': MCP endpoint '{}'",
-                    endpoint.host
-                );
-                validate_authored_mcp_versions(
-                    endpoint
-                        .mcp
-                        .as_ref()
-                        .and_then(|config| config.versions.as_deref()),
-                    &context,
-                )?;
-            } else if endpoint.mcp.is_some() {
-                return Err(miette::miette!(
-                    "network policy '{policy_name}': non-MCP endpoint '{}' cannot configure mcp options",
-                    endpoint.host
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yml::from_str(yaml)
-        .into_diagnostic()
-        .wrap_err("failed to parse sandbox policy YAML")?;
-    validate_mcp_version_schema(&raw)?;
+    let raw = openshell_policy_schema::parse_policy(yaml)?;
+    to_proto(raw)
+}
+
+/// Parse a sandbox policy from a regular file using the shared bounded reader.
+pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
+    let raw = openshell_policy_schema::parse_policy_file(
+        path,
+        openshell_policy_schema::ParseLimits::default(),
+    )?;
     to_proto(raw)
 }
 
@@ -1256,12 +889,11 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
+    validate_proto_version_for_authored_serialization(policy)?;
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
-    serde_yml::to_string(&yaml_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to YAML")
+    openshell_policy_schema::serialize_policy(&yaml_repr)
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -1269,12 +901,21 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
+    validate_proto_version_for_authored_serialization(policy)?;
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
-    serde_json::to_value(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    openshell_policy_schema::policy_to_json_value(&json_repr)
+}
+
+fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
+    if !matches!(policy.version, 0 | 1) {
+        miette::bail!(
+            "cannot serialize unsupported protobuf policy version {}; expected 0 (omitted) or 1",
+            policy.version
+        );
+    }
+    Ok(())
 }
 
 /// Serialize a proto sandbox policy to a pretty-printed JSON string.
@@ -1295,20 +936,14 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// caller to omit the policy and let the server / sandbox apply its own
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let contents = if let Some(p) = cli_path {
-        let path = Path::new(p);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+    let policy = if let Some(p) = cli_path {
+        parse_sandbox_policy_file(Path::new(p))?
     } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        let path = Path::new(&policy_path);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+        parse_sandbox_policy_file(Path::new(&policy_path))?
     } else {
         return Ok(None);
     };
-    parse_sandbox_policy(&contents).map(Some)
+    Ok(Some(policy))
 }
 
 /// Well-known path where a sandbox container image can ship a policy YAML file.
@@ -2313,7 +1948,7 @@ fn truncate_for_display(s: &str) -> String {
 ///
 /// Re-exported from `openshell-core` so existing call sites
 /// (`openshell_policy::normalize_path`) keep resolving.
-pub use openshell_core::paths::normalize_path;
+pub use openshell_policy_schema::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2423,6 +2058,7 @@ network_policies:
     #[test]
     fn ui_unspecified_clipboard_canonicalizes_to_none_across_yaml_round_trip() {
         let raw = SandboxPolicy {
+            version: 1,
             ui: Some(UiPolicy {
                 allow_graphical_ui: true,
                 clipboard: UiClipboardAccess::Unspecified as i32,
@@ -2450,7 +2086,7 @@ network_policies:
         assert!(
             error
                 .to_string()
-                .contains("failed to parse sandbox policy YAML")
+                .contains("failed to decode sandbox policy fields")
         );
     }
 
@@ -2639,19 +2275,88 @@ network_policies:
     }
 
     #[test]
-    fn process_identity_omission_survives_yaml_round_trip() {
-        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
-            .expect("partial process identity should parse");
-        let process = policy.process.as_ref().expect("process section");
-        assert_eq!(process.run_as_user, "1234");
-        assert!(process.run_as_group.is_empty());
-        assert!(validate_sandbox_policy(&policy).is_ok());
+    fn canonical_serializers_materialize_omitted_proto_version() {
+        let policy = SandboxPolicy::default();
 
-        let yaml = serialize_sandbox_policy(&policy).expect("partial identity should serialize");
-        assert!(yaml.contains("run_as_user"));
-        assert!(!yaml.contains("run_as_group"));
-        let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
-        assert!(reparsed.process.unwrap().run_as_group.is_empty());
+        let yaml = serialize_sandbox_policy(&policy).expect("serialize default protobuf policy");
+        assert_eq!(
+            parse_sandbox_policy(&yaml)
+                .expect("canonical YAML must round trip")
+                .version,
+            1
+        );
+
+        let json =
+            sandbox_policy_to_json_value(&policy).expect("serialize default protobuf policy");
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn canonical_serializers_reject_unsupported_proto_version() {
+        let policy = SandboxPolicy {
+            version: 2,
+            ..Default::default()
+        };
+
+        let error = serialize_sandbox_policy(&policy)
+            .expect_err("unsupported protobuf versions must not serialize");
+        assert!(error.to_string().contains("protobuf policy version 2"));
+    }
+
+    #[test]
+    fn canonical_serializers_preserve_independent_process_identity_omission() {
+        let cases = [
+            ("", "", None, None),
+            ("1500", "", Some("1500"), None),
+            ("", "1600", None, Some("1600")),
+            ("1500", "1600", Some("1500"), Some("1600")),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let policy = SandboxPolicy {
+                version: 1,
+                process: Some(ProcessPolicy {
+                    run_as_user: user.to_owned(),
+                    run_as_group: group.to_owned(),
+                }),
+                ..Default::default()
+            };
+
+            let yaml = serialize_sandbox_policy(&policy)
+                .expect("omitted process identity components must serialize to YAML");
+            assert_eq!(yaml.contains("run_as_user:"), expected_user.is_some());
+            assert_eq!(yaml.contains("run_as_group:"), expected_group.is_some());
+
+            let reparsed = parse_sandbox_policy(&yaml).expect("canonical YAML must round trip");
+            let reparsed_user = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_user.as_str())
+                .filter(|value| !value.is_empty());
+            let reparsed_group = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_group.as_str())
+                .filter(|value| !value.is_empty());
+            assert_eq!(reparsed_user, expected_user);
+            assert_eq!(reparsed_group, expected_group);
+
+            let json = sandbox_policy_to_json_value(&policy)
+                .expect("omitted process identity components must serialize to JSON");
+            let json_process = json.get("process");
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_user")),
+                expected_user.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_group")),
+                expected_group.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.is_some(),
+                expected_user.is_some() || expected_group.is_some()
+            );
+        }
     }
 
     #[test]
@@ -5051,6 +4756,45 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_any_as_an_mcp_parameter_name() {
+        let yaml = r#"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp: {}
+        rules:
+          - allow:
+              method: tools/call
+              params:
+                arguments:
+                  any: "first"
+                  other: "second"
+"#;
+
+        let proto = parse_sandbox_policy(yaml).expect("authored policy must parse");
+        let params = &proto.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow rule")
+            .params;
+        assert_eq!(params["arguments.any"].glob, "first");
+        assert_eq!(params["arguments.other"].glob, "second");
+
+        let serialized = serialize_sandbox_policy(&proto).expect("protobuf policy must serialize");
+        assert!(serialized.contains("arguments:"));
+        assert!(serialized.contains("any: first"));
+        assert!(serialized.contains("other: second"));
+
+        let reparsed =
+            parse_sandbox_policy(&serialized).expect("serialized protobuf policy must parse again");
+        assert_eq!(reparsed, proto);
+    }
+
+    #[test]
     fn parse_rejects_unsupported_json_rpc_config_fields() {
         let yaml = r"
 version: 1
@@ -5230,5 +4974,27 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn serialization_rejects_proto_port_above_u16() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        policy.network_policies.insert(
+            "too-wide".to_owned(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_owned(),
+                    port: u32::from(u16::MAX) + 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let error =
+            serialize_sandbox_policy(&policy).expect_err("wide protobuf port must not be clamped");
+        assert!(error.to_string().contains("exceeds"));
     }
 }

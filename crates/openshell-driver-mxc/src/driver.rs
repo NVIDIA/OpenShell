@@ -64,6 +64,9 @@ impl MxcBackend {
 /// environment variables / CLI flags via the standard gateway precedence chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+// These are independent, user-facing feature switches in the flat gateway
+// configuration schema rather than one compound state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MxcComputeConfig {
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
@@ -185,7 +188,7 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
             WatchSandboxesPlatformEvent {
                 sandbox_id,
                 event: Some(DriverPlatformEvent {
-                    timestamp_ms: 0,
+                    event_time: None,
                     source: "mxc-driver".into(),
                     r#type: "Warning".into(),
                     reason: reason.to_string(),
@@ -590,7 +593,7 @@ impl MxcComputeBackend {
                     status: "False".into(),
                     reason: "Starting".into(),
                     message: "MXC lifecycle starting".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -690,7 +693,7 @@ impl MxcComputeBackend {
                     status: "False".into(),
                     reason: "Stopped".into(),
                     message: "MXC sandbox stopped".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -870,7 +873,9 @@ async fn run_lifecycle(
     } else {
         None
     };
-    let host_proxy_ca_paths = host_proxy.as_ref().and_then(|proxy| proxy.ca_file_paths());
+    let host_proxy_ca_paths = host_proxy
+        .as_ref()
+        .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
     drop(reserved_proxy_listener.take());
     if let Some(addr) = proxy_addr {
         {
@@ -1014,7 +1019,7 @@ async fn run_lifecycle(
             status: "True".into(),
             reason: "AgentRunning".into(),
             message: format!("Agent exec launched: {command_line}"),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );
@@ -1123,7 +1128,7 @@ async fn monitor_exec(
                     status: "True".into(),
                     reason: "AgentCompleted".into(),
                     message: "Agent exec finished successfully (exit code 0)".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -1151,7 +1156,7 @@ async fn monitor_exec(
                     status: "False".into(),
                     reason: "ExecFailed".into(),
                     message: format!("Agent exec exited {code}"),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -1184,7 +1189,7 @@ async fn set_failed(
             status: "False".into(),
             reason: "ProvisionFailed".into(),
             message: message.to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );
@@ -1218,6 +1223,7 @@ fn make_sandbox_with_condition(
             sandbox_fd: String::new(),
             conditions: vec![condition.clone()],
             deleting,
+            ..Default::default()
         }),
     }
 }
@@ -1555,10 +1561,12 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let mut config = MxcComputeConfig::default();
-        config.backend = MxcBackend::ProcessContainer;
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let config = MxcComputeConfig {
+            backend: MxcBackend::ProcessContainer,
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        };
         let backend = MxcComputeBackend::new_mocked(config);
         let mut stream = backend.watch_sandboxes().await;
 
@@ -1575,7 +1583,6 @@ mod lifecycle_tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".into(),
-                    ..Default::default()
                 }],
             },
         );
@@ -1606,7 +1613,7 @@ mod lifecycle_tests {
             .as_u64()
             .expect("proxy localhost port");
         assert!(proxy_port > 0);
-        assert!(proxy_port <= u64::from(u16::MAX));
+        assert!(u16::try_from(proxy_port).is_ok());
         assert!(
             recorded["network"]["proxy"].get("host").is_none(),
             "proxy must not contain 'host' key"
@@ -1646,7 +1653,7 @@ mod lifecycle_tests {
                     }
                 }
                 Ok(_) => break,
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
         assert!(saw_redirect, "expected EgressRedirect platform event");
@@ -1850,9 +1857,11 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn governed_egress_rejects_network_middleware_before_lifecycle() {
-        let mut config = MxcComputeConfig::default();
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let config = MxcComputeConfig {
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        };
         let backend = MxcComputeBackend::new_mocked(config);
 
         let mut policy = fs_policy(&[]);

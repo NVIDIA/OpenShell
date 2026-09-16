@@ -9,8 +9,10 @@
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
-//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Older tokens remain valid
-//! until their own `exp` and are bounded by the configured short TTL.
+//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Refresh atomically advances
+//! the sandbox's credential lineage. The immediately consumed bearer may only
+//! replay the same refresh for a short recovery window; it cannot authorize
+//! ordinary RPCs or select another successor.
 
 use crate::ServerState;
 use crate::auth::identity::IdentityProvider;
@@ -23,7 +25,7 @@ use openshell_core::proto::{
 use openshell_extension_core::{ExtensionAudience, ExtensionCallerKind, MAX_EXTENSION_TOKEN_TTL};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
@@ -100,7 +102,10 @@ pub async fn handle_issue_sandbox_token(
     );
     Ok(Response::new(IssueSandboxTokenResponse {
         token: minted.token,
-        expires_at_ms: minted.expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            minted.expires_at_ms,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -141,10 +146,57 @@ pub async fn handle_refresh_sandbox_token(
         );
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
+    let session_authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("sandbox session minting is not configured"))?;
 
-    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
-
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    let authorization_values = request.metadata().get_all("authorization");
+    let mut authorization_values = authorization_values.iter();
+    let authorization = authorization_values
+        .next()
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
+    if authorization_values.next().is_some() {
+        return Err(Status::unauthenticated("duplicate authorization metadata"));
+    }
+    let gateway_token = authorization
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
+    let principal = session_authority.verify_gateway_token(gateway_token)?;
+    if principal.sandbox_id.as_str() != sandbox.sandbox_id {
+        return Err(Status::unauthenticated(
+            "gateway token does not match the authenticated sandbox",
+        ));
+    }
+    let request_hash = crate::auth::sandbox_session::RefreshRequestHash::from_extension_services(
+        &requested_extension_services,
+    );
+    let issued_at = current_unix_seconds();
+    let authorization = crate::auth::sandbox_session::authorize_refresh(
+        &state.store,
+        &principal,
+        &request_hash,
+        issued_at,
+    )
+    .await?;
+    let (successor, should_rotate) = match authorization {
+        crate::auth::sandbox_session::RefreshAuthorization::Current(identity) => (
+            identity.next_gateway_token(
+                request_hash,
+                issued_at,
+                REFRESH_REPLAY_GRACE
+                    .as_secs()
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+            ),
+            true,
+        ),
+        crate::auth::sandbox_session::RefreshAuthorization::Replay(identity) => (identity, false),
+    };
+    let authentication =
+        session_authority.mint_persisted_launch(&sandbox.sandbox_id, &successor)?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -178,22 +230,62 @@ pub async fn handle_refresh_sandbox_token(
             &sandbox.sandbox_id,
             &requested_extension_services,
             &available,
+            successor.refresh_replay.as_ref(),
         )?
     };
+    if should_rotate {
+        crate::auth::sandbox_session::rotate_gateway_token(&state.store, &principal, &successor)
+            .await?;
+    }
     info!(
         sandbox_id = %sandbox.sandbox_id,
         "renewed gateway sandbox JWT"
     );
 
     Ok(Response::new(RefreshSandboxTokenResponse {
-        token: minted.token,
-        expires_at_ms: minted.expires_at_ms,
+        token: authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string(),
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            authentication
+                .supervisor
+                .gateway_expires_at
+                .saturating_mul(1000),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
         extension_credentials,
+        sandbox_token: authentication
+            .supervisor
+            .sandbox_token
+            .expose_secret()
+            .to_string(),
+        sandbox_expiration_time: Some(
+            openshell_core::time::timestamp_from_millis(
+                authentication
+                    .supervisor
+                    .sandbox_expires_at
+                    .saturating_mul(1000),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+        ),
+        session_id: authentication.supervisor.runtime_generation.to_string(),
+        credential_epoch: authentication.supervisor.auth_epoch.get(),
     }))
 }
 
 const MAX_EXTENSION_CREDENTIALS_PER_REFRESH: usize = 64;
 const DEFAULT_EXTENSION_TOKEN_TTL: Duration = Duration::from_mins(15);
+const REFRESH_REPLAY_GRACE: Duration = Duration::from_secs(30);
+
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
 
 #[allow(clippy::result_large_err)]
 fn mint_extension_credentials(
@@ -201,6 +293,7 @@ fn mint_extension_credentials(
     sandbox_id: &str,
     requested_names: &[String],
     available_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    refresh_replay: Option<&crate::auth::sandbox_session::GatewayRefreshReplay>,
 ) -> Result<Vec<ExtensionServiceCredential>, Status> {
     if requested_names.len() > MAX_EXTENSION_CREDENTIALS_PER_REFRESH {
         return Err(Status::invalid_argument(format!(
@@ -248,16 +341,33 @@ fn mint_extension_credentials(
             }
             let audience = ExtensionAudience::new(service.audience.clone())
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            let minted = issuer.mint_extension_token(
-                &audience,
-                ExtensionCallerKind::Supervisor,
-                Some(sandbox_id),
-                ttl,
+            let minted = refresh_replay.map_or_else(
+                || {
+                    issuer.mint_extension_token(
+                        &audience,
+                        ExtensionCallerKind::Supervisor,
+                        Some(sandbox_id),
+                        ttl,
+                    )
+                },
+                |replay| {
+                    issuer.mint_extension_token_with_metadata(
+                        &audience,
+                        ExtensionCallerKind::Supervisor,
+                        Some(sandbox_id),
+                        ttl,
+                        replay.issued_at,
+                        replay.extension_token_id(name, audience.as_str()),
+                    )
+                },
             )?;
             Ok(ExtensionServiceCredential {
                 service_name: name.clone(),
                 token: minted.token,
-                expires_at_ms: minted.expires_at_ms,
+                expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+                    minted.expires_at_ms,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?,
             })
         })
         .collect()
@@ -284,7 +394,7 @@ mod tests {
     use crate::ServerState;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
-    use crate::auth::sandbox_jwt::SandboxJwtIssuer;
+    use crate::auth::sandbox_jwt::{SandboxJwtIssuer, SandboxSessionJwtAuthority};
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
@@ -321,28 +431,45 @@ mod tests {
         // We don't need the authenticator for these tests; only the issuer.
         let issuer = SandboxJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
-            mat.kid,
+            mat.kid.clone(),
             "test-gateway",
             Some(Duration::from_hours(1)),
         )
         .unwrap();
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));
+        let authority = Arc::new(
+            SandboxSessionJwtAuthority::from_pem(
+                mat.signing_key_pem.as_bytes(),
+                mat.public_key_pem.as_bytes(),
+                mat.kid,
+                "test-gateway",
+                Duration::from_hours(1),
+            )
+            .expect("session authority"),
+        );
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .expect("runtime identity");
+        state.sandbox_session_jwt_authority = Some(authority);
         let state = Arc::new(state);
-        insert_sandbox(&state, "sandbox-a").await;
+        insert_sandbox(&state, "sandbox-a", &identity).await;
         state
     }
 
-    async fn insert_sandbox(state: &Arc<ServerState>, sandbox_id: &str) {
+    async fn insert_sandbox(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) {
         let mut sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_id.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::default(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -350,6 +477,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        identity.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
     }
@@ -363,6 +491,42 @@ mod tests {
             },
             trust_domain: Some("openshell".to_string()),
         })
+    }
+
+    async fn authorize_refresh(
+        state: &ServerState,
+        request: &mut Request<RefreshSandboxTokenRequest>,
+    ) -> String {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .expect("load sandbox")
+            .expect("sandbox");
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.expect("metadata").annotations,
+        )
+        .expect("persisted identity");
+        let authentication = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .expect("session authority")
+            .mint_persisted_launch("sandbox-a", &identity)
+            .expect("active authentication");
+        let token = authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string();
+        set_refresh_authorization(request, &token);
+        token
+    }
+
+    fn set_refresh_authorization(request: &mut Request<RefreshSandboxTokenRequest>, token: &str) {
+        let value = format!("Bearer {token}")
+            .parse()
+            .expect("authorization metadata");
+        request.metadata_mut().insert("authorization", value);
     }
 
     #[tokio::test]
@@ -396,12 +560,98 @@ mod tests {
             extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+        let _ = authorize_refresh(&state, &mut req).await;
         let resp = handle_refresh_sandbox_token(&state, req)
             .await
             .expect("refresh OK")
             .into_inner();
         assert!(!resp.token.is_empty());
-        assert!(resp.expires_at_ms > 0);
+        assert!(resp.expiration_time.is_some());
+        assert!(resp.sandbox_expiration_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_replays_one_successor_then_rejects_older_bearers() {
+        let state = state_with_issuer().await;
+        let request = || {
+            let mut request = Request::new(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            });
+            request
+                .extensions_mut()
+                .insert(sandbox_principal("sandbox-a"));
+            request
+        };
+
+        let mut first_request = request();
+        let first = authorize_refresh(&state, &mut first_request).await;
+        let second = handle_refresh_sandbox_token(&state, first_request)
+            .await
+            .expect("first refresh")
+            .into_inner();
+
+        let mut lost_response_retry = request();
+        set_refresh_authorization(&mut lost_response_retry, &first);
+        let replayed = handle_refresh_sandbox_token(&state, lost_response_retry)
+            .await
+            .expect("lost response retry")
+            .into_inner();
+        assert_eq!(replayed.token, second.token);
+        assert_eq!(replayed.sandbox_token, second.sandbox_token);
+        assert_eq!(replayed.expiration_time, second.expiration_time);
+        assert_eq!(
+            replayed.sandbox_expiration_time,
+            second.sandbox_expiration_time
+        );
+
+        let mut changed_retry = request();
+        changed_retry.get_mut().extension_service_names = vec!["content-guard".to_string()];
+        set_refresh_authorization(&mut changed_retry, &first);
+        let error = handle_refresh_sandbox_token(&state, changed_retry)
+            .await
+            .expect_err("retry request shape must match the committed refresh");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let mut second_request = request();
+        set_refresh_authorization(&mut second_request, &second.token);
+        handle_refresh_sandbox_token(&state, second_request)
+            .await
+            .expect("successor refresh");
+
+        let mut replay = request();
+        set_refresh_authorization(&mut replay, &first);
+        let error = handle_refresh_sandbox_token(&state, replay)
+            .await
+            .expect_err("consumed predecessor must not mint fresh credentials");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_does_not_consume_the_gateway_bearer() {
+        let state = state_with_issuer().await;
+        let mut rejected = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: vec!["unknown-service".to_string()],
+        });
+        rejected
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        let current = authorize_refresh(&state, &mut rejected).await;
+
+        let error = handle_refresh_sandbox_token(&state, rejected)
+            .await
+            .expect_err("unknown extension service must be rejected");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut retry = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        retry
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        set_refresh_authorization(&mut retry, &current);
+        handle_refresh_sandbox_token(&state, retry)
+            .await
+            .expect("failed refresh must leave its bearer current");
     }
 
     #[tokio::test]
@@ -419,18 +669,20 @@ mod tests {
             "sandbox-a",
             &["content-guard".to_string()],
             &available,
+            None,
         )
         .expect("selected service credential");
         assert_eq!(credentials.len(), 1);
         assert_eq!(credentials[0].service_name, "content-guard");
         assert!(!credentials[0].token.is_empty());
-        assert!(credentials[0].expires_at_ms > 0);
+        assert!(credentials[0].expiration_time.is_some());
 
         let error = mint_extension_credentials(
             issuer,
             "sandbox-a",
             &["attacker-chosen-audience".to_string()],
             &available,
+            None,
         )
         .expect_err("unselected name must be rejected");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
@@ -467,6 +719,7 @@ mod tests {
             "sandbox-a",
             &["legacy-guard".to_string()],
             &available,
+            None,
         )
         .expect_err("opted-out registration must not mint a credential");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -486,6 +739,7 @@ mod tests {
             "sandbox-a",
             &["content-guard".to_string(), "content-guard".to_string()],
             &available,
+            None,
         )
         .expect_err("duplicates must be rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -502,7 +756,7 @@ mod tests {
         let err = handle_refresh_sandbox_token(&state, req)
             .await
             .expect_err("missing sandbox must not refresh");
-        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -524,7 +778,7 @@ mod tests {
             .expect("issue OK")
             .into_inner();
         assert!(!resp.token.is_empty());
-        assert!(resp.expires_at_ms > 0);
+        assert!(resp.expiration_time.is_some());
     }
 
     #[tokio::test]
@@ -615,7 +869,20 @@ mod tests {
             Arc::new(SupervisorSessionRegistry::new()),
             None,
         ));
-        insert_sandbox(&state, "sandbox-a").await;
+        insert_sandbox(
+            &state,
+            "sandbox-a",
+            &crate::auth::sandbox_session::PersistedSandboxIdentity {
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .expect("runtime generation"),
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_token_id: uuid::Uuid::new_v4(),
+                refresh_replay: None,
+            },
+        )
+        .await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
         });

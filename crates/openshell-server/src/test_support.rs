@@ -3,7 +3,17 @@
 
 //! Test fixtures for exercising gateway integration points.
 
+use crate::ServerState;
+use crate::auth::identity::{Identity, IdentityProvider};
+use crate::auth::principal::{Principal, UserPrincipal};
+use crate::compute::{new_test_runtime, new_test_runtime_for_driver};
+use crate::persistence::Store;
+use crate::sandbox_index::SandboxIndex;
+use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_session::SupervisorSessionRegistry;
+use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, stream};
+use openshell_core::Config;
 #[cfg(unix)]
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
@@ -33,6 +43,55 @@ use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
 type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+
+/// Build a real in-memory gateway service backed by the requested test compute driver.
+///
+/// This fixture is intentionally narrow: integration tests can exercise the public
+/// gRPC service without exposing the gateway's internal state construction details.
+pub async fn gateway_service_with_driver(driver_name: &str) -> crate::OpenShellService {
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory gateway store should open"),
+    );
+    crate::ensure_default_workspace(&store)
+        .await
+        .expect("default workspace should be created");
+    let compute = if driver_name == "test" {
+        new_test_runtime(store.clone()).await
+    } else {
+        new_test_runtime_for_driver(store.clone(), driver_name).await
+    };
+    let state = Arc::new(ServerState::new(
+        Config::new(None)
+            .with_database_url("sqlite::memory:?cache=shared")
+            .with_credential_drivers(["test-static"]),
+        store,
+        compute,
+        SandboxIndex::new(),
+        SandboxWatchBus::new(),
+        TracingLogBus::new(),
+        Arc::new(SupervisorSessionRegistry::new()),
+        None,
+    ));
+    crate::OpenShellService::new(state)
+}
+
+/// Tonic interceptor that authenticates integration-test requests as the dev user.
+pub fn authenticate_as_dev_user(mut request: Request<()>) -> Result<Request<()>, Status> {
+    request
+        .extensions_mut()
+        .insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "dev-user".to_string(),
+                display_name: None,
+                roles: vec!["openshell-admin".to_string(), "openshell-user".to_string()],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+    Ok(request)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeComputeDriverCall {

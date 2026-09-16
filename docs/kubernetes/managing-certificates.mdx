@@ -52,6 +52,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set certManager.enabled=true
 ```
 
@@ -73,6 +74,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set certManager.enabled=true \
   --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \

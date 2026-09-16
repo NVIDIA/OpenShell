@@ -6,12 +6,13 @@
 //!
 //! MXC uses this on Windows: MXC's `network.proxy` redirects sandbox egress to a
 //! per-sandbox loopback listener in the gateway process, and this module starts
-//! the existing OpenShell CONNECT proxy against the trimmed network-only
+//! the existing `OpenShell` CONNECT proxy against the trimmed network-only
 //! `SandboxPolicy`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use miette::Result;
 use openshell_core::activity::ActivitySender;
@@ -20,20 +21,22 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_isolation_interface::contract::{BinaryIdentity, Sha256Digest};
 use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
 };
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
-use crate::proxy::{ProxyHandle, ProxyIdentityMode};
+use crate::proxy::ProxyHandle;
 
-/// Configuration for a host-side OpenShell CONNECT proxy.
+/// Configuration for a host-side `OpenShell` CONNECT proxy.
 pub struct HostProxyConfig {
     /// Exact socket the compute driver will redirect sandbox egress to.
     pub bind_addr: SocketAddr,
@@ -190,19 +193,33 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             (None, None, None)
         }
     };
+    let binary_digest: Sha256Digest = crate::procfs::file_sha256(&config.binary_path)?
+        .parse()
+        .map_err(|error| miette::miette!("hash host proxy binary identity: {error}"))?;
+    let direct_listener_identity = BinaryIdentity {
+        binary_path: config.binary_path,
+        binary_digest: Some(binary_digest),
+        ancestors: Vec::new(),
+        cmdline_paths: Vec::new(),
+    };
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
         Some(config.bind_addr),
         engine,
-        Arc::new(ProxyIdentityMode::static_binary(config.binary_path)?),
+        Arc::new(BinaryIdentityCache::new()),
+        Arc::new(AtomicU32::new(0)),
         tls_state,
         config.provider_credentials,
         Some(policy_local_ctx.clone()),
         config.denial_tx,
         config.activity_tx,
+        None,
         ready_rx,
         &upstream_proxy_args,
         None,
+        None,
+        None,
+        Some(direct_listener_identity),
     )
     .await?;
 

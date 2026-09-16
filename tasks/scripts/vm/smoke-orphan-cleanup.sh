@@ -4,7 +4,7 @@
 #
 # Smoke test: start the gateway with the VM driver, create a sandbox, then
 # signal the gateway (SIGTERM then SIGKILL) and verify that no driver,
-# launcher, gvproxy, or libkrun worker processes survive.
+# launcher or libkrun worker processes survive.
 #
 # Exit codes:
 #   0 — both SIGTERM and SIGKILL cleanup passed
@@ -108,10 +108,8 @@ create_sandbox() {
 
     for _ in $(seq 1 60); do
         if pgrep -f "openshell-vm-orphan-$$|$STATE_DIR/sandboxes/" >/dev/null 2>&1; then
-            if pgrep -f gvproxy >/dev/null 2>&1; then
-                echo "sandbox came up (cli pid=$CLI_PID)"
-                return 0
-            fi
+            echo "sandbox came up (cli pid=$CLI_PID)"
+            return 0
         fi
         sleep 2
     done
@@ -122,17 +120,14 @@ create_sandbox() {
 
 snapshot_kids() {
     # Return all PIDs whose --state-dir or --vm-rootfs references our
-    # per-run directory, plus any gvproxy that mentions our socket base.
+    # per-run directory.
     pgrep -fl "state-dir $STATE_DIR|$STATE_DIR/sandboxes" 2>/dev/null || true
-    pgrep -fl "gvproxy" 2>/dev/null | grep "osd-gv" || true
 }
 
 count_alive() {
     local alive
     alive=$(pgrep -f "state-dir $STATE_DIR|$STATE_DIR/sandboxes" 2>/dev/null | wc -l | tr -d ' ')
-    local gv
-    gv=$(pgrep -f 'gvproxy' 2>/dev/null | xargs -r ps -o pid=,command= -p 2>/dev/null | grep -c 'osd-gv' || true)
-    echo $((alive + gv))
+    echo "$alive"
 }
 
 verify_cleanup() {
@@ -176,8 +171,7 @@ run_scenario() {
 
     # Belt-and-braces teardown between scenarios.
     pkill -9 -f "$STATE_DIR/sandboxes|$STATE_DIR " 2>/dev/null || true
-    pkill -9 -f 'gvproxy.*osd-gv' 2>/dev/null || true
-    rm -rf "$STATE_DIR" /tmp/osd-gv "$XDG" 2>/dev/null || true
+    rm -rf "$STATE_DIR" "$XDG" 2>/dev/null || true
     # CLI may still be running; reap it.
     kill "${CLI_PID:-0}" 2>/dev/null || true
     sleep 1
@@ -191,7 +185,6 @@ main() {
 
     # Clean starting state.
     pkill -9 -f 'openshell-gateway|openshell-driver-vm' 2>/dev/null || true
-    pkill -9 -f 'gvproxy.*osd-gv' 2>/dev/null || true
     sleep 1
 
     if ! run_scenario TERM "graceful SIGTERM"; then

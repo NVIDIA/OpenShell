@@ -61,10 +61,6 @@ fn assert_json_response(
 async fn destination_denials_preserve_adapter_specific_wire_contracts() {
     let cases = [
         (
-            DestinationDenialKind::Resolution,
-            "destination resolution failed",
-        ),
-        (
             DestinationDenialKind::TrustedGateway,
             "trusted-gateway check failed",
         ),
@@ -208,7 +204,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
-    assert_eq!(forward["activity_name"], "Other");
+    assert_eq!(forward["activity_name"], "Post");
     assert_eq!(forward["action"], "Denied");
     assert_eq!(forward["disposition"], "Blocked");
     assert_eq!(forward["severity"], "Medium");
@@ -267,7 +263,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
-    assert_eq!(forward["activity_name"], "Other");
+    assert_eq!(forward["activity_name"], "Get");
     assert_eq!(forward["action"], "Allowed");
     assert_eq!(forward["disposition"], "Allowed");
     assert_eq!(forward["severity"], "Informational");
@@ -385,27 +381,28 @@ network_policies:
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn static_identity_is_supported_off_linux() {
+fn identity_required_mode_is_explicitly_unsupported_off_linux() {
     let engine = OpaEngine::from_strings(
         include_str!("../../../data/sandbox-policy.rego"),
         "network_policies: {}\n",
     )
     .unwrap();
-    let binary = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(binary.path(), b"agent").unwrap();
-    let identity = ProxyIdentityMode::static_binary(binary.path()).unwrap();
     let decision = authorize_egress_intent(
         crate::procfs::WorkloadProxyTcpConnection::new(
             "127.0.0.1:41000".parse().unwrap(),
             "127.0.0.1:3000".parse().unwrap(),
         ),
         &engine,
-        &identity,
+        &BinaryIdentityCache::new(),
+        &AtomicU32::new(1),
         EgressIntent::connect("target.example".to_string(), 443),
     );
 
     assert!(matches!(decision.action, NetworkAction::Deny { .. }));
-    assert_eq!(decision.identity, ProcessIdentityEvidence::Available);
+    assert_eq!(
+        decision.identity,
+        ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::UnsupportedPlatform)
+    );
 }
 
 #[test]
@@ -493,26 +490,20 @@ async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, 
 #[test]
 #[ignore = "manual proxy allocation/query/latency baseline"]
 fn proxy_performance_baseline() {
-    temp_env::with_vars(
-        [(
-            openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
-            Some("endpoint-only"),
-        )],
-        || {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    // Benchmark the full fail-closed path using a declared loopback
-                    // destination. This is deterministic and never opens a listener
-                    // outside the local process, so it does not trigger host firewall
-                    // prompts during manual baseline collection.
-                    let target: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            // Benchmark the full fail-closed path using a declared loopback
+            // destination. This is deterministic and never opens a listener
+            // outside the local process, so it does not trigger host firewall
+            // prompts during manual baseline collection.
+            let target: SocketAddr = "127.0.0.1:18080".parse().unwrap();
 
-                    let policy = format!(
-                        r#"
+            let policy = format!(
+                r#"
 network_policies:
   proxy_compatibility:
     name: proxy_compatibility
@@ -523,95 +514,90 @@ network_policies:
     binaries:
       - path: "/**"
 "#,
-                        host = target.ip(),
-                        port = target.port(),
-                    );
-                    let engine = Arc::new(
-                        OpaEngine::from_strings_with_binary_identity_required(
-                            include_str!("../../../data/sandbox-policy.rego"),
-                            &policy,
-                            false,
-                        )
-                        .unwrap(),
-                    );
-                    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let proxy_addr = proxy_listener.local_addr().unwrap();
-                    let proxy_engine = engine.clone();
-                    let proxy_task = tokio::spawn(async move {
-                        while let Ok((stream, _)) = proxy_listener.accept().await {
-                            let engine = proxy_engine.clone();
-                            tokio::spawn(async move {
-                                Box::pin(handle_tcp_connection(
-                                    stream,
-                                    engine,
-                                    Arc::new(
-                                        ProxyIdentityMode::static_binary(
-                                            std::env::current_exe().unwrap(),
-                                        )
-                                        .unwrap(),
-                                    ),
-                                    None,
-                                    None,
-                                    AgentProposals::default(),
-                                    Arc::new(None),
-                                    Arc::new(None),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                ))
-                                .await
-                                .unwrap();
-                            });
-                        }
+                host = target.ip(),
+                port = target.port(),
+            );
+            let engine = Arc::new(
+                OpaEngine::from_strings_with_binary_identity_required(
+                    include_str!("../../../data/sandbox-policy.rego"),
+                    &policy,
+                    false,
+                )
+                .unwrap(),
+            );
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy_listener.local_addr().unwrap();
+            let proxy_engine = engine.clone();
+            let proxy_task = tokio::spawn(async move {
+                while let Ok((stream, _)) = proxy_listener.accept().await {
+                    let engine = proxy_engine.clone();
+                    tokio::spawn(async move {
+                        Box::pin(handle_tcp_connection(
+                            stream,
+                            engine,
+                            Arc::new(BinaryIdentityCache::new()),
+                            Arc::new(AtomicU32::new(0)),
+                            None,
+                            None,
+                            AgentProposals::default(),
+                            Arc::new(None),
+                            Arc::new(None),
+                            Arc::new(None),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ))
+                        .await
+                        .unwrap();
                     });
+                }
+            });
 
-                    for connect in [true, false] {
-                        exercise_benchmark_request(proxy_addr, target, connect).await;
-                    }
+            for connect in [true, false] {
+                exercise_benchmark_request(proxy_addr, target, connect).await;
+            }
 
-                    let iterations = std::env::var("OPENSHELL_PROXY_BASELINE_ITERATIONS")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .filter(|value| *value > 0)
-                        .unwrap_or(25);
-                    let mut results = serde_json::Map::new();
-                    for (name, connect) in [("connect", true), ("forward", false)] {
-                        crate::test_alloc::reset();
-                        crate::opa::reset_test_opa_query_count();
-                        let started = std::time::Instant::now();
-                        for _ in 0..iterations {
-                            exercise_benchmark_request(proxy_addr, target, connect).await;
-                        }
-                        let elapsed = started.elapsed();
-                        let queries = crate::opa::test_opa_query_count();
-                        let (allocations, allocated_bytes) = crate::test_alloc::snapshot();
-                        let expected_queries = 4;
-                        assert_eq!(queries, expected_queries * iterations);
-                        results.insert(
-                            name.to_string(),
-                            serde_json::json!({
-                                "allocated_bytes_per_request": allocated_bytes / iterations,
-                                "allocations_per_request": allocations / iterations,
-                                "latency_ns_per_request": elapsed.as_nanos() / u128::from(iterations),
-                                "opa_queries_per_request": queries / iterations,
-                            }),
-                        );
-                    }
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "iterations": iterations,
-                            "proxy_performance_baseline": results,
-                            "scenario": "declared_loopback_destination_denied",
-                            "schema_version": 1,
-                        })
-                    );
+            let iterations = std::env::var("OPENSHELL_PROXY_BASELINE_ITERATIONS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(25);
+            let mut results = serde_json::Map::new();
+            for (name, connect) in [("connect", true), ("forward", false)] {
+                crate::test_alloc::reset();
+                crate::opa::reset_test_opa_query_count();
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    exercise_benchmark_request(proxy_addr, target, connect).await;
+                }
+                let elapsed = started.elapsed();
+                let queries = crate::opa::test_opa_query_count();
+                let (allocations, allocated_bytes) = crate::test_alloc::snapshot();
+                let expected_queries = 4;
+                assert_eq!(queries, expected_queries * iterations);
+                results.insert(
+                    name.to_string(),
+                    serde_json::json!({
+                        "allocated_bytes_per_request": allocated_bytes / iterations,
+                        "allocations_per_request": allocations / iterations,
+                        "latency_ns_per_request": elapsed.as_nanos() / u128::from(iterations),
+                        "opa_queries_per_request": queries / iterations,
+                    }),
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "iterations": iterations,
+                    "proxy_performance_baseline": results,
+                    "scenario": "declared_loopback_destination_denied",
+                    "schema_version": 1,
+                })
+            );
 
-                    proxy_task.abort();
-                });
-        },
-    );
+            proxy_task.abort();
+        });
 }

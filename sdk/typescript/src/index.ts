@@ -5,6 +5,9 @@
 //
 export type {
   ConnectOptions,
+  DeleteOptions,
+  DeletionOutcome,
+  DeletionResult,
   EffectiveSettingView,
   ExecExitEvent,
   ExecInteractiveOptions,
@@ -43,11 +46,12 @@ export type {
   SettingValue,
   SshSession,
   UpdateConfigResult,
+  WaitDeletedOptions,
   WaitOptions,
   WorkspaceListScope,
 } from './client.js';
 export { errorCode, OpenShellClient, Pager, SandboxClient, SandboxTemplateClient } from './client.js';
-export type { SdkErrorCode } from './errors.js';
-export { SdkError } from './errors.js';
+export type { ErrorInfo, FieldViolation, SdkErrorCode } from './errors.js';
+export { fromConnect, SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';
 export { clientCredentials } from './oidc.js';

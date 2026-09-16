@@ -32,7 +32,7 @@ pub mod format;
 pub mod objects;
 pub mod tracing_layers;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod validation;
 
 // --- Core event types ---

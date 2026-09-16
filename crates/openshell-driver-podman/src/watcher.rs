@@ -139,14 +139,16 @@ pub async fn start_watch(
     let mut event_rx = client.events_stream(LABEL_MANAGED_FILTER).await?;
 
     // 2. List existing containers for initial state sync.
-    let existing = client.list_containers(&[LABEL_MANAGED_FILTER]).await?;
+    let existing = client
+        .list_containers(&[LABEL_MANAGED_FILTER, crate::isolation::WORKLOAD_FILTER])
+        .await?;
 
     for entry in &existing {
         // For running containers, use inspect to get full state including
         // health check status — matching the same condition derivation used
         // for live events.
         if entry.state == "running" {
-            match client.inspect_container(&entry.id).await {
+            match inspect_workload(&client, &entry.id).await {
                 Ok(inspect) => {
                     if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                         if tx.send(Ok(sandbox_event(sandbox))).await.is_err() {
@@ -246,11 +248,34 @@ async fn map_podman_event(
         return None;
     }
 
+    if event
+        .actor
+        .attributes
+        .get(crate::isolation::LABEL_ROLE)
+        .is_some_and(|role| role == "supervisor")
+    {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let workloads = client
+            .list_containers(&[
+                LABEL_MANAGED_FILTER,
+                &id_filter,
+                crate::isolation::WORKLOAD_FILTER,
+            ])
+            .await
+            .ok()?;
+        let workload = workloads.first()?;
+        return inspect_workload(client, &workload.id)
+            .await
+            .ok()
+            .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+            .map(sandbox_event);
+    }
+
     match event.action.as_str() {
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
-            match client.inspect_container(container_id).await {
+            match inspect_workload(client, container_id).await {
                 Ok(inspect) => {
                     if lifecycle_event_fences.matches_previous_exit(
                         event,
@@ -313,7 +338,7 @@ async fn map_podman_event(
                             status: "Unknown".to_string(),
                             reason: "InspectFailed".to_string(),
                             message: format!("Container inspect failed: {e}"),
-                            last_transition_time: String::new(),
+                            transition_time: None,
                         },
                         false,
                     )))
@@ -325,6 +350,54 @@ async fn map_podman_event(
             None
         }
     }
+}
+
+/// A workload is ready only when its independent supervisor is healthy. This
+/// check runs both on watch reconciliation and on events, and contains a lost
+/// supervisor even when the gateway missed the original exit event.
+pub async fn inspect_workload(
+    client: &PodmanClient,
+    id: &str,
+) -> Result<ContainerInspect, PodmanApiError> {
+    let mut workload = client.inspect_container(id).await?;
+    if workload
+        .config
+        .labels
+        .get(crate::isolation::LABEL_ROLE)
+        .is_none_or(|role| role != "sandbox")
+    {
+        return Ok(workload);
+    }
+    let Some(sandbox_id) = workload.config.labels.get(LABEL_SANDBOX_ID) else {
+        return Ok(workload);
+    };
+    let supervisor = client
+        .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
+        .await;
+    if workload.state.running {
+        match supervisor {
+            Ok(supervisor) if supervisor.state.running => {
+                workload.state.health = supervisor.state.health;
+            }
+            Ok(supervisor)
+                if supervisor.state.status == "configured"
+                    || supervisor.state.status == "created" =>
+            {
+                workload.state.health = Some(HealthState {
+                    status: "starting".into(),
+                });
+            }
+            // Both containers exist before initial start. A missing or exited
+            // companion therefore requires containment, including after a
+            // gateway restart that missed the original Podman exit event.
+            Ok(_) | Err(PodmanApiError::NotFound(_)) => {
+                client.stop_container(&workload.id, 0).await?;
+                workload = client.inspect_container(&workload.id).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(workload)
 }
 
 /// Construct a `DriverSandbox` from common fields.
@@ -353,6 +426,7 @@ fn build_driver_sandbox(
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            ..Default::default()
         }),
         workspace,
     }
@@ -421,7 +495,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
             status: status_str.to_string(),
             reason: reason.to_string(),
             message,
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         entry.state == "removing",
     ))
@@ -487,27 +561,88 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
         ),
     };
 
-    // Use Podman's state timestamps for last_transition_time:
+    // Use Podman's state timestamps for transition_time:
     // - Running/healthy states use started_at
     // - Stopped/exited states use finished_at
-    let last_transition_time = match state.status.as_str() {
+    let transition_time = match state.status.as_str() {
         "running" => state.started_at.clone().unwrap_or_default(),
         "exited" | "stopped" => state.finished_at.clone().unwrap_or_default(),
         _ => String::new(),
-    };
+    }
+    .parse()
+    .ok();
 
     DriverCondition {
         r#type: "Ready".to_string(),
         status: status_val.to_string(),
         reason: reason.to_string(),
         message,
-        last_transition_time,
+        transition_time,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_supervisor_stops_workload_during_reconciliation() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "lost-supervisor",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(StatusCode::NOT_FOUND, "missing companion"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        assert!(!inspected.state.running);
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.ends_with("/libpod/containers/workload/stop?timeout=0"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn created_supervisor_keeps_bootstrapping_workload_starting() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "starting-supervisor",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"configured","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        assert!(inspected.state.running);
+        assert_eq!(inspected.state.health.unwrap().status, "starting");
+        handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
 
     fn podman_event(action: &str, sandbox_id: &str, time_nano: i64) -> PodmanEvent {
         PodmanEvent {
@@ -586,7 +721,7 @@ mod tests {
         assert_eq!(cond.r#type, "Ready");
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "HealthCheckPassed");
-        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+        assert_eq!(cond.transition_time, "2026-04-14T10:00:00Z".parse().ok());
     }
 
     #[test]
@@ -605,7 +740,7 @@ mod tests {
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, CONDITION_RUNNING);
         assert_eq!(cond.message, "Container is running");
-        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+        assert_eq!(cond.transition_time, "2026-04-14T10:00:00Z".parse().ok());
     }
 
     #[test]
@@ -641,7 +776,7 @@ mod tests {
         let cond = condition_from_state(&state);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "OOMKilled");
-        assert_eq!(cond.last_transition_time, "2026-04-14T11:00:00Z");
+        assert_eq!(cond.transition_time, "2026-04-14T11:00:00Z".parse().ok());
     }
 
     #[test]
@@ -746,7 +881,7 @@ mod tests {
             status: "Unknown".to_string(),
             reason: "InspectFailed".to_string(),
             message: "Container inspect failed: connection refused".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         };
 
         let sandbox = DriverSandbox {
@@ -761,6 +896,7 @@ mod tests {
                 sandbox_fd: String::new(),
                 conditions: vec![condition],
                 deleting: false,
+                ..Default::default()
             }),
             workspace: String::new(),
         };

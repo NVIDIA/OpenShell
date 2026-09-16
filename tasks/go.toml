@@ -6,7 +6,17 @@
 ["go:test"]
 description = "Run Go SDK unit tests with coverage"
 dir = "sdk/go"
-run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(go env GOOS)" = "windows" ] && [ "$(go env GOARCH)" = "arm64" ]; then
+  echo "Go race detection is unsupported on windows/arm64; running without -race."
+  go test -coverprofile=coverage.out -coverpkg=./openshell/... ./...
+else
+  go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./...
+fi
+"""
 hide = true
 
 ["go:test:integration"]
@@ -120,11 +130,26 @@ if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
   exit 1
 fi
 
+BUF_TEMPLATE="$SDK_ROOT/buf.gen.yaml"
+if command -v cygpath &>/dev/null; then
+  WORK_DIR=$(mktemp -d)
+  trap 'rm -rf "$WORK_DIR"' EXIT
+  GO_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go)")
+  GRPC_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go-grpc)")
+  GO_PLUGIN=${GO_PLUGIN//&/\\&}
+  GRPC_PLUGIN=${GRPC_PLUGIN//&/\\&}
+  sed \
+    -e "s|local: protoc-gen-go$|local: $GO_PLUGIN|" \
+    -e "s|local: protoc-gen-go-grpc$|local: $GRPC_PLUGIN|" \
+    "$SDK_ROOT/buf.gen.yaml" > "$WORK_DIR/buf.gen.yaml"
+  BUF_TEMPLATE="$WORK_DIR/buf.gen.yaml"
+fi
+
 # Clean previous output before regeneration
 find proto -name '*.pb.go' -delete 2>/dev/null || true
 find proto -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-(cd "$REPO_ROOT" && buf generate --template "$SDK_ROOT/buf.gen.yaml")
+(cd "$REPO_ROOT" && buf generate --template "$BUF_TEMPLATE")
 
 echo "Proto generation complete."
 echo "Generated packages:"
@@ -162,8 +187,23 @@ if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
 fi
 
 # Generate to temp directory with adjusted output path
-CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
-(cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE")
+BUF_OUTPUT_DIR="$WORK_DIR"
+if command -v cygpath &>/dev/null; then
+  BUF_OUTPUT_DIR=$(cygpath -m "$WORK_DIR")
+fi
+sed "s|out: sdk/go|out: $BUF_OUTPUT_DIR|" "$SDK_ROOT/buf.gen.yaml" > "$WORK_DIR/buf.gen.yaml"
+if command -v cygpath &>/dev/null; then
+  GO_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go)")
+  GRPC_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go-grpc)")
+  GO_PLUGIN=${GO_PLUGIN//&/\\&}
+  GRPC_PLUGIN=${GRPC_PLUGIN//&/\\&}
+  sed \
+    -e "s|local: protoc-gen-go$|local: $GO_PLUGIN|" \
+    -e "s|local: protoc-gen-go-grpc$|local: $GRPC_PLUGIN|" \
+    "$WORK_DIR/buf.gen.yaml" > "$WORK_DIR/buf.gen.windows.yaml"
+  mv "$WORK_DIR/buf.gen.windows.yaml" "$WORK_DIR/buf.gen.yaml"
+fi
+(cd "$REPO_ROOT" && buf generate --template "$WORK_DIR/buf.gen.yaml")
 
 DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$SDK_ROOT/proto" 2>&1) || true
 

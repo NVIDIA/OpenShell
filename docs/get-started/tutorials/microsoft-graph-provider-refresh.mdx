@@ -66,8 +66,8 @@ credentials:
       strategy: oauth2_refresh_token
       token_url: https://login.microsoftonline.com/common/oauth2/v2.0/token
       scopes: [https://graph.microsoft.com/.default]
-      refresh_before_seconds: 600
-      max_lifetime_seconds: 3600
+      refresh_before: "600s"
+      max_lifetime: "3600s"
       material:
         - name: tenant_id
           description: Microsoft Entra tenant ID

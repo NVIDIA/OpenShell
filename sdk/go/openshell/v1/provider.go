@@ -23,7 +23,7 @@ type ProviderInterface interface {
 	List(workspace string, opts ...ListOptions) (*Pager[*Provider], error)
 	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error)
 	Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
-	Delete(ctx context.Context, workspace, name string) error
+	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
 	Ensure(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
 	Profiles() ProfileInterface
 	Refresh() RefreshInterface

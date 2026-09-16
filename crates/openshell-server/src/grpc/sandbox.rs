@@ -172,7 +172,7 @@ pub(super) async fn handle_create_sandbox(
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let create_request = request.get_ref().clone();
-    let result = handle_create_sandbox_inner(state, request).await;
+    let result = Box::pin(handle_create_sandbox_inner(state, request)).await;
     let created_sandbox = result
         .as_ref()
         .ok()
@@ -221,7 +221,9 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
         staging_token: slot.token,
         upload_path: slot.upload_path.to_string_lossy().into_owned(),
         max_bytes: slot.max_bytes,
-        expires_at_ms: slot.expires_at_ms,
+        expiration_time: openshell_core::time::timestamp_from_millis(slot.expires_at_ms)
+            .map(Some)
+            .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -372,7 +374,7 @@ async fn handle_create_sandbox_inner(
     };
 
     // Leave an omitted command empty rather than persisting a concrete shell:
-    // the supervisor resolves the default login shell against the sandbox image
+    // the sandbox boundary resolves the default login shell against the agent image
     // (bash when present, otherwise /bin/sh on minimal images like Alpine),
     // which the gateway cannot do since it does not see the sandbox filesystem.
     // The default is an interactive login shell, so request a TTY.
@@ -463,12 +465,12 @@ async fn handle_create_sandbox_inner(
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: name.clone(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: request.labels.clone(),
             resource_version: 0,
             annotations: request.annotations.clone(),
             workspace,
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: Some(spec),
         status: None,
@@ -499,30 +501,45 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
-    // that bootstrap through another authentication mechanism may ignore it.
-    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
-        issuer.mint(&id).map(|minted| {
-            tracing::info!(
-                sandbox_id = %id,
-                "minted sandbox JWT"
-            );
-            minted.token
-        })
-    });
-    let sandbox_token = match sandbox_token {
-        Some(Ok(token)) => Some(token),
-        Some(Err(status)) => return Err(status),
-        None => None,
+    let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        runtime_identity.write(&mut metadata.annotations);
+    }
+    let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
+        Some(authority.mint_persisted_launch(&id, &runtime_identity)?)
+    } else {
+        None
     };
+    let sandbox_token = if let Some(authentication) = &launch_authentication {
+        Some(
+            authentication
+                .supervisor
+                .gateway_token
+                .expose_secret()
+                .to_string(),
+        )
+    } else if let Some(issuer) = &state.sandbox_jwt_issuer {
+        Some(issuer.mint(&id)?.token)
+    } else {
+        None
+    };
+    let launch_authentication = launch_authentication
+        .map(|authentication| {
+            serde_json::to_vec(&authentication)
+                .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
+        })
+        .transpose()?;
 
-    let mut sandbox = state
+    let sandbox = state
         .compute
-        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .create_sandbox_authenticated(
+            sandbox,
+            sandbox_token,
+            launch_authentication,
+            await_main_process_attachment,
+        )
         .await?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     info!(
         sandbox_id = %id,
@@ -690,10 +707,7 @@ pub(super) async fn handle_get_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
-    let mut sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
+    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -744,17 +758,12 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
-    let mut page = state
+    let page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
-    // Project only the selected page so observation authority cannot change
-    // the store's ordering or continuation cursor.
-    for sandbox in &mut page.messages {
-        state.supervisor_sessions.project_endpoint_status(sandbox);
-    }
     Ok(Response::new(ListSandboxesResponse {
         sandboxes: page.messages,
         next_page_token,
@@ -797,12 +806,12 @@ pub(super) async fn handle_create_sandbox_template(
     resolved.metadata = Some(ObjectMeta {
         id: uuid::Uuid::new_v4().to_string(),
         name: metadata.name,
-        created_at_ms: current_time_ms(),
+        created_time: openshell_core::time::timestamp_from_millis(current_time_ms()).ok(),
         labels: metadata.labels,
         resource_version: 0,
         annotations: metadata.annotations,
         workspace: workspace.clone(),
-        deletion_timestamp_ms: 0,
+        deletion_time: None,
     });
     validate_sandbox_workload_template(&resolved)?;
 
@@ -969,7 +978,9 @@ pub(super) async fn handle_delete_sandbox_template(
         )
         .await
         .map_err(|e| Status::internal(format!("delete sandbox template failed: {e}")))?;
-    Ok(Response::new(DeleteSandboxTemplateResponse { deleted }))
+    Ok(Response::new(DeleteSandboxTemplateResponse {
+        outcome: super::deletion_outcome(deleted, req.allow_missing, "sandbox template")?,
+    }))
 }
 
 fn validate_sandbox_workload_template(template: &SandboxWorkloadTemplate) -> Result<(), Status> {
@@ -1162,7 +1173,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached = Arc::new(AtomicBool::new(false));
     let attached_clone = attached.clone();
 
-    let mut sandbox = state
+    let sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1184,9 +1195,6 @@ pub(super) async fn handle_attach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     let attached = attached.load(Ordering::Relaxed);
 
@@ -1264,7 +1272,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached = Arc::new(AtomicBool::new(false));
     let detached_clone = detached.clone();
 
-    let mut sandbox = state
+    let sandbox = state
         .store
         .update_message_cas::<Sandbox, _>(
             &sandbox_id,
@@ -1286,9 +1294,6 @@ pub(super) async fn handle_detach_sandbox_provider(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
 
     let detached = detached.load(Ordering::Relaxed);
 
@@ -1311,7 +1316,7 @@ pub(super) async fn handle_delete_sandbox(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let result = handle_delete_sandbox_inner(state, request).await;
     let outcome = match &result {
-        Ok(response) if response.get_ref().deleted => TelemetryOutcome::Success,
+        Ok(_) => TelemetryOutcome::Success,
         _ => TelemetryOutcome::Failure,
     };
     openshell_core::telemetry::emit_lifecycle(
@@ -1344,13 +1349,17 @@ async fn handle_delete_sandbox_inner(
         .await?
         .name;
 
-    let result = state.compute.delete_sandbox(&workspace, &name).await?;
-    if result.deleted {
+    let result = state
+        .compute
+        .delete_sandbox_allow_missing(&workspace, &name, req.allow_missing)
+        .await?;
+    if !result.sandbox_id.is_empty() {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse {
-        deleted: result.deleted,
+        outcome: result.outcome.into(),
+        sandbox_id: result.sandbox_id,
     }))
 }
 
@@ -1391,10 +1400,7 @@ async fn handle_stop_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let mut sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
-    state
-        .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
+    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -1438,7 +1444,28 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let mut sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    let current = sandbox_by_name(state, &workspace, &req.name).await?;
+    let current_phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+    let launch_authentication = if current_phase == SandboxPhase::Ready {
+        Vec::new()
+    } else if state.sandbox_session_jwt_authority.is_some() {
+        let authentication = if matches!(
+            current_phase,
+            SandboxPhase::Stopped | SandboxPhase::Completed
+        ) {
+            mint_next_runtime_authentication(state, &current).await?
+        } else {
+            mint_persisted_authentication(state, &current)?
+        };
+        serde_json::to_vec(&authentication)
+            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
+    } else {
+        Vec::new()
+    };
+    let mut sandbox = state
+        .compute
+        .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
+        .await?;
     state
         .supervisor_sessions
         .project_endpoint_status(&mut sandbox);
@@ -1446,6 +1473,68 @@ async fn handle_start_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+pub fn mint_persisted_authentication(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    let authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox session authority is unavailable"))?;
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let identity =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    authority.mint_persisted_launch(sandbox.object_id(), &identity)
+}
+
+async fn mint_next_runtime_authentication(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    let authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox session authority is unavailable"))?;
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let current =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let next_epoch = current
+        .auth_epoch
+        .get()
+        .checked_add(1)
+        .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
+        .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
+    let next = crate::auth::sandbox_session::PersistedSandboxIdentity {
+        runtime_generation: current.runtime_generation,
+        auth_epoch: next_epoch,
+        gateway_token_id: uuid::Uuid::new_v4(),
+        refresh_replay: None,
+    };
+    let authentication = authority.mint_persisted_launch(sandbox.object_id(), &next)?;
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            sandbox.object_id(),
+            metadata.resource_version,
+            |updated| {
+                if let Some(metadata) = updated.metadata.as_mut() {
+                    next.write(&mut metadata.annotations);
+                }
+            },
+        )
+        .await
+        .map_err(|error| Status::aborted(format!("persist sandbox runtime identity: {error}")))?;
+    Ok(authentication)
 }
 
 async fn sandbox_by_name(
@@ -1529,7 +1618,11 @@ pub(super) async fn handle_watch_sandbox(
         req.log_tail_lines
     };
     let stop_on_terminal = req.stop_on_terminal;
-    let log_since_ms = req.log_since_ms;
+    if let Some(since_time) = req.since_time.as_ref() {
+        openshell_core::time::validate_timestamp(since_time)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    let log_since_time = req.since_time;
     let log_sources = req.log_sources;
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
@@ -1581,10 +1674,7 @@ pub(super) async fn handle_watch_sandbox(
 
             // Re-read the snapshot now that we have subscriptions active.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                Ok(Some(mut sandbox)) => {
-                    state
-                        .supervisor_sessions
-                        .project_endpoint_status(&mut sandbox);
+                Ok(Some(sandbox)) => {
                     state.sandbox_index.update_from_sandbox(&sandbox);
                     let _ = tx
                         .send(Ok(SandboxStreamEvent {
@@ -1616,15 +1706,25 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
-            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
+            // Replay tail logs (best-effort), filtered by log_since_time and log_sources.
             if follow_logs {
                 for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
                     if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                         ref log,
                     )) = evt.payload
                     {
-                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
-                            continue;
+                        if let Some(since_time) = log_since_time.as_ref() {
+                            let Some(event_time) = log.event_time.as_ref() else {
+                                continue;
+                            };
+                            let Ok(ordering) =
+                                openshell_core::time::compare_timestamps(event_time, since_time)
+                            else {
+                                continue;
+                            };
+                            if ordering == std::cmp::Ordering::Less {
+                                continue;
+                            }
                         }
                         if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
                             continue;
@@ -1666,10 +1766,7 @@ pub(super) async fn handle_watch_sandbox(
                         match res {
                             Ok(()) => {
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                    Ok(Some(mut sandbox)) => {
-                                        state
-                                            .supervisor_sessions
-                                            .project_endpoint_status(&mut sandbox);
+                                    Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
                                         if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
@@ -1809,7 +1906,12 @@ pub(super) async fn handle_exec_sandbox(
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
-    let timeout_seconds = req.timeout_seconds;
+    let execution_timeout = req
+        .execution_timeout
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let request_tty = req.tty;
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
@@ -1833,7 +1935,7 @@ pub(super) async fn handle_exec_sandbox(
             relay_stream,
             &command_str,
             stdin_payload,
-            timeout_seconds,
+            execution_timeout,
             request_tty,
             no_login_shell,
             cols,
@@ -2009,9 +2111,11 @@ async fn validate_ssh_forward_token(
         return Err(Status::unauthenticated("SSH session token is not valid"));
     }
 
-    if session.expires_at_ms > 0 {
+    if let Some(expiration_time) = session.expiration_time.as_ref() {
         let now_ms = current_time_ms();
-        if now_ms > session.expires_at_ms {
+        let expires_at_ms = openshell_core::time::timestamp_to_millis(expiration_time)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if now_ms > expires_at_ms {
             return Err(Status::unauthenticated("SSH session token expired"));
         }
     }
@@ -2248,7 +2352,12 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
-    let timeout_seconds = req.timeout_seconds;
+    let execution_timeout = req
+        .execution_timeout
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
     let sandbox_id = sandbox.object_id().to_string();
@@ -2276,7 +2385,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             input_stream,
             request_tty,
             no_login_shell,
-            timeout_seconds,
+            execution_timeout,
             cols,
             rows,
         )
@@ -2298,10 +2407,7 @@ fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
     let phase = SandboxPhase::try_from(sandbox.phase()).ok();
     matches!(phase, Some(SandboxPhase::Ready))
         || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id())
-            && !state
-                .supervisor_sessions
-                .terminal_delivery_finalized(sandbox.object_id()))
+            && state.supervisor_sessions.has_session(sandbox.object_id()))
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -2331,17 +2437,18 @@ pub(super) async fn handle_create_ssh_session(
         metadata: Some(ObjectMeta {
             id: token.clone(),
             name: generate_name(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: sandbox.object_workspace().to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
         revoked: false,
-        expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?,
     };
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
@@ -2385,7 +2492,8 @@ pub(super) async fn handle_create_ssh_session(
         gateway_port: gateway_port.into(),
         gateway_scheme: scheme.to_string(),
         host_key_fingerprint: String::new(),
-        expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -2394,7 +2502,8 @@ pub(super) async fn handle_revoke_ssh_session(
     request: Request<RevokeSshSessionRequest>,
 ) -> Result<Response<RevokeSshSessionResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let token = request.into_inner().token;
+    let req = request.into_inner();
+    let token = req.token;
     if token.is_empty() {
         return Err(Status::invalid_argument("token is required"));
     }
@@ -2406,7 +2515,9 @@ pub(super) async fn handle_revoke_ssh_session(
         .map_err(|e| Status::internal(format!("fetch ssh session failed: {e}")))?;
 
     let Some(mut session) = session else {
-        return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
+        return Ok(Response::new(RevokeSshSessionResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "ssh session")?,
+        }));
     };
     authorize_sandbox_workspace(
         &state.store,
@@ -2423,6 +2534,12 @@ pub(super) async fn handle_revoke_ssh_session(
             e
         }
     })?;
+
+    if session.revoked {
+        return Ok(Response::new(RevokeSshSessionResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }));
+    }
 
     let resource_version = session
         .metadata
@@ -2455,7 +2572,9 @@ pub(super) async fn handle_revoke_ssh_session(
         .await
         .map_err(|e| super::persistence_error_to_status(e, "revoke ssh session"))?;
 
-    Ok(Response::new(RevokeSshSessionResponse { revoked: true }))
+    Ok(Response::new(RevokeSshSessionResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2571,7 +2690,7 @@ async fn stream_exec_over_relay(
     relay_stream: tokio::io::DuplexStream,
     command: &str,
     stdin_payload: Vec<u8>,
-    timeout_seconds: u32,
+    execution_timeout: Option<std::time::Duration>,
     request_tty: bool,
     no_login_shell: bool,
     cols: u32,
@@ -2605,25 +2724,22 @@ async fn stream_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
+    let exec_result = if let Some(execution_timeout) = execution_timeout {
+        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
+            result
+        } else {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
     } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
+        exec.await
     };
 
     let exit_code = match exec_result {
@@ -2657,7 +2773,7 @@ async fn stream_interactive_exec_over_relay(
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
     no_login_shell: bool,
-    timeout_seconds: u32,
+    execution_timeout: Option<std::time::Duration>,
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
@@ -2689,25 +2805,22 @@ async fn stream_interactive_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
+    let exec_result = if let Some(execution_timeout) = execution_timeout {
+        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
+            result
+        } else {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
     } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
+        exec.await
     };
 
     let exit_code = match exec_result {
@@ -3508,18 +3621,18 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
                 .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -3530,12 +3643,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 log_level: "debug".to_string(),
@@ -3555,12 +3668,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                 labels: HashMap::from([("team".to_string(), "runtime".to_string())]),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxWorkloadTemplateSpec {
                 workload: Some(openshell_core::proto::SandboxWorkloadConfig {
@@ -3645,6 +3758,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
+                    allow_missing: false,
                     name: "reused-name".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -3672,7 +3786,10 @@ mod tests {
         drop(global_guard);
 
         let response = delete.await.unwrap().unwrap().into_inner();
-        assert!(response.deleted);
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert!(
             state
                 .store
@@ -4860,6 +4977,7 @@ mod tests {
         let deleted = handle_delete_sandbox_template(
             &state,
             authed_request(DeleteSandboxTemplateRequest {
+                allow_missing: false,
                 name: "gpu-kata".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -4869,7 +4987,10 @@ mod tests {
         .await
         .expect("template delete should succeed")
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let missing = handle_get_sandbox_template(
             &state,
@@ -5957,6 +6078,9 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
+        assert!(sandbox_relay_reachable(&state, &sandbox));
+
+        assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
@@ -5986,7 +6110,10 @@ mod tests {
         let handle1 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state1,
-                authed_request(RevokeSshSessionRequest { token: token1 }),
+                authed_request(RevokeSshSessionRequest {
+                    allow_missing: false,
+                    token: token1,
+                }),
             )
             .await
         });
@@ -5996,7 +6123,10 @@ mod tests {
         let handle2 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state2,
-                authed_request(RevokeSshSessionRequest { token: token2 }),
+                authed_request(RevokeSshSessionRequest {
+                    allow_missing: false,
+                    token: token2,
+                }),
             )
             .await
         });
@@ -6007,7 +6137,11 @@ mod tests {
         // One should succeed, one may fail with ABORTED due to CAS conflict
         let successes = [&result1, &result2]
             .iter()
-            .filter(|r| r.is_ok() && r.as_ref().unwrap().get_ref().revoked)
+            .filter(|r| {
+                r.is_ok()
+                    && r.as_ref().unwrap().get_ref().outcome()
+                        == openshell_core::proto::DeletionOutcome::Completed
+            })
             .count();
 
         // At least one should succeed in revoking
@@ -6351,110 +6485,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_sandboxes_projects_endpoint_status_across_pages() {
-        use openshell_core::proto::{EndpointResult, EndpointStatus};
-
-        let state = test_server_state().await;
-        let endpoint = EndpointStatus {
-            endpoint_id: "endpoint:v1:tools".to_string(),
-            host: "tools.example.com".to_string(),
-            ports: vec![443],
-            path: "/mcp".to_string(),
-            last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-15T01:00:00.000Z".to_string(),
-        };
-        for name in ["alpha", "beta", "gamma"] {
-            let mut sandbox = test_sandbox(name, Vec::new());
-            sandbox
-                .status
-                .as_mut()
-                .expect("sandbox status")
-                .endpoint_statuses = vec![endpoint.clone()];
-            state.store.put_message(&sandbox).await.unwrap();
-        }
-
-        // Only alpha has a live observation authority; the other persisted
-        // results must be reset in responses, including on the second page.
-        let (session_tx, _session_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        state.supervisor_sessions.register(
-            "sandbox-alpha".to_string(),
-            "session-alpha".to_string(),
-            session_tx,
-            shutdown_tx,
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .initialize_endpoint_status_authority("sandbox-alpha", "session-alpha")
-        );
-
-        let request = ListSandboxesRequest {
-            page_size: 2,
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-            ..Default::default()
-        };
-        let first_page = handle_list_sandboxes(&state, authed_request(request.clone()))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            first_page
-                .sandboxes
-                .iter()
-                .map(ObjectName::object_name)
-                .collect::<Vec<_>>(),
-            ["alpha", "beta"]
-        );
-        assert!(!first_page.next_page_token.is_empty());
-        let second_page = handle_list_sandboxes(
-            &state,
-            authed_request(ListSandboxesRequest {
-                page_token: first_page.next_page_token,
-                ..request
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(second_page.sandboxes.len(), 1);
-        assert_eq!(second_page.sandboxes[0].object_name(), "gamma");
-        assert!(second_page.next_page_token.is_empty());
-
-        let unknown = EndpointStatus {
-            last_result: EndpointResult::NoObservedExchange as i32,
-            last_reported_at: String::new(),
-            ..endpoint.clone()
-        };
-        for (sandbox, expected_endpoint) in [
-            (&first_page.sandboxes[0], &endpoint),
-            (&first_page.sandboxes[1], &unknown),
-            (&second_page.sandboxes[0], &unknown),
-        ] {
-            let status = sandbox.status.as_ref().expect("sandbox status");
-            assert_eq!(status.phase, SandboxPhase::Ready as i32);
-            assert_eq!(
-                status.endpoint_statuses.as_slice(),
-                std::slice::from_ref(expected_endpoint)
-            );
-        }
-        // Read-time projection must not erase persisted reports.
-        let persisted = state
-            .store
-            .get_message::<Sandbox>("sandbox-gamma")
-            .await
-            .unwrap()
-            .expect("persisted sandbox");
-        assert_eq!(
-            persisted
-                .status
-                .expect("persisted status")
-                .endpoint_statuses,
-            [endpoint]
-        );
-    }
-
-    #[tokio::test]
     async fn sandbox_crud_is_workspace_isolated() {
         use crate::persistence::ObjectType;
         use openshell_core::proto::{
@@ -6783,6 +6813,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
             }),
@@ -6849,7 +6880,16 @@ mod tests {
 
         let mut sandbox = test_sandbox("cross-ws", Vec::new());
         sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        sandbox.set_phase(SandboxPhase::Completed as i32);
         state.store.put_message(&sandbox).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let _ = state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "retained-terminal-session".to_string(),
+            tx,
+            shutdown_tx,
+        );
 
         // --- handle_watch_sandbox ---
         let err = handle_watch_sandbox(
@@ -6905,6 +6945,7 @@ mod tests {
         handle_revoke_ssh_session(
             &state,
             authed_request(RevokeSshSessionRequest {
+                allow_missing: false,
                 token: token.clone(),
             }),
         )

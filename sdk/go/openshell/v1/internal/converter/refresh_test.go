@@ -83,14 +83,14 @@ func TestRefreshStatusFromProto(t *testing.T) {
 		CredentialKey:        "API_KEY",
 		Strategy:             pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
 		Status:               "active",
-		ExpiresAtMs:          1700000000000,
-		NextRefreshAtMs:      1699999000000,
-		LastRefreshAtMs:      1699998000000,
+		ExpirationTime:       TimestampFromMillis(1700000000000),
+		NextRefreshTime:      TimestampFromMillis(1699999000000),
+		LastRefreshTime:      TimestampFromMillis(1699998000000),
 		LastError:            "none",
 		RecoveryAction:       pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
 		FailureCode:          "oauth_invalid_grant",
 		ProviderErrorSubtype: "invalid_rapt",
-		LastErrorAtMs:        1699997000000,
+		LastErrorTime:        TimestampFromMillis(1699997000000),
 	}
 
 	status := RefreshStatusFromProto(proto)
@@ -138,7 +138,7 @@ func TestRefreshStatusFromProto_ParkedRefreshHasNoNextTime(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
 		ProviderName:    "test",
 		CredentialKey:   "KEY",
-		NextRefreshAtMs: math.MaxInt64,
+		NextRefreshTime: nil,
 		RecoveryAction:  pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
 	}
 
@@ -189,8 +189,8 @@ func TestRefreshConfigToProto(t *testing.T) {
 	assert.Equal(t, "client_secret", proto.SecretMaterialKeys[0], "secret keys must be deep copied")
 
 	// ExpiresAt conversion
-	require.NotNil(t, proto.ExpiresAtMs)
-	assert.Equal(t, MillisFromTime(expiresAt), *proto.ExpiresAtMs)
+	require.NotNil(t, proto.ExpirationTime)
+	assert.Equal(t, MillisFromTime(expiresAt), MillisFromProto(proto.ExpirationTime))
 }
 
 func TestRefreshConfigToProto_NilExpiresAt(t *testing.T) {
@@ -203,7 +203,7 @@ func TestRefreshConfigToProto_NilExpiresAt(t *testing.T) {
 	proto := RefreshConfigToProto(config)
 
 	require.NotNil(t, proto)
-	assert.Nil(t, proto.ExpiresAtMs)
+	assert.Nil(t, proto.ExpirationTime)
 }
 
 func TestRefreshConfigToProto_Nil(t *testing.T) {
