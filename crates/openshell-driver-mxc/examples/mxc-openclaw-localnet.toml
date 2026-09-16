@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# mxc-openclaw-localnet.toml
+# Like mxc-openclaw-gateway.toml but uses allowLocalNetwork instead of egress_proxy.
+# allowLocalNetwork=true lets the AppContainer reach the host's loopback (the gateway
+# relay) without routing through the egress proxy, which breaks node.js DLL init.
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\FromSenthil\\mxc-fixes-env-vars\\wxc-exec.exe"
+
+backend           = "process_container"
+pc_capabilities   = ["privateNetworkClientServer"]
+pc_least_privilege = false
+pc_allow_local_network = true
+# UI capability is now a SandboxPolicy concern, not gateway TOML -- see
+# openclaw-gateway.yaml's `ui: { allow_graphical_ui: true, ... }`. Needed
+# because Node.js (OpenClaw's runtime) touches user32/gdi32 during its own
+# startup and dies with STATUS_DLL_INIT_FAILED under the Win32k lockdown
+# that applies when a policy has no `ui:` section, confirmed empirically
+# against mxc-release-binaries-v0.8.0, even though this target never
+# actually opens a window.
+
+share_dir = "C:/openshell-openclaw"
+agent_cwd = "C:/openshell-openclaw"
+
+agent_command = [
+  "C:/openshell-openclaw/node.exe",
+  "C:/openshell-openclaw/openclaw-capture.mjs",
+  "gateway", "run", "--dev", "--allow-unconfigured",
+  "--auth", "token", "--bind", "loopback", "--port", "18889",
+]
+
+agent_env = [
+  "OPENCLAW_GATEWAY_TOKEN",
+  "OPENCLAW_NO_UPDATE_CHECK=1",
+  "NO_UPDATE_NOTIFIER=1",
+  "HOME=C:/openshell-openclaw/home",
+  "USERPROFILE=C:/openshell-openclaw/home",
+  "TEMP=C:/openshell-openclaw/temp",
+  "TMP=C:/openshell-openclaw/temp",
+  "NEMOCLAW_MXC_CAPTURE_ENTRY=C:/openshell-openclaw/runtime/node_modules/openclaw/openclaw.mjs",
+  "NEMOCLAW_MXC_CAPTURE_LOG=C:/openshell-openclaw/openclaw-capture.log",
+  # Credential-free target-side probe used only by the qualification harness.
+  # It records response byte counts, never response payloads.
+  "NEMOCLAW_MXC_CAPTURE_SELF_PROBE_PORT=18889",
+]
+
+# No static bridge -- relay bridging is entirely on-demand via
+# ForwardSink::open_dynamic_forward / the control channel's "forward" op,
+# driven by `openshell forward service --target-port 18889`.
+pc_relay_spawner_path = "C:/openshell-openclaw/openshell-supervisor-relay.exe"
+pc_relay_target_port  = 18889
+
+debug = true

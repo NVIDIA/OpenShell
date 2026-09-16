@@ -659,7 +659,7 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
-### MXC
+### MXC audit configuration
 
 The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
 map Windows Sandboxing provider events into the gateway's OCSF stream.
@@ -919,6 +919,52 @@ Use `ssh_socket_path` for Podman configurations. The legacy
 OpenShell sends no override and Podman applies its runtime-selected profile.
 Set `Unconfined` explicitly only when the deployment requires the supervisor's
 mount setup to bypass that profile.
+
+### MXC
+
+The MXC driver is Windows-only and opt-in. It links into the gateway, invokes Microsoft MXC through `wxc-exec.exe`, and runs each sandbox's configured command in-driver instead of using the Linux sandbox supervisor.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["mxc"]
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+# process_container (default) or isolation_session.
+backend = "process_container"
+default_configuration_id = "composable"
+pc_least_privilege = false
+pc_capabilities    = []
+# Command executed inside the MXC sandbox.
+agent_command = ["cmd", "/c", "echo hello > C:\\work\\demo\\hello.txt"]
+agent_cwd     = "C:\\work\\demo"
+# Optional non-secret operator environment. Bare keys read the gateway host
+# environment; KEY=VALUE entries pass through literally. Do not put secrets here.
+agent_env     = ["MY_NON_SECRET_SETTING=enabled"]
+share_dir     = "C:\\work\\demo"
+# Pattern C governed egress. MXC 0.8 denies direct Internet egress and permits
+# host loopback; proxy-aware clients receive HTTP_PROXY/HTTPS_PROXY and the host
+# CONNECT proxy enforces the trimmed network policy. Requires process_container.
+egress_proxy      = false
+egress_proxy_addr = ""
+debug = false
+etw_audit = false
+```
+
+Set `egress_proxy = true` with `egress_proxy_addr = "127.0.0.1:18080"` to enable the Windows Pattern C split. The address must be a `127.0.0.1:PORT` socket. The driver allocates a unique ephemeral port per sandbox, injects that listener through proxy environment variables, and stages the public proxy CA beneath `share_dir/.openshell-proxy/<sandbox-id>/`. CA staging requires a non-empty `share_dir`; sandbox-specific subdirectories prevent concurrent sandboxes from overwriting each other's trust files. MXC denies direct Internet egress but allows `127.0.0.1/32`; this permits dynamic forwarding but also means the sandbox can reach unrelated host services bound to loopback.
+
+MXC rejects policies containing `network_middlewares` before launch because this host-proxy path does not receive the gateway middleware registry.
+
+Supply the workload command and optional working directory through the sandbox's `mxc` driver configuration, for example `{"mxc":{"command":["cmd","/c","echo hello"],"cwd":"C:\\work"}}`.
+
+Attached provider credentials require this governed-egress path. The gateway gives MXC only revision-scoped environment placeholders and keeps real values in the host proxy's endpoint-bound resolver. Provider keys override matching sandbox environment entries case-insensitively. Sandbox creation fails when attached provider material exists but `egress_proxy` is disabled. MXC takes its static provider snapshot at creation and rejects credentials with an expiration timestamp because it has no live refresh channel. Dynamic token grants continue to mint credentials per request in the host proxy. Recreate the sandbox after attaching, detaching, rotating, or revoking a non-expiring static provider credential.
+
+The driver assigns a distinct loopback listener port and proxy credentials to each MXC sandbox. The host proxy rejects missing, invalid, duplicate, or cross-sandbox proxy credentials before forwarding. This authenticates the sandbox's proxy access; it does not isolate unrelated host-loopback services or distinguish processes within the same sandbox. Treat the gateway host and processes that can read the sandbox credentials as trusted.
 
 ### MicroVM
 

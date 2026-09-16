@@ -15,10 +15,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, info};
 
-/// MXC config schema version.
-pub const MXC_SCHEMA_VERSION: &str = "0.6.0-alpha";
+/// MXC config schema version. The mapper and one-shot launcher share the
+/// MXC 0.8 directional network schema.
+pub const MXC_SCHEMA_VERSION: &str = "0.8.0-alpha";
 
 /// Default `configurationId` for isolation session. Never use `"small"` (known OS bug).
 pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
@@ -69,6 +70,46 @@ pub struct MxcFilesystem {
 pub struct MxcNetwork {
     pub default_policy: String,
     pub proxy: Option<SocketAddr>,
+    /// When true, includes `"allowLocalNetwork": true` in the network JSON.
+    /// Required for node.js to initialize inside a processcontainer — without
+    /// it, node.exe DLL initialization fails with `STATUS_DLL_INIT_FAILED`.
+    pub allow_local_network: bool,
+}
+
+/// Directional clipboard access in the MXC top-level `ui` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MxcClipboardAccess {
+    None,
+    Read,
+    Write,
+    All,
+}
+
+impl MxcClipboardAccess {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Cross-platform MXC UI policy emitted for a process container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcUi {
+    pub disable: bool,
+    pub clipboard: MxcClipboardAccess,
+    pub injection: bool,
+}
+
+fn ui_json(ui: &MxcUi) -> serde_json::Value {
+    serde_json::json!({
+        "disable": ui.disable,
+        "clipboard": ui.clipboard.as_str(),
+        "injection": ui.injection,
+    })
 }
 
 /// `processContainer`-specific knobs (one-shot `AppContainer` backend).
@@ -92,20 +133,74 @@ pub struct MxcProcess {
     pub timeout: u64,
 }
 
+/// Redacts `process.env` and `process.commandLine` from a wxc-config JSON
+/// before it's ever logged or written to a sandbox-readable path (only
+/// under `self.debug`, but debug output still isn't a safe place for it).
+/// Both can carry host secrets verbatim -- `env` e.g. the shipped
+/// `OpenClaw` example config's `OPENCLAW_GATEWAY_TOKEN`, `commandLine`
+/// whenever a secret is passed as a literal CLI argument -- and both debug
+/// sinks (gateway logs, and for `run_oneshot` a file inside the sandbox's
+/// own readwrite path) are places an attacker or an over-broad log
+/// retention policy could read from. Everything else debug tooling might
+/// need to compare (filesystem grants, network policy, ...) is left intact.
+fn redact_env_for_debug(config: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = config.clone();
+    if let Some(env) = redacted.get_mut("process").and_then(|p| p.get_mut("env")) {
+        let count = env.as_array().map_or(0, Vec::len);
+        *env = serde_json::json!(format!("<redacted: {count} entries>"));
+    }
+    if let Some(command_line) = redacted
+        .get_mut("process")
+        .and_then(|p| p.get_mut("commandLine"))
+    {
+        *command_line = serde_json::json!("<redacted>");
+    }
+    redacted
+}
+
 fn network_json(network: &MxcNetwork) -> serde_json::Value {
-    // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
-    // {"host": ..., "port": ...} and every other shape is rejected — verified
-    // empirically against the real wxc-exec 0.6.0-alpha binary via --dry-run.
-    // See also docs/reference/mxc-compute-driver-design.mdx §network.proxy.
-    // The MxcNetwork.proxy field remains SocketAddr so callers keep full
-    // precision; only the port is serialized into the localhost key.
-    // Released wxc-exec rejects allowedHosts and blockedHosts as unsupported,
-    // even when they are empty. The host proxy enforces the L7 allowlist.
-    let mut value = serde_json::json!({
-        "defaultPolicy": network.default_policy.as_str(),
-    });
-    if let Some(proxy) = network.proxy {
-        value["proxy"] = serde_json::json!({ "localhost": proxy.port() });
+    // MXC 0.8.0-alpha schema uses a directional egress/ingress format.
+    // "block" default_policy maps to egress.default "deny"; "allow" maps to "allow".
+    let egress_default = if network.default_policy == "block" {
+        "deny"
+    } else {
+        "allow"
+    };
+    let mut value = if network.proxy.is_some() {
+        // Use direct loopback egress rather than runtimeConfig.networkProxy proxy
+        // mode. Proxy mode routes all outbound TCP through processmodel.dll's WFP
+        // redirect, which in practice blocks loopback connects from the relay to
+        // its target process (127.0.0.1:port) even with networkLoopback capability
+        // in the PSEC spec. Direct allow for 127.0.0.1/32 (not the broader 127.0.0.0/8
+        // range -- openshell-supervisor-relay only ever dials the literal
+        // 127.0.0.1, see imp.rs) lets the relay reach:
+        //   - the target it spawns (loopback inside AppContainer)
+        //   - the host relay listener (also 127.0.0.1 via egress allow)
+        // PSEC tier is still selected because requires_psec_networking() returns
+        // true when egress.allow is non-empty (no NetworkIsolationSetAppContainerConfig
+        // call needed — no elevation required).
+        //
+        // Deliberately no `ports` restriction: `openshell forward service`'s
+        // dynamic bridge (imp.rs's "forward" control-channel op) connects the
+        // relay out to a fresh, per-request ephemeral host port chosen at
+        // forward-call time (data.relay_addr), not a port known when this
+        // config is generated -- confirmed 2026-09-10 that scoping `ports` to
+        // just [proxy.port(), relay_target_port] breaks that dynamic forward
+        // (ws-echo failed with a "forbidden by access permissions" / 10013
+        // relay-connect error). Any-port-on-127.0.0.1 is the correct scope
+        // here, not a narrower static list.
+        serde_json::json!({
+            "egress": {
+                "default": "deny",
+                "allow": [{"to": [{"cidr": "127.0.0.1/32"}]}]
+            },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
+        })
+    } else {
+        serde_json::json!({ "egress": { "default": egress_default } })
+    };
+    if network.proxy.is_none() && network.allow_local_network {
+        value["ingress"] = serde_json::json!({ "default": "allow", "hostLoopback": "allow" });
     }
     value
 }
@@ -142,6 +237,7 @@ fn oneshot_config_json(
     pc: &MxcProcessContainer,
     process: &MxcProcess,
     network: Option<&MxcNetwork>,
+    ui: Option<&MxcUi>,
 ) -> serde_json::Value {
     let mut filesystem_json = serde_json::Map::new();
     if !filesystem.readwrite_paths.is_empty() {
@@ -181,6 +277,15 @@ fn oneshot_config_json(
     });
     if let Some(network) = network {
         config["network"] = network_json(network);
+    }
+    // Root-level ui section required by mxc-fixes-env-vars build. Comes from
+    // the typed SandboxPolicy via `ui` -- EmbeddedPolicyMapper always
+    // populates this for process_container (with restrictive defaults --
+    // disable=true, Win32k syscall lockdown -- when the policy has no
+    // explicit `ui:` section), so `None` here only happens in tests that
+    // bypass the mapper; omit the section entirely rather than guess.
+    if let Some(ui) = ui {
+        config["ui"] = ui_json(ui);
     }
     config
 }
@@ -335,7 +440,11 @@ impl WxcExecInvoker {
             cmd.arg("--debug");
         }
 
-        debug!(config = %json, "wxc-exec phase");
+        // `config` here never carries `process.env` today (provision/start/
+        // stop/deprovision have no `process` field at all -- see run_phase's
+        // doc comment), but redact defensively rather than relying on that
+        // staying true.
+        debug!(config = %redact_env_for_debug(config), "wxc-exec phase");
         let output = cmd.output().await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -406,7 +515,13 @@ impl WxcExecInvoker {
             cmd.arg("--debug");
         }
 
-        debug!(config = %json, "wxc-exec provision");
+        let redacted = redact_env_for_debug(&config);
+        if self.debug {
+            let pretty = serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| json.clone());
+            info!("generated wxc-config (provision):\n{pretty}");
+        } else {
+            debug!(config = %redacted, "wxc-exec provision");
+        }
         let output = cmd.output().await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -494,15 +609,26 @@ impl WxcExecInvoker {
         cmd.arg("--config-base64")
             .arg(&b64)
             .arg("--experimental")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
+            // Piped (not null): mirrors the ProcessContainer one-shot spawn
+            // below -- with STDIO passthrough, wxc-exec forwards this handle
+            // down to the exec'd child, giving the driver a control channel
+            // into the isolation_session sandbox with no network capability
+            // required. Without this, pc_relay_spawner_path's control channel
+            // (and therefore dynamic `openshell forward service`) silently
+            // has nothing to attach to on this backend.
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         if self.debug {
             cmd.arg("--debug");
         }
 
-        debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "wxc-exec exec spawn");
+        if self.debug {
+            let redacted = redact_env_for_debug(&config);
+            let pretty = serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| json.clone());
+            info!(sandbox_id = %iso_sandbox_id, "generated wxc-config (exec):\n{pretty}");
+        }
+        info!(sandbox_id = %iso_sandbox_id, "wxc-exec exec spawn");
         let child = cmd.spawn()?;
         Ok(child)
     }
@@ -575,9 +701,16 @@ impl WxcExecInvoker {
         pc: MxcProcessContainer,
         process: MxcProcess,
         network: Option<MxcNetwork>,
+        ui: Option<MxcUi>,
     ) -> Result<tokio::process::Child, InvokerError> {
-        let config =
-            oneshot_config_json(container_id, &filesystem, &pc, &process, network.as_ref());
+        let config = oneshot_config_json(
+            container_id,
+            &filesystem,
+            &pc,
+            &process,
+            network.as_ref(),
+            ui.as_ref(),
+        );
         if self.mock {
             let grants: Vec<String> = filesystem
                 .readwrite_paths
@@ -593,20 +726,49 @@ impl WxcExecInvoker {
         }
 
         let json = serde_json::to_string(&config)?;
+        if self.debug {
+            // Redacted before either sink: the readwrite path is inside the
+            // sandbox itself (readable by whatever untrusted code runs
+            // there), and gateway logs may have broader retention/access
+            // than the secrets in `process.env` (e.g. OPENCLAW_GATEWAY_TOKEN
+            // in the shipped OpenClaw example config) should get.
+            let redacted = redact_env_for_debug(&config);
+            let redacted_json = serde_json::to_string(&redacted).unwrap_or_else(|_| json.clone());
+            // Dump into the first readwrite path for comparison.
+            if let Some(rw) = config
+                .get("filesystem")
+                .and_then(|f| f.get("readwritePaths"))
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+            {
+                let _ = std::fs::write(
+                    std::path::Path::new(rw).join("wxc-exec-config-debug.json"),
+                    &redacted_json,
+                );
+            }
+            let pretty =
+                serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted_json.clone());
+            info!(container_id = %container_id, "generated wxc-config:\n{pretty}");
+        }
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
         let mut cmd = Command::new(&self.exec_path);
         cmd.arg("--config-base64")
             .arg(&b64)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
+            // Piped (not null): with STDIO passthrough, wxc-exec forwards this
+            // handle down to the sandboxed child, giving the driver a write
+            // channel into the AppContainer with no network capability
+            // required at all -- see openshell-supervisor-relay's stdin/stdout
+            // JSON control protocol.
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         if self.debug {
             cmd.arg("--debug");
         }
 
-        debug!(container_id = %container_id, command = %process.command_line, "wxc-exec one-shot processContainer spawn");
+        info!(container_id = %container_id, "wxc-exec one-shot processContainer spawn");
         let child = cmd.spawn()?;
         Ok(child)
     }
@@ -745,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn provision_config_json_includes_network_proxy_when_supplied() {
+    fn provision_config_json_includes_network_loopback_when_proxy_supplied() {
         let filesystem = MxcFilesystem {
             readwrite_paths: vec!["C:\\work\\demo".into()],
             readonly_paths: Vec::new(),
@@ -754,39 +916,47 @@ mod tests {
         let network = MxcNetwork {
             default_policy: "block".into(),
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
+            allow_local_network: false,
         };
         let config = provision_config_json(DEFAULT_CONFIGURATION_ID, &filesystem, Some(&network));
 
-        assert_eq!(config["network"]["defaultPolicy"], "block");
-        assert!(config["network"].get("allowedHosts").is_none());
-        assert!(config["network"].get("blockedHosts").is_none());
-        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
-        assert_eq!(config["network"]["proxy"]["localhost"], 18080);
-        assert!(
-            config["network"]["proxy"].get("host").is_none(),
-            "proxy must not contain 'host' key"
+        // With proxy: use direct loopback egress (127.0.0.1/32 allow) instead of
+        // runtimeConfig.networkProxy proxy mode, so relay can reach its spawned
+        // target process via loopback without processmodel.dll proxy-redirect WFP
+        // interference. PSEC tier still selected via requires_psec_networking().
+        assert_eq!(config["network"]["egress"]["default"], "deny");
+        assert_eq!(
+            config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+            "127.0.0.1/32"
         );
-        assert!(
-            config["network"]["proxy"].get("port").is_none(),
-            "proxy must not contain 'port' key"
-        );
+        assert_eq!(config["network"]["ingress"]["default"], "allow");
+        assert_eq!(config["network"]["ingress"]["hostLoopback"], "allow");
+        assert!(config["network"].get("defaultPolicy").is_none());
+        assert!(config["network"].get("proxy").is_none());
+        // No runtimeConfig.networkProxy — using direct loopback egress instead.
+        assert!(config.get("runtimeConfig").is_none());
     }
 
     #[test]
-    fn network_json_emits_localhost_port_shape() {
-        // MXC 0.6.0-alpha rejects {"host":...,"port":...} and accepts only
-        // {"proxy": {"localhost": N}} — verified against the real binary via
-        // --dry-run. This test pins the exact emitted JSON shape.
+    fn network_json_emits_directional_format() {
+        // MXC 0.8.0-alpha: egress/ingress replaces the legacy
+        // defaultPolicy / allowedHosts / proxy.localhost shape.
         let network = MxcNetwork {
             default_policy: "block".into(),
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
+            allow_local_network: false,
         };
         let value = network_json(&network);
-        assert!(value.get("allowedHosts").is_none());
-        assert!(value.get("blockedHosts").is_none());
-        assert_eq!(value["proxy"]["localhost"], 18080);
-        assert!(value["proxy"].get("host").is_none());
-        assert!(value["proxy"].get("port").is_none());
+        // Loopback-allow mode: egress.default="deny" with 127.0.0.1/32 allow rule.
+        // Allows relay to reach both the spawned target (intra-container loopback)
+        // and the host relay listener (host loopback) without proxy-mode WFP issues.
+        assert_eq!(value["egress"]["default"], "deny");
+        assert_eq!(value["egress"]["allow"][0]["to"][0]["cidr"], "127.0.0.1/32");
+        // ingress.hostLoopback="allow" grants networkLoopback PSEC capability.
+        assert_eq!(value["ingress"]["default"], "allow");
+        assert_eq!(value["ingress"]["hostLoopback"], "allow");
+        assert!(value.get("proxy").is_none());
+        assert!(value.get("defaultPolicy").is_none());
     }
 
     #[test]
@@ -803,9 +973,39 @@ mod tests {
             env: Vec::new(),
             timeout: 0,
         };
-        let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None);
+        let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None, None);
 
         assert!(config.get("network").is_none());
+        assert!(config.get("ui").is_none());
+    }
+
+    #[test]
+    fn oneshot_config_json_emits_typed_ui_policy() {
+        let filesystem = MxcFilesystem::default();
+        let pc = MxcProcessContainer::default();
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: "C:\\work\\demo".into(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let ui = MxcUi {
+            disable: false,
+            clipboard: MxcClipboardAccess::Write,
+            injection: true,
+        };
+        let config = oneshot_config_json("sb-ui", &filesystem, &pc, &process, None, Some(&ui));
+
+        assert_eq!(config["ui"]["disable"], false);
+        assert_eq!(config["ui"]["clipboard"], "write");
+        assert_eq!(config["ui"]["injection"], true);
+    }
+
+    #[test]
+    fn isolation_provision_config_never_synthesizes_ui() {
+        let config =
+            provision_config_json(DEFAULT_CONFIGURATION_ID, &MxcFilesystem::default(), None);
+        assert!(config.get("ui").is_none());
     }
 
     #[test]

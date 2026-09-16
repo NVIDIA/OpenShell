@@ -349,6 +349,7 @@ impl OpenShellClient {
                 let request = proto::DeleteSandboxRequest {
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
+                    ..Default::default()
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
@@ -907,6 +908,7 @@ impl WorkspaceScopedClient {
                 let request = proto::DeleteSandboxRequest {
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    ..Default::default()
                 };
                 async move { grpc.delete_sandbox(request).await }
             })

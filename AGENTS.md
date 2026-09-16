@@ -59,6 +59,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
+| `crates/openshell-supervisor-relay/` | MXC supervisor relay | **Windows-only** standalone binary the MXC driver spawns inside a ProcessContainer/isolation session in place of `agent_command`; launches the real target process, exposes a JSON control channel (launch/shutdown/forward) over its own inherited stdin/stdout, and bridges dynamic TCP forwards (`openshell forward service`) to it |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |

@@ -878,6 +878,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Resolve `--env-from KEY[=ENVVAR]` values from the CLI process environment.
+///
+/// This keeps environment values out of process arguments while preserving the
+/// same sandbox environment validation as `--env KEY=VALUE`.
+pub fn parse_env_from_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env-from key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env-from keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+        if !is_valid_env_name(env_name) {
+            return Err(miette::miette!(
+                "--env-from source must match [A-Za-z_][A-Za-z0-9_]*; got '{env_name}'"
+            ));
+        }
+        if map.contains_key(key) {
+            return Err(miette::miette!("duplicate --env-from sandbox key '{key}'"));
+        }
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--env-from source environment variable '{env_name}' is not set or is not valid Unicode"
+            )
+        })?;
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
 /// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
 /// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
 pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {

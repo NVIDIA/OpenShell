@@ -14,12 +14,13 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace_selector,
 };
+use crate::compute::SandboxDeletePreconditions;
 use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
 };
 use futures::future;
-use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::net::{connect_tcp_nodelay_best_effort, set_tcp_nodelay_best_effort};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
@@ -490,9 +491,12 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    let runtime_inputs =
+        super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -518,7 +522,12 @@ async fn handle_create_sandbox_inner(
 
     let mut sandbox = state
         .compute
-        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .create_sandbox_with_runtime_inputs(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            runtime_inputs,
+        )
         .await?;
     state
         .supervisor_sessions
@@ -1343,8 +1352,22 @@ async fn handle_delete_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    if req.expected_resource_version != 0 && req.expected_sandbox_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "expected_resource_version requires expected_sandbox_id",
+        ));
+    }
 
-    let result = state.compute.delete_sandbox(&workspace, &name).await?;
+    let preconditions = SandboxDeletePreconditions {
+        expected_sandbox_id: (!req.expected_sandbox_id.is_empty())
+            .then_some(req.expected_sandbox_id),
+        expected_resource_version: (req.expected_resource_version != 0)
+            .then_some(req.expected_resource_version),
+    };
+    let result = state
+        .compute
+        .delete_sandbox_with_preconditions(&workspace, &name, preconditions)
+        .await?;
     if result.deleted {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
@@ -1917,6 +1940,69 @@ pub(super) async fn handle_forward_tcp(
     }
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
+    let sandbox_id = sandbox.object_id().to_string();
+
+    // Drivers with no in-sandbox supervisor at all (MXC) never have a live
+    // ConnectSupervisor session -- `open_relay_with_target` below would just
+    // burn its 15s timeout and fail. When the active driver contributes a
+    // dynamic-forward capability, bridge through that instead (see
+    // `ComputeDriverForwardSink::open_dynamic_forward`).
+    if let Some(forward_sink) = state.compute.forward_sink() {
+        let target_port = match &target {
+            relay_open::Target::Tcp(t) => u16::try_from(t.port)
+                .map_err(|_| Status::invalid_argument("tcp target port out of range"))?,
+            relay_open::Target::Ssh(_) => {
+                return Err(Status::unimplemented(
+                    "this driver has no SSH server to forward to",
+                ));
+            }
+        };
+
+        let (relay_addr, nonce, relay_handle) = forward_sink
+            .open_dynamic_forward(&sandbox_id, target_port)
+            .await
+            .map_err(|e| Status::unavailable(format!("driver dynamic forward failed: {e}")))?;
+
+        // This is a latency-sensitive request/response tunnel, including on
+        // loopback -- small agent-protocol/WS frames can otherwise stall
+        // behind delayed ACK behavior, so disable Nagle on this leg too.
+        let mut relay_stream = connect_tcp_nodelay_best_effort(&[relay_addr])
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "failed to connect to MXC relay at {relay_addr}: {e}"
+                ))
+            })?;
+        // Prove to the relay this is the real Phase B peer before any
+        // tunneled application data -- see openshell-driver-mxc's relay.rs
+        // module docs (the relay listens on loopback, so without this any
+        // other local process racing to connect first could otherwise
+        // hijack the forward).
+        tokio::io::AsyncWriteExt::write_all(&mut relay_stream, &nonce)
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("failed to authenticate to MXC relay: {e}"))
+            })?;
+
+        let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
+        let sandbox_id_bridge = sandbox_id.clone();
+        tokio::spawn(async move {
+            let _connection_guard = connection_guard;
+            // Held for the bridge's lifetime; dropping it (bridge exits,
+            // this task ends) stops the ephemeral relay listener and closes
+            // Phase A, which is what tells the sandbox's dynamic bridge to
+            // stop too -- no separate teardown message needed.
+            let _relay_handle = relay_handle;
+            bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id_bridge, "mxc-dynamic")
+                .await;
+        });
+
+        let stream: Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send + 'static>,
+        > = Box::pin(ReceiverStream::new(rx));
+        return Ok(Response::new(stream));
+    }
+
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay_with_target(
@@ -1928,7 +2014,6 @@ pub(super) async fn handle_forward_tcp(
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
@@ -2114,13 +2199,15 @@ fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
     }
 }
 
-async fn bridge_forward_tcp_stream(
+async fn bridge_forward_tcp_stream<S>(
     mut inbound: tonic::Streaming<TcpForwardFrame>,
-    relay_stream: tokio::io::DuplexStream,
+    relay_stream: S,
     tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
     sandbox_id: &str,
     channel_id: &str,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
 
     let sandbox_id_in = sandbox_id.to_string();
@@ -3649,6 +3736,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
             )
             .await
@@ -3684,6 +3772,66 @@ mod tests {
         assert_eq!(
             state.telemetry.ended_sandbox_sessions(),
             [original.object_id().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_handler_rejects_expected_identity_drift_before_mutation() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_delete_sandbox_inner(
+            &state,
+            authed_request(DeleteSandboxRequest {
+                name: "guarded-delete".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                expected_sandbox_id: "sb-stale".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_handler_rejects_resource_version_without_immutable_identity() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_delete_sandbox_inner(
+            &state,
+            authed_request(DeleteSandboxRequest {
+                name: "guarded-delete".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                expected_sandbox_id: String::new(),
+                expected_resource_version: 17,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -6785,6 +6933,7 @@ mod tests {
             non_member_request(DeleteSandboxRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
+                ..Default::default()
             }),
         )
         .await

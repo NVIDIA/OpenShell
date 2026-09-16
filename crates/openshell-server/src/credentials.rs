@@ -107,6 +107,10 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
 pub struct ResolvedProviderCredentials {
     pub values: HashMap<String, String>,
     pub expires_at_ms: HashMap<String, i64>,
+    /// Keys returned by a credential driver whose effective expiration has
+    /// already passed. Values stay withheld, but create-time consumers need
+    /// the identities to fail closed instead of silently omitting credentials.
+    pub expired_keys: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -706,6 +710,7 @@ impl CredentialRuntime {
                         effective_expires_at_ms,
                         "skipping expired handle-backed credential"
                     );
+                    resolved.expired_keys.insert(credential_key);
                     continue;
                 }
                 if effective_expires_at_ms > 0 {

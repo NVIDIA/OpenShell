@@ -60,6 +60,7 @@ fn selected_workspace(
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
+    delete_requests: Arc<Mutex<Vec<DeleteSandboxRequest>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
@@ -330,6 +331,11 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        self.state
+            .delete_requests
+            .lock()
+            .await
+            .push(request.clone());
         self.state
             .deleted_names
             .lock()
@@ -1383,6 +1389,10 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
     server.openshell.state.deleted_names.lock().await.clone()
 }
 
+async fn delete_requests(server: &TestServer) -> Vec<DeleteSandboxRequest> {
+    server.openshell.state.delete_requests.lock().await.clone()
+}
+
 async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
@@ -1480,6 +1490,8 @@ async fn sandbox_delete_continues_after_entry_failure() {
         &server.endpoint,
         &["failing-sandbox".to_string(), "later-sandbox".to_string()],
         false,
+        None,
+        None,
         "default",
         &tls,
         "openshell",
@@ -1499,6 +1511,79 @@ async fn sandbox_delete_continues_after_entry_failure() {
             vec!["later-sandbox".to_string()]
         ]
     );
+}
+
+#[tokio::test]
+async fn sandbox_delete_forwards_identity_preconditions() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::sandbox_delete(
+        &server.endpoint,
+        &["guarded-sandbox".to_string()],
+        false,
+        Some("sb-123"),
+        Some(17),
+        "default",
+        &tls,
+        "openshell",
+    )
+    .await
+    .expect("identity-guarded delete should succeed");
+
+    let requests = delete_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].name, "guarded-sandbox");
+    assert_eq!(requests[0].expected_sandbox_id, "sb-123");
+    assert_eq!(requests[0].expected_resource_version, 17);
+}
+
+#[tokio::test]
+async fn sandbox_delete_rejects_preconditions_for_multiple_names_before_rpc() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    let error = run::sandbox_delete(
+        &server.endpoint,
+        &["sandbox-a".to_string(), "sandbox-b".to_string()],
+        false,
+        Some("sb-123"),
+        None,
+        "default",
+        &tls,
+        "openshell",
+    )
+    .await
+    .expect_err("identity preconditions must be single-sandbox only");
+
+    assert!(
+        error
+            .to_string()
+            .contains("require exactly one sandbox name")
+    );
+    assert!(delete_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_delete_rejects_resource_version_without_immutable_identity() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    let error = run::sandbox_delete(
+        &server.endpoint,
+        &["guarded-sandbox".to_string()],
+        false,
+        None,
+        Some(17),
+        "default",
+        &tls,
+        "openshell",
+    )
+    .await
+    .expect_err("resource version without immutable ID must fail closed");
+
+    assert!(error.to_string().contains("requires --expected-id"));
+    assert!(delete_requests(&server).await.is_empty());
 }
 
 #[tokio::test]
@@ -2814,6 +2899,16 @@ async fn run_cli_sandbox_create_with_xdg(
     name: &str,
     extra_args: &[&str],
 ) -> std::process::Output {
+    run_cli_sandbox_create_with_xdg_and_env(server, xdg_dir, name, extra_args, &[]).await
+}
+
+async fn run_cli_sandbox_create_with_xdg_and_env(
+    server: &TestServer,
+    xdg_dir: &TempDir,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
     for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
         cmd.env_remove(&key);
@@ -2831,6 +2926,7 @@ async fn run_cli_sandbox_create_with_xdg(
         "--no-auto-providers",
     ])
     .args(extra_args)
+    .envs(environment.iter().copied())
     .env("XDG_CONFIG_HOME", xdg_dir.path())
     .env("HOME", xdg_dir.path())
     .env("OPENSHELL_PROVISION_TIMEOUT", "5")
@@ -2847,6 +2943,47 @@ async fn run_cli_sandbox_create(
     let xdg_dir = tempfile::tempdir().unwrap();
     prepare_cli_xdg(server, &xdg_dir);
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
+}
+
+async fn run_cli_sandbox_create_with_env(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    prepare_cli_xdg(server, &xdg_dir);
+    run_cli_sandbox_create_with_xdg_and_env(server, &xdg_dir, name, extra_args, environment).await
+}
+
+#[tokio::test]
+async fn sandbox_create_env_from_reaches_request() {
+    let server = run_server().await;
+    let value = "qualification-value-not-in-argv";
+
+    let output = run_cli_sandbox_create_with_env(
+        &server,
+        "env-from-test",
+        &["--env-from", "SANDBOX_VALUE=HOST_VALUE", "--output=json"],
+        &[("HOST_VALUE", value)],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "sandbox create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = create_requests(&server).await;
+    let environment = &requests[0]
+        .spec
+        .as_ref()
+        .expect("spec should be present")
+        .environment;
+    assert_eq!(
+        environment.get("SANDBOX_VALUE").map(String::as_str),
+        Some(value)
+    );
 }
 
 async fn run_cli_sandbox_template_create(

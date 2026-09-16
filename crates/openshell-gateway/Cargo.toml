@@ -73,6 +73,7 @@ telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## `rust:verify:defaults-without-telemetry`.
 defaults-without-telemetry = ["in-tree-compute-drivers"]
 bundled-z3 = ["openshell-server/bundled-z3"]
+prebuilt-z3 = ["openshell-server/prebuilt-z3"]
 
 [lints]
 workspace = true

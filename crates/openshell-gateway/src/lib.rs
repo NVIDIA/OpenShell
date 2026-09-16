@@ -159,10 +159,39 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
         let backend = openshell_driver_mxc::MxcComputeBackend::new(config);
+        context.set_forward_sink(std::sync::Arc::new(MxcForwardSink(backend.forward_sink())));
+        let provider_credentials_sink = backend.provider_credentials_sink();
         let driver = openshell_driver_mxc::ComputeDriverService::new(backend);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
-        ))
+        Ok(
+            openshell_server::ComputeDriverInstance::InProcessWithProviderCredentials {
+                driver: std::sync::Arc::new(driver),
+                provider_credentials_sink,
+            },
+        )
+    }
+}
+
+/// Adapts MXC's dynamic port-forward side channel (`handle_forward_tcp`'s
+/// fallback for sandboxes with no in-sandbox supervisor) to the generic
+/// `ComputeDriverForwardSink` capability the server crate consumes, so
+/// `openshell-server` never has to depend on `openshell-driver-mxc` directly.
+#[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
+struct MxcForwardSink(openshell_driver_mxc::ForwardSink);
+
+#[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
+#[async_trait::async_trait]
+impl openshell_server::ComputeDriverForwardSink for MxcForwardSink {
+    async fn open_dynamic_forward(
+        &self,
+        sandbox_id: &str,
+        target_port: u16,
+    ) -> Result<(std::net::SocketAddr, Vec<u8>, Box<dyn std::any::Any + Send>), String> {
+        let (addr, nonce, handle) = self
+            .0
+            .open_dynamic_forward(sandbox_id, target_port)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((addr, nonce.to_vec(), Box::new(handle)))
     }
 }
 

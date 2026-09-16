@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-supervisor-relay"
+description = "Generic process spawner + WebSocket relay bridge for OpenShell MXC ProcessContainer sandboxes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-supervisor-relay"
+path = "src/main.rs"
+
+# This is an MXC/AppContainer helper: it only does anything useful on
+# Windows. The implementation is technically portable (no Windows-specific
+# APIs), but per the openshell-driver-mxc platform pattern, its real deps
+# stay Windows-only so `cargo build --workspace` on Linux/macOS doesn't pull
+# in the full relay implementation for a binary those platforms never run —
+# see src/main.rs for the corresponding cfg(target_os = "windows") gating.
+[target.'cfg(target_os = "windows")'.dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+
+# Black-box integration tests (tests/control_channel_contract.rs) spawn the
+# compiled binary above and drive it over real stdio/TCP/WS -- Windows-only,
+# same as the binary itself (the whole test file is `#![cfg(windows)]`), so
+# these stay out of the dependency graph everywhere else too.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

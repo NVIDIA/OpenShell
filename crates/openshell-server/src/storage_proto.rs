@@ -119,11 +119,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "26a2882f1fc82741f4821da90fb9674c9b5d66991760398a93a90354b7349d83";
+        "800ab99d50213956aacd377a44ff98fbe0af5a948f0138c96106b9a12c90bcd7";
     const DURABLE_SCHEMA_SHA256: &str =
-        "568ec5637c504726b40a616d286457f41b5be2f4761872c749313e1ee16b5c85";
+        "c439724f77f71b794a68a76cec4040dde9eb22cbdb6e4f1517028683399c87ef";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "f96d841e67da5c3443fa0aca15936dd14ac30d2e150ddf0439b0d195c4a0cfd9";
+        "ea546b1a1ee0ddf50ee74f2541dcf68541054c70a5ce29c93d3fd29e6af98820";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -490,13 +490,13 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (282, 13)
+            (283, 14)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (82, 9)
+            (83, 10)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (72, 9));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (73, 10));
 
         assert_eq!(
             public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
@@ -575,6 +575,7 @@ mod tests {
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())
                 .expect("legacy policy payload must decode");
         assert!(policy_payload.policy.is_some());
+        assert!(policy_payload.policy.as_ref().unwrap().ui.is_none());
         assert_eq!(policy_payload.hash, "sha256");
         assert_eq!(policy_payload.load_error, "none");
         assert_eq!(policy_payload.loaded_at_ms, 300);

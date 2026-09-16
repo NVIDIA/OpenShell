@@ -7,26 +7,29 @@ OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 This driver implements the gateway's ordinary in-process `ComputeDriver`
 contract and is linked into `openshell-gateway`. It sets
 `driver_reports_runtime_readiness`, so the gateway accepts driver-reported
-readiness without a supervisor session. The canonical create-time
-`SandboxPolicy` is carried by `DriverSandboxSpec.policy`. `process_container` launches a one-shot
-AppContainer and is the default. The opt-in `isolation_session` backend uses the
+readiness without a supervisor session. The gateway composes the create-time
+effective `SandboxPolicy` and carries it on the driver-only copy of
+`DriverSandboxSpec.policy`. `process_container` launches a one-shot AppContainer
+and is the default. The opt-in `isolation_session` backend uses the
 state-aware `provision` → `start` → `exec` → `stop` → `deprovision` lifecycle.
-The driver launches and monitors the configured workload itself and self-reports
-readiness; there is no in-sandbox supervisor or `ConnectSupervisor` relay.
+The driver launches and monitors the configured workload and self-reports
+readiness. Optional `openshell-supervisor-relay` wrapping provides launch,
+shutdown, and dynamic forwarding over an inherited stdin/stdout control channel;
+it does not implement the Linux `ConnectSupervisor` protocol.
 
 ## Capability Matrix
 
-| Capability | MXC driver | Closing it requires |
-|---|---|---|
-| Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
-| Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy, generates HTTPS MITM trust material, and injects the CA bundle into the sandbox process env | Gateway event-bus wiring follow-on |
-| Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
-| Network middleware | ❌ rejected before launch because the MXC host proxy does not receive the gateway middleware registry | Gateway middleware-registry injection |
-| Process policy (seccomp, uid/gid) | ❌ host-side governance design; OS isolation only | not pursued |
-| Interactive exec/connect/forward | ❌ exec runs in-driver, no client attach | gateway interactive-exec surgery (follow-on) |
-| Bundled agent image | ❌ no OCI image; relies on Windows host install | — |
-| Restart durability | ❌ in-memory registry; restart orphans live sessions | follow-on |
-| Concurrent sandboxes | ⚠️ isolation_session v1 is single-session | MXC backend feature |
+| Capability | MXC driver |
+|---|---|
+| Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces default-deny; `isolation_session` is an explicit grant-only compatibility mode. |
+| UI policy | `process_container` advertises complete support and maps portable graphical UI, clipboard-direction, and input-injection controls to MXC; omitted fields inside an explicit section deny. `isolation_session` advertises no support, so the gateway rejects any explicit section before provisioning. |
+| Network policy | With `egress_proxy = true` on `process_container`, split into MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
+| Provider credentials | The child receives revision-scoped placeholders and non-secret provider environment only. The per-sandbox host proxy retains the resolver and substitutes credentials only for their bound endpoints. |
+| Process policy | Unsupported; MXC supplies OS isolation only. |
+| Dynamic forwarding | Supported through `openshell-supervisor-relay`; interactive exec/connect remain unsupported. |
+| Network middleware | Rejected before launch until the host proxy receives the gateway middleware registry. |
+| ETW/OCSF audit | Optional Windows Sandboxing ETW consumer attributes host events to OpenShell sandboxes and emits OCSF records. |
+| Restart durability | Unsupported; the in-memory registry cannot recover live sessions. |
 
 The filesystem enforcement proof has two paths:
 
@@ -45,8 +48,37 @@ backend = "process_container"
 default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
-# Pattern-C governed egress. The address is a loopback seed; each sandbox
-# receives a unique ephemeral proxy port.
+# processContainer only: launch openshell-supervisor-relay instead of
+# agent_command/legacy command directly, giving the driver a control
+# channel into the sandbox (launch handshake, dynamic `openshell forward
+# service` bridging). target_port is the launched command's own listening
+# port; 0 disables spawner wrapping (default -- the command runs directly).
+pc_relay_spawner_path = ""
+pc_relay_target_port  = 0
+# processContainer only: env-inheritance tier for the launched process
+# (safest first): default is a minimal Windows CreateProcessW bootstrap set
+# (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA) + agent_env; pc_minimal_env
+# starts from an EMPTY env (agent_env only) for runtimes that choke on an
+# unrecognized host env; pc_inherit_full_env is an explicit unsafe opt-in
+# to the gateway host's entire environment (secrets included) + agent_env,
+# ignored when pc_minimal_env is also set.
+pc_minimal_env = false
+pc_inherit_full_env = false
+# processContainer only: include "allowLocalNetwork": true in the MXC
+# network section. This compatibility setting broadens network access and is
+# not required by the BaseContainer qualification profile.
+pc_allow_local_network = false
+# Legacy workload settings, used only as a fallback when a sandbox's
+# CreateSandbox request carries no --driver-config-json (see below) --
+# agent_command is required for a sandbox to succeed via this fallback path.
+agent_command = ["cmd", "/c", "echo hello > C:\\work\\demo\\hello.txt"]
+agent_cwd = "C:\\work\\demo"
+# Host directory mapped read-write into the sandbox. NOT an automatic
+# filesystem grant on its own -- the sandbox's SandboxPolicy is the only
+# source of filesystem grants, so a policy's filesystem_policy.read_write
+# must include this path explicitly for the workload to reach it.
+share_dir = "C:\\work\\demo"
+# Pattern C governed egress. Requires backend = "process_container".
 egress_proxy = false
 egress_proxy_addr = ""
 debug = false
@@ -55,7 +87,7 @@ etw_audit = false
 
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. The driver preserves the configured IP and allocates a unique
-ephemeral port for each sandbox's `network.proxy` redirect.
+ephemeral port for each sandbox's authenticated host CONNECT proxy.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
@@ -65,11 +97,11 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
   --driver-config-json $config --env MODE=demo --no-tty
 ```
 
-The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Environment variables come from the standard sandbox and template environment maps; the driver never copies values from the gateway host environment.
+The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Per-sandbox environment variables come from the standard sandbox and template environment maps only; this path never copies values from the gateway host environment. The legacy `agent_env`/`pc_inherit_full_env` TOML fields above are a separate, gateway-wide mechanism and are the only way the gateway host's own environment reaches a sandbox -- bare `agent_env` keys opt specific host values in. Provider-owned keys override matching entries case-insensitively, but raw static values remain in the host proxy; MXC receives their revision-scoped placeholders. When governed egress is enabled, the driver replaces common TLS trust environment variables with paths to public proxy CA files staged under `share_dir`, and injects `HTTP_PROXY`/`HTTPS_PROXY` while clearing `NO_PROXY` so inherited bypass rules cannot skip policy enforcement.
 
-The host CONNECT proxy enforces network policy when governed egress is enabled.
-Live policy replacement or merge updates remain unsupported; delete and recreate
-the sandbox to apply a different policy.
+UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
+
+`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: the driver reserves a unique ephemeral loopback port for every sandbox. MXC 0.8 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. The current policy permits all loopback ports, so sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
 
 When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
 session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
@@ -98,6 +130,10 @@ activity, and correlation-vector links remain available for five seconds so
 already in-flight ETW records can arrive, but retired PID evidence cannot resolve
 them. Records without matching generation evidence remain unattributed.
 
+Each sandbox receives a distinct proxy listener and a random per-sandbox credential through its proxy environment. Missing, incorrect, duplicate, or another sandbox's proxy credentials receive HTTP 407 before policy evaluation or forwarding. This authenticates requests to the OpenShell proxy; it does not restrict access to unrelated host-loopback services or authenticate individual processes inside a sandbox. Proxy credentials and command/environment payloads must not be logged.
+
+The MXC credential handoff is also fixed at sandbox creation. The gateway rejects expiring static provider credentials because the in-process MXC driver has no live credential-refresh channel. Dynamic token grants remain request-time operations in the host proxy. Recreate the sandbox after rotating or revoking a non-expiring static credential.
+
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553
@@ -116,11 +152,13 @@ The production driver maps the typed `SandboxPolicy` carried by the standard
 driver request to MXC configuration before it inserts a registry entry or
 invokes `wxc-exec`. Mapping failure therefore returns from `CreateSandbox`
 without leaving a partial sandbox. There is no in-process policy side channel
-or MXC-specific gateway composition variant.
+or MXC-specific gateway composition variant. Provider resolver state uses a
+separate, create-scoped in-process handoff because it intentionally cannot be
+represented in the public compute-driver protobuf.
 
 When `egress_proxy` is enabled, `EmbeddedPolicyMapper` uses `split_policy`
-instead: MXC receives filesystem grants plus a loopback `network.proxy`
-redirect, and the driver starts a host CONNECT proxy from the trimmed
+instead: MXC receives filesystem grants plus loopback-only egress,
+and the driver starts a host CONNECT proxy from the trimmed
 network-only `SandboxPolicy`. Policies containing `network_middlewares` are
 rejected synchronously until this host-proxy path can receive the gateway's
 built-in and remote middleware registry. The proxy uses the configured agent
@@ -128,31 +166,34 @@ command as the static sandbox process identity because MXC does not expose
 Linux-style procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
 per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
-process env. It does not add the generated CA directory to MXC read-only grants:
-released `wxc-exec` BaseContainer builds require `WRITE_DAC` on every such
-grant and reject the user-owned proxy temp directory. Instead, the driver adds
-the sandbox-unique directory as an internal read-write share so HTTPS clients
-can read the injected paths. The directory contains only public CA certificates;
+process env. In curated-environment mode, the driver stages the public CA files
+under the authorized `share_dir/.openshell-proxy/<sandbox-id>` directory. Other
+environment modes grant the sandbox's unique public-CA directory as an internal
+read-write share. The directory contains only public CA certificates;
 the ephemeral CA private key remains in the host proxy's memory. The driver
 seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the
 gateway host before applying sandbox and TLS overrides, so required Windows
 bootstrap values remain available without exposing the gateway's full
-environment. The development export surface remains the
-[`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
-`openshell policy export-mxc` subcommand yet.
+environment unless the gateway explicitly opts into another environment mode.
 
-If governed egress is disabled, any network rule fails closed rather than launching without an enforcement path.
+When governed egress is disabled, any network rule fails closed during sandbox creation.
 
-Parity and matrix tests under [`tests/`](tests/) cover the mapper on the Windows MSVC lane. The driver performs this mapping automatically; there is no separate policy-export command or example.
+Parity and matrix tests under [`tests/`](tests/) cover the mapper on the Windows MSVC lane. The real-MXC lane also dry-runs every clipboard direction against the installed schema. The driver performs this mapping automatically; there is no separate policy-export command or example.
 
-## Packaging the demo for the demo box
+## Provider credential example
 
-Use [`examples/package-demo.ps1`](examples/package-demo.ps1) to assemble
-the gateway EXE, CLI EXE, runtime DLLs (`libz3.dll`), `demo.yaml`, the
-gateway config, and the runbook into one folder, then copy that folder to
-the demo Windows host and follow `mxc-demo-runbook.md` inside it. The
-script prints a SHA256 manifest so the operator can sanity-check what
-landed before moving it.
+[`examples/run-provider-credential-test.ps1`](examples/run-provider-credential-test.ps1)
+creates an MXC sandbox with an attached GitHub provider. Its policy explicitly
+allows the graphical UI subsystem required by Windows PowerShell while denying
+clipboard access and input injection; the existing policy mapper translates
+that portable section to MXC's `ui` object. The probe verifies that the sandbox
+sees a revision-scoped `GITHUB_TOKEN` placeholder, the host CONNECT proxy
+substitutes it for `api.github.com`, and the same placeholder is rejected for a
+different allowed endpoint.
+
+This example uses `process_container`. The `IsoSessionApp.dll` and
+`--features isolation_session` prerequisites above apply only to
+`isolation_session` runs and are not required for this scenario.
 
 ## Real-MXC test lane
 
@@ -163,6 +204,7 @@ exits 0 rather than failing.
 | Task | What it runs | When to use |
 |---|---|---|
 | `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1`, including an HTTPS request through the host proxy | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
+| `windows:test:mxc-real:arm64` | Native ARM64 `tests/wxc_exec_real.rs` with the same contract | Pre-merge on an ARM64 Windows host with `wxc-exec` |
 | `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
 | `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
 
@@ -183,12 +225,12 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 **Skip semantics:** tests in `wxc_exec_real.rs` are marked
 `#[ignore = "requires real wxc-exec"]` — the standard `windows:test:x64` suite
 never runs them. `OPENSHELL_WXC_EXEC_PATH` overrides the default
-`C:\mxc\wxc-exec.exe` lookup. See `docs4gtb/mxc-box-capabilities.md` for the
-empirical capability snapshot of the development box (build 26200, processcontainer
-velocity keys not enabled, isolation_session absent).
+`C:\mxc\wxc-exec.exe` lookup. Run the probe on the actual test host; a different
+machine's capability report is not evidence that its backend is available here.
 
 ## Deferred work
 
-- **Interactive exec/connect/forward** — gateway interactive-exec surgery (follow-on)
+- **Interactive exec/connect** — gateway interactive-exec integration (follow-on); dynamic service forwarding is supported through the relay.
+- **Persistent-session governed egress** remains fail-closed until `isolation_session` exposes an enforceable proxy path.
 - **Restart durability** (deprovision orphaned sessions on startup) → follow-on
 - **GPU passthrough** → not pursued in host-side-governance design
