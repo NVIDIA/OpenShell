@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use crate::proto::{McpOptions, ProviderProfile};
 
-pub use openshell_policy_schema::{
+pub use openshell_policy_parser::{
     DEFAULT_MCP_PROTOCOL_VERSION, MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion,
     McpWireProfile, ParseMcpProtocolVersionError,
 };

@@ -141,8 +141,8 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
 }
 
 /// Compatibility re-export; authored policy path normalization is owned by
-/// `openshell-policy-schema`.
-pub use openshell_policy_schema::normalize_path;
+/// `openshell-policy-parser`.
+pub use openshell_policy_parser::normalize_path;
 
 #[cfg(test)]
 mod tests {

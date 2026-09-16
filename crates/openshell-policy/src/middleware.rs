@@ -20,7 +20,7 @@ use super::PolicyViolation;
 pub use openshell_core::host_pattern::host_matches as middleware_host_matches;
 use openshell_core::host_pattern::{HostPattern, HostSelector};
 
-use openshell_policy_schema::{
+use openshell_policy_parser::{
     MiddlewareEndpointSelector as MiddlewareEndpointSelectorDef,
     NetworkMiddleware as NetworkMiddlewareConfigDef,
 };

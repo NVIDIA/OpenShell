@@ -93,7 +93,7 @@ be additive — they don't displace existing categories.
 
 ## Inputs
 
-- **Policy** — authored YAML decoded by `openshell-policy-schema` with the shared
+- **Policy** — authored YAML decoded by `openshell-policy-parser` with the shared
   fail-closed parser, then projected into the prover-only `PolicyModel`.
   Missing `version` and unknown authored fields are rejected consistently with
   runtime parsing. An absent `filesystem_policy` uses the runtime-effective

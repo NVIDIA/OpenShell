@@ -7,7 +7,7 @@
 //! types) because the prover needs fields like `access`, `protocol`, and
 //! individual L7 rules that the proto representation strips.
 
-use openshell_policy_schema::{
+use openshell_policy_parser::{
     AccessPreset, L7Allow as AuthoredAllow, NetworkEndpoint as AuthoredEndpoint, ParseLimits,
     PolicyDocument,
 };
@@ -257,13 +257,13 @@ impl PolicyModel {
 
 /// Parse an `OpenShell` policy YAML file into a `PolicyModel`.
 pub fn parse_policy(path: &Path) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy_file(path, ParseLimits::default())?;
+    let document = openshell_policy_parser::parse_policy_file(path, ParseLimits::default())?;
     Ok(project_policy(document))
 }
 
 /// Parse a policy YAML string into a `PolicyModel`.
 pub fn parse_policy_str(yaml: &str) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy(yaml)?;
+    let document = openshell_policy_parser::parse_policy(yaml)?;
     Ok(project_policy(document))
 }
 
