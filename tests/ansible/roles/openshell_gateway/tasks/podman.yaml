@@ -2,16 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Copy OpenShell supervisor image
+- name: Copy OpenShell runtime images
   become: true
   ansible.builtin.copy:
-    src: "{{ openshell_supervisor_image }}"
-    dest: /var/lib/openshell/supervisor.tar
+    src: "{{ item.src }}"
+    dest: "/var/lib/openshell/{{ item.name }}.tar"
     owner: "{{ openshell_gateway_user }}"
     group: "{{ openshell_gateway_user }}"
     mode: "0600"
+  loop:
+    - name: sandbox
+      src: "{{ openshell_sandbox_image }}"
+    - name: supervisor
+      src: "{{ openshell_supervisor_image }}"
 
-- name: Load OpenShell supervisor image
+- name: Load OpenShell runtime images
   become: true
   become_user: "{{ openshell_gateway_user }}"
   ansible.builtin.command:
@@ -19,7 +24,10 @@
       - podman
       - load
       - --input
-      - /var/lib/openshell/supervisor.tar
+      - "/var/lib/openshell/{{ item }}.tar"
+  loop:
+    - sandbox
+    - supervisor
   environment:
     HOME: "{{ openshell_gateway_home }}"
     XDG_RUNTIME_DIR: "/run/user/{{ openshell_gateway_uid }}"

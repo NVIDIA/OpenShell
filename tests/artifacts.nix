@@ -34,7 +34,8 @@ rec {
         -p openshell-sandbox
 
       cargo build --target ${gnuToolchain.target} \
-        -p openshell-gateway
+        -p openshell-gateway \
+        -p openshell-supervisor
     '';
   };
 
@@ -51,6 +52,10 @@ rec {
       install -D -m 0755 \
         target/${gnuToolchain.target}/debug/openshell-gateway \
         deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-gateway
+
+      install -D -m 0755 \
+        target/${gnuToolchain.target}/debug/openshell-supervisor \
+        deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-supervisor
 
       install -D -m 0755 \
         target/${muslToolchain.target}/debug/openshell-sandbox \
@@ -70,6 +75,13 @@ rec {
         --tag openshell/supervisor:tmachine \
         .
 
+      docker build \
+        --platform linux/${dockerArch} \
+        --file deploy/docker/Dockerfile.sandbox \
+        --target sandbox \
+        --tag openshell/sandbox:tmachine \
+        .
+
       mkdir -p artifacts/images
 
       docker save \
@@ -79,6 +91,10 @@ rec {
       docker save \
         --output artifacts/images/openshell-supervisor-tmachine.tar \
         openshell/supervisor:tmachine
+
+      docker save \
+        --output artifacts/images/openshell-sandbox-tmachine.tar \
+        openshell/sandbox:tmachine
     '';
   };
 

@@ -69,6 +69,7 @@ let
             openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
             openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
             openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+            openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
           };
         };
       }
@@ -89,6 +90,7 @@ let
             openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
             openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
             openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+            openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
           };
         };
       }

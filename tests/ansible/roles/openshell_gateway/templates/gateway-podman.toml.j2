@@ -6,6 +6,7 @@
 socket_path = "{{ openshell_runtime_socket }}"
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "if_not_present"
+sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
 supervisor_image = "docker.io/openshell/supervisor:tmachine"
 network_name = "tmachine"
 health_check_interval_secs = 10
