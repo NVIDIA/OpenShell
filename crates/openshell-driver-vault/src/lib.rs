@@ -284,7 +284,7 @@ impl VaultCredentialDriver {
                     Ok::<_, Status>(ResolvedCredential {
                         request_id,
                         value,
-                        expires_at_ms: 0,
+                        expiration_time: None,
                     })
                 }
             });

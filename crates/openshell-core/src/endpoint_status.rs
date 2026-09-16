@@ -84,7 +84,7 @@ pub fn initial_endpoint_status(
         ports,
         path: path.to_string(),
         last_result: crate::proto::EndpointResult::NoObservedExchange.into(),
-        last_reported_at: String::new(),
+        last_reported_time: None,
     }
 }
 
@@ -672,7 +672,7 @@ mod tests {
             descriptor.last_result,
             crate::proto::EndpointResult::NoObservedExchange as i32,
         );
-        assert!(descriptor.last_reported_at.is_empty());
+        assert!(descriptor.last_reported_time.is_none());
 
         let reconstructed = endpoint(
             &descriptor.host,

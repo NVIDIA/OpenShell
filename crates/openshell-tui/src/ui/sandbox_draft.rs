@@ -282,8 +282,20 @@ pub fn draw_detail_popup(
     );
     let denied_seen = format!(
         "(first {} / last {})",
-        format_short_time(chunk.first_seen_ms),
-        format_short_time(chunk.last_seen_ms),
+        format_short_time(
+            chunk
+                .first_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or_default(),
+        ),
+        format_short_time(
+            chunk
+                .last_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or_default(),
+        ),
     );
     let denied_width = display_width(denied_label)
         + display_width(&denied_count)
@@ -1301,8 +1313,8 @@ mod tests {
             rule_name: "allow-github".to_string(),
             confidence: 0.82,
             hit_count: 3,
-            first_seen_ms: 1_700_000_000_000,
-            last_seen_ms: 1_700_000_100_000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(1_700_000_100_000).ok(),
             ..Default::default()
         }
     }

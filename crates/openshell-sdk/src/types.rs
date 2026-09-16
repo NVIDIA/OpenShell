@@ -17,6 +17,52 @@ use openshell_core::proto;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Missing targets are errors unless explicitly allowed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    pub allow_missing: bool,
+}
+
+/// A deletion acknowledgement is not necessarily completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeletionOutcome {
+    Unspecified,
+    Completed,
+    Accepted,
+    AlreadyAbsent,
+    Unknown(i32),
+}
+
+impl From<i32> for DeletionOutcome {
+    fn from(value: i32) -> Self {
+        match proto::DeletionOutcome::try_from(value) {
+            Ok(proto::DeletionOutcome::Unspecified) => Self::Unspecified,
+            Ok(proto::DeletionOutcome::Completed) => Self::Completed,
+            Ok(proto::DeletionOutcome::Accepted) => Self::Accepted,
+            Ok(proto::DeletionOutcome::AlreadyAbsent) => Self::AlreadyAbsent,
+            Err(_) => Self::Unknown(value),
+        }
+    }
+}
+
+#[test]
+fn deletion_outcomes_preserve_unknown_values() {
+    assert_eq!(DeletionOutcome::from(0), DeletionOutcome::Unspecified);
+    assert_eq!(DeletionOutcome::from(1), DeletionOutcome::Completed);
+    assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
+    assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
+    assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+/// Result for the original target, never a same-name replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionResult {
+    pub outcome: DeletionOutcome,
+    /// Present for sandbox deletions that found a target.
+    pub sandbox_id: Option<String>,
+}
+
 /// Gateway health snapshot.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -113,7 +159,16 @@ impl From<proto::SandboxLogLine> for LogLine {
         };
         Self {
             sandbox_id: value.sandbox_id,
-            timestamp_ms: value.timestamp_ms,
+            // The wire contract carries `google.protobuf.Timestamp`; these
+            // curated types stay dependency-light and expose milliseconds, the
+            // same reduction the CLI applies at its own presentation edge. An
+            // absent or unrepresentable timestamp reads as 0, which is what
+            // this field meant before the wire types gained presence.
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
             level: value.level,
             target: value.target,
             message: value.message,
@@ -126,7 +181,11 @@ impl From<proto::SandboxLogLine> for LogLine {
 impl From<proto::PlatformEvent> for PlatformEvent {
     fn from(value: proto::PlatformEvent) -> Self {
         Self {
-            timestamp_ms: value.timestamp_ms,
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
             source: value.source,
             r#type: value.r#type,
             reason: value.reason,

@@ -14,7 +14,6 @@ use crate::persistence::{ObjectId, ObjectName, ObjectWorkspace};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 use crate::supervisor_session::EndpointReportCursor;
-use chrono::{SecondsFormat, Utc};
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
@@ -139,7 +138,8 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
         &context.endpoints,
     )?;
     validate_endpoint_observation_markers(&sandbox, &reports, &observed_endpoint_ids)?;
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint report timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -345,7 +345,8 @@ pub async fn reset_endpoint_status_for_supervisor_session(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
     let reports = unknown_endpoint_reports(&context.endpoints);
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -388,7 +389,8 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
     let reports = unknown_endpoint_reports(&context.endpoints);
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -504,7 +506,7 @@ fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
     // remains available so callers can still identify the configured endpoint.
     for endpoint in &mut status.endpoint_statuses {
         endpoint.last_result = EndpointResult::NoObservedExchange as i32;
-        endpoint.last_reported_at.clear();
+        endpoint.last_reported_time = None;
     }
 }
 
@@ -703,7 +705,7 @@ pub(super) fn reconcile_endpoint_statuses(
     sandbox: &mut Sandbox,
     reports: &BTreeMap<String, EndpointStatus>,
     observed_endpoint_ids: &HashSet<String>,
-    now: &str,
+    now: &prost_types::Timestamp,
 ) {
     let phase = sandbox.phase();
     let current_policy_version = sandbox.current_policy_version();
@@ -722,12 +724,7 @@ pub(super) fn reconcile_endpoint_statuses(
     let previous = status
         .endpoint_statuses
         .iter()
-        .map(|endpoint| {
-            (
-                endpoint.endpoint_id.as_str(),
-                endpoint.last_reported_at.as_str(),
-            )
-        })
+        .map(|endpoint| (endpoint.endpoint_id.as_str(), endpoint.last_reported_time))
         .collect::<HashMap<_, _>>();
     // Replace the complete inventory to remove retired endpoints atomically.
     // Only newly accepted evidence advances the gateway acceptance timestamp;
@@ -736,17 +733,16 @@ pub(super) fn reconcile_endpoint_statuses(
         .iter()
         .map(|(endpoint_id, report)| {
             let mut endpoint = report.clone();
-            endpoint.last_reported_at =
+            endpoint.last_reported_time =
                 if endpoint.last_result == EndpointResult::NoObservedExchange as i32 {
-                    String::new()
+                    None
                 } else if observed_endpoint_ids.contains(endpoint_id) {
-                    now.to_string()
+                    Some(*now)
                 } else {
                     previous
                         .get(endpoint_id.as_str())
                         .copied()
                         .unwrap_or_default()
-                        .to_string()
                 };
             endpoint
         })

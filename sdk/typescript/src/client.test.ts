@@ -57,6 +57,27 @@ function readySandbox(
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
+describe('deletion outcomes', () => {
+  it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
+    const flags: boolean[] = [];
+    let outcome = 2;
+    const sandbox = client({
+      deleteSandbox: (req) => {
+        flags.push(req.allowMissing);
+        return { outcome, sandboxId: 'original-id' };
+      },
+    });
+    expect(await sandbox.delete('sandbox')).toEqual({ outcome: 'accepted', rawOutcome: 2, sandboxId: 'original-id' });
+    outcome = 99;
+    expect(await sandbox.delete('sandbox', { allowMissing: true })).toEqual({
+      outcome: 'unknown',
+      rawOutcome: 99,
+      sandboxId: 'original-id',
+    });
+    expect(flags).toEqual([false, true]);
+  });
+});
+
 type ScopedRequest = {
   workspaceScope?: { selection?: { case?: string; value?: unknown } };
 };
@@ -72,7 +93,12 @@ function selectsAllWorkspaces(req: ScopedRequest): boolean {
 
 describe('exec / execStream', () => {
   it('resolves the id via get, frames tty:false, and buffers the result (backward compat)', async () => {
-    let execReq: { sandboxId?: string; tty?: boolean; command?: string[] } = {};
+    let execReq: {
+      sandboxId?: string;
+      tty?: boolean;
+      command?: string[];
+      executionTimeout?: { seconds: bigint; nanos: number };
+    } = {};
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),
       // eslint-disable-next-line require-yield
@@ -89,10 +115,25 @@ describe('exec / execStream', () => {
     expect(execReq.sandboxId).toBe('sb-id-1');
     expect(execReq.tty).toBe(false);
     expect(execReq.command).toEqual(['/bin/sh', '-c', 'echo hi']);
+    expect(execReq.executionTimeout).toBeUndefined();
     expect(result.exitCode).toBe(3);
     expect(result.stdout.toString()).toBe('hello world');
     expect(result.stderr.toString()).toBe('warn');
     expect(Buffer.isBuffer(result.stdout)).toBe(true);
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid timeoutSecs %s', async (timeoutSecs) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+
+    await expect(sandbox.exec('sb', ['true'], { timeoutSecs })).rejects.toThrow(
+      'timeoutSecs must be a finite, non-negative number',
+    );
   });
 
   it('execStream yields incremental chunks then a terminal exit event', async () => {
@@ -380,7 +421,7 @@ describe('create', () => {
       },
       deleteSandbox: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
       attachSandboxProvider: (req) => {
         observed.attach = req;
@@ -434,7 +475,7 @@ describe('create', () => {
         hostKeyFingerprint: '',
         expiresAtMs: 0n,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
@@ -465,7 +506,7 @@ describe('create', () => {
     expect(created.workspace).toBe('staging');
     expect(got.workspace).toBe('staging');
     expect(listed[0]?.workspace).toBe('staging');
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(attached.sandbox.workspace).toBe('staging');
     expect(detached.sandbox.workspace).toBe('staging');
     expect(selectedWorkspace(observed.create ?? {})).toBe('staging');
@@ -668,7 +709,7 @@ describe('sandbox templates', () => {
       },
       deleteSandboxTemplate: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
     });
 
@@ -678,7 +719,7 @@ describe('sandbox templates', () => {
 
     expect(got.metadata?.name).toBe('gpu-kata');
     expect(listed).toHaveLength(1);
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(observed.get).toMatchObject({ name: 'gpu-kata' });
     expect(selectedWorkspace(observed.get ?? {})).toBe('staging');
     expect(observed.list).toMatchObject({
@@ -768,13 +809,82 @@ describe('waits', () => {
     });
   });
 
-  it('waitDeleted resolves when the gateway reports NotFound', async () => {
+  it.each([undefined, 'old-id'])('waitDeleted resolves on NotFound with expected ID %s', async (expectedSandboxId) => {
     const sandbox = client({
       getSandbox: () => {
         throw new ConnectError('gone', Code.NotFound);
       },
     });
-    await expect(sandbox.waitDeleted('sb', 1)).resolves.toBeUndefined();
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId })).resolves.toBeUndefined();
+  });
+
+  it.each([undefined, 'team'])(
+    'waitDeleted completes on replacement after accepted deletion in %s',
+    async (workspace) => {
+      let polls = 0;
+      const sandbox = client({
+        deleteSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          return { outcome: 2, sandboxId: 'old-id' };
+        },
+        getSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      const deletion = await sandbox.delete('sb', { workspace });
+      expect(deletion.outcome).toBe('accepted');
+      expect(deletion.sandboxId).toBe('old-id');
+      await expect(
+        sandbox.waitDeleted('sb', 1, {
+          workspace,
+          expectedSandboxId: deletion.sandboxId,
+        }),
+      ).resolves.toBeUndefined();
+      expect(polls).toBe(1);
+    },
+  );
+
+  it('waitDeleted keeps polling the original identity until it disappears', async () => {
+    let polls = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        if (++polls === 1) return readySandbox('sb', 'old-id');
+        throw new ConnectError('gone', Code.NotFound);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 5, { expectedSandboxId: 'old-id' })).resolves.toBeUndefined();
+    expect(polls).toBe(2);
+  });
+
+  it.each([undefined, 'replacement-id'])(
+    'waitDeleted times out while observed identity remains with expected ID %s',
+    async (expectedSandboxId) => {
+      let polls = 0;
+      const sandbox = client({
+        getSandbox: () => {
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      await expect(sandbox.waitDeleted('sb', 0.2, { expectedSandboxId })).rejects.toMatchObject({
+        code: 'connect',
+        message: "[connect] timed out waiting for sandbox 'sb' to delete",
+      });
+      expect(polls).toBeGreaterThan(0);
+    },
+  );
+
+  it.each([Code.PermissionDenied, Code.Unavailable])('waitDeleted propagates lookup error %s', async (code) => {
+    const sandbox = client({
+      getSandbox: () => {
+        throw new ConnectError('lookup failed', code);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId: 'old-id' })).rejects.toMatchObject({
+      connectCode: code,
+    });
   });
 
   it('waitDeleted rejects rather than hanging when get() never resolves', async () => {
@@ -1129,7 +1239,7 @@ describe('ssh sessions', () => {
         gatewayPort: 8443,
         gatewayScheme: 'https',
         hostKeyFingerprint: 'SHA256:abc',
-        expiresAtMs: 1730000000000n,
+        expirationTime: { seconds: 1730000000n, nanos: 0 },
       }),
     });
     const session = await withExpiry.createSshSession('sb');
@@ -1152,7 +1262,7 @@ describe('ssh sessions', () => {
         gatewayPort: 80,
         gatewayScheme: 'http',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
     });
     const bare = await noExpiry.createSshSession('sb');
@@ -1161,8 +1271,8 @@ describe('ssh sessions', () => {
   });
 
   it('revokeSshSession returns the revoked flag', async () => {
-    const sandbox = client({ revokeSshSession: () => ({ revoked: true }) });
-    expect(await sandbox.revokeSshSession('tok')).toBe(true);
+    const sandbox = client({ revokeSshSession: () => ({ outcome: 1 }) });
+    expect((await sandbox.revokeSshSession('tok')).outcome).toBe('completed');
   });
 
   it('rejects a response that violates the ProxyCommand trust-boundary contract', async () => {
@@ -1173,7 +1283,7 @@ describe('ssh sessions', () => {
       gatewayPort: 8443,
       gatewayScheme: 'https',
       hostKeyFingerprint: 'SHA256:abc',
-      expiresAtMs: 0n,
+      expirationTime: undefined,
     };
     const cases: Array<Record<string, unknown>> = [
       { ...base, sandboxId: 'different-sandbox' },
@@ -1207,7 +1317,7 @@ describe('ssh sessions', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         }),
       });
       await expect(sandbox.createSshSession('sb')).resolves.toMatchObject({ gatewayHost });
@@ -1231,12 +1341,12 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       revokeSshSession: (req) => {
         revokedToken = req.token;
-        return { revoked: true };
+        return { outcome: 1 };
       },
       forwardTcp: async function* (requests) {
         for await (const frame of requests) {
@@ -1314,9 +1424,9 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
       // Ignore inbound frames; just blast a large, verifiable byte stream back.
       forwardTcp: async function* () {
         for (let i = 0; i < CHUNKS; i++) {
@@ -1375,14 +1485,14 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       // biome-ignore lint/correctness/useYield: the socket is reset before any frame is relayed
       forwardTcp: async function* () {
         return;
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });
@@ -1445,7 +1555,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       forwardTcp: async function* (_requests, ctx) {
         streamStarted();
@@ -1461,7 +1571,7 @@ describe('forward', () => {
         });
         throw new ConnectError('canceled', Code.Canceled);
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });

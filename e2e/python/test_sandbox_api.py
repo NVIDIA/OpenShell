@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
+from google.protobuf import duration_pb2
 from openshell._proto import openshell_pb2
 
 if TYPE_CHECKING:
@@ -87,7 +88,7 @@ def test_sandbox_interactive_exec_honors_tty(
                     "printf 'stderr-sentinel\\n' >&2",
                 ],
                 tty=tty,
-                timeout_seconds=20,
+                execution_timeout=duration_pb2.Duration(seconds=20),
             )
         )
 

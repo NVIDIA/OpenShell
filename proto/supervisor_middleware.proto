@@ -7,6 +7,7 @@ package openshell.middleware.v1;
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
 
 // SupervisorMiddleware discovers and configures one operator-run middleware.
 // It evaluates HTTP requests and WebSocket messages before credentials.
@@ -63,6 +64,8 @@ message MiddlewareManifest {
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
+  reserved 4;
+  reserved "timeout";
   // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
   // Supported phase.
@@ -73,9 +76,8 @@ message MiddlewareBinding {
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
   // A non-empty value may shorten but cannot extend the operator timeout.
-  // Values use an integer with an `ms` or `s` suffix and must be between
-  // 10ms and 30s.
-  string timeout = 4;
+  // Values must be between 10ms and 30s.
+  google.protobuf.Duration request_timeout = 104;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.

@@ -575,15 +575,14 @@ func (c *fakeSandboxClient) WaitStopped(ctx context.Context, workspace, name str
 }
 
 // Delete removes a sandbox by name. The operation is idempotent.
-func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) error {
+func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 
 	deleted, existed := c.store.DeleteAndGet(workspace, name)
 	if !existed {
-		// Not found — idempotent delete
-		return nil
+		return deletionResult(false, "", opts)
 	}
 
 	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
@@ -591,7 +590,7 @@ func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) er
 		Object: deleted,
 	}, name)
 
-	return nil
+	return deletionResult(true, deleted.ID, opts)
 }
 
 // WaitReady transitions a sandbox to the Ready phase. In the fake

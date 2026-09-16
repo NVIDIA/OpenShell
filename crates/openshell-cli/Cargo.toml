@@ -91,6 +91,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+openshell-server = { path = "../openshell-server", features = ["test-support"] }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

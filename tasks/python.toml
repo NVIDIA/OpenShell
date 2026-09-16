@@ -6,6 +6,7 @@
 ["python:dev"]
 description = "Install the Python SDK in development mode"
 depends = ["python:proto"]
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0" }
 run = "uv sync --group dev"
 hide = true
 
@@ -38,23 +39,26 @@ hide = true
 ["python:lint"]
 description = "Lint Python code with ruff"
 depends = ["python:proto"]
-env = { UV_NO_SYNC = "1" }
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0", UV_NO_SYNC = "1" }
 run = "uv run ruff check {{vars.python_paths}}"
 hide = true
 
 ["python:format"]
 description = "Format Python code with ruff"
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0" }
 run = "uv run ruff format {{vars.python_paths}}"
 hide = true
 
 ["python:format:check"]
 description = "Check Python formatting with ruff"
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0" }
 run = "uv run ruff format --check {{vars.python_paths}}"
 hide = true
 
 ["python:typecheck"]
 description = "Type check Python code with ty"
 depends = ["python:proto"]
+env = { SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL = "0.0.0" }
 run = "uv run ty check {{vars.python_paths}}"
 hide = true
 

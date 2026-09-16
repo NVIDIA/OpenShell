@@ -13,6 +13,10 @@ use openshell_core::proto::{
 };
 use tonic::Code;
 
+fn timestamp(value: &str) -> prost_types::Timestamp {
+    value.parse().expect("valid test timestamp")
+}
+
 fn test_initial_endpoint_status(endpoint_id: &str, host: &str, path: &str) -> EndpointStatus {
     EndpointStatus {
         endpoint_id: endpoint_id.to_string(),
@@ -20,7 +24,7 @@ fn test_initial_endpoint_status(endpoint_id: &str, host: &str, path: &str) -> En
         ports: vec![443],
         path: path.to_string(),
         last_result: EndpointResult::NoObservedExchange as i32,
-        last_reported_at: String::new(),
+        last_reported_time: None,
     }
 }
 
@@ -179,7 +183,7 @@ async fn assert_loaded_ack_preserves_endpoint_evidence(
         before.endpoint_statuses[0].last_result,
         EndpointResult::HttpResponseReceived as i32
     );
-    assert!(!before.endpoint_statuses[0].last_reported_at.is_empty());
+    assert!(before.endpoint_statuses[0].last_reported_time.is_some());
     let cursor = state
         .supervisor_sessions
         .endpoint_report_cursor(&report.sandbox_id, &report.supervisor_session_id);
@@ -366,7 +370,7 @@ async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
             status.endpoint_statuses[0],
             EndpointStatus {
                 last_result: EndpointResult::NoObservedExchange as i32,
-                last_reported_at: String::new(),
+                last_reported_time: None,
                 ..original_status.endpoint_statuses[0].clone()
             }
         );
@@ -659,7 +663,7 @@ fn endpoint_results_preserve_address_and_lifecycle_through_failure_recovery_and_
         } else {
             HashSet::from(["current".to_string()])
         };
-        reconcile_endpoint_statuses(&mut sandbox, &reports, &observed, time);
+        reconcile_endpoint_statuses(&mut sandbox, &reports, &observed, &timestamp(time));
 
         let status = sandbox.status.as_ref().expect("status remains present");
         assert_eq!(status.phase, SandboxPhase::Ready as i32);
@@ -668,10 +672,10 @@ fn endpoint_results_preserve_address_and_lifecycle_through_failure_recovery_and_
             status.endpoint_statuses,
             vec![EndpointStatus {
                 last_result: result as i32,
-                last_reported_at: if result == EndpointResult::NoObservedExchange {
-                    String::new()
+                last_reported_time: if result == EndpointResult::NoObservedExchange {
+                    None
                 } else {
-                    time.to_string()
+                    Some(timestamp(time))
                 },
                 ..initial.clone()
             }]
@@ -689,12 +693,12 @@ fn endpoint_reconciliation_advances_only_observed_endpoint_timestamp() {
     );
     let endpoint_a = EndpointStatus {
         last_result: EndpointResult::HttpResponseReceived as i32,
-        last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+        last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
         ..test_initial_endpoint_status("a", "a.example.com", "/**")
     };
     let endpoint_b = EndpointStatus {
         last_result: EndpointResult::TransportFailed as i32,
-        last_reported_at: "2026-09-05T01:11:00.000Z".to_string(),
+        last_reported_time: Some(timestamp("2026-09-05T01:11:00.000Z")),
         ..test_initial_endpoint_status("b", "b.example.com", "/**")
     };
     sandbox.status = Some(SandboxStatus {
@@ -709,14 +713,14 @@ fn endpoint_reconciliation_advances_only_observed_endpoint_timestamp() {
         &mut sandbox,
         &reports,
         &HashSet::from(["a".to_string()]),
-        "2026-09-05T02:00:00.000Z",
+        &timestamp("2026-09-05T02:00:00.000Z"),
     );
     let status = sandbox.status.expect("status remains present");
     assert_eq!(
         status.endpoint_statuses,
         vec![
             EndpointStatus {
-                last_reported_at: "2026-09-05T02:00:00.000Z".to_string(),
+                last_reported_time: Some(timestamp("2026-09-05T02:00:00.000Z")),
                 ..endpoint_a
             },
             endpoint_b
@@ -751,7 +755,7 @@ fn endpoint_snapshot_requires_marker_for_new_observed_result() {
         &mut sandbox,
         &reports,
         &observed,
-        "2026-09-05T01:00:00.000Z",
+        &timestamp("2026-09-05T01:00:00.000Z"),
     );
     validate_endpoint_observation_markers(&sandbox, &reports, &HashSet::new())
         .expect("retained evidence");
@@ -761,11 +765,11 @@ fn endpoint_snapshot_requires_marker_for_new_observed_result() {
         &mut sandbox,
         &reports,
         &observed,
-        "2026-09-05T02:00:00.000Z",
+        &timestamp("2026-09-05T02:00:00.000Z"),
     );
     assert_eq!(
-        sandbox.status.expect("status").endpoint_statuses[0].last_reported_at,
-        "2026-09-05T02:00:00.000Z"
+        sandbox.status.expect("status").endpoint_statuses[0].last_reported_time,
+        Some(timestamp("2026-09-05T02:00:00.000Z"))
     );
 }
 
@@ -786,7 +790,7 @@ fn endpoint_reconciliation_initializes_status_name_and_unknown_result() {
         &mut sandbox,
         &reports,
         &HashSet::new(),
-        "2026-09-05T04:00:00.000Z",
+        &timestamp("2026-09-05T04:00:00.000Z"),
     );
     let status = sandbox.status.expect("status initialized");
     assert_eq!(status.endpoint_statuses, vec![endpoint]);
@@ -811,7 +815,7 @@ async fn startup_reconciliation_invalidates_status_from_previous_sessions() {
         sandbox_name: sandbox_id.to_string(),
         endpoint_statuses: vec![EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+            last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
             ..initial.clone()
         }],
         conditions: vec![ready_condition()],
@@ -928,15 +932,15 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         .find(|endpoint| endpoint.endpoint_id == observed_id)
         .expect("observed endpoint");
     observed.last_result = EndpointResult::TransportFailed as i32;
-    observed.last_reported_at.clone_from(
+    observed.last_reported_time.clone_from(
         &public
             .endpoint_statuses
             .iter()
             .find(|endpoint| endpoint.endpoint_id == observed_id)
             .expect("public endpoint")
-            .last_reported_at,
+            .last_reported_time,
     );
-    assert!(!observed.last_reported_at.is_empty());
+    assert!(observed.last_reported_time.is_some());
     assert_eq!(public.endpoint_statuses, expected);
 
     handle_report_endpoint_status(
@@ -1040,7 +1044,7 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         current_policy_version: 0,
         endpoint_statuses: vec![EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-05T01:00:00.000Z".to_string(),
+            last_reported_time: Some(timestamp("2026-09-05T01:00:00.000Z")),
             ..initial_old
         }],
         ..Default::default()
@@ -1159,12 +1163,12 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         .expect("reported status");
     assert_eq!(reported.endpoint_statuses.len(), 1);
     let endpoint = &reported.endpoint_statuses[0];
-    assert!(!endpoint.last_reported_at.is_empty());
+    assert!(endpoint.last_reported_time.is_some());
     assert_eq!(
         endpoint,
         &EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: endpoint.last_reported_at.clone(),
+            last_reported_time: endpoint.last_reported_time,
             ..initial_active
         }
     );

@@ -84,8 +84,14 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
 
         for denial in denials {
             total_count += denial.count;
-            first_seen_ms = first_seen_ms.min(denial.first_seen_ms);
-            last_seen_ms = last_seen_ms.max(denial.last_seen_ms);
+            if let Some(timestamp) = denial.first_seen_time.as_ref() {
+                first_seen_ms = first_seen_ms
+                    .min(openshell_core::time::timestamp_to_millis(timestamp).unwrap_or(i64::MAX));
+            }
+            if let Some(timestamp) = denial.last_seen_time.as_ref() {
+                last_seen_ms = last_seen_ms
+                    .max(openshell_core::time::timestamp_to_millis(timestamp).unwrap_or_default());
+            }
             if denial.denial_stage == "ssrf" {
                 is_ssrf = true;
             }
@@ -210,13 +216,13 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             security_notes,
             confidence,
             denial_summary_ids: vec![],
-            created_at_ms: 0, // Set by gateway on persist
-            decided_at_ms: 0,
+            created_time: None, // Set by gateway on persist
+            decided_time: None,
             stage,
             supersedes_chunk_id: String::new(),
             hit_count: total_count.cast_signed(),
-            first_seen_ms,
-            last_seen_ms,
+            first_seen_time: openshell_core::time::timestamp_from_millis(first_seen_ms).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(last_seen_ms).ok(),
             binary: binary.clone(),
             validation_result: String::new(),
             rejection_reason: String::new(),
@@ -503,8 +509,8 @@ mod tests {
             binary: "/usr/bin/curl".to_string(),
             ancestors: vec![],
             deny_reason: "no matching policy".to_string(),
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             count: 5,
             suppressed_count: 0,
             total_count: 5,
@@ -548,8 +554,8 @@ mod tests {
             binary: "/usr/bin/python3".to_string(),
             ancestors: vec![],
             deny_reason: "l7 deny".to_string(),
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             count: 3,
             suppressed_count: 0,
             total_count: 3,
@@ -652,8 +658,8 @@ mod tests {
             port: 80,
             binary: "/usr/bin/curl".to_string(),
             count: 5,
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             denial_stage: "ssrf".to_string(),
             ..Default::default()
         }];
@@ -672,8 +678,8 @@ mod tests {
             port: 80,
             binary: "/usr/bin/curl".to_string(),
             count: 5,
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             denial_stage: "ssrf".to_string(),
             ..Default::default()
         }];
@@ -692,8 +698,8 @@ mod tests {
             port: 80,
             binary: "/usr/bin/curl".to_string(),
             count: 5,
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             denial_stage: "ssrf".to_string(),
             ..Default::default()
         }];
@@ -712,8 +718,8 @@ mod tests {
             port: 8080,
             binary: "/usr/bin/curl".to_string(),
             count: 3,
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             denial_stage: "ssrf".to_string(),
             ..Default::default()
         }];
@@ -732,8 +738,8 @@ mod tests {
             port: 443,
             binary: "/usr/bin/curl".to_string(),
             count: 5,
-            first_seen_ms: 1000,
-            last_seen_ms: 2000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(2000).ok(),
             denial_stage: "connect".to_string(),
             ..Default::default()
         }];

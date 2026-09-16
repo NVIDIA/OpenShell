@@ -41,9 +41,9 @@ type WorkspaceInterface interface {
 	Get(ctx context.Context, name string) (*Workspace, error)
 	List(opts ...ListOptions) (*Pager[*Workspace], error)
 	ListAll(ctx context.Context, opts ...ListOptions) ([]*Workspace, error)
-	Delete(ctx context.Context, name string) error
+	Delete(ctx context.Context, name string, opts ...DeleteOptions) (*DeletionResult, error)
 	AddMember(ctx context.Context, workspace, principalSubject string, role WorkspaceRole) (*WorkspaceMember, error)
-	RemoveMember(ctx context.Context, workspace, principalSubject string) error
+	RemoveMember(ctx context.Context, workspace, principalSubject string, opts ...DeleteOptions) (*DeletionResult, error)
 	ListMembers(workspace string, opts ...ListOptions) (*Pager[*WorkspaceMember], error)
 	ListAllMembers(ctx context.Context, workspace string, opts ...ListOptions) ([]*WorkspaceMember, error)
 }
