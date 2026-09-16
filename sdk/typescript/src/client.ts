@@ -693,21 +693,49 @@ export interface Page<T> {
   readonly nextPageToken: string;
 }
 
+const maxConsumedPageTokens = 10_000;
+const maxConsumedPageTokenBytes = 1 << 20;
+
 /** Lazy, single-pass iterator that fetches one RPC page per advance. */
 export class Pager<T> implements AsyncIterable<Page<T>> {
   private nextToken: string | undefined;
+  private readonly consumedTokens = new Set<string>();
+  private consumedTokenBytes = 0;
 
   constructor(
     private readonly fetch: (pageToken: string) => Promise<Page<T>>,
     pageToken = '',
+    private readonly maxConsumedTokens = maxConsumedPageTokens,
+    private readonly maxConsumedTokenBytes = maxConsumedPageTokenBytes,
   ) {
     this.nextToken = pageToken;
+  }
+
+  private validateCurrentTokenBudget(pageToken: string): number {
+    if (pageToken === '') return 0;
+    const tokenBytes = new TextEncoder().encode(pageToken).byteLength;
+    if (
+      this.consumedTokens.size >= this.maxConsumedTokens ||
+      tokenBytes > this.maxConsumedTokenBytes - this.consumedTokenBytes
+    ) {
+      throw new Error('pager continuation token history limit exceeded');
+    }
+    return tokenBytes;
   }
 
   /** Fetch the next page, or return undefined after the final page. */
   async nextPage(): Promise<Page<T> | undefined> {
     if (this.nextToken === undefined) return undefined;
-    const page = await this.fetch(this.nextToken);
+    const pageToken = this.nextToken;
+    const tokenBytes = this.validateCurrentTokenBudget(pageToken);
+    const page = await this.fetch(pageToken);
+    if (pageToken !== '') {
+      this.consumedTokens.add(pageToken);
+      this.consumedTokenBytes += tokenBytes;
+    }
+    if (page.nextPageToken !== '' && this.consumedTokens.has(page.nextPageToken)) {
+      throw new Error('pager received a repeated continuation token');
+    }
     this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
     return page;
   }

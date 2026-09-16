@@ -4190,6 +4190,11 @@ mod tests {
             ))
             .await
             .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("other", vec!["work-github".to_string()]))
+            .await
+            .unwrap();
 
         let first_page = handle_list_sandbox_providers(
             &state,
@@ -4211,6 +4216,19 @@ mod tests {
             Some(&"REDACTED".to_string())
         );
         assert!(!first_page.next_page_token.is_empty());
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox_name: "other".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one sandbox must not list another sandbox");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
         let second_page = handle_list_sandbox_providers(
             &state,
