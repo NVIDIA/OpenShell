@@ -66,19 +66,25 @@ class Pager(Generic[T]):
     def __iter__(self) -> Pager[T]:
         return self
 
+    def _validate_page_token_budget(self, page_token: str) -> int:
+        if not page_token:
+            return 0
+        token_bytes = len(page_token.encode("utf-8"))
+        if (
+            len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
+            or self._consumed_page_token_bytes + token_bytes
+            > _PAGER_MAX_CONSUMED_TOKEN_BYTES
+        ):
+            raise SandboxError("pager continuation token history limit exceeded")
+        return token_bytes
+
     def __next__(self) -> Page[T]:
         if self._page_token is None:
             raise StopIteration
         page_token = self._page_token
+        token_bytes = self._validate_page_token_budget(page_token)
         page = self._fetch(page_token)
         if page_token:
-            token_bytes = len(page_token.encode("utf-8"))
-            if (
-                len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
-                or self._consumed_page_token_bytes + token_bytes
-                > _PAGER_MAX_CONSUMED_TOKEN_BYTES
-            ):
-                raise SandboxError("pager continuation token history limit exceeded")
             self._consumed_page_tokens.add(page_token)
             self._consumed_page_token_bytes += token_bytes
         next_page_token = page.next_page_token

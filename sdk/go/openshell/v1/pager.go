@@ -50,10 +50,25 @@ func newPager[T any](pageToken string, fetch pageFetcher[T]) *Pager[T] {
 	return NewPager(pageToken, fetch)
 }
 
+func (p *Pager[T]) validateCurrentTokenBudget() (int, error) {
+	if p.nextPageToken == nil || *p.nextPageToken == "" {
+		return 0, nil
+	}
+	tokenBytes := len(*p.nextPageToken)
+	if len(p.consumedTokens) >= p.maxConsumedTokens || tokenBytes > p.maxConsumedTokenBytes-p.consumedTokenBytes {
+		return 0, errors.New("pager continuation token history limit exceeded")
+	}
+	return tokenBytes, nil
+}
+
 // NextPage fetches the next page. It returns nil after the final page.
 func (p *Pager[T]) NextPage(ctx context.Context) (*Page[T], error) {
 	if p.nextPageToken == nil {
 		return nil, nil
+	}
+	tokenBytes, err := p.validateCurrentTokenBudget()
+	if err != nil {
+		return nil, err
 	}
 	page, err := p.fetch(ctx, *p.nextPageToken)
 	if err != nil {
@@ -66,10 +81,6 @@ func (p *Pager[T]) NextPage(ctx context.Context) (*Page[T], error) {
 		page.Items = make([]T, 0)
 	}
 	if *p.nextPageToken != "" {
-		tokenBytes := len(*p.nextPageToken)
-		if len(p.consumedTokens) >= p.maxConsumedTokens || tokenBytes > p.maxConsumedTokenBytes-p.consumedTokenBytes {
-			return nil, errors.New("pager continuation token history limit exceeded")
-		}
 		p.consumedTokens[*p.nextPageToken] = struct{}{}
 		p.consumedTokenBytes += tokenBytes
 	}
