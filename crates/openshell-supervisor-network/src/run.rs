@@ -493,6 +493,7 @@ pub async fn run_networking(
             mediated_policy_dns
                 .as_ref()
                 .map(|runtime| runtime.store.clone()),
+            None,
         )
         .await?;
         Some(proxy_handle)
