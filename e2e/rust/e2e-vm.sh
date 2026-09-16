@@ -392,6 +392,8 @@ run_e2e_test() {
   local test_target="$1"
   shift
 
+  e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
   echo "==> Running e2e ${test_target} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
   cargo test \
     --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \

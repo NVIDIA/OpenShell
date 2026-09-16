@@ -919,5 +919,7 @@ if [ -n "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256:-}" ]; then
   require_expected_sha256 "conformance CLI" "${OPENSHELL_CONFORMANCE_BIN}" \
     "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256}"
 fi
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"

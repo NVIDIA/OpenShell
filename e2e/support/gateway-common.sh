@@ -146,6 +146,23 @@ EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
 }
 
+# Import the example provider profiles at platform scope.
+#
+# OpenShell compiles no provider profile into a binary, so a freshly started
+# gateway serves an empty catalog. The e2e suites exercise providers built from
+# github, openai, nvidia and the rest, which means the lane has to import them
+# first — the same step the upgrade notes give operators.
+e2e_import_example_provider_profiles() {
+  local cli_bin=$1
+  local root=$2
+
+  echo "Importing example provider profiles from ${root}/providers..."
+  if ! "${cli_bin}" provider profile import --from "${root}/providers" --global; then
+    echo "ERROR: failed to import example provider profiles" >&2
+    return 1
+  fi
+}
+
 e2e_toml_string() {
   local value="$1"
   value="${value//\\/\\\\}"

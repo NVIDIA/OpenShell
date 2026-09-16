@@ -706,5 +706,7 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   exit 1
 fi
 
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"
