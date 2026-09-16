@@ -178,17 +178,11 @@ func profileDurationFromProto(value *durationpb.Duration) *types.ProfileDuration
 	return &types.ProfileDuration{Seconds: value.Seconds, Nanos: value.Nanos}
 }
 
-func profileDurationToProto(value *types.ProfileDuration, legacySeconds int64) *durationpb.Duration {
-	if value != nil {
-		exact := &durationpb.Duration{Seconds: value.Seconds, Nanos: value.Nanos}
-		// Honor callers that still update the deprecated whole-second field
-		// after reading a profile through the curated SDK.
-		if WholeDurationSecondsFromProto(exact) != legacySeconds {
-			return DurationFromSignedSeconds(legacySeconds)
-		}
-		return exact
+func profileDurationToProto(value *types.ProfileDuration) *durationpb.Duration {
+	if value == nil {
+		return nil
 	}
-	return DurationFromSignedSeconds(legacySeconds)
+	return &durationpb.Duration{Seconds: value.Seconds, Nanos: value.Nanos}
 }
 
 func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.ProfileCredentialRefresh {
@@ -198,8 +192,7 @@ func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.P
 	result := &types.ProfileCredentialRefresh{
 		Strategy: RefreshStrategyFromProto(r.GetStrategy()), TokenURL: r.GetTokenUrl(),
 		Scopes: CopyStringSlice(r.GetScopes()), RefreshBefore: profileDurationFromProto(r.RefreshBefore),
-		RefreshBeforeSeconds: WholeDurationSecondsFromProto(r.GetRefreshBefore()),
-		MaxLifetime:          profileDurationFromProto(r.MaxLifetime), MaxLifetimeSeconds: WholeDurationSecondsFromProto(r.GetMaxLifetime()),
+		MaxLifetime: profileDurationFromProto(r.MaxLifetime),
 	}
 	for _, material := range r.GetMaterial() {
 		result.Material = append(result.Material, types.ProfileCredentialRefreshMaterial{Name: material.GetName(), Description: material.GetDescription(), Required: material.GetRequired(), Secret: material.GetSecret()})
@@ -216,8 +209,8 @@ func profileCredentialRefreshToProto(r *types.ProfileCredentialRefresh) *pb.Prov
 	}
 	result := &pb.ProviderCredentialRefresh{
 		Strategy: RefreshStrategyToProto(r.Strategy), TokenUrl: r.TokenURL,
-		Scopes: CopyStringSlice(r.Scopes), RefreshBefore: profileDurationToProto(r.RefreshBefore, r.RefreshBeforeSeconds),
-		MaxLifetime: profileDurationToProto(r.MaxLifetime, r.MaxLifetimeSeconds),
+		Scopes: CopyStringSlice(r.Scopes), RefreshBefore: profileDurationToProto(r.RefreshBefore),
+		MaxLifetime: profileDurationToProto(r.MaxLifetime),
 	}
 	for _, material := range r.Material {
 		result.Material = append(result.Material, &pb.ProviderCredentialRefreshMaterial{Name: material.Name, Description: material.Description, Required: material.Required, Secret: material.Secret})
@@ -238,7 +231,6 @@ func tokenGrantFromProto(tg *pb.ProviderCredentialTokenGrant) *types.CredentialT
 		JWTSVIDAudience:     tg.GetJwtSvidAudience(),
 		Scopes:              CopyStringSlice(tg.GetScopes()),
 		CacheTTL:            profileDurationFromProto(tg.CacheTtl),
-		CacheTTLSeconds:     WholeDurationSecondsFromProto(tg.GetCacheTtl()),
 		ClientAssertionType: tg.GetClientAssertionType(),
 		GrantType:           CredentialTokenGrantTypeFromProto(tg.GetGrantType()),
 		SubjectToken:        subjectTokenFromProto(tg.GetSubjectToken()),
@@ -262,7 +254,7 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		Audience:            tg.Audience,
 		JwtSvidAudience:     tg.JWTSVIDAudience,
 		Scopes:              CopyStringSlice(tg.Scopes),
-		CacheTtl:            profileDurationToProto(tg.CacheTTL, tg.CacheTTLSeconds),
+		CacheTtl:            profileDurationToProto(tg.CacheTTL),
 		ClientAssertionType: tg.ClientAssertionType,
 		GrantType:           CredentialTokenGrantTypeToProto(tg.GrantType),
 		SubjectToken:        subjectTokenToProto(tg.SubjectToken),

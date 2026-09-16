@@ -57,14 +57,10 @@ type ProfileCredentialRefresh struct {
 	Scopes   []string
 	// RefreshBefore retains the exact protobuf duration, including presence and nanoseconds.
 	RefreshBefore *ProfileDuration
-	// RefreshBeforeSeconds is retained for source compatibility with whole-second profiles.
-	RefreshBeforeSeconds int64
 	// MaxLifetime retains the exact protobuf duration, including presence and nanoseconds.
-	MaxLifetime *ProfileDuration
-	// MaxLifetimeSeconds is retained for source compatibility with whole-second profiles.
-	MaxLifetimeSeconds int64
-	Material           []ProfileCredentialRefreshMaterial
-	AdditionalOutputs  []ProfileCredentialRefreshOutput
+	MaxLifetime       *ProfileDuration
+	Material          []ProfileCredentialRefreshMaterial
+	AdditionalOutputs []ProfileCredentialRefreshOutput
 }
 
 // ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.
@@ -97,9 +93,7 @@ type CredentialTokenGrant struct {
 	JWTSVIDAudience string
 	Scopes          []string
 	// CacheTTL retains the exact protobuf duration, including presence and nanoseconds.
-	CacheTTL *ProfileDuration
-	// CacheTTLSeconds is retained for source compatibility with whole-second profiles.
-	CacheTTLSeconds     int64
+	CacheTTL            *ProfileDuration
 	AudienceOverrides   []TokenGrantAudienceOverride
 	ClientAssertionType string
 	GrantType           CredentialTokenGrantType
@@ -108,7 +102,8 @@ type CredentialTokenGrant struct {
 }
 
 // ProfileDuration represents a protobuf duration without importing generated
-// protobuf packages into the curated SDK types.
+// protobuf packages into the curated SDK types. A nil pointer means absent; a
+// non-nil zero value means an explicitly present zero duration.
 type ProfileDuration struct {
 	Seconds int64
 	Nanos   int32

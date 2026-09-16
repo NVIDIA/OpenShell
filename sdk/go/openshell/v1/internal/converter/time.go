@@ -84,29 +84,6 @@ func DurationFromSeconds(value uint64) *durationpb.Duration {
 	return durationpb.New(time.Duration(value) * time.Second)
 }
 
-// WholeDurationSecondsFromProto returns the whole-second runtime component of
-// a non-negative protobuf duration. It returns -1 for malformed or negative
-// values so legacy profile validation can report the invalid input. Exact
-// profile conversion retains nanos separately.
-func WholeDurationSecondsFromProto(value *durationpb.Duration) int64 {
-	if value == nil {
-		return 0
-	}
-	if value.CheckValid() != nil || value.Seconds < 0 || value.Nanos < 0 {
-		return -1
-	}
-	return value.Seconds
-}
-
-// DurationFromSignedSeconds preserves negative profile values for validation
-// instead of converting them to large unsigned values and dropping them.
-func DurationFromSignedSeconds(value int64) *durationpb.Duration {
-	if value == 0 {
-		return nil
-	}
-	return &durationpb.Duration{Seconds: value}
-}
-
 // TimeFromMillis converts a millisecond epoch timestamp to time.Time.
 // A zero value returns the zero time.
 func TimeFromMillis(ms int64) time.Time {
