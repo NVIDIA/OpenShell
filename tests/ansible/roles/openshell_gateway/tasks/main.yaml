@@ -14,6 +14,10 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0700"
 
+- name: Prepare Docker gateway
+  ansible.builtin.include_tasks: docker.yaml
+  when: openshell_gateway_driver == "docker"
+
 - name: Prepare Podman gateway
   ansible.builtin.include_tasks: podman.yaml
   when: openshell_gateway_driver == "podman"

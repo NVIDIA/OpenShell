@@ -258,9 +258,8 @@ the required roles and their dependencies before running playbooks.
 The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
 with musl, and the gateway and supervisor with GNU. Image assembly stages
 the gateway, sandbox, and supervisor as separate binaries for their respective
-Dockerfiles. The Fedora Podman scenarios import both local runtime images and
-configure the gateway to use them. The Ubuntu Docker scenario takes the sandbox
-binary directly as an input to its VM installation playbook.
+Dockerfiles. The Ubuntu Docker and Fedora Podman scenarios import both local
+runtime images and configure the gateway to use them.
 
 ## Python Wheel Packaging
 
