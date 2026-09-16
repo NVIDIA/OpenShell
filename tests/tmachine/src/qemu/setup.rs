@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use blake3::Hasher;
 
 use crate::config::{Machine, Scenario};
 
+use super::ansible_hash::hash_sources;
 use super::layer::{cached_layer, hash_file, hash_files};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
@@ -35,10 +36,7 @@ fn setup_hash(machine: &Machine, scenario: &Scenario) -> Result<String> {
     hash_file(&mut hasher, &machine.base_image)
         .with_context(|| format!("failed to hash base image for machine {:?}", machine.name))?;
     hasher.update(&[u8::from(scenario.setup.use_galaxy)]);
-    if scenario.setup.use_galaxy {
-        hash_file(&mut hasher, Path::new(&crate::ansible::requirements_path()))
-            .context("failed to hash Ansible Galaxy requirements")?;
-    }
+    hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &scenario.setup.playbooks).context("failed to hash setup playbooks")?;
     Ok(hasher.finalize().to_hex().to_string())
 }

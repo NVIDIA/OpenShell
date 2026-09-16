@@ -15,6 +15,7 @@ pub async fn install_roles() {
     let status = Command::new("ansible-galaxy")
         .arg("role")
         .arg("install")
+        .arg("--force-with-deps")
         .arg("--role-file")
         .arg(requirements_path())
         .status()

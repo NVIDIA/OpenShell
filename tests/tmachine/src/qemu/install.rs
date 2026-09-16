@@ -8,6 +8,7 @@ use blake3::Hasher;
 
 use crate::config::{Machine, Scenario};
 
+use super::ansible_hash::hash_sources;
 use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
 use super::setup::setup;
 
@@ -35,10 +36,7 @@ fn install_hash(setup_disk: &Path, scenario: &Scenario) -> Result<String> {
     hasher.update(INSTALL_CACHE_VERSION);
     hash_file(&mut hasher, setup_disk).context("failed to hash setup disk")?;
     hasher.update(&[u8::from(scenario.install.use_galaxy)]);
-    if scenario.install.use_galaxy {
-        hash_file(&mut hasher, Path::new(&crate::ansible::requirements_path()))
-            .context("failed to hash Ansible Galaxy requirements")?;
-    }
+    hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &scenario.install.playbooks)
         .context("failed to hash install playbooks")?;
     hash_inputs(&mut hasher, &scenario.install.inputs)?;

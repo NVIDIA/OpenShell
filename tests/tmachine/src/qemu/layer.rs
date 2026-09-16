@@ -75,6 +75,9 @@ pub(super) fn hash_files(hasher: &mut Hasher, files: &[PathBuf]) -> Result<()> {
     hasher.update(&(files.len() as u64).to_le_bytes());
 
     for file in files {
+        let path = file.as_os_str().as_encoded_bytes();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
         hash_file(hasher, file)?;
     }
     Ok(())

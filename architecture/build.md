@@ -244,6 +244,17 @@ CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox.
 
+The `tests/tmachine` setup and installation caches include a digest of the
+entire directory containing `ANSIBLE_CONFIG`, including local roles, task
+includes, templates, inventory, and requirements. The digest uses sorted
+relative paths, file contents, and executable permissions; source symlinks
+are unsupported. Both keys also retain the ordered playbook paths and contents,
+their base disk contents, and whether Galaxy is enabled; installation keys
+include named binary inputs. The top-level `.roles` directory is excluded:
+Galaxy release pins in `requirements.yaml` are treated as immutable, including
+any transitive dependency pins. Cache misses with Galaxy enabled reinstall
+the required roles and their dependencies before running playbooks.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
