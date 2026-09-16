@@ -40,6 +40,7 @@ mod linux {
         CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
         SandboxConfirmEvidence,
     };
+    use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
@@ -80,8 +81,84 @@ mod linux {
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
+    const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
+    const GPU_BASELINE_READ_WRITE: &[&str] = &[
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/dev/dxg",
+        "/proc",
+    ];
+
     fn duration_micros(duration: Duration) -> u64 {
         u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// Add the filesystem paths required by GPU devices visible inside the
+    /// workload container. The companion supervisor intentionally has no GPU
+    /// devices, so it cannot discover these paths on the sandbox's behalf.
+    fn enrich_gpu_filesystem_paths(
+        policy: &mut openshell_core::policy::SandboxPolicy,
+        gpu_requested: bool,
+    ) -> bool {
+        if !gpu_requested {
+            return false;
+        }
+        let has_gpu = Path::new("/dev/nvidiactl").exists() || Path::new("/dev/dxg").exists();
+        if !has_gpu {
+            return false;
+        }
+
+        let mut read_write = GPU_BASELINE_READ_WRITE
+            .iter()
+            .copied()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            read_write.extend(entries.flatten().filter_map(|entry| {
+                let name = entry.file_name();
+                let suffix = name.to_str()?.strip_prefix("nvidia")?;
+                (!suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()))
+                    .then(|| entry.path())
+            }));
+        }
+
+        let mut modified = false;
+        for path in GPU_BASELINE_READ_ONLY.iter().copied().map(Path::new) {
+            if path.exists()
+                && !policy
+                    .filesystem
+                    .read_only
+                    .iter()
+                    .any(|allowed| allowed == path)
+                && !policy
+                    .filesystem
+                    .read_write
+                    .iter()
+                    .any(|allowed| allowed == path)
+            {
+                policy.filesystem.read_only.push(path.to_path_buf());
+                modified = true;
+            }
+        }
+        for path in read_write {
+            if !path.exists() || policy.filesystem.read_write.contains(&path) {
+                continue;
+            }
+            if policy.filesystem.read_only.contains(&path) {
+                if path != Path::new("/proc") {
+                    continue;
+                }
+                policy
+                    .filesystem
+                    .read_only
+                    .retain(|allowed| allowed != &path);
+            }
+            policy.filesystem.read_write.push(path);
+            modified = true;
+        }
+        modified
     }
 
     struct ControlConnectionSlot(Arc<AtomicUsize>);
@@ -2247,6 +2324,21 @@ mod linux {
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let mut policy = policy.into();
+            let gpu_requested = self
+                .config
+                .resource_claims
+                .get(GPU_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true");
+            if enrich_gpu_filesystem_paths(&mut policy, gpu_requested) {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "enriched")
+                        .message("Added workload-local GPU filesystem paths".to_string())
+                        .build()
+                );
+            }
             let driver_identity = DriverIdentity::Resolved {
                 uid: self.config.workload_identity.uid,
                 gid: self.config.workload_identity.gid,
