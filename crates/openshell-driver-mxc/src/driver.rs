@@ -903,7 +903,6 @@ async fn run_lifecycle(
     info!(sandbox = %sandbox_name, count = environment.len(), "MXC process env vars");
     let process = MxcProcess {
         command_line: command_line.clone(),
-        argv: sandbox_config.command,
         cwd: sandbox_config.cwd,
         env: environment,
         timeout: 0,
