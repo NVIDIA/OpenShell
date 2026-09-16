@@ -93,6 +93,8 @@ pub async fn sandbox_provider_list(
         .list_sandbox_providers(ListSandboxProvidersRequest {
             sandbox_name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            page_size: 100,
+            page_token: String::new(),
         })
         .await
         .into_diagnostic()?;

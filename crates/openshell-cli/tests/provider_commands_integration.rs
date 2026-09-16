@@ -360,7 +360,10 @@ impl OpenShell for TestOpenShell {
             .iter()
             .filter_map(|name| providers_by_name.get(name).cloned())
             .collect();
-        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+        Ok(Response::new(ListSandboxProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn attach_sandbox_provider(
