@@ -49,6 +49,10 @@ domain sockets. Their libraries remain in the gateway dependency graph, so the
 gateway's credential-driver configuration and in-process behavior still compile
 on Windows.
 
+The standalone sandbox and supervisor runtimes are Unix-only and are excluded
+as top-level Windows workspace targets. The MXC driver links only the
+cross-platform supervisor network library needed by its host egress proxy.
+
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
 | Docker | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
