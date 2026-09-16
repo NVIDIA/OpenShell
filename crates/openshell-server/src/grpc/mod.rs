@@ -921,15 +921,32 @@ pub mod test_support {
         test_server_state_with_driver("test").await
     }
 
+    /// Build a test state for a gateway with nothing imported.
+    ///
+    /// Its profile catalog is empty, which is the state a freshly installed
+    /// gateway starts in.
+    pub async fn test_server_state_without_provider_profiles() -> Arc<ServerState> {
+        test_server_state_for_driver("test", false).await
+    }
+
     /// Build an in-memory `ServerState` with a selected built-in driver name.
     pub async fn test_server_state_with_driver(driver_name: &str) -> Arc<ServerState> {
+        test_server_state_for_driver(driver_name, true).await
+    }
+
+    async fn test_server_state_for_driver(
+        driver_name: &str,
+        seed_profiles: bool,
+    ) -> Arc<ServerState> {
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
                 .unwrap(),
         );
         crate::ensure_default_workspace(&store).await.unwrap();
-        seed_example_provider_profiles(&store).await;
+        if seed_profiles {
+            seed_example_provider_profiles(&store).await;
+        }
         let compute = if driver_name == "test" {
             new_test_runtime(store.clone()).await
         } else {

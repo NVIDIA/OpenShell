@@ -20,28 +20,9 @@ use openshell_policy::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::OnceLock;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision; use an exact supported revision; or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
-
-const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../../../providers/aws.yaml"),
-    include_str!("../../../providers/aws-bedrock.yaml"),
-    include_str!("../../../providers/aws-s3.yaml"),
-    include_str!("../../../providers/anthropic.yaml"),
-    include_str!("../../../providers/claude-code.yaml"),
-    include_str!("../../../providers/codex.yaml"),
-    include_str!("../../../providers/copilot.yaml"),
-    include_str!("../../../providers/cursor.yaml"),
-    include_str!("../../../providers/deepinfra.yaml"),
-    include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/google-cloud.yaml"),
-    include_str!("../../../providers/google-vertex-ai.yaml"),
-    include_str!("../../../providers/nvidia.yaml"),
-    include_str!("../../../providers/openai.yaml"),
-    include_str!("../../../providers/pypi.yaml"),
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
@@ -1933,6 +1914,14 @@ pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, Prof
     Ok(serde_json::to_string_pretty(profiles)?)
 }
 
+/// Parse several profile YAML documents as one validated, id-sorted catalog.
+///
+/// Nothing in a release binary parses a profile *set* from YAML any more: the
+/// gateway validates the sets its configured sources return, through
+/// `validate_profile_set`. This is the loader behind the example profiles in
+/// `providers/`, so it is compiled for tests and for the `example-profiles`
+/// feature only.
+#[cfg(any(test, feature = "example-profiles"))]
 pub fn parse_profile_catalog_yamls(
     inputs: &[&str],
 ) -> Result<Vec<ProviderTypeProfile>, ProfileError> {
@@ -1945,10 +1934,12 @@ pub fn parse_profile_catalog_yamls(
     Ok(profiles)
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn is_mcp_diagnostic_field(field: &str) -> bool {
     field.split('.').any(|segment| segment == "mcp")
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileError> {
     let diagnostics = validate_profile_set(
         &profiles
@@ -3452,18 +3443,6 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     let is_cluster_local_service =
         labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
-}
-
-static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
-
-#[must_use]
-pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
-    BUILTIN_PROFILES
-        .get_or_init(|| {
-            parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
-                .expect("built-in provider profiles must be valid YAML")
-        })
-        .as_slice()
 }
 
 #[cfg(test)]

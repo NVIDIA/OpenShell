@@ -20,9 +20,9 @@ pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
-    builtin_profiles, is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json,
-    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
-    strategy_output_env_key, strategy_output_spec, strategy_primary_env_key, validate_profile_set,
+    is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, strategy_output_env_key,
+    strategy_output_spec, strategy_primary_env_key, validate_profile_set,
 };
 
 pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";

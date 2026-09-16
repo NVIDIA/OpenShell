@@ -5112,9 +5112,28 @@ mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
-    use crate::grpc::test_support::{authed_request, test_server_state};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_without_provider_profiles,
+    };
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
-    use crate::persistence::test_store;
+
+    /// An in-memory store with the example profiles imported at platform scope.
+    ///
+    /// Provider profiles are import-only, so a gateway resolves only what an
+    /// operator imported. Tests that expect `github`, `openai` or
+    /// `google-cloud` to resolve have to import them first.
+    async fn test_store() -> Store {
+        let store = crate::persistence::test_store().await;
+        for profile in openshell_providers::example_profiles::load_all() {
+            store
+                .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                    profile.to_proto(),
+                ))
+                .await
+                .expect("store example provider profile");
+        }
+        store
+    }
     use openshell_core::proto::{
         AttachSandboxProviderRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
         CreateWorkspaceRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
@@ -14917,6 +14936,81 @@ mod tests {
         assert!(
             catalog.get_profile("dupe-profile").is_some(),
             "duplicate profile should be resolvable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_with_nothing_imported_serves_an_empty_catalog() {
+        let state = test_server_state_without_provider_profiles().await;
+
+        let response = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 200,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("an empty catalog is a valid state, not an error")
+        .into_inner();
+
+        assert!(response.profiles.is_empty());
+        assert!(response.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn importing_an_example_profile_registers_it_at_its_canonical_id() {
+        let state = test_server_state_without_provider_profiles().await;
+        let github = openshell_providers::example_profiles::load("github").to_proto();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(github),
+                    source: "providers/github.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("import at platform scope")
+        .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
+
+        let stored = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "github".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("imported profile resolves at its canonical id")
+        .into_inner()
+        .profile
+        .expect("profile payload");
+
+        assert_eq!(stored.id, "github");
+        assert_eq!(stored.source, "user");
+        assert_eq!(stored.scope, "platform");
+
+        // The imported profile is the only definition for that id: nothing is
+        // shadowed behind it, so it is editable and deletable.
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog snapshot");
+        assert_eq!(catalog.static_source_for_profile("github"), None);
+        assert_eq!(
+            catalog
+                .list_all_scoped_profiles()
+                .iter()
+                .filter(|(_, profile)| profile.id == "github")
+                .count(),
+            1
         );
     }
 
