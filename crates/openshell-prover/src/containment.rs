@@ -1863,6 +1863,29 @@ fn validate_no_cross_protocol_overlap(
         )
         .into());
     }
+    let mut different_implicit_ip_modes_overlap = false;
+    for rule in policy.network_policies.values() {
+        let mut implicit_modes = AuthorityAttributeIndex::default();
+        for endpoint in &rule.endpoints {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(PolicyValidationError::Cancelled);
+            }
+            if endpoint.allowed_ips.is_empty() {
+                let host = endpoint.host.to_ascii_lowercase();
+                let ports = endpoint.effective_ports();
+                let wildcard = endpoint.host.contains('*');
+                different_implicit_ip_modes_overlap |=
+                    implicit_modes.overlaps_with_different(&host, &ports, &wildcard);
+                implicit_modes.insert(&host, &ports, &wildcard);
+            }
+        }
+    }
+    if different_implicit_ip_modes_overlap {
+        return Err(UnsupportedFeature::policy_shape(
+            "has overlapping exact and wildcard endpoints with different implicit destination IP modes",
+        )
+        .into());
+    }
     if different_protocols_overlap {
         return Err(UnsupportedFeature::policy_shape(
             "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",

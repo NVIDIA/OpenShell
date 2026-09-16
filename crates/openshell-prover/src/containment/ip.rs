@@ -405,6 +405,28 @@ mod tests {
     }
 
     #[test]
+    fn exact_and_wildcard_overlap_with_implicit_ip_modes_is_unsupported() {
+        let boundary = parse_policy_str(
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n      - { host: api.example.com, port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+        )
+        .unwrap();
+        let candidate = parse_policy_str(
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+        )
+        .unwrap();
+
+        let result = check_within_boundary(&boundary, &candidate, options());
+        assert!(
+            matches!(
+                result,
+                CheckResult::Unsupported(ref evidence)
+                    if evidence.reason().contains("different implicit destination IP modes")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn malformed_blocked_and_order_dependent_inputs_are_unsupported() {
         for ips in [
             "not-an-ip",
