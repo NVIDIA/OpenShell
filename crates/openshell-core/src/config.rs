@@ -86,6 +86,18 @@ impl FromStr for PolicyValidationFailureMode {
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
+/// Default OCI repository for the sandbox runtime image (no tag).
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
+
+/// Return the default sandbox runtime image reference with a version-pinned tag.
+#[must_use]
+pub fn default_sandbox_runtime_image() -> String {
+    format!(
+        "{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
 /// Return the default supervisor image reference with a version-pinned tag.
 #[must_use]
 pub fn default_supervisor_image() -> String {
@@ -319,8 +331,20 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
-    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
+
+    /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
+    /// addresses. This is a development-only escape hatch and never permits
+    /// cleartext requests to hostnames or non-loopback addresses.
+    #[serde(default)]
+    pub dangerously_allow_insecure_http: bool,
+
+    /// Additional origins from which JWKS may be loaded. Entries must be
+    /// origins such as `https://www.googleapis.com`, without a path, query,
+    /// credentials, or fragment. The issuer origin is always allowed.
+    #[serde(default)]
+    pub jwks_allowed_origins: Vec<String>,
 
     /// Expected audience (`aud`) claim. Typically the OIDC client ID.
     pub audience: String,
@@ -1539,10 +1563,15 @@ mod tests {
 
     #[test]
     fn default_supervisor_image_is_version_pinned() {
-        use super::default_supervisor_image;
+        use super::{default_sandbox_runtime_image, default_supervisor_image};
         let image = default_supervisor_image();
         assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
+
+        let sandbox_image = default_sandbox_runtime_image();
+        assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
+        let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
+        assert!(!sandbox_tag.is_empty());
     }
 }

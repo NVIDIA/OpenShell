@@ -168,6 +168,10 @@ The `class_uid` field identifies the event type:
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
 
+HTTP Activity records include request or response details. Rejections that have
+parsed a request, including early credential-binding failures, include safe
+method-only request context and the generated response.
+
 ## SIEM Schema Version Compatibility
 
 OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.

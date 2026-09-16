@@ -213,6 +213,10 @@ compatibility under emulation is not part of these tasks. The aggregate
 commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
+Run `rust:lockfiles:check`, `sdk:ts:ci`, `go:ci`, and `test:e2e-parity` through
+the Windows-aware tasks when validating those surfaces. Do not count the Go
+Windows ARM64 race-detector exclusion or POSIX permission-bit skips as security
+coverage. SDK test dependencies must remain at their lockfile versions.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
 for the native host target and use an inherited compiler wrapper when it is
 available. Linux glibc

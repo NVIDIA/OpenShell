@@ -32,6 +32,8 @@ network_middlewares: { ... }
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `network_middlewares` | map | No | Dynamic | Attaches ordered middleware by destination host; each implementation's manifest selects its supported HTTP and WebSocket operations. |
 
+The YAML root and each present top-level section listed as an object or map must be mappings. Each named network policy or middleware entry must also be a mapping. The OPA loader rejects the first malformed container before normalization or access preset expansion, with a structural error that excludes authored keys and values.
+
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
 ## Parsing and representation
@@ -219,6 +221,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 
 **Validation constraints:**
 
+- When present, `endpoints`, `binaries`, `rules`, and `deny_rules` must be lists of objects, even when they contain only one entry. `null` cannot replace a list or an object entry.
 - `access` and `rules` are mutually exclusive; setting both is rejected.
 - `protocol: tcp` requires a valid DNS hostname. Hostless `allowed_ips`, IP-literal hosts, trailing-dot names, and malformed DNS selectors are rejected with a policy-validation error.
 - `protocol: tcp` requires at least one port and rejects L7-only fields, including `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting and credential signing fields, and GraphQL, JSON-RPC, or MCP options.

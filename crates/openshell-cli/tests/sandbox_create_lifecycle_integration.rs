@@ -1701,6 +1701,46 @@ async fn detached_command_does_not_declare_main_process_attachment() {
 }
 
 #[tokio::test]
+async fn detached_ephemeral_command_delegates_cleanup_to_gateway() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("detached-ephemeral-main"),
+            keep: false,
+            command: &["worker".into()],
+            detach: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("detached ephemeral sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    assert!(!requests[0].await_main_process_attachment);
+    assert_eq!(
+        requests[0]
+            .annotations
+            .get("openshell.nvidia.com/retention")
+            .map(String::as_str),
+        Some("ephemeral")
+    );
+    assert!(
+        deleted_names(&server).await.is_empty(),
+        "the gateway owns cleanup after a detached canonical process exits"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_sends_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();

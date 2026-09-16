@@ -7,6 +7,7 @@ mod auth_rpc;
 pub mod policy;
 pub mod provider;
 mod sandbox;
+pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
 pub mod workspace;
@@ -82,11 +83,14 @@ pub fn persistence_error_to_status(
     match err {
         PersistenceError::Conflict {
             current_resource_version,
-        } => Status::aborted(format!(
-            "{} failed due to concurrent modification (current resource_version: {})",
-            operation,
-            current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
-        )),
+        } => openshell_core::rpc_error::resource_version_conflict(
+            format!(
+                "{} failed due to concurrent modification (current resource_version: {})",
+                operation,
+                current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            ),
+            current_resource_version,
+        ),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
@@ -891,7 +895,7 @@ pub mod test_support {
         );
         crate::ensure_default_workspace(&store).await.unwrap();
         let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
-        let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
+        let compute = new_test_runtime_with_driver(store.clone(), "test", driver);
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")

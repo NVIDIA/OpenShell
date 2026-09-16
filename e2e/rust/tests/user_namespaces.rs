@@ -8,8 +8,8 @@
 //! Enables `OPENSHELL_ENABLE_USER_NAMESPACES` on the gateway, triggers sandbox
 //! creation, and inspects the resulting pod spec to confirm:
 //!   1. `spec.hostUsers` is `false`
-//!   2. The container security context includes the extra capabilities
-//!      (SETUID, SETGID, DAC_READ_SEARCH) required for user namespace operation
+//!   2. The container security context requests no added capabilities and
+//!      drops every capability
 //!
 //! The sandbox pod may fail to start in Docker-in-Docker dev clusters where the
 //! filesystem does not support ID-mapped mounts. The test inspects the pod spec
@@ -211,7 +211,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
     .await;
 
     // Inspect capabilities on the agent container.
-    let caps = kubectl(&[
+    let cap_add = kubectl(&[
         "get",
         "pod",
         &sandbox_name,
@@ -219,6 +219,16 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         "openshell",
         "-o",
         "jsonpath={.spec.containers[?(@.name=='agent')].securityContext.capabilities.add}",
+    ])
+    .await;
+    let cap_drop = kubectl(&[
+        "get",
+        "pod",
+        &sandbox_name,
+        "-n",
+        "openshell",
+        "-o",
+        "jsonpath={.spec.containers[?(@.name=='agent')].securityContext.capabilities.drop}",
     ])
     .await;
 
@@ -235,18 +245,14 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         "sandbox pod must have spec.hostUsers=false when user namespaces are enabled"
     );
 
-    // Assert extra capabilities are present.
-    let caps_val = caps.expect("failed to get capabilities from pod spec");
-    for cap in ["SETUID", "SETGID", "DAC_READ_SEARCH"] {
-        assert!(
-            caps_val.contains(cap),
-            "sandbox pod must include {cap} in capabilities when user namespaces are enabled, got: {caps_val}"
-        );
-    }
-    for cap in ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"] {
-        assert!(
-            caps_val.contains(cap),
-            "sandbox pod must include {cap} in capabilities, got: {caps_val}"
-        );
-    }
+    let cap_add = cap_add.expect("failed to get added capabilities from pod spec");
+    assert!(
+        cap_add.trim().is_empty(),
+        "sandbox pod must not request added capabilities, got: {cap_add}"
+    );
+    let cap_drop = cap_drop.expect("failed to get dropped capabilities from pod spec");
+    assert!(
+        cap_drop.contains("ALL"),
+        "sandbox pod must drop every capability, got: {cap_drop}"
+    );
 }

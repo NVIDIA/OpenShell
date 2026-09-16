@@ -13,7 +13,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 
 ## Non-Negotiable Rules
 
-- Keep normal gator launches supervised: use `--watch --background` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
+- Keep normal gator launches supervised: use `--watch` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
 - Do not add passive `sleep` loops in the operator session to watch gator. Check logs or status once, then report the current state or launch a proper watcher outside the model session only when explicitly asked.
 - Do not change the default gator model in `scripts/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
 - Do not push to contributor branches, approve, merge, post `/ok to test`, or broaden gator scope unless the operator explicitly authorized that action.
@@ -34,7 +34,6 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
-| `scripts/agents/gator/logs/` | Background launch and supervisor logs. |
 
 ## Preflight
 
@@ -156,11 +155,12 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries gateway's selected compute driver, builds gator image in matching Docker or Podman image store, stages immutable payload, imports provider profiles, configures provider credentials and refresh, creates and uploads sandbox payload, then starts agent supervisor with `sandbox exec`. It writes a background log under `scripts/agents/gator/logs/`. `CONTAINER_ENGINE`, when set, must match gateway driver.
+The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the supervisor exits. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+
+The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
 ### Launch An Issue Or Issue/PR Pair
 
@@ -177,7 +177,6 @@ sandbox_name="gator-issue-${issue_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Run gator on issue #${issue_number}. Scope this invocation only to issue #${issue_number}."
 ```
 
@@ -198,7 +197,6 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} with linked issue #${issue_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number} and issue #${issue_number}."
 ```
 
@@ -219,7 +217,6 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test for the current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
 ```
 
@@ -241,7 +238,6 @@ CODEX_MODEL=gpt-5.6-sol \
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
 ```
 
@@ -266,7 +262,6 @@ CODEX_MODEL=gpt-5.6-sol \
   --name "$sandbox_name" \
   --from "$tmp_context" \
   --watch \
-  --background \
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
@@ -274,19 +269,15 @@ CODEX_MODEL=gpt-5.6-sol \
 
 ### Read The Launch Result
 
-The launcher prints the log path when `--background` is used:
-
-```text
-Started in background. Log: scripts/agents/gator/logs/<sandbox-name>.log
-```
-
-Read that file directly. Important markers:
+The launcher streams image-build and provisioning output to the terminal. Important markers:
 
 - `Built image ...` means the local image build completed.
 - `Created sandbox: <name>` means OpenShell accepted the sandbox.
 - `openshell-agent: starting watch cycle` means the in-sandbox supervisor began a bounded cycle.
 - `OpenAI Codex v...` plus `model: ...` confirms the Codex CLI and model actually used.
 - `OPENSHELL_AGENT_RESULT {...}` is the bounded-cycle sentinel. In watch mode, the supervisor sleeps and relaunches after this line.
+- `/sandbox/.openshell-agent/status.json` is the atomic current state snapshot. Its `result.notes` field is Gator's plain-language diagnosis and next action for that cycle.
+- `/sandbox/.openshell-agent/history.jsonl` contains the latest 100 supervisor transitions, including active-cycle starts and completed cycle results.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
 - `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
 
@@ -314,6 +305,11 @@ If `sandbox get` is not supported by the local CLI shape, use `openshell sandbox
 | `status=terminal_failure` | Unrecoverable or stale immutable payload. | Inspect the reason; rebuild/relaunch for `stale_gator_payload`. |
 | `status=complete` | Target closed, merged, or one-shot complete. | Delete sandbox if no longer needed. |
 
+Prefer the state snapshot over scraping transient `/tmp` cycle output. Use the
+history file to tell whether a failure is repeating or whether the supervisor
+has begun a fresh cycle. Runtime logs remain useful for full command output and
+transport diagnostics.
+
 ## Restarting A Gator
 
 Restart when the payload must change, the sandbox is wedged without a sentinel, the model/tooling version changed, or a transient failure repeats past the useful retry point.
@@ -339,7 +335,6 @@ openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  --background \
   "<same scoped operator prompt, updated only with the reason for relaunch>"
 ```
 
@@ -401,7 +396,6 @@ When you launch or inspect gator, report:
 
 - Sandbox name.
 - Gateway name.
-- Log path.
 - Target issue/PR scope.
 - Harness and model when relevant.
 - Whether image build and sandbox creation succeeded.

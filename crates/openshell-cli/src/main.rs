@@ -1372,7 +1372,7 @@ enum SandboxCommands {
         no_tty: bool,
 
         /// Start the canonical main process without attaching to it.
-        #[arg(long, conflicts_with_all = ["editor", "no_keep"])]
+        #[arg(long, conflicts_with = "editor")]
         detach: bool,
 
         /// Auto-create missing providers from local credentials.
@@ -5461,10 +5461,35 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_detach_rejects_ephemeral_sandbox() {
-        let result =
-            Cli::try_parse_from(["openshell", "sandbox", "create", "--detach", "--no-keep"]);
-        assert!(result.is_err());
+    fn sandbox_create_detach_accepts_ephemeral_sandbox() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--detach",
+            "--no-keep",
+            "--",
+            "worker",
+        ])
+        .expect("detached ephemeral sandbox should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        detach,
+                        no_keep,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert!(detach);
+                assert!(no_keep);
+                assert_eq!(command, ["worker"]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
     }
 
     #[test]

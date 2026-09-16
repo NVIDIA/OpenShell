@@ -84,7 +84,9 @@ An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and returns its exact exit
 status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
 in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
-after output drains, or `--detach` for a long-running service.
+after output drains, or `--detach` for a long-running service. Combine
+`--detach --no-keep` when the gateway should run the service without a host
+attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
@@ -263,7 +265,9 @@ Key flags:
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
 expected main-process SSH attachment; cleanup finalizes after that connection
-closes naturally.
+closes naturally. With `--detach --no-keep`, the gateway owns the detached
+process lifecycle and deletes the ephemeral sandbox after terminal reporting
+finishes.
 
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use

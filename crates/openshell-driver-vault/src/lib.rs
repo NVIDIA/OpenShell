@@ -17,7 +17,7 @@ use openshell_core::proto::credentials::v1::{
     credential_driver_server::CredentialDriver,
 };
 use openshell_core::{Error, Result as CoreResult};
-use reqwest::{StatusCode, Url};
+use reqwest::{Certificate, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
@@ -58,6 +58,7 @@ impl CredentialDriverService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VaultDriverSettings {
     address: Url,
+    ca_bundle: Option<PathBuf>,
     mount: String,
     kv_version: KvVersion,
     auth: VaultAuthSettings,
@@ -85,6 +86,7 @@ enum KvVersion {
 #[serde(default, deny_unknown_fields)]
 struct VaultDriverConfig {
     address: Option<String>,
+    ca_bundle: Option<PathBuf>,
     mount: Option<String>,
     kv_version: Option<String>,
     auth_method: Option<String>,
@@ -127,14 +129,43 @@ impl VaultCredentialDriver {
         let settings = VaultDriverSettings::from_table(config)?;
         let timeout_secs = timeout_secs(config)?;
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let client = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|err| {
+            // System HTTP proxies can turn an otherwise-local plaintext request
+            // into a network request. Vault credentials must always go directly
+            // to the configured backend.
+            .no_proxy()
+            // Vault API requests carry bootstrap identity, backend tokens, and
+            // provider secrets. Never replay them to a redirect target.
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(ca_bundle) = settings.ca_bundle.as_deref() {
+            let pem = std::fs::read(ca_bundle).map_err(|err| {
                 Error::config(format!(
-                    "failed to configure vault credential driver: {err}"
+                    "failed to read Vault CA bundle '{}': {err}",
+                    ca_bundle.display()
                 ))
             })?;
+            let certificates = Certificate::from_pem_bundle(&pem).map_err(|err| {
+                Error::config(format!(
+                    "failed to parse Vault CA bundle '{}': {err}",
+                    ca_bundle.display()
+                ))
+            })?;
+            if certificates.is_empty() {
+                return Err(Error::config(format!(
+                    "Vault CA bundle '{}' contains no certificates",
+                    ca_bundle.display()
+                )));
+            }
+            for certificate in certificates {
+                client_builder = client_builder.add_root_certificate(certificate);
+            }
+        }
+        let client = client_builder.build().map_err(|err| {
+            Error::config(format!(
+                "failed to configure vault credential driver: {err}"
+            ))
+        })?;
         Ok(Self {
             client,
             settings,
@@ -537,6 +568,11 @@ impl VaultDriverSettings {
                 Error::config("[openshell.credential_drivers.vault] address is required")
             })
             .and_then(vault_address)?;
+        if config.ca_bundle.is_some() && address.scheme() != "https" {
+            return Err(Error::config(
+                "[openshell.credential_drivers.vault] ca_bundle requires an https address",
+            ));
+        }
         let mount = config
             .mount
             .as_deref()
@@ -601,6 +637,7 @@ impl VaultDriverSettings {
 
         Ok(Self {
             address,
+            ca_bundle: config.ca_bundle,
             mount,
             kv_version,
             auth,
@@ -630,6 +667,16 @@ fn vault_address(value: &str) -> CoreResult<Url> {
             "[openshell.credential_drivers.vault] address must use http or https",
         ));
     }
+    if url.host().is_none() {
+        return Err(Error::config(
+            "[openshell.credential_drivers.vault] address must include a host",
+        ));
+    }
+    if url.scheme() == "http" && !vault_host_is_loopback(&url) {
+        return Err(Error::config(
+            "[openshell.credential_drivers.vault] address must use https unless the host is loopback",
+        ));
+    }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::config(
             "[openshell.credential_drivers.vault] address must not include credentials",
@@ -645,6 +692,15 @@ fn vault_address(value: &str) -> CoreResult<Url> {
         url.set_path(&path);
     }
     Ok(url)
+}
+
+fn vault_host_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 fn timeout_secs(table: &toml::Table) -> CoreResult<u64> {
@@ -915,7 +971,12 @@ fn extract_secret_value(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
     use openshell_core::proto::CredentialHandle;
+    use rcgen::{CertificateParams, IsCa, KeyPair};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tonic::Code;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -943,12 +1004,78 @@ mod tests {
         file
     }
 
+    fn test_ca() -> (rcgen::Certificate, KeyPair) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        (certificate, key)
+    }
+
+    async fn start_tls_server(response: String) -> (SocketAddr, String) {
+        let (ca_certificate, ca_key) = test_ca();
+        let server_key = KeyPair::generate().unwrap();
+        let server_certificate = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca_certificate, &ca_key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(socket).await else {
+                return;
+            };
+            let mut request = vec![0_u8; 4096];
+            let mut used = 0;
+            loop {
+                let Ok(read) = tls.read(&mut request[used..]).await else {
+                    return;
+                };
+                used += read;
+                if read == 0 || request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+                if used == request.len() {
+                    return;
+                }
+            }
+            let _ = tls.write_all(response.as_bytes()).await;
+            let _ = tls.flush().await;
+        });
+        (address, ca_certificate.pem())
+    }
+
+    fn ca_bundle_file(pem: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), pem).unwrap();
+        file
+    }
+
+    fn test_reference() -> VaultSecretReference {
+        VaultSecretReference {
+            api_path: "secret/data/test".to_string(),
+            key: STORED_VALUE_KEY.to_string(),
+            kv_version: KvVersion::V2,
+        }
+    }
+
     #[test]
     fn settings_parse_kubernetes_auth() {
         let settings = VaultDriverSettings::from_table(&table(&[
             (
                 "address",
-                toml::Value::String("http://vault:8200".to_string()),
+                toml::Value::String("https://vault:8200".to_string()),
             ),
             ("mount", toml::Value::String("team-secret".to_string())),
             ("kv_version", toml::Value::String("1".to_string())),
@@ -970,7 +1097,7 @@ mod tests {
         let settings = VaultDriverSettings::from_table(&table(&[
             (
                 "address",
-                toml::Value::String("http://vault:8200".to_string()),
+                toml::Value::String("https://vault:8200".to_string()),
             ),
             ("auth_method", toml::Value::String("token_file".to_string())),
             (
@@ -989,7 +1116,7 @@ mod tests {
         let err = VaultDriverSettings::from_table(&table(&[
             (
                 "address",
-                toml::Value::String("http://vault:8200".to_string()),
+                toml::Value::String("https://vault:8200".to_string()),
             ),
             ("auth_method", toml::Value::String("token_file".to_string())),
             (
@@ -1008,13 +1135,260 @@ mod tests {
         let err = VaultDriverSettings::from_table(&table(&[
             (
                 "address",
-                toml::Value::String("http://vault:8200".to_string()),
+                toml::Value::String("https://vault:8200".to_string()),
             ),
             ("auth_method", toml::Value::String("token_file".to_string())),
         ]))
         .unwrap_err();
 
         assert!(err.to_string().contains("token_path is required"));
+    }
+
+    #[test]
+    fn settings_reject_non_loopback_http_address() {
+        let err = vault_address("http://vault.vault.svc.cluster.local:8200").unwrap_err();
+
+        assert!(err.to_string().contains("must use https"), "{err}");
+    }
+
+    #[test]
+    fn settings_allow_loopback_http_addresses() {
+        for address in [
+            "http://127.0.0.1:8200",
+            "http://[::1]:8200",
+            "http://localhost:8200",
+        ] {
+            vault_address(address).unwrap();
+        }
+    }
+
+    #[test]
+    fn settings_reject_ca_bundle_for_http() {
+        let err = VaultDriverSettings::from_table(&table(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:8200".to_string()),
+            ),
+            (
+                "ca_bundle",
+                toml::Value::String("/etc/vault/ca.pem".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String("/run/secrets/vault-token".to_string()),
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("ca_bundle requires an https"));
+    }
+
+    #[tokio::test]
+    async fn https_uses_custom_ca_bundle() {
+        let body = r#"{"data":{"data":{"value":"protected-secret"}}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (address, ca_pem) = start_tls_server(response).await;
+        let ca_bundle = ca_bundle_file(&ca_pem);
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String(format!("https://localhost:{}/", address.port())),
+            ),
+            (
+                "ca_bundle",
+                toml::Value::String(ca_bundle.path().display().to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let value = driver
+            .resolve_secret_value(&test_reference(), "dev-token")
+            .await
+            .unwrap();
+
+        assert_eq!(value, "protected-secret");
+    }
+
+    #[tokio::test]
+    async fn https_rejects_invalid_ca() {
+        let (address, _) = start_tls_server(String::new()).await;
+        let (untrusted_ca, _) = test_ca();
+        let ca_bundle = ca_bundle_file(&untrusted_ca.pem());
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String(format!("https://localhost:{}/", address.port())),
+            ),
+            (
+                "ca_bundle",
+                toml::Value::String(ca_bundle.path().display().to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let err = driver
+            .resolve_secret_value(&test_reference(), "dev-token")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn https_preserves_hostname_verification() {
+        let (address, ca_pem) = start_tls_server(String::new()).await;
+        let ca_bundle = ca_bundle_file(&ca_pem);
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String(format!("https://127.0.0.1:{}/", address.port())),
+            ),
+            (
+                "ca_bundle",
+                toml::Value::String(ca_bundle.path().display().to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let err = driver
+            .resolve_secret_value(&test_reference(), "dev-token")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn https_does_not_follow_redirect_downgrade() {
+        let downgrade_target = MockServer::start().await;
+        let location = format!("{}/stolen", downgrade_target.uri());
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (address, ca_pem) = start_tls_server(response).await;
+        let ca_bundle = ca_bundle_file(&ca_pem);
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String(format!("https://localhost:{}/", address.port())),
+            ),
+            (
+                "ca_bundle",
+                toml::Value::String(ca_bundle.path().display().to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        driver
+            .login_kubernetes("openshell-gateway", "kubernetes", "gateway-jwt")
+            .await
+            .unwrap_err();
+
+        assert!(
+            downgrade_target
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn loopback_http_bypasses_system_proxy() {
+        let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::loopback_http_bypasses_system_proxy_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OPENSHELL_VAULT_PROXY_TEST_CHILD", "1")
+            .env("HTTP_PROXY", format!("http://{proxy_address}"))
+            .env("http_proxy", format!("http://{proxy_address}"))
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("REQUEST_METHOD")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by loopback_http_bypasses_system_proxy in an isolated process"]
+    async fn loopback_http_bypasses_system_proxy_child() {
+        if std::env::var_os("OPENSHELL_VAULT_PROXY_TEST_CHILD").is_none() {
+            return;
+        }
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/test"))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"data": {"value": "protected-secret"}}
+            })))
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String(format!("{}/", mock_server.uri())),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+
+        let value = driver
+            .resolve_secret_value(&test_reference(), "dev-token")
+            .await
+            .unwrap();
+
+        assert_eq!(value, "protected-secret");
     }
 
     #[test]

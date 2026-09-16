@@ -36,8 +36,9 @@ disable_tls         = true
 [openshell.drivers.docker]
 # Default image pulled for `openshell sandbox create` without --from.
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-# Supervisor image from which the openshell-sandbox binary is extracted on
-# first start.  The binary is cached to XDG_DATA_HOME and reused on restart.
+# Sandbox runtime image from which the openshell-sandbox binary is extracted.
+sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:latest"
+# Image containing the external supervisor process.
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 # Only pull images that are not already cached locally.
 image_pull_policy = "if_not_present"

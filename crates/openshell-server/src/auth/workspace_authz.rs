@@ -109,7 +109,8 @@ pub async fn authorize_list_workspace_selector(
 pub fn selected_workspace_name(selector: Option<&WorkspaceSelector>) -> Result<&str, Status> {
     match selected_workspace(selector)? {
         WorkspaceSelection::Workspace(workspace) => Ok(workspace),
-        WorkspaceSelection::AllWorkspaces(_) => Err(Status::invalid_argument(
+        WorkspaceSelection::AllWorkspaces(_) => Err(openshell_core::rpc_error::invalid_argument(
+            "workspace_scope",
             "all_workspaces is not supported by this request",
         )),
     }
@@ -119,7 +120,12 @@ pub fn selected_workspace_name(selector: Option<&WorkspaceSelector>) -> Result<&
 fn selected_workspace(selector: Option<&WorkspaceSelector>) -> Result<&WorkspaceSelection, Status> {
     let selection = selector
         .and_then(|selector| selector.selection.as_ref())
-        .ok_or_else(|| Status::invalid_argument("workspace_scope is required"))?;
+        .ok_or_else(|| {
+            openshell_core::rpc_error::invalid_argument(
+                "workspace_scope",
+                "workspace_scope is required",
+            )
+        })?;
 
     if let WorkspaceSelection::Workspace(workspace) = selection {
         crate::grpc::workspace::validate_workspace_name(workspace)?;

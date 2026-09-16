@@ -4,6 +4,7 @@
 ["test:e2e-parity"]
 description = "Run deterministic schema-v1/schema-v2 parity harness tests"
 run = "bash e2e/parity/test.sh"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/run-git-bash.ps1 e2e/parity/test.sh"
 hide = true
 
 ["e2e:parity:podman"]

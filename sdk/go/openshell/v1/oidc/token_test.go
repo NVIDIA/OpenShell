@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -41,9 +42,7 @@ func TestWriteToken_ReplacesInsecureExistingFileWithOwnerOnlyFile(t *testing.T) 
 
 	require.NoError(t, writeToken(dir, &oauth2.Token{AccessToken: "secret"}))
 
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	assertOwnerOnlyFilePermissions(t, path)
 }
 
 func TestWriteToken_ExpiresInCalculated(t *testing.T) {
@@ -187,8 +186,16 @@ func TestWriteToken_FilePermissions(t *testing.T) {
 	err := writeToken(dir, tok)
 	require.NoError(t, err)
 
-	info, err := os.Stat(filepath.Join(dir, "oidc_token.json"))
+	assertOwnerOnlyFilePermissions(t, filepath.Join(dir, "oidc_token.json"))
+}
+
+func assertOwnerOnlyFilePermissions(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permission bits are not supported on Windows")
+	}
+
+	info, err := os.Stat(path)
 	require.NoError(t, err)
-	// File should be owner-only readable (0600).
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }

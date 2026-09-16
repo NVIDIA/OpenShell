@@ -15,7 +15,7 @@ The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft,
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
-Pushed gateway and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
+Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
 
 ## Prerequisites
 

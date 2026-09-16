@@ -9,6 +9,7 @@
 description = "Install TypeScript SDK dependencies"
 dir = "sdk/typescript"
 run = "npm ci"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-install.ps1"
 hide = true
 
 ["sdk:ts:proto"]
@@ -16,6 +17,7 @@ description = "Generate TypeScript protobuf stubs for the SDK"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run gen"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-proto.ps1"
 
 # Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
 # buf ships only in the SDK's devDependencies today, so this depends on the

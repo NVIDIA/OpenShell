@@ -262,6 +262,7 @@ def verify_variant(
     sandbox_id = launch.get("sandbox_image_id")
     sandbox_digest = launch.get("sandbox_image_digest")
     sandbox_runtime = launch.get("sandbox_runtime_image")
+    sandbox_boundary_image = launch.get("sandbox_boundary_image")
     sandbox_match = (
         DIGEST_REFERENCE_RE.fullmatch(sandbox_runtime)
         if isinstance(sandbox_runtime, str)
@@ -284,6 +285,10 @@ def verify_variant(
     require(
         sandbox_request == sandbox_runtime,
         f"{launch_path}: sandbox image request was not the resolved digest reference",
+    )
+    require(
+        isinstance(sandbox_boundary_image, str) and sandbox_boundary_image,
+        f"{launch_path}: sandbox boundary image is missing",
     )
     if not external:
         require(
@@ -369,6 +374,7 @@ def verify_variant(
         )
         driver_environment = launch.get("external_driver_environment")
         expected_environment_keys = {
+            "XDG_DATA_HOME",
             "OPENSHELL_COMPUTE_DRIVER_SOCKET",
             "OPENSHELL_PODMAN_SOCKET",
             "OPENSHELL_SANDBOX_IMAGE",
@@ -378,6 +384,7 @@ def verify_variant(
             "OPENSHELL_GATEWAY_PORT",
             "OPENSHELL_NETWORK_NAME",
             "OPENSHELL_STOP_TIMEOUT",
+            "OPENSHELL_SANDBOX_RUNTIME_IMAGE",
             "OPENSHELL_SUPERVISOR_IMAGE",
             "OPENSHELL_PODMAN_TLS_CA",
             "OPENSHELL_PODMAN_TLS_CERT",
@@ -388,6 +395,10 @@ def verify_variant(
             isinstance(driver_environment, dict)
             and set(driver_environment) == expected_environment_keys,
             f"{launch_path}: external driver allowlisted environment is incomplete",
+        )
+        require(
+            Path(driver_environment["XDG_DATA_HOME"]).is_absolute(),
+            f"{launch_path}: external driver data directory is not absolute",
         )
         require(
             driver_environment["OPENSHELL_COMPUTE_DRIVER_SOCKET"]
@@ -402,7 +413,7 @@ def verify_variant(
             f"{launch_path}: external driver Podman socket is not isolated",
         )
         require(
-            driver_environment["OPENSHELL_SANDBOX_IMAGE"] == sandbox_runtime
+            driver_environment["OPENSHELL_SANDBOX_IMAGE"] == sandbox_request
             and driver_environment["OPENSHELL_SANDBOX_IMAGE_PULL_POLICY"]
             == expected_policy
             and driver_environment["OPENSHELL_HEALTH_CHECK_INTERVAL_SECS"] == 10
@@ -412,6 +423,8 @@ def verify_variant(
             and driver_environment["OPENSHELL_NETWORK_NAME"]
             and isinstance(driver_environment["OPENSHELL_STOP_TIMEOUT"], int)
             and driver_environment["OPENSHELL_STOP_TIMEOUT"] >= 0
+            and driver_environment["OPENSHELL_SANDBOX_RUNTIME_IMAGE"]
+            == sandbox_boundary_image
             and driver_environment["OPENSHELL_SUPERVISOR_IMAGE"] == runtime_image
             and driver_environment["OPENSHELL_ENABLE_BIND_MOUNTS"] is True,
             f"{launch_path}: external driver allowlisted runtime inputs differ",
