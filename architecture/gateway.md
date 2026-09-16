@@ -454,7 +454,12 @@ and elapsed time with `google.protobuf.Duration`. The integer
 bookkeeping values, not part of that public convention. On startup, both
 storage backends transactionally rewrite legacy scalar time fields inside
 protobuf payloads before serving requests. A malformed affected payload aborts
-and rolls back startup migration rather than silently dropping a value.
+and rolls back startup migration. Legacy driver-provided condition strings that
+cannot be represented as timestamps are dropped so an accepted historical
+value cannot make the upgraded gateway unavailable.
+Gateway and Sandbox Protocol token responses follow the same convention: a
+present expiration timestamp carries the absolute deadline, while absence means
+the issued token does not expire.
 
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are

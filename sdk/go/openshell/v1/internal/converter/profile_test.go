@@ -204,8 +204,8 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, []string{"admin"}, cred.TokenGrant.AudienceOverrides[0].Scopes)
 }
 
-func TestProfileCredentialFromProto_RejectsInvalidOrFractionalDurations(t *testing.T) {
-	credential := ProfileCredentialFromProto(&pb.ProviderProfileCredential{
+func TestProfileCredentialDurationRoundTripPreservesPresencePrecisionAndValidationSignal(t *testing.T) {
+	original := &pb.ProviderProfileCredential{
 		Refresh: &pb.ProviderCredentialRefresh{
 			RefreshBefore: &durationpb.Duration{Nanos: 500_000_000},
 			MaxLifetime:   &durationpb.Duration{Seconds: 1, Nanos: -1},
@@ -213,11 +213,49 @@ func TestProfileCredentialFromProto_RejectsInvalidOrFractionalDurations(t *testi
 		TokenGrant: &pb.ProviderCredentialTokenGrant{
 			CacheTtl: &durationpb.Duration{Seconds: 1, Nanos: -1},
 		},
-	})
+	}
+	credential := ProfileCredentialFromProto(original)
 
-	assert.Equal(t, int64(-1), credential.Refresh.RefreshBeforeSeconds)
+	assert.Equal(t, int64(0), credential.Refresh.RefreshBeforeSeconds)
 	assert.Equal(t, int64(-1), credential.Refresh.MaxLifetimeSeconds)
 	assert.Equal(t, int64(-1), credential.TokenGrant.CacheTTLSeconds)
+	assert.Equal(t, &v1.ProfileDuration{Nanos: 500_000_000}, credential.Refresh.RefreshBefore)
+	assert.Equal(t, &v1.ProfileDuration{Seconds: 1, Nanos: -1}, credential.Refresh.MaxLifetime)
+
+	roundTripped := ProfileCredentialToProto(credential)
+	assert.Equal(t, original.Refresh.RefreshBefore.Seconds, roundTripped.Refresh.RefreshBefore.Seconds)
+	assert.Equal(t, original.Refresh.RefreshBefore.Nanos, roundTripped.Refresh.RefreshBefore.Nanos)
+	assert.Equal(t, original.Refresh.MaxLifetime.Seconds, roundTripped.Refresh.MaxLifetime.Seconds)
+	assert.Equal(t, original.Refresh.MaxLifetime.Nanos, roundTripped.Refresh.MaxLifetime.Nanos)
+	assert.Equal(t, original.TokenGrant.CacheTtl.Seconds, roundTripped.TokenGrant.CacheTtl.Seconds)
+	assert.Equal(t, original.TokenGrant.CacheTtl.Nanos, roundTripped.TokenGrant.CacheTtl.Nanos)
+}
+
+func TestProfileCredentialDurationRoundTripDistinguishesAbsentAndZero(t *testing.T) {
+	original := &pb.ProviderProfileCredential{
+		Refresh: &pb.ProviderCredentialRefresh{
+			RefreshBefore: &durationpb.Duration{},
+			MaxLifetime:   nil,
+		},
+	}
+
+	roundTripped := ProfileCredentialToProto(ProfileCredentialFromProto(original))
+	require.NotNil(t, roundTripped.Refresh.RefreshBefore)
+	assert.Equal(t, int64(0), roundTripped.Refresh.RefreshBefore.Seconds)
+	assert.Nil(t, roundTripped.Refresh.MaxLifetime)
+}
+
+func TestProfileCredentialDurationHonorsDeprecatedSecondsMutation(t *testing.T) {
+	credential := ProfileCredentialFromProto(&pb.ProviderProfileCredential{
+		TokenGrant: &pb.ProviderCredentialTokenGrant{
+			CacheTtl: &durationpb.Duration{Seconds: 30, Nanos: 500_000_000},
+		},
+	})
+	credential.TokenGrant.CacheTTLSeconds = 60
+
+	roundTripped := ProfileCredentialToProto(credential)
+	assert.Equal(t, int64(60), roundTripped.TokenGrant.CacheTtl.Seconds)
+	assert.Equal(t, int32(0), roundTripped.TokenGrant.CacheTtl.Nanos)
 }
 
 func TestProfileCredentialFromProto_DeepCopy(t *testing.T) {

@@ -6125,6 +6125,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_provider_profile_preserves_exact_duration_values() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("duration-api");
+        let mut credential = refreshable_credential("access_token", "ACCESS_TOKEN");
+        let refresh = credential.refresh.as_mut().unwrap();
+        refresh.refresh_before = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        });
+        refresh.max_lifetime = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 0,
+        });
+        profile.credentials.push(credential);
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "duration-api.proto".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.imported, "diagnostics: {:?}", response.diagnostics);
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "duration-api".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        let refresh = fetched.credentials[0].refresh.as_ref().unwrap();
+        assert_eq!(
+            refresh.refresh_before,
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            })
+        );
+        assert_eq!(
+            refresh.max_lifetime,
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 0,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_malformed_duration_values() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("invalid-duration-api");
+        let mut credential = refreshable_credential("access_token", "ACCESS_TOKEN");
+        credential.refresh.as_mut().unwrap().refresh_before = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: -1,
+        });
+        profile.credentials.push(credential);
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "invalid-duration-api.proto".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.refresh.refresh_before"
+                && diagnostic.message.contains("valid non-negative duration")
+        }));
+    }
+
+    #[tokio::test]
     async fn profile_update_rejects_fanout_endpoint_ambiguity_without_persisting() {
         let state = test_server_state().await;
 

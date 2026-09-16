@@ -1612,13 +1612,11 @@ pub(super) async fn handle_watch_sandbox(
         req.log_tail_lines
     };
     let stop_on_terminal = req.stop_on_terminal;
-    let log_since_ms = req
-        .since_time
-        .as_ref()
-        .map(openshell_core::time::timestamp_to_millis)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?
-        .unwrap_or_default();
+    if let Some(since_time) = req.since_time.as_ref() {
+        openshell_core::time::validate_timestamp(since_time)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    let log_since_time = req.since_time;
     let log_sources = req.log_sources;
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
@@ -1702,20 +1700,25 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
-            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
+            // Replay tail logs (best-effort), filtered by log_since_time and log_sources.
             if follow_logs {
                 for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
                     if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                         ref log,
                     )) = evt.payload
                     {
-                        let event_ms = log
-                            .event_time
-                            .as_ref()
-                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                            .unwrap_or_default();
-                        if log_since_ms > 0 && event_ms < log_since_ms {
-                            continue;
+                        if let Some(since_time) = log_since_time.as_ref() {
+                            let Some(event_time) = log.event_time.as_ref() else {
+                                continue;
+                            };
+                            let Ok(ordering) =
+                                openshell_core::time::compare_timestamps(event_time, since_time)
+                            else {
+                                continue;
+                            };
+                            if ordering == std::cmp::Ordering::Less {
+                                continue;
+                            }
                         }
                         if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
                             continue;

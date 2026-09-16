@@ -50,6 +50,7 @@ fn root_message_name(object_type: &str) -> Option<&'static str> {
         }
         "service_endpoint" => Some("openshell.v1.ServiceEndpoint"),
         "ssh_session" => Some("openshell.v1.SshSession"),
+        "sandbox_workload_template" => Some("openshell.v1.SandboxWorkloadTemplate"),
         "sandbox_policy" => Some("openshell.storage.v1.PolicyRevisionPayload"),
         "draft_policy_chunk" => Some("openshell.storage.v1.DraftChunkPayload"),
         _ => None,
@@ -223,9 +224,8 @@ fn conversion(message: &str, field: u32) -> Option<Conversion> {
     };
     match (message, field) {
         ("openshell.datamodel.v1.ObjectMeta", 3) => Some(T { new_tag: 103 }),
-        ("openshell.datamodel.v1.ObjectMeta" | "openshell.v1.SshSession", 8) => {
-            Some(T { new_tag: 108 })
-        }
+        ("openshell.datamodel.v1.ObjectMeta", 8) => Some(T { new_tag: 108 }),
+        ("openshell.v1.SshSession", 4) => Some(T { new_tag: 104 }),
         ("openshell.datamodel.v1.Provider", 5) => Some(M { new_tag: 105 }),
         ("openshell.v1.SandboxCondition", 5) => Some(TS { new_tag: 105 }),
         ("openshell.v1.PlatformEvent", 1) => Some(T { new_tag: 101 }),
@@ -325,7 +325,7 @@ fn require_wire_type(actual: u8, expected: u8) -> PersistenceResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{Provider, SandboxCondition};
+    use openshell_core::proto::{Provider, SandboxCondition, SandboxWorkloadTemplate, SshSession};
     use std::collections::HashMap;
 
     #[derive(Clone, PartialEq, Message)]
@@ -362,6 +362,26 @@ mod tests {
         message: String,
         #[prost(string, tag = "5")]
         last_transition_time: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySshSession {
+        #[prost(message, optional, tag = "1")]
+        metadata: Option<LegacyObjectMeta>,
+        #[prost(string, tag = "2")]
+        sandbox_id: String,
+        #[prost(string, tag = "3")]
+        token: String,
+        #[prost(int64, tag = "4")]
+        expires_at_ms: i64,
+        #[prost(bool, tag = "5")]
+        revoked: bool,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxWorkloadTemplate {
+        #[prost(message, optional, tag = "1")]
+        metadata: Option<LegacyObjectMeta>,
     }
 
     #[test]
@@ -402,6 +422,55 @@ mod tests {
             !provider
                 .credential_expiration_times
                 .contains_key("NO_EXPIRY")
+        );
+    }
+
+    #[test]
+    fn migrates_ssh_session_expiration() {
+        let legacy = LegacySshSession {
+            metadata: Some(LegacyObjectMeta {
+                id: "session-id".into(),
+                name: "session-name".into(),
+                created_at_ms: 1_700_000_000_123,
+                deletion_timestamp_ms: 0,
+            }),
+            sandbox_id: "sandbox-id".into(),
+            token: "token".into(),
+            expires_at_ms: 1_700_000_001_456,
+            revoked: false,
+        };
+
+        let migrated = migrate("ssh_session", &legacy.encode_to_vec()).unwrap();
+        let session = SshSession::decode(migrated.as_slice()).unwrap();
+
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(&session.expiration_time.unwrap()).unwrap(),
+            1_700_000_001_456
+        );
+    }
+
+    #[test]
+    fn migrates_sandbox_workload_template_metadata() {
+        let legacy = LegacySandboxWorkloadTemplate {
+            metadata: Some(LegacyObjectMeta {
+                id: "template-id".into(),
+                name: "template-name".into(),
+                created_at_ms: 1_700_000_000_123,
+                deletion_timestamp_ms: 1_700_000_001_456,
+            }),
+        };
+
+        let migrated = migrate("sandbox_workload_template", &legacy.encode_to_vec()).unwrap();
+        let template = SandboxWorkloadTemplate::decode(migrated.as_slice()).unwrap();
+        let metadata = template.metadata.unwrap();
+
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(&metadata.created_time.unwrap()).unwrap(),
+            1_700_000_000_123
+        );
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(&metadata.deletion_time.unwrap()).unwrap(),
+            1_700_000_001_456
         );
     }
 

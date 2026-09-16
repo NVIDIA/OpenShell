@@ -3912,13 +3912,14 @@ impl ComputeRuntime {
         {
             Ok(response) => {
                 let sandbox = response.into_inner().sandbox;
-                if let Some(sandbox) = sandbox.as_ref()
-                    && sandbox.id != sandbox_id
-                {
-                    return Err(format!(
-                        "compute driver returned sandbox '{}' for requested id '{sandbox_id}'",
-                        sandbox.id
-                    ));
+                if let Some(sandbox) = sandbox.as_ref() {
+                    if sandbox.id != sandbox_id {
+                        return Err(format!(
+                            "compute driver returned sandbox '{}' for requested id '{sandbox_id}'",
+                            sandbox.id
+                        ));
+                    }
+                    validate_driver_sandbox_timestamps(sandbox)?;
                 }
                 Ok(sandbox)
             }
@@ -3931,22 +3932,8 @@ impl ComputeRuntime {
 fn validate_driver_watch_event_timestamps(event: &WatchSandboxesEvent) -> Result<(), String> {
     match &event.payload {
         Some(watch_sandboxes_event::Payload::Sandbox(update)) => {
-            if let Some(status) = update
-                .sandbox
-                .as_ref()
-                .and_then(|sandbox| sandbox.status.as_ref())
-            {
-                for (index, condition) in status.conditions.iter().enumerate() {
-                    if let Some(transition_time) = condition.transition_time.as_ref() {
-                        openshell_core::time::validate_timestamp(transition_time).map_err(
-                            |error| {
-                                format!(
-                                    "sandbox.status.conditions[{index}].transition_time: {error}"
-                                )
-                            },
-                        )?;
-                    }
-                }
+            if let Some(sandbox) = update.sandbox.as_ref() {
+                validate_driver_sandbox_timestamps(sandbox)?;
             }
         }
         Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
@@ -3960,6 +3947,19 @@ fn validate_driver_watch_event_timestamps(event: &WatchSandboxesEvent) -> Result
             }
         }
         Some(watch_sandboxes_event::Payload::Deleted(_)) | None => {}
+    }
+    Ok(())
+}
+
+fn validate_driver_sandbox_timestamps(sandbox: &DriverSandbox) -> Result<(), String> {
+    if let Some(status) = sandbox.status.as_ref() {
+        for (index, condition) in status.conditions.iter().enumerate() {
+            if let Some(transition_time) = condition.transition_time.as_ref() {
+                openshell_core::time::validate_timestamp(transition_time).map_err(|error| {
+                    format!("sandbox.status.conditions[{index}].transition_time: {error}")
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -6724,6 +6724,19 @@ mod tests {
         };
         let error = validate_driver_watch_event_timestamps(&platform_event).unwrap_err();
         assert!(error.contains("platform_event.event_time"));
+    }
+
+    #[test]
+    fn driver_snapshot_timestamp_validation_rejects_malformed_observations() {
+        let mut sandbox = ready_driver_sandbox("sandbox-id", "sandbox-name");
+        sandbox.status.as_mut().unwrap().conditions[0].transition_time =
+            Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 1_000_000_000,
+            });
+
+        let error = validate_driver_sandbox_timestamps(&sandbox).unwrap_err();
+        assert!(error.contains("sandbox.status.conditions[0].transition_time"));
     }
 
     #[test]

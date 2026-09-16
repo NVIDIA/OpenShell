@@ -52,13 +52,19 @@ type ProfileCredential struct {
 
 // ProfileCredentialRefresh declares how a profile credential is refreshed.
 type ProfileCredentialRefresh struct {
-	Strategy             RefreshStrategy
-	TokenURL             string
-	Scopes               []string
+	Strategy RefreshStrategy
+	TokenURL string
+	Scopes   []string
+	// RefreshBefore retains the exact protobuf duration, including presence and nanoseconds.
+	RefreshBefore *ProfileDuration
+	// RefreshBeforeSeconds is retained for source compatibility with whole-second profiles.
 	RefreshBeforeSeconds int64
-	MaxLifetimeSeconds   int64
-	Material             []ProfileCredentialRefreshMaterial
-	AdditionalOutputs    []ProfileCredentialRefreshOutput
+	// MaxLifetime retains the exact protobuf duration, including presence and nanoseconds.
+	MaxLifetime *ProfileDuration
+	// MaxLifetimeSeconds is retained for source compatibility with whole-second profiles.
+	MaxLifetimeSeconds int64
+	Material           []ProfileCredentialRefreshMaterial
+	AdditionalOutputs  []ProfileCredentialRefreshOutput
 }
 
 // ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.
@@ -86,16 +92,26 @@ const (
 
 // CredentialTokenGrant configures dynamic credential acquisition via OAuth2 grant.
 type CredentialTokenGrant struct {
-	TokenEndpoint       string
-	Audience            string
-	JWTSVIDAudience     string
-	Scopes              []string
+	TokenEndpoint   string
+	Audience        string
+	JWTSVIDAudience string
+	Scopes          []string
+	// CacheTTL retains the exact protobuf duration, including presence and nanoseconds.
+	CacheTTL *ProfileDuration
+	// CacheTTLSeconds is retained for source compatibility with whole-second profiles.
 	CacheTTLSeconds     int64
 	AudienceOverrides   []TokenGrantAudienceOverride
 	ClientAssertionType string
 	GrantType           CredentialTokenGrantType
 	SubjectToken        *TokenGrantSubjectToken
 	RequestedTokenType  string
+}
+
+// ProfileDuration represents a protobuf duration without importing generated
+// protobuf packages into the curated SDK types.
+type ProfileDuration struct {
+	Seconds int64
+	Nanos   int32
 }
 
 // TokenGrantSubjectToken configures the subject token for token exchange grants.

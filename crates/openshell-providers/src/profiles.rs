@@ -121,7 +121,26 @@ pub struct CredentialProfile {
     pub token_grant: Option<TokenGrantProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// Origin-aware protobuf duration presence retained across profile conversion.
+#[derive(Debug, Clone, Copy, Default)]
+#[doc(hidden)]
+pub enum ProfileDurationWkt {
+    /// The profile came from YAML and uses the compatibility seconds field.
+    #[default]
+    FromYaml,
+    /// The protobuf duration was absent.
+    Absent,
+    /// The protobuf duration was present, including an explicit zero.
+    Present(prost_types::Duration),
+}
+
+impl ProfileDurationWkt {
+    fn from_proto(value: Option<prost_types::Duration>) -> Self {
+        value.map_or(Self::Absent, Self::Present)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenGrantProfile {
     #[serde(
         default = "default_token_grant_type",
@@ -141,6 +160,10 @@ pub struct TokenGrantProfile {
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub cache_ttl_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub cache_ttl_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +171,23 @@ pub struct TokenGrantProfile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_token_type: String,
 }
+
+impl PartialEq for TokenGrantProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.grant_type == other.grant_type
+            && self.token_endpoint == other.token_endpoint
+            && self.audience == other.audience
+            && self.jwt_svid_audience == other.jwt_svid_audience
+            && self.client_assertion_type == other.client_assertion_type
+            && self.scopes == other.scopes
+            && self.cache_ttl_seconds == other.cache_ttl_seconds
+            && self.audience_overrides == other.audience_overrides
+            && self.subject_token == other.subject_token
+            && self.requested_token_type == other.requested_token_type
+    }
+}
+
+impl Eq for TokenGrantProfile {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantSubjectTokenProfile {
@@ -170,7 +210,7 @@ pub struct TokenGrantAudienceOverrideProfile {
     pub scopes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CredentialRefreshProfile {
     #[serde(
         default = "default_refresh_strategy",
@@ -184,8 +224,16 @@ pub struct CredentialRefreshProfile {
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub refresh_before_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub refresh_before_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub max_lifetime_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub max_lifetime_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub material: Vec<CredentialRefreshMaterialProfile>,
     /// Additional credentials this refresh mints beyond its primary credential.
@@ -194,6 +242,20 @@ pub struct CredentialRefreshProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_outputs: Vec<CredentialRefreshOutputProfile>,
 }
+
+impl PartialEq for CredentialRefreshProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.strategy == other.strategy
+            && self.token_url == other.token_url
+            && self.scopes == other.scopes
+            && self.refresh_before_seconds == other.refresh_before_seconds
+            && self.max_lifetime_seconds == other.max_lifetime_seconds
+            && self.material == other.material
+            && self.additional_outputs == other.additional_outputs
+    }
+}
+
+impl Eq for CredentialRefreshProfile {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CredentialRefreshMaterialProfile {
@@ -1261,8 +1323,10 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: whole_duration_seconds(refresh.refresh_before.as_ref()),
-        max_lifetime_seconds: whole_duration_seconds(refresh.max_lifetime.as_ref()),
+        refresh_before_seconds: duration_seconds_for_runtime(refresh.refresh_before.as_ref()),
+        refresh_before_wkt: ProfileDurationWkt::from_proto(refresh.refresh_before),
+        max_lifetime_seconds: duration_seconds_for_runtime(refresh.max_lifetime.as_ref()),
+        max_lifetime_wkt: ProfileDurationWkt::from_proto(refresh.max_lifetime),
         material: refresh
             .material
             .iter()
@@ -1284,19 +1348,32 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
     }
 }
 
-// Profile storage currently represents durations as whole seconds. Preserve the
-// validation signal for malformed, negative, or fractional protobuf durations
-// instead of silently truncating or normalizing them.
-fn whole_duration_seconds(value: Option<&prost_types::Duration>) -> i64 {
+fn duration_seconds_for_runtime(value: Option<&prost_types::Duration>) -> i64 {
     let Some(value) = value else {
         return 0;
     };
-    match openshell_core::time::duration_to_std(value) {
-        Ok(duration) if duration.subsec_nanos() == 0 => {
-            i64::try_from(duration.as_secs()).unwrap_or(-1)
+    openshell_core::time::duration_to_std(value).map_or(0, |duration| {
+        i64::try_from(duration.as_secs()).unwrap_or_default()
+    })
+}
+
+fn profile_duration_to_proto(
+    exact: ProfileDurationWkt,
+    seconds: i64,
+) -> Option<prost_types::Duration> {
+    match exact {
+        ProfileDurationWkt::FromYaml => {
+            (seconds != 0).then_some(prost_types::Duration { seconds, nanos: 0 })
         }
-        Ok(_) | Err(_) => -1,
+        ProfileDurationWkt::Absent => None,
+        ProfileDurationWkt::Present(value) => Some(value),
     }
+}
+
+fn validate_profile_duration(value: &prost_types::Duration) -> Result<(), String> {
+    openshell_core::time::duration_to_std(value)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCredentialRefresh {
@@ -1304,14 +1381,14 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
         strategy: refresh.strategy as i32,
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before: Some(prost_types::Duration {
-            seconds: refresh.refresh_before_seconds,
-            nanos: 0,
-        }),
-        max_lifetime: Some(prost_types::Duration {
-            seconds: refresh.max_lifetime_seconds,
-            nanos: 0,
-        }),
+        refresh_before: profile_duration_to_proto(
+            refresh.refresh_before_wkt,
+            refresh.refresh_before_seconds,
+        ),
+        max_lifetime: profile_duration_to_proto(
+            refresh.max_lifetime_wkt,
+            refresh.max_lifetime_seconds,
+        ),
         material: refresh
             .material
             .iter()
@@ -1346,7 +1423,8 @@ fn token_grant_from_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: whole_duration_seconds(token_grant.cache_ttl.as_ref()),
+        cache_ttl_seconds: duration_seconds_for_runtime(token_grant.cache_ttl.as_ref()),
+        cache_ttl_wkt: ProfileDurationWkt::from_proto(token_grant.cache_ttl),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -1370,10 +1448,10 @@ fn token_grant_to_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl: Some(prost_types::Duration {
-            seconds: token_grant.cache_ttl_seconds,
-            nanos: 0,
-        }),
+        cache_ttl: profile_duration_to_proto(
+            token_grant.cache_ttl_wkt,
+            token_grant.cache_ttl_seconds,
+        ),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -2092,7 +2170,18 @@ pub fn validate_profile_set(
                         "refresh strategy is required",
                     ));
                 }
-                if refresh.refresh_before_seconds < 0 {
+                if let ProfileDurationWkt::Present(value) = refresh.refresh_before_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.refresh_before",
+                        format!("refresh_before must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(refresh.refresh_before_wkt, ProfileDurationWkt::FromYaml)
+                    && refresh.refresh_before_seconds < 0
+                {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -2100,7 +2189,18 @@ pub fn validate_profile_set(
                         "refresh_before_seconds must be greater than or equal to 0",
                     ));
                 }
-                if refresh.max_lifetime_seconds < 0 {
+                if let ProfileDurationWkt::Present(value) = refresh.max_lifetime_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.max_lifetime",
+                        format!("max_lifetime must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(refresh.max_lifetime_wkt, ProfileDurationWkt::FromYaml)
+                    && refresh.max_lifetime_seconds < 0
+                {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -2260,7 +2360,18 @@ pub fn validate_profile_set(
             }
 
             if let Some(token_grant) = credential.token_grant.as_ref() {
-                if token_grant.cache_ttl_seconds < 0 {
+                if let ProfileDurationWkt::Present(value) = token_grant.cache_ttl_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.cache_ttl",
+                        format!("cache_ttl must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(token_grant.cache_ttl_wkt, ProfileDurationWkt::FromYaml)
+                    && token_grant.cache_ttl_seconds < 0
+                {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -3282,11 +3393,12 @@ mod tests {
     use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError,
-        ProviderTypeProfile, builtin_profiles, is_mcp_diagnostic_field, normalize_profile_id,
-        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml, profile_to_json,
-        profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
-        whole_duration_seconds,
+        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, builtin_profiles,
+        is_mcp_diagnostic_field, normalize_profile_id, parse_profile_catalog_yamls,
+        parse_profile_json, parse_profile_yaml, profile_duration_to_proto, profile_to_json,
+        profile_to_yaml, profiles_to_json, profiles_to_yaml, token_grant_from_proto,
+        token_grant_to_proto, validate_profile_duration, validate_profile_set,
     };
 
     fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
@@ -3297,27 +3409,64 @@ mod tests {
     }
 
     #[test]
-    fn profile_duration_conversion_rejects_fractional_and_malformed_values() {
+    fn profile_duration_conversion_preserves_presence_and_fractional_values() {
+        let fractional = prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        };
         assert_eq!(
-            whole_duration_seconds(Some(&prost_types::Duration {
+            profile_duration_to_proto(ProfileDurationWkt::Present(fractional), 0),
+            Some(fractional)
+        );
+        assert_eq!(
+            profile_duration_to_proto(
+                ProfileDurationWkt::Present(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 0,
+                }),
+                0,
+            ),
+            Some(prost_types::Duration {
                 seconds: 0,
-                nanos: 500_000_000,
-            })),
-            -1
+                nanos: 0,
+            })
         );
         assert_eq!(
-            whole_duration_seconds(Some(&prost_types::Duration {
-                seconds: 1,
-                nanos: -1,
-            })),
-            -1
+            profile_duration_to_proto(ProfileDurationWkt::Absent, 60),
+            None
         );
         assert_eq!(
-            whole_duration_seconds(Some(&prost_types::Duration {
+            profile_duration_to_proto(ProfileDurationWkt::FromYaml, 60),
+            Some(prost_types::Duration {
                 seconds: 60,
                 nanos: 0,
-            })),
-            60
+            })
+        );
+        assert!(
+            validate_profile_duration(&prost_types::Duration {
+                seconds: 1,
+                nanos: -1,
+            })
+            .is_err()
+        );
+
+        let raw_grant = openshell_core::proto::ProviderCredentialTokenGrant {
+            cache_ttl: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            token_grant_to_proto(&token_grant_from_proto(&raw_grant)).cache_ttl,
+            raw_grant.cache_ttl
+        );
+
+        let absent_grant = openshell_core::proto::ProviderCredentialTokenGrant::default();
+        assert!(
+            token_grant_to_proto(&token_grant_from_proto(&absent_grant))
+                .cache_ttl
+                .is_none()
         );
     }
 

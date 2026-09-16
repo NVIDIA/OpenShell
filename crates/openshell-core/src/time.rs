@@ -4,6 +4,7 @@
 //! Time utilities shared across `OpenShell` crates.
 
 use prost_types::{Duration as ProtoDuration, Timestamp};
+use std::cmp::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -51,6 +52,13 @@ pub fn validate_timestamp(value: &Timestamp) -> Result<(), ProtoTimeError> {
         return Err(ProtoTimeError::InvalidTimestampNanos);
     }
     Ok(())
+}
+
+/// Compare two canonical protobuf timestamps without reducing their precision.
+pub fn compare_timestamps(left: &Timestamp, right: &Timestamp) -> Result<Ordering, ProtoTimeError> {
+    validate_timestamp(left)?;
+    validate_timestamp(right)?;
+    Ok((left.seconds, left.nanos).cmp(&(right.seconds, right.nanos)))
 }
 
 /// Convert Unix epoch milliseconds to a canonical protobuf timestamp.
@@ -225,6 +233,21 @@ mod tests {
             }),
             Err(ProtoTimeError::InvalidTimestampNanos)
         );
+    }
+
+    #[test]
+    fn timestamp_comparison_preserves_nanoseconds() {
+        let earlier = Timestamp {
+            seconds: 1,
+            nanos: 100,
+        };
+        let later = Timestamp {
+            seconds: 1,
+            nanos: 900,
+        };
+
+        assert_eq!(compare_timestamps(&earlier, &later), Ok(Ordering::Less));
+        assert_eq!(compare_timestamps(&later, &earlier), Ok(Ordering::Greater));
     }
 
     #[test]

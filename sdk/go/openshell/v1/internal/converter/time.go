@@ -84,14 +84,15 @@ func DurationFromSeconds(value uint64) *durationpb.Duration {
 	return durationpb.New(time.Duration(value) * time.Second)
 }
 
-// WholeDurationSecondsFromProto converts a non-negative whole-second protobuf
-// duration. It returns -1 for malformed, negative, or fractional values so
-// profile validation can report the invalid input.
+// WholeDurationSecondsFromProto returns the whole-second runtime component of
+// a non-negative protobuf duration. It returns -1 for malformed or negative
+// values so legacy profile validation can report the invalid input. Exact
+// profile conversion retains nanos separately.
 func WholeDurationSecondsFromProto(value *durationpb.Duration) int64 {
 	if value == nil {
 		return 0
 	}
-	if value.CheckValid() != nil || value.Seconds < 0 || value.Nanos != 0 {
+	if value.CheckValid() != nil || value.Seconds < 0 || value.Nanos < 0 {
 		return -1
 	}
 	return value.Seconds

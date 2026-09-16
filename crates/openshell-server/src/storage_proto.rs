@@ -118,7 +118,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "72c1a3052c67de7ca4b05e651617be191a945febaf620408038599168ecd28c9";
+        "6905fc2ecaf27b4b8be69758a800ca1988134eaf9ff379f4aa2d2e9304274eb4";
     const DURABLE_SCHEMA_SHA256: &str =
         "2c69587b9d0c6cdd7d7fcb9605818fd2f758ae00e4b47eadd67eebc8b9f7fa67";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

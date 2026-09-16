@@ -4383,13 +4383,11 @@ pub(super) async fn handle_get_sandbox_logs(
 
     let buffer_total = tail.len() as u32;
 
-    let since_ms = req
-        .since_time
-        .as_ref()
-        .map(openshell_core::time::timestamp_to_millis)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?
-        .unwrap_or_default();
+    if let Some(since_time) = req.since_time.as_ref() {
+        openshell_core::time::validate_timestamp(since_time)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    let since_time = req.since_time;
 
     let logs: Vec<SandboxLogLine> = tail
         .into_iter()
@@ -4397,13 +4395,13 @@ pub(super) async fn handle_get_sandbox_logs(
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
                 evt.payload
             {
-                let event_ms = log
-                    .event_time
-                    .as_ref()
-                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                    .unwrap_or_default();
-                if since_ms > 0 && event_ms < since_ms {
-                    return None;
+                if let Some(since_time) = since_time.as_ref() {
+                    let event_time = log.event_time.as_ref()?;
+                    if openshell_core::time::compare_timestamps(event_time, since_time).ok()?
+                        == std::cmp::Ordering::Less
+                    {
+                        return None;
+                    }
                 }
                 if !req.sources.is_empty() && !source_matches(&log.source, &req.sources) {
                     return None;
@@ -8994,6 +8992,101 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_filters_with_nanosecond_precision() {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".to_string(),
+                name: "sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        for (timestamp, message) in [
+            (
+                prost_types::Timestamp {
+                    seconds: -1,
+                    nanos: 999_999_999,
+                },
+                "pre-epoch",
+            ),
+            (
+                prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 0,
+                },
+                "epoch",
+            ),
+        ] {
+            state.tracing_log_bus.publish_external(SandboxLogLine {
+                sandbox_id: "sandbox-id".to_string(),
+                event_time: Some(timestamp),
+                message: message.to_string(),
+                ..Default::default()
+            });
+        }
+        for (nanos, message) in [(100, "before"), (900, "at-boundary"), (950, "after")] {
+            state.tracing_log_bus.publish_external(SandboxLogLine {
+                sandbox_id: "sandbox-id".to_string(),
+                event_time: Some(prost_types::Timestamp { seconds: 1, nanos }),
+                message: message.to_string(),
+                ..Default::default()
+            });
+        }
+
+        let response = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-id".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 900,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .logs
+                .iter()
+                .map(|log| log.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["at-boundary", "after"]
+        );
+
+        let response = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-id".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 0,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let messages = response
+            .logs
+            .iter()
+            .map(|log| log.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(!messages.contains(&"pre-epoch"));
+        assert!(messages.contains(&"epoch"));
     }
 
     #[tokio::test]
