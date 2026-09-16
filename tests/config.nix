@@ -109,10 +109,15 @@ let
     name = "tmachine";
     runtimeInputs = [
       qemu
+      pkgs.git
       pkgs.ansible
       pkgs.sshpass
     ];
     text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root/tests"
+      export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
+
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };
