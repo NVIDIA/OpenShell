@@ -18,6 +18,9 @@ pub use runtime::OpenShellRuntimeBackend;
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = "openshell-sandbox";
 
+/// Resource claim set by compute drivers when the workload requests GPU access.
+pub const GPU_RESOURCE_CLAIM: &str = "openshell.gpu";
+
 /// Memory-backed parent used for supervisor CA material.
 pub const SUPERVISOR_CA_RUNTIME_ROOT: &str = "/run/openshell-supervisor-ca";
 

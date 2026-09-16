@@ -40,6 +40,7 @@ mod linux {
         CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
         SandboxConfirmEvidence,
     };
+    use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
@@ -80,8 +81,84 @@ mod linux {
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
+    const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
+    const GPU_BASELINE_READ_WRITE: &[&str] = &[
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/dev/dxg",
+        "/proc",
+    ];
+
     fn duration_micros(duration: Duration) -> u64 {
         u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// Add the filesystem paths required by GPU devices visible inside the
+    /// workload container. The companion supervisor intentionally has no GPU
+    /// devices, so it cannot discover these paths on the sandbox's behalf.
+    fn enrich_gpu_filesystem_paths(
+        policy: &mut openshell_core::policy::SandboxPolicy,
+        gpu_requested: bool,
+    ) -> bool {
+        if !gpu_requested {
+            return false;
+        }
+        let has_gpu = Path::new("/dev/nvidiactl").exists() || Path::new("/dev/dxg").exists();
+        if !has_gpu {
+            return false;
+        }
+
+        let mut read_write = GPU_BASELINE_READ_WRITE
+            .iter()
+            .copied()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            read_write.extend(entries.flatten().filter_map(|entry| {
+                let name = entry.file_name();
+                let suffix = name.to_str()?.strip_prefix("nvidia")?;
+                (!suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()))
+                    .then(|| entry.path())
+            }));
+        }
+
+        let mut modified = false;
+        for path in GPU_BASELINE_READ_ONLY.iter().copied().map(Path::new) {
+            if path.exists()
+                && !policy
+                    .filesystem
+                    .read_only
+                    .iter()
+                    .any(|allowed| allowed == path)
+                && !policy
+                    .filesystem
+                    .read_write
+                    .iter()
+                    .any(|allowed| allowed == path)
+            {
+                policy.filesystem.read_only.push(path.to_path_buf());
+                modified = true;
+            }
+        }
+        for path in read_write {
+            if !path.exists() || policy.filesystem.read_write.contains(&path) {
+                continue;
+            }
+            if policy.filesystem.read_only.contains(&path) {
+                if path != Path::new("/proc") {
+                    continue;
+                }
+                policy
+                    .filesystem
+                    .read_only
+                    .retain(|allowed| allowed != &path);
+            }
+            policy.filesystem.read_write.push(path);
+            modified = true;
+        }
+        modified
     }
 
     struct ControlConnectionSlot(Arc<AtomicUsize>);
@@ -120,7 +197,10 @@ mod linux {
         })?;
         validate_config(&config)?;
         validate_runtime_resource_claims(&config)?;
-        validate_running_identity(&config.workload_identity)?;
+        validate_running_identity(
+            &config.workload_identity,
+            allows_runtime_supplementary_groups(&config),
+        )?;
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
@@ -302,8 +382,29 @@ mod linux {
         groups
     }
 
+    fn allows_runtime_supplementary_groups(config: &BoundaryConfig) -> bool {
+        config
+            .resource_claims
+            .get(GPU_RESOURCE_CLAIM)
+            .is_some_and(|value| value == "true")
+    }
+
+    fn supplementary_groups_match(actual: &[u32], expected: &[u32], allow_extra: bool) -> bool {
+        if allow_extra {
+            // GPU runtimes may add host device-access groups while materializing
+            // an admitted GPU claim. They may extend, but never replace, the
+            // image-derived identity asserted by the compute driver.
+            expected.iter().all(|gid| actual.binary_search(gid).is_ok())
+        } else {
+            actual == expected
+        }
+    }
+
     #[allow(clippy::similar_names)]
-    fn validate_running_identity(expected: &ResolvedWorkloadIdentity) -> Result<(), String> {
+    fn validate_running_identity(
+        expected: &ResolvedWorkloadIdentity,
+        allow_runtime_supplementary_groups: bool,
+    ) -> Result<(), String> {
         let mut real_uid = 0;
         let mut effective_uid = 0;
         let mut saved_uid = 0;
@@ -362,7 +463,11 @@ mod linux {
             }
         }
         let groups = normalized_supplementary_groups(groups, expected.gid);
-        if groups != expected.supplementary_gids {
+        if !supplementary_groups_match(
+            &groups,
+            &expected.supplementary_gids,
+            allow_runtime_supplementary_groups,
+        ) {
             return Err(format!(
                 "sandbox supplementary groups {groups:?} do not match resolved workload {:?}",
                 expected.supplementary_gids
@@ -2140,7 +2245,10 @@ mod linux {
         }
 
         fn measure_confirmation_evidence(&self) -> Result<SandboxConfirmEvidence, String> {
-            validate_running_identity(&self.config.workload_identity)?;
+            validate_running_identity(
+                &self.config.workload_identity,
+                allows_runtime_supplementary_groups(&self.config),
+            )?;
             self.network_broker
                 .confirm_healthy()
                 .map_err(|error| format!("verify sandbox network broker: {error}"))?;
@@ -2247,6 +2355,21 @@ mod linux {
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let mut policy = policy.into();
+            let gpu_requested = self
+                .config
+                .resource_claims
+                .get(GPU_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true");
+            if enrich_gpu_filesystem_paths(&mut policy, gpu_requested) {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "enriched")
+                        .message("Added workload-local GPU filesystem paths".to_string())
+                        .build()
+                );
+            }
             let driver_identity = DriverIdentity::Resolved {
                 uid: self.config.workload_identity.uid,
                 gid: self.config.workload_identity.gid,
@@ -3592,6 +3715,17 @@ mod linux {
         }
 
         #[test]
+        fn supplementary_group_measurement_rejects_unexpected_groups_by_default() {
+            assert!(!supplementary_groups_match(&[44, 992], &[], false));
+        }
+
+        #[test]
+        fn gpu_runtime_groups_may_extend_but_not_replace_expected_groups() {
+            assert!(supplementary_groups_match(&[44, 992, 1001], &[1001], true));
+            assert!(!supplementary_groups_match(&[44, 992], &[1001], true));
+        }
+
+        #[test]
         fn control_connection_slots_bound_authenticated_sessions() {
             let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS - 1));
             let slot = acquire_control_connection_slot(&active).expect("last available slot");
@@ -4175,7 +4309,7 @@ mod linux {
             };
 
             validate_config(&config).unwrap();
-            validate_running_identity(&config.workload_identity).unwrap();
+            validate_running_identity(&config.workload_identity, false).unwrap();
         }
 
         #[test]

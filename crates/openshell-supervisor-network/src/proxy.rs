@@ -221,6 +221,7 @@ impl ProxyHandle {
         backend_host_gateway: Option<IpAddr>,
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
+        direct_listener_identity: Option<ContractBinaryIdentity>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -414,7 +415,12 @@ impl ProxyHandle {
                             let workload_addr = stream.peer_addr().ok();
                             let proxy_addr = stream.local_addr().ok();
                             let stream: BoundaryDuplexStream = Box::new(stream);
-                            (stream, None, workload_addr.zip(proxy_addr), None)
+                            (
+                                stream,
+                                direct_listener_identity.clone().map(Ok),
+                                workload_addr.zip(proxy_addr),
+                                None,
+                            )
                         })
                         .map_err(ProxyAcceptError::Listener)
                 };
@@ -1273,6 +1279,9 @@ fn classify_accept_error(
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> AcceptAction {
+    #[cfg(not(unix))]
+    let _ = (err, &mut *consecutive_resource_errors);
+
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -6840,6 +6849,7 @@ network_policies: {}
             None,
             Some(Arc::new(FailedMediationSource)),
             None,
+            None,
         )
         .await
         .expect("proxy starts before source accept");
@@ -11947,15 +11957,17 @@ network_policies:
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let exe = std::env::current_exe().expect("current_exe");
+        // JSON strings are valid YAML scalars and correctly escape Windows
+        // path separators such as `D:\\...`.
+        let exe_yaml = serde_json::to_string(&exe.to_string_lossy()).expect("encode executable");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 

@@ -25,6 +25,7 @@ use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::{SupportContainer, e2e_network_name};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
+use serial_test::serial;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -889,6 +890,7 @@ fn parse_json_line(output: &str) -> Value {
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn policy_reload_updates_transparent_requests_and_closes_existing_http_stream() {
     let server = KeepAliveHttpServer::start()
         .await
@@ -993,6 +995,7 @@ async fn policy_reload_updates_transparent_requests_and_closes_existing_http_str
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
     let server = KeepAliveHttpServer::start()
         .await
@@ -1090,6 +1093,7 @@ async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn transparent_destination_denials_fail_connect_with_eacces() {
     let policy = write_destination_denial_policy().expect("write destination denial policy");
     let policy_path = policy_path(&policy);
@@ -1122,6 +1126,7 @@ print(json.dumps(result, sort_keys=True))
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_transparently() {
     if e2e_network_name().is_none() {
         eprintln!("skipping IP-literal success assertions without a shared container network");
@@ -1186,6 +1191,7 @@ ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn tls_skip_connect_relays_opaque_bytes_bidirectionally() {
     let server = EchoServer::start().await.expect("start TCP echo server");
     let policy = write_policy(TEST_SERVER_HOST, server.port, "        tls: skip")
@@ -1226,6 +1232,7 @@ print("RAW_RELAY_OK")
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn middleware_redacts_transparent_request_bodies() {
     let server = RequestBodyEchoServer::start()
         .await
@@ -1298,6 +1305,7 @@ print(json.dumps({{"first": request_once(), "second": request_once()}}, sort_key
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn fail_closed_middleware_blocks_uninspectable_transparent_payload_before_upstream() {
     let server = EchoServer::start().await.expect("start TCP echo server");
     let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
@@ -1372,6 +1380,7 @@ print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn fail_open_middleware_bypasses_uninspectable_transparent_tls_skip() {
     let server = EchoServer::start().await.expect("start TCP echo server");
     let policy = write_middleware_policy(
@@ -1427,6 +1436,7 @@ print("UNINSPECTABLE_MIDDLEWARE_BYPASSED")
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn transparent_pipeline_never_reaches_upstream_as_first_request_overflow() {
     let server = PipelineProbeServer::start()
         .await
@@ -1490,6 +1500,7 @@ print("TRANSPARENT_PIPELINE_DENIED")
 }
 
 #[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn http_credentials_are_rewritten_in_transparent_headers_and_bodies() {
     let _provider_lock = PROVIDER_LOCK
         .lock()

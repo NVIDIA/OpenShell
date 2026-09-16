@@ -227,6 +227,8 @@ The Nix test guest harness under `nix/test-guest` boots native-architecture clou
 through QEMU for package, release, and E2E validation. A prepared cache entry is
 captured after the exact ordered Ansible configuration list and before
 test-specific packages, copied binaries, forwarded ports, or commands.
+On macOS, the test guest and tmachine paths use the same pinned QEMU and OVMF
+package set so the hypervisor and firmware remain compatible.
 
 Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
 read-only and each test receives a fresh writable overlay and cloud-init
@@ -241,6 +243,23 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+
+The `tests/tmachine` setup and installation caches include a digest of the
+entire directory containing `ANSIBLE_CONFIG`, including local roles, task
+includes, templates, inventory, and requirements. The digest uses sorted
+relative paths, file contents, and executable permissions; source symlinks
+are unsupported. Both keys also retain the ordered playbook paths and contents,
+their base disk contents, and whether Galaxy is enabled; installation keys
+include named binary inputs. The top-level `.roles` directory is excluded:
+Galaxy release pins in `requirements.yaml` are treated as immutable, including
+any transitive dependency pins. Cache misses with Galaxy enabled reinstall
+the required roles and their dependencies before running playbooks.
+
+The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
+with musl, and the gateway and supervisor with GNU. Image assembly stages
+the gateway, sandbox, and supervisor as separate binaries for their respective
+Dockerfiles. The Ubuntu Docker and Fedora Podman scenarios import both local
+runtime images and configure the gateway to use them.
 
 ## Python Wheel Packaging
 
@@ -420,10 +439,18 @@ job republishes the analysis job's outcome as the
 required statuses, so they do not gate merges.
 
 Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Creating pre-release
-tags and gating stable promotion on qualification results are part of
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
-implemented yet.
+workflow only reports on candidates that already exist. Gating stable promotion
+on qualification results remains proposed in
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+
+`release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
+saving time changes) and supports manual dispatch. Maintainers start weekday
+pre-release publishing by tagging the initial `vX.Y.Z-pre.1` release candidate.
+The workflow increments the highest release series' pre-release number on `main`
+only when that seed exists, its stable tag does not exist, and new commits are
+available. It never chooses a minor or patch version or creates the initial seed.
+After pushing the tag, it explicitly dispatches `release-tag.yml` to build the
+candidate.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

@@ -12,6 +12,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -28,6 +29,7 @@ pub struct DockerBoundarySpec {
     pub verification_keys: Vec<GatewayVerificationKey>,
     pub container_id: String,
     pub image_identity: String,
+    pub gpu_requested: bool,
     pub listener_socket: PathBuf,
     pub control_socket: PathBuf,
     pub sandbox_tls: SandboxTlsServerConfig,
@@ -48,10 +50,13 @@ impl DockerBoundarySpec {
     /// Docker coordinates so attach cannot bind a different container.
     #[must_use]
     pub fn provision(self) -> DockerBoundaryProvisioning {
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             ("docker.container_id".to_string(), self.container_id),
             ("docker.image_identity".to_string(), self.image_identity),
         ]);
+        if self.gpu_requested {
+            resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
+        }
         let driver_fence = DriverFenceEvidence::Docker {
             container_id: resource_claims["docker.container_id"].clone(),
             network_mode: "none".to_string(),
@@ -116,6 +121,7 @@ mod tests {
             }],
             container_id: "sha256:container".to_string(),
             image_identity: "sha256:image".to_string(),
+            gpu_requested: true,
             listener_socket: PathBuf::from("/run/openshell/boundary/control.sock"),
             control_socket: PathBuf::from("/host/control.sock"),
             sandbox_tls: SandboxTlsServerConfig {
@@ -146,6 +152,10 @@ mod tests {
         assert_eq!(
             provisioned.runtime_descriptor.resource_claims["docker.container_id"],
             "sha256:container"
+        );
+        assert_eq!(
+            provisioned.runtime_descriptor.resource_claims[GPU_RESOURCE_CLAIM],
+            "true"
         );
         assert_eq!(
             provisioned.boundary_config.driver_fence,

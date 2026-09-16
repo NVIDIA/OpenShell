@@ -1,0 +1,6 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "gateway.service.j2" %}
+{% block service %}
+Environment=XDG_RUNTIME_DIR=/run/user/{{ openshell_gateway_uid }}
+{% endblock %}
