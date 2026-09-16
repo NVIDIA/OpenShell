@@ -110,6 +110,8 @@ The Secret may also be issued by cert-manager, or you can reference the chart's 
 Enable an HTTPS listener, point it at the Secret, configure the gateway for a plaintext backend, and provide OIDC settings in `oidc-values.yaml`:
 
 ```yaml
+server:
+  disableTls: true
 gatewayConfig:
   openshell.gateway.oidc:
     issuer: https://keycloak.example.com/realms/openshell

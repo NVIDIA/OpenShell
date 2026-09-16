@@ -113,7 +113,7 @@ OIDC RBAC is method-level authorization. It controls which API operations a call
 
 ## Reverse-Proxy Auth Termination
 
-When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the OpenShell gateway, you can explicitly allow unauthenticated user calls at the gateway:
+When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, terminates TLS and handles authentication in front of the OpenShell gateway, configure the gateway for plaintext traffic from that trusted proxy and explicitly allow unauthenticated user calls:
 
 ```shell
 helm upgrade openshell \
@@ -126,22 +126,14 @@ helm upgrade openshell \
 Create `reverse-proxy-values.yaml`:
 
 ```yaml
+server:
+  disableTls: true
 gatewayConfig:
   openshell.gateway.auth:
     allow_unauthenticated_users: true
 ```
 
-The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
-
-When the gateway terminates TLS directly and callers connect without client certificates, also set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
-
-To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
-
-```yaml
-gatewayConfig:
-  openshell.gateway.auth:
-    allow_unauthenticated_users: true
-```
+The gateway listens on plaintext traffic from the proxy, while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
 
 <Warning>
 Only enable unauthenticated users when the gateway is not reachable from outside a trusted local development environment or the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network.
