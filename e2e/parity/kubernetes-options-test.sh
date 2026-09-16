@@ -9,6 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="${ROOT}/e2e/parity/kubernetes-options.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
+TRUE_BIN="$(type -P true)"
 
 OPENSHELL_PARITY_HOST_GATEWAY_IP=169.254.1.2 bash "${SCRIPT}" --print-config baseline >"${TMP}/baseline.toml"
 OPENSHELL_PARITY_HOST_GATEWAY_IP=169.254.1.2 bash "${SCRIPT}" --print-config candidate >"${TMP}/candidate.toml"
@@ -28,6 +29,13 @@ check(shared.isdisjoint(candidate['gateway'].keys()),'candidate leaked driver fi
 check(shared <= candidate['drivers']['kubernetes'].keys(),'candidate driver fields missing')
 b=dict(baseline['drivers']['kubernetes']); b.update({key:baseline['gateway'][key] for key in shared})
 c=dict(candidate['drivers']['kubernetes'])
+# These fields belong only to the frozen schema-v1 baseline. RFC 0012 removed
+# their configuration surface; the Agent Sandbox controller owns its internals.
+legacy_v1_only={'supervisor_sideload_method','topology','app_armor_profile'}
+check(legacy_v1_only <= b.keys(),'baseline legacy fields missing')
+check(legacy_v1_only.isdisjoint(c.keys()),'candidate retained RFC 0012 fields')
+for field in legacy_v1_only:
+    b.pop(field)
 for projection in (b,c):
     projection['gateway_id']='<isolated-gateway-id>'
     projection['grpc_endpoint']='http://host.openshell.internal:<isolated-port>'
@@ -39,9 +47,9 @@ PY
 : >"${TMP}/kubeconfig"
 set +e
 OPENSHELL_PARITY_BASELINE_ROOT="${TMP}/not-a-worktree" \
-OPENSHELL_PARITY_BASELINE_GATEWAY=/bin/true \
-OPENSHELL_PARITY_CANDIDATE_GATEWAY=/bin/true \
-OPENSHELL_PARITY_CLI=/bin/true \
+OPENSHELL_PARITY_BASELINE_GATEWAY="${TRUE_BIN}" \
+OPENSHELL_PARITY_CANDIDATE_GATEWAY="${TRUE_BIN}" \
+OPENSHELL_PARITY_CLI="${TRUE_BIN}" \
 OPENSHELL_PARITY_KUBECONFIG="${TMP}/kubeconfig" \
 OPENSHELL_PARITY_KUBE_CONTEXT=default/external-production-cluster \
 OPENSHELL_PARITY_HOST_GATEWAY_IP=169.254.1.2 \
