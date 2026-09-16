@@ -2,15 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# In-cluster (OpenShift/Buildah) variant of Dockerfile.supervisor.
+# In-cluster (OpenShift/Buildah) variant of Dockerfile.sandbox.
 #
-# Upstream CI builds the dynamically linked GNU `openshell-supervisor` binary
-# inside the project's Nix devShell with the gnu cross target (z3 and aws-lc
-# statically embedded, standard ELF interpreter), and stages it under
-# deploy/docker/.build/prebuilt-binaries. This multi-stage Dockerfile reproduces
-# that exact artifact in a builder stage so clusters without the Nix CI pipeline
-# can build the supervisor image directly from source. The final stage is
-# identical to Dockerfile.supervisor.
+# Upstream CI produces the static musl `openshell-sandbox` binary by building
+# inside the project's Nix devShell with the musl cross target, and stages it
+# under deploy/docker/.build/prebuilt-binaries. This multi-stage Dockerfile
+# reproduces that exact binary in a builder stage so clusters without the Nix
+# CI pipeline can build the sandbox image directly from source. The final stage
+# is identical to Dockerfile.sandbox.
 
 # ---- Builder: glibc base + Nix, reproduce upstream's cross build -------------
 #
@@ -44,30 +43,33 @@ ENV HOME=/root \
 WORKDIR /build
 COPY . .
 
-# Build the supervisor exactly like CI: same devShell, same cargo command and
-# target triple. The gnu cross toolchain emits a standard ELF interpreter, so
-# the binary runs on a plain Debian base without post-processing. Everything
-# runs in a single layer: build, stage the binary at /, then delete the Nix
-# store and Cargo target so the committed builder layer stays small.
+# Build the sandbox binary exactly like CI: same devShell, same cargo command
+# and target triple. Everything runs in a single layer: build, stage the static
+# binary at /, then delete the Nix store and Cargo target. The binary is static
+# musl (it needs nothing from /nix at runtime), so the committed builder layer
+# shrinks to the binary alone, keeping the intermediate commit fast and within
+# the node's ephemeral-storage budget.
 RUN nix develop -c bash -euo pipefail -c '\
       GIT_DIR=/nonexistent cargo auditable build --release \
-        --target x86_64-unknown-linux-gnu \
-        --package openshell-supervisor --bin openshell-supervisor' && \
-    cp target/x86_64-unknown-linux-gnu/release/openshell-supervisor /openshell-supervisor && \
+        --target x86_64-unknown-linux-musl \
+        --package openshell-sandbox --bin openshell-sandbox' && \
+    cp target/x86_64-unknown-linux-musl/release/openshell-sandbox /openshell-sandbox && \
     cd / && rm -rf /nix /build /root/.cache /tmp/*
 
-# ---- Runtime: identical to deploy/docker/Dockerfile.supervisor ---------------
+# ---- Runtime: identical to deploy/docker/Dockerfile.sandbox ------------------
 #
-# The dynamically linked GNU supervisor binary needs a glibc runtime plus a CA
-# bundle for its outbound TLS connections.
-FROM debian:bookworm-slim AS supervisor
+# Runtime-specific bootstrap tools belong to their compute drivers rather than
+# this portable image, so the sandbox runtime image is a bare scratch layer.
+FROM scratch AS sandbox
 
 ARG TARGETARCH
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Keep the binary root-owned for image-volume mounts and executable by the
+# sandbox runtime's non-root UID.
+COPY --from=builder --chmod=0555 /openshell-sandbox /openshell-sandbox
 
-COPY --from=builder --chmod=0555 /openshell-supervisor /openshell-supervisor
+# Drivers may override this identity to match the admitted workload. Keep the
+# standalone image non-root by default.
+USER 65532:65532
 
-ENTRYPOINT ["/openshell-supervisor"]
+ENTRYPOINT ["/openshell-sandbox"]
