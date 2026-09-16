@@ -1865,8 +1865,18 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
+            // Events drained above the publication watermark. They are held
+            // back rather than emitted so the client's highest delivered cursor
+            // is never above an event still queued on the other source.
+            let mut deferred: Vec<CursoredEvent> = Vec::new();
+
             loop {
-                let first = tokio::select! {
+                // Events withheld by the previous round are already in hand, so
+                // this round must not block on a new publication: the watermark
+                // that covers them has already advanced past them, and waiting
+                // for unrelated traffic would stall their delivery indefinitely.
+                let first = if deferred.is_empty() {
+                    Some(tokio::select! {
                     () = tx.closed() => {
                         return;
                     }
@@ -1935,12 +1945,16 @@ pub(super) async fn handle_watch_sandbox(
                             None => future::pending().await,
                         }
                     } => res,
+                    })
+                } else {
+                    None
                 };
 
-                let mut batch = Vec::new();
+                let mut batch = std::mem::take(&mut deferred);
                 match first {
-                    Ok(evt) => batch.push(evt),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                    None => {}
+                    Some(Ok(evt)) => batch.push(evt),
+                    Some(Err(broadcast::error::RecvError::Lagged(n))) => {
                         // Lag is recoverable: surface a warning and keep streaming.
                         if tx
                             .send(Ok(crate::sandbox_watch::lag_warning_event(n)))
@@ -1949,20 +1963,34 @@ pub(super) async fn handle_watch_sandbox(
                         {
                             return;
                         }
+                        // Carry any withheld events into the next round rather
+                        // than dropping them with this batch.
+                        deferred = batch;
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Some(Err(broadcast::error::RecvError::Closed)) => {
                         let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                         return;
                     }
                 }
 
-                // Drain what is already queued on both sources. Anything ready
-                // now was published before the event we just took, so sorting
-                // the batch restores cursor order without waiting on either
-                // source. Events published after this drain are not held back:
-                // strict global ordering would mean delaying every event to see
-                // whether a lower cursor still arrives.
+                // Read the publication watermark before draining. Publishers
+                // assign a sequence and push it onto their broadcast channel
+                // under one allocator lock, so every event at or below the
+                // sequence observed here has already reached its channel and
+                // the drain below is guaranteed to see it. Reading after the
+                // drain would admit a publish into the gap and defeat this.
+                //
+                // `None` means the cursor space is gone (teardown). Nothing
+                // further can be published into it, so nothing is withheld.
+                let watermark = state
+                    .tracing_log_bus
+                    .cursor_space(&sandbox_id)
+                    .map_or(u64::MAX, |space| space.highest_seq);
+
+                // Drain what is already queued on both sources. Sorting the
+                // batch restores cursor order across the two sources without
+                // waiting on either one.
                 let mut lagged = 0u64;
                 let mut closed = false;
                 for rx in [log_rx.as_mut(), platform_rx.as_mut()]
@@ -1984,6 +2012,29 @@ pub(super) async fn handle_watch_sandbox(
                 }
 
                 batch.sort_by_key(|cursored| cursored.seq);
+
+                // Withhold anything above the watermark. Such an event was
+                // published after the drain started, so a lower-cursor event
+                // from the other source may still be queued behind it. Emitting
+                // it now would let the client checkpoint above an event it has
+                // not seen, and resume past it after a disconnect. The next
+                // round re-reads the watermark, which by then covers these.
+                let held_from = batch.partition_point(|cursored| cursored.seq <= watermark);
+                deferred = batch.split_off(held_from);
+
+                // Announce the gap before any event from this batch. A warning
+                // carries no cursor and is never replayed, so emitting it after
+                // the events lets a disconnect at the wrong moment strand the
+                // client past the gap: it would resume from a cursor above the
+                // skipped events having never learned they were dropped.
+                if lagged > 0
+                    && tx
+                        .send(Ok(crate::sandbox_watch::lag_warning_event(lagged)))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
 
                 for cursored in batch {
                     // Skip events the tail/replay phase already handled, judged
@@ -2014,14 +2065,6 @@ pub(super) async fn handle_watch_sandbox(
                     }
                 }
 
-                if lagged > 0
-                    && tx
-                        .send(Ok(crate::sandbox_watch::lag_warning_event(lagged)))
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
                 if closed {
                     let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                     return;
@@ -4162,6 +4205,208 @@ mod tests {
             got.push(seq_of(&stream.next().await.unwrap().unwrap()));
         }
         assert_eq!(got, (1..=10).collect::<Vec<u64>>());
+    }
+
+    /// A reconnect resumes from the highest cursor the client saw, so live
+    /// delivery may never emit a cursor while a lower one is still undelivered.
+    /// The producer drains the log receiver before the platform one: a log line
+    /// published after that first drain but before the platform drain finishes
+    /// misses the batch, and its seq is below platform cursors the same batch
+    /// carries. Emitting them strands the log line -- a disconnect there resumes
+    /// above it, and no replay ever returns it. The publication watermark holds
+    /// back anything the drain cannot prove it saw in full.
+    ///
+    /// Reaching that interleaving takes a wide drain: the producer is first
+    /// parked on a full stream channel so a platform backlog accumulates, then
+    /// both sources are hammered from other worker threads while it walks that
+    /// backlog. Serialized against the test task the window does not exist --
+    /// the drain holds no await a single-threaded test could wedge open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_delivery_never_emits_a_cursor_above_an_undrained_event() {
+        use tokio_stream::StreamExt as _;
+
+        /// Enough to overrun the 256-slot stream channel and park the producer.
+        const PARK: usize = 400;
+        /// Platform events queued while it is parked. The next drain walks all
+        /// of them, and that walk is the window the hammers below publish into.
+        /// Kept under the 1024-slot broadcast capacity so nothing is dropped.
+        const BACKLOG: usize = 600;
+        const HAMMER: usize = 300;
+        /// Hitting the window is a race, so repeat it. One round reproduced the
+        /// unfixed behavior in two runs of three; four caught it in ten of ten.
+        const ROUNDS: u64 = 4;
+        const PER_ROUND: u64 = (PARK + BACKLOG + HAMMER * 2) as u64;
+        const TOTAL: u64 = PER_ROUND * ROUNDS;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("watermark", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        // Drain the snapshot before publishing anything. It is emitted at the
+        // end of initialization, so taking it first proves the producer is in
+        // the live loop and keeps every event below out of the tail replay --
+        // which is capped (200 log lines by default) and would otherwise drop
+        // events this test counts on.
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let mut highest = 0u64;
+        let mut seen = 0u64;
+        let mut last_cursor = String::new();
+
+        for round in 0..ROUNDS {
+            // Nothing reads during this round's setup, so the producer fills
+            // the stream channel and blocks part-way through this batch.
+            seed_log_lines(&state, &id, PARK);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            for i in 0..BACKLOG {
+                seed_platform_event(&state, &id, &format!("b{round}-{i}"));
+            }
+
+            let log_hammer = {
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                tokio::spawn(async move {
+                    for _ in 0..HAMMER {
+                        seed_log_lines(&state, &id, 1);
+                    }
+                })
+            };
+            let platform_hammer = {
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                tokio::spawn(async move {
+                    for i in 0..HAMMER {
+                        seed_platform_event(&state, &id, &format!("h{round}-{i}"));
+                    }
+                })
+            };
+
+            while seen < PER_ROUND * (round + 1) {
+                let evt = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "live delivery stalled after {seen}/{TOTAL} events, highest {highest}"
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                let seq = seq_of(&evt);
+                // Ascending delivery is what makes a highest-cursor resume safe.
+                // Without the watermark this trips: a log line published during
+                // the platform walk follows platform cursors emitted above it.
+                assert!(seq > highest, "cursor {seq} emitted after {highest}");
+                highest = seq;
+                last_cursor = evt.cursor;
+                seen += 1;
+            }
+
+            log_hammer.await.unwrap();
+            platform_hammer.await.unwrap();
+        }
+
+        // Every seq in the space belongs to one of the two buses, so `TOTAL`
+        // ascending events ending at `TOTAL` means none was skipped.
+        assert_eq!(highest, TOTAL, "live delivery skipped a cursor");
+
+        // Reconnecting from that cursor is consistent with what was delivered:
+        // the replay resumes at the next event rather than past one.
+        seed_log_lines(&state, &id, 1);
+        seed_platform_event(&state, &id, "after-resume");
+        drop(stream);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                resume_after_cursor: last_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let a = stream.next().await.unwrap().unwrap();
+        let b = stream.next().await.unwrap().unwrap();
+        assert_eq!(seq_of(&a), TOTAL + 1);
+        assert_eq!(seq_of(&b), TOTAL + 2);
+    }
+
+    /// A lag warning carries no cursor, so it is never replayed on resume. Sent
+    /// after the surviving events of its own batch, a disconnect in between
+    /// leaves the client checkpointed past the dropped range having never been
+    /// told anything was dropped. The warning must lead the batch.
+    ///
+    /// Which branch `select!` takes is arbitrary, so the run is repeated: the
+    /// assertion holds on both paths, but only the platform-first path reaches
+    /// the drain's lag counter, which is where the ordering used to be wrong.
+    /// Eight attempts caught the unfixed ordering in three runs of five; forty
+    /// caught it in six of six.
+    #[tokio::test]
+    async fn lag_warning_precedes_the_events_of_its_batch() {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        use tokio_stream::StreamExt as _;
+
+        /// `select!` polls the log receiver before the platform one in three of
+        /// its four rotations, and only the platform-first path reaches the
+        /// drain's lag counter. Repeat enough that missing it is negligible.
+        const ATTEMPTS: usize = 40;
+
+        let state = test_server_state().await;
+
+        for attempt in 0..ATTEMPTS {
+            let sandbox = test_sandbox(&format!("lagorder{attempt}"), Vec::new());
+            state.store.put_message(&sandbox).await.unwrap();
+            let id = sandbox.object_id().to_string();
+
+            let response = handle_watch_sandbox(
+                &state,
+                authed_request(WatchSandboxRequest {
+                    id: id.clone(),
+                    follow_logs: true,
+                    follow_events: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut stream = response.into_inner();
+            let snap = stream.next().await.unwrap().unwrap();
+            assert!(snap.cursor.is_empty());
+
+            // One platform event plus a log burst past the 1024-slot broadcast
+            // capacity, published without an await in between so the producer
+            // sees both on a single wake-up: a deliverable event and a drop.
+            seed_platform_event(&state, &id, "e1");
+            seed_log_lines(&state, &id, 1100);
+
+            let first = stream.next().await.unwrap().unwrap();
+            assert!(
+                matches!(first.payload, Some(Payload::Warning(_))),
+                "the lag warning must arrive before any event of the lagged batch, got {:?}",
+                first.payload
+            );
+        }
     }
 
     #[tokio::test]
