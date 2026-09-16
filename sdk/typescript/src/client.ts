@@ -211,6 +211,14 @@ export interface SandboxWorkspaceOptions {
   workspace?: string;
 }
 
+/** Pagination and workspace scope for providers attached to one sandbox. */
+export type SandboxProviderListOptions = SandboxWorkspaceOptions & {
+  /** Maximum providers requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
+};
+
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
 export interface SandboxTemplateWorkspaceOptions {
@@ -1491,21 +1499,27 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
-    try {
-      return await new Pager(async (pageToken) => {
+  listProviders(name: string, options?: SandboxProviderListOptions | null): Pager<ProviderRef> {
+    return new Pager(async (pageToken) => {
+      try {
         const resp = await this.grpc.listSandboxProviders({
           ...sandboxTarget(name, options),
+          pageSize: options?.pageSize ?? 0,
           pageToken,
         });
         return {
           items: resp.providers.map((provider) => providerRef(provider)),
           nextPageToken: resp.nextPageToken,
         };
-      }).all();
-    } catch (e) {
-      throw fromConnect(e);
-    }
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every provider attached to this sandbox. */
+  async listAllProviders(name: string, options?: SandboxProviderListOptions | null): Promise<ProviderRef[]> {
+    return this.listProviders(name, options).all();
   }
 
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
