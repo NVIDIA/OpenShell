@@ -3068,34 +3068,59 @@ pub(super) fn get_provider_type_profile_for_scope(
     catalog.get_type_profile_for_scope(id, profile_workspace)
 }
 
-/// Prevent a legacy alternate-upstream provider from binding its credential to
-/// the built-in public vendor endpoint. Alternate endpoints must be expressed
-/// by an explicitly imported endpoint-bearing profile.
+/// Whether a profile's endpoints apply to this provider.
+///
+/// A profile's endpoints are the boundary its credential is bound to. When a
+/// provider redirects its client to a different upstream — `OPENAI_BASE_URL`
+/// pointing somewhere other than the hosts the `openai` profile declares — the
+/// profile no longer describes where that credential goes. Treating it as if it
+/// did would bind the credential to hosts the workload never contacts while
+/// leaving the real upstream uncovered, so the profile is treated as
+/// endpointless instead: no policy layer, and the credential binds only through
+/// explicit sandbox policy.
+///
+/// A profile that declares no endpoints has no boundary to contradict.
 pub(super) fn provider_profile_endpoints_are_active(
     profile: &ProviderTypeProfile,
     provider: &Provider,
 ) -> bool {
-    if profile.source != "builtin" {
+    if profile.endpoints.is_empty() {
         return true;
     }
 
-    let (base_url_key, default_base_url) = match profile.id.as_str() {
-        "openai" => ("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "anthropic" => ("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
-        _ => return true,
-    };
-
     provider
         .config
-        .get(base_url_key)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none_or(|configured| {
-            configured
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(default_base_url.trim_end_matches('/'))
+        .iter()
+        .filter(|(key, _)| is_upstream_base_url_key(key))
+        .filter_map(|(_, value)| configured_upstream_host(value))
+        .all(|host| {
+            profile.endpoints.iter().any(|endpoint| {
+                openshell_core::host_pattern::host_matches(&endpoint.host, &host).unwrap_or(false)
+            })
         })
+}
+
+/// Config keys that redirect a client to a different upstream.
+///
+/// `OpenShell` provider config spells these `<VENDOR>_BASE_URL` throughout —
+/// `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `VERTEX_AI_BASE_URL`.
+fn is_upstream_base_url_key(key: &str) -> bool {
+    key.to_ascii_uppercase().ends_with("_BASE_URL")
+}
+
+/// The host a configured base URL points at, if it names one.
+///
+/// A value that does not parse as an absolute URL with a host is not a
+/// redirect we can reason about, so it does not deactivate the profile.
+fn configured_upstream_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    url::Url::parse(value)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -5834,6 +5859,103 @@ mod tests {
                 .message
                 .contains("update would create ambiguous dynamic token grants")
         }));
+    }
+
+    fn provider_with_config(provider_type: &str, config: &[(&str, &str)]) -> Provider {
+        Provider {
+            r#type: provider_type.to_string(),
+            config: config
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_endpoints_stay_active_for_declared_upstreams() {
+        let openai = openshell_providers::example_profiles::load("openai");
+
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[])
+        ));
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config(
+                "openai",
+                &[("OPENAI_BASE_URL", "https://api.openai.com/v1")]
+            )
+        ));
+        // An empty value is not a redirect.
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[("OPENAI_BASE_URL", "   ")])
+        ));
+        // Neither is a value that names no host.
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[("OPENAI_BASE_URL", "not-a-url")])
+        ));
+    }
+
+    #[test]
+    fn profile_endpoints_deactivate_for_an_undeclared_upstream() {
+        let openai = openshell_providers::example_profiles::load("openai");
+        assert!(!provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config(
+                "openai",
+                &[("OPENAI_BASE_URL", "https://api.example.com/v1")]
+            )
+        ));
+
+        // The rule is not keyed on the profile ID: it applies to any
+        // endpoint-bearing profile, including an operator's own.
+        let mut mine = openai;
+        mine.id = "my-inference".to_string();
+        assert!(!provider_profile_endpoints_are_active(
+            &mine,
+            &provider_with_config(
+                "my-inference",
+                &[("MY_INFERENCE_BASE_URL", "https://elsewhere.example.com")]
+            )
+        ));
+    }
+
+    #[test]
+    fn profile_endpoints_honor_wildcard_hosts() {
+        let vertex = openshell_providers::example_profiles::load("google-vertex-ai");
+        assert!(provider_profile_endpoints_are_active(
+            &vertex,
+            &provider_with_config(
+                "google-vertex-ai",
+                &[(
+                    "VERTEX_AI_BASE_URL",
+                    "https://us-central1-aiplatform.googleapis.com/v1"
+                )]
+            )
+        ));
+        assert!(!provider_profile_endpoints_are_active(
+            &vertex,
+            &provider_with_config(
+                "google-vertex-ai",
+                &[("VERTEX_AI_BASE_URL", "https://aiplatform.example.com/v1")]
+            )
+        ));
+    }
+
+    #[test]
+    fn a_profile_without_endpoints_has_no_boundary_to_contradict() {
+        let google_cloud = openshell_providers::example_profiles::load("google-cloud");
+        assert!(google_cloud.endpoints.is_empty());
+        assert!(provider_profile_endpoints_are_active(
+            &google_cloud,
+            &provider_with_config(
+                "google-cloud",
+                &[("GCP_BASE_URL", "https://anything.example.com")]
+            )
+        ));
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
