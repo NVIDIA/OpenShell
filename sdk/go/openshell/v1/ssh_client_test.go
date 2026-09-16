@@ -170,7 +170,10 @@ func (m *mockSandboxResolver) AttachProvider(_ context.Context, _, _, _ string, 
 func (m *mockSandboxResolver) DetachProvider(_ context.Context, _, _, _ string, _ uint64) (*DetachProviderResult, error) {
 	return nil, nil
 }
-func (m *mockSandboxResolver) ListProviders(_ context.Context, _, _ string) ([]*Provider, error) {
+func (m *mockSandboxResolver) ListProviders(_, _ string, _ ...ListOptions) (*Pager[*Provider], error) {
+	return nil, nil
+}
+func (m *mockSandboxResolver) ListAllProviders(_ context.Context, _, _ string, _ ...ListOptions) ([]*Provider, error) {
 	return nil, nil
 }
 func (m *mockSandboxResolver) WaitReady(_ context.Context, _, _ string, _ ...WaitOptions) (*Sandbox, error) {

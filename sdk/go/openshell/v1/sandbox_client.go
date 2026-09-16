@@ -11,7 +11,6 @@ import (
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
-	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
@@ -229,28 +228,39 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 	}, nil
 }
 
-func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
-	pager := newPager("", func(ctx context.Context, pageToken string) (*Page[*dm.Provider], error) {
+func (s *sandboxClient) ListProviders(workspace, sandboxName string, opts ...ListOptions) (*Pager[*Provider], error) {
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
+	}
+	pageToken := ""
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Provider], error) {
 		resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
 			Sandbox:        sandboxName,
 			WorkspaceScope: namedWorkspaceScope(workspace),
+			PageSize:       pageSize,
 			PageToken:      pageToken,
 		})
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
 		}
-		return &Page[*dm.Provider]{Items: resp.GetProviders(), NextPageToken: resp.GetNextPageToken()}, nil
-	})
-	protos, err := pager.All(ctx)
+		providers := make([]*Provider, 0, len(resp.GetProviders()))
+		for _, proto := range resp.GetProviders() {
+			providers = append(providers, converter.ProviderFromProto(proto))
+		}
+		return &Page[*Provider]{Items: providers, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (s *sandboxClient) ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*Provider, error) {
+	pager, err := s.ListProviders(workspace, sandboxName, opts...)
 	if err != nil {
 		return nil, err
 	}
-
-	providers := make([]*Provider, 0, len(protos))
-	for _, proto := range protos {
-		providers = append(providers, converter.ProviderFromProto(proto))
-	}
-	return providers, nil
+	return pager.All(ctx)
 }
 
 func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {

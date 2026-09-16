@@ -540,7 +540,7 @@ describe('create', () => {
     await sandbox.createSshSession('ssh', { workspace: 'staging' });
     const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
-    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
     await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
@@ -1346,7 +1346,31 @@ describe('providers', () => {
     expect(detach.changed).toBe(false);
   });
 
-  it('lists providers with u64 resourceVersion rendered as a string', async () => {
+  it('lists one provider page with its continuation token', async () => {
+    const pageTokens: string[] = [];
+    const sandbox = client({
+      listSandboxProviders: ({ pageToken, pageSize }) => {
+        pageTokens.push(pageToken);
+        expect(pageSize).toBe(1);
+        return {
+          providers: [
+            {
+              metadata: { id: 'p1', name: 'claude', resourceVersion: 99n },
+              type: 'claude',
+            },
+          ],
+          nextPageToken: 'page-2',
+        };
+      },
+    });
+
+    const page = await sandbox.listProviders('sb', { pageSize: 1 }).nextPage();
+    expect(page).toMatchObject({ nextPageToken: 'page-2' });
+    expect(page?.items.map((provider) => provider.name)).toEqual(['claude']);
+    expect(pageTokens).toEqual(['']);
+  });
+
+  it('lists all providers with u64 resourceVersion rendered as a string', async () => {
     const pageTokens: string[] = [];
     const sandbox = client({
       listSandboxProviders: ({ pageToken }) => {
@@ -1381,7 +1405,7 @@ describe('providers', () => {
             };
       },
     });
-    const providers = await sandbox.listProviders('sb');
+    const providers = await sandbox.listAllProviders('sb');
     expect(providers).toEqual([
       {
         id: 'p1',

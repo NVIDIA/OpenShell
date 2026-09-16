@@ -688,7 +688,30 @@ func TestSandboxListProviders(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ListProviders(context.Background(), "default", "my-sb")
+	pager, err := client.ListProviders("default", "my-sb", ListOptions{PageSize: 1})
+
+	require.NoError(t, err)
+	page, err := pager.NextPage(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, page)
+	assert.Len(t, page.Items, 1)
+	assert.Equal(t, "page-2", page.NextPageToken)
+	require.Len(t, mock.listProviderRequests, 1)
+	assert.Equal(t, "", mock.listProviderRequests[0].GetPageToken())
+	assert.Equal(t, int32(1), mock.listProviderRequests[0].GetPageSize())
+}
+
+func TestSandboxListAllProviders(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.listProviderPages = [][]*dm.Provider{{
+		{Metadata: &dm.ObjectMeta{Name: "claude-prov"}, Type: "claude"},
+	}, {
+		{Metadata: &dm.ObjectMeta{Name: "github-prov"}, Type: "github"},
+	}}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.ListAllProviders(context.Background(), "default", "my-sb", ListOptions{PageSize: 1})
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
@@ -702,7 +725,7 @@ func TestSandboxListProviders_Empty(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ListProviders(context.Background(), "default", "empty-sb")
+	result, err := client.ListAllProviders(context.Background(), "default", "empty-sb")
 
 	require.NoError(t, err)
 	assert.Empty(t, result)
@@ -714,7 +737,9 @@ func TestSandboxListProviders_Error(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.ListProviders(context.Background(), "default", "sb")
+	pager, err := client.ListProviders("default", "sb")
+	require.NoError(t, err)
+	_, err = pager.NextPage(context.Background())
 
 	require.Error(t, err)
 	assert.True(t, IsUnavailable(err))
