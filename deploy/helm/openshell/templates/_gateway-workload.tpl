@@ -11,6 +11,10 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $kubernetesRuntimeConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
 {{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
 {{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
+{{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
+{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
+{{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
@@ -125,6 +129,11 @@ spec:
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
         {{- end }}
+        {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
+        - name: vault-ca
+          mountPath: /etc/openshell-tls/vault
+          readOnly: true
+        {{- end }}
         {{- if $spiffeSocketPath }}
         - name: spiffe-workload-api
           mountPath: {{ dir $spiffeSocketPath | quote }}
@@ -201,6 +210,14 @@ spec:
     - name: oidc-ca
       configMap:
         name: {{ .Values.oidc.caConfigMapName }}
+    {{- end }}
+    {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
+    - name: vault-ca
+      configMap:
+        name: {{ $vaultCaConfigMapName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
     {{- end }}
     {{- if $spiffeSocketPath }}
     - name: spiffe-workload-api

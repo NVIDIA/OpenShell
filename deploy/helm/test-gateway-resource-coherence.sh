@@ -16,10 +16,11 @@ render() {
   helm template resource-coherence "${chart}" \
     --namespace resource-namespace \
     --set agentSandbox.preflight.enabled=false \
+    --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
     "$@" >"${work_dir}/${name}.yaml"
 
   if ! awk 'BEGIN { RS="---" }
-    /^\n?# Source:/ && $0 !~ /\napiVersion:/ {
+    /^\n?# Source:/ && $0 !~ /\napiVersion:/ && $0 !~ /network-policy-ack\.yaml/ {
       print "rendered an empty or invalid Kubernetes document:" $0 > "/dev/stderr"
       exit 1
     }' "${work_dir}/${name}.yaml"; then

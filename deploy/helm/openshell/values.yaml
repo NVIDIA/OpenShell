@@ -262,6 +262,14 @@ server:
 oidc:
   caConfigMapName: ""
 
+# Kubernetes resource references for external credential drivers. Runtime
+# driver settings remain in gatewayConfig.
+credentialDrivers:
+  vault:
+    # -- ConfigMap containing the private Vault/OpenBao CA certificate under
+    # the ca.crt key. Helm mounts it only when the Vault driver is selected.
+    caConfigMapName: ""
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,

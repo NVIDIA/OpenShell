@@ -445,7 +445,7 @@ credential_drivers = ["vault"]
 
 [openshell.credential_drivers.vault]
 address = "https://vault.vault.svc.cluster.local:8200"
-ca_bundle = "/etc/openshell/vault/ca.pem"
+ca_bundle = "/etc/openshell-tls/vault/ca.crt"
 mount = "secret"
 kv_version = "2"
 auth_method = "kubernetes"
@@ -467,7 +467,7 @@ For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secr
 
 For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
-For Helm deployments, set `server.credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and renders `ca_bundle` automatically.
+For Helm deployments, set `credentialDrivers.vault.caConfigMapName` to a ConfigMap containing the private CA bundle under the `ca.crt` key. The chart mounts that key and derives `ca_bundle` automatically.
 
 Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles. Before OpenShell 0.1.0, OpenShell does not automatically migrate inline refresh material or credential handles between drivers. Reconfigure refresh grants after an upgrade. Before changing credential drivers, remove affected credentials while the original driver is still available, then select the new driver and create them again. Do not run mixed gateway versions against the same refresh records.
 

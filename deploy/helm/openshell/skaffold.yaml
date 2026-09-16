@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local dev: builds gateway, sandbox, and supervisor images via tasks/scripts/docker-build-image.sh,
+# Local dev: builds gateway + supervisor images via tasks/scripts/docker-build-image.sh,
 # which first stages Rust binaries natively on the host (using cargo / cargo-zigbuild
 # when cross-compiling) and then builds the image from the prebuilt binary. This
 # mirrors CI and is faster than compiling inside Docker on every rebuild because
@@ -54,23 +54,6 @@ build:
             - crates/**
             - proto/**
             - deploy/docker/Dockerfile.supervisor
-            - tasks/scripts/docker-build-image.sh
-            - tasks/scripts/stage-prebuilt-binaries.sh
-    - image: openshell/sandbox
-      context: ../../..
-      custom:
-        buildCommand: |
-          CONTAINER_ENGINE_TARGET=local-k8s-cluster \
-          IMAGE_NAME="${IMAGE%:*}" \
-          IMAGE_TAG="${IMAGE##*:}" \
-          tasks/scripts/docker-build-image.sh sandbox
-        dependencies:
-          paths:
-            - Cargo.toml
-            - Cargo.lock
-            - crates/**
-            - proto/**
-            - deploy/docker/Dockerfile.sandbox
             - tasks/scripts/docker-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
 deploy:
@@ -141,9 +124,8 @@ deploy:
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
-          sandboxRuntime.image.repository: '{{.IMAGE_REPO_openshell_sandbox}}'
-          sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
-          gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
+          supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
+          supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
   - name: credential-driver-kubernetes-secrets
     patches:

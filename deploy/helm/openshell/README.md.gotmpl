@@ -44,13 +44,12 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
 
 ```shell
-# Precreate the openshell namespace
+# Precreate the namespace before installation.
 oc create ns openshell
 
-# Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
+# Deploy with the required NetworkPolicy enforcement acknowledgement.
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
@@ -108,7 +107,6 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
