@@ -163,6 +163,57 @@ e2e_import_example_provider_profiles() {
   fi
 }
 
+# Register an administrator OIDC session for a gateway, non-interactively.
+#
+# The browser PKCE flow the CLI normally uses cannot run unattended, so mint an
+# admin access token with Keycloak's password grant and write the same token
+# bundle `openshell gateway login` would have stored. Used only to establish a
+# setup identity; the tests themselves still authenticate however they choose.
+e2e_register_oidc_admin_session() {
+  local config_home=$1
+  local name=$2
+  local endpoint=$3
+  local port=$4
+  local issuer=$5
+  local username=$6
+  local password=$7
+  local client_id="${8:-openshell-cli}"
+  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+
+  local token
+  token=$(curl -sf -X POST "${issuer}/protocol/openid-connect/token" \
+    -d "grant_type=password" \
+    -d "client_id=${client_id}" \
+    -d "username=${username}" \
+    -d "password=${password}" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
+
+  if [ -z "${token}" ]; then
+    echo "ERROR: could not obtain an admin OIDC token from ${issuer}" >&2
+    return 1
+  fi
+
+  mkdir -p "${gateway_config_dir}"
+  cat >"${gateway_config_dir}/metadata.json" <<EOF
+{
+  "name": "${name}",
+  "gateway_endpoint": "${endpoint}",
+  "is_remote": false,
+  "gateway_port": ${port},
+  "oidc_issuer": "${issuer}"
+}
+EOF
+  cat >"${gateway_config_dir}/oidc_token.json" <<EOF
+{
+  "access_token": "${token}",
+  "issuer": "${issuer}",
+  "client_id": "${client_id}"
+}
+EOF
+  chmod 600 "${gateway_config_dir}/oidc_token.json"
+  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+}
+
 e2e_toml_string() {
   local value="$1"
   value="${value//\\/\\\\}"

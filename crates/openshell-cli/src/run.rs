@@ -546,12 +546,18 @@ pub async fn sandbox_create(
     let effective_tls = tls.clone();
 
     // Provider profiles are import-only, so the catalog lives on the gateway.
-    // A failure here is not fatal: the credential warning degrades to its
-    // generic form rather than blocking sandbox creation.
-    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
-        .await
-        .unwrap_or_default();
-    warn_credential_env_vars(&environment, &profile_catalog, suppress_credential_warnings);
+    // Keep the lookup's outcome rather than collapsing it: an unreachable
+    // catalog and an empty one mean very different things, and only one of the
+    // two consumers below can safely treat them alike.
+    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace).await;
+
+    // The credential warning is advisory, so it degrades to its generic form
+    // rather than blocking sandbox creation.
+    warn_credential_env_vars(
+        &environment,
+        profile_catalog.as_deref().unwrap_or(&[]),
+        suppress_credential_warnings,
+    );
 
     if template.is_some()
         && (from.is_some()
@@ -587,9 +593,25 @@ pub async fn sandbox_create(
             None => (None, None),
         }
     };
-    let inferred_types: Vec<String> = inferred_provider_type(command, &profile_catalog)
-        .into_iter()
-        .collect();
+    // Inference cannot treat a failed lookup as an authoritative empty catalog:
+    // that would silently create a provider-less sandbox and defer the failure
+    // to the workload. Only consult the catalog when there is a command to
+    // resolve, and surface the lookup failure when there is.
+    let inferred_types: Vec<String> = if command.is_empty() {
+        Vec::new()
+    } else {
+        let catalog = profile_catalog.as_ref().map_err(|error| {
+            miette!(
+                "failed to list provider profiles from gateway '{gateway_name}': {error}. \
+                 Cannot determine which provider '{}' needs; retry, or select one \
+                 explicitly with --provider <name>",
+                command.first().map_or("the command", String::as_str)
+            )
+        })?;
+        inferred_provider_type(command, catalog)
+            .into_iter()
+            .collect()
+    };
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,

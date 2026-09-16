@@ -59,6 +59,9 @@ fn selected_workspace(
 
 #[derive(Clone, Default)]
 struct SandboxState {
+    /// Make `ListProviderProfiles` fail while every other RPC keeps working,
+    /// so a catalog lookup failure can be told apart from an empty catalog.
+    fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
@@ -494,6 +497,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        if self
+            .state
+            .fail_list_provider_profiles
+            .load(Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("profile catalog is unavailable"));
+        }
         let profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
@@ -1523,6 +1533,96 @@ async fn sandbox_delete_continues_after_entry_failure() {
             vec!["failing-sandbox".to_string()],
             vec!["later-sandbox".to_string()]
         ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_fails_when_the_profile_catalog_is_unreachable() {
+    // A failed catalog lookup must not read as an authoritative empty catalog:
+    // that would infer nothing and create a provider-less sandbox, deferring
+    // the failure to the workload.
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    server
+        .openshell
+        .state
+        .fail_list_provider_profiles
+        .store(true, Ordering::SeqCst);
+
+    let error = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("catalog-unavailable"),
+            command: &["claude".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect_err("an unreachable catalog must not silently create a provider-less sandbox");
+
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("provider profiles"),
+        "error should name the failed catalog lookup: {message}"
+    );
+    assert!(
+        message.contains("--provider"),
+        "error should point at explicit selection: {message}"
+    );
+    assert!(
+        server
+            .openshell
+            .state
+            .create_requests
+            .lock()
+            .await
+            .is_empty(),
+        "no sandbox should be created when the catalog lookup failed"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_without_a_command_tolerates_an_unreachable_catalog() {
+    // With no trailing command there is nothing to infer, so the lookup is not
+    // needed and its failure must not block creation.
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    server
+        .openshell
+        .state
+        .fail_list_provider_profiles
+        .store(true, Ordering::SeqCst);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("catalog-unavailable-no-command"),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("a sandbox with no command needs no catalog");
+
+    assert_eq!(
+        server.openshell.state.create_requests.lock().await.len(),
+        1,
+        "the sandbox should still be created"
     );
 }
 
