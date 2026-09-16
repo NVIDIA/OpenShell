@@ -14,6 +14,9 @@
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 [![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
 
+> [!IMPORTANT]
+> **OpenShell 0.1.0 is coming soon.** This release exits alpha with stable APIs and defined upgrade policies. [Track the 0.1.0 milestone](https://github.com/NVIDIA/OpenShell/milestone/10), [read the prerelease documentation](https://docs.nvidia.com/openshell/dev/index.html), or [try the prerelease](#prerelease-and-development-builds).
+
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
 OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
@@ -27,21 +30,15 @@ OpenShell is built agent-first. It ships public agent skills for using and opera
 
 ### Install
 
-**Binary (recommended):**
+**Local installation:**
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
+The installer installs the latest stable release by default. See [Prerelease and development builds](#prerelease-and-development-builds) to install an upcoming release or the latest commit on `main`.
 
-The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv add openshell
-```
-
-**Helm chart:**
+**Kubernetes installation:**
 
 > **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
 
@@ -102,6 +99,44 @@ See the [full walkthrough](examples/sandbox-policy-quickstart/) or run the autom
 
 ```bash
 bash examples/sandbox-policy-quickstart/demo.sh
+```
+
+## SDKs
+
+OpenShell provides client SDKs for Python, TypeScript, Go, and Rust. SDK packages connect applications to an OpenShell gateway; they do not install the `openshell` CLI. Use the SDK and gateway from the same OpenShell release when possible.
+
+### Python
+
+The [Python SDK](python/openshell/) is published to [PyPI](https://pypi.org/project/openshell/):
+
+```shell
+uv add openshell
+```
+
+### TypeScript
+
+The [TypeScript SDK](sdk/typescript/README.md) is published to GitHub Packages as `@nvidia/openshell-sdk`. Configure the `@nvidia` npm scope for `https://npm.pkg.github.com`, authenticate with a token that has `read:packages`, and install it:
+
+```shell
+npm install @nvidia/openshell-sdk
+```
+
+### Go
+
+Add the [Go SDK](sdk/go/README.md) to a Go module:
+
+```shell
+go get github.com/NVIDIA/OpenShell/sdk/go@latest
+```
+
+### Rust
+
+The [Rust SDK](crates/openshell-sdk/README.md) is currently consumed from source. Pin the Git dependency to the same OpenShell release as the gateway:
+
+```shell
+cargo add openshell-sdk \
+  --git https://github.com/NVIDIA/OpenShell \
+  --tag <release-tag>
 ```
 
 ## How It Works
@@ -254,6 +289,48 @@ Agent implementation is human-directed: a user may request a phase directly, or 
 - [Support Matrix](https://docs.nvidia.com/openshell/latest/reference/support-matrix) — platforms, versions, and kernel requirements
 - [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
 - [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors
+
+## Prerelease and development builds
+
+Use a tagged prerelease to evaluate an upcoming release, or use the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
+
+Tagged prerelease artifacts are retained for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias selects the highest prerelease version with a successful release workflow:
+
+```shell
+gh auth login
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=pre sh
+```
+
+Set the full tag to install a specific prerelease:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=v0.1.0-pre.1 sh
+```
+
+The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=dev sh
+```
+
+For Kubernetes, select the corresponding Helm chart version. Helm chart versions omit the leading `v` from release tags:
+
+```shell
+# Tagged prerelease
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.1.0-pre.1
+
+# Rolling development build
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.0-dev
+```
+
+Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
 
 ## Contributing
 

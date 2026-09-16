@@ -20,6 +20,18 @@ The script detects your operating system and installs the OpenShell CLI, standal
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
+### Install a prerelease
+
+Tagged prereleases are stored as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session:
+
+```shell
+gh auth login
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=pre sh
+```
+
+The `pre` alias selects the highest prerelease version with a successful release workflow. To install a specific prerelease instead, set `OPENSHELL_VERSION` to its full tag, such as `v0.1.0-pre.1`. The installer downloads the release bundle, verifies the package checksums, and installs with Debian, RPM, or Homebrew for your platform.
+
 The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with:
 
 ```shell

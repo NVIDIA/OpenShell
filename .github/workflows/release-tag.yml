@@ -407,7 +407,6 @@ jobs:
           cat openshell-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
-        if: needs.compute-versions.outputs.is_prerelease != 'true'
         run: |
           set -euo pipefail
           python3 tasks/scripts/release.py generate-homebrew-formula \

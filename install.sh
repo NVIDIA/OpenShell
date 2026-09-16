@@ -14,10 +14,14 @@ APP_NAME="openshell"
 REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
+RELEASE_ASSET_DIR=""
 CHECKSUMS_NAME="openshell-checksums-sha256.txt"
 LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
+HOMEBREW_CLI_ASSET="openshell-aarch64-apple-darwin.tar.gz"
+HOMEBREW_GATEWAY_ASSET="openshell-gateway-aarch64-apple-darwin.tar.gz"
+HOMEBREW_DRIVER_VM_ASSET="openshell-driver-vm-aarch64-apple-darwin.tar.gz"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
@@ -51,6 +55,9 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
                         Set OPENSHELL_VERSION=dev to install the rolling dev build.
+                        Set OPENSHELL_VERSION=pre to install the latest prerelease.
+                        Tagged prereleases require an authenticated GitHub CLI
+                        session.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 installation.
@@ -328,6 +335,11 @@ guard_breaking_upgrade() {
 }
 
 resolve_release_tag() {
+  if [ "${OPENSHELL_VERSION:-}" = "pre" ]; then
+    resolve_latest_prerelease_tag
+    return 0
+  fi
+
   if [ -n "${OPENSHELL_VERSION:-}" ]; then
     echo "$OPENSHELL_VERSION"
     return 0
@@ -355,10 +367,108 @@ resolve_release_tag() {
   echo "$_version"
 }
 
+is_prerelease_tag() {
+  printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$'
+}
+
+require_prerelease_github_access() {
+  require_cmd gh
+  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    error "GitHub CLI authentication is required for prerelease artifacts; run 'gh auth login' and try again"
+  fi
+}
+
+resolve_latest_prerelease_tag() {
+  require_prerelease_github_access
+
+  info "resolving latest prerelease..."
+  _release_branches="$(gh run list \
+    --repo "$REPO" \
+    --workflow release-tag.yml \
+    --status success \
+    --limit 1000 \
+    --json headBranch \
+    --jq '.[].headBranch')" || {
+    error "failed to list successful release workflow runs"
+  }
+
+  _latest_prerelease="$(printf '%s\n' "$_release_branches" | awk '
+    /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
+      tag = $0
+      sub(/^v/, "", tag)
+      split(tag, version_parts, "-pre\\.")
+      split(version_parts[1], core, "\\.")
+      sequence = version_parts[2] + 0
+
+      if (!found || core[1] + 0 > major ||
+          (core[1] + 0 == major && core[2] + 0 > minor) ||
+          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
+          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
+        selected = $0
+        major = core[1] + 0
+        minor = core[2] + 0
+        patch = core[3] + 0
+        prerelease = sequence
+        found = 1
+      }
+    }
+    END {
+      if (found) print selected
+    }
+  ')"
+
+  if [ -z "$_latest_prerelease" ]; then
+    error "no successful prerelease workflow run found"
+  fi
+
+  printf '%s\n' "$_latest_prerelease"
+}
+
+prepare_prerelease_assets() {
+  _destination="$1"
+
+  is_prerelease_tag "$RELEASE_TAG" || return 0
+
+  require_prerelease_github_access
+
+  info "locating ${RELEASE_TAG} prerelease artifacts..."
+  _run_id="$(gh run list \
+    --repo "$REPO" \
+    --branch "$RELEASE_TAG" \
+    --workflow release-tag.yml \
+    --status success \
+    --limit 1 \
+    --json databaseId \
+    --jq '.[0].databaseId')" || {
+    error "failed to find the release workflow run for ${RELEASE_TAG}"
+  }
+  if [ -z "$_run_id" ] || ! printf '%s\n' "$_run_id" | grep -Eq '^[0-9]+$'; then
+    error "no successful release workflow run found for ${RELEASE_TAG}"
+  fi
+
+  RELEASE_ASSET_DIR="${_destination}/release"
+  info "downloading ${RELEASE_TAG} prerelease artifacts..."
+  gh run download "$_run_id" \
+    --repo "$REPO" \
+    --name "openshell-${RELEASE_TAG}" \
+    --dir "$RELEASE_ASSET_DIR" || {
+    error "failed to download prerelease artifacts for ${RELEASE_TAG}"
+  }
+}
+
 download_release_asset() {
   _tag="$1"
   _filename="$2"
   _output="$3"
+
+  if [ -n "$RELEASE_ASSET_DIR" ]; then
+    _source="${RELEASE_ASSET_DIR}/${_filename}"
+    if [ -f "$_source" ]; then
+      cp "$_source" "$_output"
+      return 0
+    fi
+    return 1
+  fi
 
   if curl -fLs --retry 3 --max-redirs 5 -o "$_output" \
     "${GITHUB_URL}/releases/download/${_tag}/${_filename}"; then
@@ -697,6 +807,28 @@ patch_homebrew_formula() {
 
 }
 
+patch_prerelease_homebrew_formula_urls() {
+  _formula_file="$1"
+
+  [ -n "$RELEASE_ASSET_DIR" ] || return 0
+
+  for _asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET"; do
+    if [ ! -f "${RELEASE_ASSET_DIR}/${_asset}" ]; then
+      error "prerelease bundle is missing the required macOS asset: ${_asset}"
+    fi
+  done
+
+  _release_asset_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}"
+  _local_asset_url="file://${RELEASE_ASSET_DIR}"
+  _patched_file="${_formula_file}.prerelease"
+  sed \
+    -e "s#${_release_asset_url}/${HOMEBREW_CLI_ASSET}#${_local_asset_url}/${HOMEBREW_CLI_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_GATEWAY_ASSET}#${_local_asset_url}/${HOMEBREW_GATEWAY_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#${_local_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#g" \
+    "$_formula_file" >"$_patched_file"
+  mv "$_patched_file" "$_formula_file"
+}
+
 start_user_gateway() {
   info "restarting openshell-gateway user service as ${TARGET_USER}..."
 
@@ -891,11 +1023,11 @@ install_linux_deb() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
+  prepare_prerelease_assets "$_tmpdir"
 
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
   info "downloading ${RELEASE_TAG} release checksums..."
-  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
-    error "failed to download ${_checksums_url}"
+  download_release_asset "$RELEASE_TAG" "$CHECKSUMS_NAME" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${CHECKSUMS_NAME} for ${RELEASE_TAG}"
   }
 
   _deb_file="$(find_deb_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch")"
@@ -903,14 +1035,13 @@ install_linux_deb() {
     error "no Debian package found for architecture: ${_arch}"
   fi
 
-  _deb_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_deb_file}"
   _deb_path="${_tmpdir}/${_deb_file}"
 
   info "selected ${_deb_file}"
 
   info "downloading ${_deb_file}..."
   download_release_asset "$RELEASE_TAG" "$_deb_file" "$_deb_path" || {
-    error "failed to download ${_deb_url}"
+    error "failed to download ${_deb_file} for ${RELEASE_TAG}"
   }
   chmod 0644 "$_deb_path"
 
@@ -931,11 +1062,11 @@ install_linux_rpm() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
+  prepare_prerelease_assets "$_tmpdir"
 
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
   info "downloading ${RELEASE_TAG} release checksums..."
-  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
-    error "failed to download ${_checksums_url}"
+  download_release_asset "$RELEASE_TAG" "$CHECKSUMS_NAME" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${CHECKSUMS_NAME} for ${RELEASE_TAG}"
   }
 
   _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
@@ -961,7 +1092,7 @@ install_linux_rpm() {
 
     info "downloading ${_package_file}..."
     download_release_asset "$RELEASE_TAG" "$_package_file" "$_package_path" || {
-      error "failed to download ${_package_url}"
+      error "failed to download ${_package_file} for ${RELEASE_TAG}"
     }
     chmod 0644 "$_package_path"
 
@@ -984,6 +1115,7 @@ install_macos_homebrew() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
+  prepare_prerelease_assets "$_tmpdir"
 
   _formula_file="${_tmpdir}/openshell.rb"
   _formula_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/openshell.rb"
@@ -993,6 +1125,7 @@ install_macos_homebrew() {
     error "failed to download ${_formula_url}; the selected release may not include a Homebrew formula"
   }
   chmod 0644 "$_formula_file"
+  patch_prerelease_homebrew_formula_urls "$_formula_file"
   patch_homebrew_formula "$_formula_file"
 
   _tap_formula_file="$(homebrew_formula_path "$HOMEBREW_TAP" "$HOMEBREW_FORMULA_NAME")"
