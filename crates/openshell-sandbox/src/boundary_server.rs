@@ -1547,7 +1547,7 @@ mod linux {
         fn discover_image_policy_from_paths(paths: &[&str]) -> Response {
             use std::io::Read as _;
             for path in paths {
-                match std::fs::File::open(path) {
+                match File::open(path) {
                     Ok(file) => {
                         let mut yaml = String::new();
                         if file.take(1_048_577).read_to_string(&mut yaml).is_err()
@@ -1563,7 +1563,7 @@ mod linux {
                             invalid: false,
                         };
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(_) => {
                         return Response::ImagePolicy {
                             yaml: None,
