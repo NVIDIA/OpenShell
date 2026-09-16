@@ -197,7 +197,10 @@ mod linux {
         })?;
         validate_config(&config)?;
         validate_runtime_resource_claims(&config)?;
-        validate_running_identity(&config.workload_identity)?;
+        validate_running_identity(
+            &config.workload_identity,
+            allows_runtime_supplementary_groups(&config),
+        )?;
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
@@ -379,8 +382,29 @@ mod linux {
         groups
     }
 
+    fn allows_runtime_supplementary_groups(config: &BoundaryConfig) -> bool {
+        config
+            .resource_claims
+            .get(GPU_RESOURCE_CLAIM)
+            .is_some_and(|value| value == "true")
+    }
+
+    fn supplementary_groups_match(actual: &[u32], expected: &[u32], allow_extra: bool) -> bool {
+        if allow_extra {
+            // GPU runtimes may add host device-access groups while materializing
+            // an admitted GPU claim. They may extend, but never replace, the
+            // image-derived identity asserted by the compute driver.
+            expected.iter().all(|gid| actual.binary_search(gid).is_ok())
+        } else {
+            actual == expected
+        }
+    }
+
     #[allow(clippy::similar_names)]
-    fn validate_running_identity(expected: &ResolvedWorkloadIdentity) -> Result<(), String> {
+    fn validate_running_identity(
+        expected: &ResolvedWorkloadIdentity,
+        allow_runtime_supplementary_groups: bool,
+    ) -> Result<(), String> {
         let mut real_uid = 0;
         let mut effective_uid = 0;
         let mut saved_uid = 0;
@@ -439,7 +463,11 @@ mod linux {
             }
         }
         let groups = normalized_supplementary_groups(groups, expected.gid);
-        if groups != expected.supplementary_gids {
+        if !supplementary_groups_match(
+            &groups,
+            &expected.supplementary_gids,
+            allow_runtime_supplementary_groups,
+        ) {
             return Err(format!(
                 "sandbox supplementary groups {groups:?} do not match resolved workload {:?}",
                 expected.supplementary_gids
@@ -2217,7 +2245,10 @@ mod linux {
         }
 
         fn measure_confirmation_evidence(&self) -> Result<SandboxConfirmEvidence, String> {
-            validate_running_identity(&self.config.workload_identity)?;
+            validate_running_identity(
+                &self.config.workload_identity,
+                allows_runtime_supplementary_groups(&self.config),
+            )?;
             self.network_broker
                 .confirm_healthy()
                 .map_err(|error| format!("verify sandbox network broker: {error}"))?;
@@ -3684,6 +3715,17 @@ mod linux {
         }
 
         #[test]
+        fn supplementary_group_measurement_rejects_unexpected_groups_by_default() {
+            assert!(!supplementary_groups_match(&[44, 992], &[], false));
+        }
+
+        #[test]
+        fn gpu_runtime_groups_may_extend_but_not_replace_expected_groups() {
+            assert!(supplementary_groups_match(&[44, 992, 1001], &[1001], true));
+            assert!(!supplementary_groups_match(&[44, 992], &[1001], true));
+        }
+
+        #[test]
         fn control_connection_slots_bound_authenticated_sessions() {
             let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS - 1));
             let slot = acquire_control_connection_slot(&active).expect("last available slot");
@@ -4267,7 +4309,7 @@ mod linux {
             };
 
             validate_config(&config).unwrap();
-            validate_running_identity(&config.workload_identity).unwrap();
+            validate_running_identity(&config.workload_identity, false).unwrap();
         }
 
         #[test]
