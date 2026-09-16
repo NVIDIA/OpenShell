@@ -184,7 +184,7 @@ verify_gateway_config_rollout() {
     echo "ERROR: ConfigMap-only gateway configuration change did not update workload checksum" >&2
     return 1
   fi
-  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=5m
+  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=5m || return 1
 
   for attempt in $(seq 1 60); do
     new_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"

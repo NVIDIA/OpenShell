@@ -251,6 +251,9 @@ passes through Helm values into gateway.toml; only this reference is rendered.
 {{- if not (kindIs "string" $name) -}}
 {{- fail (printf "%s must be a Kubernetes Secret name, got %s" $path (kindOf $name)) -}}
 {{- end -}}
+{{- if gt (len $name) 253 -}}
+{{- fail (printf "%s must be no more than 253 characters" $path) -}}
+{{- end -}}
 {{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name) -}}
 {{- fail (printf "%s must be a valid Kubernetes Secret name" $path) -}}
 {{- end -}}
