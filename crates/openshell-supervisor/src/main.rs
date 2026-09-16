@@ -279,7 +279,7 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            openshell_crypto::tls::ensure_default_provider();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -324,7 +324,7 @@ fn main() -> Result<()> {
         .into_diagnostic()?;
 
     let exit_code = runtime.block_on(async move {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let log_push_state = if args.role == SupervisorRole::IsolationBackend
             && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {

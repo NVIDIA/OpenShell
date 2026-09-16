@@ -3283,7 +3283,7 @@ mod linux {
     fn load_tls_server_config(
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> io::Result<rustls::ServerConfig> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
         let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
             .collect::<Result<Vec<_>, _>>()?;
@@ -3525,7 +3525,7 @@ mod linux {
             GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
             generate_sandbox_tls_material,
         };
-        use rcgen::{KeyPair, PKCS_ED25519};
+        use rcgen::PKCS_ED25519;
 
         #[test]
         fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
@@ -3592,7 +3592,8 @@ mod linux {
         }
 
         fn test_verification_key() -> GatewayVerificationKey {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate gateway key");
             GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),
@@ -3600,7 +3601,8 @@ mod linux {
         }
 
         fn test_auth_material(sandbox_id: &str) -> (GatewayVerificationKey, String) {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate gateway key");
             let verification_key = GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),

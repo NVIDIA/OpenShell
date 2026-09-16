@@ -36,9 +36,8 @@ mod session {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use jsonwebtoken::{
-        Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-    };
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode_header};
+    use openshell_crypto::jwt::{decode, encode};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
     use zeroize::Zeroizing;
@@ -807,7 +806,7 @@ mod session {
     }
 
     fn install_crypto_provider() {
-        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+        openshell_crypto::install_jwt_provider();
     }
 
     fn validate_ttl(ttl: Duration) -> Result<(), SessionJwtError> {
@@ -894,8 +893,9 @@ mod tests {
     mod session_tests {
         use std::sync::Arc;
 
-        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-        use rcgen::{KeyPair, PKCS_ED25519};
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use openshell_crypto::jwt::encode;
+        use rcgen::PKCS_ED25519;
         use serde::Serialize;
 
         use super::super::session::*;
@@ -917,7 +917,8 @@ mod tests {
             SessionJwtVerifier,
             SandboxRuntimeIdentity,
         ) {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
             let public_key_pem = key.public_key_pem().into_bytes();
             let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
             let issuer = SessionJwtIssuer::from_ed25519_pem(
@@ -1035,7 +1036,8 @@ mod tests {
 
         #[test]
         fn audience_arrays_are_rejected() {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
             let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
             let verifier = SessionJwtVerifier::new(
                 "test",
