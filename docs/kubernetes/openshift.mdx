@@ -3,68 +3,76 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OpenShift"
 sidebar-title: "OpenShift"
-description: "Install the OpenShell Helm chart on OpenShift with capability-free sandbox workloads."
-keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
+description: "Install the OpenShell Helm chart on OpenShift with the Agent Sandbox controller and NetworkPolicy enforcement."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, Helm, Gateway, Agent Sandbox, NetworkPolicy, Installation"
 position: 6
 ---
 
-The Kubernetes driver resolves the UID range assigned to each OpenShift
-namespace and renders the sandbox and supervisor with a numeric non-root
-identity from that range. OpenShell does not require the `privileged` SCC or any
-added Linux capability.
-
 <Warning>
-Verify that the selected OpenShift runtime profile permits an unprivileged
-process to install a nested seccomp user-notification filter and use Landlock.
-OpenShell fails sandbox startup when either capability-free runtime probe fails.
+The OpenShift install path is experimental. Verify that your CNI enforces ingress and egress NetworkPolicy before acknowledging the isolated sandbox runtime.
 </Warning>
+
+OpenShell uses the Kubernetes Agent Sandbox controller and runs with the
+restricted security posture supported by current OpenShift releases. The chart
+requires an explicit acknowledgement only after the cluster CNI enforces the
+NetworkPolicies that isolate sandbox workloads.
 
 ## Prerequisites
 
-- OpenShift 4.x cluster with `oc` configured.
-- Helm 3.x.
-- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs.
-- A CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces.
+- OpenShift 4.x cluster with `oc` configured
+- Helm 3.x
+- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs installed
 
-## Install OpenShell
+## Install
 
-Pre-create the namespace, then install the chart. Keep the default restricted
-security posture and acknowledge NetworkPolicy only after validating the CNI.
+<Steps>
+
+## Create the namespace
+
+Pre-create the namespace before installing the chart:
 
 ```shell
 oc create ns openshell
+```
+
+## Install the chart
+
+```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
-| Override | Reason |
-|---|---|
-| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
-
-Wait for the gateway:
+## Wait for the gateway to be ready
 
 ```shell
 oc -n openshell rollout status statefulset/openshell
 ```
 
-If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
+If you set `workload.kind=deployment`, use
+`oc -n openshell rollout status deployment/openshell` instead.
 
-## Connect to the Gateway
+</Steps>
 
-Forward the gateway port for local evaluation:
+## Connect to the gateway
+
+The gateway serves its normal TLS listener. Connect with `oc port-forward`:
 
 ```shell
 oc -n openshell port-forward svc/openshell 8080:8080
+```
+
+Register the gateway with the CLI:
+
+```shell
 openshell gateway add https://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
 ## Options for end-to-end TLS
 
-The steps above run the gateway over plaintext HTTP for quick evaluation. For production deployments, choose one of the approaches below based on your OpenShift version and preferences.
+The steps above retain the chart's TLS defaults. For externally exposed production deployments, choose one of the approaches below based on your OpenShift version and preferences.
 
 ### End-to-end TLS using Gateway API and BackendTLSPolicy (OpenShift 4.22+)
 
@@ -139,8 +147,7 @@ Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen h
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.name=openshell-gateway \
@@ -152,7 +159,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 | Override | Reason |
 |---|---|
-| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Let OpenShift's SCC admission assign UIDs. |
+| `supervisor.sandboxRuntime.networkPolicyEnforced=true` | Acknowledge that the cluster CNI enforces ingress and egress NetworkPolicy in sandbox namespaces. |
 | `server.tls.enableMtls=false` | Disable mTLS client certificate authentication. BackendTLSPolicy only validates the server certificate; the ingress proxy cannot present a client certificate to the backend. Use OIDC for authentication instead. |
 | `grpcRoute.enabled=true` | Create a GRPCRoute pointing at the external Gateway. |
 | `grpcRoute.gateway.name` / `namespace` | Reference the Gateway created above in `openshift-ingress`. |
@@ -190,8 +197,7 @@ Install the chart with:
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set certManager.enabled=true \
   --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
