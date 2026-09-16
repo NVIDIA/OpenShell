@@ -654,9 +654,18 @@ fn resolve_docker_identity_from_accounts(
         requested_user
     };
     if user_selector.is_empty() {
-        return Err(Status::failed_precondition(
-            "the pinned image defaults to root; configure a non-root process.run_as_user",
-        ));
+        // The image declares no USER (e.g. a plain Alpine base) and the policy
+        // requested none. Synthesize a numeric non-root identity instead of
+        // rejecting, matching the Podman driver's USER-less default and the
+        // numeric-identity behavior of the Kubernetes and VM drivers.
+        return ResolvedWorkloadIdentity::new(
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            Vec::new(),
+            "default".to_string(),
+            image.id.clone(),
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()));
     }
     let (uid, passwd_entry) = resolve_numeric_or_named_user(user_selector, &passwd)?;
     let username = passwd_entry.map(|entry| entry.name.as_str());
