@@ -86,7 +86,5 @@ certificate or authorization policy into primitive implementations.
 Run `cargo test -p openshell-crypto` for known-answer crypto, tampering, JWT
 validation, context substitution, and isolated global-provider tests. Existing
 bootstrap, credential-store, gateway TLS/OIDC, and proxy tests exercise the
-migrated consumers. `mise run crypto:check` rejects direct backend imports and
-feature selections outside this crate. The cargo-deny Ring restrictions and their
-explicit wrapper exceptions remain in force. A source scan cannot attest the
-behavior of transitive dependencies.
+migrated consumers. The cargo-deny Ring restrictions and their explicit wrapper
+exceptions remain in force.
