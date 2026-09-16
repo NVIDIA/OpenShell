@@ -38,6 +38,14 @@ preflight() {
   "${gateway_bin}" config preflight --path "${toml}"
 }
 
+if helm template parser-validation "${chart}" --namespace parser-namespace \
+  --set agentSandbox.preflight.enabled=false >"${work_dir}/unacknowledged-default.yaml" 2>"${work_dir}/unacknowledged-default.err"; then
+  echo "the chart must require explicit NetworkPolicy enforcement acknowledgement" >&2
+  exit 1
+fi
+grep -F 'supervisor.sandboxRuntime.networkPolicyEnforced must be true' "${work_dir}/unacknowledged-default.err" >/dev/null
+
+# The runtime default is valid after the required infrastructure acknowledgement.
 render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
