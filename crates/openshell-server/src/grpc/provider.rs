@@ -16,7 +16,10 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
-use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
+use crate::storage_proto::{
+    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+    StoredProviderProfile,
+};
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
@@ -3941,7 +3944,9 @@ pub(super) async fn handle_exchange_provider_subject_token(
         token_grant
             .cache_ttl
             .as_ref()
-            .map_or(0, |value| value.seconds),
+            .map(openshell_core::time::duration_to_std)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?,
         provider_credential_expiration_ms(&provider, &subject_token.credential)?
             .unwrap_or_default(),
         supervisor_claims.exp,
@@ -4061,25 +4066,31 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
 
 fn intermediate_token_cache_expires_at_ms(
     token: &oauth::OAuthTokenResponse,
-    cache_ttl_seconds: i64,
+    cache_ttl: Option<std::time::Duration>,
     subject_token_expires_at_ms: i64,
     supervisor_svid_exp_seconds: i64,
 ) -> i64 {
     let now_ms = crate::persistence::current_time_ms();
-    let mut ttl_seconds = if token.expires_in > 0 {
+    let default_ttl_seconds = if token.expires_in > 0 {
         token
             .expires_in
             .min(MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS)
     } else {
         DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS
     };
-    if cache_ttl_seconds > 0 {
-        ttl_seconds = ttl_seconds.min(cache_ttl_seconds);
+    let default_ttl =
+        std::time::Duration::from_secs(u64::try_from(default_ttl_seconds).unwrap_or(u64::MAX));
+    let ttl = cache_ttl.map_or(default_ttl, |override_ttl| override_ttl.min(default_ttl));
+    if ttl.is_zero() {
+        return now_ms;
     }
-    ttl_seconds = ttl_seconds
-        .saturating_sub(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS)
-        .max(1);
-    let mut expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+    let ttl = ttl
+        .saturating_sub(std::time::Duration::from_secs(
+            u64::try_from(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS).unwrap_or(u64::MAX),
+        ))
+        .max(std::time::Duration::from_millis(1));
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+    let mut expires_at_ms = now_ms.saturating_add(ttl_ms);
     expires_at_ms = cap_cache_expiry_ms(expires_at_ms, jwt_exp_ms(&token.access_token));
     expires_at_ms = cap_cache_expiry_ms(expires_at_ms, Some(subject_token_expires_at_ms));
     expires_at_ms = cap_cache_expiry_ms(
@@ -4529,31 +4540,37 @@ pub(super) async fn handle_configure_provider_refresh(
         material_scopes
     };
     let refresh_before_seconds =
-        crate::provider_refresh::parse_material_i64(&request.material, "refresh_before_seconds")?
-            .or_else(|| {
-                refresh_defaults
-                    .as_ref()
-                    .map(|refresh| refresh.refresh_before_seconds)
-            })
-            .unwrap_or_default();
+        crate::provider_refresh::parse_material_i64(&request.material, "refresh_before_seconds")?;
     let max_lifetime_seconds =
-        crate::provider_refresh::parse_material_i64(&request.material, "max_lifetime_seconds")?
-            .or_else(|| {
-                refresh_defaults
-                    .as_ref()
-                    .map(|refresh| refresh.max_lifetime_seconds)
-            })
-            .unwrap_or_default();
-    if refresh_before_seconds < 0 {
+        crate::provider_refresh::parse_material_i64(&request.material, "max_lifetime_seconds")?;
+    if refresh_before_seconds.is_some_and(|value| value < 0) {
         return Err(Status::invalid_argument(
             "refresh_before_seconds material must be greater than or equal to 0",
         ));
     }
-    if max_lifetime_seconds < 0 {
+    if max_lifetime_seconds.is_some_and(|value| value < 0) {
         return Err(Status::invalid_argument(
             "max_lifetime_seconds material must be greater than or equal to 0",
         ));
     }
+    let refresh_before = match refresh_before_seconds {
+        Some(0) => None,
+        Some(seconds) => Some(prost_types::Duration { seconds, nanos: 0 }),
+        None => refresh_defaults.as_ref().and_then(|refresh| {
+            refresh
+                .refresh_before_wkt
+                .to_proto(refresh.refresh_before_seconds)
+        }),
+    };
+    let max_lifetime = match max_lifetime_seconds {
+        Some(0) => None,
+        Some(seconds) => Some(prost_types::Duration { seconds, nanos: 0 }),
+        None => refresh_defaults.as_ref().and_then(|refresh| {
+            refresh
+                .max_lifetime_wkt
+                .to_proto(refresh.max_lifetime_seconds)
+        }),
+    };
     let existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
@@ -4607,8 +4624,8 @@ pub(super) async fn handle_configure_provider_refresh(
             expires_at_ms,
             token_url,
             scopes,
-            refresh_before_seconds,
-            max_lifetime_seconds,
+            refresh_before,
+            max_lifetime,
             additional_output_keys,
         },
     )?;
@@ -6135,8 +6152,8 @@ mod tests {
             nanos: 500_000_000,
         });
         refresh.max_lifetime = Some(prost_types::Duration {
-            seconds: 0,
-            nanos: 0,
+            seconds: 1,
+            nanos: 500_000_000,
         });
         profile.credentials.push(credential);
 
@@ -6178,8 +6195,8 @@ mod tests {
         assert_eq!(
             refresh.max_lifetime,
             Some(prost_types::Duration {
-                seconds: 0,
-                nanos: 0,
+                seconds: 1,
+                nanos: 500_000_000,
             })
         );
     }
@@ -7435,8 +7452,8 @@ mod tests {
                 expires_at_ms,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -9194,8 +9211,14 @@ mod tests {
                 expires_at_ms: 123_456,
                 token_url: "https://refresh.example.com/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(prost_types::Duration {
+                    seconds: 300,
+                    nanos: 0,
+                }),
+                max_lifetime: Some(prost_types::Duration {
+                    seconds: 3600,
+                    nanos: 0,
+                }),
             },
         )
         .unwrap();
@@ -13010,8 +13033,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
             },
         )
         .unwrap();

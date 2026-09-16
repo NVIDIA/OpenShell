@@ -28,7 +28,10 @@ use crate::persistence::{
     DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectListQuery, ObjectType, POLICY_OBJECT_TYPE,
     WriteCondition, current_time_ms,
 };
-use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
+use crate::storage_proto::{
+    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+    StoredProviderProfile,
+};
 use std::collections::HashMap;
 
 pub const WORKSPACE_OBJECT_TYPE: &str = "workspace";

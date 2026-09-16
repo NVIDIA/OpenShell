@@ -121,7 +121,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Ports:          slices.Clone(endpoint.GetPorts()),
 			Path:           endpoint.GetPath(),
 			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
-			LastReportedAt: endpoint.GetLastReportedAt(),
+			LastReportedAt: TimestampStringFromProto(endpoint.GetLastReportedTime()),
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)

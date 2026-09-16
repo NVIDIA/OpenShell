@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestSandboxFromProto(t *testing.T) {
@@ -195,7 +196,7 @@ func TestSandboxFromProto_EndpointStatuses(t *testing.T) {
 			Type: "Ready", Status: "True", Reason: "AllGood", Message: "Sandbox is ready",
 		}},
 		EndpointStatuses: []*pb.EndpointStatus{
-			{EndpointId: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, LastReportedAt: "2026-09-11T10:00:00Z"},
+			{EndpointId: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, LastReportedTime: timestamppb.New(time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC))},
 			{EndpointId: "endpoint-two", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other", LastResult: pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE},
 		},
 	}}

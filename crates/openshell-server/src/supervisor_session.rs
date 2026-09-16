@@ -317,7 +317,7 @@ impl SupervisorSessionRegistry {
         // configured address so a caller can still identify each endpoint.
         for endpoint in &mut status.endpoint_statuses {
             endpoint.last_result = openshell_core::proto::EndpointResult::NoObservedExchange as i32;
-            endpoint.last_reported_at.clear();
+            endpoint.last_reported_time = None;
         }
     }
 
@@ -1266,7 +1266,7 @@ mod tests {
             ports: vec![443],
             path: "/mcp".to_string(),
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+            last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
         };
         let ready = SandboxCondition {
             r#type: "Ready".to_string(),
@@ -1280,7 +1280,7 @@ mod tests {
         });
         let unknown = EndpointStatus {
             last_result: EndpointResult::NoObservedExchange as i32,
-            last_reported_at: String::new(),
+            last_reported_time: None,
             ..endpoint.clone()
         };
 

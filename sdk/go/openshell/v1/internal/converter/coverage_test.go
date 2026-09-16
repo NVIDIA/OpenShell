@@ -144,12 +144,12 @@ func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 	handled := fieldSet{
-		"endpoint_id":      true,
-		"host":             true,
-		"ports":            true,
-		"path":             true,
-		"last_result":      true,
-		"last_reported_at": true,
+		"endpoint_id":        true,
+		"host":               true,
+		"ports":              true,
+		"path":               true,
+		"last_result":        true,
+		"last_reported_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)

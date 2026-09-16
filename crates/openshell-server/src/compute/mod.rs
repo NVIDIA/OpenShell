@@ -6748,7 +6748,7 @@ mod tests {
             ports: vec![443],
             path: "/mcp".to_string(),
             last_result: openshell_core::proto::EndpointResult::TransportFailed as i32,
-            last_reported_at: "2026-09-05T01:01:00.000Z".to_string(),
+            last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
         };
         sandbox.status = Some(SandboxStatus {
             sandbox_name: "sandbox-name".to_string(),

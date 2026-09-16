@@ -22,7 +22,10 @@ use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::{info, warn};
 
-use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
+use crate::storage_proto::{
+    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+    StoredRefreshMaterialDeletion,
+};
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
@@ -360,8 +363,8 @@ pub struct NewRefreshStateConfig {
     pub expires_at_ms: i64,
     pub token_url: String,
     pub scopes: Vec<String>,
-    pub refresh_before_seconds: i64,
-    pub max_lifetime_seconds: i64,
+    pub refresh_before: Option<prost_types::Duration>,
+    pub max_lifetime: Option<prost_types::Duration>,
     /// Resolved semantic output id -> concrete env key for credentials this
     /// refresh co-mints beyond its primary. Pinned from the profile's
     /// `additional_outputs` at configure time.
@@ -375,15 +378,24 @@ pub fn new_refresh_state(
     credential_key: &str,
     config: NewRefreshStateConfig,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
+    if let Some(value) = config.refresh_before.as_ref() {
+        openshell_core::time::duration_to_std(value)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    if let Some(value) = config.max_lifetime.as_ref() {
+        let duration = openshell_core::time::duration_to_std(value)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if duration.is_zero() {
+            return Err(Status::invalid_argument(
+                "max_lifetime must be greater than zero when present",
+            ));
+        }
+    }
     let provider_id = provider.object_id().to_string();
     let provider_name = provider.object_name().to_string();
     let now_ms = current_time_ms();
-    let next_refresh_at_ms = next_refresh_at_ms(
-        config.expires_at_ms,
-        config.refresh_before_seconds,
-        config.max_lifetime_seconds,
-        now_ms,
-    );
+    let next_refresh_at_ms =
+        next_refresh_at_ms(config.expires_at_ms, config.refresh_before.as_ref());
     Ok(StoredProviderCredentialRefreshState {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -408,8 +420,8 @@ pub fn new_refresh_state(
         last_error: String::new(),
         token_url: config.token_url,
         scopes: config.scopes,
-        refresh_before_seconds: config.refresh_before_seconds,
-        max_lifetime_seconds: config.max_lifetime_seconds,
+        refresh_before: config.refresh_before,
+        max_lifetime: config.max_lifetime,
         additional_output_keys: config.additional_output_keys,
         authorization_epoch: uuid::Uuid::new_v4().to_string(),
         secret_material_handles: HashMap::new(),
@@ -573,19 +585,37 @@ struct GoogleServiceAccountClaims<'a> {
 
 pub fn next_refresh_at_ms(
     expires_at_ms: i64,
-    refresh_before_seconds: i64,
-    _max_lifetime_seconds: i64,
-    _now_ms: i64,
+    refresh_before: Option<&prost_types::Duration>,
 ) -> i64 {
-    let refresh_before_seconds = if refresh_before_seconds > 0 {
-        refresh_before_seconds
-    } else {
-        DEFAULT_REFRESH_BEFORE_SECONDS
-    };
+    let refresh_before = refresh_before
+        .and_then(|value| openshell_core::time::duration_to_std(value).ok())
+        .unwrap_or_else(|| {
+            Duration::from_secs(u64::try_from(DEFAULT_REFRESH_BEFORE_SECONDS).unwrap_or(u64::MAX))
+        });
+    let refresh_before_ms = refresh_before.as_millis().saturating_add(u128::from(
+        !refresh_before.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    let refresh_before_ms = i64::try_from(refresh_before_ms).unwrap_or(i64::MAX);
     if expires_at_ms > 0 {
-        return expires_at_ms.saturating_sub(refresh_before_seconds.saturating_mul(1000));
+        return expires_at_ms.saturating_sub(refresh_before_ms);
     }
     0
+}
+
+// OAuth/JWT expiry fields use whole seconds. Round an exact positive profile
+// duration up only at that protocol boundary so a fractional lifetime never
+// collapses into the absent/default sentinel.
+fn max_lifetime_seconds(state: &StoredProviderCredentialRefreshState) -> i64 {
+    let Some(value) = state.max_lifetime.as_ref() else {
+        return DEFAULT_MAX_LIFETIME_SECONDS;
+    };
+    let Ok(duration) = openshell_core::time::duration_to_std(value) else {
+        return DEFAULT_MAX_LIFETIME_SECONDS;
+    };
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0));
+    i64::try_from(seconds).unwrap_or(i64::MAX).max(1)
 }
 
 fn seconds_until_ms(now_ms: i64, target_ms: i64) -> i64 {
@@ -938,12 +968,8 @@ pub async fn refresh_provider_credential(
             }
             state.expires_at_ms = minted.expires_at_ms;
             set_refresh_expiration_presence(&mut state, true);
-            state.next_refresh_at_ms = next_refresh_at_ms(
-                minted.expires_at_ms,
-                state.refresh_before_seconds,
-                state.max_lifetime_seconds,
-                now_ms,
-            );
+            state.next_refresh_at_ms =
+                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
             state.last_refresh_at_ms = now_ms;
             state.status = "refreshed".to_string();
             state.last_error.clear();
@@ -1343,7 +1369,7 @@ async fn mint_oauth2_refresh_token(
     request_token(
         &token_url,
         &form,
-        state.max_lifetime_seconds,
+        max_lifetime_seconds(state),
         OAuthGrantKind::UserRefreshToken,
     )
     .await
@@ -1368,7 +1394,7 @@ async fn mint_oauth2_client_credentials(
     request_token(
         &token_url,
         &form,
-        state.max_lifetime_seconds,
+        max_lifetime_seconds(state),
         OAuthGrantKind::NonInteractive,
     )
     .await
@@ -1390,11 +1416,7 @@ async fn mint_google_service_account_jwt(
     }
     let now_ms = current_time_ms();
     let now_secs = now_ms / 1000;
-    let lifetime_secs = if state.max_lifetime_seconds > 0 {
-        state.max_lifetime_seconds.min(DEFAULT_MAX_LIFETIME_SECONDS)
-    } else {
-        DEFAULT_MAX_LIFETIME_SECONDS
-    };
+    let lifetime_secs = max_lifetime_seconds(state).min(DEFAULT_MAX_LIFETIME_SECONDS);
     let subject = material_value(&state.material, &["subject", "sub"]);
     let claims = GoogleServiceAccountClaims {
         iss: &client_email,
@@ -1491,11 +1513,7 @@ async fn mint_aws_sts_assume_role(
     };
     let client = aws_sdk_sts::Client::from_conf(sts_config);
 
-    let max_lifetime_i64 = if state.max_lifetime_seconds > 0 {
-        state.max_lifetime_seconds
-    } else {
-        DEFAULT_MAX_LIFETIME_SECONDS
-    };
+    let max_lifetime_i64 = max_lifetime_seconds(state);
     let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
     let max_lifetime_ms = i64::from(max_lifetime).saturating_mul(1000);
 
@@ -2045,15 +2063,40 @@ mod tests {
         RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
         enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
-        list_refresh_states_for_provider, new_refresh_state, put_refresh_state,
-        read_bounded_oauth_error_body, refresh_has_expiration, refresh_material_scope,
-        refresh_provider_credential, refresh_state_name, refresh_status_from_state,
-        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
-        set_refresh_expiration_presence, validate_secret_material_references,
+        list_refresh_states_for_provider, max_lifetime_seconds, new_refresh_state,
+        next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
+        refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
+        validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
-    use crate::storage_proto::StoredProviderCredentialRefreshState;
+    use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+
+    fn proto_duration(seconds: i64) -> prost_types::Duration {
+        prost_types::Duration { seconds, nanos: 0 }
+    }
+
+    #[test]
+    fn exact_refresh_durations_preserve_fractional_values_until_protocol_boundaries() {
+        let refresh_before = prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        };
+        assert_eq!(next_refresh_at_ms(10_000, Some(&refresh_before)), 9_500);
+        let submillisecond = prost_types::Duration {
+            seconds: 0,
+            nanos: 1,
+        };
+        assert_eq!(next_refresh_at_ms(10_000, Some(&submillisecond)), 9_999);
+
+        let state = StoredProviderCredentialRefreshState {
+            max_lifetime: Some(refresh_before),
+            ..Default::default()
+        };
+        assert_eq!(max_lifetime_seconds(&state), 1);
+    }
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
@@ -2135,8 +2178,8 @@ mod tests {
             expires_at_ms: 0,
             token_url: "https://issuer.example/token".to_string(),
             scopes: vec!["scope".to_string()],
-            refresh_before_seconds: 300,
-            max_lifetime_seconds: 3600,
+            refresh_before: Some(proto_duration(300)),
+            max_lifetime: Some(proto_duration(3600)),
             additional_output_keys: HashMap::new(),
         };
         let first = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
@@ -2504,8 +2547,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "not-an-absolute-url".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2578,8 +2621,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2656,8 +2699,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://graph.microsoft.com/.default".to_string()],
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -2746,8 +2789,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2879,8 +2922,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -2970,8 +3013,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://graph.microsoft.com/.default".to_string()],
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -3087,8 +3130,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3180,8 +3223,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3290,8 +3333,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://www.googleapis.com/auth/drive.readonly".to_string()],
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3343,8 +3386,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
             },
         )
         .unwrap();
@@ -3394,8 +3437,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "https://issuer.example/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3451,8 +3494,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "https://issuer.example/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3607,8 +3650,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3703,8 +3746,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3778,8 +3821,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4115,8 +4158,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4182,8 +4225,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4263,8 +4306,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4384,8 +4427,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();

@@ -2493,7 +2493,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "ports": endpoint.ports,
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
-                    "last_reported_at": endpoint.last_reported_at,
+                    "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
                 })
             })
             .collect::<Vec<_>>()
@@ -2586,8 +2586,11 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         EndpointResult::UpstreamRejected => "Server rejected the request (HTTP 400 or higher).",
     };
     // The gateway supplies acceptance time, which can follow the actual
-    // exchange. An empty timestamp means there is no accepted observation.
-    let reported_at = non_empty_or(&endpoint.last_reported_at, "no report yet");
+    // exchange. An absent timestamp means there is no accepted observation.
+    let reported_at = endpoint
+        .last_reported_time
+        .as_ref()
+        .map_or_else(|| "no report yet".to_string(), ToString::to_string);
     vec![
         format!(
             "{} (ports: {ports}; path: {})",
@@ -7377,7 +7380,7 @@ mod tests {
                     ports: vec![443, 8443],
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
-                    last_reported_at: "2026-09-05T10:01:00Z".to_string(),
+                    last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
@@ -7438,7 +7441,7 @@ mod tests {
             ports: vec![443, 8443],
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
-            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
         };
 
         assert_eq!(
@@ -7459,7 +7462,7 @@ mod tests {
             ports: vec![443],
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
-            last_reported_at: String::new(),
+            last_reported_time: None,
         };
 
         assert_eq!(
@@ -7499,7 +7502,7 @@ mod tests {
             ports: vec![443],
             path: "/mcp".to_string(),
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
             ..Default::default()
         };
         assert_eq!(

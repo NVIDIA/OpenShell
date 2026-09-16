@@ -65,25 +65,25 @@ impl ObjectWorkspace for StoredProviderProfile {
     }
 }
 
-impl ObjectId for StoredProviderCredentialRefreshState {
+impl ObjectId for StoredProviderCredentialRefreshStateV2 {
     fn object_id(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
-impl ObjectName for StoredProviderCredentialRefreshState {
+impl ObjectName for StoredProviderCredentialRefreshStateV2 {
     fn object_name(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
-impl ObjectLabels for StoredProviderCredentialRefreshState {
+impl ObjectLabels for StoredProviderCredentialRefreshStateV2 {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
 }
 
-impl SetResourceVersion for StoredProviderCredentialRefreshState {
+impl SetResourceVersion for StoredProviderCredentialRefreshStateV2 {
     fn set_resource_version(&mut self, version: u64) {
         if let Some(meta) = self.metadata.as_mut() {
             meta.resource_version = version;
@@ -91,13 +91,13 @@ impl SetResourceVersion for StoredProviderCredentialRefreshState {
     }
 }
 
-impl GetResourceVersion for StoredProviderCredentialRefreshState {
+impl GetResourceVersion for StoredProviderCredentialRefreshStateV2 {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }
 }
 
-impl ObjectWorkspace for StoredProviderCredentialRefreshState {
+impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }
@@ -116,11 +116,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "79c72615d957fc0653c672f61998bf7d8d21b757bc05d07b3fff92bd70fc8f52";
+        "574bf5fcff731bd6e3fd84ed3f124161035bd236ef0fb7e32b4d8a8c55ceba5e";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "6905fc2ecaf27b4b8be69758a800ca1988134eaf9ff379f4aa2d2e9304274eb4";
+        "3c2ad1ef3f38b9bfe029252974e261fb9adf440cebc60acf4b2ff5088f7ba6aa";
     const DURABLE_SCHEMA_SHA256: &str =
-        "2c69587b9d0c6cdd7d7fcb9605818fd2f758ae00e4b47eadd67eebc8b9f7fa67";
+        "65066c0b0eef57a4c708f20fcbbb8e8f47376da9f4bf73dfc3bca0b3df174ba8";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "39e8aaf0d1fbc86906c49a9e7f60641a3ce203d3130799c8065e09acf9d53ddf";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -138,12 +138,13 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
-    const STORAGE_MESSAGE_NAMES: [&str; 7] = [
+    const STORAGE_MESSAGE_NAMES: [&str; 8] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
         "StoredDraftChunk",
         "StoredPolicyRevision",
         "StoredProviderCredentialRefreshState",
+        "StoredProviderCredentialRefreshStateV2",
         "StoredProviderProfile",
         "StoredRefreshMaterialDeletion",
     ];
@@ -153,7 +154,7 @@ mod tests {
         ".openshell.sandbox.v1.SandboxPolicy",
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
-        ".openshell.storage.v1.StoredProviderCredentialRefreshState",
+        ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
@@ -692,7 +693,7 @@ mod tests {
         }
 
         let refresh = current_store
-            .get_message::<StoredProviderCredentialRefreshState>("legacy-id")
+            .get_message::<StoredProviderCredentialRefreshStateV2>("legacy-id")
             .await
             .expect("decode refresh fixture")
             .expect("refresh fixture must remain present");

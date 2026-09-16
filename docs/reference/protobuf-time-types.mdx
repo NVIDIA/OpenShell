@@ -6,6 +6,10 @@ description: Timestamp and duration representation in the OpenShell API
 OpenShell represents absolute times with `google.protobuf.Timestamp` and
 elapsed times with `google.protobuf.Duration` in its protobuf APIs.
 
+Provider profile YAML and JSON accept canonical duration strings such as
+`cache_ttl: "0.500s"`. The legacy `cache_ttl_seconds`, `refresh_before_seconds`,
+and `max_lifetime_seconds` inputs remain supported for existing profiles.
+
 In protobuf JSON, timestamps are RFC 3339 strings and durations are strings
 ending in `s`:
 

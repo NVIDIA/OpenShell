@@ -335,8 +335,8 @@ credentials:
       strategy: oauth2_client_credentials
       token_url: https://login.example.com/oauth2/token
       scopes: [api.read, api.write]
-      refresh_before_seconds: 300
-      max_lifetime_seconds: 3600
+      refresh_before: "300s"
+      max_lifetime: "3600s"
       material:
         - name: client_id
           description: OAuth client ID
@@ -358,7 +358,7 @@ credentials:
       jwt_svid_audience: https://login.example.com/realms/custom
       client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
       scopes: [api.read, api.write]
-      cache_ttl_seconds: 300
+      cache_ttl: "300s"
       requested_token_type: urn:ietf:params:oauth:token-type:access_token
       subject_token:
         source: provider_credential
@@ -419,6 +419,12 @@ binaries:
   - /usr/bin/curl
   - /usr/local/bin/custom-cli
 ```
+
+Duration fields use protobuf duration strings and preserve fractional seconds.
+An absent `refresh_before` uses the gateway default, while `"0s"` refreshes at
+expiry. An absent `max_lifetime` uses the strategy default; an explicit zero
+maximum lifetime is invalid. Existing `*_seconds` fields remain accepted on
+import for compatibility.
 
 ### Profile Sections
 
@@ -541,7 +547,7 @@ Token grant fields:
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
+| `cache_ttl` | No | Protobuf-duration cache override, such as `300s` or `0.500s`. Omission uses the token response expiry; `0s` disables caching. The legacy `cache_ttl_seconds` input remains accepted. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |

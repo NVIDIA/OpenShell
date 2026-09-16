@@ -3227,6 +3227,8 @@ message ReportEndpointStatusResponse {}
 // A configured endpoint and its last accepted network result in one record.
 // Address fields contain policy selectors, never request URLs or credentials.
 message EndpointStatus {
+  reserved 6;
+  reserved "last_reported_at";
   // Stable identifier for selecting this endpoint without parsing display text.
   string endpoint_id = 1;
   // Lowercase configured endpoint host.
@@ -3239,8 +3241,8 @@ message EndpointStatus {
   // Last accepted result, aggregated across configured callers and ports.
   // NoObservedExchange retains the address and has no report timestamp.
   EndpointResult last_result = 5;
-  // RFC 3339 UTC time when the gateway accepted the observation. This is not
-  // the request time: still-valid evidence can be reaccepted after a reset.
-  // Identical same-sequence retries do not advance it.
-  string last_reported_at = 6;
+  // Time when the gateway accepted the observation. This is not the request
+  // time: still-valid evidence can be reaccepted after a reset. Identical
+  // same-sequence retries do not advance it. Absent until a result is reported.
+  google.protobuf.Timestamp last_reported_time = 106;
 }

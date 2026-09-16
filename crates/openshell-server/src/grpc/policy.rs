@@ -33,7 +33,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use crate::storage_proto::StoredProviderCredentialRefreshState;
+use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
@@ -4326,7 +4326,7 @@ pub(super) async fn handle_report_policy_status(
                             sandbox,
                             endpoints,
                             &HashSet::new(),
-                            "",
+                            &prost_types::Timestamp::default(),
                         );
                     }
                 },
