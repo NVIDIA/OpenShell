@@ -1838,7 +1838,9 @@ fn validate_no_cross_protocol_overlap(
 ) -> Result<(), PolicyValidationError> {
     let mut protocols = AuthorityAttributeIndex::default();
     let mut allowed_ips = AuthorityAttributeIndex::default();
+    let mut implicit_modes = AuthorityAttributeIndex::default();
     let mut different_allowed_ips_overlap = false;
+    let mut different_implicit_ip_modes_overlap = false;
     let mut different_protocols_overlap = false;
     for endpoint in policy
         .network_policies
@@ -1854,6 +1856,12 @@ fn validate_no_cross_protocol_overlap(
         different_allowed_ips_overlap |=
             allowed_ips.overlaps_with_different(&host, &ports, &endpoint.allowed_ips);
         different_protocols_overlap |= protocols.overlaps_with_different(&host, &ports, &protocol);
+        if endpoint.allowed_ips.is_empty() {
+            let wildcard = endpoint.host.contains('*');
+            different_implicit_ip_modes_overlap |=
+                implicit_modes.overlaps_with_different(&host, &ports, &wildcard);
+            implicit_modes.insert(&host, &ports, &wildcard);
+        }
         allowed_ips.insert(&host, &ports, &endpoint.allowed_ips);
         protocols.insert(&host, &ports, &protocol);
     }
@@ -1862,23 +1870,6 @@ fn validate_no_cross_protocol_overlap(
             "has overlapping endpoints with different allowed_ips; runtime first-endpoint selection is not modeled",
         )
         .into());
-    }
-    let mut different_implicit_ip_modes_overlap = false;
-    for rule in policy.network_policies.values() {
-        let mut implicit_modes = AuthorityAttributeIndex::default();
-        for endpoint in &rule.endpoints {
-            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                return Err(PolicyValidationError::Cancelled);
-            }
-            if endpoint.allowed_ips.is_empty() {
-                let host = endpoint.host.to_ascii_lowercase();
-                let ports = endpoint.effective_ports();
-                let wildcard = endpoint.host.contains('*');
-                different_implicit_ip_modes_overlap |=
-                    implicit_modes.overlaps_with_different(&host, &ports, &wildcard);
-                implicit_modes.insert(&host, &ports, &wildcard);
-            }
-        }
     }
     if different_implicit_ip_modes_overlap {
         return Err(UnsupportedFeature::policy_shape(
@@ -2489,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn host_wildcard_zero_length_suffix_preserves_exact_deny() {
+    fn overlapping_exact_deny_and_wildcard_is_unsupported() {
         let boundary = parse(
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: GET, path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
@@ -2497,14 +2488,14 @@ mod tests {
             "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
-        assert!(matches!(
-            result,
-            CheckResult::Exceeds(ref evidence)
-                if matches!(
-                    evidence.counterexample(),
-                    Counterexample::Network { host, .. } if host == "api.example.com"
-                )
-        ));
+        assert!(
+            matches!(
+                result,
+                CheckResult::Unsupported(ref evidence)
+                    if evidence.reason().contains("different implicit destination IP modes")
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

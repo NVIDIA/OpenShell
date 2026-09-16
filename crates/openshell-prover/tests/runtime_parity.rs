@@ -314,10 +314,15 @@ network_policies:
         &input,
         "data.openshell.sandbox.allow_request"
     ));
-    assert!(matches!(
-        check(boundary, candidate),
-        CheckResult::Exceeds(_)
-    ));
+    let result = check(boundary, candidate);
+    assert!(
+        matches!(
+            result,
+            CheckResult::Unsupported(ref evidence)
+                if evidence.reason().contains("different implicit destination IP modes")
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]
