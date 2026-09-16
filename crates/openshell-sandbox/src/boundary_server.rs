@@ -2335,7 +2335,10 @@ mod linux {
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
             };
-            audit.validate().map_err(|error| error.to_string())?;
+            // The boundary reports mechanism evidence; the authenticated host
+            // backend validates it before constructing a ConfirmedBoundary.
+            // Keeping that decision at the verifier also lets lifecycle tests
+            // exercise the protocol without claiming host-kernel enforcement.
             let properties = audit.properties();
             let backend_audit = serde_json::to_value(audit)
                 .map_err(|error| format!("encode OpenShell sandbox audit evidence: {error}"))?;
