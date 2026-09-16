@@ -52,7 +52,7 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `gatewayConfig.openshell.drivers.kubernetes.default_image` / `supervisor_image` for the sandbox runtime.
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway, `gatewayConfig.openshell.drivers.kubernetes.default_image` for default sandbox images, and `sandboxRuntime.image` / `supervisor.image` for isolated runtime images.
 </Note>
 
 Confirm the controller pod is running before proceeding:
@@ -113,6 +113,7 @@ helm upgrade --install openshell \
   --namespace openshell \
   --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workspaceResources.enabled=false \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.sandboxNamespace=app-a
 
 helm upgrade --install openshell-workspace \

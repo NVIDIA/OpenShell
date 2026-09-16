@@ -35,11 +35,16 @@ server:
   disableTls: false
 
 gatewayConfig:
-  openshell.drivers.kubernetes:
-    supervisor_image_pull_policy: always
-    image_pull_policy: always
   openshell.gateway.auth:
     allow_unauthenticated_users: true
+
+sandboxRuntime:
+  image:
+    pullPolicy: Always
+
+supervisor:
+  image:
+    pullPolicy: Always
 
 openshiftRoute:
   enabled: true
