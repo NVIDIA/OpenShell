@@ -239,7 +239,7 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         ConfirmedBoundary::try_new(
             Box::new(MockReady::<K> { _k: PhantomData }),
-            confirmation_evidence(),
+            confirmation(),
             &workload_identity(),
         )
     }
@@ -368,40 +368,16 @@ fn workload_identity() -> ResolvedWorkloadIdentity {
     .unwrap()
 }
 
-fn confirmation_evidence() -> SandboxConfirmEvidence {
-    SandboxConfirmEvidence {
+fn confirmation() -> BoundaryConfirmation {
+    BoundaryConfirmation {
         generation: "generation-1".to_string(),
         identity: workload_identity(),
-        capabilities: CapabilityEvidence {
-            inheritable: 0,
-            permitted: 0,
-            effective: 0,
-            bounding: 0,
-            ambient: 0,
+        properties: BoundaryProperties {
+            filesystem_confinement: EnforcedProperty::new(true, "mock-filesystem"),
+            egress_interception: EnforcedProperty::new(true, "mock-egress"),
+            request_attribution: EnforcedProperty::new(true, "mock-attribution"),
+            privilege_floor: EnforcedProperty::new(true, "mock-privilege-floor"),
         },
-        no_new_privileges: true,
-        sandbox_dumpable: false,
-        child_dumpable: true,
-        core_limit_zero: true,
-        native_architecture: std::env::consts::ARCH.to_string(),
-        kernel_release: "test".to_string(),
-        seccomp: SeccompEvidence {
-            new_listener: true,
-            notification_round_trip: true,
-            id_validation: true,
-            addfd_send: true,
-            retained_socket_operation: true,
-            proc_fd_identity: true,
-            task_memory_read: true,
-            task_memory_write: true,
-            cancellation: true,
-        },
-        landlock_abi: 3,
-        landlock_allow_deny: true,
-        udp_dns_round_trip: true,
-        tcp_dns_round_trip: true,
-        tcp_allow_round_trip: true,
-        tcp_deny_round_trip: true,
         authenticated_supervisor: true,
         session_id: SandboxSessionId::new(),
         driver_fence: DriverFenceEvidence::Vm {
@@ -410,6 +386,7 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
         },
         runtime_exit_terminates_workload: true,
         resource_claims: BTreeMap::new(),
+        backend_audit: serde_json::json!({"backend": "mock"}),
     }
 }
 
@@ -458,7 +435,7 @@ async fn drive(
     let _ingress = bound.network_mediation_source();
     assert_eq!(bound.host_gateway_ip(), None);
     let confirmed = bound.confirm().await?;
-    confirmed.evidence().validate(&sandbox_ctx().identity)?;
+    confirmed.confirmation().validate(&sandbox_ctx().identity)?;
     confirmed.into_boundary().start_agent().await
 }
 
@@ -536,12 +513,12 @@ async fn one_driver_runs_both_backends() {
 }
 
 #[test]
-fn confirmation_constructor_rejects_incomplete_evidence() {
-    let mut evidence = confirmation_evidence();
-    evidence.seccomp.cancellation = false;
+fn confirmation_constructor_rejects_unenforced_property() {
+    let mut confirmation = confirmation();
+    confirmation.properties.egress_interception.enforced = false;
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
-        evidence,
+        confirmation,
         &workload_identity(),
     );
     assert!(matches!(result, Err(BackendError::Confirm(_))));
@@ -559,7 +536,7 @@ fn confirmation_constructor_rejects_another_workload_identity() {
     .unwrap();
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
-        confirmation_evidence(),
+        confirmation(),
         &expected,
     );
     assert!(matches!(result, Err(BackendError::Confirm(_))));
@@ -842,16 +819,16 @@ fn workload_identity_rejects_root_and_normalizes_groups() {
 }
 
 #[test]
-fn confirmation_evidence_rejects_identity_or_posture_drift() {
+fn confirmation_rejects_identity_or_property_drift() {
     let expected = workload_identity();
-    let evidence = confirmation_evidence();
-    evidence.validate(&expected).unwrap();
+    let baseline = confirmation();
+    baseline.validate(&expected).unwrap();
 
-    let mut drifted = confirmation_evidence();
-    drifted.capabilities.effective = 1;
+    let mut drifted = confirmation();
+    drifted.properties.privilege_floor.enforced = false;
     assert!(drifted.validate(&expected).is_err());
 
-    let mut unmanaged = confirmation_evidence();
+    let mut unmanaged = confirmation();
     unmanaged.runtime_exit_terminates_workload = false;
     assert!(unmanaged.validate(&expected).is_err());
 
@@ -863,7 +840,7 @@ fn confirmation_evidence_rejects_identity_or_posture_drift() {
         "sha256:test".into(),
     )
     .unwrap();
-    assert!(evidence.validate(&different).is_err());
+    assert!(baseline.validate(&different).is_err());
 }
 
 // ---------------------------------------------------------------------------

@@ -307,17 +307,27 @@ impl BoundBoundary for RemoteBound {
 
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
-        let Response::Confirmed { evidence } = response else {
-            return Err(unexpected_response("confirmed_with_evidence", &response));
+        let Response::Confirmed { confirmation } = response else {
+            return Err(unexpected_response("confirmed", &response));
         };
-        if evidence.generation != self.generation
-            || evidence.session_id != self.session_id
-            || evidence.resource_claims != self.resource_claims
-            || evidence.driver_fence != self.driver_fence
+        if confirmation.generation != self.generation
+            || confirmation.session_id != self.session_id
+            || confirmation.resource_claims != self.resource_claims
+            || confirmation.driver_fence != self.driver_fence
         {
             return Err(BackendError::Confirm(
                 "sandbox confirmation generation, session, resource claims, or driver fence do not match runtime descriptor"
                     .to_string(),
+            ));
+        }
+        let audit: crate::boundary_protocol::OpenShellSandboxAuditEvidence =
+            serde_json::from_value(confirmation.backend_audit.clone()).map_err(|error| {
+                BackendError::Confirm(format!("decode OpenShell sandbox audit evidence: {error}"))
+            })?;
+        audit.validate()?;
+        if confirmation.properties != audit.properties() {
+            return Err(BackendError::Confirm(
+                "sandbox confirmation properties do not match OpenShell audit evidence".to_string(),
             ));
         }
         self.client.start_credential_monitor();
@@ -330,7 +340,7 @@ impl BoundBoundary for RemoteBound {
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
             }),
-            *evidence,
+            *confirmation,
             &self.identity,
         )
     }
@@ -2024,7 +2034,7 @@ mod tests {
                                 },
                             },
                             Request::Confirm => Response::Confirmed {
-                                evidence: Box::new(test_confirmation_evidence()),
+                                confirmation: Box::new(test_confirmation()),
                             },
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
@@ -2552,12 +2562,9 @@ mod tests {
         }
     }
 
-    fn test_confirmation_evidence()
-    -> openshell_isolation_interface::contract::SandboxConfirmEvidence {
-        openshell_isolation_interface::contract::SandboxConfirmEvidence {
-            generation: "test-generation".to_string(),
-            identity: sandbox().identity,
-            capabilities: openshell_isolation_interface::contract::CapabilityEvidence {
+    fn test_confirmation() -> openshell_isolation_interface::contract::BoundaryConfirmation {
+        let audit = crate::boundary_protocol::OpenShellSandboxAuditEvidence {
+            capabilities: crate::boundary_protocol::CapabilityEvidence {
                 inheritable: 0,
                 permitted: 0,
                 effective: 0,
@@ -2570,7 +2577,7 @@ mod tests {
             core_limit_zero: true,
             native_architecture: std::env::consts::ARCH.to_string(),
             kernel_release: "test".to_string(),
-            seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+            seccomp: crate::boundary_protocol::SeccompEvidence {
                 new_listener: true,
                 notification_round_trip: true,
                 id_validation: true,
@@ -2587,11 +2594,17 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+        };
+        openshell_isolation_interface::contract::BoundaryConfirmation {
+            generation: "test-generation".to_string(),
+            identity: sandbox().identity,
+            properties: audit.properties(),
             authenticated_supervisor: true,
             session_id: test_session_id(),
             driver_fence: test_driver_fence(),
             runtime_exit_terminates_workload: true,
             resource_claims: std::collections::BTreeMap::new(),
+            backend_audit: serde_json::to_value(audit).expect("serialize audit evidence"),
         }
     }
 
@@ -2709,7 +2722,7 @@ mod tests {
                 .await
                 .expect("TLS request"),
             Response::Confirmed {
-                evidence: Box::new(test_confirmation_evidence()),
+                confirmation: Box::new(test_confirmation()),
             }
         );
         server.abort();

@@ -70,8 +70,12 @@ replacement from granting authority.
 3. `openshell-supervisor` loads policy and runtime settings from the gateway,
    attaches to the sandbox, and verifies the driver's generation and evidence.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   then reports measured confirmation. The supervisor must accept that evidence
-before it sends the launch permit.
+   validates its mechanism-specific audit evidence, and reports backend-neutral
+   enforcement properties. The supervisor must accept those properties and
+   their immutable session and resource binding before it sends the launch
+   permit. Other isolation backends may establish the same properties with
+   different mechanisms and retain their detailed evidence in backend-owned
+   audit data.
 5. The sandbox starts the canonical process through its single workload
    launcher. The supervisor starts SSH and registers its gateway session.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the

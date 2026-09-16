@@ -23,8 +23,9 @@ use openshell_core::policy::{
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal,
-    DriverFenceEvidence, ExecSpec, ResolveError, SandboxConfirmEvidence,
+    BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
+    BoundaryProperties, BoundarySignal, DriverFenceEvidence, EnforcedProperty, ExecSpec,
+    ResolveError,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -41,6 +42,145 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+/// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
+/// co-located runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityEvidence {
+    pub inheritable: u64,
+    pub permitted: u64,
+    pub effective: u64,
+    pub bounding: u64,
+    pub ambient: u64,
+}
+
+impl CapabilityEvidence {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.inheritable == 0
+            && self.permitted == 0
+            && self.effective == 0
+            && self.bounding == 0
+            && self.ambient == 0
+    }
+}
+
+/// Active seccomp notification and socket-broker measurements specific to the
+/// `OpenShell` co-located runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each independently measured kernel operation is reported explicitly"
+)]
+pub struct SeccompEvidence {
+    pub new_listener: bool,
+    pub notification_round_trip: bool,
+    pub id_validation: bool,
+    pub addfd_send: bool,
+    pub retained_socket_operation: bool,
+    pub proc_fd_identity: bool,
+    pub task_memory_read: bool,
+    pub task_memory_write: bool,
+    pub cancellation: bool,
+}
+
+/// Mechanism-specific audit evidence for the `OpenShell` co-located runtime.
+///
+/// This schema belongs to this backend rather than the generic isolation
+/// interface. The host-side backend validates it before constructing a
+/// backend-neutral `ConfirmedBoundary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "audit evidence preserves independently measured security results"
+)]
+pub struct OpenShellSandboxAuditEvidence {
+    pub capabilities: CapabilityEvidence,
+    pub no_new_privileges: bool,
+    pub sandbox_dumpable: bool,
+    pub child_dumpable: bool,
+    pub core_limit_zero: bool,
+    pub native_architecture: String,
+    pub kernel_release: String,
+    pub seccomp: SeccompEvidence,
+    pub landlock_abi: u32,
+    pub landlock_allow_deny: bool,
+    pub udp_dns_round_trip: bool,
+    pub tcp_dns_round_trip: bool,
+    pub tcp_allow_round_trip: bool,
+    pub tcp_deny_round_trip: bool,
+}
+
+impl OpenShellSandboxAuditEvidence {
+    /// Validate the complete mechanism-specific posture required by this backend.
+    pub fn validate(&self) -> Result<(), BackendError> {
+        let complete = self.capabilities.is_empty()
+            && self.no_new_privileges
+            && !self.sandbox_dumpable
+            && self.child_dumpable
+            && self.core_limit_zero
+            && !self.native_architecture.is_empty()
+            && !self.kernel_release.is_empty()
+            && self.seccomp.new_listener
+            && self.seccomp.notification_round_trip
+            && self.seccomp.id_validation
+            && self.seccomp.addfd_send
+            && self.seccomp.retained_socket_operation
+            && self.seccomp.proc_fd_identity
+            && self.seccomp.task_memory_read
+            && self.seccomp.task_memory_write
+            && self.seccomp.cancellation
+            && self.landlock_abi >= 3
+            && self.landlock_allow_deny
+            && self.udp_dns_round_trip
+            && self.tcp_dns_round_trip
+            && self.tcp_allow_round_trip
+            && self.tcp_deny_round_trip;
+        if complete {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "OpenShell sandbox audit evidence is incomplete".to_string(),
+            ))
+        }
+    }
+
+    /// Project backend measurements into the common property contract.
+    #[must_use]
+    pub fn properties(&self) -> BoundaryProperties {
+        BoundaryProperties {
+            filesystem_confinement: EnforcedProperty::new(
+                self.landlock_abi >= 3 && self.landlock_allow_deny,
+                format!("landlock-v{}", self.landlock_abi),
+            ),
+            egress_interception: EnforcedProperty::new(
+                self.seccomp.new_listener
+                    && self.seccomp.notification_round_trip
+                    && self.seccomp.addfd_send
+                    && self.udp_dns_round_trip
+                    && self.tcp_dns_round_trip
+                    && self.tcp_allow_round_trip
+                    && self.tcp_deny_round_trip,
+                "seccomp-notify",
+            ),
+            request_attribution: EnforcedProperty::new(
+                self.seccomp.id_validation
+                    && self.seccomp.proc_fd_identity
+                    && self.seccomp.task_memory_read
+                    && self.seccomp.task_memory_write,
+                "seccomp-notify-procfs",
+            ),
+            privilege_floor: EnforcedProperty::new(
+                self.capabilities.is_empty()
+                    && self.no_new_privileges
+                    && !self.sandbox_dumpable
+                    && self.child_dumpable
+                    && self.core_limit_zero,
+                "linux-capability-free",
+            ),
+        }
+    }
+}
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
 ///
@@ -712,8 +852,9 @@ pub enum Response {
         snapshot: SessionSnapshotWire,
     },
     Confirmed {
-        /// Measured capability-free posture produced before workload launch.
-        evidence: Box<SandboxConfirmEvidence>,
+        /// Backend-neutral properties and backend-owned audit evidence produced
+        /// before workload launch.
+        confirmation: Box<BoundaryConfirmation>,
     },
     Started {
         process_id: String,
@@ -1195,6 +1336,61 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_audit_evidence() -> OpenShellSandboxAuditEvidence {
+        OpenShellSandboxAuditEvidence {
+            capabilities: CapabilityEvidence {
+                inheritable: 0,
+                permitted: 0,
+                effective: 0,
+                bounding: 0,
+                ambient: 0,
+            },
+            no_new_privileges: true,
+            sandbox_dumpable: false,
+            child_dumpable: true,
+            core_limit_zero: true,
+            native_architecture: "x86_64".to_string(),
+            kernel_release: "6.12.0".to_string(),
+            seccomp: SeccompEvidence {
+                new_listener: true,
+                notification_round_trip: true,
+                id_validation: true,
+                addfd_send: true,
+                retained_socket_operation: true,
+                proc_fd_identity: true,
+                task_memory_read: true,
+                task_memory_write: true,
+                cancellation: true,
+            },
+            landlock_abi: 6,
+            landlock_allow_deny: true,
+            udp_dns_round_trip: true,
+            tcp_dns_round_trip: true,
+            tcp_allow_round_trip: true,
+            tcp_deny_round_trip: true,
+        }
+    }
+
+    #[test]
+    fn openshell_audit_evidence_projects_backend_neutral_properties() {
+        let audit = complete_audit_evidence();
+        audit.validate().unwrap();
+        let properties = audit.properties();
+        assert!(properties.filesystem_confinement.enforced);
+        assert_eq!(properties.filesystem_confinement.mechanism, "landlock-v6");
+        assert!(properties.egress_interception.enforced);
+        assert!(properties.request_attribution.enforced);
+        assert!(properties.privilege_floor.enforced);
+    }
+
+    #[test]
+    fn openshell_audit_evidence_rejects_mechanism_failure() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.addfd_send = false;
+        assert!(audit.validate().is_err());
+        assert!(!audit.properties().egress_interception.enforced);
+    }
 
     #[test]
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {

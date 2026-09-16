@@ -36,9 +36,8 @@ mod linux {
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-        CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
-        SandboxConfirmEvidence,
+        BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
+        BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
     };
     use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
@@ -60,11 +59,11 @@ mod linux {
     use openshell_sandbox_backend::boundary_protocol::{
         AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
-        ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
-        ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
-        STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT,
-        SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame, read_frame,
-        read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
+        ExitStatusWire, MediationTimingWire, OpenShellSandboxAuditEvidence, OutputWindowWire,
+        ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
+        STREAM_EXIT, STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED,
+        STREAM_STDOUT, SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame,
+        read_frame, read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2262,20 +2261,20 @@ mod linux {
                     if let Err(error) = prepared.confirm(&self.process_runtime) {
                         return guest_error(BoundaryErrorKind::Process, error);
                     }
-                    let evidence = match self.measure_confirmation_evidence() {
-                        Ok(evidence) => evidence,
+                    let confirmation = match self.measure_confirmation() {
+                        Ok(confirmation) => confirmation,
                         Err(error) => return guest_error(BoundaryErrorKind::Process, error),
                     };
                     *state = RuntimeState::Ready(prepared.clone());
                     Response::Confirmed {
-                        evidence: Box::new(evidence),
+                        confirmation: Box::new(confirmation),
                     }
                 }
                 RuntimeState::Ready(_) | RuntimeState::Running(_) => {
-                    self.measure_confirmation_evidence().map_or_else(
+                    self.measure_confirmation().map_or_else(
                         |error| guest_error(BoundaryErrorKind::Process, error),
-                        |evidence| Response::Confirmed {
-                            evidence: Box::new(evidence),
+                        |confirmation| Response::Confirmed {
+                            confirmation: Box::new(confirmation),
                         },
                     )
                 }
@@ -2286,7 +2285,7 @@ mod linux {
             }
         }
 
-        fn measure_confirmation_evidence(&self) -> Result<SandboxConfirmEvidence, String> {
+        fn measure_confirmation(&self) -> Result<BoundaryConfirmation, String> {
             validate_running_identity(
                 &self.config.workload_identity,
                 allows_runtime_supplementary_groups(&self.config),
@@ -2299,7 +2298,7 @@ mod linux {
             }
             let status = std::fs::read_to_string("/proc/self/status")
                 .map_err(|error| format!("read sandbox process status: {error}"))?;
-            let capabilities = CapabilityEvidence {
+            let capabilities = openshell_sandbox_backend::boundary_protocol::CapabilityEvidence {
                 inheritable: parse_status_hex(&status, "CapInh")?,
                 permitted: parse_status_hex(&status, "CapPrm")?,
                 effective: parse_status_hex(&status, "CapEff")?,
@@ -2320,9 +2319,7 @@ mod linux {
             // SAFETY: successful getrlimit initialized the value.
             let core_limit = unsafe { core_limit.assume_init() };
             let (native_architecture, kernel_release) = uname_values()?;
-            Ok(SandboxConfirmEvidence {
-                generation: self.config.generation.clone(),
-                identity: self.config.workload_identity.clone(),
+            let audit = OpenShellSandboxAuditEvidence {
                 capabilities,
                 no_new_privileges,
                 sandbox_dumpable,
@@ -2337,11 +2334,21 @@ mod linux {
                 tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
+            };
+            audit.validate().map_err(|error| error.to_string())?;
+            let properties = audit.properties();
+            let backend_audit = serde_json::to_value(audit)
+                .map_err(|error| format!("encode OpenShell sandbox audit evidence: {error}"))?;
+            Ok(BoundaryConfirmation {
+                generation: self.config.generation.clone(),
+                identity: self.config.workload_identity.clone(),
+                properties,
                 authenticated_supervisor: true,
                 session_id: self.config.session_id,
                 driver_fence: self.config.driver_fence.clone(),
                 runtime_exit_terminates_workload: true,
                 resource_claims: self.config.resource_claims.clone(),
+                backend_audit,
             })
         }
 
@@ -4267,7 +4274,7 @@ mod linux {
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {
             crate::RuntimeQualification {
-                seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+                seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
                     new_listener: true,
                     notification_round_trip: true,
                     id_validation: true,

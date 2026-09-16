@@ -16,7 +16,8 @@
 //!
 //! Each transition consumes the prior state by value (`self: Box<Self>`).
 //! Trusted backend implementations construct confirmation through a validating
-//! constructor; the supervisor cannot obtain a ready boundary without evidence.
+//! constructor; the supervisor cannot obtain a ready boundary without confirmed
+//! backend-neutral enforcement properties.
 //! The supervisor holds no `match`/downcast on concrete backends: the
 //! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
@@ -385,46 +386,6 @@ pub trait BoundBoundary: Send {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
 }
 
-/// Capability masks measured from `/proc/<pid>/status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityEvidence {
-    pub inheritable: u64,
-    pub permitted: u64,
-    pub effective: u64,
-    pub bounding: u64,
-    pub ambient: u64,
-}
-
-impl CapabilityEvidence {
-    /// True only when every Linux capability set is empty.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.inheritable == 0
-            && self.permitted == 0
-            && self.effective == 0
-            && self.bounding == 0
-            && self.ambient == 0
-    }
-}
-
-/// Active seccomp notification and socket-broker evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "each independently measured kernel operation is reported explicitly"
-)]
-pub struct SeccompEvidence {
-    pub new_listener: bool,
-    pub notification_round_trip: bool,
-    pub id_validation: bool,
-    pub addfd_send: bool,
-    pub retained_socket_operation: bool,
-    pub proc_fd_identity: bool,
-    pub task_memory_read: bool,
-    pub task_memory_write: bool,
-    pub cancellation: bool,
-}
-
 /// Driver-owned evidence that the mandatory outer network fence is installed.
 ///
 /// The sandbox cannot observe the Docker daemon, Kubernetes API, or VM device
@@ -512,29 +473,67 @@ impl DriverFenceEvidence {
     }
 }
 
-/// Measured sandbox-owned evidence produced before agent launch.
+/// A backend-neutral security property established before agent launch.
+///
+/// `mechanism` is diagnostic and audit metadata. It never authorizes launch;
+/// the registered backend is responsible for validating its mechanism-specific
+/// evidence before setting `enforced`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "confirmation preserves independently measured security results"
-)]
-pub struct SandboxConfirmEvidence {
+pub struct EnforcedProperty {
+    pub enforced: bool,
+    pub mechanism: String,
+}
+
+impl EnforcedProperty {
+    #[must_use]
+    pub fn new(enforced: bool, mechanism: impl Into<String>) -> Self {
+        Self {
+            enforced,
+            mechanism: mechanism.into(),
+        }
+    }
+
+    fn validate(&self, name: &str) -> Result<(), BackendError> {
+        if self.enforced && !self.mechanism.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(format!(
+                "{name} is not enforced or has no declared mechanism"
+            )))
+        }
+    }
+}
+
+/// Security properties every isolation backend establishes before launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryProperties {
+    pub filesystem_confinement: EnforcedProperty,
+    pub egress_interception: EnforcedProperty,
+    pub request_attribution: EnforcedProperty,
+    pub privilege_floor: EnforcedProperty,
+}
+
+impl BoundaryProperties {
+    fn validate(&self) -> Result<(), BackendError> {
+        self.filesystem_confinement
+            .validate("filesystem confinement")?;
+        self.egress_interception.validate("egress interception")?;
+        self.request_attribution.validate("request attribution")?;
+        self.privilege_floor.validate("privilege floor")
+    }
+}
+
+/// Per-boundary confirmation produced before agent launch.
+///
+/// Common validation binds the confirmation to the admitted workload and
+/// checks backend-neutral properties. `backend_audit` remains opaque to this
+/// crate; the registered backend owns its schema and validates it before
+/// constructing [`ConfirmedBoundary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryConfirmation {
     pub generation: String,
     pub identity: ResolvedWorkloadIdentity,
-    pub capabilities: CapabilityEvidence,
-    pub no_new_privileges: bool,
-    pub sandbox_dumpable: bool,
-    pub child_dumpable: bool,
-    pub core_limit_zero: bool,
-    pub native_architecture: String,
-    pub kernel_release: String,
-    pub seccomp: SeccompEvidence,
-    pub landlock_abi: u32,
-    pub landlock_allow_deny: bool,
-    pub udp_dns_round_trip: bool,
-    pub tcp_dns_round_trip: bool,
-    pub tcp_allow_round_trip: bool,
-    pub tcp_deny_round_trip: bool,
+    pub properties: BoundaryProperties,
     pub authenticated_supervisor: bool,
     pub session_id: SandboxSessionId,
     pub driver_fence: DriverFenceEvidence,
@@ -542,33 +541,15 @@ pub struct SandboxConfirmEvidence {
     /// Sandbox Runtime exits.
     pub runtime_exit_terminates_workload: bool,
     pub resource_claims: BTreeMap<String, String>,
+    pub backend_audit: serde_json::Value,
 }
 
-impl SandboxConfirmEvidence {
-    /// Validate the security-critical evidence required before launch.
+impl BoundaryConfirmation {
+    /// Validate common security properties and immutable launch binding.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
         self.driver_fence.validate()?;
+        self.properties.validate()?;
         let complete = &self.identity == expected
-            && self.capabilities.is_empty()
-            && self.no_new_privileges
-            && !self.sandbox_dumpable
-            && self.child_dumpable
-            && self.core_limit_zero
-            && self.seccomp.new_listener
-            && self.seccomp.notification_round_trip
-            && self.seccomp.id_validation
-            && self.seccomp.addfd_send
-            && self.seccomp.retained_socket_operation
-            && self.seccomp.proc_fd_identity
-            && self.seccomp.task_memory_read
-            && self.seccomp.task_memory_write
-            && self.seccomp.cancellation
-            && self.landlock_abi >= 3
-            && self.landlock_allow_deny
-            && self.udp_dns_round_trip
-            && self.tcp_dns_round_trip
-            && self.tcp_allow_round_trip
-            && self.tcp_deny_round_trip
             && self.authenticated_supervisor
             && self.runtime_exit_terminates_workload
             && !self.generation.is_empty();
@@ -576,41 +557,45 @@ impl SandboxConfirmEvidence {
             Ok(())
         } else {
             Err(BackendError::Confirm(
-                "sandbox confirmation evidence is incomplete or mismatched".to_string(),
+                "boundary confirmation is incomplete or mismatched".to_string(),
             ))
         }
     }
 }
 
-/// Ready boundary paired with the evidence measured by `confirm`.
+/// Ready boundary paired with the confirmation established by `confirm`.
 pub struct ConfirmedBoundary {
     boundary: Box<dyn ReadyBoundary>,
-    evidence: SandboxConfirmEvidence,
+    confirmation: BoundaryConfirmation,
 }
 
 impl ConfirmedBoundary {
-    /// Construct confirmation after checking measured evidence against the
-    /// immutable identity admitted at attach time.
+    /// Construct confirmation after checking backend-neutral properties and
+    /// immutable identity binding.
     ///
-    /// Backend implementations are trusted to collect this evidence and bind
-    /// it to their resource. This constructor enforces the common requirements
-    /// without requiring those implementations to live in the interface crate.
+    /// Backend implementations are trusted to validate their audit evidence and
+    /// bind this confirmation to their resource. This constructor enforces the
+    /// common requirements without requiring those implementations to live in
+    /// the interface crate.
     ///
     /// # Errors
     ///
-    /// Returns an error if evidence is incomplete or the identity does not match.
+    /// Returns an error if confirmation is incomplete or the identity does not match.
     pub fn try_new(
         boundary: Box<dyn ReadyBoundary>,
-        evidence: SandboxConfirmEvidence,
+        confirmation: BoundaryConfirmation,
         expected: &ResolvedWorkloadIdentity,
     ) -> Result<Self, BackendError> {
-        evidence.validate(expected)?;
-        Ok(Self { boundary, evidence })
+        confirmation.validate(expected)?;
+        Ok(Self {
+            boundary,
+            confirmation,
+        })
     }
 
-    /// Return the measured evidence carried by this confirmed state.
-    pub fn evidence(&self) -> &SandboxConfirmEvidence {
-        &self.evidence
+    /// Return the record carried by this confirmed state.
+    pub fn confirmation(&self) -> &BoundaryConfirmation {
+        &self.confirmation
     }
 
     /// Consume confirmation and advance to the sole launch-capable state.
