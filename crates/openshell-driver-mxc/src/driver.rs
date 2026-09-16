@@ -91,35 +91,23 @@ pub struct MxcComputeConfig {
     pub pc_allow_local_network: bool,
     /// `processContainer` only: when `true`, start with an EMPTY process env
     /// (not even `MINIMAL_WINDOWS_BOOTSTRAP_ENV`) instead of the safe
-    /// default -- only the entries in `agent_env` are passed to the process.
+    /// default -- only the sandbox's explicit per-request environment is
+    /// passed to the process.
     /// Use for agents like Node.js that fail with `STATUS_DLL_INIT_FAILED`
     /// when unrecognised host env vars are present; the caller is then
     /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`COMSPEC`/
-    /// `LOCALAPPDATA` themselves via `agent_env` if the agent needs them
+    /// `LOCALAPPDATA` through `sandbox create --env/--env-from` if needed
     /// (`CreateProcessW` itself won't succeed without `LOCALAPPDATA` at
     /// least -- see `MINIMAL_WINDOWS_BOOTSTRAP_ENV`).
     ///
-    /// Three tiers overall, safest first: this flag (`agent_env` only) ->
-    /// the default (`MINIMAL_WINDOWS_BOOTSTRAP_ENV` + `agent_env`) ->
-    /// `pc_inherit_full_env` (the gateway's entire host env + `agent_env`,
-    /// explicit unsafe opt-in).
+    /// The sandbox's explicit per-request environment is layered on top.
     pub pc_minimal_env: bool,
-    /// `processContainer` only: when `true`, seed the process env from the
-    /// gateway host's ENTIRE environment instead of the safe
-    /// `MINIMAL_WINDOWS_BOOTSTRAP_ENV` default. This hands whatever the
-    /// gateway process itself happens to have in its environment --
-    /// including host secrets unrelated to this sandbox, e.g. API keys or
-    /// tokens picked up from the operator's shell -- to whatever untrusted
-    /// code `agent_command` runs inside the sandbox. Explicit, unsafe
-    /// opt-in only; ignored when `pc_minimal_env` is also set (that flag
-    /// wins). See `pc_minimal_env` for the full tier breakdown.
-    pub pc_inherit_full_env: bool,
     /// `processContainer` only: path to a generic spawn+relay-bridge binary
     /// (see the `openshell-supervisor-relay` crate). When non-empty (and
     /// `pc_relay_target_port != 0`), the driver launches this binary instead
-    /// of `agent_command` directly, sending the real `agent_command` / env
+    /// of the per-sandbox workload command directly, sending the command/env
     /// over the control channel once the spawner announces readiness (the
-    /// "launch" handshake) rather than writing them to `share_dir`. This
+    /// "launch" handshake) rather than writing them to the workload directory. This
     /// decouples the relay-bridging logic from the target application (e.g.
     /// `OpenClaw`) entirely — the target needs no awareness of the relay
     /// protocol. It's also what gives the driver a control channel into the
@@ -127,23 +115,14 @@ pub struct MxcComputeConfig {
     /// `openshell forward service` bridging) depends on regardless of any
     /// particular port being pre-declared.
     pub pc_relay_spawner_path: String,
-    /// `processContainer` only: the TCP port `agent_command`'s target process
+    /// `processContainer` only: the TCP port the workload's target process
     /// binds, which `pc_relay_spawner_path` bridges to the gateway relay.
     /// Ignored unless `pc_relay_spawner_path` is set. `0` disables spawner
-    /// wrapping (default) — `agent_command` runs directly as before.
+    /// wrapping (default) — the per-sandbox command runs directly.
     pub pc_relay_target_port: u16,
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
-    /// Legacy gateway-wide workload command. New callers should use
-    /// `template.driver_config.mxc.command`.
-    pub agent_command: Vec<String>,
-    /// Legacy gateway-wide workload directory.
-    pub agent_cwd: String,
-    /// Legacy gateway-host environment passthrough entries.
-    pub agent_env: Vec<String>,
-    /// Legacy default working directory used when `agent_cwd` is empty.
-    pub share_dir: String,
     /// Enable Pattern-C governed egress. When true, MXC permits loopback-only
     /// egress, the driver injects proxy environment variables, and the host
     /// CONNECT proxy receives the full network policy.
@@ -173,12 +152,7 @@ impl Default for MxcComputeConfig {
             pc_relay_target_port: 0,
             pc_allow_local_network: false,
             pc_minimal_env: false,
-            pc_inherit_full_env: false,
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
-            agent_command: Vec::new(),
-            agent_cwd: String::new(),
-            agent_env: Vec::new(),
-            share_dir: String::new(),
             egress_proxy: false,
             egress_proxy_addr: String::new(),
 
@@ -242,7 +216,7 @@ struct SandboxEntry {
     /// silently skipping the wait because the field looks empty.
     terminated_rx: Option<watch::Receiver<bool>>,
     /// Path to the shutdown signal file written by `delete_sandbox` so
-    /// `mxc-ws-agent.rs` (set directly as `agent_command`, no control
+    /// `mxc-ws-agent.rs` (set directly as the sandbox command, no control
     /// channel) can detect a deletion and exit cleanly. Only set for that
     /// case -- when spawner wrapping is active, `delete_sandbox` sends a
     /// `"shutdown"` control-channel request to `openshell-supervisor-relay`
@@ -345,29 +319,21 @@ impl std::fmt::Debug for MxcComputeBackend {
     }
 }
 
-fn sandbox_config(
-    sandbox: &DriverSandbox,
-    legacy: &MxcComputeConfig,
-) -> Result<MxcSandboxConfig, tonic::Status> {
+fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
     let config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref());
-    let config = if let Some(config) = config {
+        .and_then(|template| template.driver_config.as_ref())
+        .ok_or_else(|| {
+            tonic::Status::invalid_argument(
+                "mxc requires template.driver_config.mxc with a non-empty command array",
+            )
+        })?;
+    let config: MxcSandboxConfig =
         serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
             tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?
-    } else {
-        MxcSandboxConfig {
-            command: legacy.agent_command.clone(),
-            cwd: if legacy.agent_cwd.is_empty() {
-                legacy.share_dir.clone()
-            } else {
-                legacy.agent_cwd.clone()
-            },
-        }
-    };
+        })?;
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
             "mxc driver_config.command must contain a non-empty executable",
@@ -376,13 +342,8 @@ fn sandbox_config(
     Ok(config)
 }
 
-fn sandbox_environment(sandbox: &DriverSandbox, legacy: &MxcComputeConfig) -> Vec<String> {
+fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
     let mut environment = HashMap::new();
-    for entry in resolve_agent_env(&legacy.agent_env) {
-        if let Some((key, value)) = entry.split_once('=') {
-            environment.insert(key.to_string(), value.to_string());
-        }
-    }
     if let Some(spec) = sandbox.spec.as_ref() {
         if let Some(template) = spec.template.as_ref() {
             environment.extend(template.environment.clone());
@@ -395,20 +356,6 @@ fn sandbox_environment(sandbox: &DriverSandbox, legacy: &MxcComputeConfig) -> Ve
         .collect::<Vec<_>>();
     environment.sort_unstable();
     environment
-}
-
-fn resolve_agent_env(entries: &[String]) -> Vec<String> {
-    let mut resolved = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if entry.contains('=') {
-            resolved.push(entry.clone());
-        } else if let Ok(value) = std::env::var(entry) {
-            resolved.push(format!("{entry}={value}"));
-        } else {
-            warn!(var = %entry, "agent_env passthrough variable not set; skipping");
-        }
-    }
-    resolved
 }
 
 /// Merge provider-owned child environment values into MXC `process.env`.
@@ -525,14 +472,14 @@ fn allocate_sandbox_proxy_addr(
 
 /// Minimum Windows environment variables required just for `CreateProcessW`
 /// / `AppContainer`-DACL process creation to succeed at all -- independent of
-/// whatever runtime `agent_command` happens to be. Confirmed empirically:
+/// whatever per-sandbox runtime command is selected. Confirmed empirically:
 /// without `LOCALAPPDATA` specifically, `CreateProcessW` itself fails with
 /// `ERROR_ENVVAR_NOT_FOUND` (Win32 203) under the appcontainer-dacl fallback
 /// tier, before the agent binary is ever reached -- a Windows `AppContainer`
 /// requirement, not specific to Node.js or any other agent. None of these
 /// are secrets, so resolving them from the gateway host is safe; this is
-/// the default baseline `agent_env` layers on top of. See `pc_minimal_env`
-/// / `pc_inherit_full_env` on `MxcComputeConfig` for the other two tiers.
+/// the per-sandbox environment layers on top of. See `pc_minimal_env` on
+/// `MxcComputeConfig` for the explicit empty-baseline option.
 const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
     ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
 
@@ -580,16 +527,16 @@ fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBu
 
 fn stage_tls_ca_files(
     ca_paths: Option<&(PathBuf, PathBuf)>,
-    share_dir: &str,
+    workload_dir: &str,
     sandbox_id: &str,
 ) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
     let Some((ca_cert_path, combined_bundle_path)) = ca_paths else {
         return Ok(None);
     };
-    if share_dir.trim().is_empty() {
+    if workload_dir.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "share_dir must be set when staging proxy CA files",
+            "mxc driver_config.cwd must be set when staging proxy CA files",
         ));
     }
     if sandbox_id.is_empty()
@@ -602,7 +549,7 @@ fn stage_tls_ca_files(
             "sandbox_id must be a non-empty alphanumeric, hyphen or underscore component",
         ));
     }
-    let target_dir = PathBuf::from(share_dir)
+    let target_dir = PathBuf::from(workload_dir)
         .join(".openshell-proxy")
         .join(sandbox_id);
     std::fs::create_dir_all(&target_dir)?;
@@ -864,7 +811,7 @@ impl MxcComputeBackend {
                 ));
             }
         }
-        sandbox_config(sandbox, &self.config)?;
+        sandbox_config(sandbox)?;
         Ok(())
     }
 
@@ -919,7 +866,7 @@ impl MxcComputeBackend {
         validate_provider_child_env_keys(provider_credentials.as_ref())?;
 
         self.validate_sandbox_fields(sandbox)?;
-        let sandbox_config = sandbox_config(sandbox, &self.config)?;
+        let sandbox_config = sandbox_config(sandbox)?;
         let (egress_addr, reserved_proxy_listener) = match configured_egress_addr(&self.config)? {
             Some(configured_addr) => {
                 let (addr, reservation) = allocate_sandbox_proxy_addr(configured_addr).map_err(
@@ -1495,11 +1442,15 @@ async fn run_lifecycle(
         .as_ref()
         .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
     // A curated ProcessContainer cannot read the host's private temp folder.
-    // Stage only the public CA material beneath share_dir, whose AppContainer
+    // Stage only the public CA material beneath the per-sandbox working directory,
     // DACL is already granted by the policy, so HTTPS clients can authenticate
     // the OpenShell inspection proxy without broadening filesystem access.
     let agent_proxy_ca_paths = if config.pc_minimal_env && host_proxy_ca_paths.is_some() {
-        match stage_tls_ca_files(host_proxy_ca_paths.as_ref(), &config.share_dir, &sandbox_id) {
+        match stage_tls_ca_files(
+            host_proxy_ca_paths.as_ref(),
+            &sandbox_config.cwd,
+            &sandbox_id,
+        ) {
             Ok(paths) => paths,
             Err(error) => {
                 set_failed(
@@ -1547,19 +1498,12 @@ async fn run_lifecycle(
     };
     let command_line = encode_windows_command_line(&sandbox_config.command);
     // ProcessContainer starts with a completely blank environment — no PATH,
-    // no SystemRoot, nothing. Three tiers of base env, safest first (see
-    // `pc_minimal_env` / `pc_inherit_full_env` field docs for the full
-    // rationale) -- then layer sandbox_environment's output (static
-    // agent_env passthrough merged with any per-request environment from
-    // the CreateSandbox spec) on top, and finally layer TLS CA vars when an
-    // egress proxy is active. Skip internal Windows drive-letter variables
-    // (keys starting with '=') in the full-inherit tier.
+    // no SystemRoot, nothing. Start with either an empty environment or the
+    // safe Windows bootstrap set, then layer the per-request environment from
+    // the CreateSandbox spec and the TLS/proxy variables required by governed
+    // egress.
     let mut env_map: HashMap<String, String> = if config.pc_minimal_env {
         HashMap::new()
-    } else if config.pc_inherit_full_env {
-        std::env::vars()
-            .filter(|(k, _)| !k.is_empty() && !k.starts_with('='))
-            .collect()
     } else {
         MINIMAL_WINDOWS_BOOTSTRAP_ENV
             .iter()
@@ -1567,7 +1511,7 @@ async fn run_lifecycle(
             .collect()
     };
 
-    for entry in sandbox_environment(&sandbox, &config) {
+    for entry in sandbox_environment(&sandbox) {
         if let Some(pos) = entry.find('=') {
             env_map.insert(entry[..pos].to_string(), entry[pos + 1..].to_string());
         }
@@ -1586,13 +1530,13 @@ async fn run_lifecycle(
     info!(sandbox = %sandbox_name, count = env.len(), "MXC process env vars");
 
     // When spawner wrapping is configured, launch openshell-supervisor-relay
-    // instead of agent_command directly. The real command/env are sent over
+    // instead of the per-sandbox command directly. The real command/env are sent over
     // the control channel once the spawner announces readiness (see the
-    // "launch" handshake below) rather than written to share_dir as
+    // "launch" handshake below) rather than written to the working directory as
     // agent-cmd.txt/agent-env.txt -- this keeps command/env (which can carry
     // secrets, e.g. OPENCLAW_GATEWAY_TOKEN) off disk entirely and eliminates
     // the file-staleness/namespace-mismatch bug class that existed when they
-    // were file-based. `agent_command`'s target application (e.g. OpenClaw)
+    // were file-based. The target application (e.g. OpenClaw)
     // stays entirely unaware of the relay protocol either way.
     let spawner_wrapping_active =
         !config.pc_relay_spawner_path.is_empty() && config.pc_relay_target_port != 0;
@@ -1611,12 +1555,12 @@ async fn run_lifecycle(
 
     // Downstream logging/ETW attribution should reflect what's actually
     // launched (openshell-supervisor-relay, when wrapping is active), not
-    // the original agent_command -- shadow command_line with the effective
+    // the original workload command -- shadow command_line with the effective
     // value.
     let command_line = effective_command_line;
     let process = MxcProcess {
         command_line: command_line.clone(),
-        cwd: sandbox_config.cwd,
+        cwd: sandbox_config.cwd.clone(),
         // Cloned: the launch handshake below (spawner_wrapping_active case)
         // needs its own copy of `env` to send over the control channel.
         env: env.clone(),
@@ -1759,7 +1703,7 @@ async fn run_lifecycle(
     // pending requests sent over stdin (see control_channel.rs). Only
     // meaningful when the process on the other end is
     // openshell-supervisor-relay (spawner wrapping active) -- an arbitrary
-    // agent_command target wouldn't understand this protocol, so stdin is
+    // workload target wouldn't understand this protocol, so stdin is
     // left untouched (and unpiped expectations unaffected) otherwise.
     let control_channel: Option<Arc<ControlChannel>> = if spawner_wrapping_active {
         if let Some(stdin) = child.stdin.take() {
@@ -1950,11 +1894,11 @@ async fn run_lifecycle(
             // The generic spawner (openshell-supervisor-relay) gets its
             // shutdown notice over the control channel (see delete_sandbox's
             // "shutdown" request) -- no file needed. Only mxc-ws-agent.rs
-            // (set directly as agent_command, not spawner-wrapped, no
+            // (set directly as the sandbox command, not spawner-wrapped, no
             // control channel) still polls a signal file for it.
-            if !spawner_wrapping_active && !config.share_dir.is_empty() {
+            if !spawner_wrapping_active && !sandbox_config.cwd.is_empty() {
                 entry.signal_file =
-                    Some(PathBuf::from(&config.share_dir).join("openshell-shutdown.signal"));
+                    Some(PathBuf::from(&sandbox_config.cwd).join("openshell-shutdown.signal"));
             }
             Some((rx, done_tx))
         } else {
@@ -1988,7 +1932,7 @@ async fn run_lifecycle(
     // When spawner wrapping is active, openshell-supervisor-relay.rs hasn't
     // spawned the real target yet -- it waits for a "launch" request over
     // the control channel instead of reading agent-cmd.txt/agent-env.txt
-    // from share_dir (see its module docs). Wait for its startup-ready
+    // from files in the workload directory (see its module docs). Wait for its startup-ready
     // event, then send the real command/env directly; this keeps them off
     // disk (they can carry secrets, e.g. OPENCLAW_GATEWAY_TOKEN) and also
     // proves the correlated request/response path works end to end -- the
@@ -2532,6 +2476,17 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn gateway_config_rejects_per_sandbox_workload_fields() {
+        for field in ["agent_command", "agent_cwd", "agent_env", "share_dir"] {
+            let mut config = serde_json::Map::new();
+            config.insert(field.to_string(), serde_json::json!([]));
+            let error = serde_json::from_value::<MxcComputeConfig>(config.into())
+                .expect_err("workload fields must not be accepted in gateway config");
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
     fn sandbox_proxy_addr_uses_ephemeral_loopback_port() {
         let configured = "127.0.0.1:18080".parse().unwrap();
         let (addr, _reservation) = allocate_sandbox_proxy_addr(configured).unwrap();
@@ -2892,7 +2847,7 @@ mod lifecycle_tests {
             .insert("SHARED".into(), "template".into());
         spec.environment.insert("SHARED".into(), "spec".into());
         spec.environment.insert("TOKEN".into(), "value".into());
-        let environment = sandbox_environment(&sandbox, &MxcComputeConfig::default());
+        let environment = sandbox_environment(&sandbox);
         assert!(environment.contains(&"SHARED=spec".to_string()));
         assert!(environment.contains(&"TOKEN=value".to_string()));
         assert!(environment.iter().all(|entry| {

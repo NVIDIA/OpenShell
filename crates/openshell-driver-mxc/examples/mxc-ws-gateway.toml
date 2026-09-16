@@ -4,18 +4,18 @@
 # mxc-ws-gateway.toml - Gateway config for the WebSocket agent test.
 #
 # Used by run-ws-agent-test.ps1.  Fields that contain host-specific paths
-# (wxc_exec_path, share_dir, agent_cwd, agent_command, pc_relay_spawner_path)
+# (wxc_exec_path and pc_relay_spawner_path)
 # are patched at test runtime by the script; the values below are
 # safe-to-commit placeholders.
 #
 # Layout:
-#   agent_command   = mxc-ws-agent.exe server
+#   sandbox command = mxc-ws-agent.exe server
 #                     Binds WebSocket on 0.0.0.0:22000, echoes messages back.
 #                     No relay awareness -- launched the same way OpenClaw's
 #                     gateway is in mxc-openclaw-gateway.toml.
 #
 #   pc_relay_spawner_path / pc_relay_target_port
-#                     Wrap agent_command in openshell-supervisor-relay.exe
+#                     Wrap the sandbox command in openshell-supervisor-relay.exe
 #                     instead of launching it directly (see driver.rs's
 #                     launch handshake). This is what gives the driver a
 #                     control channel into the sandbox, which dynamic
@@ -54,23 +54,10 @@ pc_least_privilege = false
 egress_proxy      = true
 egress_proxy_addr = "127.0.0.1:18080"
 
-# Host folder mapped read-write into the AppContainer by the policy mapper.
-# Must contain mxc-ws-agent.exe and openshell-supervisor-relay.exe.
-# Patched at runtime by run-ws-agent-test.ps1.
-share_dir = "C:/work/openshell-mxc-ws"
+# The workload command and cwd are supplied per sandbox by
+# run-ws-agent-test.ps1 through `sandbox create --driver-config-json`.
 
-# Working directory inside the AppContainer.  Must match share_dir.
-# Patched at runtime by run-ws-agent-test.ps1.
-agent_cwd = "C:/work/openshell-mxc-ws"
-
-# The target application -- launched via the spawner wrapper below, not
-# directly.  Patched at runtime by run-ws-agent-test.ps1.
-agent_command = [
-  "C:/work/openshell-mxc-ws/mxc-ws-agent.exe",
-  "server",
-]
-
-# Launch agent_command via the generic openshell-supervisor-relay binary.
+# Launch the per-sandbox command via the generic openshell-supervisor-relay binary.
 # Patched at runtime by run-ws-agent-test.ps1.
 pc_relay_spawner_path = "C:/work/openshell-mxc-ws/openshell-supervisor-relay.exe"
 pc_relay_target_port  = 22000

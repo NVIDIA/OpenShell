@@ -20,7 +20,7 @@ WHAT THIS PROVES
   Both exercise the exact same dynamic-forward/control-channel code path in
   the driver -- only the gateway config differs (mxc-openclaw-gateway.toml
   vs mxc-openclaw-isolation.toml). isolation_session is simpler to configure:
-  it merges agent_env onto the full inherited host environment rather than
+  it merges the per-sandbox environment onto the inherited host environment rather than
   replacing it, so none of ProcessContainer's pc_minimal_env / LOCALAPPDATA
   workaround is needed -- see mxc-openclaw-isolation.toml's own comments for
   what else differs (ProcessContainer-only fields it ignores entirely).
@@ -131,11 +131,10 @@ NOTES
   - A "supervisor session not connected" / ssh 255 message during sandbox
     create is EXPECTED on MXC and harmless - the agent already ran in-driver.
   - `pc_minimal_env = true` in mxc-openclaw-gateway.toml (process_container
-    only) means the sandboxed process gets ONLY the env vars listed in
-    agent_env -- see the comment above that list for the (non-obvious)
-    minimum Windows needs just to let CreateProcessW succeed, independent of
-    anything Node.js-specific. mxc-openclaw-isolation.toml doesn't need this
-    at all: isolation_session merges agent_env onto the full host env.
+    only) means the sandboxed process gets ONLY the env vars passed by
+    run-openclaw-forward-test.ps1 to `sandbox create`. That includes the
+    non-obvious minimum Windows values needed for CreateProcessW, independent
+    of anything Node.js-specific. isolation_session does not need this mode.
   - The relay is entirely on-demand: nothing is listening on any fixed host
     port before you run `openshell forward service`, and nothing is left
     listening after the forward process exits.

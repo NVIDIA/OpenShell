@@ -19,7 +19,7 @@
 # Both go through the exact same dynamic-forward/control-channel code path in
 # the driver -- spawner wrapping is computed before the backend branch, so
 # nothing about openshell-supervisor-relay or the relay protocol differs.
-# What DOES differ is the config: isolation_session merges agent_env onto the
+# What DOES differ is the config: isolation_session merges the sandbox env onto the
 # full host environment (no pc_minimal_env / LOCALAPPDATA workaround needed)
 # and ignores ProcessContainer-only fields like pc_capabilities entirely --
 # see mxc-openclaw-isolation.toml's own comments.
@@ -79,9 +79,9 @@ param(
   [string] $SandboxName = "",
   [switch] $KeepRunning,
   # Which MXC backend to exercise. process_container: one-shot AppContainer,
-  # no inbound network capability, needs pc_minimal_env's curated agent_env
+  # no inbound network capability, needs pc_minimal_env's curated sandbox env
   # (mxc-openclaw-gateway.toml). isolation_session: persistent
-  # provision/start/exec session, merges agent_env onto the full host env,
+  # provision/start/exec session, merges the sandbox env onto the full host env,
   # ignores ProcessContainer-only fields (mxc-openclaw-isolation.toml).
   [ValidateSet("process_container", "isolation_session")]
   [string] $Backend = "process_container",
@@ -242,12 +242,8 @@ try {
   $tomlText = Get-Content $toml -Raw
   $escaped  = $WxcExecPath.Replace('\', '\\')
   $tomlText = [regex]::Replace($tomlText, '(?m)^\s*#?\s*wxc_exec_path\s*=.*$', "wxc_exec_path = `"$escaped`"")
-  # The shipped TOMLs hardcode the default share dir (C:/openshell-openclaw)
-  # as a literal in share_dir, agent_cwd, agent_command, pc_relay_spawner_path,
-  # and the NEMOCLAW_MXC_CAPTURE_*/HOME/TEMP agent_env entries -- not just
-  # wxc_exec_path. When -ShareDir overrides the default, every one of those
-  # needs to move too, or the sandbox ends up reading/writing the wrong
-  # directory while wxc_exec_path alone points at the right wxc-exec.
+  # The shipped TOMLs hardcode the default share dir only in the relay spawner
+  # path. Workload command/cwd/env are supplied per sandbox below.
   $defaultShareDirToml = "C:/openshell-openclaw"
   $shareDirToml = $shareDirNorm.Replace('\', '/')
   if ($shareDirToml -ne $defaultShareDirToml) {
@@ -314,6 +310,7 @@ try {
   New-Item -ItemType Directory -Force $shareDirNorm | Out-Null
   New-Item -ItemType Directory -Force (Join-Path $shareDirNorm "home") | Out-Null
   New-Item -ItemType Directory -Force (Join-Path $shareDirNorm "temp") | Out-Null
+  New-Item -ItemType Directory -Force (Join-Path $shareDirNorm "local") | Out-Null
   Grant-AppContainerWritableDirectory (Join-Path $shareDirNorm "home")
   Grant-AppContainerWritableDirectory (Join-Path $shareDirNorm "temp")
   Remove-Item (Join-Path $shareDirNorm "openclaw-capture.log") -Force -ErrorAction SilentlyContinue
@@ -344,10 +341,9 @@ try {
   # 5. Gateway env: config path via env var (clap: OPENSHELL_GATEWAY_CONFIG),
   #    NOT a --config token -- Start-Process -ArgumentList does not quote
   #    array elements, so a config path containing a space gets split and the
-  #    gateway's arg parser rejects it. OPENCLAW_GATEWAY_TOKEN is a bare key
-  #    in agent_env, resolved from THIS process's env at sandbox-create time,
-  #    so setting it here gives the sandboxed OpenClaw a stable, known token
-  #    instead of a fresh random one every restart.
+  #    gateway's arg parser rejects it. OPENCLAW_GATEWAY_TOKEN is passed with
+  #    sandbox create --env-from below, so setting it here gives the sandboxed
+  #    OpenClaw a stable, known token without placing it in argv.
   $env:OPENSHELL_DRIVERS        = "mxc"
   $env:OPENSHELL_GATEWAY_CONFIG = $tomlUsed
   $env:OPENCLAW_GATEWAY_TOKEN   = $GatewayToken
@@ -426,7 +422,41 @@ try {
     elseif ($delOut) { Info "sandbox pre-delete '$SandboxName': $delOut (continuing)" }
     else { Info "sandbox pre-delete '$SandboxName': delete exited $delCode (continuing)" }
   }
-  try { $createOut = & $cli sandbox create --name $SandboxName --policy $policyUsed --no-tty -- exit 2>&1; $createCode = $LASTEXITCODE }
+  $driverConfigJson = @{
+    mxc = @{
+      command = @(
+        "$shareDirToml/node.exe",
+        "$shareDirToml/openclaw-capture.mjs",
+        "gateway", "run", "--dev", "--allow-unconfigured",
+        "--auth", "token", "--bind", "loopback", "--port", "$TargetPort"
+      )
+      cwd = $shareDirToml
+    }
+  } | ConvertTo-Json -Compress -Depth 5
+  $createArgs = @(
+    "sandbox", "create", "--name", $SandboxName, "--policy", $policyUsed,
+    "--driver-config-json", $driverConfigJson,
+    "--env-from", "SYSTEMROOT", "--env-from", "WINDIR",
+    "--env-from", "PATH", "--env-from", "COMSPEC",
+    "--env-from", "OPENCLAW_GATEWAY_TOKEN",
+    "--env", "OPENCLAW_NO_UPDATE_CHECK=1",
+    "--env", "NO_UPDATE_NOTIFIER=1",
+    "--env", "LOCALAPPDATA=$shareDirToml/local",
+    "--env", "HOME=$shareDirToml/home",
+    "--env", "USERPROFILE=$shareDirToml/home",
+    "--env", "TEMP=$shareDirToml/temp", "--env", "TMP=$shareDirToml/temp",
+    "--env", "NEMOCLAW_MXC_CAPTURE_ENTRY=$shareDirToml/runtime/node_modules/openclaw/openclaw.mjs",
+    "--env", "NEMOCLAW_MXC_CAPTURE_LOG=$shareDirToml/openclaw-capture.log",
+    "--env", "NEMOCLAW_MXC_CAPTURE_SELF_PROBE_PORT=$TargetPort",
+    "--env", "NODE_OPTIONS=--use-env-proxy",
+    "--env", "NEMOCLAW_MXC_EGRESS_PROOF=1",
+    "--env", "NEMOCLAW_MXC_EGRESS_ALLOWED_URL=https://example.com/",
+    "--env", "NEMOCLAW_MXC_EGRESS_DENIED_URL=https://example.org/",
+    "--env", "NEMOCLAW_MXC_EGRESS_DIRECT_HOST=1.1.1.1",
+    "--env", "NEMOCLAW_MXC_EGRESS_LOOPBACK_PORT=29999",
+    "--no-tty", "--", "exit"
+  )
+  try { $createOut = & $cli @createArgs 2>&1; $createCode = $LASTEXITCODE }
   catch { $createOut = $_.Exception.Message; $createCode = 1 }
   $createBenign = Show-SandboxCreate $createOut $SandboxName
   if ($createCode -ne 0 -and -not $createBenign) {

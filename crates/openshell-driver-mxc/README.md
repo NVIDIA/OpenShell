@@ -49,7 +49,7 @@ default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
 # processContainer only: launch openshell-supervisor-relay instead of
-# agent_command/legacy command directly, giving the driver a control
+# the per-sandbox command directly, giving the driver a control
 # channel into the sandbox (launch handshake, dynamic `openshell forward
 # service` bridging). target_port is the launched command's own listening
 # port; 0 disables spawner wrapping (default -- the command runs directly).
@@ -57,27 +57,13 @@ pc_relay_spawner_path = ""
 pc_relay_target_port  = 0
 # processContainer only: env-inheritance tier for the launched process
 # (safest first): default is a minimal Windows CreateProcessW bootstrap set
-# (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA) + agent_env; pc_minimal_env
-# starts from an EMPTY env (agent_env only) for runtimes that choke on an
-# unrecognized host env; pc_inherit_full_env is an explicit unsafe opt-in
-# to the gateway host's entire environment (secrets included) + agent_env,
-# ignored when pc_minimal_env is also set.
+# (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA); pc_minimal_env starts from an
+# EMPTY env for runtimes that need a fully curated per-sandbox environment.
 pc_minimal_env = false
-pc_inherit_full_env = false
 # processContainer only: include "allowLocalNetwork": true in the MXC
 # network section. This compatibility setting broadens network access and is
 # not required by the BaseContainer qualification profile.
 pc_allow_local_network = false
-# Legacy workload settings, used only as a fallback when a sandbox's
-# CreateSandbox request carries no --driver-config-json (see below) --
-# agent_command is required for a sandbox to succeed via this fallback path.
-agent_command = ["cmd", "/c", "echo hello > C:\\work\\demo\\hello.txt"]
-agent_cwd = "C:\\work\\demo"
-# Host directory mapped read-write into the sandbox. NOT an automatic
-# filesystem grant on its own -- the sandbox's SandboxPolicy is the only
-# source of filesystem grants, so a policy's filesystem_policy.read_write
-# must include this path explicitly for the workload to reach it.
-share_dir = "C:\\work\\demo"
 # Pattern C governed egress. Requires backend = "process_container".
 egress_proxy = false
 egress_proxy_addr = ""
@@ -97,7 +83,7 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
   --driver-config-json $config --env MODE=demo --no-tty
 ```
 
-The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Per-sandbox environment variables come from the standard sandbox and template environment maps only; this path never copies values from the gateway host environment. The legacy `agent_env`/`pc_inherit_full_env` TOML fields above are a separate, gateway-wide mechanism and are the only way the gateway host's own environment reaches a sandbox -- bare `agent_env` keys opt specific host values in. Provider-owned keys override matching entries case-insensitively, but raw static values remain in the host proxy; MXC receives their revision-scoped placeholders. When governed egress is enabled, the driver replaces common TLS trust environment variables with paths to public proxy CA files staged under `share_dir`, and injects `HTTP_PROXY`/`HTTPS_PROXY` while clearing `NO_PROXY` so inherited bypass rules cannot skip policy enforcement.
+The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Supply per-sandbox environment variables with `--env` or `--env-from`; gateway configuration does not carry workload commands or environment. Provider-owned keys override matching entries case-insensitively, but raw static values remain in the host proxy; MXC receives their revision-scoped placeholders. When governed egress is enabled, the driver replaces common TLS trust environment variables with paths to public proxy CA files staged under `<cwd>/.openshell-proxy/<sandbox-id>/`, and injects `HTTP_PROXY`/`HTTPS_PROXY` while clearing `NO_PROXY` so inherited bypass rules cannot skip policy enforcement.
 
 UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
 
@@ -167,7 +153,7 @@ Linux-style procfs socket ownership. For HTTPS L7 inspection, the host proxy gen
 per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
 process env. In curated-environment mode, the driver stages the public CA files
-under the authorized `share_dir/.openshell-proxy/<sandbox-id>` directory. Other
+under the authorized `<cwd>/.openshell-proxy/<sandbox-id>` directory. Other
 environment modes grant the sandbox's unique public-CA directory as an internal
 read-write share. The directory contains only public CA certificates;
 the ephemeral CA private key remains in the host proxy's memory. The driver

@@ -15,13 +15,13 @@
 #     TOML.
 #   - No writes to the host filesystem.
 #
-# share_dir (configured in mxc-ws-gateway.toml, default C:\work\openshell-mxc-ws)
+# workload directory (passed by run-ws-agent-test.ps1, default C:\work\openshell-mxc-ws)
 # is granted explicitly below via read_only, since the policy is the only
 # source of filesystem grants (the driver no longer adds gateway-configured
 # host paths on its own) -- this makes the binary directory accessible even
 # with an otherwise-empty filesystem_policy, without granting more than the
 # no-writes-needed requirement above actually calls for. run-ws-agent-test.ps1
-# patches this path (alongside the TOML's share_dir) when -AgentDir overrides
+# patches this path and the per-sandbox driver config when -AgentDir overrides
 # the default below.
 #
 # This example intentionally omits network_policies, not because the driver

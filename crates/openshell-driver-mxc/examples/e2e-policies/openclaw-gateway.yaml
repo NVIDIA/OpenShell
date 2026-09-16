@@ -13,7 +13,7 @@
 #     (including its own Node.js runtime and the OpenClaw package) must
 #     live under share_dir; see run-openclaw-forward-test.ps1's staging
 #     step. run-openclaw-forward-test.ps1 patches this path (alongside the
-#     TOML's share_dir) when -ShareDir overrides the default below.
+#     per-sandbox cwd) when -ShareDir overrides the default below.
 #   - TCP socket binding on port 18889 (loopback) — governed by pc_capabilities.
 #   - Outbound TCP through the egress proxy — governed by egress_proxy in the TOML.
 #   - Win32k syscall access (ui.allow_graphical_ui) even though it never

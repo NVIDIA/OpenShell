@@ -49,8 +49,8 @@ param(
     # Path to wxc-exec.exe.  Required for real runs; ignored in mock mode.
     [string] $WxcExecPath = "",
 
-    # Working directory the AppContainer can read/write (becomes share_dir in
-    # the gateway TOML). mxc-ws-agent.exe is expected alongside this script;
+    # Working directory the AppContainer can read/write. mxc-ws-agent.exe is
+    # expected alongside this script;
     # the script copies it here if needed.
     [string] $AgentDir = "C:\work\openshell-mxc-ws",
 
@@ -135,7 +135,7 @@ $policyUsed = Join-Path $resultDir "ws-agent.yaml"
 $agentExeSrc = Join-Path $here "mxc-ws-agent.exe"
 $agentExe    = Join-Path $AgentDir "mxc-ws-agent.exe"
 
-# openshell-supervisor-relay.exe wraps agent_command (see mxc-ws-gateway.toml's
+# openshell-supervisor-relay.exe wraps the per-sandbox command (see mxc-ws-gateway.toml's
 # pc_relay_spawner_path) so the driver has a control channel into the sandbox,
 # which dynamic forwarding depends on.
 $relayExeSrc = Join-Path $here "openshell-supervisor-relay.exe"
@@ -298,16 +298,8 @@ function Render-Toml {
             "wxc_exec_path = `"$(Esc $WxcExecPath)`"")
     }
 
-    $agentDirFwd = Fwd $AgentDir
-    $agentExeFwd = Fwd $agentExe
     $relayExeFwd = Fwd $relayExe
 
-    $t = [regex]::Replace($t, '(?m)^\s*#?\s*share_dir\s*=.*$',
-        "share_dir = `"$agentDirFwd`"")
-    $t = [regex]::Replace($t, '(?m)^\s*#?\s*agent_cwd\s*=.*$',
-        "agent_cwd = `"$agentDirFwd`"")
-    $t = [regex]::Replace($t, '(?ms)^agent_command\s*=\s*\[.*?\]',
-        "agent_command = [`"$agentExeFwd`", `"server`"]")
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*pc_relay_spawner_path\s*=.*$',
         "pc_relay_spawner_path = `"$relayExeFwd`"")
 
@@ -317,9 +309,8 @@ function Render-Toml {
 # --- Render policy (disposable copy) ------------------------------------------
 
 # The policy's read_write grant is the only source of filesystem access now
-# (the driver no longer adds share_dir automatically) -- it hardcodes the
-# same default AgentDir literal as the TOML's share_dir, so it needs the
-# same -AgentDir substitution, or an overridden AgentDir loses its grant
+# (the driver never adds a workload directory automatically) -- it hardcodes
+# the default AgentDir, so it needs the same -AgentDir substitution or an override loses its grant
 # entirely and the wrapped server can't even read its own binary/DLLs.
 function Render-Policy {
     if (-not (Test-Path $policyFile)) {
@@ -485,6 +476,12 @@ try {
 
     Step "Create sandbox '$sandboxName'"
     $createOut = $null; $createExitCode = 0
+    $driverConfigJson = @{
+        mxc = @{
+            command = @((Fwd $agentExe), "server")
+            cwd = (Fwd $AgentDir)
+        }
+    } | ConvertTo-Json -Compress -Depth 4
     try {
         # MXC exec-in-driver has no SSH server, so any `sandbox create` invocation
         # that attempts SSH will fail with connection-refused and exit non-zero.
@@ -494,6 +491,7 @@ try {
         $createOut = & $cli sandbox create `
             --name $sandboxName `
             --policy $policyUsed `
+            --driver-config-json $driverConfigJson `
             --no-tty `
             -- cmd.exe /c exit 0 `
             2>&1

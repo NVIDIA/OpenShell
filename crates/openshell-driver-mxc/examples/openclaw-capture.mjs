@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // openclaw-capture.mjs - generic launcher/log-capture shim for running an
-// arbitrary Node.js entry point as agent_command inside an MXC
+// arbitrary Node.js entry point as the per-sandbox command inside an MXC
 // ProcessContainer sandbox.
 //
 // This is OpenShell's own adapter code, not part of OpenClaw -- it contains
@@ -12,7 +12,7 @@
 // "[target stdout]"/"[target stderr]" -- but a durable on-disk log inside
 // share_dir is also useful for post-hoc debugging without re-running.
 //
-// Required env vars (set via agent_env in the gateway TOML):
+// Required env vars (set via `openshell sandbox create --env`):
 //   NEMOCLAW_MXC_CAPTURE_ENTRY  absolute path to the real entry .mjs to run
 //                               (e.g. <openclaw install>/openclaw.mjs)
 //   NEMOCLAW_MXC_CAPTURE_LOG    absolute path to append captured output to
