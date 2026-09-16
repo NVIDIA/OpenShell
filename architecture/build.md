@@ -185,7 +185,9 @@ Runtime layout:
   supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
   GNU supervisor builds must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
-  drivers set the runtime identity and writable mounts. Health probes execute
+  drivers set the runtime identity and writable mounts. Docker stages private
+  files with the same numeric identity as the supervisor so archive uploads
+  preserve access regardless of the base image's default user. Health probes execute
   the supervisor binary directly. Base updates require refreshing the
   multi-architecture digest and rebuilding the image.
 
