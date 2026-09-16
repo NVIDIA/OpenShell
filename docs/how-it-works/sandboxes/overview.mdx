@@ -925,6 +925,15 @@ Delete multiple sandboxes by listing their names in one command:
 openshell sandbox delete sandbox-a sandbox-b
 ```
 
+Use `--all` to delete all sandboxes. The `--prune` flag only deletes sandboxes
+in `Error` or `Completed` phase (see [sandbox phases](#sandbox-lifecycle)). The
+two flags are mutually exclusive.
+
+```shell
+openshell sandbox delete --all
+openshell sandbox delete --prune
+```
+
 When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
 failure and continues with the remaining names. The command exits with an error
 after it attempts every requested deletion if any entry failed.
