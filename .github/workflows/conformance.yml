@@ -26,15 +26,133 @@ jobs:
       - id: gate
         uses: ./.github/actions/pr-gate
 
+  version:
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      cargo: ${{ steps.version.outputs.cargo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: echo "cargo=$(python3 tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+
+  build-cli:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-cli
+      binary: openshell
+      triple: x86_64-unknown-linux-musl
+      runner: linux-amd64-cpu8
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-gateway:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-gateway
+      binary: openshell-gateway
+      triple: x86_64-unknown-linux-gnu
+      runner: linux-amd64-cpu8
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-runtimes:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-runtime-binaries.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-sandbox-image:
+    needs: build-runtimes
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-supervisor-image:
+    needs: build-runtimes
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      binary: openshell-supervisor
+      target-suffix: unknown-linux-gnu
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-conformance-archive:
+    needs: version
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Build conformance nextest archive
+        run: nix run .#build-artifacts-test-archives
+
+      - name: Upload conformance nextest archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-conformance-tests-x86_64-unknown-linux-musl
+          path: artifacts/test-archives/x86_64-unknown-linux-musl/openshell-conformance-tests.tar
+          compression-level: 0
+          retention-days: 5
+          if-no-files-found: error
+
   fedora:
     name: Fedora with Rootless Podman
-    needs: pr_metadata
+    needs:
+      - pr_metadata
+      - build-cli
+      - build-gateway
+      - build-sandbox-image
+      - build-supervisor-image
+      - build-conformance-archive
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       actions: read
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,13 +171,42 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      - name: Build t-machine test artifacts
+      - name: Download candidate CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-x86_64-unknown-linux-musl
+          path: candidate/cli
+
+      - name: Download candidate gateway
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-x86_64-unknown-linux-gnu
+          path: candidate/gateway
+
+      - name: Download conformance nextest archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-conformance-tests-x86_64-unknown-linux-musl
+          path: artifacts/test-archives/x86_64-unknown-linux-musl
+
+      - name: Stage candidate artifacts for t-machine
         shell: bash
+        env:
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
-          nix run .#build-artifacts-binaries
-          nix run .#build-artifacts-test-archives
-          nix run .#build-artifacts-images
+          install -Dm0755 candidate/cli/openshell \
+            target/x86_64-unknown-linux-musl/debug/openshell
+          install -Dm0755 candidate/gateway/openshell-gateway \
+            target/x86_64-unknown-linux-gnu/debug/openshell-gateway
+
+          for component in sandbox supervisor; do
+            source="ghcr.io/nvidia/openshell/${component}:${IMAGE_TAG}"
+            target="docker.io/openshell/${component}:tmachine"
+            docker pull "$source"
+            docker image tag "$source" "$target"
+            docker save --output "artifacts/images/openshell-${component}-tmachine.tar" "$target"
+          done
 
       - name: Run t-machine conformance archive
         run: nix run .#tmachine -- test fedora-podman-rootless smoke
