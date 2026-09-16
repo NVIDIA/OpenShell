@@ -4258,8 +4258,10 @@ mod tests {
         .unwrap();
 
         let mut stream = response.into_inner();
-        // Draining the snapshot proves the producer reached the live loop, so
-        // it is subscribed to both buses before anything below is published.
+        // The snapshot itself only proves both subscriptions are live -- the
+        // replay reads come after it. But on this current-thread runtime the
+        // producer cannot yield between the two, so by the time the test task
+        // is scheduled again the producer has run through to the live loop.
         let snap = stream.next().await.unwrap().unwrap();
         assert!(snap.cursor.is_empty());
 
@@ -4307,8 +4309,11 @@ mod tests {
         /// Hitting the window is a race, so repeat it. One round reproduced the
         /// unfixed behavior in two runs of three; four caught it in ten of ten.
         const ROUNDS: u64 = 4;
+        /// The single line published to confirm the producer finished
+        /// initialization before the rounds below start publishing.
+        const HANDSHAKE: u64 = 1;
         const PER_ROUND: u64 = (PARK + BACKLOG + HAMMER * 2) as u64;
-        const TOTAL: u64 = PER_ROUND * ROUNDS;
+        const TOTAL: u64 = PER_ROUND * ROUNDS + HANDSHAKE;
 
         let state = test_server_state().await;
         let sandbox = test_sandbox("watermark", Vec::new());
@@ -4327,17 +4332,29 @@ mod tests {
         .await
         .unwrap();
         let mut stream = response.into_inner();
-        // Drain the snapshot before publishing anything. It is emitted at the
-        // end of initialization, so taking it first proves the producer is in
-        // the live loop and keeps every event below out of the tail replay --
-        // which is capped (200 log lines by default) and would otherwise drop
-        // events this test counts on.
+        // The snapshot only proves both subscriptions are live; the producer
+        // sends it before reading either replay window. Publishing the rest of
+        // this test against that state is unsound: the log tail is capped at
+        // 200 by default, so a burst landing before the read is truncated, the
+        // rest is suppressed as already replayed, and the test stalls.
+        //
+        // One line is the handshake. Receiving it with a cursor -- replayed or
+        // live, either way -- proves the producer is past both tail reads, and
+        // one line cannot overflow any tail. Everything below is published into
+        // a producer known to be in the live loop.
         let snap = stream.next().await.unwrap().unwrap();
         assert!(snap.cursor.is_empty());
+        seed_log_lines(&state, &id, 1);
+        let handshake = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            seq_of(&handshake),
+            HANDSHAKE,
+            "handshake line should be seq 1"
+        );
 
-        let mut highest = 0u64;
-        let mut seen = 0u64;
-        let mut last_cursor = String::new();
+        let mut highest = HANDSHAKE;
+        let mut seen = HANDSHAKE;
+        let mut last_cursor = handshake.cursor;
 
         for round in 0..ROUNDS {
             // Nothing reads during this round's setup, so the producer fills
@@ -4368,7 +4385,7 @@ mod tests {
                 })
             };
 
-            while seen < PER_ROUND * (round + 1) {
+            while seen < PER_ROUND * (round + 1) + HANDSHAKE {
                 let evt = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
                     .await
                     .unwrap_or_else(|_| {
