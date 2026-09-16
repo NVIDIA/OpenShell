@@ -2664,24 +2664,35 @@ def test_pager_rejects_a_repeated_continuation_token() -> None:
 
 def test_pager_bounds_consumed_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKENS", 1)
+    requests: list[str] = []
     pager = Pager(
-        lambda token: Page(items=[token], next_page_token="next"), page_token="first"
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
+        page_token="first",
     )
 
     assert next(pager).items == ["first"]
     with pytest.raises(SandboxError, match="token history limit exceeded"):
         next(pager)
+    assert requests == ["first"]
 
 
 def test_pager_bounds_consumed_token_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKEN_BYTES", 1)
+    requests: list[str] = []
     pager = Pager(
-        lambda token: Page(items=[token], next_page_token="next"),
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
         page_token="too-large",
     )
 
     with pytest.raises(SandboxError, match="token history limit exceeded"):
         next(pager)
+    assert requests == []
 
 
 def test_list_ids_forwards_label_selector() -> None:
