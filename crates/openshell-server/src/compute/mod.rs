@@ -11585,7 +11585,7 @@ mod tests {
                 ..Default::default()
             }),
             template: Some(SandboxTemplate {
-                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+                image: "docker.io/library/alpine:3.22".to_string(),
                 driver_config: Some(prost_types::Struct {
                     fields: [
                         (

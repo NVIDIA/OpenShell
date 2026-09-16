@@ -92,7 +92,7 @@ client
         }),
         spec: Some(SandboxWorkloadTemplateSpec {
             workload: Some(SandboxWorkloadConfig {
-                image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest".to_string(),
+                image: "docker.io/library/alpine:3.22".to_string(),
                 ..Default::default()
             }),
             ..Default::default()

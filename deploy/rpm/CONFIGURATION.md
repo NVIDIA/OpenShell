@@ -221,7 +221,7 @@ overrides that persist across package upgrades.
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
-| `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
+| `[openshell.drivers.podman].default_image` | `docker.io/library/alpine:3.22` | Default sandbox image. |
 | `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Static musl sandbox runtime image mounted into Podman workloads. |
 | `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Dynamic glibc supervisor image used outside the workload. |
 | `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
@@ -244,7 +244,7 @@ version = 2
 compute_driver = "podman"
 
 [openshell.drivers.podman]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image = "docker.io/library/alpine:3.22"
 image_pull_policy = "if_not_present"
 health_check_interval_secs = 10
 network_name = "openshell"
@@ -261,7 +261,7 @@ To update cached images:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull docker.io/library/alpine:3.22
 ```
 
 Or set `image_pull_policy = "always"` in
@@ -273,7 +273,7 @@ To pin specific image versions instead of `:latest`, set these values in
 ```toml
 sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:v0.0.37"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37"
+default_image = "docker.io/library/alpine:3.22"
 ```
 
 For air-gapped environments:
@@ -282,9 +282,9 @@ For air-gapped environments:
 
    ```shell
    podman pull ghcr.io/nvidia/openshell/supervisor:latest
-   podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman pull docker.io/library/alpine:3.22
    podman save -o supervisor.tar ghcr.io/nvidia/openshell/supervisor:latest
-   podman save -o sandbox.tar ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman save -o sandbox.tar docker.io/library/alpine:3.22
    ```
 
 1. Transfer the tarballs to the air-gapped host and load them:
