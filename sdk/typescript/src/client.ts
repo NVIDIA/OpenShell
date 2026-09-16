@@ -1608,10 +1608,16 @@ export class SandboxClient {
 
   async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
     try {
-      const resp = await this.grpc.listSandboxProviders({
-        ...sandboxTarget(name, options),
-      });
-      return resp.providers.map((p) => providerRef(p));
+      return await new Pager(async (pageToken) => {
+        const resp = await this.grpc.listSandboxProviders({
+          ...sandboxTarget(name, options),
+          pageToken,
+        });
+        return {
+          items: resp.providers.map((provider) => providerRef(provider)),
+          nextPageToken: resp.nextPageToken,
+        };
+      }).all();
     } catch (e) {
       throw fromConnect(e);
     }

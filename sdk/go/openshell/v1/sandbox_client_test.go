@@ -25,26 +25,28 @@ import (
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu                 sync.Mutex
-	sandboxes          map[string]*pb.Sandbox
-	providers          map[string][]*dm.Provider
-	createErr          error
-	getErr             error
-	listErr            error
-	listPages          [][]*pb.Sandbox
-	listRequests       []*pb.ListSandboxesRequest
-	deleteErr          error
-	deleteResponse     *pb.DeleteSandboxResponse
-	deleteRequest      *pb.DeleteSandboxRequest
-	attachErr          error
-	detachErr          error
-	listProvErr        error
-	createRequest      *pb.CreateSandboxRequest
-	watchEvents        []*pb.SandboxStreamEvent
-	watchErr           error
-	watchPostEventsErr error
-	watchKeepOpen      chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest       *pb.WatchSandboxRequest // recorded request
+	mu                   sync.Mutex
+	sandboxes            map[string]*pb.Sandbox
+	providers            map[string][]*dm.Provider
+	createErr            error
+	getErr               error
+	listErr              error
+	listPages            [][]*pb.Sandbox
+	listRequests         []*pb.ListSandboxesRequest
+	listProviderPages    [][]*dm.Provider
+	listProviderRequests []*pb.ListSandboxProvidersRequest
+	deleteErr            error
+	deleteResponse       *pb.DeleteSandboxResponse
+	deleteRequest        *pb.DeleteSandboxRequest
+	attachErr            error
+	detachErr            error
+	listProvErr          error
+	createRequest        *pb.CreateSandboxRequest
+	watchEvents          []*pb.SandboxStreamEvent
+	watchErr             error
+	watchPostEventsErr   error
+	watchKeepOpen        chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest         *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -209,8 +211,25 @@ func (s *mockSandboxServer) DetachSandboxProvider(_ context.Context, req *pb.Det
 }
 
 func (s *mockSandboxServer) ListSandboxProviders(_ context.Context, req *pb.ListSandboxProvidersRequest) (*pb.ListSandboxProvidersResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.listProvErr != nil {
 		return nil, s.listProvErr
+	}
+	s.listProviderRequests = append(s.listProviderRequests, proto.Clone(req).(*pb.ListSandboxProvidersRequest))
+	if s.listProviderPages != nil {
+		page := 0
+		if req.GetPageToken() == "page-2" {
+			page = 1
+		}
+		nextPageToken := ""
+		if page+1 < len(s.listProviderPages) {
+			nextPageToken = "page-2"
+		}
+		return &pb.ListSandboxProvidersResponse{
+			Providers:     s.listProviderPages[page],
+			NextPageToken: nextPageToken,
+		}, nil
 	}
 	provs := s.providers[req.GetSandbox()]
 	return &pb.ListSandboxProvidersResponse{Providers: provs}, nil
@@ -661,10 +680,11 @@ func TestSandboxDetachProvider_NotFound(t *testing.T) {
 
 func TestSandboxListProviders(t *testing.T) {
 	mock := newMockSandboxServer()
-	mock.providers["my-sb"] = []*dm.Provider{
+	mock.listProviderPages = [][]*dm.Provider{{
 		{Metadata: &dm.ObjectMeta{Name: "claude-prov"}, Type: "claude"},
+	}, {
 		{Metadata: &dm.ObjectMeta{Name: "github-prov"}, Type: "github"},
-	}
+	}}
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
@@ -672,6 +692,9 @@ func TestSandboxListProviders(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
+	require.Len(t, mock.listProviderRequests, 2)
+	assert.Equal(t, "", mock.listProviderRequests[0].GetPageToken())
+	assert.Equal(t, "page-2", mock.listProviderRequests[1].GetPageToken())
 }
 
 func TestSandboxListProviders_Empty(t *testing.T) {

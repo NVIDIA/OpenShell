@@ -11,6 +11,7 @@ import (
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
@@ -229,16 +230,24 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 }
 
 func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
-	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+	pager := newPager("", func(ctx context.Context, pageToken string) (*Page[*dm.Provider], error) {
+		resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
+			Sandbox:        sandboxName,
+			WorkspaceScope: namedWorkspaceScope(workspace),
+			PageToken:      pageToken,
+		})
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		return &Page[*dm.Provider]{Items: resp.GetProviders(), NextPageToken: resp.GetNextPageToken()}, nil
 	})
+	protos, err := pager.All(ctx)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
 
-	providers := make([]*Provider, 0, len(resp.GetProviders()))
-	for _, proto := range resp.GetProviders() {
+	providers := make([]*Provider, 0, len(protos))
+	for _, proto := range protos {
 		providers = append(providers, converter.ProviderFromProto(proto))
 	}
 	return providers, nil

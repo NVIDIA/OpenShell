@@ -1309,20 +1309,39 @@ describe('providers', () => {
   });
 
   it('lists providers with u64 resourceVersion rendered as a string', async () => {
+    const pageTokens: string[] = [];
     const sandbox = client({
-      listSandboxProviders: () => ({
-        providers: [
-          {
-            metadata: {
-              id: 'p1',
-              name: 'claude',
-              labels: { a: 'b' },
-              resourceVersion: 99n,
-            },
-            type: 'claude',
-          },
-        ],
-      }),
+      listSandboxProviders: ({ pageToken }) => {
+        pageTokens.push(pageToken);
+        return pageToken === ''
+          ? {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p1',
+                    name: 'claude',
+                    labels: { a: 'b' },
+                    resourceVersion: 99n,
+                  },
+                  type: 'claude',
+                },
+              ],
+              nextPageToken: 'page-2',
+            }
+          : {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p2',
+                    name: 'github',
+                    resourceVersion: 100n,
+                  },
+                  type: 'github',
+                },
+              ],
+              nextPageToken: '',
+            };
+      },
     });
     const providers = await sandbox.listProviders('sb');
     expect(providers).toEqual([
@@ -1333,7 +1352,15 @@ describe('providers', () => {
         labels: { a: 'b' },
         resourceVersion: '99',
       },
+      {
+        id: 'p2',
+        name: 'github',
+        type: 'github',
+        labels: {},
+        resourceVersion: '100',
+      },
     ]);
+    expect(pageTokens).toEqual(['', 'page-2']);
   });
 });
 

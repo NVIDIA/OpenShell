@@ -18,6 +18,7 @@ message PageToken {
     ObjectCursor object = 4;
     PolicyCursor policy = 5;
     ProfileCursor profile = 6;
+    OffsetCursor offset = 7;
   }
 }
 
@@ -37,4 +38,9 @@ message PolicyCursor {
 // Cursor for a deterministically ordered provider-profile catalog.
 message ProfileCursor {
   string key = 1;
+}
+
+// Cursor for a bounded collection whose order is defined by its parent.
+message OffsetCursor {
+  uint32 offset = 1;
 }

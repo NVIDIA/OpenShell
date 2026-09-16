@@ -855,16 +855,14 @@ modes:
   backfill and sandbox annotation updates).
 
 **Lists.** Public list RPCs follow AIP-158: requests carry direct `page_size`
-and `page_token` fields, and responses carry `next_page_token`. The sole
-exception is `ListSandboxProviders`: a sandbox can have at most 32 attached
-providers, so the gateway returns its complete bounded result in one response
-and does not expose pagination fields. The gateway clamps page sizes to 1,000
-and returns opaque base64url continuation tokens.
+and `page_token` fields, and responses carry `next_page_token`. The gateway
+clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
-authorization grant, and use immutable keyset cursors rather than database
-offsets. Each page repeats normal authentication and authorization. Pagination
-is weakly consistent under concurrent writes and deletes; it does not provide a
-historical snapshot.
+authorization grant, and use immutable keyset cursors for object-backed lists.
+`ListSandboxProviders` uses an opaque position cursor within its bounded
+attachment order, not a database offset. Each page repeats normal
+authentication and authorization. Pagination is weakly consistent under
+concurrent writes and deletes; it does not provide a historical snapshot.
 
 Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
 `ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
