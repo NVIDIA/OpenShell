@@ -106,14 +106,7 @@ fi
 # All maintained CI/dev overlays must render a loader-valid configuration.
 for values in "${chart}"/ci/values-*.yaml; do
   name="$(basename "${values}" .yaml)"
-  if [[ "${name}" == "values-corporate-proxy-e2e" ]]; then
-    # The e2e wrapper supplies this generated URL alongside the overlay.
-    render "${work_dir}/${name}.yaml" \
-      --values "${values}" \
-      --set-string 'gatewayConfig.openshell\.drivers\.kubernetes.https_proxy=http://proxy.corp.example:8080'
-  else
-    render "${work_dir}/${name}.yaml" --values "${values}"
-  fi
+  render "${work_dir}/${name}.yaml" --values "${values}"
   extract_toml "${work_dir}/${name}.yaml" "${work_dir}/${name}.toml"
   preflight "${work_dir}/${name}.toml"
 done
