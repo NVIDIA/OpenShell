@@ -342,22 +342,23 @@ and `openshell sandbox provider detach`. See
 
 ### Auto-Discovery Shortcut
 
-When the trailing command in `openshell sandbox create` maps to an available
-profile, the CLI auto-creates the required provider from local profile
-discovery if one does not already exist. You do not need to create the provider
-separately:
+Name a provider with `--provider`. If no provider by that name exists and the
+name matches an imported profile ID, the CLI creates one from local profile
+discovery, so you do not need to create it separately:
 
 ```shell
-openshell sandbox create -- claude
+openshell sandbox create --provider claude-code -- claude
 ```
 
-This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
-a provider, attaches it to the sandbox, and launches Claude Code.
+This finds your `ANTHROPIC_API_KEY`, creates a `claude-code` provider, attaches
+it to the sandbox, and launches Claude Code. Add `--auto-providers` to skip the
+confirmation prompt, or `--no-auto-providers` to skip creation entirely.
 
-Inference resolves through the gateway's catalog: OpenShell matches the command
-against each imported profile's ID and the binaries it authorizes. A command no
-profile claims, or one that several claim, infers nothing. Import a profile that
-names the binary first, or pass an existing provider with `--provider <name>`.
+A provider is attached only when you name it. OpenShell does not derive one from
+the trailing command: a profile's `binaries` list authorizes a binary to reach
+that profile's endpoints, which is not a statement that running the binary asks
+for the provider. A sandbox with no providers is a normal, fully supported
+state.
 
 ## How Credential Injection Works
 

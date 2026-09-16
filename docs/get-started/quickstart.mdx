@@ -75,11 +75,11 @@ Choose the tab that matches your agent:
 Run the following command to create a sandbox with Claude Code:
 
 ```shell
-openshell sandbox create -- claude
+openshell sandbox create --provider claude-code -- claude
 ```
 
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
+`--provider` names the profile to use. If no provider by that name exists yet,
+the CLI prompts you to create one from local credentials; type `yes` to continue.
 If `ANTHROPIC_API_KEY` is set in your environment, the CLI picks it up automatically.
 If not, you can configure it from inside the sandbox after it launches.
 
@@ -93,11 +93,11 @@ If not, you can configure it from inside the sandbox after it launches.
 Run the following command to create a sandbox with OpenCode:
 
 ```shell
-openshell sandbox create -- opencode
+openshell sandbox create --provider openai -- opencode
 ```
 
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
+`--provider` names the profile to use. If no provider by that name exists yet,
+the CLI prompts you to create one from local credentials; type `yes` to continue.
 If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, the CLI picks it up automatically.
 If not, you can configure it from inside the sandbox after it launches.
 </Tab>
@@ -107,11 +107,11 @@ If not, you can configure it from inside the sandbox after it launches.
 Run the following command to create a sandbox with Codex:
 
 ```shell
-openshell sandbox create -- codex
+openshell sandbox create --provider codex -- codex
 ```
 
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
+`--provider` names the profile to use. If no provider by that name exists yet,
+the CLI prompts you to create one from local credentials; type `yes` to continue.
 If `OPENAI_API_KEY` is set in your environment, the CLI picks it up automatically.
 If not, you can configure it from inside the sandbox after it launches.
 </Tab>

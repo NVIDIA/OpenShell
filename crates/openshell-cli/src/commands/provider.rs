@@ -321,82 +321,25 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     output
 }
 
-/// Return the provider profile inferred from the trailing command, if any.
-///
-/// Inference resolves through the gateway's catalog: the command's basename is
-/// matched against each profile's ID and against the basenames of the binaries
-/// the profile authorizes. A profile that names `/usr/bin/claude` is the profile
-/// for running `claude`.
-///
-/// The catalog is the authority. A profile that declares a binary claims the
-/// command that runs it — narrowing that is the profile's job, not the CLI's,
-/// which is why no command is special-cased here.
-///
-/// The match must be unique. Several profiles authorize `curl`, so `curl`
-/// infers nothing and the user names one with `--provider`. An empty catalog
-/// infers nothing.
-pub fn inferred_provider_type(
-    command: &[String],
-    profiles: &[ProviderTypeProfile],
-) -> Option<String> {
-    let first = command.first()?;
-    let basename = Path::new(first)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(first);
-    if basename.is_empty() {
-        return None;
-    }
-
-    let mut matched: Option<&str> = None;
-    for profile in profiles {
-        if !profile_claims_command(profile, basename) {
-            continue;
-        }
-        match matched {
-            // More than one profile claims this command; an explicit
-            // --provider is the only unambiguous answer.
-            Some(existing) if existing != profile.id => return None,
-            Some(_) => {}
-            None => matched = Some(&profile.id),
-        }
-    }
-    matched.map(str::to_string)
-}
-
-fn profile_claims_command(profile: &ProviderTypeProfile, basename: &str) -> bool {
-    if profile.id.eq_ignore_ascii_case(basename) {
-        return true;
-    }
-    profile.binaries.iter().any(|binary| {
-        Path::new(&binary.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            // A glob in the final segment names no single command, so it cannot
-            // attribute one.
-            .is_some_and(|name| !name.contains('*') && name.eq_ignore_ascii_case(basename))
-    })
-}
-
 /// Ensure all required providers exist.
 ///
 /// `explicit_names` are provider **names** supplied via `--provider`. They are
 /// passed through directly; the server validates they exist at sandbox creation.
 ///
-/// `inferred_types` are provider **types** inferred from the trailing command
-/// (e.g. `claude` -> type `"claude-code"`). These are resolved to provider names via
-/// a type→name lookup, and missing types may be auto-created interactively.
+/// A provider is attached only when the user names it. Nothing is derived from
+/// the trailing command: a profile's `binaries` list authorizes a binary to
+/// reach its endpoints, which is not a statement that running that binary asks
+/// for the provider.
 ///
 /// Returns a deduplicated list of provider **names** suitable for
 /// `SandboxSpec.providers`.
 pub async fn ensure_required_providers(
     client: &mut crate::tls::GrpcClient,
     explicit_names: &[String],
-    inferred_types: &[String],
     auto_providers_override: Option<bool>,
     workspace: &str,
 ) -> Result<Vec<String>> {
-    if explicit_names.is_empty() && inferred_types.is_empty() {
+    if explicit_names.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -442,6 +385,12 @@ pub async fn ensure_required_providers(
     // name matches a known provider type, auto-create a provider of that
     // type with the requested name.
     for name in explicit_names {
+        // --provider may repeat a name. Without this guard a repeated name that
+        // does not exist yet is auto-created twice, and the second attempt
+        // fails with "provider already exists".
+        if seen_names.contains(name) {
+            continue;
+        }
         if known_names.contains(name) {
             if seen_names.insert(name.clone()) {
                 configured_names.push(name.clone());
@@ -467,42 +416,9 @@ pub async fn ensure_required_providers(
                 workspace,
             )
             .await?;
-            // Record the type mapping so the inferred-types pass below
-            // doesn't attempt to create a duplicate provider.
             type_to_name
                 .entry(provider_type.to_ascii_lowercase())
                 .or_insert_with(|| name.clone());
-        }
-    }
-
-    // ── Resolve inferred provider types ──────────────────────────────────
-    if !inferred_types.is_empty() {
-        // Collect resolved names for types that already have a provider.
-        for t in inferred_types {
-            if let Some(name) = type_to_name.get(&t.to_ascii_lowercase())
-                && seen_names.insert(name.clone())
-            {
-                configured_names.push(name.clone());
-            }
-        }
-
-        let missing = inferred_types
-            .iter()
-            .filter(|t| !type_to_name.contains_key(&t.to_ascii_lowercase()))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for provider_type in missing {
-            auto_create_provider(
-                client,
-                &provider_type,
-                None,
-                auto_providers_override,
-                &mut seen_names,
-                &mut configured_names,
-                workspace,
-            )
-            .await?;
         }
     }
 
@@ -2799,78 +2715,6 @@ mod tests {
         assert!(provider_profile_allows_empty_credentials(
             &optional_refresh_profile
         ));
-    }
-
-    /// Stands in for the catalog a connected gateway would publish.
-    fn catalog() -> &'static [ProviderTypeProfile] {
-        static CATALOG: std::sync::OnceLock<Vec<ProviderTypeProfile>> = std::sync::OnceLock::new();
-        CATALOG
-            .get_or_init(openshell_providers::example_profiles::load_all)
-            .as_slice()
-    }
-
-    fn infer(command: &[&str]) -> Option<String> {
-        let command = command.iter().map(ToString::to_string).collect::<Vec<_>>();
-        inferred_provider_type(&command, catalog())
-    }
-
-    #[test]
-    fn inferred_provider_type_matches_a_profile_binary() {
-        // claude-code is the only profile authorizing /usr/bin/claude.
-        assert_eq!(
-            infer(&["claude", "--help"]),
-            Some("claude-code".to_string())
-        );
-        assert_eq!(
-            infer(&["/usr/local/bin/claude"]),
-            Some("claude-code".to_string())
-        );
-        // gh and git both belong to github.
-        assert_eq!(infer(&["gh"]), Some("github".to_string()));
-        assert_eq!(infer(&["git"]), Some("github".to_string()));
-    }
-
-    #[test]
-    fn inferred_provider_type_matches_a_profile_id() {
-        assert_eq!(infer(&["codex"]), Some("codex".to_string()));
-    }
-
-    #[test]
-    fn inferred_provider_type_returns_none_for_unclaimed_command() {
-        // A retired legacy type has no profile, so nothing claims it.
-        assert_eq!(infer(&["glab"]), None);
-        assert_eq!(infer(&["vim"]), None);
-    }
-
-    #[test]
-    fn inferred_provider_type_honors_whatever_a_profile_declares() {
-        // `binaries` is the operator's authorization statement, so a profile
-        // that declares a binary claims the command that runs it — including
-        // binaries a reader might not expect. aws-s3 declares /bin/bash, so it
-        // claims `bash`; narrowing that belongs in the profile, not here.
-        assert_eq!(infer(&["bash"]), Some("aws-s3".to_string()));
-        assert_eq!(infer(&["wget"]), Some("cursor".to_string()));
-        assert_eq!(infer(&["pip"]), Some("pypi".to_string()));
-    }
-
-    #[test]
-    fn inferred_provider_type_declines_when_several_profiles_claim_it() {
-        // Six profiles authorize curl; two authorize python3. The CLI cannot
-        // pick, so the user names one with --provider.
-        assert_eq!(infer(&["curl"]), None);
-        assert_eq!(infer(&["python3"]), None);
-    }
-
-    #[test]
-    fn inferred_provider_type_returns_none_for_empty_command_or_catalog() {
-        assert_eq!(inferred_provider_type(&[], catalog()), None);
-        assert_eq!(inferred_provider_type(&["claude".to_string()], &[]), None);
-    }
-
-    #[test]
-    fn inferred_provider_type_ignores_glob_binary_segments() {
-        // pypi authorizes /sandbox/.uv/python/**, which names no single command.
-        assert_eq!(infer(&["**"]), None);
     }
 
     #[test]

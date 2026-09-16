@@ -1537,62 +1537,11 @@ async fn sandbox_delete_continues_after_entry_failure() {
 }
 
 #[tokio::test]
-async fn sandbox_create_fails_when_the_profile_catalog_is_unreachable() {
-    // A failed catalog lookup must not read as an authoritative empty catalog:
-    // that would infer nothing and create a provider-less sandbox, deferring
-    // the failure to the workload.
-    let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-
-    server
-        .openshell
-        .state
-        .fail_list_provider_profiles
-        .store(true, Ordering::SeqCst);
-
-    let error = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("catalog-unavailable"),
-            command: &["claude".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect_err("an unreachable catalog must not silently create a provider-less sandbox");
-
-    let message = format!("{error:?}");
-    assert!(
-        message.contains("provider profiles"),
-        "error should name the failed catalog lookup: {message}"
-    );
-    assert!(
-        message.contains("--provider"),
-        "error should point at explicit selection: {message}"
-    );
-    assert!(
-        server
-            .openshell
-            .state
-            .create_requests
-            .lock()
-            .await
-            .is_empty(),
-        "no sandbox should be created when the catalog lookup failed"
-    );
-}
-
-#[tokio::test]
-async fn sandbox_create_without_a_command_tolerates_an_unreachable_catalog() {
-    // With no trailing command there is nothing to infer, so the lookup is not
-    // needed and its failure must not block creation.
+async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
+    // The catalog's only consumer is the advisory credential warning, so a
+    // failed lookup degrades that warning instead of blocking creation.
+    // Nothing derives provider authority from it: a provider is attached only
+    // when the user names one.
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1610,19 +1559,24 @@ async fn sandbox_create_without_a_command_tolerates_an_unreachable_catalog() {
         &server.endpoint,
         "openshell",
         run::SandboxCreateConfig {
-            name: Some("catalog-unavailable-no-command"),
+            name: Some("catalog-unavailable"),
+            command: &["claude".into()],
             ..test_config()
         },
         "default",
         &tls,
     )
     .await
-    .expect("a sandbox with no command needs no catalog");
+    .expect("an unreachable catalog must not block sandbox creation");
 
-    assert_eq!(
-        server.openshell.state.create_requests.lock().await.len(),
-        1,
-        "the sandbox should still be created"
+    let requests = server.openshell.state.create_requests.lock().await;
+    assert_eq!(requests.len(), 1, "the sandbox should still be created");
+    assert!(
+        requests[0]
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.providers.is_empty()),
+        "no provider should be attached without an explicit --provider"
     );
 }
 

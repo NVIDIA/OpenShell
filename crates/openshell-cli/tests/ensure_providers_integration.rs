@@ -836,7 +836,6 @@ async fn explicit_provider_name_passes_through_when_it_exists() {
     let result = run::ensure_required_providers(
         &mut client,
         &["nvidia".to_string()],
-        &[],
         Some(true), // --auto-providers (should not matter here)
         "default",
     )
@@ -865,7 +864,6 @@ async fn explicit_provider_name_auto_creates_when_valid_type() {
     let result = run::ensure_required_providers(
         &mut client,
         &["nvidia".to_string()],
-        &[],
         Some(true), // --auto-providers to skip interactive prompt
         "default",
     )
@@ -899,7 +897,6 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
     let err = run::ensure_required_providers(
         &mut client,
         &["my-custom-thing".to_string()],
-        &[],
         Some(true),
         "default",
     )
@@ -917,36 +914,6 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
     );
 }
 
-/// Inferred types (from the trailing command) that don't exist should be
-/// auto-created, preserving the existing behaviour.
-#[tokio::test]
-async fn inferred_type_auto_creates_provider() {
-    let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("ANTHROPIC_API_KEY", "sk-ant-test")]);
-
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
-        .await
-        .expect("grpc client");
-
-    let result = run::ensure_required_providers(
-        &mut client,
-        &[],
-        &["claude-code".to_string()],
-        Some(true), // --auto-providers
-        "default",
-    )
-    .await
-    .expect("should auto-create the inferred provider");
-
-    assert_eq!(result, vec!["claude-code".to_string()]);
-
-    let providers = ts.openshell.state.providers.lock().await;
-    let provider = providers
-        .get("claude-code")
-        .expect("claude-code provider should exist");
-    assert_eq!(provider.r#type, "claude-code");
-}
-
 /// When `--no-auto-providers` is set, missing explicit providers that would
 /// otherwise be auto-created should be silently skipped.
 #[tokio::test]
@@ -961,7 +928,6 @@ async fn no_auto_providers_skips_missing_explicit_provider() {
     let result = run::ensure_required_providers(
         &mut client,
         &["nvidia".to_string()],
-        &[],
         Some(false), // --no-auto-providers
         "default",
     )
@@ -980,10 +946,9 @@ async fn no_auto_providers_skips_missing_explicit_provider() {
     );
 }
 
-/// Both explicit names and inferred types should be resolved together,
-/// deduplicating providers that appear in both lists.
+/// Several explicit providers are all resolved and created.
 #[tokio::test]
-async fn explicit_and_inferred_providers_combined() {
+async fn multiple_explicit_providers_combined() {
     let ts = run_server().await;
     let _guard = EnvVarGuard::set(&[
         ("NVIDIA_API_KEY", "nvapi-combo"),
@@ -996,8 +961,7 @@ async fn explicit_and_inferred_providers_combined() {
 
     let result = run::ensure_required_providers(
         &mut client,
-        &["nvidia".to_string()],
-        &["claude-code".to_string()],
+        &["nvidia".to_string(), "claude-code".to_string()],
         Some(true),
         "default",
     )
@@ -1014,10 +978,9 @@ async fn explicit_and_inferred_providers_combined() {
     assert!(providers.contains_key("claude-code"));
 }
 
-/// When an explicit provider name matches an inferred type, the provider
-/// should only appear once in the result.
+/// A provider named twice appears only once in the result.
 #[tokio::test]
-async fn explicit_and_inferred_deduplicates() {
+async fn repeated_explicit_provider_deduplicates() {
     let ts = run_server().await;
     let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-dedup")]);
 
@@ -1025,11 +988,9 @@ async fn explicit_and_inferred_deduplicates() {
         .await
         .expect("grpc client");
 
-    // Both explicit and inferred want "nvidia".
     let result = run::ensure_required_providers(
         &mut client,
-        &["nvidia".to_string()],
-        &["nvidia".to_string()],
+        &["nvidia".to_string(), "nvidia".to_string()],
         Some(true),
         "default",
     )
