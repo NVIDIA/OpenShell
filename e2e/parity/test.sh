@@ -269,7 +269,7 @@ if [ "${OPENSHELL_PARITY_TEST_MUTATE_ARTIFACT:-}" = "${OPENSHELL_PARITY_VARIANT}
   replacement="${OPENSHELL_GATEWAY_BIN}.replacement"
   printf '#!/usr/bin/env bash\nexit 0\n# mutated\n' >"${replacement}"
   chmod 0555 "${replacement}"
-  mv "${replacement}" "${OPENSHELL_GATEWAY_BIN}"
+  mv -f "${replacement}" "${OPENSHELL_GATEWAY_BIN}"
 fi
 if [ "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" = podman-options ]; then
   case "${OPENSHELL_PARITY_VARIANT}" in baseline) pids=2048 ;; candidate) pids=31 ;; esac
