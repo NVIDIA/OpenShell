@@ -5,7 +5,8 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use openshell_core::proto::pagination::v1::{
-    ObjectCursor as ProtoObjectCursor, PageToken, PolicyCursor, ProfileCursor, page_token::Cursor,
+    ObjectCursor as ProtoObjectCursor, OffsetCursor, PageToken, PolicyCursor, ProfileCursor,
+    page_token::Cursor,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -110,6 +111,16 @@ impl Pagination {
         }
     }
 
+    pub fn offset_cursor(&self) -> Result<Option<u32>, Status> {
+        match &self.cursor {
+            None => Ok(None),
+            Some(Cursor::Offset(cursor)) => Ok(Some(cursor.offset)),
+            Some(_) => Err(Status::invalid_argument(
+                "page_token has the wrong cursor type",
+            )),
+        }
+    }
+
     pub fn next_object_token(&self, cursor: Option<&ObjectCursor>) -> String {
         cursor.map_or_else(String::new, |cursor| {
             self.encode(Cursor::Object(ProtoObjectCursor {
@@ -132,6 +143,12 @@ impl Pagination {
             self.encode(Cursor::Profile(ProfileCursor {
                 key: key.to_string(),
             }))
+        })
+    }
+
+    pub fn next_offset_token(&self, offset: Option<u32>) -> String {
+        offset.map_or_else(String::new, |offset| {
+            self.encode(Cursor::Offset(OffsetCursor { offset }))
         })
     }
 
@@ -177,19 +194,8 @@ mod tests {
             .0
     }
 
-    fn message_documentation<'a>(proto: &'a str, message: &str) -> &'a str {
-        let marker = format!("message {message} {{");
-        let message_start = proto
-            .find(&marker)
-            .unwrap_or_else(|| panic!("{message} message must exist"));
-        let documentation_start = proto[..message_start]
-            .rfind("\n\n")
-            .map_or(0, |boundary| boundary + 2);
-        &proto[documentation_start..message_start]
-    }
-
     #[test]
-    fn every_public_list_rpc_is_paginated_or_explicitly_bounded() {
+    fn every_public_list_rpc_is_paginated() {
         let proto = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../proto/openshell.proto"
@@ -210,31 +216,36 @@ mod tests {
                 .expect("List RPC response type must close");
             let request = format!("{method}Request");
 
-            if method == "ListSandboxProviders" {
-                assert!(
-                    message_documentation(proto, &request)
-                        .contains("bounded list intentionally has no pagination"),
-                    "{request} must document why it has no pagination"
-                );
-                assert!(message_body(proto, response).contains("complete bounded set"));
-            } else {
-                let request_body = message_body(proto, &request);
-                assert!(
-                    request_body.contains("int32 page_size"),
-                    "{request} must declare page_size"
-                );
-                assert!(
-                    request_body.contains("string page_token"),
-                    "{request} must declare page_token"
-                );
-                assert!(
-                    message_body(proto, response).contains("string next_page_token"),
-                    "{response} must declare next_page_token"
-                );
-            }
+            let request_body = message_body(proto, &request);
+            assert!(
+                request_body.contains("int32 page_size"),
+                "{request} must declare page_size"
+            );
+            assert!(
+                request_body.contains("string page_token"),
+                "{request} must declare page_token"
+            );
+            assert!(
+                message_body(proto, response).contains("string next_page_token"),
+                "{response} must declare next_page_token"
+            );
 
             remaining = after_response;
         }
+    }
+
+    #[test]
+    fn offset_token_round_trips() {
+        let first =
+            Pagination::new(1, "", "ListSandboxProviders", &["default", "sandbox"]).unwrap();
+        let token = first.next_offset_token(Some(1));
+        assert_eq!(
+            Pagination::new(1, &token, "ListSandboxProviders", &["default", "sandbox"])
+                .unwrap()
+                .offset_cursor()
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
