@@ -1003,22 +1003,22 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_loads_discovery_and_jwks_from_tls_idp_with_rotated_local_ca() {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa};
         use rustls::pki_types::PrivateKeyDer;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let old_ca_key = KeyPair::generate().unwrap();
+        let old_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
         let old_ca_cert = old_ca_params.self_signed(&old_ca_key).unwrap();
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server_key = KeyPair::generate().unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
         let server_cert = server_params
             .signed_by(&server_key, &ca_cert, &ca_key)
             .unwrap();
