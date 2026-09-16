@@ -27,7 +27,7 @@ use openshell_isolation_interface::contract::{
     BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
     OuterFenceGuarantees, ResolveError, ShellSpec,
 };
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -349,7 +349,7 @@ pub fn generate_sandbox_tls_material(
     session_id: SandboxSessionId,
 ) -> Result<SandboxTlsMaterial, BackendError> {
     let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
         .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
     let mut ca_params = CertificateParams::default();
     ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -363,9 +363,10 @@ pub fn generate_sandbox_tls_material(
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
-    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-    })?;
+    let sandbox_key =
+        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
+            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+        })?;
     let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
         .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
     sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);

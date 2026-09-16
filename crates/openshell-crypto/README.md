@@ -71,6 +71,10 @@ scheduling randomness are not migrated. No SSH or PQC capability is asserted by
 the primitive capability report. OpenSSL, strict policy, module version discovery,
 and deployment qualification belong in follow-up work.
 
+Durable proxy CA loading retains rcgen's PEM key import and X.509 parser. The
+parser and build-time Z3 downloader retain the narrowly allowed Ring dependencies
+listed in `deny.toml`; context capabilities do not attest these paths.
+
 ## Extending and checking
 
 Implement both traits without importing application crates. Retain provider/key
@@ -83,5 +87,6 @@ Run `cargo test -p openshell-crypto` for known-answer crypto, tampering, JWT
 validation, context substitution, and isolated global-provider tests. Existing
 bootstrap, credential-store, gateway TLS/OIDC, and proxy tests exercise the
 migrated consumers. `mise run crypto:check` rejects direct backend imports and
-feature selections outside this crate. The existing cargo-deny Ring ban remains
-in force. A source scan cannot attest the behavior of transitive dependencies.
+feature selections outside this crate. The cargo-deny Ring restrictions and their
+explicit wrapper exceptions remain in force. A source scan cannot attest the
+behavior of transitive dependencies.

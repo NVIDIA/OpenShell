@@ -100,7 +100,7 @@ impl SandboxCa {
     /// Load a durable CA while preserving the exact certificate bytes supplied
     /// by the provisioner for boundary launch replay.
     pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let ca_key = KeyPair::from_pem(private_key_pem)
             .into_diagnostic()
             .wrap_err("parse proxy CA private key")?;

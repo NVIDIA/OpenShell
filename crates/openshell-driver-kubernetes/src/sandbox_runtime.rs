@@ -16,7 +16,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
@@ -86,7 +86,8 @@ pub struct ProxyCaMaterial {
 }
 
 pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, String> {
-    let key = KeyPair::generate().map_err(|error| format!("generate proxy CA key: {error}"))?;
+    let key = openshell_crypto::pki::generate_keypair()
+        .map_err(|error| format!("generate proxy CA key: {error}"))?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
