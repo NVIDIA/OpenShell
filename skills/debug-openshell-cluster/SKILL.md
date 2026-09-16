@@ -187,6 +187,13 @@ Inspect sandbox OCSF configuration and finding events for the validation
 rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
+The published supervisor image uses a shell-free distroless Debian 13 base.
+Use container logs, engine inspection and the configured exec health probe for
+diagnostics; `exec ... sh`, package installation and in-container shell scripts
+are unavailable. Workload shells belong to the separate sandbox image. Preserve
+the driver-selected UID and writable runtime/log mounts when reproducing a
+supervisor startup failure.
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash

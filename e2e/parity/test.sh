@@ -8,6 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SUPERVISOR_BASE="$(awk '$1 == "FROM" { print $2; exit }' "${ROOT}/deploy/docker/Dockerfile.supervisor")"
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_ROOT="${TMP_ROOT%/}"
 WORKDIR="$(mktemp -d "${TMP_ROOT}/openshell-parity-test.XXXXXX")"
@@ -17,6 +18,37 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_contains() { grep -F -- "$2" "$1" >/dev/null || fail "expected $1 to contain: $2"; }
 assert_not_contains() { ! grep -F -- "$2" "$1" >/dev/null || fail "expected $1 not to contain: $2"; }
 assert_status() { [ "$1" -eq "$2" ] || fail "expected status $2, got $1"; }
+
+# Package provenance must work for both Debian status and distroless status.d.
+uv run --no-project python - "${ROOT}" "${WORKDIR}" <<'PYTEST'
+import runpy
+import sys
+from pathlib import Path
+
+manifest = runpy.run_path(str(Path(sys.argv[1]) / "e2e/support/debian-package-manifest.py"))["package_manifest"]
+root = Path(sys.argv[2]) / "dpkg-fixture"
+root.mkdir()
+(root / "status").write_text("Package: removed\nStatus: deinstall ok config-files\n\n")
+(root / "status.d").mkdir()
+(root / "status.d/libc6").write_text("Package: libc6\nVersion: 2.41\nArchitecture: arm64\nMulti-Arch: same\n")
+(root / "status.d/libc6.md5sums").write_text("ignored checksum file")
+assert manifest(root) == ["libc6:arm64=2.41"]
+(root / "status").write_text("Package: ca-certificates\nStatus: install ok installed\nVersion: 20250419\nArchitecture: all\n")
+assert manifest(root) == ["ca-certificates=20250419", "libc6:arm64=2.41"]
+(root / "status.d/libc6").write_text("Package: broken\n")
+try:
+    manifest(root)
+except ValueError:
+    pass
+else:
+    raise AssertionError("incomplete package metadata accepted")
+try:
+    manifest(root / "missing")
+except ValueError:
+    pass
+else:
+    raise AssertionError("missing package metadata accepted")
+PYTEST
 
 # Schema generator behavior is separately deterministic and does not need a
 # gateway, certificates, or Podman.
@@ -111,7 +143,7 @@ expected_sandbox="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:$(pri
 [ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" = "${expected_sandbox}" ] || exit 25
 [ "${OPENSHELL_COMMUNITY_REGISTRY:-}" = "ghcr.io/nvidia/openshell-community/sandboxes" ] || exit 28
 expected_base="docker.io/library/debian@sha256:$(printf '%064d' 0)"
-[ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = debian:bookworm-slim ] || exit 26
+[ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = "${OPENSHELL_PARITY_TEST_SUPERVISOR_BASE}" ] || exit 26
 [ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" = "${expected_base}" ] || exit 27
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
@@ -174,7 +206,7 @@ launch = {
     "supervisor_image_id": zero,
     "supervisor_image_digest": image_digest,
     "supervisor_runtime_image": supervisor_runtime,
-    "supervisor_base_image": "debian:bookworm-slim",
+    "supervisor_base_image": os.environ["OPENSHELL_PARITY_TEST_SUPERVISOR_BASE"],
     "supervisor_base_image_id": zero,
     "supervisor_base_image_digest": image_digest,
     "supervisor_base_runtime_image": base_runtime,
@@ -335,6 +367,7 @@ run_harness() {
   if [ "${OPENSHELL_PARITY_TEST_KEEP_RESULTS_DIR:-0}" != 1 ]; then
     rm -rf -- "${WORKDIR}/results"
   fi
+  OPENSHELL_PARITY_TEST_SUPERVISOR_BASE="${TEST_SUPERVISOR_BASE}" \
   OPENSHELL_PARITY_CAPABILITY_MANIFEST="${WORKDIR}/manifest.toml" \
   OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
   OPENSHELL_PARITY_PODMAN_WRAPPER="${WORKDIR}/bin/fake-wrapper" \
@@ -407,7 +440,7 @@ assert_not_contains "${WORKDIR}/results/baseline.json" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.log" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.conformance.json" '"passed":true'
 assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
-assert_contains "${WORKDIR}/podman-calls" 'pull debian:bookworm-slim'
+assert_contains "${WORKDIR}/podman-calls" "pull ${TEST_SUPERVISOR_BASE}"
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
 

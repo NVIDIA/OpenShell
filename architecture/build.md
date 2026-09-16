@@ -88,9 +88,8 @@ SONAMEs.
 
 The workload-side `openshell-sandbox` binary is statically linked with musl so
 drivers can stage it into an arbitrary agent image without depending on that
-image's libc. The supervisor is also statically linked: release images use the
-default musl build, while distribution-specific builds may select the
-`glibc-static` variant.
+image's libc. The separate `openshell-supervisor` binary is dynamically linked
+with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
@@ -115,11 +114,8 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries are static in every configuration. The default `musl`
-variant uses `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
-`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
+Supervisor staging uses the GNU build path and verifies the glibc 2.28 floor.
+Sandbox staging uses the static musl build path. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -184,9 +180,14 @@ Runtime layout:
 - **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
   musl `/openshell-sandbox` binary and its static VM guest-init helper.
   Drivers stage this binary into the workload trust domain.
-- **Supervisor**: Debian-based `openshell/supervisor` image containing only the
-  dynamically linked GNU `/openshell-supervisor` binary. GNU supervisor builds
-  must not reference `GLIBC_*` symbols newer than `GLIBC_2.28`.
+- **Supervisor**: digest-pinned `gcr.io/distroless/base-nossl-debian13` base
+  with the dynamically linked GNU `/openshell-supervisor` binary. The base
+  supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
+  GNU supervisor builds must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
+  drivers set the runtime identity and writable mounts. Health probes execute
+  the supervisor binary directly. Base updates require refreshing the
+  multi-architecture digest and rebuilding the image.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
