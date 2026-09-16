@@ -445,15 +445,19 @@ backend = "aqua:GoogleContainerTools/skaffold"
 "vars.version_prefix" = "v"
 
 [tools.skaffold."platforms.linux-arm64"]
+checksum = "sha256:0062e1ff61f35200168454fa5a836306dd30b51acf30999d5d8836770d70ad2f"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
+checksum = "sha256:de75d5697d4a14d6a5e87105671ef9a30990270ab14ad301913f8f8d41a1ecca"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
+checksum = "sha256:73478a431c17674d2f75d2c6e2fcbf35aa019de4ad6027e5573cc0f581767fbc"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [tools.skaffold."platforms.windows-x64"]
+checksum = "sha256:a257da2988782b4c1971bb58b9c7bb52176f8a0b587b6520dec0064f271fa416"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]
@@ -461,13 +465,15 @@ version = "0.10.12"
 backend = "aqua:astral-sh/uv"
 
 [tools.uv."platforms.linux-arm64"]
-checksum = "sha256:55bd1c1c10ec8b95a8c184f5e18b566703c6ab105f0fc118aaa4d748aabf28e4"
-url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:0ed7d20f49f6b9b60d45fdfcac28f3ac01a671a6ef08672401ed2833423fea2a"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491938"
 provenance = "github-attestations"
 
 [tools.uv."platforms.linux-x64"]
-checksum = "sha256:adccf40b5d1939a5e0093081ec2307ea24235adf7c2d96b122c561fa37711c46"
-url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:ec72570c9d1f33021aa80b176d7baba390de2cfeb1abcbefca346d563bf17484"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491996"
 provenance = "github-attestations"
 
 [tools.uv."platforms.macos-arm64"]
