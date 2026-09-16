@@ -10,10 +10,15 @@ and mounts) remain chart values.
 Remove every application-only `server.*`, `supervisor.*`, and `upstreamProxy.*`
 setting before upgrading. There is no compatibility translation. Kubernetes pull
 policy spellings such as `Always` are not aliases: use `always`,
-`if_not_present`, or `never`. Do not put passwords, private keys, or
-`database_url` in `gatewayConfig`; use Secret-backed environment configuration.
+`if_not_present`, or `never`. `gatewayConfig` is strictly a non-secret
+configuration contract: do not put passwords, tokens, private keys,
+`database_url`, or other secret material in it; use Secret-backed environment,
+file, or volume configuration instead. Helm serializes unknown fields
+generically and cannot determine whether an arbitrary string such as
+`api_token` is confidential. It rejects `database_url`, inline URL credentials,
+and PEM private keys, but is not a general secret scanner.
 
-Keep `server.disableTls`, TLS Secret names, `server.externalDbSecret`,
+Keep `server.disableTls`, TLS Secret names, `server.hostGatewayIP`, `server.externalDbSecret`,
 `server.sandboxNamespace`, `oidc.caConfigMapName`, certificate settings and
 Service settings: these own Kubernetes resources. The chart derives their
 runtime counterparts.
@@ -32,7 +37,9 @@ runtime counterparts.
 | `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}` | `openshell.gateway.gateway_jwt` or `openshell.drivers.kubernetes.sa_token_ttl_secs` |
 | `supervisor.*` | `openshell.drivers.kubernetes` and `.sidecar` |
 | `upstreamProxy.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}` |
-| credential-driver runtime settings | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
+| `server.credentialDrivers.{kubernetesSecrets,vault}.*` | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
+| `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | `openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`; omit it to disable SPIFFE provider grants. |
+| `server.hostGatewayIP` | Retained as the chart-owned host-alias input; the chart derives `openshell.drivers.kubernetes.host_gateway_ip`. |
 
 ## Examples
 
