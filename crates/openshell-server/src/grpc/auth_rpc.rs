@@ -261,10 +261,15 @@ pub async fn handle_refresh_sandbox_token(
             .sandbox_token
             .expose_secret()
             .to_string(),
-        sandbox_expires_at_ms: authentication
-            .supervisor
-            .sandbox_expires_at
-            .saturating_mul(1000),
+        sandbox_expiration_time: Some(
+            openshell_core::time::timestamp_from_millis(
+                authentication
+                    .supervisor
+                    .sandbox_expires_at
+                    .saturating_mul(1000),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+        ),
         session_id: authentication.supervisor.runtime_generation.to_string(),
         credential_epoch: authentication.supervisor.auth_epoch.get(),
     }))
@@ -562,6 +567,7 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
+        assert!(resp.sandbox_expiration_time.is_some());
     }
 
     #[tokio::test]
@@ -593,6 +599,10 @@ mod tests {
         assert_eq!(replayed.token, second.token);
         assert_eq!(replayed.sandbox_token, second.sandbox_token);
         assert_eq!(replayed.expiration_time, second.expiration_time);
+        assert_eq!(
+            replayed.sandbox_expiration_time,
+            second.sandbox_expiration_time
+        );
 
         let mut changed_retry = request();
         changed_retry.get_mut().extension_service_names = vec!["content-guard".to_string()];

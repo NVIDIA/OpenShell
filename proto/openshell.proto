@@ -787,8 +787,8 @@ message RefreshSandboxTokenRequest {
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
 message RefreshSandboxTokenResponse {
-  reserved 2;
-  reserved "expires_at_ms";
+  reserved 2, 5;
+  reserved "expires_at_ms", "sandbox_expires_at_ms";
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the new token. Absence means the token is non-expiring.
@@ -798,8 +798,8 @@ message RefreshSandboxTokenResponse {
   repeated ExtensionServiceCredential extension_credentials = 3;
   // Fresh Sandbox Protocol bearer token from the same atomic refresh.
   string sandbox_token = 4 [(openshell.options.v1.secret) = true];
-  // Absolute Sandbox Protocol token expiry, milliseconds since the epoch.
-  int64 sandbox_expires_at_ms = 5;
+  // Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+  google.protobuf.Timestamp sandbox_expiration_time = 105;
   // Launch generation to which both refreshed credentials are bound.
   string session_id = 6;
   // Durable authorization epoch shared by the gateway and Sandbox Runtime.
