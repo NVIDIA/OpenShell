@@ -57,7 +57,7 @@ part of sandbox runtime material.
 
 ## Endpoint Boundary
 
-The built-in profile permits official Vertex hosts:
+The example profile in `providers/google-vertex-ai.yaml` permits official Vertex hosts:
 
 - `<region>-aiplatform.googleapis.com`
 - `aiplatform.googleapis.com`

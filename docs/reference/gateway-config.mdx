@@ -165,9 +165,8 @@ grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
 # Optional exact provider-profile source composition. When omitted, the
-# gateway uses builtin + user.
+# gateway uses imported profiles only.
 provider_profile_sources = [
-  { type = "builtin" },
   { type = "user" },
 ]
 
@@ -398,7 +397,9 @@ Bindings under `allowlist` and `exact` require `rpc` or `service` plus `method`,
 
 Bindings that include `post_commit` must resolve to `failure_policy = "fail_open"`; the gateway rejects fail-closed post-commit configuration at startup. Post-commit evaluation is observational. If response observation or interceptor evaluation fails after a handler succeeds, the gateway logs and counts the failure but returns the committed response unchanged.
 
-`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use the built-in and user-managed sources. Use `{ type = "builtin" }`, `{ type = "user" }`, and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include local sources explicitly to compose them. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use imported profiles only. Use `{ type = "user" }` and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include `{ type = "user" }` explicitly to compose imported profiles with it. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+
+OpenShell ships no profiles inside the gateway binary. A gateway with nothing imported reaches ready and serves an empty catalog; import the profiles it needs with `openshell provider profile import`. The `builtin` source type was removed and a configuration that still names it is rejected at startup.
 
 For an authoritative interceptor catalog, select only that interceptor:
 

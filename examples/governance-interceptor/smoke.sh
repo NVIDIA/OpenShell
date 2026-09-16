@@ -440,8 +440,19 @@ configure_gateway() {
 run_suite() {
   expect_output_contains "lists github profile" "github" "${CLI[@]}" provider list-profiles
   expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" provider list-profiles
+  # The interceptor is the only configured source, so a profile imported into
+  # the user source stays out of the catalog.
+  cat >"$TMPDIR/unvended-profile.yaml" <<'EOF'
+id: unvended-api
+display_name: Unvended API
+category: other
+endpoints:
+  - host: api.unvended.example
+    port: 443
+binaries: [/usr/bin/curl]
+EOF
+  "${CLI[@]}" provider profile import -f "$TMPDIR/unvended-profile.yaml" --global >/dev/null 2>&1 || true
+  expect_output_not_contains "hides profiles the interceptor does not vend" "unvended-api" "${CLI[@]}" provider list-profiles
   expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" provider profile export github -o json
   expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" provider profile export github -o json
 

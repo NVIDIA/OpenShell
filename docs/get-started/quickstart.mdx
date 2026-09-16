@@ -36,6 +36,34 @@ After installing the CLI, run `openshell --help` in your terminal to view the fu
 Install the public OpenShell agent skills with `npx skills add NVIDIA/OpenShell`. The `openshell-cli` skill guides your agent through common workflows and uses the installed CLI help as the command reference; no OpenShell source checkout is required.
 </Tip>
 
+## Import a Provider Profile
+
+A provider profile describes the credentials, endpoints, and client binaries a
+provider needs. A gateway serves only the profiles you imported, so import one
+before creating a sandbox that uses a provider.
+
+The OpenShell repository ships example profiles in
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). Download
+the one matching your agent and import it at platform scope:
+
+```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+openshell provider profile import -f claude-code.yaml --global
+```
+
+Use `codex.yaml` for Codex, or `openai.yaml` for OpenCode. Confirm the catalog:
+
+```shell
+openshell provider list-profiles
+```
+
+<Tip>
+Read the comment header at the top of each file before importing it. It names
+the client binaries the profile expects and the image layout those paths assume.
+If your sandbox image installs the agent somewhere else, edit `binaries` first —
+otherwise the profile matches nothing and the credential is never injected.
+</Tip>
+
 ## Create Your First OpenShell Sandbox
 
 Create a sandbox and launch an agent inside it.

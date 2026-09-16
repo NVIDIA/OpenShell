@@ -78,8 +78,8 @@ YAML files do not need an `id` field; if one is present, the filename still wins
 The interceptor advertises `provider_profiles = true` in its manifest and vends
 the current profile set through `SnapshotProviderProfiles`. The gateway config
 selects the interceptor as its only provider profile source, so
-`provider list-profiles` shows only `github` and `slack`; built-in and user
-sources are omitted. The example signs each profile's canonical protobuf payload
+`provider list-profiles` shows only `github` and `slack`; the user source is
+omitted, so imported profiles do not appear beside them. The example signs each profile's canonical protobuf payload
 and exposes the JWT under
 `annotations["openshell.nvidia.com/profile-signature"]`; the signed hash and key
 ID are exposed beside it. These annotations demonstrate logic an interceptor

@@ -232,11 +232,12 @@ observation or evaluation failures outside binding policy emit warnings and the
 The gateway reconstructs the original response frames, including trailers and
 body errors, before evaluating the observer.
 
-Interceptor manifests can also vend provider profile catalogs. Gateway
-configuration selects the exact ordered source set from the in-tree built-in
-source, the stored user source, and named profile-capable interceptors. Omitting
-the setting selects `builtin + user`; selecting only an interceptor makes it
-authoritative by omission. Every selected source uses the same snapshot,
+Interceptor manifests can also vend provider profile catalogs. No profile is
+compiled into the gateway: configuration selects the exact ordered source set
+from the stored user source and named profile-capable interceptors. Omitting the
+setting selects the user source alone, so a gateway with nothing imported serves
+an empty catalog; selecting only an interceptor makes it authoritative by
+omission. Every selected source uses the same snapshot,
 semantic-validation, and duplicate-detection path. Duplicate normalized profile
 IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in

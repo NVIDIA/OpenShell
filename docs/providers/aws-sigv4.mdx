@@ -17,6 +17,14 @@ AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3,
 
 ## Provider Setup
 
+Import the `aws` profile first; a gateway serves only the profiles you
+imported:
+
+```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/aws.yaml
+openshell provider profile import -f aws.yaml --global
+```
+
 Create a provider with AWS credentials:
 
 ```shell

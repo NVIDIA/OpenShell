@@ -12,6 +12,30 @@ NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub re
 
 ## 0.1.0 migration notes
 
+### Provider profiles are import-only
+
+OpenShell 0.1.0 stops compiling provider profiles into the gateway binary. A gateway's catalog contains exactly the profiles an operator imported, the default `provider_profile_sources` is `[{ type = "user" }]`, and the `builtin` source type is removed: a `gateway.toml` that still names it is rejected at startup with the import command. A gateway with nothing imported reaches ready and serves an empty catalog.
+
+Export the profiles your deployment relies on **before** upgrading:
+
+```shell
+openshell provider profile export <id> -o yaml --global > <id>.yaml
+```
+
+After upgrading, import them at the scope your providers use. You can also take them from the `providers/` directory of the matching release tag:
+
+```shell
+openshell provider profile import --from ./providers --global
+```
+
+Omit `--global` for workspace-scoped providers. The canonical IDs are no longer reserved, so `github`, `openai`, `pypi` and the rest import at their own IDs, and the imported profile is the only definition for that ID.
+
+A provider whose profile is absent after the upgrade stays listable and exportable, but creating a sandbox with it, or attaching it to one, fails with a message naming the provider, the missing profile ID, and the import command. Legacy provider type aliases are gone with the compiled catalog: use a profile's own ID, so `--type claude-code` rather than `--type claude`, and `--type github` rather than `--type gh`.
+
+Command-to-provider inference is also catalog-driven now. `openshell sandbox create -- <command>` matches the command against each imported profile's ID and the binaries it declares, instead of a fixed alias table. A command that exactly one profile declares infers that profile and prompts to create the provider; a command several profiles declare infers nothing and needs an explicit `--provider`. Commands the old table never listed can therefore infer where they previously did not — `git`, `pip` and `uv` are declared by the `github` and `pypi` example profiles — and a profile that declares a shell or interpreter claims that command too. Narrow a profile's `binaries` if that is not what you want.
+
+The files under `providers/` are reviewable examples, not defaults. Read each file's header before importing it: several bind network access to binary paths that exist only in the OpenShell Community image, and imported unchanged into another image the profile matches nothing.
+
 ### Network policy binaries
 
 OpenShell 0.1.0 removes the deprecated `NetworkBinary.harness` protobuf field and reserves its field number and name. Generated protobuf decoders ignore the unknown value. When the gateway loads policy history written by an older version, it migrates binaries marked by the former field into endpoint-provenance-marked rules so the upgrade cannot widen private-address access.

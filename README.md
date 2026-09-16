@@ -136,7 +136,9 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 
 ## Providers
 
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+
+A provider is created from a **provider profile**, which declares the credentials, endpoints, and client binaries the provider needs. Profiles are import-only: a gateway serves exactly the profiles you imported with `openshell provider profile import`, and ships none of its own. The [`providers/`](providers/) directory holds reviewable examples to copy and adapt. Once a profile is imported, the CLI can auto-discover credentials for its provider from your shell environment, or you can create providers explicitly with `openshell provider create`.
 
 Inference access uses the same provider workflow. Attach an inference-capable provider to a sandbox, call the provider's native endpoint, and select the model in the client. Provider profiles contribute the endpoint policy and bind credential placeholders to the authorized destination.
 

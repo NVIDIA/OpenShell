@@ -152,7 +152,7 @@ provider_profile_sources = [
 ]
 ```
 
-Include `{ type = "builtin" }` or `{ type = "user" }` entries to compose interceptor profiles with the built-in or user-managed sources. Duplicate normalized profile IDs fail instead of overriding one source with another.
+Include a `{ type = "user" }` entry to compose interceptor profiles with imported profiles. Duplicate normalized profile IDs fail instead of overriding one source with another, so an interceptor-vended profile and an imported profile cannot share an ID.
 
 The gateway validates snapshot structure and provider profile semantics. It treats the configured interceptor as a trusted source and does not verify interceptor-defined signature, hash, or key annotations.
 
