@@ -420,6 +420,13 @@ async fn handle_create_sandbox_inner(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    super::provider::validate_provider_profiles_present(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &spec.providers,
+    )
+    .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -1165,6 +1172,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    super::provider::validate_provider_profiles_present(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &candidate_spec.providers,
+    )
+    .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -3640,6 +3654,26 @@ mod tests {
         }
     }
 
+    /// Import a minimal profile so a synthetic provider type resolves.
+    ///
+    /// Provider profiles are import-only: a provider whose type no profile
+    /// declares cannot compose a sandbox. Tests about limits, CAS or credential
+    /// collisions still need their placeholder types to exist.
+    async fn import_test_profile(state: &ServerState, id: &str) {
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                openshell_core::proto::ProviderProfile {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("store test provider profile");
+    }
+
     fn test_provider(name: &str, provider_type: &str) -> Provider {
         test_provider_with_credential_key(name, provider_type, "TOKEN")
     }
@@ -3904,7 +3938,7 @@ mod tests {
             }),
         )
         .await
-        .expect("user-only profile catalog should not include the builtin github profile")
+        .expect("an imported github profile should resolve from the user source")
         .into_inner();
 
         assert!(response.attached);
@@ -4288,6 +4322,8 @@ mod tests {
     #[tokio::test]
     async fn create_sandbox_rejects_provider_credential_key_collisions() {
         let state = test_server_state().await;
+        import_test_profile(&state, "outlook").await;
+        import_test_profile(&state, "google-drive").await;
         state
             .store
             .put_message(&test_provider("provider-a", "outlook"))
@@ -4342,12 +4378,84 @@ mod tests {
             }),
         )
         .await
-        .expect("user-only profile catalog should not include the builtin github profile")
+        .expect("an imported github profile should resolve from the user source")
         .into_inner();
 
         assert_eq!(
             response.sandbox.expect("created sandbox").object_name(),
             "user-catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_a_provider_whose_profile_is_absent() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("orphan", "never-imported"))
+            .await
+            .unwrap();
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "orphan-sandbox".to_string(),
+                spec: Some(SandboxSpec {
+                    providers: vec!["orphan".to_string()],
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                await_main_process_attachment: false,
+                workload_template_name: String::new(),
+            }),
+        )
+        .await
+        .expect_err("a provider with no profile must not compose a sandbox");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let message = err.message();
+        assert!(message.contains("'orphan'"), "{message}");
+        assert!(message.contains("'never-imported'"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_rejects_a_provider_whose_profile_is_absent() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("orphan", "never-imported"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "orphan".to_string(),
+                expected_resource_version: 0,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect_err("a provider with no profile must not attach");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let message = err.message();
+        assert!(message.contains("'never-imported'"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
         );
     }
 
@@ -5909,6 +6017,8 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_rejects_credential_key_collisions() {
         let state = test_server_state().await;
+        import_test_profile(&state, "outlook").await;
+        import_test_profile(&state, "google-drive").await;
         state
             .store
             .put_message(&test_provider("provider-a", "outlook"))
@@ -5947,6 +6057,7 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_accepts_at_max_providers_limit() {
         let state = test_server_state().await;
+        import_test_profile(&state, "generic").await;
 
         // Create MAX_PROVIDERS (32) providers
         for i in 0..MAX_PROVIDERS {
@@ -6003,6 +6114,7 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_rejects_beyond_max_providers_limit() {
         let state = test_server_state().await;
+        import_test_profile(&state, "generic").await;
 
         // Create MAX_PROVIDERS + 1 providers
         for i in 0..=MAX_PROVIDERS {
@@ -6064,6 +6176,7 @@ mod tests {
 
         // Provider name that exceeds validation limits
         let long_name = "a".repeat(1000);
+        import_test_profile(&state, "generic").await;
         state
             .store
             .put_message(&test_provider(&long_name, "generic"))
@@ -6533,6 +6646,7 @@ mod tests {
         use std::sync::Arc;
 
         let state = Arc::new(test_server_state().await);
+        import_test_profile(&state, "generic").await;
 
         // Create multiple providers
         for i in 0..3 {

@@ -1793,6 +1793,52 @@ pub async fn validate_provider_environment_keys_unique(
     .await
 }
 
+/// Reject a sandbox composition whose providers name profiles this gateway does
+/// not serve.
+///
+/// Provider profiles are import-only, so a provider whose profile was never
+/// imported — or was deleted, or lives at a scope this workspace cannot see —
+/// resolves to nothing. Composing it silently would produce a sandbox that
+/// looks ready but carries none of the provider's credentials or policy, and
+/// the failure would surface later as a denied connection. Name the missing
+/// profile and the command that supplies it instead.
+pub async fn validate_provider_profiles_present(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<(), Status> {
+    for name in provider_names {
+        let Some(provider) = store
+            .get_message_by_name::<Provider>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        else {
+            continue;
+        };
+        if get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        )
+        .is_some()
+        {
+            continue;
+        }
+        let requested = provider.r#type.trim();
+        let scope_flag = if provider.profile_workspace.trim().is_empty() {
+            " --global"
+        } else {
+            ""
+        };
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' references provider profile '{requested}', which is not in this gateway's profile catalog; \
+             import it with 'openshell provider profile import -f <file>{scope_flag}'"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn validate_provider_environment_keys_unique_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
