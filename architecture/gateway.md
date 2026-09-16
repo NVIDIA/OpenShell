@@ -276,8 +276,13 @@ controlling Sandbox CR. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
-the sandbox record still exists. Older tokens are not server-revoked; shared
-deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+the sandbox record still exists. Each successful refresh atomically stores the
+new gateway-token ID in that sandbox record. The immediately consumed bearer
+can recover that same successor for 30 seconds when the request matches, but it
+cannot authorize ordinary RPCs or choose another successor. Advancing the
+successor removes that retry path across every gateway replica. Short
+`gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
+that has not yet been refreshed.
 Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
 single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
 Kubernetes and other shared deployments should set a positive TTL. Explicit
@@ -906,7 +911,7 @@ system entry instead of pretending to delete package-manager owned state.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration. Local Docker, Podman, and VM callback endpoints can
   be derived from their fixed host aliases. Kubernetes requires an explicit
-  endpoint from deployment topology; Helm renders it from the gateway Service
+  endpoint from driver placement; Helm renders it from the gateway Service
   name and namespace rather than inferring it from sandbox placement.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback

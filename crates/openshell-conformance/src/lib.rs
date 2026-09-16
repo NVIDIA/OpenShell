@@ -288,6 +288,22 @@ impl OpenShellRunner {
         ))
     }
 
+    /// Uses the candidate CLI selected by the archive test runner.
+    ///
+    /// Archive-based tests set `OPENSHELL_BIN` to the candidate artifact
+    /// installed in the guest. Requiring it here prevents a test from silently
+    /// resolving a different `openshell` binary from `PATH`.
+    pub fn from_env(scenario: &str) -> Result<Self, RunnerError> {
+        let binary = std::env::var_os("OPENSHELL_BIN")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                RunnerError::BinaryUnavailable(
+                    "OPENSHELL_BIN must name the candidate openshell CLI".to_string(),
+                )
+            })?;
+        Self::with_binary(binary, scenario)
+    }
+
     /// Creates a runner with an injected executor. This is useful for harness tests.
     pub fn with_executor(cli: Arc<dyn CliExecutor>, scenario: &str) -> Self {
         Self {

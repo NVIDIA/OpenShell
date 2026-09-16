@@ -7,6 +7,7 @@ mod auth_rpc;
 pub mod policy;
 pub mod provider;
 mod sandbox;
+pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
 pub mod workspace;

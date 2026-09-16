@@ -117,6 +117,8 @@ where
     }
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
+    let http_10_closes_by_default =
+        response_is_http_10(&header_str) && !parse_connection_keep_alive(&header_str);
     let event_stream = response_is_event_stream(&header_str);
     let body_length = parse_body_length(&header_str)?;
 
@@ -171,7 +173,7 @@ where
             header_end,
             status_code,
             body_length,
-            server_wants_close,
+            server_wants_close || http_10_closes_by_default,
             event_stream,
         ))
         .await?
@@ -196,12 +198,12 @@ where
     // No explicit framing (no Content-Length, no Transfer-Encoding).
     // Per RFC 7230 §3.3.3 the body is delimited by connection close.
     if matches!(body_length, BodyLength::None) {
-        if server_wants_close || event_stream {
+        if server_wants_close || http_10_closes_by_default || event_stream {
             // Server indicated it will close, or this is a streaming response
             // such as SSE where the body is intentionally delimited by EOF.
             let before_end = &buf[..header_end - 2];
             client.write_all(before_end).await.into_diagnostic()?;
-            if server_wants_close {
+            if server_wants_close || http_10_closes_by_default {
                 client
                     .write_all(b"Connection: close\r\n\r\n")
                     .await
@@ -220,6 +222,7 @@ where
                 relay_until_eof(upstream, client).await?;
             }
             client.flush().await.into_diagnostic()?;
+            client.shutdown().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
@@ -2021,6 +2024,24 @@ pub(super) fn parse_connection_close(headers: &str) -> bool {
     false
 }
 
+/// Check if an HTTP/1.0 response opts into a persistent connection.
+pub(super) fn parse_connection_keep_alive(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("connection:")
+            .is_some_and(|value| value.split(',').any(|token| token.trim() == "keep-alive"))
+    })
+}
+
+pub(super) fn response_is_http_10(headers: &str) -> bool {
+    headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        == Some("HTTP/1.0")
+}
+
 pub(super) fn response_is_event_stream(headers: &str) -> bool {
     headers.lines().skip(1).any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -2036,9 +2057,23 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponseFraming, parse_response_head_for_middleware, serialize_response_head};
+    use super::{
+        ResponseFraming, parse_connection_keep_alive, parse_response_head_for_middleware,
+        response_is_http_10, serialize_response_head,
+    };
     use crate::l7::provider::BodyLength;
     use openshell_core::proto::HttpHeader;
+
+    #[test]
+    fn http_10_connection_persistence() {
+        let default_close = "HTTP/1.0 200 OK\r\nServer: test\r\n\r\n";
+        assert!(response_is_http_10(default_close));
+        assert!(!parse_connection_keep_alive(default_close));
+
+        let keep_alive = "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n";
+        assert!(response_is_http_10(keep_alive));
+        assert!(parse_connection_keep_alive(keep_alive));
+    }
 
     #[test]
     fn response_middleware_preflight_keeps_read_only_content_length() {
