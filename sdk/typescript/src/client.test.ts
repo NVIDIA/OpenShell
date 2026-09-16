@@ -617,6 +617,44 @@ describe('create', () => {
     expect(tokens).toEqual(['resume', 'resume']);
   });
 
+  it('rejects a repeated continuation token', async () => {
+    const pager = new Pager<number>(async (token) => ({ items: [1], nextPageToken: token }), 'resume');
+
+    await expect(pager.nextPage()).rejects.toThrow('pager received a repeated continuation token');
+  });
+
+  it('prevents a request when the token-count budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: 'next' };
+      },
+      'first',
+      1,
+    );
+
+    await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: 'next' });
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual(['first']);
+  });
+
+  it('prevents a request when the token-byte budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: '' };
+      },
+      'too-large',
+      10,
+      1,
+    );
+
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual([]);
+  });
+
   it('createFromTemplate rejects an empty template name locally', async () => {
     const sandbox = client({});
     await expect(sandbox.createFromTemplate({ workloadTemplate: ' ' })).rejects.toMatchObject({
