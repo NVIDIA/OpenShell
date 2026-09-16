@@ -1477,11 +1477,6 @@ pub async fn sandbox_sync_command(
     Ok(())
 }
 
-/// Fetch a sandbox by name.
-///
-/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
-/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
-/// prints sandbox metadata and the same policy with formatted YAML.
 pub async fn sandbox_get(
     server: &str,
     name: &str,
@@ -1490,6 +1485,44 @@ pub async fn sandbox_get(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let mut stdout = Vec::new();
+    sandbox_get_to_writer(
+        server,
+        name,
+        policy_only,
+        output,
+        workspace,
+        tls,
+        &mut stdout,
+    )
+    .await?;
+    if !stdout.is_empty() {
+        std::io::stdout()
+            .lock()
+            .write_all(&stdout)
+            .into_diagnostic()?;
+    }
+    Ok(())
+}
+
+/// Fetch a sandbox by name.
+///
+/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
+/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
+/// prints sandbox metadata and the same policy with formatted YAML.
+#[doc(hidden)]
+pub async fn sandbox_get_to_writer<W>(
+    server: &str,
+    name: &str,
+    policy_only: bool,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: Write + Send,
+{
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
@@ -1524,7 +1557,7 @@ pub async fn sandbox_get(
         };
         let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
             .wrap_err("failed to serialize policy to YAML")?;
-        print!("{yaml_str}");
+        stdout.write_all(yaml_str.as_bytes()).into_diagnostic()?;
         return Ok(());
     }
 

@@ -895,7 +895,7 @@ pub mod test_support {
         );
         crate::ensure_default_workspace(&store).await.unwrap();
         let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
-        let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
+        let compute = new_test_runtime_with_driver(store.clone(), "test", driver);
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")

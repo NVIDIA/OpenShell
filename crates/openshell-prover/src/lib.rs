@@ -127,6 +127,35 @@ filesystem_policy:
         assert!(!readable.contains(&policy::WORKDIR_PATH_SYMBOL.to_owned()));
     }
 
+    #[test]
+    fn absent_filesystem_uses_runtime_effective_workdir_default() {
+        let model = policy::parse_policy_str("version: 1\n").expect("parse");
+        assert!(model.filesystem_policy.include_workdir);
+        assert!(
+            model
+                .filesystem_policy
+                .readable_paths(None)
+                .contains(&policy::WORKDIR_PATH_SYMBOL.to_owned())
+        );
+    }
+
+    #[test]
+    fn policy_parser_requires_version_and_rejects_unknown_authority() {
+        assert!(policy::parse_policy_str("network_policies: {}\n").is_err());
+        assert!(policy::parse_policy_str("version: 1\nfuture_authority: true\n").is_err());
+    }
+
+    #[test]
+    fn explicit_tcp_is_l4_in_the_risk_projection() {
+        let model = policy::parse_policy_str(
+            "version: 1\nnetwork_policies:\n  tcp:\n    endpoints:\n      - host: example.com\n        port: 443\n        protocol: tcp\n",
+        )
+        .expect("parse");
+        let endpoint = &model.network_policies["tcp"].endpoints[0];
+        assert!(!endpoint.is_l7_enforced());
+        assert_eq!(endpoint.intent(), policy::PolicyIntent::L4Only);
+    }
+
     // 4. Workdir excluded when include_workdir: false.
     #[test]
     fn test_include_workdir_false() {
