@@ -362,6 +362,9 @@ Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
 generates these types separately, so the public descriptor set and the Rust,
 Go, Python, and TypeScript client generation inputs do not advertise them.
+When a frozen scalar storage field cannot distinguish absence from its zero
+value, gateway-owned object metadata annotations carry that presence bit rather
+than extending the frozen message.
 
 | Storage classification | Protobuf messages | Durable use |
 |---|---|---|

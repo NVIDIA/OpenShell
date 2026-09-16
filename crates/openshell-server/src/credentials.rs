@@ -688,35 +688,32 @@ impl CredentialRuntime {
                     .get(&credential_key)
                     .map(openshell_core::time::timestamp_to_millis)
                     .transpose()
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?
-                    .unwrap_or(0);
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
                 let driver_expires_at_ms = response
                     .expiration_time
                     .as_ref()
                     .map(openshell_core::time::timestamp_to_millis)
                     .transpose()
-                    .map_err(|error| Status::internal(error.to_string()))?
-                    .unwrap_or(0);
+                    .map_err(|error| Status::internal(error.to_string()))?;
 
-                // Compute effective expiration (earliest non-zero timestamp)
-                let effective_expires_at_ms = match (provider_expires_at_ms, driver_expires_at_ms) {
-                    (0, driver) => driver,
-                    (provider, 0) => provider,
-                    (provider, driver) => provider.min(driver),
-                };
+                // Compute effective expiration (earliest present timestamp).
+                let effective_expires_at_ms = effective_credential_expiration_ms(
+                    provider_expires_at_ms,
+                    driver_expires_at_ms,
+                );
 
-                if effective_expires_at_ms > 0 && effective_expires_at_ms <= now_ms {
-                    warn!(
-                        provider_name = %provider_name,
-                        credential_key = %credential_key,
-                        provider_expires_at_ms,
-                        driver_expires_at_ms,
-                        effective_expires_at_ms,
-                        "skipping expired handle-backed credential"
-                    );
-                    continue;
-                }
-                if effective_expires_at_ms > 0 {
+                if let Some(effective_expires_at_ms) = effective_expires_at_ms {
+                    if effective_expires_at_ms <= now_ms {
+                        warn!(
+                            provider_name = %provider_name,
+                            credential_key = %credential_key,
+                            ?provider_expires_at_ms,
+                            ?driver_expires_at_ms,
+                            effective_expires_at_ms,
+                            "skipping expired handle-backed credential"
+                        );
+                        continue;
+                    }
                     resolved
                         .expires_at_ms
                         .insert(credential_key.clone(), effective_expires_at_ms);
@@ -742,6 +739,18 @@ impl CredentialRuntime {
                 "credential driver '{driver_name}' is enabled but not connected"
             ))
         })
+    }
+}
+
+fn effective_credential_expiration_ms(
+    provider_expiration_ms: Option<i64>,
+    driver_expiration_ms: Option<i64>,
+) -> Option<i64> {
+    match (provider_expiration_ms, driver_expiration_ms) {
+        (Some(provider), Some(driver)) => Some(provider.min(driver)),
+        (Some(provider), None) => Some(provider),
+        (None, Some(driver)) => Some(driver),
+        (None, None) => None,
     }
 }
 
@@ -1891,6 +1900,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effective_expiration_preserves_timestamp_presence() {
+        assert_eq!(effective_credential_expiration_ms(None, None), None);
+        assert_eq!(effective_credential_expiration_ms(Some(0), None), Some(0));
+        assert_eq!(effective_credential_expiration_ms(None, Some(0)), Some(0));
+        assert_eq!(
+            effective_credential_expiration_ms(Some(2_000), Some(1_000)),
+            Some(1_000)
+        );
+    }
+
     fn config_file(toml: &str) -> crate::config_file::ConfigFile {
         toml::from_str(toml).expect("config file TOML")
     }
@@ -2050,6 +2070,16 @@ mod tests {
             resolved.values.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-test")
         );
+
+        provider.credential_expiration_times.insert(
+            "OPENAI_API_KEY".to_string(),
+            openshell_core::time::timestamp_from_millis(0).unwrap(),
+        );
+        let expired = runtime
+            .resolve_provider_handles(&provider, 1_000)
+            .await
+            .unwrap();
+        assert!(!expired.values.contains_key("OPENAI_API_KEY"));
     }
 
     #[tokio::test]

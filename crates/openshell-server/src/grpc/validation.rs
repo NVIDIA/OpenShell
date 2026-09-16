@@ -590,10 +590,9 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
                 ),
             ));
         }
-        openshell_core::time::validate_timestamp(value)
-            .map_err(|error| {
-                invalid_argument("provider.credential_expiration_times", error.to_string())
-            })?;
+        openshell_core::time::validate_timestamp(value).map_err(|error| {
+            invalid_argument("provider.credential_expiration_times", error.to_string())
+        })?;
     }
     Ok(())
 }

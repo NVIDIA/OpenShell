@@ -4450,7 +4450,10 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        for log in batch.logs.into_iter().take(100) {
+        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        validate_sandbox_log_timestamps(&logs)?;
+
+        for log in logs {
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
@@ -4459,6 +4462,17 @@ pub(super) async fn handle_push_sandbox_logs(
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status> {
+    for (index, log) in logs.iter().enumerate() {
+        if let Some(event_time) = log.event_time.as_ref() {
+            openshell_core::time::validate_timestamp(event_time).map_err(|error| {
+                Status::invalid_argument(format!("logs[{index}].event_time: {error}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_log_stream_sandbox_scope(
@@ -4646,6 +4660,38 @@ pub(super) async fn handle_submit_policy_analysis(
             rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
             continue;
         }
+        let first_seen_ms = match chunk
+            .first_seen_time
+            .as_ref()
+            .map(openshell_core::time::timestamp_to_millis)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!(
+                    "chunk '{}' has invalid first_seen_time: {error}",
+                    chunk.rule_name
+                ));
+                continue;
+            }
+        };
+        let last_seen_ms = match chunk
+            .last_seen_time
+            .as_ref()
+            .map(openshell_core::time::timestamp_to_millis)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!(
+                    "chunk '{}' has invalid last_seen_time: {error}",
+                    chunk.rule_name
+                ));
+                continue;
+            }
+        };
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
         if req.analysis_mode == "agent_authored"
@@ -4781,16 +4827,8 @@ pub(super) async fn handle_submit_policy_analysis(
             port: ep_port,
             binary: ep_binary,
             hit_count: chunk.hit_count.clamp(1, 100),
-            first_seen_ms: chunk
-                .first_seen_time
-                .as_ref()
-                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                .unwrap_or(now_ms),
-            last_seen_ms: chunk
-                .last_seen_time
-                .as_ref()
-                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                .unwrap_or(now_ms),
+            first_seen_ms: first_seen_ms.unwrap_or(now_ms),
+            last_seen_ms: last_seen_ms.unwrap_or(now_ms),
             validation_result: evaluation.validation_result.clone(),
             rejection_reason: String::new(),
             application_error: evaluation.application_error.clone(),
@@ -7198,6 +7236,27 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_log_timestamp_validation_rejects_malformed_batches_atomically() {
+        let logs = vec![
+            SandboxLogLine {
+                event_time: openshell_core::time::timestamp_from_millis(0).ok(),
+                ..Default::default()
+            },
+            SandboxLogLine {
+                event_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: -1,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let error = validate_sandbox_log_timestamps(&logs).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("logs[1].event_time"));
+    }
+
+    #[test]
     fn stored_policy_decode_migrates_legacy_provenance_and_preserves_unknown_fields() {
         #[derive(Clone, PartialEq, Message)]
         struct FutureStoredNetworkBinary {
@@ -8935,6 +8994,75 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn submit_policy_analysis_rejects_only_chunks_with_invalid_timestamps() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_name = "invalid-policy-chunk-timestamps";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-policy-chunk-timestamps",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let chunk = |name: &str| PolicyChunk {
+            rule_name: name.to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: name.to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: format!("{name}.example.com"),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let invalid = prost_types::Timestamp {
+            seconds: 253_402_300_800,
+            nanos: 0,
+        };
+        let mut invalid_first = chunk("invalid_first");
+        invalid_first.first_seen_time = Some(invalid);
+        let mut invalid_last = chunk("invalid_last");
+        invalid_last.last_seen_time = Some(invalid);
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![invalid_first, invalid_last, chunk("valid_absent")],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 1);
+        assert_eq!(response.rejected_chunks, 2);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("invalid first_seen_time"))
+        );
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("invalid last_seen_time"))
+        );
     }
 
     #[tokio::test]

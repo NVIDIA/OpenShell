@@ -20,10 +20,10 @@ func TimeFromProto(value *timestamppb.Timestamp) time.Time {
 
 // TimePtrFromProto converts a valid protobuf timestamp to a UTC time pointer.
 func TimePtrFromProto(value *timestamppb.Timestamp) *time.Time {
-	converted := TimeFromProto(value)
-	if converted.IsZero() {
+	if value == nil || value.CheckValid() != nil {
 		return nil
 	}
+	converted := value.AsTime().UTC()
 	return &converted
 }
 
@@ -40,7 +40,7 @@ func TimestampFromTimePtr(value *time.Time) *timestamppb.Timestamp {
 	if value == nil {
 		return nil
 	}
-	return TimestampFromTime(*value)
+	return timestamppb.New(*value)
 }
 
 // MillisFromProto converts a valid protobuf timestamp to Unix milliseconds.
@@ -62,11 +62,10 @@ func TimestampFromMillis(value int64) *timestamppb.Timestamp {
 
 // TimestampStringFromProto formats a valid protobuf timestamp as RFC 3339.
 func TimestampStringFromProto(value *timestamppb.Timestamp) string {
-	converted := TimeFromProto(value)
-	if converted.IsZero() {
+	if value == nil || value.CheckValid() != nil {
 		return ""
 	}
-	return converted.Format(time.RFC3339Nano)
+	return value.AsTime().UTC().Format(time.RFC3339Nano)
 }
 
 // DurationSecondsFromProto converts a valid non-negative protobuf duration to seconds.

@@ -1231,18 +1231,19 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 let expires_at_ms = provider
                     .credential_expiration_times
                     .get(key)
-                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-                    .unwrap_or_default();
-                if expires_at_ms > 0 && expires_at_ms <= now_ms {
-                    warn!(
-                        provider_name = %name,
-                        key = %key,
-                        expires_at_ms,
-                        "skipping expired provider credential"
-                    );
-                    continue;
-                }
-                if expires_at_ms > 0 {
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if let Some(expires_at_ms) = expires_at_ms {
+                    if expires_at_ms <= now_ms {
+                        warn!(
+                            provider_name = %name,
+                            key = %key,
+                            expires_at_ms,
+                            "skipping expired provider credential"
+                        );
+                        continue;
+                    }
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
                 provider_env.insert(key.clone(), value.clone());
@@ -1307,12 +1308,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                     );
                     continue;
                 }
-                if let Some(expires_at_ms) = resolved_refs
-                    .expires_at_ms
-                    .get(&key)
-                    .copied()
-                    .filter(|expires_at_ms| *expires_at_ms > 0)
-                {
+                if let Some(expires_at_ms) = resolved_refs.expires_at_ms.get(&key).copied() {
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
                 provider_env.insert(key.clone(), value);
@@ -3946,7 +3942,8 @@ pub(super) async fn handle_exchange_provider_subject_token(
             .cache_ttl
             .as_ref()
             .map_or(0, |value| value.seconds),
-        provider_credential_expiration_times(&provider, &subject_token.credential),
+        provider_credential_expiration_ms(&provider, &subject_token.credential)?
+            .unwrap_or_default(),
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -3999,8 +3996,8 @@ fn ensure_subject_token_credential_not_expired(
     provider: &Provider,
     credential_key: &str,
 ) -> Result<(), Status> {
-    let expires_at_ms = provider_credential_expiration_times(provider, credential_key);
-    if expires_at_ms > 0 && expires_at_ms <= crate::persistence::current_time_ms() {
+    let expires_at_ms = provider_credential_expiration_ms(provider, credential_key)?;
+    if expires_at_ms.is_some_and(|value| value <= crate::persistence::current_time_ms()) {
         return Err(Status::failed_precondition(
             "subject token credential has expired",
         ));
@@ -4008,12 +4005,16 @@ fn ensure_subject_token_credential_not_expired(
     Ok(())
 }
 
-fn provider_credential_expiration_times(provider: &Provider, credential_key: &str) -> i64 {
+fn provider_credential_expiration_ms(
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<Option<i64>, Status> {
     provider
         .credential_expiration_times
         .get(credential_key)
-        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
-        .unwrap_or_default()
+        .map(openshell_core::time::timestamp_to_millis)
+        .transpose()
+        .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 struct IntermediateTokenCacheKeyInput<'a> {
@@ -4576,6 +4577,10 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
+    let has_expiration = requested_expiration_ms.is_some()
+        || existing_refresh_state
+            .as_ref()
+            .is_some_and(crate::provider_refresh::refresh_has_expiration);
     let expires_at_ms = requested_expiration_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
@@ -4621,6 +4626,7 @@ pub(super) async fn handle_configure_provider_refresh(
             );
         }
     }
+    crate::provider_refresh::set_refresh_expiration_presence(&mut state_record, has_expiration);
     let material_staging_id = format!(
         "{}-refresh-config-{}",
         provider.object_id(),
@@ -4762,9 +4768,6 @@ fn clear_refresh_owned_expiries(
     refresh_expires_at_ms: i64,
     owned_keys: &[String],
 ) {
-    if refresh_expires_at_ms <= 0 {
-        return;
-    }
     for key in owned_keys {
         if provider
             .credential_expiration_times
@@ -4831,7 +4834,7 @@ pub(super) async fn handle_delete_provider_refresh(
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
     if let Some(refresh_state) = existing_refresh_state
-        && refresh_state.expires_at_ms > 0
+        && crate::provider_refresh::refresh_has_expiration(&refresh_state)
     {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
         let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
@@ -4996,6 +4999,20 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn subject_token_epoch_expiration_is_expired() {
+        let provider = Provider {
+            credential_expiration_times: HashMap::from([("SUBJECT_TOKEN".to_string(), ts(0))]),
+            ..Default::default()
+        };
+
+        let error = ensure_subject_token_credential_not_expired(&provider, "SUBJECT_TOKEN")
+            .expect_err("the Unix epoch is a present, expired timestamp");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
+            .expect("an absent expiration remains non-expiring");
     }
 
     #[test]
@@ -6877,7 +6894,7 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expiration_time: openshell_core::time::timestamp_from_millis(expires_at_ms).ok(),
+                expiration_time: openshell_core::time::timestamp_from_millis(0).ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6898,6 +6915,43 @@ mod tests {
         assert_ne!(
             first_refresh.authorization_epoch, second_refresh.authorization_epoch,
             "every explicit configuration starts a new authorization epoch"
+        );
+        assert!(crate::provider_refresh::refresh_has_expiration(
+            &second_refresh
+        ));
+        assert_eq!(second_refresh.expires_at_ms, 0);
+
+        let epoch_status = handle_get_provider_refresh_status(
+            &state,
+            authed_request(GetProviderRefreshStatusRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            epoch_status.credentials[0]
+                .expiration_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok()),
+            Some(0)
+        );
+        let provider_with_epoch = state
+            .store
+            .get_message_by_name::<Provider>("default", "msgraph")
+            .await
+            .unwrap()
+            .expect("provider");
+        assert_eq!(
+            provider_with_epoch
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(0))
         );
 
         let deleted = handle_delete_provider_refresh(
@@ -7695,6 +7749,17 @@ mod tests {
                 .credential_expiration_times
                 .get("AWS_SESSION_TOKEN"),
             Some(&ts(concurrently_changed))
+        );
+
+        provider
+            .credential_expiration_times
+            .insert("AWS_ACCESS_KEY_ID".to_string(), ts(0));
+        clear_refresh_owned_expiries(&mut provider, 0, &owned_keys);
+        assert!(
+            !provider
+                .credential_expiration_times
+                .contains_key("AWS_ACCESS_KEY_ID"),
+            "an epoch expiry owned by the refresh must be cleared"
         );
     }
 
@@ -10701,6 +10766,7 @@ mod tests {
             credentials: [
                 ("FRESH_TOKEN".to_string(), "fresh".to_string()),
                 ("STALE_TOKEN".to_string(), "stale".to_string()),
+                ("EPOCH_TOKEN".to_string(), "epoch".to_string()),
             ]
             .into_iter()
             .collect(),
@@ -10708,6 +10774,7 @@ mod tests {
             credential_expiration_times: [
                 ("FRESH_TOKEN".to_string(), ts(now_ms + 60_000)),
                 ("STALE_TOKEN".to_string(), ts(now_ms - 60_000)),
+                ("EPOCH_TOKEN".to_string(), ts(0)),
             ]
             .into_iter()
             .collect(),
@@ -10724,6 +10791,7 @@ mod tests {
                 .unwrap();
         assert_eq!(result.get("FRESH_TOKEN"), Some(&"fresh".to_string()));
         assert!(!result.contains_key("STALE_TOKEN"));
+        assert!(!result.contains_key("EPOCH_TOKEN"));
         assert_eq!(
             result.credential_expiration_times.get("FRESH_TOKEN"),
             Some(&(now_ms + 60_000))

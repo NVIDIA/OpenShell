@@ -757,7 +757,7 @@ This example assumes you imported a custom profile with `id: google-drive`.
 `--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. Prefer `--secret-material-env` so the value does not appear in shell history. The gateway combines caller markings with authoritative profile metadata and strategy-defined secret fields, then stores those values through the active credential driver. Only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes injectable. If an OAuth response rotates a refresh token, OpenShell stores the replacement through the credential driver automatically.
 </Note>
 
-Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. Later gateway-managed refreshes replace it with the minted token expiry.
+Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. An explicit Unix epoch value remains distinct from an omitted expiry and is already expired. Later gateway-managed refreshes replace it with the minted token expiry.
 
 Force a refresh immediately:
 
@@ -804,7 +804,7 @@ openshell provider refresh delete my-graph \
   --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
 
-Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
+Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state, including an explicit Unix epoch expiry. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
 
 ### Refresh Logs
 

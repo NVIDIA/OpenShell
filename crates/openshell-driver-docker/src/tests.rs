@@ -366,7 +366,7 @@ async fn control_failure_overrides_running_container_readiness() {
             status: "True".to_string(),
             reason: "BackendReady".to_string(),
             message: "Container is running".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );
@@ -403,7 +403,7 @@ async fn control_failure_does_not_hide_a_terminal_container_exit() {
             status: "False".to_string(),
             reason: CONDITION_EXITED.to_string(),
             message: "Container exited".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );

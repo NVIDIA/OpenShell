@@ -4989,7 +4989,7 @@ fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
             status: "True".to_string(),
             reason: "SandboxRuntimeGenerationStarting".to_string(),
             message: "replacement sandbox-runtime generation is starting".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
     }
     mark_sandbox_runtime_control_unavailable(sandbox);
@@ -5015,7 +5015,7 @@ fn mark_sandbox_runtime_control_unavailable(sandbox: &mut Sandbox) {
             status: "False".to_string(),
             reason: REASON.to_string(),
             message: MESSAGE.to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
     }
 }

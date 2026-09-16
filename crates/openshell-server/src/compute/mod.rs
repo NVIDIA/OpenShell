@@ -2963,6 +2963,7 @@ impl ComputeRuntime {
     }
 
     async fn apply_watch_event_inner(&self, event: WatchSandboxesEvent) -> Result<(), String> {
+        validate_driver_watch_event_timestamps(&event)?;
         match event.payload {
             Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
@@ -3925,6 +3926,42 @@ impl ComputeRuntime {
             Err(status) => Err(status.to_string()),
         }
     }
+}
+
+fn validate_driver_watch_event_timestamps(event: &WatchSandboxesEvent) -> Result<(), String> {
+    match &event.payload {
+        Some(watch_sandboxes_event::Payload::Sandbox(update)) => {
+            if let Some(status) = update
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.status.as_ref())
+            {
+                for (index, condition) in status.conditions.iter().enumerate() {
+                    if let Some(transition_time) = condition.transition_time.as_ref() {
+                        openshell_core::time::validate_timestamp(transition_time).map_err(
+                            |error| {
+                                format!(
+                                    "sandbox.status.conditions[{index}].transition_time: {error}"
+                                )
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+        Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
+            if let Some(event_time) = platform_event
+                .event
+                .as_ref()
+                .and_then(|event| event.event_time.as_ref())
+            {
+                openshell_core::time::validate_timestamp(event_time)
+                    .map_err(|error| format!("platform_event.event_time: {error}"))?;
+            }
+        }
+        Some(watch_sandboxes_event::Payload::Deleted(_)) | None => {}
+    }
+    Ok(())
 }
 
 fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: i32) {
@@ -6660,6 +6697,36 @@ mod tests {
     }
 
     #[test]
+    fn driver_watch_timestamp_validation_rejects_malformed_observations() {
+        let mut sandbox = ready_driver_sandbox("sandbox-id", "sandbox-name");
+        sandbox.status.as_mut().unwrap().conditions[0].transition_time =
+            Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: -1,
+            });
+        let error =
+            validate_driver_watch_event_timestamps(&sandbox_watch_event(sandbox)).unwrap_err();
+        assert!(error.contains("sandbox.status.conditions[0].transition_time"));
+
+        let platform_event = WatchSandboxesEvent {
+            payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
+                openshell_core::proto::compute::v1::WatchSandboxesPlatformEvent {
+                    sandbox_id: "sandbox-id".to_string(),
+                    event: Some(DriverPlatformEvent {
+                        event_time: Some(prost_types::Timestamp {
+                            seconds: openshell_core::time::MAX_TIMESTAMP_SECONDS + 1,
+                            nanos: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                },
+            )),
+        };
+        let error = validate_driver_watch_event_timestamps(&platform_event).unwrap_err();
+        assert!(error.contains("platform_event.event_time"));
+    }
+
+    #[test]
     fn driver_snapshot_preserves_endpoint_failure_and_ready_phase() {
         let mut sandbox = sandbox_record("sandbox-id", "sandbox-name", SandboxPhase::Ready);
         let endpoint = openshell_core::proto::EndpointStatus {
@@ -8263,7 +8330,7 @@ mod tests {
             status: "True".to_string(),
             reason: "GenerationStarting".to_string(),
             message: "Replacement generation is starting".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
         bootstrapping.status = Some(status);
 
@@ -8292,14 +8359,14 @@ mod tests {
             status: "True".to_string(),
             reason: "GenerationStarting".to_string(),
             message: "Replacement generation is starting".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
         status.conditions.push(DriverCondition {
             r#type: "Suspended".to_string(),
             status: "True".to_string(),
             reason: "PodTerminated".to_string(),
             message: "Sandbox is suspended".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
         let mut suspended = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         suspended.status = Some(status);

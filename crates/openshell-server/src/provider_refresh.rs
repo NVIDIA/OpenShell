@@ -25,6 +25,7 @@ use tracing::{info, warn};
 use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
+const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
@@ -291,11 +292,11 @@ pub fn refresh_status_from_state(
         credential_key: state.credential_key.clone(),
         strategy: state.strategy,
         status: state.status.clone(),
-        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
-            state.expires_at_ms,
-        )
-        .ok()
-        .flatten(),
+        expiration_time: if refresh_has_expiration(state) {
+            openshell_core::time::timestamp_from_millis(state.expires_at_ms).ok()
+        } else {
+            None
+        },
         next_refresh_time: if state.next_refresh_at_ms == i64::MAX {
             None
         } else {
@@ -317,6 +318,38 @@ pub fn refresh_status_from_state(
         )
         .ok()
         .flatten(),
+    }
+}
+
+/// Whether a refresh expiration was explicitly provided.
+///
+/// Legacy records infer presence from a nonzero millisecond value. New records
+/// use a private metadata annotation only for the ambiguous Unix epoch value so
+/// the frozen storage protobuf schema does not need to change.
+pub fn refresh_has_expiration(state: &StoredProviderCredentialRefreshState) -> bool {
+    state.expires_at_ms != 0
+        || state.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .annotations
+                .get(EXPIRATION_PRESENT_ANNOTATION)
+                .is_some_and(|value| value == "true")
+        })
+}
+
+pub fn set_refresh_expiration_presence(
+    state: &mut StoredProviderCredentialRefreshState,
+    present: bool,
+) {
+    let Some(metadata) = state.metadata.as_mut() else {
+        return;
+    };
+    if present && state.expires_at_ms == 0 {
+        metadata.annotations.insert(
+            EXPIRATION_PRESENT_ANNOTATION.to_string(),
+            "true".to_string(),
+        );
+    } else {
+        metadata.annotations.remove(EXPIRATION_PRESENT_ANNOTATION);
     }
 }
 
@@ -904,6 +937,7 @@ pub async fn refresh_provider_credential(
                 state.material.remove("refresh_token");
             }
             state.expires_at_ms = minted.expires_at_ms;
+            set_refresh_expiration_presence(&mut state, true);
             state.next_refresh_at_ms = next_refresh_at_ms(
                 minted.expires_at_ms,
                 state.refresh_before_seconds,
@@ -2012,9 +2046,10 @@ mod tests {
         delete_refresh_state_with_credentials, effective_authorization_epoch,
         enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
         list_refresh_states_for_provider, new_refresh_state, put_refresh_state,
-        read_bounded_oauth_error_body, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
-        validate_secret_material_references,
+        read_bounded_oauth_error_body, refresh_has_expiration, refresh_material_scope,
+        refresh_provider_credential, refresh_state_name, refresh_status_from_state,
+        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        set_refresh_expiration_presence, validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
@@ -2141,6 +2176,33 @@ mod tests {
             "google_service_account_jwt"
         );
         assert_eq!(refresh_strategy_name(i32::MAX), "unspecified");
+    }
+
+    #[test]
+    fn refresh_expiration_presence_distinguishes_absent_epoch_and_legacy_values() {
+        let mut state = StoredProviderCredentialRefreshState {
+            metadata: Some(ObjectMeta::default()),
+            ..Default::default()
+        };
+        assert!(!refresh_has_expiration(&state));
+        assert!(refresh_status_from_state(&state).expiration_time.is_none());
+
+        set_refresh_expiration_presence(&mut state, true);
+        assert!(refresh_has_expiration(&state));
+        assert_eq!(
+            refresh_status_from_state(&state).expiration_time,
+            Some(ts(0))
+        );
+
+        set_refresh_expiration_presence(&mut state, false);
+        assert!(!refresh_has_expiration(&state));
+
+        state.expires_at_ms = 1;
+        assert!(refresh_has_expiration(&state));
+        assert_eq!(
+            refresh_status_from_state(&state).expiration_time,
+            Some(ts(1))
+        );
     }
 
     #[test]
