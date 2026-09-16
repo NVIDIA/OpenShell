@@ -195,6 +195,8 @@ The OPA loader checks the object and list shapes of raw policy data before injec
 
 After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
 
+An explicitly supplied MCP rule `params` value must be a map in both allow and deny rules. Omit the field when using only the `tool` alias; `params: null` is rejected before alias lowering. A rejected raw policy reload preserves the active evaluator and its generation.
+
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;

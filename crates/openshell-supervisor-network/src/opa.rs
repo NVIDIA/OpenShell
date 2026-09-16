@@ -3294,6 +3294,128 @@ network_policies:
     }
 
     #[test]
+    fn raw_mcp_params_maps_preserve_denials_and_reject_malformed_reload() {
+        let valid = serde_json::json!({
+            "network_policies": {
+                "tools": {
+                    "endpoints": [{
+                        "host": "mcp.params.test",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "enforcement": "enforce",
+                        "rules": [{"allow": {"method": "tools/call", "tool": "read_*"}}],
+                        "deny_rules": [{"method": "tools/call", "tool": "read_secret"}]
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}]
+                }
+            }
+        });
+        let request = |name: &str| {
+            l7_jsonrpc_input_with_params(
+                "mcp.params.test",
+                443,
+                "/mcp",
+                "tools/call",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let allowed = request("read_status");
+        let denied = request("read_secret");
+
+        for yaml in [true, false] {
+            let encode = |data: &serde_json::Value| {
+                if yaml {
+                    serde_yml::to_string(data).expect("serialize YAML policy")
+                } else {
+                    data.to_string()
+                }
+            };
+            let engine = OpaEngine::from_strings(TEST_POLICY, &encode(&valid))
+                .expect("omitted params must preserve tool aliases");
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+            let generation = engine.current_generation();
+
+            // Every raw rule shape must reject before normalization can remove
+            // an alias. Failed reloads must leave both allow and deny intact.
+            for (rule_pointer, flat_allow, diagnostic) in [
+                (
+                    "/rules/0/allow",
+                    false,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/rules/0",
+                    true,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/deny_rules/0",
+                    false,
+                    "deny_rules[0].params: expected map of matchers",
+                ),
+            ] {
+                for params in [
+                    serde_json::Value::Null,
+                    serde_json::json!([]),
+                    serde_json::json!("invalid"),
+                    serde_json::json!(false),
+                    serde_json::json!(42),
+                ] {
+                    let mut candidate = valid.clone();
+                    let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                    if flat_allow {
+                        endpoint["rules"][0] = endpoint["rules"][0]["allow"].take();
+                    }
+                    endpoint
+                        .pointer_mut(rule_pointer)
+                        .expect("fixture rule exists")["params"] = params;
+                    let source = encode(&candidate);
+                    let error = OpaEngine::from_strings(TEST_POLICY, &source)
+                        .err()
+                        .expect("non-map params must reject at startup");
+                    assert!(error.to_string().contains(diagnostic), "{error}");
+                    let error = engine
+                        .reload(TEST_POLICY, &source)
+                        .expect_err("non-map params must reject on reload");
+                    assert!(error.to_string().contains(diagnostic), "{error}");
+                    assert_eq!(engine.current_generation(), generation);
+                    assert!(eval_l7(&engine, &allowed));
+                    assert!(!eval_l7(&engine, &denied));
+                }
+            }
+
+            // Empty maps accept alias insertion; explicit name maps retain the
+            // same selector without an alias. Neither form may erase a deny.
+            for explicit_name in [false, true] {
+                let mut candidate = valid.clone();
+                let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                for pointer in ["/rules/0/allow", "/deny_rules/0"] {
+                    let rule = endpoint.pointer_mut(pointer).expect("fixture rule exists");
+                    rule["params"] = if explicit_name {
+                        let tool = rule.as_object_mut().expect("rule map").remove("tool");
+                        serde_json::json!({"name": tool.expect("fixture tool selector")})
+                    } else {
+                        serde_json::json!({})
+                    };
+                }
+                let source = encode(&candidate);
+                let control = OpaEngine::from_strings(TEST_POLICY, &source)
+                    .expect("valid matcher map must load");
+                assert!(eval_l7(&control, &allowed));
+                assert!(!eval_l7(&control, &denied));
+                let previous_generation = engine.current_generation();
+                engine
+                    .reload(TEST_POLICY, &source)
+                    .expect("valid matcher map must reload after rejection");
+                assert_eq!(engine.current_generation(), previous_generation + 1);
+                assert!(eval_l7(&engine, &allowed));
+                assert!(!eval_l7(&engine, &denied));
+            }
+        }
+    }
+
+    #[test]
     fn yaml_empty_query_matcher_retains_deny_semantics_across_reload() {
         // Empty scalar matchers are OPA-only: an empty protobuf glob has no
         // presence and is rejected. Rego strings can still match empty input.
