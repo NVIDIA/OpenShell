@@ -858,7 +858,7 @@ pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    validate_raw_proto_for_authored_serialization(policy)?;
+    validate_proto_version_for_authored_serialization(policy)?;
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
@@ -870,31 +870,19 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    validate_raw_proto_for_authored_serialization(policy)?;
+    validate_proto_version_for_authored_serialization(policy)?;
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
     openshell_policy_schema::policy_to_json_value(&json_repr)
 }
 
-fn validate_raw_proto_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
+fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
     if !matches!(policy.version, 0 | 1) {
         miette::bail!(
             "cannot serialize unsupported protobuf policy version {}; expected 0 (omitted) or 1",
             policy.version
         );
-    }
-    if let Some(process) = &policy.process {
-        if process.run_as_user.is_empty() {
-            miette::bail!(
-                "cannot serialize explicit protobuf process policy with empty run_as_user"
-            );
-        }
-        if process.run_as_group.is_empty() {
-            miette::bail!(
-                "cannot serialize explicit protobuf process policy with empty run_as_group"
-            );
-        }
     }
     Ok(())
 }
@@ -2158,17 +2146,59 @@ network_policies:
     }
 
     #[test]
-    fn partial_authored_process_parses_but_invalid_proto_presence_does_not_serialize() {
-        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
-            .expect("partial process identity should parse");
-        let process = policy.process.as_ref().expect("process section");
-        assert_eq!(process.run_as_user, "1234");
-        assert!(process.run_as_group.is_empty());
-        assert!(validate_sandbox_policy(&policy).is_ok());
+    fn canonical_serializers_preserve_independent_process_identity_omission() {
+        let cases = [
+            ("", "", None, None),
+            ("1500", "", Some("1500"), None),
+            ("", "1600", None, Some("1600")),
+            ("1500", "1600", Some("1500"), Some("1600")),
+        ];
 
-        let error = serialize_sandbox_policy(&policy)
-            .expect_err("explicit protobuf process fields must be complete");
-        assert!(error.to_string().contains("empty run_as_group"));
+        for (user, group, expected_user, expected_group) in cases {
+            let policy = SandboxPolicy {
+                version: 1,
+                process: Some(ProcessPolicy {
+                    run_as_user: user.to_owned(),
+                    run_as_group: group.to_owned(),
+                }),
+                ..Default::default()
+            };
+
+            let yaml = serialize_sandbox_policy(&policy)
+                .expect("omitted process identity components must serialize to YAML");
+            assert_eq!(yaml.contains("run_as_user:"), expected_user.is_some());
+            assert_eq!(yaml.contains("run_as_group:"), expected_group.is_some());
+
+            let reparsed = parse_sandbox_policy(&yaml).expect("canonical YAML must round trip");
+            let reparsed_user = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_user.as_str())
+                .filter(|value| !value.is_empty());
+            let reparsed_group = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_group.as_str())
+                .filter(|value| !value.is_empty());
+            assert_eq!(reparsed_user, expected_user);
+            assert_eq!(reparsed_group, expected_group);
+
+            let json = sandbox_policy_to_json_value(&policy)
+                .expect("omitted process identity components must serialize to JSON");
+            let json_process = json.get("process");
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_user")),
+                expected_user.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_group")),
+                expected_group.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.is_some(),
+                expected_user.is_some() || expected_group.is_some()
+            );
+        }
     }
 
     #[test]
@@ -4743,27 +4773,6 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
-    }
-
-    #[test]
-    fn serialization_rejects_each_empty_explicit_proto_process_shape() {
-        for (user, group, field) in [
-            ("", "sandbox", "run_as_user"),
-            ("sandbox", "", "run_as_group"),
-            ("", "", "run_as_user"),
-        ] {
-            let policy = SandboxPolicy {
-                version: 1,
-                process: Some(ProcessPolicy {
-                    run_as_user: user.to_owned(),
-                    run_as_group: group.to_owned(),
-                }),
-                ..Default::default()
-            };
-            let error = serialize_sandbox_policy(&policy)
-                .expect_err("empty explicit process value must fail");
-            assert!(error.to_string().contains(field));
-        }
     }
 
     #[test]
