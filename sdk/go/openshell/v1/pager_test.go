@@ -68,6 +68,30 @@ func TestPagerRejectsRepeatedContinuationToken(t *testing.T) {
 	assert.EqualError(t, err, "pager received a repeated continuation token")
 }
 
+func TestPagerBoundsConsumedTokenCount(t *testing.T) {
+	pager := NewPager("first", func(_ context.Context, token string) (*Page[string], error) {
+		return &Page[string]{Items: []string{token}, NextPageToken: "next"}, nil
+	})
+	pager.maxConsumedTokens = 1
+
+	_, err := pager.NextPage(context.Background())
+	require.NoError(t, err)
+	page, err := pager.NextPage(context.Background())
+	assert.Nil(t, page)
+	assert.EqualError(t, err, "pager continuation token history limit exceeded")
+}
+
+func TestPagerBoundsConsumedTokenBytes(t *testing.T) {
+	pager := NewPager("too-large", func(_ context.Context, token string) (*Page[string], error) {
+		return &Page[string]{Items: []string{token}, NextPageToken: "next"}, nil
+	})
+	pager.maxConsumedTokenBytes = 1
+
+	page, err := pager.NextPage(context.Background())
+	assert.Nil(t, page)
+	assert.EqualError(t, err, "pager continuation token history limit exceeded")
+}
+
 func TestPagerNormalizesEmptyItems(t *testing.T) {
 	pager := NewPager("", func(_ context.Context, _ string) (*Page[string], error) {
 		return &Page[string]{}, nil
