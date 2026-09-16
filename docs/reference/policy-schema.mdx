@@ -36,6 +36,22 @@ The YAML root and each present top-level section listed as an object or map must
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
+## Policy Load Diagnostics
+
+When the supervisor's OPA engine rejects a policy load or reload, its error message identifies the validation category without copying policy or middleware names, hostnames, paths, values, or source text. The message also omits the original error chain. This applies to the engine's file, string, and protobuf loaders.
+
+Each message contains at most eight error items and 512 UTF-8 bytes, including the heading, separators, and the `additional violations omitted` marker when more items cannot fit. Categories help you choose which part of the submitted policy to inspect:
+
+- Typed validation distinguishes process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration.
+- L7 validation reports `invalid L7 policy configuration` for semantic errors and `invalid L7 protocol configuration` for protocol configuration or alias errors.
+- Endpoint conflicts report `ambiguous network endpoint selectors`.
+- YAML errors report a fixed parser category, with numeric line and column when the parser provides them.
+- File I/O, Rego loading, and internal policy-data failures return fixed messages.
+
+A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor then applies the gateway's `policy_validation_failure_mode`; `fail_closed` can publish a quarantine generation that denies egress, while `retain_last_valid` keeps an existing valid generation active. See [Gateway Configuration](/reference/gateway-config) for that setting and startup behavior.
+
+These bounds apply to returned OPA load errors. Warnings for accepted policies, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting behavior.
+
 ## Version
 
 The version field identifies which schema the policy uses:

@@ -109,8 +109,10 @@ expected_sandbox="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:$(pri
 [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = 1 ] || exit 24
 [ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" = "${expected_sandbox}" ] || exit 25
 [ "${OPENSHELL_COMMUNITY_REGISTRY:-}" = "ghcr.io/nvidia/openshell-community/sandboxes" ] || exit 28
-expected_base="docker.io/library/alpine@sha256:$(printf '%064d' 0)"
-[ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = alpine:3.22 ] || exit 26
+# Both driver variants must use the supervisor's Debian base and the same
+# immutable image digest.
+expected_base="docker.io/library/debian@sha256:$(printf '%064d' 0)"
+[ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = debian:bookworm-slim ] || exit 26
 [ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" = "${expected_base}" ] || exit 27
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
@@ -128,7 +130,9 @@ zero = "0" * 64
 image_digest = f"sha256:{zero}"
 sandbox_runtime = f"ghcr.io/nvidia/openshell-community/sandboxes/base@{image_digest}"
 supervisor_runtime = f"localhost/openshell/supervisor@{image_digest}"
-base_runtime = f"docker.io/library/alpine@{image_digest}"
+# The workload image and the capability-free sandbox runtime are distinct.
+sandbox_boundary = f"localhost/openshell/sandbox@{image_digest}"
+base_runtime = f"docker.io/library/debian@{image_digest}"
 pull_policy = "missing" if schema == 1 else "if_not_present"
 gateway_port = 18181
 callback = f"https://host.containers.internal:{gateway_port}"
@@ -172,7 +176,7 @@ launch = {
     "supervisor_image_id": zero,
     "supervisor_image_digest": image_digest,
     "supervisor_runtime_image": supervisor_runtime,
-    "supervisor_base_image": "alpine:3.22",
+    "supervisor_base_image": "debian:bookworm-slim",
     "supervisor_base_image_id": zero,
     "supervisor_base_image_digest": image_digest,
     "supervisor_base_runtime_image": base_runtime,
@@ -183,6 +187,7 @@ launch = {
     "sandbox_image_id": zero,
     "sandbox_image_digest": image_digest,
     "sandbox_runtime_image": sandbox_runtime,
+    "sandbox_boundary_image": sandbox_boundary,
     "sandbox_client_image_alias": "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
     "sandbox_client_image_alias_id": zero,
     "gateway_sha256_before_execution": os.environ[
@@ -226,6 +231,7 @@ if external:
                 "OPENSHELL_NETWORK_NAME": network,
                 "OPENSHELL_STOP_TIMEOUT": 15,
                 "OPENSHELL_SUPERVISOR_IMAGE": supervisor_runtime,
+                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": sandbox_boundary,
                 "OPENSHELL_PODMAN_TLS_CA": {
                     "path": f"/tmp/{variant}-pki/ca.crt",
                     "sha256": "8" * 64,
@@ -288,7 +294,7 @@ case "$1" in
     case "$4" in
       '{{.Id}}') printf 'sha256:%064d\n' 0 ;;
       '{{.Digest}}') printf 'sha256:%064d\n' 0 ;;
-      '{{index .RepoDigests 0}}') printf 'docker.io/library/alpine@sha256:%064d\n' 0 ;;
+      '{{index .RepoDigests 0}}') printf 'docker.io/library/debian@sha256:%064d\n' 0 ;;
       *) exit 19 ;;
     esac
     ;;
@@ -402,7 +408,7 @@ assert_not_contains "${WORKDIR}/results/baseline.json" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.log" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.conformance.json" '"passed":true'
 assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
-assert_contains "${WORKDIR}/podman-calls" 'pull alpine:3.22'
+assert_contains "${WORKDIR}/podman-calls" 'pull debian:bookworm-slim'
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
 
