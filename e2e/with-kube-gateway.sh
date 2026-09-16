@@ -1072,7 +1072,10 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
-  helm_extra_args+=(--set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.host_gateway_ip=${HOST_GATEWAY_IP}")
+  # server.hostGatewayIP owns both the gateway runtime field and sandbox-pod
+  # hostAliases. Exercise the public chart input rather than bypassing it with
+  # a direct gatewayConfig override.
+  helm_extra_args+=(--set-string "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
