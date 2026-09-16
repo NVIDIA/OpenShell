@@ -43,6 +43,7 @@ use tonic::{Response, Status};
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    supports_stable_placeholder: Arc<AtomicBool>,
     scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
@@ -649,6 +650,10 @@ impl OpenShell for TestOpenShell {
             openshell_core::proto::LintProviderProfilesResponse {
                 diagnostics: Vec::new(),
                 valid: true,
+                supports_stable_placeholder: self
+                    .state
+                    .supports_stable_placeholder
+                    .load(Ordering::SeqCst),
             },
         ))
     }
@@ -1960,6 +1965,72 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
             provider_name: "missing-provider".to_string(),
         }]
     );
+}
+
+#[tokio::test]
+async fn provider_profile_stable_placeholder_checks_support_before_writing() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().expect("profile directory");
+    let path = dir.path().join("external.yaml");
+    let stable = r"
+id: external
+display_name: External
+category: other
+resource_version: 1
+credentials:
+  - name: token
+    env_vars: [EXTERNAL_TOKEN]
+    stable_placeholder: true
+endpoints:
+  - host: api.example.com
+    port: 443
+";
+    std::fs::write(&path, stable).expect("stable profile");
+    let error = run::provider_profile_import(&ts.endpoint, Some(&path), None, "default", &ts.tls)
+        .await
+        .expect_err("legacy gateway cannot import the opt-in");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support stable_placeholder")
+    );
+    assert!(ts.state.profiles.lock().await.is_empty());
+    assert!(
+        run::provider_profile_lint(&ts.endpoint, Some(&path), None, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+
+    // A legacy gateway still accepts ordinary profiles through the old path.
+    std::fs::write(
+        &path,
+        stable.replace("stable_placeholder: true", "stable_placeholder: false"),
+    )
+    .expect("ordinary profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, "default", &ts.tls)
+        .await
+        .expect("ordinary import");
+    let original = ts.state.profiles.lock().await["external"].clone();
+    std::fs::write(&path, stable).expect("enable opt-in");
+    assert!(
+        run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+    assert_eq!(ts.state.profiles.lock().await["external"], original);
+
+    ts.state
+        .supports_stable_placeholder
+        .store(true, Ordering::SeqCst);
+    run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+        .await
+        .expect("supporting gateway update");
+    assert!(ts.state.profiles.lock().await["external"].credentials[0].stable_placeholder);
+    std::fs::write(&path, stable.replace("id: external", "id: second")).expect("second profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, "default", &ts.tls)
+        .await
+        .expect("supporting gateway import");
+    assert!(ts.state.profiles.lock().await["second"].credentials[0].stable_placeholder);
 }
 
 #[tokio::test]

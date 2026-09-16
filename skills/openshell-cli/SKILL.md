@@ -174,6 +174,8 @@ openshell provider delete my-github
 
 `provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
 
+For an external updater whose workload must retain its original environment reference, use a credential profile with `stable_placeholder: true` and a gateway and supervisor that support that mode. The CLI checks gateway support before importing or updating the opt-in. The default remains `false`, preserving existing revision-scoped behavior and ordinary legacy gateway operation. Preserve the supervisor-issued value; never manufacture a placeholder. After the supervisor installs a value-only update, the retained reference resolves the current credential only at its effective host, port, and path binding. Replacement, expiry, changed binding, or an activated detach prevents old authority from resolving. Remove the opt-in and activate that change before downgrading the gateway. See the provider profiles documentation for the lifecycle contract and its separation from gateway-managed refresh and `token_grant`.
+
 ### Configure credential refresh
 
 Use refresh commands only when the provider profile and gateway support refreshable credentials:

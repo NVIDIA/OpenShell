@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -34,7 +35,8 @@ type mockProfileServer struct {
 	lintErr   error
 	deleteErr error
 
-	lastListReq *pb.ListProviderProfilesRequest
+	lastListReq               *pb.ListProviderProfilesRequest
+	supportsStablePlaceholder bool
 }
 
 func newMockProfileServer() *mockProfileServer {
@@ -145,8 +147,9 @@ func (s *mockProfileServer) LintProviderProfiles(_ context.Context, req *pb.Lint
 		}
 	}
 	return &pb.LintProviderProfilesResponse{
-		Diagnostics: diagnostics,
-		Valid:       valid,
+		Diagnostics:               diagnostics,
+		Valid:                     valid,
+		SupportsStablePlaceholder: s.supportsStablePlaceholder,
 	}, nil
 }
 
@@ -320,6 +323,47 @@ func TestProfileGet_Error(t *testing.T) {
 }
 
 // --- Import tests ---
+
+func TestProfileStablePlaceholderCompatibility(t *testing.T) {
+	for _, supports := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("gateway_supports=%t/enabled=%t", supports, enabled), func(t *testing.T) {
+				mock := newMockProfileServer()
+				mock.supportsStablePlaceholder = supports
+				if !enabled {
+					// Ordinary writes must not acquire a new dependency on lint.
+					mock.lintErr = status.Error(codes.Unimplemented, "legacy lint unavailable")
+				}
+				seedProfile(mock, "existing", "Existing", pb.ProviderProfileCategory_PROVIDER_PROFILE_CATEGORY_INFERENCE)
+				client, cleanup := setupProfileTest(t, mock)
+				defer cleanup()
+				item := ProfileImportItem{Profile: ProviderProfile{
+					ID:          "new",
+					Credentials: []ProfileCredential{{Name: "token", StablePlaceholder: enabled}},
+				}}
+				imported, importErr := client.Import(context.Background(), "default", []ProfileImportItem{item})
+				item.Profile.ID = "existing"
+				updated, updateErr := client.Update(context.Background(), "default", "existing", 1, item)
+				if enabled && !supports {
+					require.ErrorContains(t, importErr, "does not support stable_placeholder")
+					require.ErrorContains(t, updateErr, "does not support stable_placeholder")
+					mock.mu.Lock()
+					defer mock.mu.Unlock()
+					assert.NotContains(t, mock.profiles, "new")
+					assert.Equal(t, uint64(1), mock.profiles["existing"].GetResourceVersion())
+					assert.False(t, mock.profiles["existing"].GetCredentials()[0].GetStablePlaceholder())
+				} else {
+					require.NoError(t, importErr)
+					require.NoError(t, updateErr)
+					assert.True(t, imported.Imported)
+					assert.True(t, updated.Updated)
+					assert.Equal(t, enabled, imported.Profiles[0].Credentials[0].StablePlaceholder)
+					assert.Equal(t, enabled, updated.Profile.Credentials[0].StablePlaceholder)
+				}
+			})
+		}
+	}
+}
 
 func TestProfileImport(t *testing.T) {
 	mock := newMockProfileServer()

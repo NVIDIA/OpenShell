@@ -314,16 +314,17 @@ func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_ProviderProfileCredential(t *testing.T) {
 	handled := fieldSet{
-		"name":          true,
-		"description":   true,
-		"env_vars":      true,
-		"required":      true,
-		"auth_style":    true,
-		"header_name":   true,
-		"query_param":   true,
-		"refresh":       true,
-		"path_template": true,
-		"token_grant":   true,
+		"name":               true,
+		"description":        true,
+		"env_vars":           true,
+		"required":           true,
+		"auth_style":         true,
+		"header_name":        true,
+		"query_param":        true,
+		"refresh":            true,
+		"path_template":      true,
+		"token_grant":        true,
+		"stable_placeholder": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, nil)

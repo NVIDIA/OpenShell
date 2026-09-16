@@ -137,17 +137,18 @@ func ProfileCredentialFromProto(c *pb.ProviderProfileCredential) *types.ProfileC
 		return nil
 	}
 	return &types.ProfileCredential{
-		Name:         c.GetName(),
-		Description:  c.GetDescription(),
-		EnvVars:      CopyStringSlice(c.GetEnvVars()),
-		Required:     c.GetRequired(),
-		Secret:       c.GetRefresh() != nil,
-		Refresh:      profileCredentialRefreshFromProto(c.GetRefresh()),
-		AuthStyle:    c.GetAuthStyle(),
-		HeaderName:   c.GetHeaderName(),
-		QueryParam:   c.GetQueryParam(),
-		PathTemplate: c.GetPathTemplate(),
-		TokenGrant:   tokenGrantFromProto(c.GetTokenGrant()),
+		Name:              c.GetName(),
+		Description:       c.GetDescription(),
+		EnvVars:           CopyStringSlice(c.GetEnvVars()),
+		Required:          c.GetRequired(),
+		StablePlaceholder: c.GetStablePlaceholder(),
+		Secret:            c.GetRefresh() != nil,
+		Refresh:           profileCredentialRefreshFromProto(c.GetRefresh()),
+		AuthStyle:         c.GetAuthStyle(),
+		HeaderName:        c.GetHeaderName(),
+		QueryParam:        c.GetQueryParam(),
+		PathTemplate:      c.GetPathTemplate(),
+		TokenGrant:        tokenGrantFromProto(c.GetTokenGrant()),
 	}
 }
 
@@ -157,16 +158,17 @@ func ProfileCredentialToProto(c *types.ProfileCredential) *pb.ProviderProfileCre
 		return nil
 	}
 	return &pb.ProviderProfileCredential{
-		Name:         c.Name,
-		Description:  c.Description,
-		EnvVars:      CopyStringSlice(c.EnvVars),
-		Required:     c.Required,
-		AuthStyle:    c.AuthStyle,
-		HeaderName:   c.HeaderName,
-		QueryParam:   c.QueryParam,
-		PathTemplate: c.PathTemplate,
-		Refresh:      profileCredentialRefreshToProto(c.Refresh),
-		TokenGrant:   tokenGrantToProto(c.TokenGrant),
+		Name:              c.Name,
+		Description:       c.Description,
+		EnvVars:           CopyStringSlice(c.EnvVars),
+		Required:          c.Required,
+		StablePlaceholder: c.StablePlaceholder,
+		AuthStyle:         c.AuthStyle,
+		HeaderName:        c.HeaderName,
+		QueryParam:        c.QueryParam,
+		PathTemplate:      c.PathTemplate,
+		Refresh:           profileCredentialRefreshToProto(c.Refresh),
+		TokenGrant:        tokenGrantToProto(c.TokenGrant),
 	}
 }
 

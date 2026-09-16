@@ -138,14 +138,15 @@ func TestNetworkBinaryToProto_Nil(t *testing.T) {
 
 func TestProfileCredentialFromProto(t *testing.T) {
 	proto := &pb.ProviderProfileCredential{
-		Name:         "API_KEY",
-		Description:  "API key for auth",
-		EnvVars:      []string{"ANTHROPIC_API_KEY", "API_KEY"},
-		Required:     true,
-		AuthStyle:    "header",
-		HeaderName:   "X-API-Key",
-		QueryParam:   "api_key",
-		PathTemplate: "/v1/{credential}/chat",
+		Name:              "API_KEY",
+		Description:       "API key for auth",
+		EnvVars:           []string{"ANTHROPIC_API_KEY", "API_KEY"},
+		Required:          true,
+		StablePlaceholder: true,
+		AuthStyle:         "header",
+		HeaderName:        "X-API-Key",
+		QueryParam:        "api_key",
+		PathTemplate:      "/v1/{credential}/chat",
 		Refresh: &pb.ProviderCredentialRefresh{
 			Strategy: pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
 		},
@@ -176,6 +177,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, "API key for auth", cred.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY", "API_KEY"}, cred.EnvVars)
 	assert.True(t, cred.Required)
+	assert.True(t, cred.StablePlaceholder)
 	assert.True(t, cred.Secret, "credential with refresh config is secret")
 	assert.Equal(t, "header", cred.AuthStyle)
 	assert.Equal(t, "X-API-Key", cred.HeaderName)
@@ -249,11 +251,12 @@ func TestProfileCredentialFromProto_Nil(t *testing.T) {
 
 func TestProfileCredentialToProto(t *testing.T) {
 	cred := &v1.ProfileCredential{
-		Name:        "API_KEY",
-		Description: "API key",
-		EnvVars:     []string{"ANTHROPIC_API_KEY"},
-		Required:    true,
-		Secret:      true,
+		Name:              "API_KEY",
+		Description:       "API key",
+		EnvVars:           []string{"ANTHROPIC_API_KEY"},
+		Required:          true,
+		StablePlaceholder: true,
+		Secret:            true,
 		Refresh: &v1.ProfileCredentialRefresh{
 			Strategy:             v1.RefreshStrategyOAuth2RefreshToken,
 			TokenURL:             "https://auth.example.com/token",
@@ -294,6 +297,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "API key", proto.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY"}, proto.EnvVars)
 	assert.True(t, proto.Required)
+	assert.True(t, proto.StablePlaceholder)
 	assert.Equal(t, "header", proto.AuthStyle)
 	assert.Equal(t, "X-API-Key", proto.HeaderName)
 	assert.Equal(t, "api_key", proto.QueryParam)

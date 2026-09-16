@@ -37,17 +37,21 @@ type ProviderProfile struct {
 
 // ProfileCredential defines a single credential required by a provider profile.
 type ProfileCredential struct {
-	Name         string
-	Description  string
-	EnvVars      []string
-	Required     bool
-	Secret       bool
-	Refresh      *ProfileCredentialRefresh
-	AuthStyle    string
-	HeaderName   string
-	QueryParam   string
-	PathTemplate string
-	TokenGrant   *CredentialTokenGrant
+	Name        string
+	Description string
+	EnvVars     []string
+	Required    bool
+	// StablePlaceholder uses an opaque identity-bound resolver handle across
+	// value-only external provider updates. It does not change secret
+	// classification or bypass endpoint authorization.
+	StablePlaceholder bool
+	Secret            bool
+	Refresh           *ProfileCredentialRefresh
+	AuthStyle         string
+	HeaderName        string
+	QueryParam        string
+	PathTemplate      string
+	TokenGrant        *CredentialTokenGrant
 }
 
 // ProfileCredentialRefresh declares how a profile credential is refreshed.

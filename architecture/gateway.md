@@ -358,6 +358,10 @@ The durable-policy compatibility decoder reads the former boolean before Prost
 discards it and migrates advisor provenance to the rule endpoint. A fixed
 pre-0.1.0 policy payload verifies that the former wire format still decodes.
 
+Stable-placeholder support adds fields to `ProviderProfileCredential`, `LintProviderProfilesResponse`, and the provider-environment request and response without changing existing field numbers or types. The opt-in and capability fields default to false, and the stable-key list defaults to empty. Ordinary legacy operations remain supported; opted-in delivery requires the capability checks described under Provider Environment Resolution.
+
+`StoredProviderProfile` embeds the public credential declaration, so the additive `stable_placeholder` field changes its transitive durable schema. Existing stored credentials decode with the opt-in disabled and need no migration or rewrite; a fixed prior-schema profile fixture verifies the false default and byte-preserving re-encoding. The private storage message declarations and public/durable type overlap remain unchanged. Older writers can discard the new field, so enabling it requires supporting components; remove the opt-in and activate the change before downgrading.
+
 Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
 generates these types separately, so the public descriptor set and the Rust,
@@ -661,6 +665,12 @@ binding metadata. It continues to return provider-generated non-secret
 configuration, valid endpoint-bound static credentials from other attached
 providers, and the dynamic credential snapshot. Provider environment revisions
 include profile endpoint and binding changes.
+
+A credential profile can explicitly request an opaque workload handle for an external updater that must preserve one placeholder across value-only provider revisions. The handle is derived from the sandbox, provider instance, credential key, and endpoint authorization. Replacing any of those inputs changes the handle and revokes the old placeholder. The gateway emits this mode only with a complete static endpoint binding and to a supervisor that advertises the dedicated capability; it withholds the affected credential during a mixed-version rollout instead of degrading to revision-scoped behavior. The supervisor keeps endpoint authorization in force. Gateway-managed refresh uses the same handle format with its refresh authorization epoch as an additional lifecycle boundary.
+
+Ordinary credentials retain revision-scoped behavior and remain compatible with older gateways. The CLI and Go profile client check the lint RPC's support acknowledgment before importing or updating an external stable opt-in. A supervisor requires delivery acknowledgment for declared or previously activated external stable credentials; failed refreshes retain that requirement and revoke static material. An acknowledged snapshot removing the last external stable credential clears the requirement. Initial setup and supervisor reconstruction with this opt-in require a supporting gateway: an older gateway's discarded profile fields cannot be recovered from an ordinary environment response.
+
+The supervisor owns provider fetching, support negotiation, and credential resolution outside the workload. The authenticated sandbox boundary receives a revision and its prepared child environment from one snapshot; it preserves the issued placeholders without receiving the secret resolver or turning those placeholders into new references.
 
 ## Provider Environment Resolution
 
