@@ -1617,12 +1617,16 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
         /// Sandbox names.
-        #[arg(required_unless_present = "all", num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        #[arg(required_unless_present = "all", required_unless_present = "prune", num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         names: Vec<String>,
 
         /// Delete all sandboxes.
-        #[arg(long, conflicts_with = "names")]
+        #[arg(long, conflicts_with_all = ["names", "prune"])]
         all: bool,
+
+        /// Delete all inactive sandboxes.
+        #[arg(long, conflicts_with_all = ["names", "all"])]
+        prune: bool,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3492,11 +3496,12 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete { names, all } => {
+                        SandboxCommands::Delete { names, all, prune } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
                                 all,
+                                prune,
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,

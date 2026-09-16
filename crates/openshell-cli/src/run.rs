@@ -409,7 +409,7 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+    if let Err(err) = sandbox_delete(server, &names, false, false, workspace, tls, gateway).await {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3424,13 +3424,14 @@ pub async fn sandbox_delete(
     server: &str,
     names: &[String],
     all: bool,
+    prune: bool,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
-    let names_to_delete: Vec<String> = if all {
+    let names_to_delete: Vec<String> = if all || prune {
         let mut page_token = String::new();
         let mut sandboxes = Vec::new();
         loop {
@@ -3444,7 +3445,16 @@ pub async fn sandbox_delete(
                 .await
                 .into_diagnostic()?
                 .into_inner();
-            sandboxes.extend(response.sandboxes);
+
+            if prune {
+                sandboxes.extend(response.sandboxes.into_iter().filter(|s| {
+                    let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
+                    [SandboxPhase::Error, SandboxPhase::Completed].contains(&phase)
+                }));
+            } else {
+                sandboxes.extend(response.sandboxes);
+            }
+
             if response.next_page_token.is_empty() {
                 break;
             }
