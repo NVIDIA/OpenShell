@@ -162,6 +162,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \

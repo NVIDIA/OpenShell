@@ -154,6 +154,7 @@ Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen h
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
   --set server.tls.enableMtls=false \
@@ -206,6 +207,7 @@ Install the chart with:
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
   --set server.disableTls=false \
