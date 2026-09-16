@@ -68,6 +68,12 @@ tests:
             apiGroups: [""]
             resources: ["services"]
             verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "list", "delete"]
 
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
