@@ -25,6 +25,8 @@ provenance = "minisign"
 [tools.buf."platforms.windows-arm64"]
 checksum = "sha256:79d7a18bddde96c248e5a606ba280708e71887a35939dee82cd49749740b77dc"
 url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Windows-arm64.zip"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772606"
+provenance = "minisign"
 
 [tools.buf."platforms.windows-x64"]
 checksum = "sha256:0332d8d1bf062c95a0418081b7e574551032ee72064af05e304e3a1454f8cf11"
@@ -117,6 +119,7 @@ provenance = "github-attestations"
 checksum = "sha256:3ebcde4f1bdfd3149c4527b85279cfc725ba7660ccf54b68b51be06a9271808e"
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_arm64.zip"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001171"
+provenance = "github-attestations"
 
 [tools."github:anchore/syft"."platforms.windows-x64"]
 checksum = "sha256:195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f47a"
@@ -346,6 +349,7 @@ url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/17832
 [tools.helm-docs."platforms.windows-arm64"]
 checksum = "sha256:c6a5f43e89837bd29749298ca27ed350ca8ee6ef64e25ce9653e709171dbbaa4"
 url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Windows_arm64.tar.gz"
+url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/178327223"
 
 [tools.helm-docs."platforms.windows-x64"]
 checksum = "sha256:3c54fd78d99e2769cf83a0faf12cf6cd4de1cac6ed7bee8d908a2c8fc23f538c"
@@ -374,6 +378,7 @@ url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450067"
 [tools.k3d."platforms.windows-arm64"]
 checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
 url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
+url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450011"
 
 [tools.k3d."platforms.windows-x64"]
 checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
@@ -457,6 +462,7 @@ url_api = "https://api.github.com/repos/protocolbuffers/protobuf/releases/assets
 [tools.protoc."platforms.windows-arm64"]
 checksum = "sha256:1ebd7c87baffb9f1c47169b640872bf5fb1e4408079c691af527be9561d8f6f7"
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-win64.zip"
+url_api = "https://api.github.com/repos/protocolbuffers/protobuf/releases/assets/350795088"
 
 [tools.protoc."platforms.windows-x64"]
 checksum = "sha256:1ebd7c87baffb9f1c47169b640872bf5fb1e4408079c691af527be9561d8f6f7"
@@ -550,6 +556,7 @@ provenance = "github-attestations"
 [tools.uv."platforms.windows-arm64"]
 checksum = "sha256:4c1d55501869b3330d4aabf45ad6024ce2367e0f3af83344395702d272c22e88"
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491992"
 provenance = "github-attestations"
 
 [tools.uv."platforms.windows-x64"]
@@ -583,6 +590,8 @@ provenance = "cosign"
 [tools.yq."platforms.windows-arm64"]
 checksum = "sha256:9a0ec8f648b0749d3d71286df96384f358c0eeca486bbcdec04e747307021d3a"
 url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_windows_arm64.exe"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522027986"
+provenance = "cosign"
 
 [tools.yq."platforms.windows-x64"]
 checksum = "sha256:ece3dd8bb50d39f93610506273ea262feb91e5c486bbddbb10abf91b2a6c0f14"
