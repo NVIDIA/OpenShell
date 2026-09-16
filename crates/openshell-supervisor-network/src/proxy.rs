@@ -11957,15 +11957,17 @@ network_policies:
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let exe = std::env::current_exe().expect("current_exe");
+        // JSON strings are valid YAML scalars and correctly escape Windows
+        // path separators such as `D:\\...`.
+        let exe_yaml = serde_json::to_string(&exe.to_string_lossy()).expect("encode executable");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 
