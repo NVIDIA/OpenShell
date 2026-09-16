@@ -17,27 +17,60 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
+    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant,
-    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage,
-    UpdateProviderRequest, WatchSandboxRequest,
+    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
+    ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt, ProviderProfile,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderReadinessObservation,
+    ProviderReadinessReason, ProviderReadinessState, ProviderReadinessStatus, ProviderResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
-use tonic::{Response, Status};
+use tonic::{Code, Response, Status};
+
+type ReadinessScript = HashMap<String, VecDeque<ReadinessReply>>;
+type ReceiptCorruption = fn(&mut ProviderMutationReceipt);
+
+#[derive(Clone)]
+enum ReadinessReply {
+    Status(Box<ProviderReadinessStatus>),
+    DelayedStatus(Duration, Box<ProviderReadinessStatus>),
+    Error(Code),
+    Hung,
+}
+
+const READINESS_PROVIDER: &str = "readiness-provider";
+const SYNTHETIC_READINESS_CREDENTIAL: &str = "fixture-provider-credential";
+const SYNTHETIC_READINESS_BACKEND_ERROR: &str = "fixture-backend-authorization-details";
+const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
+
+fn selected_workspace(
+    scope: &Option<openshell_core::proto::datamodel::v1::WorkspaceSelector>,
+) -> Option<&str> {
+    match scope.as_ref()?.selection.as_ref()? {
+        openshell_core::proto::datamodel::v1::workspace_selector::Selection::Workspace(
+            workspace,
+        ) => Some(workspace),
+        openshell_core::proto::datamodel::v1::workspace_selector::Selection::AllWorkspaces(_) => {
+            None
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct ProviderState {
@@ -48,6 +81,10 @@ struct ProviderState {
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     deny_provider_reads: Arc<AtomicBool>,
+    fail_provider_reads: Arc<AtomicBool>,
+    fail_sandbox_reads: Arc<AtomicBool>,
+    profile_read_errors: Arc<Mutex<HashMap<String, Code>>>,
+    profile_read_requests: Arc<Mutex<Vec<String>>>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     delete_provider_profile_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
@@ -56,6 +93,11 @@ struct ProviderState {
     fail_delete_provider_profile_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+    readiness_receipts: Arc<Mutex<HashMap<String, ProviderMutationReceipt>>>,
+    readiness_scripts: Arc<Mutex<ReadinessScript>>,
+    readiness_requests: Arc<Mutex<Vec<GetSandboxProviderStatusRequest>>>,
+    readiness_sequence: Arc<AtomicU64>,
+    corrupt_mutation_receipt: Arc<Mutex<Option<ReceiptCorruption>>>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
@@ -100,6 +142,68 @@ enum SandboxProviderRequestLog {
 #[derive(Clone, Default)]
 struct TestOpenShell {
     state: ProviderState,
+}
+
+impl TestOpenShell {
+    async fn provider_receipt(
+        &self,
+        sandbox_name: &str,
+        provider_name: &str,
+        workspace: &str,
+        kind: ProviderMutationKind,
+        mutation_id: Option<&str>,
+    ) -> ProviderMutationReceipt {
+        let sequence = self.state.readiness_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let provider = self
+            .state
+            .providers
+            .lock()
+            .await
+            .get(provider_name)
+            .cloned();
+        let detached = kind == ProviderMutationKind::Detach;
+        let mut receipt = ProviderMutationReceipt {
+            receipt_id: format!("receipt-{sequence}"),
+            mutation_id: mutation_id.map_or_else(|| format!("mutation-{sequence}"), str::to_string),
+            provider_name: provider_name.to_string(),
+            workspace: workspace.to_string(),
+            kind: kind.into(),
+            desired: Some(ProviderDesiredIdentity {
+                sandbox_id: format!("sb-{sandbox_name}"),
+                sandbox_name: sandbox_name.to_string(),
+                attachment_epoch: format!("attachment-{sandbox_name}"),
+                provider_id: if detached {
+                    String::new()
+                } else {
+                    provider
+                        .as_ref()
+                        .map_or_else(String::new, |provider| provider.object_id().to_string())
+                },
+                provider_resource_version: if detached {
+                    0
+                } else {
+                    provider
+                        .as_ref()
+                        .and_then(|provider| provider.metadata.as_ref())
+                        .map_or(0, |metadata| metadata.resource_version)
+                },
+                provider_env_revision: sequence,
+                config_revision: 17,
+                policy_hash: "effective-policy".to_string(),
+            }),
+            persisted_at_ms: i64::try_from(sequence).unwrap(),
+        };
+        let corrupt = *self.state.corrupt_mutation_receipt.lock().await;
+        if let Some(corrupt) = corrupt {
+            corrupt(&mut receipt);
+        }
+        self.state
+            .readiness_receipts
+            .lock()
+            .await
+            .insert(receipt.receipt_id.clone(), receipt.clone());
+        receipt
+    }
 }
 
 #[tonic::async_trait]
@@ -183,6 +287,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
+        if self.state.fail_sandbox_reads.load(Ordering::SeqCst) {
+            return Err(Status::internal(SYNTHETIC_READINESS_BACKEND_ERROR));
+        }
         let name = request.into_inner().name;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
@@ -246,6 +353,9 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
+        let workspace = selected_workspace(&request.workspace_scope)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
         self.state
             .sandbox_provider_requests
             .lock()
@@ -273,13 +383,24 @@ impl OpenShell for TestOpenShell {
             providers.push(request.provider_name.clone());
             true
         };
+        let provider_names = providers.clone();
+        drop(sandbox_providers);
+        let receipt = self
+            .provider_receipt(
+                &request.sandbox_name,
+                &request.provider_name,
+                workspace,
+                ProviderMutationKind::Attach,
+                None,
+            )
+            .await;
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 name: request.sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
-                providers: providers.clone(),
+                providers: provider_names,
                 ..Default::default()
             }),
             ..Default::default()
@@ -287,6 +408,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(AttachSandboxProviderResponse {
             sandbox: Some(sandbox),
             attached,
+            receipt: Some(receipt),
         }))
     }
 
@@ -295,6 +417,9 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
+        let workspace = selected_workspace(&request.workspace_scope)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
         self.state
             .sandbox_provider_requests
             .lock()
@@ -310,13 +435,24 @@ impl OpenShell for TestOpenShell {
         let before_len = providers.len();
         providers.retain(|name| name != &request.provider_name);
         let detached = providers.len() != before_len;
+        let provider_names = providers.clone();
+        drop(sandbox_providers);
+        let receipt = self
+            .provider_receipt(
+                &request.sandbox_name,
+                &request.provider_name,
+                workspace,
+                ProviderMutationKind::Detach,
+                None,
+            )
+            .await;
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 name: request.sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
-                providers: providers.clone(),
+                providers: provider_names,
                 ..Default::default()
             }),
             ..Default::default()
@@ -324,6 +460,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DetachSandboxProviderResponse {
             sandbox: Some(sandbox),
             detached,
+            receipt: Some(receipt),
         }))
     }
 
@@ -357,6 +494,97 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
         Ok(Response::new(
             GetSandboxProviderEnvironmentResponse::default(),
+        ))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        request: tonic::Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = selected_workspace(&request.workspace_scope)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
+        self.state
+            .readiness_requests
+            .lock()
+            .await
+            .push(request.clone());
+        let receipts = self.state.readiness_receipts.lock().await;
+        let receipt = if request.receipt_id.is_empty() {
+            receipts
+                .values()
+                .filter(|receipt| {
+                    receipt.workspace == workspace
+                        && receipt.provider_name == request.provider_name
+                        && receipt
+                            .desired
+                            .as_ref()
+                            .is_some_and(|desired| desired.sandbox_name == request.sandbox_name)
+                })
+                .max_by_key(|receipt| receipt.persisted_at_ms)
+        } else {
+            receipts
+                .get(&request.receipt_id)
+                .filter(|receipt| receipt.workspace == workspace)
+        }
+        .cloned()
+        .ok_or_else(|| Status::not_found("provider receipt not found"))?;
+        drop(receipts);
+        let scripted = self
+            .state
+            .readiness_scripts
+            .lock()
+            .await
+            .get_mut(&request.sandbox_name)
+            .and_then(|script| {
+                if script.len() > 1 {
+                    script.pop_front()
+                } else {
+                    script.front().cloned()
+                }
+            });
+        let mut status = match scripted {
+            Some(ReadinessReply::Status(status)) => *status,
+            // The last scripted reply repeats its delay after cancellation,
+            // matching a gateway whose status calls are consistently slow.
+            Some(ReadinessReply::DelayedStatus(delay, status)) => {
+                tokio::time::sleep(delay).await;
+                *status
+            }
+            Some(ReadinessReply::Error(code)) => {
+                return Err(Status::new(code, SYNTHETIC_READINESS_BACKEND_ERROR));
+            }
+            // No mock lock survives this await; the client deadline must cancel
+            // the request while retaining its previously observed status.
+            Some(ReadinessReply::Hung) => std::future::pending().await,
+            None => ProviderReadinessStatus {
+                state: ProviderReadinessState::Persisted.into(),
+                reason: ProviderReadinessReason::WaitingForSupervisor.into(),
+                ..Default::default()
+            },
+        };
+        let response_receipt = status.receipt.get_or_insert(receipt);
+        if let Some(observed) = status.observed.as_mut() {
+            let desired = response_receipt.desired.as_ref().unwrap();
+            observed
+                .attachment_epoch
+                .clone_from(&desired.attachment_epoch);
+            observed.provider_env_revision = desired.provider_env_revision;
+            observed.config_revision = desired.config_revision;
+            observed.policy_hash.clone_from(&desired.policy_hash);
+        }
+        Ok(Response::new(GetSandboxProviderStatusResponse {
+            status: Some(status),
+        }))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
         ))
     }
 
@@ -456,6 +684,7 @@ impl OpenShell for TestOpenShell {
         providers.insert(provider_name, provider.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
+            ..Default::default()
         }))
     }
 
@@ -463,6 +692,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        if self.state.fail_provider_reads.load(Ordering::SeqCst) {
+            return Err(Status::internal(SYNTHETIC_READINESS_BACKEND_ERROR));
+        }
         if self.state.deny_provider_reads.load(Ordering::SeqCst) {
             return Err(Status::permission_denied("scope 'provider:read' required"));
         }
@@ -474,6 +706,7 @@ impl OpenShell for TestOpenShell {
             .ok_or_else(|| Status::not_found("provider not found"))?;
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
+            ..Default::default()
         }))
     }
 
@@ -518,6 +751,21 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let request = request.into_inner();
         let id = request.id;
+        self.state
+            .profile_read_requests
+            .lock()
+            .await
+            .push(id.clone());
+        let error_code = self
+            .state
+            .profile_read_errors
+            .lock()
+            .await
+            .get(&id)
+            .copied();
+        if let Some(code) = error_code {
+            return Err(Status::new(code, SYNTHETIC_PROFILE_BACKEND_ERROR));
+        }
         let scoped_profile = self
             .state
             .scoped_profiles
@@ -657,8 +905,11 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = selected_workspace(&request.workspace_scope)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
         let provider = request
-            .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         self.state
@@ -667,6 +918,16 @@ impl OpenShell for TestOpenShell {
             .await
             .push(provider.clone());
 
+        let mut targets = self
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, attached)| attached.iter().any(|name| name == provider.object_name()))
+            .map(|(sandbox_name, _)| sandbox_name.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
         let mut providers = self.state.providers.lock().await;
         let existing = providers
             .get(provider.object_name())
@@ -709,9 +970,9 @@ impl OpenShell for TestOpenShell {
                 name: provider_metadata.name,
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
-                resource_version: 0,
+                resource_version: existing_metadata.resource_version + 1,
                 annotations: HashMap::new(),
-                workspace: String::new(),
+                workspace: workspace.to_string(),
                 deletion_timestamp_ms: 0,
             }),
             r#type: existing.r#type,
@@ -729,9 +990,29 @@ impl OpenShell for TestOpenShell {
             },
         };
         let updated_name = updated.object_name().to_string();
-        providers.insert(updated_name, updated.clone());
+        providers.insert(updated_name.clone(), updated.clone());
+        drop(providers);
+        let mutation_id = format!(
+            "update-{}",
+            self.state.readiness_sequence.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        let mut target_receipts = Vec::with_capacity(targets.len());
+        for sandbox_name in targets {
+            target_receipts.push(
+                self.provider_receipt(
+                    &sandbox_name,
+                    &updated_name,
+                    workspace,
+                    ProviderMutationKind::Update,
+                    Some(&mutation_id),
+                )
+                .await,
+            );
+        }
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
+            target_receipts,
+            mutation_id,
         }))
     }
     async fn get_provider_refresh_status(
@@ -1171,7 +1452,7 @@ struct TestServer {
     endpoint: String,
     tls: TlsOptions,
     state: ProviderState,
-    _dir: TempDir,
+    tls_materials_dir: TempDir,
 }
 
 async fn run_server() -> TestServer {
@@ -1218,8 +1499,1278 @@ async fn run_server() -> TestServer {
         endpoint,
         tls,
         state,
-        _dir: dir,
+        tls_materials_dir: dir,
     }
+}
+
+async fn seed_readiness_provider(server: &TestServer) {
+    server.state.providers.lock().await.insert(
+        READINESS_PROVIDER.to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{READINESS_PROVIDER}"),
+                name: READINESS_PROVIDER.to_string(),
+                workspace: "default".to_string(),
+                resource_version: 1,
+                ..Default::default()
+            }),
+            r#type: "openai".to_string(),
+            credentials: HashMap::from([(
+                "OPENAI_API_KEY".to_string(),
+                SYNTHETIC_READINESS_CREDENTIAL.to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+}
+
+fn readiness_status(
+    state: ProviderReadinessState,
+    reason: ProviderReadinessReason,
+    process_installed: bool,
+) -> ProviderReadinessStatus {
+    ProviderReadinessStatus {
+        state: state.into(),
+        reason: reason.into(),
+        observed: Some(ProviderReadinessObservation {
+            session_id: "network-session".to_string(),
+            sequence: 1,
+            credentials_installed: true,
+            policy_active: true,
+            launch_environment_installed: process_installed,
+            process_instance_id: if process_installed {
+                "process-instance".to_string()
+            } else {
+                String::new()
+            },
+            reason: reason.into(),
+            ..Default::default()
+        }),
+        network_instance_id: "network-instance".to_string(),
+        observed_at_ms: 1000,
+        evaluated_at_ms: 1000,
+        ..Default::default()
+    }
+}
+
+async fn script_readiness(
+    server: &TestServer,
+    sandbox_name: &str,
+    responses: Vec<Result<ProviderReadinessStatus, Code>>,
+) {
+    server.state.readiness_scripts.lock().await.insert(
+        sandbox_name.to_string(),
+        responses
+            .into_iter()
+            .map(|response| match response {
+                Ok(status) => ReadinessReply::Status(Box::new(status)),
+                Err(code) => ReadinessReply::Error(code),
+            })
+            .collect(),
+    );
+}
+
+async fn script_readiness_then_hang(
+    server: &TestServer,
+    sandbox_name: &str,
+    first_status: ProviderReadinessStatus,
+) {
+    server.state.readiness_scripts.lock().await.insert(
+        sandbox_name.to_string(),
+        VecDeque::from([
+            ReadinessReply::Status(Box::new(first_status)),
+            ReadinessReply::Hung,
+        ]),
+    );
+}
+
+async fn seed_readiness_receipt(
+    server: &TestServer,
+    sandbox_name: &str,
+    kind: ProviderMutationKind,
+) -> ProviderMutationReceipt {
+    seed_readiness_provider(server).await;
+    TestOpenShell {
+        state: server.state.clone(),
+    }
+    .provider_receipt(sandbox_name, READINESS_PROVIDER, "default", kind, None)
+    .await
+}
+
+async fn latest_readiness_receipt(
+    server: &TestServer,
+    sandbox_name: &str,
+) -> ProviderMutationReceipt {
+    server
+        .state
+        .readiness_receipts
+        .lock()
+        .await
+        .values()
+        .filter(|receipt| {
+            receipt
+                .desired
+                .as_ref()
+                .is_some_and(|desired| desired.sandbox_name == sandbox_name)
+        })
+        .max_by_key(|receipt| receipt.persisted_at_ms)
+        .cloned()
+        .expect("sandbox mutation receipt")
+}
+
+fn provider_wait_options() -> run::ProviderWaitOptions<'static> {
+    run::ProviderWaitOptions {
+        wait: true,
+        timeout: Duration::from_secs(2),
+        output: "json",
+    }
+}
+
+// A separate CLI process provides isolated stdout/stderr without redirecting
+// the test runner's descriptors or sharing the user's gateway configuration.
+async fn run_readiness_cli(server: &TestServer, args: &[&str]) -> std::process::Output {
+    let config_dir = tempfile::tempdir().unwrap();
+    let tls_dir = config_dir
+        .path()
+        .join("openshell/gateways/provider-readiness/mtls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    for filename in ["ca.crt", "tls.crt", "tls.key"] {
+        std::fs::copy(
+            server.tls_materials_dir.path().join(filename),
+            tls_dir.join(filename),
+        )
+        .unwrap();
+    }
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("OPENSHELL_")) {
+        command.env_remove(key);
+    }
+    command
+        .args([
+            "--gateway",
+            "provider-readiness",
+            "--gateway-endpoint",
+            &server.endpoint,
+            "--color",
+            "never",
+        ])
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await
+        .expect("bounded readiness CLI process")
+        .expect("readiness CLI output")
+}
+
+fn assert_readiness_output_redacted(output: &std::process::Output) {
+    for bytes in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains(SYNTHETIC_READINESS_CREDENTIAL));
+        assert!(!text.contains(SYNTHETIC_READINESS_BACKEND_ERROR));
+        assert!(!text.contains(SYNTHETIC_PROFILE_BACKEND_ERROR));
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_mutations_reject_unbound_receipts_before_output_or_polling() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    let corruptions: &[(&str, ReceiptCorruption)] = &[
+        ("empty", |receipt| {
+            *receipt = ProviderMutationReceipt::default();
+        }),
+        ("receipt_id", |receipt| receipt.receipt_id.clear()),
+        ("mutation_id", |receipt| receipt.mutation_id.clear()),
+        ("workspace", |receipt| {
+            receipt.workspace = "other".to_string();
+        }),
+        ("provider", |receipt| {
+            receipt.provider_name = "other".to_string();
+        }),
+        ("kind", |receipt| {
+            receipt.kind = ProviderMutationKind::Observe.into();
+        }),
+        ("sandbox_name", |receipt| {
+            receipt
+                .desired
+                .as_mut()
+                .expect("desired identity")
+                .sandbox_name = "other".to_string();
+        }),
+        ("sandbox_id", |receipt| {
+            receipt
+                .desired
+                .as_mut()
+                .expect("desired identity")
+                .sandbox_id = "other-id".to_string();
+        }),
+        ("desired", |receipt| receipt.desired = None),
+        ("timestamp", |receipt| receipt.persisted_at_ms = 0),
+        ("provider_presence", |receipt| {
+            let detached = receipt.kind == i32::from(ProviderMutationKind::Detach);
+            receipt
+                .desired
+                .as_mut()
+                .expect("desired identity")
+                .provider_id = if detached {
+                "unexpected-provider".to_string()
+            } else {
+                String::new()
+            };
+        }),
+    ];
+    for action in ["attach", "detach"] {
+        let state = if action == "attach" {
+            ProviderReadinessState::Ready
+        } else {
+            ProviderReadinessState::Revoked
+        };
+        script_readiness(
+            &server,
+            "receipt-target",
+            vec![Ok(readiness_status(
+                state,
+                ProviderReadinessReason::Unspecified,
+                true,
+            ))],
+        )
+        .await;
+        for wait in [false, true] {
+            for (field, corrupt) in corruptions {
+                *server.state.corrupt_mutation_receipt.lock().await = Some(*corrupt);
+                let mut args = vec![
+                    "sandbox",
+                    "provider",
+                    action,
+                    "receipt-target",
+                    READINESS_PROVIDER,
+                    "--timeout",
+                    "1",
+                    "--output",
+                    "json",
+                ];
+                if wait {
+                    args.push("--wait");
+                }
+                let output = run_readiness_cli(&server, &args).await;
+                assert!(!output.status.success(), "{action}: {field}, wait={wait}");
+                assert!(
+                    output.stdout.is_empty(),
+                    "invalid receipt was printed: {field}"
+                );
+                assert_readiness_output_redacted(&output);
+                assert!(server.state.readiness_requests.lock().await.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_update_rejects_unbound_batch_identity() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server.state.sandbox_providers.lock().await.insert(
+        "update-target".to_string(),
+        vec![READINESS_PROVIDER.to_string()],
+    );
+    script_readiness(
+        &server,
+        "update-target",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Ready,
+            ProviderReadinessReason::Unspecified,
+            true,
+        ))],
+    )
+    .await;
+    let corruptions: &[(&str, ReceiptCorruption)] = &[
+        ("mutation_id", |receipt| {
+            receipt.mutation_id = "another-update".to_string();
+        }),
+        ("workspace", |receipt| {
+            receipt.workspace = "other".to_string();
+        }),
+        ("provider_name", |receipt| {
+            receipt.provider_name = "other".to_string();
+        }),
+        ("kind", |receipt| {
+            receipt.kind = ProviderMutationKind::Observe.into();
+        }),
+        ("provider_id", |receipt| {
+            receipt
+                .desired
+                .as_mut()
+                .expect("desired identity")
+                .provider_id = "other-id".to_string();
+        }),
+        ("provider_revision", |receipt| {
+            receipt
+                .desired
+                .as_mut()
+                .expect("desired identity")
+                .provider_resource_version = u64::MAX;
+        }),
+    ];
+    for wait in [false, true] {
+        for (field, corrupt) in corruptions {
+            *server.state.corrupt_mutation_receipt.lock().await = Some(*corrupt);
+            let mut args = vec![
+                "provider",
+                "update",
+                READINESS_PROVIDER,
+                "--credential",
+                "OPENAI_API_KEY=updated-fixture",
+                "--timeout",
+                "1",
+                "--output",
+                "json",
+            ];
+            if wait {
+                args.push("--wait");
+            }
+            let output = run_readiness_cli(&server, &args).await;
+            assert!(!output.status.success(), "{field}, wait={wait}");
+            assert!(
+                output.stdout.is_empty(),
+                "invalid batch was printed: {field}"
+            );
+            assert_readiness_output_redacted(&output);
+            assert!(server.state.readiness_requests.lock().await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_update_with_no_targets_preserves_saved_success() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for wait in [false, true] {
+        let mut args = vec![
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--credential",
+            "OPENAI_API_KEY=updated-fixture",
+            "--output",
+            "json",
+        ];
+        if wait {
+            args.push("--wait");
+        }
+        let output = run_readiness_cli(&server, &args).await;
+        assert!(output.status.success());
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("saved update JSON");
+        assert_eq!(value["targets"], serde_json::json!([]));
+        assert!(
+            !value["mutation_id"]
+                .as_str()
+                .expect("mutation ID")
+                .is_empty()
+        );
+        assert!(server.state.readiness_requests.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_update_redacts_exact_and_alias_profile_lookup_errors() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for (profile, failed_lookup, expected_lookups) in [
+        ("openai", "openai", vec!["openai"]),
+        ("gh", "github", vec!["gh", "github"]),
+    ] {
+        server
+            .state
+            .providers
+            .lock()
+            .await
+            .get_mut(READINESS_PROVIDER)
+            .expect("seeded provider")
+            .r#type = profile.to_string();
+        let mut errors = server.state.profile_read_errors.lock().await;
+        errors.clear();
+        errors.insert(failed_lookup.to_string(), Code::Internal);
+        drop(errors);
+        for source in ["--from-existing", "--from-oidc-token"] {
+            server.state.profile_read_requests.lock().await.clear();
+            let output = run_readiness_cli(
+                &server,
+                &[
+                    "provider",
+                    "update",
+                    READINESS_PROVIDER,
+                    source,
+                    "--wait",
+                    "--output",
+                    "json",
+                ],
+            )
+            .await;
+            assert!(!output.status.success());
+            assert_readiness_output_redacted(&output);
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("provider profile lookup failed")
+            );
+            assert_eq!(
+                *server.state.profile_read_requests.lock().await,
+                expected_lookups
+            );
+            assert!(
+                server
+                    .state
+                    .provider_update_requests
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+}
+
+async fn assert_later_readiness_targets_are_polled(
+    blocked_targets: usize,
+    blocked_reply: ReadinessReply,
+    expected_state: &str,
+) {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for index in 0..17 {
+        let sandbox = format!("sandbox-{index:02}");
+        server
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .insert(sandbox.clone(), vec![READINESS_PROVIDER.to_string()]);
+        script_readiness(
+            &server,
+            &sandbox,
+            vec![Ok(readiness_status(
+                ProviderReadinessState::Ready,
+                ProviderReadinessReason::Unspecified,
+                true,
+            ))],
+        )
+        .await;
+    }
+    for index in 0..blocked_targets {
+        server.state.readiness_scripts.lock().await.insert(
+            format!("sandbox-{index:02}"),
+            VecDeque::from([blocked_reply.clone()]),
+        );
+    }
+    let started = std::time::Instant::now();
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--credential",
+            "OPENAI_API_KEY=updated-fixture",
+            "--wait",
+            "--timeout",
+            "1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("target outcomes");
+    let targets = value["targets"].as_array().expect("target array");
+    assert_eq!(targets.len(), 17);
+    let requests = server.state.readiness_requests.lock().await;
+    for (index, target) in targets.iter().enumerate() {
+        let sandbox = format!("sandbox-{index:02}");
+        assert_eq!(target["receipt"]["desired"]["sandbox_name"], sandbox);
+        if index < blocked_targets {
+            assert_eq!(target["wait_outcome"], "timed_out");
+            assert_eq!(target["state"], expected_state);
+        } else {
+            assert_eq!(target["wait_outcome"], "complete");
+        }
+        let target_requests = requests
+            .iter()
+            .filter(|request| request.sandbox_name == sandbox)
+            .collect::<Vec<_>>();
+        assert!(!target_requests.is_empty(), "{sandbox} was never queried");
+        if index >= blocked_targets {
+            assert_eq!(
+                target_requests.len(),
+                1,
+                "completed targets leave the queue"
+            );
+        }
+        for request in target_requests {
+            assert_eq!(
+                request.receipt_id,
+                target["receipt"]["receipt_id"]
+                    .as_str()
+                    .expect("receipt ID")
+            );
+            assert_eq!(request.provider_name, READINESS_PROVIDER);
+            assert_eq!(
+                selected_workspace(&request.workspace_scope),
+                Some("default")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_update_polls_later_targets_while_first_is_hung() {
+    assert_later_readiness_targets_are_polled(1, ReadinessReply::Hung, "persisted").await;
+}
+
+#[tokio::test]
+async fn provider_readiness_update_polls_later_targets_while_first_batch_is_pending() {
+    assert_later_readiness_targets_are_polled(
+        16,
+        ReadinessReply::Status(Box::new(readiness_status(
+            ProviderReadinessState::Pending,
+            ProviderReadinessReason::WaitingForProcess,
+            false,
+        ))),
+        "pending",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn provider_readiness_update_polls_later_targets_while_first_batch_is_hung() {
+    assert_later_readiness_targets_are_polled(16, ReadinessReply::Hung, "persisted").await;
+}
+
+async fn assert_slow_readiness_targets_complete(target_count: usize, delay: Duration) {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for index in 0..target_count {
+        let sandbox = format!("slow-sandbox-{index:02}");
+        server
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .insert(sandbox.clone(), vec![READINESS_PROVIDER.to_string()]);
+        server.state.readiness_scripts.lock().await.insert(
+            sandbox,
+            VecDeque::from([ReadinessReply::DelayedStatus(
+                delay,
+                Box::new(readiness_status(
+                    ProviderReadinessState::Ready,
+                    ProviderReadinessReason::Unspecified,
+                    true,
+                )),
+            )]),
+        );
+    }
+    let started = std::time::Instant::now();
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--credential",
+            "OPENAI_API_KEY=updated-fixture",
+            "--wait",
+            "--timeout",
+            "2",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "healthy status replies that fit the shared deadline must complete: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("target outcomes");
+    let targets = value["targets"].as_array().expect("target array");
+    assert_eq!(targets.len(), target_count);
+    let requests = server.state.readiness_requests.lock().await;
+    for (index, target) in targets.iter().enumerate() {
+        let sandbox = format!("slow-sandbox-{index:02}");
+        assert_eq!(target["receipt"]["desired"]["sandbox_name"], sandbox);
+        assert_eq!(target["wait_outcome"], "complete");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.sandbox_name == sandbox)
+                .count(),
+            1,
+            "a healthy response must not be discarded and retried"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_update_wait_allows_slow_single_target() {
+    assert_slow_readiness_targets_complete(1, Duration::from_millis(1200)).await;
+}
+
+#[tokio::test]
+async fn provider_readiness_update_wait_allows_slow_queued_targets() {
+    assert_slow_readiness_targets_complete(17, Duration::from_millis(700)).await;
+}
+
+#[tokio::test]
+async fn provider_readiness_attach_wait_observes_pending_then_ready() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    script_readiness(
+        &server,
+        "pending-sandbox",
+        vec![
+            Ok(readiness_status(
+                ProviderReadinessState::Pending,
+                ProviderReadinessReason::WaitingForProcess,
+                false,
+            )),
+            Ok(readiness_status(
+                ProviderReadinessState::Ready,
+                ProviderReadinessReason::Unspecified,
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    run::sandbox_provider_attach(
+        &server.endpoint,
+        "pending-sandbox",
+        READINESS_PROVIDER,
+        "default",
+        &server.tls,
+        provider_wait_options(),
+    )
+    .await
+    .expect("attachment waits through pending state");
+
+    let requests = server.state.readiness_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].receipt_id.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.receipt_id == requests[0].receipt_id)
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+    );
+}
+
+#[tokio::test]
+async fn provider_readiness_attach_wait_times_out_without_process_ack() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    script_readiness(
+        &server,
+        "missing-process",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Pending,
+            ProviderReadinessReason::WaitingForProcess,
+            false,
+        ))],
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "attach",
+            "missing-process",
+            READINESS_PROVIDER,
+            "--wait",
+            "--timeout",
+            "1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("readiness JSON");
+    let target = &value["targets"][0];
+    assert_eq!(target["state"], "pending");
+    assert_eq!(target["reason"], "waiting_for_process");
+    assert_eq!(target["wait_outcome"], "timed_out");
+    assert_eq!(target["observed"]["launch_environment_installed"], false);
+    assert!(!server.state.readiness_requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn provider_readiness_status_wait_supersedes_changed_desired_authority() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    run::sandbox_provider_attach(
+        &server.endpoint,
+        "changed-authority",
+        READINESS_PROVIDER,
+        "default",
+        &server.tls,
+        run::ProviderWaitOptions::default(),
+    )
+    .await
+    .unwrap();
+    let original = latest_readiness_receipt(&server, "changed-authority").await;
+    let mut newer = original.clone();
+    newer.desired.as_mut().unwrap().provider_env_revision += 1;
+    let mut newer_status = readiness_status(
+        ProviderReadinessState::Ready,
+        ProviderReadinessReason::Unspecified,
+        true,
+    );
+    newer_status.receipt = Some(newer);
+    script_readiness(
+        &server,
+        "changed-authority",
+        vec![
+            Ok(readiness_status(
+                ProviderReadinessState::Pending,
+                ProviderReadinessReason::WaitingForProcess,
+                false,
+            )),
+            Ok(newer_status),
+        ],
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "status",
+            "changed-authority",
+            READINESS_PROVIDER,
+            "--receipt",
+            &original.receipt_id,
+            "--wait",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("superseded readiness JSON");
+    let target = &value["targets"][0];
+    assert_eq!(target["state"], "superseded");
+    assert_eq!(target["reason"], "desired_state_changed");
+    assert_eq!(target["wait_outcome"], "terminal");
+    assert_eq!(target["receipt"]["receipt_id"], original.receipt_id);
+    assert_eq!(
+        target["receipt"]["desired"]["provider_env_revision"],
+        original
+            .desired
+            .as_ref()
+            .unwrap()
+            .provider_env_revision
+            .to_string()
+    );
+    let requests = server.state.readiness_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.receipt_id == original.receipt_id)
+    );
+}
+
+#[tokio::test]
+async fn provider_readiness_status_without_wait_rejects_missing_process_ack() {
+    let server = run_server().await;
+    let receipt =
+        seed_readiness_receipt(&server, "unproved-ready", ProviderMutationKind::Attach).await;
+    script_readiness(
+        &server,
+        "unproved-ready",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Ready,
+            ProviderReadinessReason::Unspecified,
+            false,
+        ))],
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "status",
+            "unproved-ready",
+            READINESS_PROVIDER,
+            "--receipt",
+            &receipt.receipt_id,
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid provider readiness status"));
+    assert_eq!(server.state.readiness_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn provider_readiness_status_without_wait_rejects_ready_for_detach() {
+    let server = run_server().await;
+    let receipt =
+        seed_readiness_receipt(&server, "unrevoked-detach", ProviderMutationKind::Detach).await;
+    script_readiness(
+        &server,
+        "unrevoked-detach",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Ready,
+            ProviderReadinessReason::Unspecified,
+            true,
+        ))],
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "status",
+            "unrevoked-detach",
+            READINESS_PROVIDER,
+            "--receipt",
+            &receipt.receipt_id,
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid provider readiness status"));
+    assert_eq!(server.state.readiness_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn provider_readiness_status_wait_completes_from_first_ready_response() {
+    let server = run_server().await;
+    let receipt =
+        seed_readiness_receipt(&server, "first-ready", ProviderMutationKind::Attach).await;
+    script_readiness_then_hang(
+        &server,
+        "first-ready",
+        readiness_status(
+            ProviderReadinessState::Ready,
+            ProviderReadinessReason::Unspecified,
+            true,
+        ),
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "status",
+            "first-ready",
+            READINESS_PROVIDER,
+            "--receipt",
+            &receipt.receipt_id,
+            "--wait",
+            "--timeout",
+            "1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(output.status.success());
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("completed readiness JSON");
+    let target = &value["targets"][0];
+    assert_eq!(target["state"], "ready");
+    assert_eq!(target["wait_outcome"], "complete");
+    assert_eq!(target["receipt"]["receipt_id"], receipt.receipt_id);
+    assert_eq!(target["observed"]["launch_environment_installed"], true);
+    assert_eq!(server.state.readiness_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn provider_readiness_status_wait_timeout_preserves_first_pending_response() {
+    let server = run_server().await;
+    let receipt =
+        seed_readiness_receipt(&server, "first-pending", ProviderMutationKind::Attach).await;
+    script_readiness_then_hang(
+        &server,
+        "first-pending",
+        readiness_status(
+            ProviderReadinessState::Pending,
+            ProviderReadinessReason::WaitingForProcess,
+            false,
+        ),
+    )
+    .await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "sandbox",
+            "provider",
+            "status",
+            "first-pending",
+            READINESS_PROVIDER,
+            "--receipt",
+            &receipt.receipt_id,
+            "--wait",
+            "--timeout",
+            "1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("timed-out readiness JSON");
+    let target = &value["targets"][0];
+    assert_eq!(target["state"], "pending");
+    assert_eq!(target["reason"], "waiting_for_process");
+    assert_eq!(target["wait_outcome"], "timed_out");
+    assert_eq!(target["receipt"]["receipt_id"], receipt.receipt_id);
+    assert_eq!(target["observed"]["session_id"], "network-session");
+    assert_eq!(target["observed"]["launch_environment_installed"], false);
+    let requests = server.state.readiness_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.receipt_id == receipt.receipt_id)
+    );
+}
+
+#[tokio::test]
+async fn provider_readiness_mutations_redact_sandbox_lookup_errors() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .fail_sandbox_reads
+        .store(true, Ordering::SeqCst);
+
+    for operation in ["attach", "detach"] {
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "sandbox",
+                "provider",
+                operation,
+                "read-failed",
+                READINESS_PROVIDER,
+                "--wait",
+                "--output",
+                "json",
+            ],
+        )
+        .await;
+
+        assert!(!output.status.success());
+        assert_readiness_output_redacted(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .to_ascii_lowercase()
+                .contains("internal")
+        );
+    }
+    assert!(
+        server
+            .state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert!(server.state.readiness_requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn provider_readiness_update_redacts_provider_lookup_errors() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server
+        .state
+        .fail_provider_reads
+        .store(true, Ordering::SeqCst);
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--config",
+            "region=test",
+            "--wait",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("internal")
+    );
+    assert!(
+        server
+            .state
+            .provider_update_requests
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert!(server.state.readiness_requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn provider_readiness_status_rejects_wrong_first_receipt() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    run::sandbox_provider_attach(
+        &server.endpoint,
+        "wrong-receipt",
+        READINESS_PROVIDER,
+        "default",
+        &server.tls,
+        run::ProviderWaitOptions::default(),
+    )
+    .await
+    .unwrap();
+    let original = latest_readiness_receipt(&server, "wrong-receipt").await;
+    let mut replacement = original.clone();
+    replacement.receipt_id = "another-mutation-receipt".to_string();
+    replacement.mutation_id = "another-mutation".to_string();
+    let mut status = readiness_status(
+        ProviderReadinessState::Ready,
+        ProviderReadinessReason::Unspecified,
+        true,
+    );
+    status.receipt = Some(replacement);
+    script_readiness(&server, "wrong-receipt", vec![Ok(status)]).await;
+
+    let error = run::sandbox_provider_status(
+        &server.endpoint,
+        "wrong-receipt",
+        READINESS_PROVIDER,
+        &original.receipt_id,
+        "default",
+        &server.tls,
+        provider_wait_options(),
+    )
+    .await
+    .expect_err("a replacement receipt cannot satisfy the requested receipt");
+
+    assert!(
+        error
+            .to_string()
+            .contains("invalid provider readiness status")
+    );
+    assert_eq!(server.state.readiness_requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn provider_readiness_detach_wait_requires_revoked() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    server.state.sandbox_providers.lock().await.insert(
+        "detach-sandbox".to_string(),
+        vec![READINESS_PROVIDER.to_string()],
+    );
+    script_readiness(
+        &server,
+        "detach-sandbox",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Ready,
+            ProviderReadinessReason::Unspecified,
+            true,
+        ))],
+    )
+    .await;
+
+    let error = run::sandbox_provider_detach(
+        &server.endpoint,
+        "detach-sandbox",
+        READINESS_PROVIDER,
+        "default",
+        &server.tls,
+        provider_wait_options(),
+    )
+    .await
+    .expect_err("READY cannot establish detachment completion");
+    assert!(
+        error
+            .to_string()
+            .contains("readiness wait did not complete")
+    );
+    script_readiness(
+        &server,
+        "detach-sandbox",
+        vec![
+            Ok(readiness_status(
+                ProviderReadinessState::Pending,
+                ProviderReadinessReason::WaitingForProcess,
+                false,
+            )),
+            Ok(readiness_status(
+                ProviderReadinessState::Revoked,
+                ProviderReadinessReason::Unspecified,
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    // A repeated detach still returns a receipt and waits for revoked authority.
+    run::sandbox_provider_detach(
+        &server.endpoint,
+        "detach-sandbox",
+        READINESS_PROVIDER,
+        "default",
+        &server.tls,
+        provider_wait_options(),
+    )
+    .await
+    .expect("revoked receipt completes detachment");
+    let requests = server.state.readiness_requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+    );
+}
+
+#[tokio::test]
+async fn provider_readiness_update_reports_every_target_failure() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for sandbox in ["network-failed", "unsupported", "transport-failed"] {
+        server
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .insert(sandbox.to_string(), vec![READINESS_PROVIDER.to_string()]);
+    }
+    script_readiness(
+        &server,
+        "network-failed",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Failed,
+            ProviderReadinessReason::CredentialInstallFailed,
+            false,
+        ))],
+    )
+    .await;
+    script_readiness(
+        &server,
+        "unsupported",
+        vec![Ok(readiness_status(
+            ProviderReadinessState::Withheld,
+            ProviderReadinessReason::UnsupportedSupervisor,
+            false,
+        ))],
+    )
+    .await;
+    script_readiness(&server, "transport-failed", vec![Err(Code::Internal)]).await;
+
+    let output = run_readiness_cli(
+        &server,
+        &[
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--config",
+            "region=test",
+            "--wait",
+            "--timeout",
+            "1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    assert_readiness_output_redacted(&output);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("multi-target readiness JSON");
+    let targets: HashMap<_, _> = value["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| {
+            (
+                target["receipt"]["desired"]["sandbox_name"]
+                    .as_str()
+                    .unwrap(),
+                target,
+            )
+        })
+        .collect();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(targets["network-failed"]["state"], "failed");
+    assert_eq!(
+        targets["network-failed"]["reason"],
+        "credential_install_failed"
+    );
+    assert_eq!(targets["unsupported"]["state"], "withheld");
+    assert_eq!(targets["unsupported"]["reason"], "unsupported_supervisor");
+    assert_eq!(
+        targets["transport-failed"]["wait_outcome"],
+        "observation_error"
+    );
+    assert!(!value["mutation_id"].as_str().unwrap().is_empty());
+    assert!(
+        targets
+            .values()
+            .all(|target| target["receipt"]["mutation_id"] == value["mutation_id"])
+    );
+    let requests = server.state.readiness_requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+    );
 }
 
 async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
@@ -1275,6 +2826,7 @@ async fn provider_update_preserves_stored_type_and_profile_workspace_when_readab
         credential_expires_at: &[],
         workspace: "default",
         tls: &ts.tls,
+        readiness: run::ProviderWaitOptions::default(),
     })
     .await
     .expect("provider update");
@@ -1396,6 +2948,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         credential_expires_at: &[],
         workspace: "default",
         tls: &ts.tls,
+        readiness: run::ProviderWaitOptions::default(),
     })
     .await
     .expect("provider update");
@@ -1871,6 +3424,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "work-github",
         "default",
         &ts.tls,
+        run::ProviderWaitOptions::default(),
     )
     .await
     .expect("sandbox provider attach");
@@ -1880,6 +3434,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "work-github",
         "default",
         &ts.tls,
+        run::ProviderWaitOptions::default(),
     )
     .await
     .expect("sandbox provider attach is idempotent");
@@ -1892,6 +3447,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "work-github",
         "default",
         &ts.tls,
+        run::ProviderWaitOptions::default(),
     )
     .await
     .expect("sandbox provider detach");
@@ -1901,6 +3457,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "work-github",
         "default",
         &ts.tls,
+        run::ProviderWaitOptions::default(),
     )
     .await
     .expect("sandbox provider detach is idempotent");
@@ -1945,14 +3502,12 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
         "missing-provider",
         "default",
         &ts.tls,
+        run::ProviderWaitOptions::default(),
     )
     .await
     .expect_err("missing provider should fail");
 
-    assert!(
-        err.to_string().contains("provider not found"),
-        "unexpected error: {err}"
-    );
+    assert!(err.to_string().contains("provider attachment failed"));
     assert_eq!(
         ts.state.sandbox_provider_requests.lock().await.as_slice(),
         [SandboxProviderRequestLog::Attach {
@@ -2364,6 +3919,7 @@ async fn provider_update_from_existing_uses_profile_discovery() {
         credential_expires_at: &[],
         workspace: "default",
         tls: &ts.tls,
+        readiness: run::ProviderWaitOptions::default(),
     })
     .await
     .expect("profile-backed provider update --from-existing");
@@ -2436,6 +3992,7 @@ async fn provider_update_from_existing_preserves_global_profile_scope() {
         credential_expires_at: &[],
         workspace: "default",
         tls: &ts.tls,
+        readiness: run::ProviderWaitOptions::default(),
     })
     .await
     .expect("global profile-backed provider update --from-existing");
@@ -2513,6 +4070,7 @@ async fn provider_update_from_oidc_token_preserves_global_profile_scope() {
         credential_expires_at: &[],
         workspace: "default",
         tls: &ts.tls,
+        readiness: run::ProviderWaitOptions::default(),
     })
     .await
     .expect_err("unnamed test gateway should stop after profile validation");

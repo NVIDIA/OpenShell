@@ -6,6 +6,7 @@
 mod auth_rpc;
 pub mod policy;
 pub mod provider;
+pub mod provider_readiness;
 mod sandbox;
 pub use sandbox::mint_persisted_authentication;
 mod service;
@@ -36,7 +37,8 @@ use openshell_core::proto::{
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
+    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
     GpuResourceCapabilities, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
     ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
@@ -51,12 +53,13 @@ use openshell_core::proto::{
     RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
     RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest,
     ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ResourceCapabilities,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, SandboxTemplateResponse,
-    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ReportProviderReadinessRequest,
+    ReportProviderReadinessResponse, ResourceCapabilities, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus,
+    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -334,6 +337,20 @@ impl OpenShell for OpenShellService {
         request: Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         sandbox::handle_detach_sandbox_provider(&self.state, request).await
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        request: Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        provider_readiness::handle_get_sandbox_provider_status(&self.state, request).await
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        request: Request<ReportProviderReadinessRequest>,
+    ) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+        provider_readiness::handle_report_provider_readiness(&self.state, request).await
     }
 
     async fn delete_sandbox(

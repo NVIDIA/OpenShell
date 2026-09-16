@@ -157,6 +157,16 @@ service OpenShell {
     };
   }
 
+  // Inspect the installed authority for one sandbox provider mutation.
+  rpc GetSandboxProviderStatus(GetSandboxProviderStatusRequest)
+      returns (GetSandboxProviderStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -478,6 +488,15 @@ service OpenShell {
   // Replace the gateway's observed tool server endpoint status for one sandbox.
   rpc ReportEndpointStatus(ReportEndpointStatusRequest)
       returns (ReportEndpointStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Report installed provider state for the current ConnectSupervisor session.
+  // Replacing or losing that session invalidates its observations.
+  rpc ReportProviderReadiness(ReportProviderReadinessRequest)
+      returns (ReportProviderReadinessResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -950,6 +969,9 @@ message SandboxSpec {
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the main process.
   bool tty = 13;
+  // Gateway-owned attachment identity, changed atomically with the provider set.
+  // Equality only: detach and reattach must not revive an older receipt.
+  string provider_attachment_epoch = 14;
 }
 
 message ResourceRequirements {
@@ -1360,6 +1382,8 @@ message AttachSandboxProviderResponse {
   Sandbox sandbox = 1;
   // True when the provider was newly attached. False means it was already attached.
   bool attached = 2;
+  // Persisted intent; readiness requires current supervisor observations.
+  ProviderMutationReceipt receipt = 3;
 }
 
 // Detach provider from sandbox response.
@@ -1367,6 +1391,205 @@ message DetachSandboxProviderResponse {
   Sandbox sandbox = 1;
   // True when the provider was removed. False means it was not attached.
   bool detached = 2;
+  // Revocation is complete only when this receipt reports REVOKED.
+  ProviderMutationReceipt receipt = 3;
+}
+
+// Operation whose installed authority is tracked by a receipt.
+enum ProviderMutationKind {
+  PROVIDER_MUTATION_KIND_UNSPECIFIED = 0;
+  PROVIDER_MUTATION_KIND_ATTACH = 1;
+  PROVIDER_MUTATION_KIND_DETACH = 2;
+  PROVIDER_MUTATION_KIND_UPDATE = 3;
+  // Reconstructed status for existing desired state without a mutation receipt.
+  PROVIDER_MUTATION_KIND_OBSERVE = 4;
+}
+
+// Readiness states describe persisted intent separately from installed state.
+enum ProviderReadinessState {
+  PROVIDER_READINESS_STATE_UNSPECIFIED = 0;
+  PROVIDER_READINESS_STATE_PERSISTED = 1;
+  PROVIDER_READINESS_STATE_PENDING = 2;
+  PROVIDER_READINESS_STATE_READY = 3;
+  PROVIDER_READINESS_STATE_WITHHELD = 4;
+  PROVIDER_READINESS_STATE_REVOKED = 5;
+  PROVIDER_READINESS_STATE_FAILED = 6;
+  PROVIDER_READINESS_STATE_SUPERSEDED = 7;
+}
+
+// Closed reason categories are safe to display. Raw installation errors are
+// never part of the readiness protocol.
+enum ProviderReadinessReason {
+  PROVIDER_READINESS_REASON_UNSPECIFIED = 0;
+  PROVIDER_READINESS_REASON_WAITING_FOR_SUPERVISOR = 1;
+  PROVIDER_READINESS_REASON_WAITING_FOR_CREDENTIALS = 2;
+  PROVIDER_READINESS_REASON_WAITING_FOR_POLICY = 3;
+  PROVIDER_READINESS_REASON_WAITING_FOR_PROCESS = 4;
+  PROVIDER_READINESS_REASON_UNSUPPORTED_SUPERVISOR = 5;
+  PROVIDER_READINESS_REASON_CREDENTIALS_WITHHELD = 6;
+  PROVIDER_READINESS_REASON_CREDENTIAL_INSTALL_FAILED = 7;
+  PROVIDER_READINESS_REASON_POLICY_ACTIVATION_FAILED = 8;
+  PROVIDER_READINESS_REASON_PROCESS_INSTALL_FAILED = 9;
+  PROVIDER_READINESS_REASON_SUPERVISOR_DISCONNECTED = 10;
+  PROVIDER_READINESS_REASON_SUPERVISOR_LEASE_EXPIRED = 11;
+  PROVIDER_READINESS_REASON_DESIRED_STATE_CHANGED = 12;
+  PROVIDER_READINESS_REASON_CREDENTIAL_EXPIRED = 13;
+  PROVIDER_READINESS_REASON_LOCAL_POLICY = 14;
+  PROVIDER_READINESS_REASON_SNAPSHOT_MISMATCH = 15;
+}
+
+// Exact desired authority. Revisions are opaque identities, never ordered.
+message ProviderDesiredIdentity {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+  string attachment_epoch = 3;
+  // Empty for a detached provider.
+  string provider_id = 4;
+  uint64 provider_resource_version = 5;
+  uint64 provider_env_revision = 6;
+  uint64 config_revision = 7;
+  string policy_hash = 8;
+}
+
+// Component whose desired state is tracked by a durable update operation.
+enum ConfigComponent {
+  CONFIG_COMPONENT_UNSPECIFIED = 0;
+  CONFIG_COMPONENT_SANDBOX_CONFIG = 1;
+  CONFIG_COMPONENT_PROVIDER_ENVIRONMENT = 2;
+}
+
+// Identifies one component snapshot revision. Revisions are equality tokens,
+// not members of one shared ordering domain.
+message ConfigSnapshotRevision {
+  oneof component {
+    SandboxConfigRevision sandbox_config = 1;
+    uint64 provider_environment = 2;
+    // Complete desired authority for one sandbox-scoped provider mutation.
+    ProviderDesiredIdentity provider_target = 3;
+  }
+}
+
+// Identity needed to correlate effective sandbox configuration with the
+// policy-history row whose apply status the gateway records.
+message SandboxConfigRevision {
+  uint64 config_revision = 1;
+  uint32 policy_version = 2;
+  openshell.sandbox.v1.PolicySource policy_source = 3;
+  uint32 global_policy_version = 4;
+  // Monotonic revision of the sandbox-scoped settings row. This disambiguates
+  // setting operations whose effective config fingerprint is equality-only.
+  uint64 settings_revision = 5;
+}
+
+// Result of applying a component revision at its owning runtime boundary.
+enum ConfigApplyOutcome {
+  CONFIG_APPLY_OUTCOME_UNSPECIFIED = 0;
+  CONFIG_APPLY_OUTCOME_APPLIED = 1;
+  CONFIG_APPLY_OUTCOME_IGNORED_DUPLICATE = 2;
+  CONFIG_APPLY_OUTCOME_IGNORED_STALE = 3;
+  CONFIG_APPLY_OUTCOME_RETAINED_LOCAL_OVERRIDE = 4;
+  CONFIG_APPLY_OUTCOME_DEGRADED = 5;
+  CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD = 6;
+  CONFIG_APPLY_OUTCOME_FAILED_CLOSED = 7;
+  CONFIG_APPLY_OUTCOME_UNSUPPORTED = 8;
+}
+
+// Durable lifecycle of one desired-state update operation.
+enum ConfigUpdateOperationState {
+  CONFIG_UPDATE_OPERATION_STATE_UNSPECIFIED = 0;
+  CONFIG_UPDATE_OPERATION_STATE_PENDING = 1;
+  CONFIG_UPDATE_OPERATION_STATE_APPLIED = 2;
+  CONFIG_UPDATE_OPERATION_STATE_INACTIVE = 3;
+  CONFIG_UPDATE_OPERATION_STATE_FAILED = 4;
+  CONFIG_UPDATE_OPERATION_STATE_SUPERSEDED = 5;
+  CONFIG_UPDATE_OPERATION_STATE_CANCELLED = 6;
+}
+
+// Durable progress for one sandbox-scoped desired-state mutation. Snapshot
+// contents and credentials are never stored in this resource.
+message ConfigUpdateOperation {
+  string operation_id = 1;
+  string sandbox_id = 2;
+  ConfigComponent component = 3;
+  ConfigSnapshotRevision target_revision = 4;
+  ConfigUpdateOperationState state = 5;
+  ConfigApplyOutcome outcome = 6;
+  string sanitized_error = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+  int64 completed_at_ms = 10;
+}
+
+// Immutable, secret-free record of one sandbox's intended provider mutation.
+message ProviderMutationReceipt {
+  string receipt_id = 1;
+  // Shared by all sandbox receipts from one provider update.
+  string mutation_id = 2;
+  string provider_name = 3;
+  string workspace = 4;
+  ProviderMutationKind kind = 5;
+  ProviderDesiredIdentity desired = 6;
+  int64 persisted_at_ms = 7;
+}
+
+// Installed state reported by the current supervisor. Process installation is
+// acknowledged by the authenticated sandbox boundary after replacing its
+// environment for future process launches.
+message ProviderReadinessObservation {
+  // Gateway-issued identifier from the current ConnectSupervisor response.
+  string session_id = 1;
+  // Monotonic only within this connection; unrelated to revision fingerprints.
+  uint64 sequence = 2;
+  string attachment_epoch = 3;
+  uint64 provider_env_revision = 4;
+  uint64 config_revision = 5;
+  string policy_hash = 6;
+  bool credentials_installed = 7;
+  bool policy_active = 8;
+  bool launch_environment_installed = 9;
+  string process_instance_id = 10;
+  ProviderReadinessReason reason = 11;
+}
+
+// Operator view of desired and observed state; contains no credential material.
+message ProviderReadinessStatus {
+  ProviderMutationReceipt receipt = 1;
+  ProviderReadinessState state = 2;
+  ProviderReadinessReason reason = 3;
+  ProviderReadinessObservation observed = 4;
+  string network_instance_id = 5;
+  int64 observed_at_ms = 6;
+  int64 evaluated_at_ms = 7;
+  // Durable operation for the receipt, including its terminal apply outcome.
+  ConfigUpdateOperation operation = 8;
+}
+
+// Query an immutable receipt, or reconstruct the current desired state when
+// receipt_id is empty. The sandbox identity must match the receipt.
+message GetSandboxProviderStatusRequest {
+  string sandbox_name = 1;
+  string provider_name = 2;
+  string receipt_id = 3;
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
+}
+
+message GetSandboxProviderStatusResponse {
+  ProviderReadinessStatus status = 1;
+}
+
+// Installation evidence from the authenticated supervisor for this sandbox.
+// A caller-provided instance identifier alone never establishes authority.
+message ReportProviderReadinessRequest {
+  string sandbox_id = 1;
+  ProviderReadinessObservation observation = 2;
+}
+
+// Acknowledges accepted evidence without granting a separate session authority.
+// Identical retries do not extend the evidence's original acceptance time.
+message ReportProviderReadinessResponse {
+  uint64 accepted_sequence = 1;
+  uint32 report_interval_seconds = 2;
+  uint32 observation_ttl_seconds = 3;
 }
 
 // Delete sandbox response.
@@ -1765,6 +1988,11 @@ message DeleteProviderRequest {
 // Provider response.
 message ProviderResponse {
   openshell.datamodel.v1.Provider provider = 1;
+  // Selection-time sandbox target set for an update, with one receipt per target.
+  // Sandboxes attached later are outside this operation's readiness result.
+  repeated ProviderMutationReceipt target_receipts = 2;
+  // Identifies the update even when its target set is empty.
+  string mutation_id = 3;
 }
 
 // List providers response.
@@ -2198,6 +2426,12 @@ message GetSandboxProviderEnvironmentResponse {
   // Environment variables that contain provider configuration rather than
   // credentials and therefore do not require endpoint-scoped resolution.
   repeated string non_secret_environment_keys = 6;
+  // Attachment identity captured with the returned provider records.
+  string provider_attachment_epoch = 7;
+  // Effective policy identity used to derive this snapshot's endpoint bindings.
+  string policy_hash = 8;
+  // Nonzero when material was withheld; installing an empty map is not readiness.
+  ProviderReadinessReason readiness_reason = 9;
 }
 
 message ExchangeProviderSubjectTokenRequest {
@@ -2505,6 +2739,8 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // The supervisor can report credential, policy, and launch-environment installation.
+  bool supports_provider_readiness = 4;
 }
 
 // Gateway accepts the supervisor session.

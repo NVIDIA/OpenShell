@@ -37,6 +37,7 @@ pub mod edge_tunnel;
 pub mod error;
 pub mod oidc;
 pub mod pagination;
+pub mod provider_readiness;
 pub mod raw;
 pub mod refresh;
 pub mod transport;

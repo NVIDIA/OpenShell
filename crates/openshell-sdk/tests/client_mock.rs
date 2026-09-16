@@ -693,6 +693,24 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
+        ))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _: tonic::Request<proto::GetSandboxProviderEnvironmentRequest>,

@@ -14,14 +14,16 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
-    SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
+    ReportMainProcessExitRequest, ReportMainProcessExitResponse, Sandbox, SandboxPhase,
+    SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message, relay_open,
+    supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
@@ -71,6 +73,9 @@ struct LiveSession {
     /// gateway restart invalidates every session and startup reconciliation
     /// resets any persisted endpoint result before requests are served.
     endpoint_report_cursor: Option<EndpointReportCursor>,
+    /// Installation evidence belongs to this connection and is never restored
+    /// from persistence or inherited by a replacement supervisor session.
+    provider_readiness: Option<ProviderReadinessEvidence>,
     #[allow(dead_code)]
     connected_at: Instant,
 }
@@ -155,6 +160,7 @@ impl SupervisorSessionRegistry {
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
+                provider_readiness: None,
                 connected_at: Instant::now(),
             },
         );
@@ -265,6 +271,79 @@ impl SupervisorSessionRegistry {
             .unwrap()
             .get(sandbox_id)
             .is_some_and(|session| session.session_id == session_id)
+    }
+
+    /// Bind the authenticated hello's installation capability to its session.
+    /// Initialization is single-use and cannot erase accepted observations.
+    pub(crate) fn initialize_provider_readiness(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        evidence: ProviderReadinessEvidence,
+    ) -> Result<(), Status> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("supervisor session state is unavailable"))?;
+        let session = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+            .ok_or_else(|| Status::failed_precondition("supervisor session was replaced"))?;
+        if session.provider_readiness.is_some() {
+            return Err(Status::failed_precondition(
+                "provider readiness is already initialized",
+            ));
+        }
+        session.provider_readiness = Some(evidence);
+        Ok(())
+    }
+
+    /// Accept installation evidence only while its session owns this sandbox.
+    /// Session comparison and publication share one lock so reconnects cannot
+    /// transfer a predecessor's evidence into the replacement session.
+    pub(crate) fn accept_provider_readiness(
+        &self,
+        sandbox_id: &str,
+        active_instance_id: &str,
+        observation: ProviderReadinessObservation,
+    ) -> Result<(), Status> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("supervisor session state is unavailable"))?;
+        let evidence = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| {
+                session.session_id == observation.session_id && session.endpoint_status_initialized
+            })
+            .and_then(|session| session.provider_readiness.as_mut())
+            .ok_or_else(|| {
+                Status::permission_denied(
+                    "provider readiness requires the active supervisor session",
+                )
+            })?;
+        if !evidence.belongs_to_instance(active_instance_id) {
+            return Err(Status::failed_precondition(
+                "provider readiness requires the current sandbox instance",
+            ));
+        }
+        evidence.accept(observation)
+    }
+
+    /// Snapshot installation evidence from the current initialized session.
+    /// Disconnect and replacement discard the previous connection's state.
+    pub(crate) fn provider_readiness(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<ProviderReadinessEvidence>, Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("supervisor session state is unavailable"))?;
+        Ok(sessions
+            .get(sandbox_id)
+            .filter(|session| session.endpoint_status_initialized)
+            .and_then(|session| session.provider_readiness.clone()))
     }
 
     /// Mark the current session as the observation authority after its
@@ -870,6 +949,9 @@ pub async fn handle_connect_supervisor(
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    // Validate readiness identities before replacing a healthy session. Older
+    // supervisors remain usable but cannot assert provider installation.
+    let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -918,6 +1000,16 @@ pub async fn handle_connect_supervisor(
         return Err(Status::failed_precondition(
             "supervisor session was replaced during endpoint status initialization",
         ));
+    }
+    if let Err(error) = state.supervisor_sessions.initialize_provider_readiness(
+        &sandbox_id,
+        &session_id,
+        provider_readiness,
+    ) {
+        state
+            .supervisor_sessions
+            .remove_if_current(&sandbox_id, &session_id);
+        return Err(error);
     }
 
     // Step 3: Send SessionAccepted.

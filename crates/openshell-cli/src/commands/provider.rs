@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::provider_readiness::{
+    ProviderMutationExpectation, ProviderWaitOptions, finish_provider_mutation,
+};
 use crate::color::Colorize;
 use crate::commands::common::{
     format_epoch_ms, format_optional_epoch_ms, parse_credential_expiry_pairs,
@@ -19,9 +22,9 @@ use openshell_core::proto::{
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RotateProviderCredentialRequest, UpdateProviderProfilesRequest,
-    UpdateProviderRequest,
+    ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
@@ -78,13 +81,16 @@ pub async fn sandbox_provider_list(
     Ok(())
 }
 
+/// Save a provider attachment and optionally wait for its installed authority.
 pub async fn sandbox_provider_attach(
     server: &str,
     name: &str,
     provider: &str,
     workspace: &str,
     tls: &TlsOptions,
+    readiness: ProviderWaitOptions<'_>,
 ) -> Result<()> {
+    readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
     // Fetch current sandbox to get resource_version for CAS
@@ -94,7 +100,7 @@ pub async fn sandbox_provider_attach(
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -115,32 +121,43 @@ pub async fn sandbox_provider_attach(
             return Err(miette::miette!(
                 "Failed to attach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
+            ));
         }
-        Err(e) => return Err(e).into_diagnostic(),
+        Err(error) => return Err(miette!("provider attachment failed ({})", error.code())),
     };
 
-    if response.attached {
-        println!(
-            "{} Attached provider {} to sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} is already attached to sandbox {name}.");
-    }
-    Ok(())
+    let receipt = response.receipt.ok_or_else(|| {
+        miette!(
+            "gateway did not return a provider receipt; saved attachment cannot establish readiness"
+        )
+    })?;
+    let mutation_id = receipt.mutation_id.clone();
+    finish_provider_mutation(
+        &client,
+        &mutation_id,
+        vec![receipt],
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: provider,
+            kind: ProviderMutationKind::Attach,
+            sandbox: Some((name, sandbox.object_id())),
+            provider: None,
+        },
+        readiness,
+    )
+    .await
 }
 
+/// Save a provider detachment and optionally wait for future authority revocation.
 pub async fn sandbox_provider_detach(
     server: &str,
     name: &str,
     provider: &str,
     workspace: &str,
     tls: &TlsOptions,
+    readiness: ProviderWaitOptions<'_>,
 ) -> Result<()> {
+    readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
     // Fetch current sandbox to get resource_version for CAS
@@ -150,7 +167,7 @@ pub async fn sandbox_provider_detach(
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -171,23 +188,27 @@ pub async fn sandbox_provider_detach(
             return Err(miette::miette!(
                 "Failed to detach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
+            ));
         }
-        Err(e) => return Err(e).into_diagnostic(),
+        Err(error) => return Err(miette!("provider detachment failed ({})", error.code())),
     };
 
-    if response.detached {
-        println!(
-            "{} Detached provider {} from sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} was not attached to sandbox {name}.");
-    }
-    Ok(())
+    let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
+    let mutation_id = receipt.mutation_id.clone();
+    finish_provider_mutation(
+        &client,
+        &mutation_id,
+        vec![receipt],
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: provider,
+            kind: ProviderMutationKind::Detach,
+            sandbox: Some((name, sandbox.object_id())),
+            provider: None,
+        },
+        readiness,
+    )
+    .await
 }
 
 fn print_provider_attachment_table(providers: &[Provider]) {
@@ -722,11 +743,16 @@ async fn fetch_provider_profile(
                             "provider profile '{requested}' not found; import a matching profile before using this provider type"
                         )
                     } else {
-                        miette::miette!(fallback_status.to_string())
+                        miette!("provider profile lookup failed ({})", fallback_status.code())
                     }
                 })?
         }
-        Err(status) => return Err(miette::miette!(status.to_string())),
+        Err(status) => {
+            return Err(miette!(
+                "provider profile lookup failed ({})",
+                status.code()
+            ));
+        }
     };
 
     Ok(response)
@@ -2201,6 +2227,7 @@ fn print_provider_type_row(
     );
 }
 
+/// Credential update inputs and observation choices for all attached sandboxes.
 pub struct ProviderUpdateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
@@ -2211,8 +2238,11 @@ pub struct ProviderUpdateOptions<'a> {
     pub credential_expires_at: &'a [String],
     pub workspace: &'a str,
     pub tls: &'a TlsOptions,
+    /// Bound observation of the sandbox target set selected by the update.
+    pub readiness: ProviderWaitOptions<'a>,
 }
 
+/// Update provider credentials and report each selected sandbox independently.
 pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let ProviderUpdateOptions {
         server,
@@ -2224,7 +2254,9 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         credential_expires_at,
         workspace,
         tls,
+        readiness,
     } = options;
+    readiness.validate()?;
 
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
@@ -2262,7 +2294,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         {
             None
         }
-        Err(status) => return Err(status).into_diagnostic(),
+        Err(status) => return Err(miette!("provider update lookup failed ({})", status.code())),
     };
 
     if existing.is_none() && (from_existing || from_oidc_token) {
@@ -2338,19 +2370,28 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|error| miette!("provider update failed ({})", error.code()))?;
 
-    let provider = response
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-
-    println!(
-        "{} Updated provider {}",
-        "✓".green().bold(),
-        provider.object_name()
-    );
-    Ok(())
+    let response = response.into_inner();
+    if response.mutation_id.is_empty() {
+        return Err(miette!(
+            "gateway did not return a provider mutation receipt; saved credentials cannot establish readiness"
+        ));
+    }
+    finish_provider_mutation(
+        &client,
+        &response.mutation_id,
+        response.target_receipts,
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: name,
+            kind: ProviderMutationKind::Update,
+            sandbox: None,
+            provider: response.provider.as_ref(),
+        },
+        readiness,
+    )
+    .await
 }
 
 pub async fn provider_delete(

@@ -40,7 +40,7 @@ Provider profiles include these user-facing features:
 - Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
 - Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
-- Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
+- Runtime sandbox provider commands under `openshell sandbox provider list|attach|detach|status`, with an option to wait until the sandbox applies a change.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
@@ -962,29 +962,62 @@ Composition follows these rules:
 
 ## Attach and Detach Providers
 
-Attach an existing provider to a running sandbox:
+Attach an existing provider and wait until the sandbox can use it:
 
 ```shell
-openshell sandbox provider attach provider-demo work-github
+openshell sandbox provider attach provider-demo work-github --wait --timeout 30
 ```
 
-Detach a provider:
+Detach a provider and wait until the sandbox stops resolving its credentials:
 
 ```shell
-openshell sandbox provider detach provider-demo work-github
+openshell sandbox provider detach provider-demo work-github --wait --timeout 30
 ```
 
 Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
 
+### Inspect Provider Readiness
+
+Without `--wait`, attach, detach, and update confirm that the gateway saved the change. Add `--wait` when the next step depends on that change taking effect. The command succeeds after the sandbox applies the matching credentials and policy, and updates the environment used by new processes.
+
+Each result includes a change record called a `receipt` in the API. Its ID lets you check the same change later, including after a timeout:
+
+```shell
+openshell sandbox provider status provider-demo work-github --output json
+openshell sandbox provider status provider-demo work-github --receipt RECEIPT_ID --wait --timeout 30
+```
+
+Replace `RECEIPT_ID` with the `receipt_id` returned by attach, detach, or update. The ID always refers to the original change. If a later change replaces it, the status is `superseded` and the wait ends without reporting success.
+
+Readiness states have these meanings:
+
+- `persisted`: the gateway saved the change; the command has not checked the sandbox yet.
+- `pending`: the sandbox has not confirmed all parts of the change.
+- `ready`: the sandbox applied the requested provider credentials, policy, and environment for new processes.
+- `revoked`: the detached provider's credentials no longer resolve, and new processes do not receive its credential references.
+- `withheld`: a credential or supervisor configuration prevents the sandbox from applying the change.
+- `failed`: the sandbox could not install the credentials, policy, or process environment.
+- `superseded`: a later change replaced the original request.
+
+The default wait is 30 seconds and the maximum is 3600 seconds. The timeout starts after the gateway saves the change and includes time spent requesting status. If time runs out, the command exits with an error and reports `wait_outcome: timed_out` with the last known state. The change remains saved and may finish applying later. Check its ID again to learn the result.
+
+An unavailable supervisor, an expired report, a failed installation, or a missing process-environment acknowledgment cannot produce `ready` or `revoked`. After a reconnect or restart, the current authenticated supervisor must report its installed state again.
+
+JSON and YAML output include change IDs, requested and installed revisions, timestamps, reason categories, and a result for each sandbox. Revision strings identify configurations; compare them for equality rather than numerical order. Status output excludes credential values, credential references, authorization headers, and raw installation errors.
+
+The API's `operation` field records the common operation's historical outcome; its `operation_id` equals the receipt ID. Use the provider `state` and the wait result for current readiness. A disconnected supervisor can make the live state pending even after the operation previously applied, and a newer change can supersede the live result. Historical completion does not override those checks.
+
 ### Runtime Limitations
 
-Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.
+Running sandboxes periodically check for provider and policy changes. Use `--wait` or `sandbox provider status` to confirm when a saved change has taken effect.
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 
-Already-running processes keep the placeholder environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. The proxy resolves existing placeholders against current credentials and bindings, so rotation, expiry, endpoint changes, and detach take effect without restarting the process. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
+Already-running processes keep the placeholder environment they started with. For ordinary static credentials, an existing reference retains its selected revision after a value update; readiness does not retarget that reference to the replacement value. After an update wait succeeds, launch a new process to receive the updated credential reference. Gateway-managed refresh follows its own reference lifecycle. Expiry, endpoint authorization, and acknowledged detach continue to apply when the proxy resolves retained references.
 
-Detaching a provider removes its provider policy layer from future effective policy reads, revokes resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove the placeholder strings from already-running process environments.
+For a static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using its retained revision or that an old upstream key can be retired.
+
+An acknowledged detachment removes its provider policy layer from the active effective policy, revokes future resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove strings from already-running process environments or undo requests already forwarded upstream.
 
 OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
 

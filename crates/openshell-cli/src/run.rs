@@ -32,6 +32,7 @@ pub use crate::commands::provider::{
     provider_refresh_status, provider_rotate, provider_update, sandbox_provider_attach,
     sandbox_provider_detach, sandbox_provider_list,
 };
+pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provider_status};
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;

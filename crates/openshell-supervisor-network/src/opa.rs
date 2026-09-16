@@ -170,7 +170,7 @@ pub(crate) fn test_opa_query_count() -> u64 {
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
@@ -708,7 +708,7 @@ impl OpaEngine {
     /// validation guarantees as initial load. Atomically replaces the inner
     /// engine on success; on failure the previous engine is untouched (LKG).
     pub fn reload_from_proto(&self, proto: &ProtoSandboxPolicy) -> Result<()> {
-        self.reload_from_proto_with_pid(proto, 0)
+        self.reload_from_proto_with_pid(proto, 0).map(|_| ())
     }
 
     /// Reload policy from a proto with symlink resolution.
@@ -716,11 +716,12 @@ impl OpaEngine {
     /// When `entrypoint_pid` is non-zero, binary paths that are symlinks
     /// inside the container filesystem are resolved and added as additional
     /// match entries. See [`from_proto_with_pid`] for details.
+    /// Returns evidence tied to the generation installed by this call.
     pub fn reload_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
-    ) -> Result<()> {
+    ) -> Result<PolicyGenerationGuard> {
         // Build a complete new engine through the same validated pipeline.
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
@@ -736,8 +737,10 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        let generation = self.advance_generation();
+        // Capture evidence while the installation lock still excludes a
+        // competing reload; reading the generation later can bind the wrong policy.
+        self.generation_guard(generation)
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
@@ -746,12 +749,13 @@ impl OpaEngine {
     /// engine and runner are then swapped while holding both locks, followed by
     /// a single generation increment. A preparation or lock failure leaves the
     /// live pair and generation untouched.
+    /// Returns evidence tied to that combined installation.
     pub fn reload_policy_and_middleware_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
-    ) -> Result<()> {
+    ) -> Result<PolicyGenerationGuard> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
             .engine
@@ -774,8 +778,8 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        let generation = self.advance_generation();
+        self.generation_guard(generation)
     }
 
     /// Publish a deny-all quarantine generation without activating any part

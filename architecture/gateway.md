@@ -352,6 +352,8 @@ Public RPC contracts and durable protobuf formats have separate ownership. The `
 
 `ReportEndpointStatus` is a sandbox-authenticated public gateway RPC. Its request, response, and `EndpointObservation` messages belong only to the public closure. `EndpointStatus` and `EndpointResult` also belong to the durable closure because `Sandbox.status.endpoint_statuses` persists them. The repeated status field uses a new wire tag; stored sandboxes without it decode with an empty endpoint list and retain their lifecycle fields. A fixed payload encoded with the earlier sandbox schema verifies that no database rewrite is required.
 
+`GetSandboxProviderStatus` and `ReportProviderReadiness` are unary public gateway RPCs. The first lets authorized users inspect a provider change; the second accepts installation reports only from the sandbox's current authenticated supervisor session.
+
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
@@ -370,8 +372,10 @@ Go, Python, and TypeScript client generation inputs do not advertise them.
 | SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
 | Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
+| Configuration operation storage root | `StoredConfigUpdateOperation` | One common operation resource stores the exact provider target, receipt projection, snapshot failure reason, and historical outcome. |
+| Public dependencies of an operation | `ConfigUpdateOperation`, `ProviderMutationReceipt`, `ProviderReadinessReason` | Their complete message and enum closures are durable contracts. |
 
-The descriptor-derived test inventories the complete message and enum closure of the encoded durable roots and its intersection with the public RPC closure. The tables here record the reviewed roots and classifications.
+The descriptor-derived test owns the complete public, durable, and intersecting inventories and their reviewed fingerprints. The tables here record their roots and classifications. A synthetic sandbox-spec byte fixture verifies that an absent server-owned attachment epoch decodes to the valid empty initial identity; direct and template creation tests separately require the gateway to replace any caller-supplied epoch.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
@@ -383,6 +387,9 @@ The descriptor-derived test inventories the complete message and enum closure of
 | `SshSession` | Defer a storage twin; govern its complete dependency closure as durable. |
 | `ServiceEndpoint` | Defer a storage twin; govern its complete dependency closure as durable. |
 | `SandboxPolicy` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `ConfigUpdateOperation` | Persist the common historical outcome within `StoredConfigUpdateOperation`; govern its complete dependency closure as durable. |
+| `ProviderMutationReceipt` | Persist the immutable provider projection within `StoredConfigUpdateOperation`; govern its complete dependency closure as durable. |
+| `ProviderReadinessReason` | Persist only the closed snapshot failure category within the operation; govern its enum values as durable. |
 
 The public/storage overlap is deliberate for the current format. Storage twins
 for the public roots are deferred: introducing them would require a broad
@@ -661,6 +668,22 @@ binding metadata. It continues to return provider-generated non-secret
 configuration, valid endpoint-bound static credentials from other attached
 providers, and the dynamic credential snapshot. Provider environment revisions
 include profile endpoint and binding changes.
+
+The supervisor owns provider fetching, support negotiation, and credential resolution outside the workload. The authenticated sandbox boundary receives a revision and its prepared child environment from one snapshot; it preserves the issued placeholders without receiving the secret resolver or turning those placeholders into new references.
+
+Provider mutations return immutable per-sandbox receipts that separate saved desired state from observed runtime installation. A receipt pins sandbox and provider identity, the attachment epoch, and the exact provider/configuration/policy fingerprints. Attachment-set changes replace the epoch in the same sandbox CAS write; credential updates stage distinct backend objects before publishing their handles and provider revision. This prevents a published revision from referring to an unfinished in-place credential write. Update receipts retain the sandbox target set selected before publication.
+
+Each receipt projects a common configuration operation in the `config_update_operation` store; its receipt ID is the operation ID. The provider status path evaluates current installation evidence and records historical terminal outcomes through resource-version CAS. A previously applied operation does not bypass current session, freshness, or authority checks. The live provider projection can be pending after disconnection or superseded after another change even when historical operation state remains applied. Pending operations are evaluated through provider status queries; this path adds no background delivery engine or mutation replay contract.
+
+Provider mutation and operation-result writes are separate. A result-storage failure can follow a saved mutation and returns structured uncertainty without a rollback or safe-retry claim. A failed initial snapshot remains failed rather than acquiring a different target during a later lookup. Operations contain only identities, revisions, timestamps, and closed reason categories.
+
+Provider installation reports belong to the existing `ConnectSupervisor` session. Each report names that session, has an increasing sequence, and expires unless the supervisor reports again. Reconnection or disconnect invalidates prior observations; stored change records survive a gateway restart, but runtime evidence does not. Replaying an identical report cannot extend its lifetime.
+
+Reports and status also compare the supervisor instance with the sandbox's persisted current instance. A different supervisor becoming current invalidates an older connection, including one retained by another gateway replica. Observations stay local to the gateway holding the supervisor session; a status request reaching a replica without that session returns pending. Multi-replica deployments therefore retain the existing supervisor-session routing requirement.
+
+The supervisor reports success only after it installs the matching credentials, activates the effective policy, and receives an acknowledgment from the authenticated workload boundary that it installed the environment for future processes. Environment synchronization shares the process-launch lock, and its acknowledgment identifies the exact publication, including retries at the same provider revision. Failed policy installation cannot reuse evidence for a different installed policy. Ready and revoked statuses also recheck the requested sandbox, provider, attachment and configuration identities; revision fingerprints are compared only for equality. Revocation applies to future credential resolution and future processes. Requests already forwarded upstream can still finish.
+
+Ordinary static credentials retain revision-scoped references. After update readiness, a newly launched process receives the updated reference; an existing process keeps its original revision. Installation completion does not retarget that reference or establish that an old upstream key can be retired.
 
 ## Provider Environment Resolution
 

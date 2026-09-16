@@ -7990,6 +7990,7 @@ network_policies:
             },
         );
         let snapshot = ProviderCredentialSnapshot {
+            installation_id: String::new(),
             revision: 42,
             child_env: std::collections::HashMap::new(),
             dynamic_credentials,
