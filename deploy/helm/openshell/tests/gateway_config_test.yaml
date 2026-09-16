@@ -217,24 +217,60 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"always".*?supervisor_image_pull_policy\s*=\s*"if_not_present"'
 
-  - it: renders driver-owned Kubernetes settings only in its driver table
+  - it: derives the Kubernetes host gateway IP from the pod host alias owner
     template: templates/gateway-config.yaml
     set:
+      server.hostGatewayIP: 10.23.45.67
       gatewayConfig:
         openshell.drivers.kubernetes:
-          host_gateway_ip: 10.0.0.1
+          host_gateway_ip: 192.0.2.1
           enable_user_namespaces: true
           supervisor_image: ghcr.io/nvidia/openshell/supervisor:test
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=.*?default_image\s*=.*?enable_user_namespaces\s*=\s*true.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?namespace\s*=\s*"my-namespace".*?sa_token_ttl_secs\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?supervisor_image\s*='
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=.*?default_image\s*=.*?enable_user_namespaces\s*=\s*true.*?host_gateway_ip\s*=\s*"10\.23\.45\.67".*?namespace\s*=\s*"my-namespace".*?sa_token_ttl_secs\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?supervisor_image\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'host_gateway_ip\s*=\s*"192\.0\.2\.1"'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'guest_tls_(ca|cert|key)\s*='
+
+  - it: derives TLS runtime fields from chart-owned TLS resources
+    template: templates/gateway-config.yaml
+    set:
+      server.disableTls: false
+      server.tls.clientTlsSecretName: chart-client-tls
+      gatewayConfig:
+        openshell.gateway:
+          disable_tls: true
+        openshell.drivers.kubernetes:
+          client_tls_secret_name: conflicting-client-tls
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?disable_tls\s*=\s*false'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=\s*"chart-client-tls"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'conflicting-client-tls'
+
+  - it: restores chart-owned TLS runtime paths when gatewayConfig omits the TLS table
+    template: templates/gateway-config.yaml
+    set:
+      server.disableTls: false
+      gatewayConfig:
+        openshell.gateway.tls: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.tls\].*?cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt".*?key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
 
   - it: renders user namespace enablement under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml

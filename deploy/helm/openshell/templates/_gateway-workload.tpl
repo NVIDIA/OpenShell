@@ -33,9 +33,9 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   serviceAccountName: {{ include "openshell.serviceAccountName" . }}
-  {{- if get $kubernetesRuntimeConfig "host_gateway_ip" }}
+  {{- if .Values.server.hostGatewayIP }}
   hostAliases:
-    - ip: {{ get $kubernetesRuntimeConfig "host_gateway_ip" | quote }}
+    - ip: {{ .Values.server.hostGatewayIP | quote }}
       hostnames:
         - host.docker.internal
         - host.openshell.internal
