@@ -141,7 +141,7 @@ impl RootfsTarStagingRegistry {
     }
 
     /// Registry for a driver that does not accept rootfs tar sources.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn disabled() -> Self {
         Self::new(None, 0)
     }

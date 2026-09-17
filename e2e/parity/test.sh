@@ -97,6 +97,7 @@ for variable in \
   CONTAINER_HOST CONTAINER_CONNECTION CONTAINERS_STORAGE_CONF CONTAINERS_CONF \
   CONTAINERS_REGISTRIES_CONF CONTAINERS_REGISTRIES_CONF_DIR CONTAINERS_POLICY \
   PODMAN_CONNECTIONS_CONF DOCKER_HOST OPENSHELL_SANDBOX_IMAGE \
+  OPENSHELL_SANDBOX_RUNTIME_IMAGE \
   OPENSHELL_GRPC_ENDPOINT OPENSHELL_PODMAN_HOST_GATEWAY_IP OPENSHELL_PODMAN_USERNS \
   OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET \
   OPENSHELL_APP_ARMOR_PROFILE OPENSHELL_SANDBOX_HTTPS_PROXY OPENSHELL_SANDBOX_NO_PROXY \
@@ -127,7 +128,7 @@ external = os.environ.get("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER") == "1"
 zero = "0" * 64
 image_digest = f"sha256:{zero}"
 sandbox_runtime = f"ghcr.io/nvidia/openshell-community/sandboxes/base@{image_digest}"
-sandbox_boundary = f"localhost/openshell/sandbox@{image_digest}"
+sandbox_boundary = "localhost/openshell/sandbox:dev"
 supervisor_runtime = f"localhost/openshell/supervisor@{image_digest}"
 base_runtime = f"docker.io/library/debian@{image_digest}"
 pull_policy = "missing" if schema == 1 else "if_not_present"
@@ -222,12 +223,12 @@ if external:
                 "OPENSHELL_PODMAN_SOCKET": podman_socket,
                 "OPENSHELL_SANDBOX_IMAGE": sandbox_runtime,
                 "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY": pull_policy,
+                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": sandbox_boundary,
                 "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS": 10,
                 "OPENSHELL_GRPC_ENDPOINT": callback,
                 "OPENSHELL_GATEWAY_PORT": gateway_port,
                 "OPENSHELL_NETWORK_NAME": network,
                 "OPENSHELL_STOP_TIMEOUT": 15,
-                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": sandbox_boundary,
                 "OPENSHELL_SUPERVISOR_IMAGE": supervisor_runtime,
                 "OPENSHELL_PODMAN_TLS_CA": {
                     "path": f"/tmp/{variant}-pki/ca.crt",
@@ -372,6 +373,7 @@ CONTAINERS_POLICY=/tmp/untrusted-policy.json \
 PODMAN_CONNECTIONS_CONF=/tmp/untrusted-connections.json \
 DOCKER_HOST=tcp://untrusted.invalid:2375 \
 OPENSHELL_SANDBOX_IMAGE=untrusted.invalid/sandbox:latest \
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=untrusted.invalid/runtime:latest \
 OPENSHELL_GRPC_ENDPOINT=http://untrusted.invalid:1 \
 OPENSHELL_PODMAN_HOST_GATEWAY_IP=192.0.2.1 \
 OPENSHELL_PODMAN_USERNS=keep-id \
