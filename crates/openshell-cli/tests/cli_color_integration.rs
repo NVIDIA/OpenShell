@@ -24,7 +24,7 @@ const PORT: u16 = 8443;
 /// The PID is one that cannot be running, so the row reports `dead`. Status text
 /// is irrelevant here — both states go through the same styling path.
 fn config_dir_with_forward(root: &Path) {
-    let forwards = root.join("openshell").join("forwards");
+    let forwards = root.join("openshell").join("forwards").join("default");
     std::fs::create_dir_all(&forwards).expect("create forwards dir");
     std::fs::write(
         forwards.join(format!("{SANDBOX}-{PORT}.pid")),
@@ -423,7 +423,7 @@ fn status_column_is_matchable_by_a_whitespace_anchored_pattern() {
     let stdout = forward_list(tmpdir.path(), &[], None);
     let row = stdout
         .lines()
-        .find(|line| line.starts_with(SANDBOX))
+        .find(|line| line.split_whitespace().nth(1) == Some(SANDBOX))
         .unwrap_or_else(|| panic!("no row for {SANDBOX} in: {stdout:?}"));
 
     let status = row
