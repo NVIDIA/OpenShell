@@ -184,11 +184,6 @@ if ! grep -Fq 'no unexpired prerelease artifacts found' "$err"; then
   exit 1
 fi
 
-if [ "$(OPENSHELL_VERSION=pre-0.1.0 resolve_release_tag)" != "v0.1.0-pre.9" ]; then
-  echo "FAIL: explicit prerelease train did not resolve its latest candidate" >&2
-  exit 1
-fi
-
 RELEASE_TAG=v0.1.0-pre.9
 prerelease_tmp="${tmpdir}/prerelease"
 prepare_prerelease_assets "$prerelease_tmp"

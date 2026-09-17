@@ -55,8 +55,7 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
                         Set OPENSHELL_VERSION=dev to install the rolling dev build.
-                        Set OPENSHELL_VERSION=pre to install the newest active
-                        prerelease, or pre-X.Y.Z to select a release train.
+                        Set OPENSHELL_VERSION=pre to install the latest prerelease.
                         Prereleases require an authenticated GitHub CLI session.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
@@ -340,11 +339,6 @@ resolve_release_tag() {
     return 0
   fi
 
-  if printf '%s\n' "${OPENSHELL_VERSION:-}" | grep -Eq '^pre-[0-9]+\.[0-9]+\.[0-9]+$'; then
-    resolve_latest_prerelease_tag "${OPENSHELL_VERSION#pre-}"
-    return 0
-  fi
-
   if [ -n "${OPENSHELL_VERSION:-}" ]; then
     echo "$OPENSHELL_VERSION"
     return 0
@@ -373,7 +367,6 @@ resolve_release_tag() {
 }
 
 resolve_latest_prerelease_tag() {
-  _train="${1:-}"
   require_prerelease_github_access
 
   info "resolving latest prerelease..."
@@ -385,12 +378,11 @@ resolve_latest_prerelease_tag() {
   }
   _release_tags="$(printf '%s\n' "$_artifact_names" | sed -n "s/^openshell-\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-pre\.[1-9][0-9]*\)-${_artifact_platform}$/\1/p" | sort -u)"
 
-  _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk -v train="$_train" '
+  _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk '
     /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
       tag = $0
       sub(/^v/, "", tag)
       split(tag, version_parts, "-pre\\.")
-      if (train != "" && version_parts[1] != train) next
       split(version_parts[1], core, "\\.")
       sequence = version_parts[2] + 0
 
@@ -412,9 +404,6 @@ resolve_latest_prerelease_tag() {
   ')"
 
   if [ -z "$_latest_prerelease" ]; then
-    if [ -n "$_train" ]; then
-      error "no unexpired prerelease artifacts found for ${_train}"
-    fi
     error "no unexpired prerelease artifacts found"
   fi
 

@@ -294,19 +294,12 @@ Agent implementation is human-directed: a user may request a phase directly, or 
 
 Use a prerelease candidate to evaluate an upcoming release, or use the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
 
-Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest candidate with unexpired artifacts:
+Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
 
 ```shell
 gh auth login
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
   OPENSHELL_VERSION=pre sh
-```
-
-Select the latest candidate from a specific release train when more than one is active:
-
-```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
-  OPENSHELL_VERSION=pre-0.1.0 sh
 ```
 
 The installer downloads only the artifact for the current platform, and rejects expired candidates during discovery. Post-publication canaries exercise the Debian, RPM, Homebrew, Snap, and Helm installation paths. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.

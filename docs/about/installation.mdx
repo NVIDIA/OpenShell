@@ -22,7 +22,7 @@ You can also download release artifacts directly from the [OpenShell GitHub Rele
 
 ### Install a prerelease
 
-Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest candidate with unexpired artifacts:
+Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
 
 ```shell
 gh auth login
@@ -30,7 +30,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
   OPENSHELL_VERSION=pre sh
 ```
 
-To select the latest candidate from a specific release train, set `OPENSHELL_VERSION` to a selector such as `pre-0.1.0`. The installer rejects expired candidates, downloads only the artifact required for your platform, and installs with Debian, RPM, or Homebrew. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.
+The installer rejects expired candidates, downloads only the artifact required for your platform, and installs with Debian, RPM, or Homebrew. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.
 
 The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with:
 
