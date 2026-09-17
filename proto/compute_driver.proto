@@ -399,6 +399,12 @@ message StartSandboxRequest {
   // Stable identity of this gateway start transition. Retries of the same
   // transition carry the same generation ID; a later start uses a new ID.
   string generation_id = 4;
+  // Durable provisioning snapshot recovered by the gateway from its persisted
+  // Sandbox record. Local drivers use this only to reconcile a stopped
+  // workload/supervisor pair without trusting mutable runtime inspection
+  // output. Older gateways omit the field, preserving the original start
+  // contract on the wire.
+  optional DriverSandbox sandbox = 5;
 }
 
 message StartSandboxResponse {}

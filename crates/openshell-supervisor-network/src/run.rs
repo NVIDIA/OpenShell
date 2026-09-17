@@ -31,8 +31,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
-    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
-    write_ca_files,
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config_with_additional,
+    read_and_verify_additional_ca_bundle, read_system_ca_bundle,
+    validate_network_additional_ca_args, write_ca_files,
 };
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
@@ -203,7 +204,22 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    network_additional_ca_bundle: Option<&std::path::Path>,
+    network_additional_ca_digest: Option<&str>,
 ) -> Result<Networking> {
+    // This must be the first networking action. The driver supplies only a
+    // protected path/digest pair, so authenticate and retain the canonical
+    // destination roots before DNS, listeners, mediation, or interception CA
+    // setup can begin. Nothing below re-opens the mutable mounted artifact.
+    validate_network_additional_ca_args(
+        network_additional_ca_bundle,
+        network_additional_ca_digest,
+    )?;
+    let additional_ca_bundle = network_additional_ca_bundle
+        .zip(network_additional_ca_digest)
+        .map(|(path, digest)| read_and_verify_additional_ca_bundle(path, digest))
+        .transpose()?;
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -378,7 +394,10 @@ pub async fn run_networking(
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
+                        let upstream_config = build_upstream_client_config_with_additional(
+                            &system_ca_bundle,
+                            additional_ca_bundle.as_deref(),
+                        )?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(

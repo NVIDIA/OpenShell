@@ -133,6 +133,37 @@ tests:
       - hasDocuments:
           count: 1
 
+  - it: grants only ConfigMap get/create when shared workspace resources are external
+    template: templates/role.yaml
+    set:
+      supervisor.network.additionalCaConfigMapName: private-destination-ca
+      workspaceResources.enabled: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "create"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+          any: true
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+          any: true
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+          any: true
+
   - it: grants only cluster-wide ConfigMap get and create in managed mode
     template: templates/clusterrole.yaml
     set:
