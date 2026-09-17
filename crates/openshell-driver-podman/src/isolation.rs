@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{OuterFenceGuarantees, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -36,14 +38,28 @@ struct PodmanOuterFenceEvidence<'a> {
 
 impl PodmanOuterFenceEvidence<'_> {
     fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, ComputeDriverError> {
-        if self.container_id.is_empty()
-            || self.network_mode != "none"
-            || !self.unexpected_networks.is_empty()
-        {
+        if self.container_id.is_empty() {
             return Err(invalid("Podman outer fence evidence is incomplete"));
         }
+        let mut established = Vec::new();
+        if self.network_mode == "none" {
+            // With no container network namespace attachment, workload egress
+            // remains denied both after revocation and if the supervisor exits.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.unexpected_networks.is_empty() {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
         let encoded = serde_json::to_vec(self).map_err(invalid)?;
-        OuterFenceGuarantees::confirmed(generation, &encoded).map_err(invalid)
+        let projection =
+            OuterFenceGuarantees::from_driver_evidence(generation, established, &encoded)
+                .map_err(invalid)?;
+        projection.validate(generation).map_err(invalid)?;
+        Ok(projection)
     }
 }
 
@@ -348,6 +364,30 @@ mod tests {
         CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
         SupervisorAuthBundle,
     };
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["podman".to_string()];
+        for evidence in [
+            PodmanOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
 
     fn authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {

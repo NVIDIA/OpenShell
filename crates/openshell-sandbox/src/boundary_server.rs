@@ -59,7 +59,7 @@ mod linux {
     use openshell_sandbox_backend::boundary_protocol::{
         AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
-        ExitStatusWire, MediationTimingWire, OpenShellSandboxAuditEvidence, OutputWindowWire,
+        ExitStatusWire, MediationTimingWire, NativeLinuxSandboxAuditEvidence, OutputWindowWire,
         ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
         STREAM_EXIT, STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED,
         STREAM_STDOUT, SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame,
@@ -2319,7 +2319,7 @@ mod linux {
             // SAFETY: successful getrlimit initialized the value.
             let core_limit = unsafe { core_limit.assume_init() };
             let (native_architecture, kernel_release) = uname_values()?;
-            let audit = OpenShellSandboxAuditEvidence {
+            let audit = NativeLinuxSandboxAuditEvidence {
                 capabilities,
                 no_new_privileges,
                 sandbox_dumpable,
@@ -4269,8 +4269,16 @@ mod linux {
         }
 
         fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-            openshell_isolation_interface::contract::OuterFenceGuarantees::confirmed(
+            use openshell_isolation_interface::contract::OuterFenceGuarantee;
+
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
                 "generation-1",
+                [
+                    OuterFenceGuarantee::DefaultDenyEgress,
+                    OuterFenceGuarantee::NoUnmanagedEgressPath,
+                    OuterFenceGuarantee::RevocationVerified,
+                    OuterFenceGuarantee::ControllerLossFailsClosed,
+                ],
                 b"test-vm-fence",
             )
             .unwrap()

@@ -417,9 +417,14 @@ pub struct OuterFenceGuarantees {
 }
 
 impl OuterFenceGuarantees {
-    /// Construct guarantees after the driver has validated its native evidence.
-    pub fn confirmed(
+    /// Bind the guarantees explicitly established by driver-owned evidence.
+    ///
+    /// This constructor deliberately does not infer guarantees from the mere
+    /// presence of evidence. The driver must inspect its native state and
+    /// project each established guarantee before calling this function.
+    pub fn from_driver_evidence(
         generation: impl Into<String>,
+        established: impl IntoIterator<Item = OuterFenceGuarantee>,
         native_evidence: &[u8],
     ) -> Result<Self, BackendError> {
         let generation = generation.into();
@@ -434,12 +439,7 @@ impl OuterFenceGuarantees {
         binding.extend_from_slice(native_evidence);
         Ok(Self {
             generation,
-            established: BTreeSet::from([
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::NoUnmanagedEgressPath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ]),
+            established: established.into_iter().collect(),
             evidence_digest: Sha256Digest::compute(&binding),
         })
     }

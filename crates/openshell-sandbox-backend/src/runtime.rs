@@ -322,18 +322,21 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
-        let audit: crate::boundary_protocol::OpenShellSandboxAuditEvidence =
+        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
             serde_json::from_value(confirmation.backend_audit.clone()).map_err(|error| {
-                BackendError::Confirm(format!("decode OpenShell sandbox audit evidence: {error}"))
+                BackendError::Confirm(format!(
+                    "decode native Linux sandbox audit evidence: {error}"
+                ))
             })?;
         audit.validate()?;
         if confirmation.properties != audit.properties() {
             return Err(BackendError::Confirm(
-                "sandbox confirmation properties do not match OpenShell audit evidence".to_string(),
+                "sandbox confirmation properties do not match native Linux audit evidence"
+                    .to_string(),
             ));
         }
-        self.client.start_credential_monitor();
-        ConfirmedBoundary::try_new(
+        let client = self.client.clone();
+        let confirmed = ConfirmedBoundary::try_new(
             Box::new(RemoteReady {
                 client: self.client,
                 agent: self.agent,
@@ -344,7 +347,9 @@ impl BoundBoundary for RemoteBound {
             }),
             *confirmation,
             &self.identity,
-        )
+        )?;
+        client.start_credential_monitor();
+        Ok(confirmed)
     }
 }
 
@@ -1937,8 +1942,16 @@ mod tests {
     };
 
     fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-        openshell_isolation_interface::contract::OuterFenceGuarantees::confirmed(
+        use openshell_isolation_interface::contract::OuterFenceGuarantee;
+
+        openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
             "test-generation",
+            [
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::NoUnmanagedEgressPath,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ],
             b"test-vm-fence",
         )
         .unwrap()
@@ -1965,6 +1978,7 @@ mod tests {
         mediation_failures: Arc<std::sync::atomic::AtomicUsize>,
         mediation_ready: bool,
         provider_environment_generation: u64,
+        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
     }
 
     type TestGrpcStream = Pin<
@@ -1994,6 +2008,7 @@ mod tests {
             let requests = self.requests.clone();
             let mediation_ready = self.mediation_ready;
             let provider_environment_generation = self.provider_environment_generation;
+            let confirmation = self.confirmation.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -2037,7 +2052,7 @@ mod tests {
                                 },
                             },
                             Request::Confirm => Response::Confirmed {
-                                confirmation: Box::new(test_confirmation()),
+                                confirmation: Box::new(confirmation),
                             },
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
@@ -2142,6 +2157,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            confirmation: test_confirmation(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2206,6 +2222,7 @@ mod tests {
                     mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     mediation_ready: false,
                     provider_environment_generation: 0,
+                    confirmation: test_confirmation(),
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2299,6 +2316,7 @@ mod tests {
                     mediation_failures: server_failures.clone(),
                     mediation_ready: true,
                     provider_environment_generation: 0,
+                    confirmation: test_confirmation(),
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2353,6 +2371,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            confirmation: test_confirmation(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2513,12 +2532,25 @@ mod tests {
             else {
                 return;
             };
-            serve_test_grpc(Box::new(stream), expected_token).await;
+            serve_test_grpc_with_confirmation(
+                Box::new(stream),
+                expected_token,
+                test_confirmation(),
+            )
+            .await;
         });
         (address, task)
     }
 
     async fn serve_test_grpc(stream: BoundaryDuplexStream, expected_token: String) {
+        serve_test_grpc_with_confirmation(stream, expected_token, test_confirmation()).await;
+    }
+
+    async fn serve_test_grpc_with_confirmation(
+        stream: BoundaryDuplexStream,
+        expected_token: String,
+        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
+    ) {
         let service = TestGrpcBoundary {
             wait_for_half_close: false,
             expected_token,
@@ -2526,6 +2558,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            confirmation,
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBoundaryServer::new(service))
@@ -2566,7 +2599,7 @@ mod tests {
     }
 
     fn test_confirmation() -> openshell_isolation_interface::contract::BoundaryConfirmation {
-        let audit = crate::boundary_protocol::OpenShellSandboxAuditEvidence {
+        let audit = crate::boundary_protocol::NativeLinuxSandboxAuditEvidence {
             capabilities: crate::boundary_protocol::CapabilityEvidence {
                 inheritable: 0,
                 permitted: 0,
@@ -2609,6 +2642,110 @@ mod tests {
             resource_claims: std::collections::BTreeMap::new(),
             backend_audit: serde_json::to_value(audit).expect("serialize audit evidence"),
         }
+    }
+
+    async fn assert_remote_confirmation_rejected(
+        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
+    ) {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind confirmation test server");
+        let address = listener.local_addr().expect("confirmation test address");
+        let expected_token = "a".repeat(32);
+        let server_config = certificate.server_config;
+        let server_token = expected_token.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept confirmation client");
+            let stream = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(stream)
+                .await
+                .expect("accept confirmation TLS");
+            serve_test_grpc_with_confirmation(Box::new(stream), server_token, confirmation).await;
+        });
+
+        let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
+        let outer_fence = descriptor.outer_fence.clone();
+        let context = sandbox();
+        let client = Arc::new(BoundaryClient::new(
+            descriptor,
+            test_bearer(&expected_token),
+        ));
+        let bound = RemoteBound {
+            client: client.clone(),
+            agent: context.agent,
+            policy: context.policy,
+            sandbox_id: context.sandbox_id,
+            mediation: Arc::new(RemoteNetworkMediation {
+                client: client.clone(),
+            }),
+            host_gateway_ip: None,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials:
+                openshell_core::provider_credentials::ProviderCredentialState::from_environment(
+                    0,
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                ),
+            identity: context.identity,
+            generation: "test-generation".to_string(),
+            session_id: test_session_id(),
+            resource_claims: std::collections::BTreeMap::new(),
+            outer_fence,
+        };
+
+        assert!(matches!(
+            Box::new(bound).confirm().await,
+            Err(BackendError::Confirm(_))
+        ));
+        assert!(
+            !client.credential_monitor_started.load(Ordering::Acquire),
+            "credential monitoring must start only after confirmation succeeds"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_confirm_rejects_invalid_native_audit_before_monitoring() {
+        let mut confirmation = test_confirmation();
+        let mut audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
+            serde_json::from_value(confirmation.backend_audit.clone()).expect("decode test audit");
+        audit.seccomp.notification_round_trip = false;
+        confirmation.backend_audit = serde_json::to_value(audit).expect("encode test audit");
+
+        assert_remote_confirmation_rejected(confirmation).await;
+    }
+
+    #[tokio::test]
+    async fn remote_confirm_rejects_property_projection_mismatch_before_monitoring() {
+        let mut confirmation = test_confirmation();
+        confirmation.properties.egress_interception.mechanism = "untrusted projection".to_string();
+
+        assert_remote_confirmation_rejected(confirmation).await;
+    }
+
+    #[tokio::test]
+    async fn remote_confirm_rejects_outer_fence_generation_mismatch_before_monitoring() {
+        let mut confirmation = test_confirmation();
+        confirmation.outer_fence.generation = "other-generation".to_string();
+
+        assert_remote_confirmation_rejected(confirmation).await;
+    }
+
+    #[tokio::test]
+    async fn remote_confirm_rejects_outer_fence_digest_mismatch_before_monitoring() {
+        let mut confirmation = test_confirmation();
+        let different_fence =
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
+                "test-generation",
+                confirmation.outer_fence.established.iter().copied(),
+                b"different evidence",
+            )
+            .expect("construct different test evidence");
+        confirmation.outer_fence.evidence_digest = different_fence.evidence_digest;
+
+        assert_remote_confirmation_rejected(confirmation).await;
     }
 
     #[test]
@@ -2849,6 +2986,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            confirmation: test_confirmation(),
         };
         let server = tokio::spawn(async move {
             loop {

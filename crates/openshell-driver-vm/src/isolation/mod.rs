@@ -9,7 +9,7 @@
 //! the common control and boundary behavior.
 
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -26,15 +26,30 @@ struct VmOuterFenceEvidence<'a> {
 
 impl VmOuterFenceEvidence<'_> {
     fn project(&self) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.generation.is_empty() || self.network_device_count != 0 {
+        if self.generation.is_empty() {
             return Err(BackendError::Descriptor(
                 "VM outer fence evidence is incomplete".to_string(),
             ));
         }
+        let established = (self.network_device_count == 0).then_some([
+            // A guest with no NIC has no kernel network path. Closing the
+            // supervisor-owned channel revokes access, and controller loss
+            // cannot introduce a device.
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ]);
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode VM outer fence evidence: {error}"))
         })?;
-        OuterFenceGuarantees::confirmed(self.generation, &encoded)
+        let projection = OuterFenceGuarantees::from_driver_evidence(
+            self.generation,
+            established.into_iter().flatten(),
+            &encoded,
+        )?;
+        projection.validate(self.generation)?;
+        Ok(projection)
     }
 }
 
@@ -127,6 +142,26 @@ mod tests {
         SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
         generate_sandbox_tls_material,
     };
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        assert!(
+            VmOuterFenceEvidence {
+                generation: "",
+                network_device_count: 0,
+            }
+            .project()
+            .is_err()
+        );
+        assert!(
+            VmOuterFenceEvidence {
+                generation: "generation-1",
+                network_device_count: 1,
+            }
+            .project()
+            .is_err()
+        );
+    }
 
     #[test]
     fn provisioning_binds_identical_resource_claims() {

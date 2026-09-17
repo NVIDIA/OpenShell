@@ -91,6 +91,21 @@ controller loss fails closed. A digest commits those guarantees to the native
 driver evidence without teaching the shared contract about container networks,
 Kubernetes objects, VM devices, or accelerator resources.
 
+Each driver makes that projection explicitly. Non-empty native evidence alone
+does not establish a guarantee:
+
+| Driver | Native evidence | Guarantees projected by the driver |
+|---|---|---|
+| Docker | Pinned container ID, `network_mode=none`, and no unexpected network attachments | No workload route establishes default-deny, revocation, and controller-loss behavior; the attachment inspection establishes that no unmanaged route exists. |
+| Podman | Pinned container ID, `--network=none`, and no unexpected network attachments | The same container-network facts establish the same four guarantees. |
+| Kubernetes | NetworkPolicy UID and resource version, ingress and egress isolation, and zero workload egress rules | The persisted, selecting policy establishes default-deny and continued denial after revocation or controller loss; zero egress rules establish that no unmanaged route is permitted. |
+| VM | Generation and zero guest network devices | The absent NIC establishes all four guarantees; approved traffic uses the separate supervisor-owned channel. |
+
+The shared contract checks that all four guarantees are present, that the
+projection names the admitted generation, and that its evidence digest matches
+the value passed to the workload-side runtime. It does not infer guarantees or
+interpret the native fields.
+
 When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
 to serve policy-authorized exec and loopback forwarding until explicit stop or

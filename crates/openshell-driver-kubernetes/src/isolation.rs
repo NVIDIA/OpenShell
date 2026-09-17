@@ -21,7 +21,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -40,20 +40,31 @@ struct KubernetesOuterFenceEvidence<'a> {
 
 impl KubernetesOuterFenceEvidence<'_> {
     fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.network_policy_uid.is_empty()
-            || self.network_policy_resource_version.is_empty()
-            || !self.ingress_isolated
-            || !self.egress_isolated
-            || self.egress_rule_count != 0
-        {
+        if self.network_policy_uid.is_empty() || self.network_policy_resource_version.is_empty() {
             return Err(BackendError::Descriptor(
                 "Kubernetes outer fence evidence is incomplete".to_string(),
             ));
         }
+        let mut established = Vec::new();
+        if self.ingress_isolated && self.egress_isolated && self.egress_rule_count == 0 {
+            // A persisted policy selecting both directions with no egress rule
+            // continues to deny direct egress after revocation or controller loss.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.egress_isolated && self.egress_rule_count == 0 {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode Kubernetes outer fence evidence: {error}"))
         })?;
-        OuterFenceGuarantees::confirmed(generation, &encoded)
+        let projection =
+            OuterFenceGuarantees::from_driver_evidence(generation, established, &encoded)?;
+        projection.validate(generation)?;
+        Ok(projection)
     }
 }
 
@@ -288,6 +299,49 @@ impl KubernetesSandboxRuntimeBoundarySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        for evidence in [
+            KubernetesOuterFenceEvidence {
+                network_policy_uid: "",
+                network_policy_resource_version: "1",
+                ingress_isolated: true,
+                egress_isolated: true,
+                egress_rule_count: 0,
+            },
+            KubernetesOuterFenceEvidence {
+                network_policy_uid: "uid",
+                network_policy_resource_version: "",
+                ingress_isolated: true,
+                egress_isolated: true,
+                egress_rule_count: 0,
+            },
+            KubernetesOuterFenceEvidence {
+                network_policy_uid: "uid",
+                network_policy_resource_version: "1",
+                ingress_isolated: false,
+                egress_isolated: true,
+                egress_rule_count: 0,
+            },
+            KubernetesOuterFenceEvidence {
+                network_policy_uid: "uid",
+                network_policy_resource_version: "1",
+                ingress_isolated: true,
+                egress_isolated: false,
+                egress_rule_count: 0,
+            },
+            KubernetesOuterFenceEvidence {
+                network_policy_uid: "uid",
+                network_policy_resource_version: "1",
+                ingress_isolated: true,
+                egress_isolated: true,
+                egress_rule_count: 1,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
 
     fn spec() -> KubernetesSandboxRuntimeBoundarySpec {
         KubernetesSandboxRuntimeBoundarySpec {

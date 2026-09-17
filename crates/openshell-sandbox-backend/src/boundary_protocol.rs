@@ -84,7 +84,7 @@ pub struct SeccompEvidence {
     pub cancellation: bool,
 }
 
-/// Mechanism-specific audit evidence for the `OpenShell` co-located runtime.
+/// Mechanism-specific audit evidence for the native Linux sandbox adapter.
 ///
 /// This schema belongs to this backend rather than the generic isolation
 /// interface. The host-side backend validates it before constructing a
@@ -94,7 +94,7 @@ pub struct SeccompEvidence {
     clippy::struct_excessive_bools,
     reason = "audit evidence preserves independently measured security results"
 )]
-pub struct OpenShellSandboxAuditEvidence {
+pub struct NativeLinuxSandboxAuditEvidence {
     pub capabilities: CapabilityEvidence,
     pub no_new_privileges: bool,
     pub sandbox_dumpable: bool,
@@ -111,7 +111,7 @@ pub struct OpenShellSandboxAuditEvidence {
     pub tcp_deny_round_trip: bool,
 }
 
-impl OpenShellSandboxAuditEvidence {
+impl NativeLinuxSandboxAuditEvidence {
     /// Validate the complete mechanism-specific posture required by this backend.
     pub fn validate(&self) -> Result<(), BackendError> {
         let complete = self.capabilities.is_empty()
@@ -140,7 +140,7 @@ impl OpenShellSandboxAuditEvidence {
             Ok(())
         } else {
             Err(BackendError::Confirm(
-                "OpenShell sandbox audit evidence is incomplete".to_string(),
+                "native Linux sandbox audit evidence is incomplete".to_string(),
             ))
         }
     }
@@ -1337,8 +1337,8 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
-    fn complete_audit_evidence() -> OpenShellSandboxAuditEvidence {
-        OpenShellSandboxAuditEvidence {
+    fn complete_audit_evidence() -> NativeLinuxSandboxAuditEvidence {
+        NativeLinuxSandboxAuditEvidence {
             capabilities: CapabilityEvidence {
                 inheritable: 0,
                 permitted: 0,
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn openshell_audit_evidence_projects_backend_neutral_properties() {
+    fn native_linux_audit_evidence_projects_backend_neutral_properties() {
         let audit = complete_audit_evidence();
         audit.validate().unwrap();
         let properties = audit.properties();
@@ -1385,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn openshell_audit_evidence_rejects_mechanism_failure() {
+    fn native_linux_audit_evidence_rejects_mechanism_failure() {
         let mut audit = complete_audit_evidence();
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());

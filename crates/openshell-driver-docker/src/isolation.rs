@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -30,18 +30,31 @@ struct DockerOuterFenceEvidence<'a> {
 
 impl DockerOuterFenceEvidence<'_> {
     fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.container_id.is_empty()
-            || self.network_mode != "none"
-            || !self.unexpected_networks.is_empty()
-        {
+        if self.container_id.is_empty() {
             return Err(BackendError::Descriptor(
                 "Docker outer fence evidence is incomplete".to_string(),
             ));
         }
+        let mut established = Vec::new();
+        if self.network_mode == "none" {
+            // With no container network namespace attachment, workload egress
+            // remains denied both after revocation and if the supervisor exits.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.unexpected_networks.is_empty() {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode Docker outer fence evidence: {error}"))
         })?;
-        OuterFenceGuarantees::confirmed(generation, &encoded)
+        let projection =
+            OuterFenceGuarantees::from_driver_evidence(generation, established, &encoded)?;
+        projection.validate(generation)?;
+        Ok(projection)
     }
 }
 
@@ -129,6 +142,30 @@ impl DockerBoundarySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["bridge".to_string()];
+        for evidence in [
+            DockerOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
 
     #[test]
     fn provisioning_binds_container_and_image_claims() {

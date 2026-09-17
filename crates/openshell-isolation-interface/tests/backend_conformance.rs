@@ -368,6 +368,20 @@ fn workload_identity() -> ResolvedWorkloadIdentity {
     .unwrap()
 }
 
+fn complete_outer_fence(generation: &str, evidence: &[u8]) -> OuterFenceGuarantees {
+    OuterFenceGuarantees::from_driver_evidence(
+        generation,
+        [
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ],
+        evidence,
+    )
+    .unwrap()
+}
+
 fn confirmation() -> BoundaryConfirmation {
     BoundaryConfirmation {
         generation: "generation-1".to_string(),
@@ -380,8 +394,7 @@ fn confirmation() -> BoundaryConfirmation {
         },
         authenticated_supervisor: true,
         session_id: SandboxSessionId::new(),
-        outer_fence: OuterFenceGuarantees::confirmed("generation-1", b"mock-fence-evidence")
-            .unwrap(),
+        outer_fence: complete_outer_fence("generation-1", b"mock-fence-evidence"),
         runtime_exit_terminates_workload: true,
         resource_claims: BTreeMap::new(),
         backend_audit: serde_json::json!({"backend": "mock"}),
@@ -390,13 +403,11 @@ fn confirmation() -> BoundaryConfirmation {
 
 #[test]
 fn outer_fence_guarantees_are_backend_neutral_and_fail_closed() {
-    let fence = OuterFenceGuarantees::confirmed("generation-1", b"native-driver-evidence").unwrap();
+    let fence = complete_outer_fence("generation-1", b"native-driver-evidence");
     assert!(fence.validate("generation-1").is_ok());
     assert_ne!(
         fence.evidence_digest,
-        OuterFenceGuarantees::confirmed("generation-2", b"native-driver-evidence")
-            .unwrap()
-            .evidence_digest
+        complete_outer_fence("generation-2", b"native-driver-evidence").evidence_digest
     );
 
     let mut wrong_generation = fence.clone();
@@ -414,8 +425,16 @@ fn outer_fence_guarantees_are_backend_neutral_and_fail_closed() {
         assert!(incomplete.validate("generation-1").is_err());
     }
 
-    assert!(OuterFenceGuarantees::confirmed("", b"evidence").is_err());
-    assert!(OuterFenceGuarantees::confirmed("generation-1", b"").is_err());
+    assert!(OuterFenceGuarantees::from_driver_evidence("", [], b"evidence").is_err());
+    assert!(OuterFenceGuarantees::from_driver_evidence("generation-1", [], b"").is_err());
+
+    let unproven = OuterFenceGuarantees::from_driver_evidence(
+        "generation-1",
+        [OuterFenceGuarantee::DefaultDenyEgress],
+        b"native-driver-evidence",
+    )
+    .unwrap();
+    assert!(unproven.validate("generation-1").is_err());
 }
 
 /// The backend-independent supervisor sequence. Identical for every backend:
