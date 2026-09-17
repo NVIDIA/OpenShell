@@ -248,11 +248,10 @@ autoscaling:
   # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
   # Pods metrics served by prometheus-adapter.
   metrics: []
-  # -- HPA scaling behavior. Scale-down disconnects the removed pod's
-  # supervisor sessions; they reconnect to the remaining replicas, so the
-  # default removes at most one replica every two minutes after a
-  # five-minute stabilization window. Helm merges maps: set
-  # autoscaling.behavior.scaleDown to null to drop the default.
+  # -- HPA scaling behavior. Scale-down hands the removed pod's supervisor
+  # sessions to the remaining replicas, so the default removes at most one
+  # replica every two minutes after a five-minute stabilization window. Helm
+  # merges maps: set autoscaling.behavior.scaleDown to null to drop the default.
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300
