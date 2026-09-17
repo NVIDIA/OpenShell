@@ -324,14 +324,30 @@ fn embedded_nul_network_literal_is_unsupported_without_panicking() {
 }
 
 #[test]
-fn resource_exhaustion_is_inconclusive_and_returns_three() {
+fn over_limit_mixed_protocol_policy_is_rejected_before_shape_validation() {
     let path = std::env::temp_dir().join(format!(
         "openshell-prover-resource-limit-{}.yaml",
         std::process::id()
     ));
-    let mut source = String::from("version: 1\nnetwork_policies:\n");
-    for index in 0..=1_024 {
-        writeln!(source, "  rule-{index}: {{}}").unwrap();
+    let mut source = String::from("version: 1\nnetwork_policies:\n  mixed:\n    endpoints:\n");
+    for index in 0..2_500 {
+        writeln!(
+            source,
+            "      - {{ host: l4-{index}.example.com, port: 443 }}"
+        )
+        .unwrap();
+    }
+    for index in 0..2_500 {
+        let host = if index == 2_499 {
+            "l4-0.example.com".to_owned()
+        } else {
+            format!("rest-{index}.example.com")
+        };
+        writeln!(
+            source,
+            "      - {{ host: {host}, port: 443, protocol: rest, enforcement: enforce, access: read-only }}"
+        )
+        .unwrap();
     }
     fs::write(&path, source).expect("write resource-limit policy");
 

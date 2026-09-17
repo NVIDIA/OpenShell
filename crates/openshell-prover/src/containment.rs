@@ -7,7 +7,7 @@
 //! canonical authored schema and fails closed when authority falls outside its
 //! supported containment model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -25,6 +25,13 @@ use z3::{Context, Params, SatResult, Solver};
 const LAYER_L4: &str = "l4";
 const LAYER_REST: &str = "rest";
 const WORKDIR_SYMBOL: &str = "<OCI_WORKDIR>";
+const MAX_RULES: usize = 1_024;
+const MAX_ENDPOINTS: usize = 4_096;
+const MAX_BINARIES: usize = 4_096;
+const MAX_PORT_ENTRIES: usize = 65_536;
+const MAX_L7_RULES: usize = 16_384;
+const MAX_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_TOTAL_PATTERN_BYTES: usize = 1024 * 1024;
 
 /// Parser error for a containment input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,32 +352,12 @@ fn check_within_boundary_inner(
     options: CheckOptions,
     cancelled: Option<&AtomicBool>,
 ) -> CheckResult {
-    if let Err(feature) = validate_supported_policy(boundary) {
-        return unsupported(
-            feature.reason_code,
-            format!("boundary policy {}", feature.detail),
-        );
-    }
-    if let Err(feature) = validate_supported_policy(candidate) {
-        return unsupported(
-            feature.reason_code,
-            format!("candidate policy {}", feature.detail),
-        );
-    }
-    if let Some(reason) = resource_limit_reason(boundary, candidate) {
-        return CheckResult::Inconclusive(ReasonEvidence {
-            code: ReasonCode::ResourceLimit,
-            reason,
-        });
-    }
-    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-        return cancelled_result();
-    }
-    if options.timeout.is_zero() {
-        return CheckResult::Inconclusive(ReasonEvidence {
-            code: ReasonCode::SolverTimeout,
-            reason: "solver timeout must be positive".to_owned(),
-        });
+    if let Some(result) =
+        preflight_and_validate_policies(boundary, candidate, options, cancelled, |policy| {
+            validate_supported_policy(policy, cancelled)
+        })
+    {
+        return result;
     }
     if let Some(reason) = unresolved_workdir_reason(boundary, candidate) {
         return unsupported(ReasonCode::UnresolvedWorkdir, reason);
@@ -414,6 +401,55 @@ fn check_within_boundary_inner(
         );
     }
     filesystem_result.unwrap_or(CheckResult::Within(WithinEvidence))
+}
+
+fn preflight_and_validate_policies<F>(
+    boundary: &ContainmentPolicy,
+    candidate: &ContainmentPolicy,
+    options: CheckOptions,
+    cancelled: Option<&AtomicBool>,
+    mut validate: F,
+) -> Option<CheckResult>
+where
+    F: FnMut(&ContainmentPolicy) -> Result<(), PolicyValidationError>,
+{
+    // Cancellation and aggregate limits intentionally take precedence over
+    // semantic shape errors. This keeps validation work bounded and lets an
+    // already-cancelled invocation stop before inspecting either policy.
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Some(cancelled_result());
+    }
+    if let Some(reason) = resource_limit_reason(boundary, candidate) {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Some(cancelled_result());
+        }
+        return Some(CheckResult::Inconclusive(ReasonEvidence {
+            code: ReasonCode::ResourceLimit,
+            reason,
+        }));
+    }
+    if options.timeout.is_zero() {
+        return Some(CheckResult::Inconclusive(ReasonEvidence {
+            code: ReasonCode::SolverTimeout,
+            reason: "solver timeout must be positive".to_owned(),
+        }));
+    }
+    for (context, policy) in [("boundary", boundary), ("candidate", candidate)] {
+        match validate(policy) {
+            Ok(()) => {}
+            Err(PolicyValidationError::Cancelled) => return Some(cancelled_result()),
+            Err(PolicyValidationError::Unsupported(feature)) => {
+                return Some(unsupported(
+                    feature.reason_code,
+                    format!("{context} policy {}", feature.detail),
+                ));
+            }
+        }
+    }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Some(cancelled_result());
+    }
+    None
 }
 
 fn solve_network_mode(
@@ -1276,6 +1312,17 @@ struct UnsupportedFeature {
     detail: String,
 }
 
+enum PolicyValidationError {
+    Unsupported(UnsupportedFeature),
+    Cancelled,
+}
+
+impl From<UnsupportedFeature> for PolicyValidationError {
+    fn from(feature: UnsupportedFeature) -> Self {
+        Self::Unsupported(feature)
+    }
+}
+
 impl UnsupportedFeature {
     fn policy_shape(detail: impl Into<String>) -> Self {
         Self {
@@ -1285,12 +1332,18 @@ impl UnsupportedFeature {
     }
 }
 
-fn validate_supported_policy(policy: &ContainmentPolicy) -> Result<(), UnsupportedFeature> {
+fn validate_supported_policy(
+    policy: &ContainmentPolicy,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), PolicyValidationError> {
     validate_supported_common_policy(policy)?;
     for (rule_name, rule) in &policy.network_policies {
-        validate_supported_network_rule(rule_name, rule)?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(PolicyValidationError::Cancelled);
+        }
+        validate_supported_network_rule(rule_name, rule, cancelled)?;
     }
-    validate_no_cross_protocol_overlap(policy)
+    validate_no_cross_protocol_overlap(policy, cancelled)
 }
 
 fn validate_supported_common_policy(policy: &ContainmentPolicy) -> Result<(), UnsupportedFeature> {
@@ -1308,11 +1361,18 @@ fn validate_supported_common_policy(policy: &ContainmentPolicy) -> Result<(), Un
 fn validate_supported_network_rule(
     rule_name: &str,
     rule: &NetworkRule,
-) -> Result<(), UnsupportedFeature> {
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), PolicyValidationError> {
     for binary in &rule.binaries {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(PolicyValidationError::Cancelled);
+        }
         validate_supported_binary(rule_name, binary)?;
     }
     for endpoint in &rule.endpoints {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(PolicyValidationError::Cancelled);
+        }
         validate_supported_endpoint(rule_name, endpoint)?;
     }
     Ok(())
@@ -1545,23 +1605,64 @@ fn validate_supported_rest(context: &str, endpoint: &Endpoint) -> Result<(), Uns
     Ok(())
 }
 
+#[derive(Default)]
+struct ProtocolAuthorityIndex {
+    all: BTreeSet<u16>,
+    wildcards: BTreeSet<u16>,
+    exact: BTreeMap<String, BTreeSet<u16>>,
+}
+
+impl ProtocolAuthorityIndex {
+    fn overlaps(&self, host: &str, ports: &[u16]) -> bool {
+        ports.iter().any(|port| {
+            self.wildcards.contains(port)
+                || if host.contains('*') {
+                    self.all.contains(port)
+                } else {
+                    self.exact
+                        .get(host)
+                        .is_some_and(|ports_for_host| ports_for_host.contains(port))
+                }
+        })
+    }
+
+    fn insert(&mut self, host: &str, ports: &[u16]) {
+        self.all.extend(ports);
+        if host.contains('*') {
+            self.wildcards.extend(ports);
+        } else {
+            self.exact.entry(host.to_owned()).or_default().extend(ports);
+        }
+    }
+}
+
 fn validate_no_cross_protocol_overlap(
     policy: &ContainmentPolicy,
-) -> Result<(), UnsupportedFeature> {
-    let endpoints = policy
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), PolicyValidationError> {
+    let mut l4 = ProtocolAuthorityIndex::default();
+    let mut rest = ProtocolAuthorityIndex::default();
+    for endpoint in policy
         .network_policies
         .values()
-        .flat_map(|rule| rule.endpoints.iter())
-        .collect::<Vec<_>>();
-    if endpoints.iter().enumerate().any(|(index, endpoint)| {
-        endpoints[index + 1..].iter().any(|other| {
-            endpoint.protocol_kind() != other.protocol_kind()
-                && endpoint_authority_may_overlap(endpoint, other)
-        })
-    }) {
-        return Err(UnsupportedFeature::policy_shape(
-            "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",
-        ));
+        .flat_map(|rule| &rule.endpoints)
+    {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(PolicyValidationError::Cancelled);
+        }
+        let host = endpoint.host.to_ascii_lowercase();
+        let ports = endpoint.effective_ports();
+        let (current, other) = match endpoint.protocol_kind() {
+            Protocol::L4 => (&mut l4, &rest),
+            Protocol::Rest => (&mut rest, &l4),
+        };
+        if other.overlaps(&host, &ports) {
+            return Err(UnsupportedFeature::policy_shape(
+                "contains overlapping L4 and REST endpoints whose inspection selection is not modeled",
+            )
+            .into());
+        }
+        current.insert(&host, &ports);
     }
     Ok(())
 }
@@ -1580,79 +1681,124 @@ fn resource_limit_reason(
     boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
 ) -> Option<String> {
-    const MAX_RULES: usize = 1_024;
-    const MAX_ENDPOINTS: usize = 4_096;
-    const MAX_BINARIES: usize = 4_096;
-    const MAX_L7_RULES: usize = 16_384;
-    const MAX_PATTERN_BYTES: usize = 4 * 1024;
-    const MAX_TOTAL_PATTERN_BYTES: usize = 1024 * 1024;
-
     let policies = [boundary, candidate];
     let rule_count = policies
         .iter()
         .map(|policy| policy.network_policies.len())
-        .sum::<usize>();
+        .fold(0_usize, usize::saturating_add);
+    if rule_count > MAX_RULES {
+        return Some(resource_limit_detail("rules", rule_count, MAX_RULES));
+    }
+
     let endpoint_count = policies
         .iter()
         .flat_map(|policy| policy.network_policies.values())
         .map(|rule| rule.endpoints.len())
-        .sum::<usize>();
+        .fold(0_usize, usize::saturating_add);
+    if endpoint_count > MAX_ENDPOINTS {
+        return Some(resource_limit_detail(
+            "endpoints",
+            endpoint_count,
+            MAX_ENDPOINTS,
+        ));
+    }
+
     let binary_count = policies
         .iter()
         .flat_map(|policy| policy.network_policies.values())
         .map(|rule| rule.binaries.len())
-        .sum::<usize>();
-    let l7_count = policies
-        .iter()
-        .flat_map(|policy| policy.network_policies.values())
-        .flat_map(|rule| &rule.endpoints)
-        .map(|endpoint| endpoint.rules.len() + endpoint.deny_rules.len())
-        .sum::<usize>();
+        .fold(0_usize, usize::saturating_add);
+    if binary_count > MAX_BINARIES {
+        return Some(resource_limit_detail(
+            "binaries",
+            binary_count,
+            MAX_BINARIES,
+        ));
+    }
+
+    let mut port_entry_count = 0_usize;
+    let mut l7_count = 0_usize;
     let mut total_pattern_bytes = 0_usize;
-    let mut longest_pattern = 0_usize;
     for policy in policies {
-        let mut account = |value: &str| {
-            total_pattern_bytes = total_pattern_bytes.saturating_add(value.len());
-            longest_pattern = longest_pattern.max(value.len());
-        };
         for path in policy
             .filesystem_policy
             .read_only
             .iter()
             .chain(&policy.filesystem_policy.read_write)
         {
-            account(path);
+            if let Some(reason) = account_pattern_bytes(path, &mut total_pattern_bytes) {
+                return Some(reason);
+            }
         }
         for rule in policy.network_policies.values() {
             for binary in &rule.binaries {
-                account(&binary.path);
+                if let Some(reason) = account_pattern_bytes(&binary.path, &mut total_pattern_bytes)
+                {
+                    return Some(reason);
+                }
             }
             for endpoint in &rule.endpoints {
-                account(&endpoint.host);
-                account(&endpoint.path);
+                let endpoint_port_entries =
+                    usize::from(endpoint.ports.is_empty() && endpoint.port != 0)
+                        .max(endpoint.ports.len());
+                port_entry_count = port_entry_count.saturating_add(endpoint_port_entries);
+                if port_entry_count > MAX_PORT_ENTRIES {
+                    return Some(resource_limit_detail(
+                        "port_entries",
+                        port_entry_count,
+                        MAX_PORT_ENTRIES,
+                    ));
+                }
+
+                l7_count = l7_count
+                    .saturating_add(endpoint.rules.len())
+                    .saturating_add(endpoint.deny_rules.len());
+                if l7_count > MAX_L7_RULES {
+                    return Some(resource_limit_detail("l7_rules", l7_count, MAX_L7_RULES));
+                }
+
+                for value in [&endpoint.host, &endpoint.path] {
+                    if let Some(reason) = account_pattern_bytes(value, &mut total_pattern_bytes) {
+                        return Some(reason);
+                    }
+                }
                 for rule in &endpoint.rules {
-                    account(&rule.allow.path);
-                    account(&rule.allow.method);
+                    for value in [&rule.allow.path, &rule.allow.method] {
+                        if let Some(reason) = account_pattern_bytes(value, &mut total_pattern_bytes)
+                        {
+                            return Some(reason);
+                        }
+                    }
                 }
                 for rule in &endpoint.deny_rules {
-                    account(&rule.path);
-                    account(&rule.method);
+                    for value in [&rule.path, &rule.method] {
+                        if let Some(reason) = account_pattern_bytes(value, &mut total_pattern_bytes)
+                        {
+                            return Some(reason);
+                        }
+                    }
                 }
             }
         }
     }
+    None
+}
 
-    (rule_count > MAX_RULES
-        || endpoint_count > MAX_ENDPOINTS
-        || binary_count > MAX_BINARIES
-        || l7_count > MAX_L7_RULES
-        || longest_pattern > MAX_PATTERN_BYTES
-        || total_pattern_bytes > MAX_TOTAL_PATTERN_BYTES)
-        .then(|| {
-            format!(
-                "containment model exceeds resource limits (rules={rule_count}, endpoints={endpoint_count}, binaries={binary_count}, l7_rules={l7_count}, pattern_bytes={total_pattern_bytes}, longest_pattern={longest_pattern})"
-            )
-        })
+fn account_pattern_bytes(value: &str, total: &mut usize) -> Option<String> {
+    if value.len() > MAX_PATTERN_BYTES {
+        return Some(resource_limit_detail(
+            "longest_pattern",
+            value.len(),
+            MAX_PATTERN_BYTES,
+        ));
+    }
+    *total = total.saturating_add(value.len());
+    (*total > MAX_TOTAL_PATTERN_BYTES)
+        .then(|| resource_limit_detail("pattern_bytes", *total, MAX_TOTAL_PATTERN_BYTES))
+}
+
+fn resource_limit_detail(metric: &str, observed: usize, limit: usize) -> String {
+    format!("containment model exceeds resource limit ({metric}={observed}, limit={limit})")
 }
 
 fn unsupported_allow(rule: &Allow) -> bool {
@@ -1834,6 +1980,7 @@ fn non_separator_regex(separator: &str) -> Regexp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fmt::Write as _;
 
     fn parse(value: &str) -> ContainmentPolicy {
@@ -2426,6 +2573,261 @@ mod tests {
         assert!(parse_policy_str(
             "version: 1\nnetwork_policies:\n  n:\n    binaries: [{ path: /usr/bin/curl, harness: true }]\n"
         ).is_err());
+    }
+
+    fn mixed_protocol_policy(endpoint_count: usize) -> ContainmentPolicy {
+        let l4 = parse(
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: l4-0.example.com, port: 443 }]
+",
+        )
+        .network_policies["n"]
+            .endpoints[0]
+            .clone();
+        let rest = parse(
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: rest.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }]
+",
+        )
+        .network_policies["n"]
+            .endpoints[0]
+            .clone();
+        let l4_count = endpoint_count / 2;
+        let mut endpoints = Vec::with_capacity(endpoint_count);
+        for index in 0..l4_count {
+            let mut endpoint = l4.clone();
+            endpoint.host = format!("l4-{index}.example.com");
+            endpoints.push(endpoint);
+        }
+        for index in l4_count..endpoint_count {
+            let mut endpoint = rest.clone();
+            endpoint.host = if index + 1 == endpoint_count {
+                "l4-0.example.com".to_owned()
+            } else {
+                format!("rest-{index}.example.com")
+            };
+            endpoints.push(endpoint);
+        }
+        let mut policy = parse(
+            "version: 1
+",
+        );
+        policy.network_policies.insert(
+            "mixed".to_owned(),
+            NetworkRule {
+                name: String::new(),
+                endpoints,
+                binaries: Vec::new(),
+            },
+        );
+        policy
+    }
+
+    fn l4_policy(endpoint_count: usize, host_prefix: &str) -> ContainmentPolicy {
+        let template = parse(
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: api.example.com, port: 443 }]
+",
+        )
+        .network_policies["n"]
+            .endpoints[0]
+            .clone();
+        let endpoints = (0..endpoint_count)
+            .map(|index| {
+                let mut endpoint = template.clone();
+                endpoint.host = format!("{host_prefix}-{index}.example.com");
+                endpoint
+            })
+            .collect();
+        let mut policy = parse(
+            "version: 1
+",
+        );
+        policy.network_policies.insert(
+            "l4".to_owned(),
+            NetworkRule {
+                name: String::new(),
+                endpoints,
+                binaries: Vec::new(),
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn resource_limits_precede_mixed_protocol_validation_for_either_input() {
+        let empty = parse(
+            "version: 1
+",
+        );
+        let oversized = mixed_protocol_policy(MAX_ENDPOINTS + 1);
+
+        assert!(matches!(
+            validate_supported_policy(&oversized, None),
+            Err(PolicyValidationError::Unsupported(_))
+        ));
+        for (boundary, candidate) in [(&oversized, &empty), (&empty, &oversized)] {
+            let result =
+                preflight_and_validate_policies(boundary, candidate, options(), None, |_| {
+                    panic!("semantic validation must not run after failed preflight")
+                });
+            assert!(matches!(
+                result,
+                Some(CheckResult::Inconclusive(ref evidence))
+                    if evidence.reason_code() == ReasonCode::ResourceLimit
+            ));
+            assert!(matches!(
+                check_within_boundary(boundary, candidate, options()),
+                CheckResult::Inconclusive(ref evidence)
+                    if evidence.reason_code() == ReasonCode::ResourceLimit
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_resource_limit_skips_both_validators() {
+        let boundary = l4_policy(MAX_ENDPOINTS / 2 + 1, "boundary");
+        let candidate = l4_policy(MAX_ENDPOINTS / 2 + 1, "candidate");
+        let empty = parse(
+            "version: 1
+",
+        );
+        assert!(resource_limit_reason(&boundary, &empty).is_none());
+        assert!(resource_limit_reason(&empty, &candidate).is_none());
+
+        let result =
+            preflight_and_validate_policies(&boundary, &candidate, options(), None, |_| {
+                panic!("semantic validation must not run after aggregate preflight failure")
+            });
+        assert!(matches!(
+            result,
+            Some(CheckResult::Inconclusive(ref evidence))
+                if evidence.reason_code() == ReasonCode::ResourceLimit
+        ));
+    }
+
+    #[test]
+    fn permitted_preflight_invokes_both_validators() {
+        let boundary = l4_policy(1, "boundary");
+        let candidate = l4_policy(1, "candidate");
+        let calls = Cell::new(0);
+        let result =
+            preflight_and_validate_policies(&boundary, &candidate, options(), None, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+        assert!(result.is_none());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn aggregate_endpoint_limit_accepts_exactly_the_limit() {
+        let empty = parse(
+            "version: 1
+",
+        );
+        let at_limit = mixed_protocol_policy(MAX_ENDPOINTS);
+        let over_limit = mixed_protocol_policy(MAX_ENDPOINTS + 1);
+        assert!(resource_limit_reason(&empty, &at_limit).is_none());
+        assert!(resource_limit_reason(&at_limit, &empty).is_none());
+        assert_eq!(
+            resource_limit_reason(&empty, &over_limit).as_deref(),
+            Some("containment model exceeds resource limit (endpoints=4097, limit=4096)")
+        );
+        assert_eq!(
+            resource_limit_reason(&over_limit, &empty).as_deref(),
+            Some("containment model exceeds resource limit (endpoints=4097, limit=4096)")
+        );
+    }
+
+    #[test]
+    fn pattern_limit_diagnostic_reports_the_observed_count() {
+        let empty = parse(
+            "version: 1
+",
+        );
+        let mut oversized = empty.clone();
+        oversized
+            .filesystem_policy
+            .read_only
+            .push("x".repeat(MAX_PATTERN_BYTES + 1));
+        assert_eq!(
+            resource_limit_reason(&empty, &oversized).as_deref(),
+            Some("containment model exceeds resource limit (longest_pattern=4097, limit=4096)")
+        );
+    }
+
+    #[test]
+    fn cancellation_precedes_resource_limits_and_validation() {
+        let empty = parse(
+            "version: 1
+",
+        );
+        let oversized = mixed_protocol_policy(MAX_ENDPOINTS + 1);
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            check_within_boundary_cancellable(&empty, &oversized, options(), &cancelled),
+            CheckResult::Inconclusive(ref evidence)
+                if evidence.reason_code() == ReasonCode::Cancelled
+        ));
+    }
+
+    #[test]
+    fn indexed_cross_protocol_overlap_matches_pairwise_reference() {
+        fn pairwise(policy: &ContainmentPolicy) -> bool {
+            let endpoints = policy
+                .network_policies
+                .values()
+                .flat_map(|rule| &rule.endpoints)
+                .collect::<Vec<_>>();
+            endpoints.iter().enumerate().any(|(index, endpoint)| {
+                endpoints[index + 1..].iter().any(|other| {
+                    endpoint.protocol_kind() != other.protocol_kind()
+                        && endpoint_authority_may_overlap(endpoint, other)
+                })
+            })
+        }
+
+        let policies = [
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: api.example.com, port: 443 }, { host: API.EXAMPLE.COM, port: 443, protocol: rest }]
+",
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: '*.example.com', ports: [80, 443] }, { host: api.other.test, port: 443, protocol: rest }]
+",
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: api.example.com, port: 80 }, { host: api.example.com, port: 443, protocol: rest }]
+",
+            "version: 1
+network_policies:
+  n:
+    endpoints: [{ host: api.example.com, ports: [80, 443] }, { host: other.example.com, ports: [443, 8443], protocol: rest }]
+",
+            "version: 1
+network_policies:
+  a:
+    endpoints: [{ host: api.example.com, port: 443 }]
+  b:
+    endpoints: [{ host: api.example.com, port: 443 }, { host: api.example.com, port: 443, protocol: rest }]
+",
+        ];
+        for source in policies {
+            let policy = parse(source);
+            let indexed = validate_no_cross_protocol_overlap(&policy, None).is_err();
+            assert_eq!(indexed, pairwise(&policy), "{source}");
+        }
     }
 
     #[test]
