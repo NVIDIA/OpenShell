@@ -13,7 +13,8 @@ use crate::isolation::{
 };
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH,
-    SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT, SandboxRuntimeNames, boundary_service,
+    SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT,
+    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, boundary_service,
     generate_proxy_ca_material, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
@@ -108,6 +109,7 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: &str =
 enum SandboxRuntimeBootstrapPhase {
     Preparing,
     Released,
+    StoppingSupervisor,
     RollingBack,
 }
 
@@ -116,6 +118,7 @@ impl SandboxRuntimeBootstrapPhase {
         match self {
             Self::Preparing => "preparing",
             Self::Released => "released",
+            Self::StoppingSupervisor => "stopping-supervisor",
             Self::RollingBack => "rolling-back",
         }
     }
@@ -124,6 +127,7 @@ impl SandboxRuntimeBootstrapPhase {
         match value {
             "preparing" => Some(Self::Preparing),
             "released" => Some(Self::Released),
+            "stopping-supervisor" => Some(Self::StoppingSupervisor),
             "rolling-back" => Some(Self::RollingBack),
             _ => None,
         }
@@ -2705,9 +2709,20 @@ impl KubernetesComputeDriver {
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
-            .patch_sandbox_operating_state(sandbox_id, false)
+        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase) =
+            self.prepare_sandbox_stop(sandbox_id).await?;
+        if phase != Some(SandboxRuntimeBootstrapPhase::RollingBack) {
+            self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
+                .await?;
+            patch_dynamic_object_with_resource_version_retry(
+                &agent_sandbox_api.api,
+                &kube_name,
+                |version| {
+                    sandbox_runtime_rollback_patch(&agent_sandbox_api.resource.version, version)
+                },
+            )
             .await?;
+        }
         let pod_api = Api::<Pod>::namespaced(self.client.clone(), &namespace);
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
@@ -2745,7 +2760,7 @@ impl KubernetesComputeDriver {
                 pod_is_gone,
             );
             if stop_is_complete {
-                self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
+                self.delete_sandbox_runtime_generation_secrets(sandbox_id, &namespace)
                     .await?;
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
@@ -3037,11 +3052,20 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    async fn patch_sandbox_operating_state(
+    async fn prepare_sandbox_stop(
         &self,
         sandbox_id: &str,
-        running: bool,
-    ) -> Result<(AgentSandboxApi, String, String, String, Duration), KubernetesDriverError> {
+    ) -> Result<
+        (
+            AgentSandboxApi,
+            String,
+            String,
+            String,
+            Duration,
+            Option<SandboxRuntimeBootstrapPhase>,
+        ),
+        KubernetesDriverError,
+    > {
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -3066,6 +3090,7 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or(KubernetesDriverError::NotFound)?;
+        let phase = sandbox_runtime_bootstrap_phase(&object);
         let namespace = object
             .metadata
             .namespace
@@ -3087,20 +3112,25 @@ impl KubernetesComputeDriver {
             .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
             .cloned()
             .unwrap_or_else(|| kube_name.clone());
-        patch_dynamic_object_with_resource_version_retry(
-            &agent_sandbox_api.api,
-            &kube_name,
-            |version| {
-                sandbox_operating_state_patch(&agent_sandbox_api.resource.version, version, running)
-            },
-        )
-        .await?;
+        if !matches!(
+            phase,
+            Some(
+                SandboxRuntimeBootstrapPhase::StoppingSupervisor
+                    | SandboxRuntimeBootstrapPhase::RollingBack
+            )
+        ) {
+            patch_dynamic_object_with_resource_version_retry(
+                &agent_sandbox_api.api,
+                &kube_name,
+                sandbox_runtime_stop_begin_patch,
+            )
+            .await?;
+        }
 
         info!(
             sandbox_id,
             sandbox_api_version = %agent_sandbox_api.resource.version,
-            running,
-            "Updated Kubernetes sandbox operating state"
+            "Prepared Kubernetes sandbox stop"
         );
         Ok((
             agent_sandbox_api,
@@ -3108,10 +3138,11 @@ impl KubernetesComputeDriver {
             pod_name,
             namespace,
             stop_timeout,
+            phase,
         ))
     }
 
-    async fn delete_sandbox_runtime_supervisor(
+    async fn delete_sandbox_runtime_supervisor_pod(
         &self,
         sandbox_id: &str,
         namespace: &str,
@@ -3123,16 +3154,22 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::from_kube)?
         {
-            pods.delete(
-                &names.supervisor_pod,
-                &DeleteParams::foreground().preconditions(Preconditions {
-                    uid: pod.metadata.uid,
-                    resource_version: None,
-                }),
-            )
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
-            let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
+            let deletion_timeout = kubernetes_pod_termination_timeout(&pod);
+            match pods
+                .delete(
+                    &names.supervisor_pod,
+                    &DeleteParams::foreground().preconditions(Preconditions {
+                        uid: pod.metadata.uid,
+                        resource_version: None,
+                    }),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(KubeError::Api(error)) if error.code == 404 => return Ok(()),
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+            }
+            let deadline = tokio::time::Instant::now() + deletion_timeout;
             loop {
                 if pods
                     .get_opt(&names.supervisor_pod)
@@ -3143,13 +3180,24 @@ impl KubernetesComputeDriver {
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(KubernetesDriverError::Message(
-                        "timed out waiting for supervisor Pod deletion".to_string(),
-                    ));
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timed out after {}s waiting for supervisor Pod deletion",
+                        deletion_timeout.as_secs()
+                    )));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        Ok(())
+    }
+
+    async fn delete_sandbox_runtime_supervisor(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
+            .await?;
         self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace)
             .await
     }
@@ -3407,6 +3455,18 @@ impl KubernetesComputeDriver {
                 .unwrap_or(&self.config.namespace);
             let cr_name = object.metadata.name.as_deref().unwrap_or_default();
             if sandbox_runtime_bootstrap_phase(&object)
+                == Some(SandboxRuntimeBootstrapPhase::StoppingSupervisor)
+            {
+                self.reconcile_sandbox_runtime_stopping_supervisor(
+                    &lookup_api,
+                    &sandbox_id,
+                    namespace,
+                    cr_name,
+                )
+                .await;
+                continue;
+            }
+            if sandbox_runtime_bootstrap_phase(&object)
                 == Some(SandboxRuntimeBootstrapPhase::RollingBack)
             {
                 self.reconcile_sandbox_runtime_rollback(
@@ -3591,6 +3651,32 @@ impl KubernetesComputeDriver {
             Err(_) => {
                 warn!(sandbox_id, "timed out completing sandbox-runtime rollback");
             }
+        }
+    }
+
+    async fn reconcile_sandbox_runtime_stopping_supervisor(
+        &self,
+        lookup_api: &AgentSandboxApi,
+        sandbox_id: &str,
+        namespace: &str,
+        cr_name: &str,
+    ) {
+        if let Err(error) = self
+            .delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
+            .await
+        {
+            warn!(sandbox_id, %error, "could not stop sandbox-runtime supervisor; reconciliation will retry");
+            return;
+        }
+        let api =
+            Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
+        if let Err(error) =
+            patch_dynamic_object_with_resource_version_retry(&api.api, cr_name, |version| {
+                sandbox_runtime_rollback_patch(&lookup_api.resource.version, version)
+            })
+            .await
+        {
+            debug!(sandbox_id, %error, "sandbox-runtime stop transition raced; reconciliation will retry");
         }
     }
 
@@ -6462,6 +6548,18 @@ fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
     termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
 }
 
+fn kubernetes_pod_termination_timeout(pod: &Pod) -> Duration {
+    let default_grace = u64::try_from(SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS)
+        .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
+    let termination_grace = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.termination_grace_period_seconds)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map_or(default_grace, Duration::from_secs);
+    termination_grace.saturating_add(KUBE_API_TIMEOUT)
+}
+
 fn next_stop_poll_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
 }
@@ -6490,6 +6588,21 @@ fn sandbox_operating_state_patch(
             sandbox_runtime_rollback_patch(api_version, resource_version)
         }
     }
+}
+
+fn sandbox_runtime_stop_begin_patch(resource_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::StoppingSupervisor.as_str(),
+                ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+            },
+        },
+    })
 }
 
 fn sandbox_runtime_rollback_patch(api_version: &str, resource_version: &str) -> serde_json::Value {
@@ -7405,25 +7518,41 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_patch_uses_version_specific_operating_state() {
-        let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
-        assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
+    fn lifecycle_patch_stops_supervisor_before_suspending_workload() {
+        let stop_begin = sandbox_runtime_stop_begin_patch("42");
+        assert_eq!(stop_begin["metadata"]["resourceVersion"], "42");
         assert_eq!(
-            beta_stop["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
+            stop_begin["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
             "true"
         );
         assert_eq!(
-            beta_stop["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
-            SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+            stop_begin["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::StoppingSupervisor.as_str()
         );
+        assert!(stop_begin.get("spec").is_none());
+
+        let beta_stop = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1BETA1, "43");
         assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
         assert!(beta_stop["spec"].get("replicas").is_none());
 
-        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
-        assert_eq!(alpha_start["metadata"]["resourceVersion"], "43");
+        let alpha_stop = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1ALPHA1, "44");
+        assert_eq!(alpha_stop["spec"]["replicas"], 0);
+        assert!(alpha_stop["spec"].get("operatingMode").is_none());
+
+        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "45", true);
+        assert_eq!(alpha_start["metadata"]["resourceVersion"], "45");
         assert!(alpha_start["metadata"].get("annotations").is_none());
         assert_eq!(alpha_start["spec"]["replicas"], 1);
         assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    #[test]
+    fn bootstrap_phase_round_trips_stopping_supervisor() {
+        let phase = SandboxRuntimeBootstrapPhase::StoppingSupervisor;
+        assert_eq!(
+            SandboxRuntimeBootstrapPhase::parse(phase.as_str()),
+            Some(phase)
+        );
     }
 
     #[test]
@@ -7452,6 +7581,29 @@ mod tests {
             kubernetes_sandbox_stop_timeout(&sandbox),
             Duration::from_secs(75)
         );
+    }
+
+    #[test]
+    fn supervisor_deletion_timeout_includes_grace_and_api_headroom() {
+        let mut pod = Pod::default();
+        assert_eq!(
+            kubernetes_pod_termination_timeout(&pod),
+            Duration::from_mins(1),
+            "an older Pod without an explicit grace uses the Kubernetes default"
+        );
+
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            containers: Vec::new(),
+            termination_grace_period_seconds: Some(45),
+            ..Default::default()
+        });
+        assert_eq!(
+            kubernetes_pod_termination_timeout(&pod),
+            Duration::from_secs(75)
+        );
+
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(0);
+        assert_eq!(kubernetes_pod_termination_timeout(&pod), KUBE_API_TIMEOUT);
     }
 
     #[test]

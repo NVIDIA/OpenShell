@@ -186,6 +186,13 @@ A driver stop operation does not complete while its backend still reports an
 in-progress stop. This prevents an immediate start from racing the previous
 run's delayed exit event and regressing the new run to `Error`.
 
+The Kubernetes driver records stop as a durable two-phase transition. It first
+deletes the supervisor Pod while the workload boundary remains reachable, then
+suspends the Agent Sandbox workload and cleans generation bootstrap material.
+Periodic reconciliation resumes either phase after a gateway restart. Pod
+deletion waits include the configured termination grace period plus Kubernetes
+API observation headroom.
+
 Persisted `Stopping` and `Starting` rows are retried at startup. Stable
 `Stopped` rows remain stopped. Docker and Podman retain the stopped container
 and attached storage, Kubernetes retains the Sandbox CR and PVC while scaling
