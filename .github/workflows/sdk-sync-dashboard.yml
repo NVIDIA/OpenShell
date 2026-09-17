@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: SDK Proto Sync
+name: SDK Sync Dashboard
 
 on:
   schedule:
@@ -30,7 +30,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: config
-        run: echo "matrix=$(jq -c '.include' tasks/sdk-sync-config.json)" >> "$GITHUB_OUTPUT"
+        run: |
+          MATRIX=$(jq -e -c '
+            if (.include | type == "array" and length > 0 and all(.[];
+              type == "object" and
+              (.name | type == "string") and
+              (.display_name | type == "string") and
+              (.bindings_committed | type == "boolean") and
+              (.no_file_tracking_hint == null or (.no_file_tracking_hint | type == "string")) and
+              (.generated_bindings_status | type == "string") and
+              (.label | type == "string") and
+              (.drift_task | type == "string") and
+              (.build_check_task | type == "string") and
+              (.proto_task | type == "string") and
+              (.build_task | type == "string") and
+              (.test_task | type == "string") and
+              (.source_dirs | type == "array" and all(.[]; type == "string"))
+            )) then .include else error("invalid SDK sync configuration") end
+          ' tasks/sdk-sync-config.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   sdk_sync_check:
     name: Sync Check (${{ matrix.sdk.name }})
@@ -38,6 +56,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
+      # Keep this workflow reproducible; update the digest deliberately when the CI image changes.
       image: ghcr.io/nvidia/openshell/ci:5b9daab9351b1e053f9a5e0ce4c899f5d3f674b0
       credentials:
         username: ${{ github.actor }}
@@ -57,12 +76,20 @@ jobs:
           BUILD_CHECK_TASK: ${{ matrix.sdk.build_check_task }}
         run: |
           mkdir -p report
-          mise run "$DRIFT_TASK" > report/drift.json 2> report/drift.stderr || true
+          DRIFT_STATUS=0
+          mise run "$DRIFT_TASK" > report/drift.json 2> report/drift.stderr || DRIFT_STATUS=$?
           if ! jq -e 'type == "object" and has("synced") and (.synced | type == "boolean") and (has("error") | not)' report/drift.json >/dev/null 2>&1; then
             jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"error", build_failed:"false"}' > report/status.json
             exit 0
           fi
           SYNCED=$(jq -r '.synced' report/drift.json)
+          if { [ "$DRIFT_STATUS" -eq 0 ] && [ "$SYNCED" = "true" ]; } || \
+             { [ "$DRIFT_STATUS" -eq 1 ] && [ "$SYNCED" = "false" ]; }; then
+            :
+          else
+            jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"error", build_failed:"false"}' > report/status.json
+            exit 0
+          fi
           if [ "$SYNCED" = "true" ]; then
             jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"false", build_failed:"false"}' > report/status.json
             exit 0
@@ -86,7 +113,7 @@ jobs:
   issue_management:
     name: Manage Drift Issue (${{ matrix.sdk.name }})
     needs: [load_config, sdk_sync_check]
-    if: always() && needs.load_config.result == 'success' && needs.sdk_sync_check.result == 'success'
+    if: always() && needs.load_config.result == 'success'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     permissions:
@@ -94,6 +121,7 @@ jobs:
       issues: write
       packages: read
     container:
+      # Keep this workflow reproducible; update the digest deliberately when the CI image changes.
       image: ghcr.io/nvidia/openshell/ci:5b9daab9351b1e053f9a5e0ce4c899f5d3f674b0
       credentials:
         username: ${{ github.actor }}
@@ -115,8 +143,10 @@ jobs:
           echo "build_failed=$(jq -r '.build_failed' report/status.json)" >> "$GITHUB_OUTPUT"
       - name: Warn on drift detection error
         if: steps.status.outputs.has_drift == 'error'
+        env:
+          SDK_NAME: ${{ matrix.sdk.name }}
         run: |
-          echo "::error::Drift detection failed for ${{ matrix.sdk.name }} SDK"
+          echo "::error::Drift detection failed for $SDK_NAME SDK"
           cat report/drift.stderr
           exit 1
       - name: Install tools
@@ -126,14 +156,16 @@ jobs:
         if: steps.status.outputs.has_drift == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_NAME: ${{ matrix.sdk.name }}
+          SDK_LABEL: ${{ matrix.sdk.label }}
         run: |
           set +e
           RESULT=$(uv run python tasks/scripts/sdk_sync.py manage-issue \
             --drift-report "$(cat report/drift.json)" \
             --build-report "$(cat report/build.json)" \
-            --sdk "${{ matrix.sdk.name }}" \
+            --sdk "$SDK_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --label "${{ matrix.sdk.label }}")
+            --label "$SDK_LABEL")
           STATUS=$?
           set -e
           if ! printf '%s\n' "$RESULT" | jq .; then
@@ -147,16 +179,23 @@ jobs:
             ACTION=unknown
           fi
           if [ "$ACTION" != "created" ] && [ "$ACTION" != "updated" ]; then
-            echo "::error::Issue management for ${{ matrix.sdk.name }} failed: $ACTION"
+            echo "::error::Issue management for $SDK_NAME failed: $ACTION"
             exit 1
           fi
       - name: Close resolved drift issue
         if: steps.status.outputs.has_drift == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_LABEL: ${{ matrix.sdk.label }}
         run: |
-          ISSUE=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "${{ matrix.sdk.label }}" --state open --json number --jq '.[0].number')
-          if [ -n "$ISSUE" ]; then
+          ISSUES=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$SDK_LABEL" --state open --limit 101 --json number --jq '.[].number')
+          ISSUE_COUNT=$(printf '%s\n' "$ISSUES" | sed '/^$/d' | wc -l | tr -d ' ')
+          if [ "$ISSUE_COUNT" -ge 101 ]; then
+            echo "::error::Issue list for $SDK_LABEL reached the 101-result limit; refusing to close issues"
+            exit 1
+          fi
+          while IFS= read -r ISSUE; do
+            [ -z "$ISSUE" ] && continue
             gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --comment "The SDK proto drift check passed. Closing automatically."
             echo "Closed issue #$ISSUE"
-          fi
+          done <<< "$ISSUES"

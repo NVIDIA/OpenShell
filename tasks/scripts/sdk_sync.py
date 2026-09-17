@@ -102,6 +102,7 @@ def generate_issue_body(
     build_report: dict | None,
     sdk: str,
     max_log_lines: int = 500,
+    max_log_chars: int = 12000,
 ) -> str:
     paths = SDK_CONFIGS[sdk]
     files = drift_report.get("files", [])
@@ -109,7 +110,7 @@ def generate_issue_body(
     return ISSUE_TEMPLATE.format(
         summary=drift_report.get("summary", "unknown"),
         file_table=_render_file_table(drifted_files),
-        build_section=_render_build_section(build_report, max_log_lines),
+        build_section=_render_build_section(build_report, max_log_lines, max_log_chars),
         proto_task=paths["proto_task"],
         build_task=paths["build_task"],
         test_task=paths["test_task"],
@@ -132,11 +133,19 @@ def _render_file_table(files: list[dict]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _render_build_section(build_report: dict | None, max_log_lines: int) -> str:
+def _render_build_section(
+    build_report: dict | None, max_log_lines: int, max_log_chars: int
+) -> str:
     if not build_report or not build_report.get("failed_step"):
         return ""
     log_lines = build_report.get("log", "no log available").splitlines()
     log = "\n".join(log_lines[-max_log_lines:])
+    if len(log) > max_log_chars:
+        marker = "[... build log truncated ...]\n"
+        if max_log_chars <= len(marker):
+            log = marker[:max_log_chars]
+        else:
+            log = marker + log[-(max_log_chars - len(marker)) :]
     return BUILD_SECTION_TEMPLATE.format(
         failed_step=build_report["failed_step"],
         log=log,
@@ -146,16 +155,14 @@ def _render_build_section(build_report: dict | None, max_log_lines: int) -> str:
 def _render_agent_section(
     sdk: str, drifted_files: list[dict], build_report: dict | None
 ) -> str:
+    # These values come from reviewed repository configuration and generated CI reports.
     paths = SDK_CONFIGS[sdk]
     display_name = _sdk_display_name(sdk)
     failed_step = build_report.get("failed_step") if build_report else None
     if drifted_files:
         drifted_names = ", ".join(f"`{f['name']}`" for f in drifted_files)
-    elif sdk == "typescript":
-        drifted_names = (
-            "not individually tracked (run `mise run sdk:ts:proto && "
-            "mise run sdk:ts:typecheck` to reproduce)"
-        )
+    elif paths.get("no_file_tracking_hint"):
+        drifted_names = paths["no_file_tracking_hint"]
     else:
         drifted_names = "unknown"
 
@@ -166,15 +173,15 @@ def _render_agent_section(
             f"{display_name} SDK code so it compiles and passes tests with the updated protos."
         )
     elif build_report and build_report.get("success") is True:
-        if sdk == "go":
+        if paths.get("bindings_committed"):
             build_context = (
                 "\nRegeneration, build, and tests passed in CI, but the "
                 "committed bindings still need to be regenerated and committed."
             )
         else:
             build_context = (
-                "\nThe subsequent regeneration, typecheck, and tests passed in CI. "
-                "Generated TypeScript bindings are gitignored; rerun "
+                "\nThe subsequent regeneration, build, and tests passed in CI. "
+                f"Generated bindings are {paths['generated_bindings_status']}; rerun "
                 f"`mise run {paths['drift_task']}` to confirm compatibility "
                 "before changing SDK source."
             )
@@ -273,7 +280,7 @@ def _ensure_label(repo: str, label: str, description: str) -> None:
         raise RuntimeError(f"Failed to create label '{label}': {details}")
 
 
-def _find_open_issue(repo: str, label: str) -> dict | None:
+def _find_open_issues(repo: str, label: str) -> list[dict]:
     result = _run_cmd(
         [
             "gh",
@@ -286,7 +293,7 @@ def _find_open_issue(repo: str, label: str) -> dict | None:
             "--state",
             "open",
             "--limit",
-            "1",
+            "101",
             "--json",
             "url,number",
         ],
@@ -307,22 +314,27 @@ def _find_open_issue(repo: str, label: str) -> dict | None:
         ) from error
     if not isinstance(issues, list):
         raise RuntimeError(f"Invalid issue list {context}: expected JSON array")
-    if not issues:
-        return None
-
-    issue = issues[0]
-    if not isinstance(issue, dict):
-        raise RuntimeError(f"Invalid issue list {context}: expected issue object")
-    url = issue.get("url")
-    number = issue.get("number")
-    if (
-        not isinstance(url, str)
-        or not url.strip()
-        or type(number) is not int
-        or number <= 0
-    ):
-        raise RuntimeError(f"Invalid issue list {context}: invalid issue URL or number")
-    return {"url": url, "number": str(number)}
+    if len(issues) >= 101:
+        raise RuntimeError(
+            f"Issue list {context} was truncated at 101 results; refusing to mutate issues"
+        )
+    result_issues = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            raise RuntimeError(f"Invalid issue list {context}: expected issue object")
+        url = issue.get("url")
+        number = issue.get("number")
+        if (
+            not isinstance(url, str)
+            or not url.strip()
+            or type(number) is not int
+            or number <= 0
+        ):
+            raise RuntimeError(
+                f"Invalid issue list {context}: invalid issue URL or number"
+            )
+        result_issues.append({"url": url, "number": str(number)})
+    return result_issues
 
 
 # --- public functions ---
@@ -364,14 +376,15 @@ def _manage_issue(
     body = generate_issue_body(drift_report, build_report, sdk)
     title = f"SDK proto drift: {sdk}"
 
-    existing = _find_open_issue(repo, label)
+    existing = _find_open_issues(repo, label)
     if existing:
+        canonical = existing[0]
         result = _run_cmd(
             [
                 "gh",
                 "issue",
                 "edit",
-                existing["number"],
+                canonical["number"],
                 "--repo",
                 repo,
                 "--body-file",
@@ -381,11 +394,32 @@ def _manage_issue(
             stdin_data=body,
         )
         if result.returncode == 0:
-            return {"issue_url": existing["url"], "action": "updated"}
+            for duplicate in existing[1:]:
+                close = _run_cmd(
+                    [
+                        "gh",
+                        "issue",
+                        "close",
+                        duplicate["number"],
+                        "--repo",
+                        repo,
+                        "--comment",
+                        "Closed as a duplicate of the canonical SDK proto drift issue.",
+                    ],
+                    capture=True,
+                )
+                if close.returncode != 0:
+                    details = close.stderr.strip() or "no details"
+                    return {
+                        "issue_url": "",
+                        "action": "error",
+                        "reason": f"Failed to close duplicate issue: {details}",
+                    }
+            return {"issue_url": canonical["url"], "action": "updated"}
         return {
             "issue_url": "",
             "action": "error",
-            "reason": "Failed to update issue",
+            "reason": f"Failed to update issue: {result.stderr.strip() or 'no details'}",
         }
 
     result = _run_cmd(
@@ -411,7 +445,7 @@ def _manage_issue(
     return {
         "issue_url": "",
         "action": "error",
-        "reason": "Failed to create issue",
+        "reason": f"Failed to create issue: {result.stderr.strip() or 'no details'}",
     }
 
 

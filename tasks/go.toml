@@ -134,15 +134,8 @@ BUF_TEMPLATE="$SDK_ROOT/buf.gen.yaml"
 if command -v cygpath &>/dev/null; then
   WORK_DIR=$(mktemp -d)
   trap 'rm -rf "$WORK_DIR"' EXIT
-  GO_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go)")
-  GRPC_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go-grpc)")
-  GO_PLUGIN=${GO_PLUGIN//&/\\&}
-  GRPC_PLUGIN=${GRPC_PLUGIN//&/\\&}
-  sed \
-    -e "s|local: protoc-gen-go$|local: $GO_PLUGIN|" \
-    -e "s|local: protoc-gen-go-grpc$|local: $GRPC_PLUGIN|" \
-    "$SDK_ROOT/buf.gen.yaml" > "$WORK_DIR/buf.gen.yaml"
-  BUF_TEMPLATE="$WORK_DIR/buf.gen.yaml"
+  source "$REPO_ROOT/tasks/scripts/prepare_go_buf_template.sh"
+  BUF_TEMPLATE=$(prepare_go_buf_template "$SDK_ROOT" "$WORK_DIR")
 fi
 
 # Clean previous output before regeneration

@@ -41,7 +41,25 @@ jobs:
 
       - id: config
         name: Load SDK configuration
-        run: echo "matrix=$(jq -c '.include' tasks/sdk-sync-config.json)" >> "$GITHUB_OUTPUT"
+        run: |
+          MATRIX=$(jq -e -c '
+            if (.include | type == "array" and length > 0 and all(.[];
+              type == "object" and
+              (.name | type == "string") and
+              (.display_name | type == "string") and
+              (.bindings_committed | type == "boolean") and
+              (.no_file_tracking_hint == null or (.no_file_tracking_hint | type == "string")) and
+              (.generated_bindings_status | type == "string") and
+              (.label | type == "string") and
+              (.drift_task | type == "string") and
+              (.build_check_task | type == "string") and
+              (.proto_task | type == "string") and
+              (.build_task | type == "string") and
+              (.test_task | type == "string") and
+              (.source_dirs | type == "array" and all(.[]; type == "string"))
+            )) then .include else error("invalid SDK sync configuration") end
+          ' tasks/sdk-sync-config.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   sdk_proto_drift:
     name: Proto Drift (${{ matrix.sdk.name }})
@@ -50,6 +68,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
     container:
+      # Keep this workflow reproducible; update the digest deliberately when the CI image changes.
       image: ghcr.io/nvidia/openshell/ci:5b9daab9351b1e053f9a5e0ce4c899f5d3f674b0
       credentials:
         username: ${{ github.actor }}
@@ -66,22 +85,34 @@ jobs:
 
       - name: Check proto drift
         id: drift
+        env:
+          DRIFT_TASK: ${{ matrix.sdk.drift_task }}
         run: |
-          REPORT=$(mise run ${{ matrix.sdk.drift_task }} 2>"$RUNNER_TEMP/drift_stderr.log") || true
+          DRIFT_STATUS=0
+          REPORT=$(mise run "$DRIFT_TASK" 2>"$RUNNER_TEMP/drift_stderr.log") || DRIFT_STATUS=$?
 
-          if echo "$REPORT" | jq -e 'has("synced") and (.synced | type == "boolean")' >/dev/null 2>&1; then
+          if echo "$REPORT" | jq -e 'type == "object" and has("synced") and (.synced | type == "boolean") and (has("error") | not)' >/dev/null 2>&1; then
             SYNCED=$(echo "$REPORT" | jq -r '.synced')
-            DELIMITER="REPORT_EOF_$(openssl rand -hex 16)"
-            {
-              echo "report<<$DELIMITER"
-              echo "$REPORT"
-              echo "$DELIMITER"
-            } >> "$GITHUB_OUTPUT"
-            echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+            if { [ "$DRIFT_STATUS" -eq 0 ] && [ "$SYNCED" = "true" ]; } || \
+               { [ "$DRIFT_STATUS" -eq 1 ] && [ "$SYNCED" = "false" ]; }; then
+              DELIMITER="REPORT_EOF_$(openssl rand -hex 16)"
+              {
+                echo "report<<$DELIMITER"
+                echo "$REPORT"
+                echo "$DELIMITER"
+              } >> "$GITHUB_OUTPUT"
+              echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Proto drift check failed: exit status $DRIFT_STATUS disagrees with report"
+              echo "stderr: $(cat "$RUNNER_TEMP/drift_stderr.log")"
+              echo "synced=error" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
           else
             echo "::warning::Proto drift check failed: unable to parse report"
             echo "stderr: $(cat "$RUNNER_TEMP/drift_stderr.log")"
             echo "synced=error" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
 
       - name: Annotate drift warning

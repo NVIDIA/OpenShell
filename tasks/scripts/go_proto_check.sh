@@ -24,17 +24,14 @@ emit_error() {
   fi
 }
 
-TOOLS=(buf protoc-gen-go protoc-gen-go-grpc)
-if [ "$OUTPUT_FORMAT" = "json" ]; then
-  TOOLS+=(jq)
+if [ "$OUTPUT_FORMAT" = "json" ] && ! command -v jq &>/dev/null; then
+  echo '{"sdk":"go","synced":false,"files":[],"summary":"jq not found","error":"jq not found"}'
+  exit 1
 fi
+TOOLS=(buf protoc-gen-go protoc-gen-go-grpc)
 for tool in "${TOOLS[@]}"; do
   if ! command -v "$tool" &>/dev/null; then
-    if [ "$OUTPUT_FORMAT" = "json" ] && [ "$tool" = "jq" ]; then
-      echo '{"sdk":"go","synced":false,"files":[],"summary":"jq not found","error":"jq not found"}'
-    else
-      emit_error "$tool not found. Run 'mise install' to install it."
-    fi
+    emit_error "$tool not found. Run 'mise install' to install it."
     exit 1
   fi
 done
@@ -49,22 +46,8 @@ RESULTS_FILE=$(mktemp)
 GENERATION_LOG=$(mktemp)
 trap 'rm -rf "$WORK_DIR"; rm -f "$RESULTS_FILE" "$GENERATION_LOG"' EXIT
 
-BUF_OUTPUT_DIR="$WORK_DIR"
-if command -v cygpath &>/dev/null; then
-  BUF_OUTPUT_DIR=$(cygpath -m "$WORK_DIR")
-fi
-sed "s|out: sdk/go|out: $BUF_OUTPUT_DIR|" buf.gen.yaml >"$WORK_DIR/buf.gen.yaml"
-if command -v cygpath &>/dev/null; then
-  GO_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go)")
-  GRPC_PLUGIN=$(cygpath -m "$(command -v protoc-gen-go-grpc)")
-  GO_PLUGIN=${GO_PLUGIN//&/\\&}
-  GRPC_PLUGIN=${GRPC_PLUGIN//&/\\&}
-  sed \
-    -e "s|local: protoc-gen-go$|local: $GO_PLUGIN|" \
-    -e "s|local: protoc-gen-go-grpc$|local: $GRPC_PLUGIN|" \
-    "$WORK_DIR/buf.gen.yaml" >"$WORK_DIR/buf.gen.windows.yaml"
-  mv "$WORK_DIR/buf.gen.windows.yaml" "$WORK_DIR/buf.gen.yaml"
-fi
+source "$REPO_ROOT/tasks/scripts/prepare_go_buf_template.sh"
+prepare_go_buf_template "$SDK_ROOT" "$WORK_DIR" >/dev/null
 CHECK_TEMPLATE="$WORK_DIR/buf.gen.yaml"
 if ! (cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE") >"$GENERATION_LOG" 2>&1; then
   if [ "$OUTPUT_FORMAT" = "text" ]; then
