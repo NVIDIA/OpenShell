@@ -1531,7 +1531,9 @@ async fn connect_uds_driver(
         spawn_uds_driver(driver_name, config, socket_path).await
     } else {
         let (channel, negotiated_extension) =
-            connect_ready_credential_driver(driver_name, socket_path).await?;
+            connect_ready_credential_driver(driver_name, socket_path)
+                .await
+                .map_err(CredentialDriverReadinessError::into_error)?;
         Ok(BuiltCredentialDriver {
             driver: Arc::new(RemoteCredentialDriver::new(channel)),
             process: None,
@@ -1655,6 +1657,24 @@ async fn wait_for_launched_credential_driver(
     child: &mut tokio::process::Child,
     timeout: Duration,
 ) -> CoreResult<(Channel, NegotiatedExtension)> {
+    wait_for_launched_credential_driver_with(driver_name, socket_path, child, timeout, || {
+        connect_ready_credential_driver(driver_name, socket_path)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn wait_for_launched_credential_driver_with<F, Fut>(
+    driver_name: &str,
+    socket_path: &Path,
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+    mut connect: F,
+) -> CoreResult<(Channel, NegotiatedExtension)>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(Channel, NegotiatedExtension), CredentialDriverReadinessError>>,
+{
     let deadline = Instant::now() + timeout;
     let mut last_error: Option<String> = None;
 
@@ -1679,14 +1699,12 @@ async fn wait_for_launched_credential_driver(
             )));
         }
 
-        match tokio::time::timeout(
-            remaining,
-            connect_ready_credential_driver(driver_name, socket_path),
-        )
-        .await
-        {
+        match tokio::time::timeout(remaining, connect()).await {
             Ok(Ok(connected)) => return Ok(connected),
-            Ok(Err(err)) => last_error = Some(err.to_string()),
+            Ok(Err(CredentialDriverReadinessError::Retryable(err))) => {
+                last_error = Some(err.to_string());
+            }
+            Ok(Err(CredentialDriverReadinessError::Terminal(err))) => return Err(err),
             Err(_) => {
                 return Err(Error::execution(format!(
                     "timed out waiting for credential driver '{driver_name}' to respond to GetCapabilities"
@@ -1707,11 +1725,29 @@ async fn wait_for_launched_credential_driver(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+enum CredentialDriverReadinessError {
+    Retryable(Error),
+    Terminal(Error),
+}
+
+#[cfg(unix)]
+impl CredentialDriverReadinessError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Retryable(error) | Self::Terminal(error) => error,
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn connect_ready_credential_driver(
     driver_name: &str,
     socket_path: &Path,
-) -> CoreResult<(Channel, NegotiatedExtension)> {
-    let channel = connect_credential_driver_socket(driver_name, socket_path).await?;
+) -> Result<(Channel, NegotiatedExtension), CredentialDriverReadinessError> {
+    let channel = connect_credential_driver_socket(driver_name, socket_path)
+        .await
+        .map_err(CredentialDriverReadinessError::Retryable)?;
     let mut client = CredentialDriverClient::new(channel.clone());
     let gateway = gateway_metadata(ExtensionFamily::Credentials);
     let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {
@@ -1724,14 +1760,15 @@ async fn connect_ready_credential_driver(
         timeout,
         client.get_capabilities(request),
     )
-    .await?;
+    .await
+    .map_err(CredentialDriverReadinessError::Retryable)?;
     let negotiated_extension = negotiate(
         ExtensionFamily::Credentials,
         driver_name,
         &gateway,
         capabilities.extension,
     )
-    .map_err(|error| Error::config(error.to_string()))?;
+    .map_err(|error| CredentialDriverReadinessError::Terminal(Error::config(error.to_string())))?;
     Ok((channel, negotiated_extension))
 }
 
@@ -2525,6 +2562,36 @@ socket_path = {socket_path_toml}
         .unwrap_err();
 
         assert!(err.to_string().contains("GetCapabilities timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launched_driver_protocol_incompatibility_is_terminal() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        let err = wait_for_launched_credential_driver_with(
+            "enterprise-secrets",
+            Path::new("/unused-test-socket"),
+            &mut child,
+            Duration::from_secs(30),
+            || {
+                std::future::ready(Err(CredentialDriverReadinessError::Terminal(
+                    Error::config(
+                        "credentials extension 'enterprise-secrets' uses unsupported protocol 2.0; gateway supports 1.0",
+                    ),
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported protocol 2.0"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
