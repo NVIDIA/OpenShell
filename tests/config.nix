@@ -108,8 +108,8 @@ let
 
     testsuites = [
       {
-        name = "smoke";
-        playbooks = [ "ansible/playbooks/smoke.yaml" ];
+        name = "conformance";
+        playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
         inputs = {
           openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
         };
