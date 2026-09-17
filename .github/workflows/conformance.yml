@@ -23,6 +23,8 @@ jobs:
       should_run: ${{ steps.gate.outputs.should_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: gate
         uses: ./.github/actions/pr-gate
 
@@ -41,6 +43,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Compute versions
         id: version
@@ -56,46 +59,67 @@ jobs:
 
   build-cli:
     needs: version
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-cli
-      binary: openshell
-      triple: x86_64-unknown-linux-musl
-      runner: linux-amd64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      checkout-ref: ${{ github.sha }}
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-cli
+          binary: openshell
+          triple: x86_64-unknown-linux-musl
+          cargo-version: ${{ needs.version.outputs.cargo }}
 
   build-conformance:
     needs: version
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-conformance-cli
-      binary: openshell-conformance
-      triple: x86_64-unknown-linux-musl
-      runner: linux-amd64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      checkout-ref: ${{ github.sha }}
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-conformance-cli
+          binary: openshell-conformance
+          triple: x86_64-unknown-linux-musl
+          cargo-version: ${{ needs.version.outputs.cargo }}
 
   build-gateway:
     needs: version
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-gateway
-      binary: openshell-gateway
-      triple: x86_64-unknown-linux-gnu
-      runner: linux-amd64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      image-tag: dev
-      checkout-ref: ${{ github.sha }}
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-gateway
+          binary: openshell-gateway
+          triple: x86_64-unknown-linux-gnu
+          cargo-version: ${{ needs.version.outputs.cargo }}
+          supervisor-image-tag: dev
 
   build-rpm:
     needs: [version, build-cli, build-gateway]
