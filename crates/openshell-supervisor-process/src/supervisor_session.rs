@@ -769,22 +769,29 @@ async fn open_target(
     port_forward: &Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(unix))]
+    let _ = (ssh_socket_path, expected_ssh_peer_pid);
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
-            let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
-            let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
-            if let Some(expected_pid) = expected_ssh_peer_pid {
-                let credentials = stream.peer_cred()?;
-                let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
-                if actual_pid != Some(expected_pid) {
-                    return Err(format!(
+            #[cfg(not(unix))]
+            return Err("SSH relay targets are unsupported by the Windows supervisor".into());
+            #[cfg(unix)]
+            {
+                let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
+                let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
+                if let Some(expected_pid) = expected_ssh_peer_pid {
+                    let credentials = stream.peer_cred()?;
+                    let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
+                    if actual_pid != Some(expected_pid) {
+                        return Err(format!(
                         "SSH relay peer PID mismatch: expected {expected_pid}, got {actual_pid:?}"
                     )
                     .into());
+                    }
                 }
+                Ok(Box::new(stream))
             }
-            Ok(Box::new(stream))
         }
     }
 }

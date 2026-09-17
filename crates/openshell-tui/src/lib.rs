@@ -823,6 +823,7 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
         allow_missing: true,
         name: sandbox_name,
         workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
+        ..Default::default()
     };
     match app.client.delete_sandbox(req).await {
         Ok(response) => {

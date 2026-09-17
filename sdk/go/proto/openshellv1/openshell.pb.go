@@ -1269,8 +1269,11 @@ type ComputeDriverCapabilities struct {
 	DriverVersion string `protobuf:"bytes,2,opt,name=driver_version,json=driverVersion,proto3" json:"driver_version,omitempty"`
 	// Static portable resource request forms reported by the driver.
 	ResourceCapabilities *ResourceCapabilities `protobuf:"bytes,3,opt,name=resource_capabilities,json=resourceCapabilities,proto3" json:"resource_capabilities,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Whether the configured driver instance completely enforces the portable
+	// SandboxPolicy.ui contract.
+	SupportsUiPolicy bool `protobuf:"varint,4,opt,name=supports_ui_policy,json=supportsUiPolicy,proto3" json:"supports_ui_policy,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ComputeDriverCapabilities) Reset() {
@@ -1322,6 +1325,13 @@ func (x *ComputeDriverCapabilities) GetResourceCapabilities() *ResourceCapabilit
 		return x.ResourceCapabilities
 	}
 	return nil
+}
+
+func (x *ComputeDriverCapabilities) GetSupportsUiPolicy() bool {
+	if x != nil {
+		return x.SupportsUiPolicy
+	}
+	return false
 }
 
 // Static portable resource request forms reported by a compute driver.
@@ -3673,9 +3683,19 @@ type DeleteSandboxRequest struct {
 	// Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
 	// asynchronous cleanup and does not suppress authorization or parent errors.
 	AllowMissing bool `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	// Optional immutable sandbox identity precondition. When non-empty, the
+	// gateway rejects the request with ABORTED unless the currently resolved
+	// sandbox has this exact metadata ID. The check is repeated under the
+	// lifecycle lock immediately before any delete mutation.
+	ExpectedSandboxId string `protobuf:"bytes,5,opt,name=expected_sandbox_id,json=expectedSandboxId,proto3" json:"expected_sandbox_id,omitempty"`
+	// Optional optimistic-concurrency precondition. Requires
+	// expected_sandbox_id. When non-zero, the gateway rejects the request with
+	// ABORTED unless the sandbox's current resource version matches this value
+	// immediately before any delete mutation.
+	ExpectedResourceVersion uint64 `protobuf:"varint,6,opt,name=expected_resource_version,json=expectedResourceVersion,proto3" json:"expected_resource_version,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3729,6 +3749,20 @@ func (x *DeleteSandboxRequest) GetAllowMissing() bool {
 		return x.AllowMissing
 	}
 	return false
+}
+
+func (x *DeleteSandboxRequest) GetExpectedSandboxId() string {
+	if x != nil {
+		return x.ExpectedSandboxId
+	}
+	return ""
+}
+
+func (x *DeleteSandboxRequest) GetExpectedResourceVersion() uint64 {
+	if x != nil {
+		return x.ExpectedResourceVersion
+	}
+	return 0
 }
 
 func (x *DeleteSandboxRequest) GetRequestId() string {
@@ -15211,12 +15245,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fcompute_drivers\x18\x03 \x03(\v2\x1f.openshell.v1.ComputeDriverInfoR\x0ecomputeDrivers\"t\n" +
 	"\x11ComputeDriverInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12K\n" +
-	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xbc\x01\n" +
+	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xea\x01\n" +
 	"\x19ComputeDriverCapabilities\x12\x1f\n" +
 	"\vdriver_name\x18\x01 \x01(\tR\n" +
 	"driverName\x12%\n" +
 	"\x0edriver_version\x18\x02 \x01(\tR\rdriverVersion\x12W\n" +
-	"\x15resource_capabilities\x18\x03 \x01(\v2\".openshell.v1.ResourceCapabilitiesR\x14resourceCapabilities\"\xca\x01\n" +
+	"\x15resource_capabilities\x18\x03 \x01(\v2\".openshell.v1.ResourceCapabilitiesR\x14resourceCapabilities\x12,\n" +
+	"\x12supports_ui_policy\x18\x04 \x01(\bR\x10supportsUiPolicy\"\xca\x01\n" +
 	"\x14ResourceCapabilities\x127\n" +
 	"\x03cpu\x18\x01 \x01(\v2%.openshell.v1.CpuResourceCapabilitiesR\x03cpu\x12@\n" +
 	"\x06memory\x18\x02 \x01(\v2(.openshell.v1.MemoryResourceCapabilitiesR\x06memory\x127\n" +
@@ -15413,13 +15448,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12R\n" +
 	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\xd3\x01\n" +
+	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\xbf\x02\n" +
 	"\x14DeleteSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
-	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12\x1d\n" +
+	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12.\n" +
+	"\x13expected_sandbox_id\x18\x05 \x01(\tR\x11expectedSandboxId\x12:\n" +
+	"\x19expected_resource_version\x18\x06 \x01(\x04R\x17expectedResourceVersion\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\xac\x01\n" +
+	"request_id\x18\a \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\xac\x01\n" +
 	"\x12StopSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +

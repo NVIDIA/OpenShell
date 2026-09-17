@@ -16,7 +16,8 @@
 //!
 //! Each transition consumes the prior state by value (`self: Box<Self>`).
 //! Trusted backend implementations construct confirmation through a validating
-//! constructor; the supervisor cannot obtain a ready boundary without evidence.
+//! constructor; the supervisor cannot obtain a ready boundary without confirmed
+//! backend-neutral enforcement properties.
 //! The supervisor holds no `match`/downcast on concrete backends: the
 //! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
@@ -30,7 +31,7 @@
 //! The contract is transport-neutral. Compute drivers keep runtime placement
 //! and coordination details behind these interfaces.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -369,6 +370,15 @@ pub trait BoundBoundary: Send {
     /// Retained by the supervisor before consuming `Bound`.
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
 
+    /// Driver-provisioned direct proxy listener for backends whose outer
+    /// fence can route workload traffic to a host listener but cannot stage
+    /// individual socket opens. The supervisor owns this listener and its
+    /// policy evaluation; the generation-scoped authorization prevents other
+    /// local processes from entering the sandbox's policy context.
+    fn direct_proxy_configuration(&self) -> Option<DirectProxyConfiguration> {
+        None
+    }
+
     /// Trusted host-side dial target for the well-known host-gateway aliases.
     ///
     /// Backends return this when the mediation service runs outside the
@@ -385,190 +395,187 @@ pub trait BoundBoundary: Send {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
 }
 
-/// Capability masks measured from `/proc/<pid>/status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityEvidence {
-    pub inheritable: u64,
-    pub permitted: u64,
-    pub effective: u64,
-    pub bounding: u64,
-    pub ambient: u64,
+/// Authenticated host listener used by an isolation backend's explicit-proxy
+/// path.
+///
+/// This is control-plane material and must be delivered through the protected
+/// runtime descriptor, never command-line arguments or logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectProxyConfiguration {
+    pub bind_addr: SocketAddr,
+    /// Exact HTTP `Proxy-Authorization` value required from this generation.
+    pub authorization: String,
+    /// Driver-resolved identity applied to direct-listener requests.
+    pub binary_identity: BinaryIdentity,
 }
 
-impl CapabilityEvidence {
-    /// True only when every Linux capability set is empty.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.inheritable == 0
-            && self.permitted == 0
-            && self.effective == 0
-            && self.bounding == 0
-            && self.ambient == 0
+impl fmt::Debug for DirectProxyConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectProxyConfiguration")
+            .field("bind_addr", &self.bind_addr)
+            .field("authorization", &"<redacted>")
+            .field("binary_identity", &self.binary_identity)
+            .finish()
     }
 }
 
-/// Active seccomp notification and socket-broker evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "each independently measured kernel operation is reported explicitly"
-)]
-pub struct SeccompEvidence {
-    pub new_listener: bool,
-    pub notification_round_trip: bool,
-    pub id_validation: bool,
-    pub addfd_send: bool,
-    pub retained_socket_operation: bool,
-    pub proc_fd_identity: bool,
-    pub task_memory_read: bool,
-    pub task_memory_write: bool,
-    pub cancellation: bool,
-}
-
-/// Driver-owned evidence that the mandatory outer network fence is installed.
+/// Backend-neutral guarantees established by the compute driver's outer fence.
 ///
-/// The sandbox cannot observe the Docker daemon, Kubernetes API, or VM device
-/// model directly. Drivers therefore bind the exact fence they validated into
-/// both protected bootstrap halves. The sandbox reports that value back during
-/// confirmation, and the supervisor rejects any mismatch before agent launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "backend", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum DriverFenceEvidence {
-    Docker {
-        container_id: String,
-        network_mode: String,
-        unexpected_networks: Vec<String>,
-    },
-    Podman {
-        container_id: String,
-        network_mode: String,
-        unexpected_networks: Vec<String>,
-    },
-    Kubernetes {
-        network_policy_uid: String,
-        network_policy_resource_version: String,
-        ingress_isolated: bool,
-        egress_isolated: bool,
-        egress_rule_count: u32,
-    },
-    Vm {
-        generation: String,
-        network_device_count: u32,
-    },
+/// Each driver owns its native evidence schema and the code that validates it.
+/// After validation, the driver projects that evidence into these guarantees
+/// and supplies a digest that binds the original evidence to this generation.
+/// The common runtime only validates and compares this projection; it never
+/// interprets runtime- or accelerator-specific fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OuterFenceGuarantee {
+    /// No workload packet can leave without an explicit mediated decision.
+    DefaultDenyEgress,
+    /// The driver found no network path outside the mediated boundary.
+    NoUnmanagedEgressPath,
+    /// Previously granted access can be revoked by the driver-owned fence.
+    RevocationVerified,
+    /// Loss of the driver or its controller does not open network access.
+    ControllerLossFailsClosed,
 }
 
-impl DriverFenceEvidence {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OuterFenceGuarantees {
+    /// Sandbox generation for which the evidence was collected.
+    pub generation: String,
+    /// Complete set of normalized guarantees established by the driver.
+    pub established: BTreeSet<OuterFenceGuarantee>,
+    /// Commitment to the driver-owned native evidence used for this projection.
+    pub evidence_digest: Sha256Digest,
+}
+
+impl OuterFenceGuarantees {
+    /// Construct guarantees after the driver has validated its native evidence.
+    pub fn confirmed(
+        generation: impl Into<String>,
+        native_evidence: &[u8],
+    ) -> Result<Self, BackendError> {
+        let generation = generation.into();
+        if generation.is_empty() || native_evidence.is_empty() {
+            return Err(BackendError::Descriptor(
+                "outer fence generation and native evidence are required".to_string(),
+            ));
+        }
+        let mut binding = Vec::with_capacity(8 + generation.len() + native_evidence.len());
+        binding.extend_from_slice(&(generation.len() as u64).to_be_bytes());
+        binding.extend_from_slice(generation.as_bytes());
+        binding.extend_from_slice(native_evidence);
+        Ok(Self {
+            generation,
+            established: BTreeSet::from([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::NoUnmanagedEgressPath,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]),
+            evidence_digest: Sha256Digest::compute(&binding),
+        })
+    }
+
+    /// Validate the common guarantees against the admitted generation.
+    pub fn validate(&self, expected_generation: &str) -> Result<(), BackendError> {
+        let required = BTreeSet::from([
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ]);
+        let complete = !self.generation.is_empty()
+            && self.generation == expected_generation
+            && self.established == required;
+        if complete {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "outer fence guarantees are incomplete or bound to another generation".to_string(),
+            ))
+        }
+    }
+}
+
+/// A backend-neutral security property established before agent launch.
+///
+/// `mechanism` is diagnostic and audit metadata. It never authorizes launch;
+/// the registered backend is responsible for validating its mechanism-specific
+/// evidence before setting `enforced`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcedProperty {
+    pub enforced: bool,
+    pub mechanism: String,
+}
+
+impl EnforcedProperty {
     #[must_use]
-    pub const fn driver_name(&self) -> &'static str {
-        match self {
-            Self::Docker { .. } => "docker",
-            Self::Podman { .. } => "podman",
-            Self::Kubernetes { .. } => "kubernetes",
-            Self::Vm { .. } => "vm",
+    pub fn new(enforced: bool, mechanism: impl Into<String>) -> Self {
+        Self {
+            enforced,
+            mechanism: mechanism.into(),
         }
     }
 
-    /// Validate the concrete outer-fence properties reported by the compute driver.
-    pub fn validate(&self) -> Result<(), BackendError> {
-        let valid = match self {
-            Self::Docker {
-                container_id,
-                network_mode,
-                unexpected_networks,
-            }
-            | Self::Podman {
-                container_id,
-                network_mode,
-                unexpected_networks,
-            } => {
-                !container_id.is_empty() && network_mode == "none" && unexpected_networks.is_empty()
-            }
-            Self::Kubernetes {
-                network_policy_uid,
-                network_policy_resource_version,
-                ingress_isolated,
-                egress_isolated,
-                egress_rule_count,
-            } => {
-                !network_policy_uid.is_empty()
-                    && !network_policy_resource_version.is_empty()
-                    && *ingress_isolated
-                    && *egress_isolated
-                    && *egress_rule_count == 0
-            }
-            Self::Vm {
-                generation,
-                network_device_count,
-            } => !generation.is_empty() && *network_device_count == 0,
-        };
-        if valid {
+    fn validate(&self, name: &str) -> Result<(), BackendError> {
+        if self.enforced && !self.mechanism.trim().is_empty() {
             Ok(())
         } else {
             Err(BackendError::Confirm(format!(
-                "{} driver fence evidence is incomplete",
-                self.driver_name()
+                "{name} is not enforced or has no declared mechanism"
             )))
         }
     }
 }
 
-/// Measured sandbox-owned evidence produced before agent launch.
+/// Security properties every isolation backend establishes before launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "confirmation preserves independently measured security results"
-)]
-pub struct SandboxConfirmEvidence {
+pub struct BoundaryProperties {
+    pub filesystem_confinement: EnforcedProperty,
+    pub egress_interception: EnforcedProperty,
+    pub request_attribution: EnforcedProperty,
+    pub privilege_floor: EnforcedProperty,
+}
+
+impl BoundaryProperties {
+    fn validate(&self) -> Result<(), BackendError> {
+        self.filesystem_confinement
+            .validate("filesystem confinement")?;
+        self.egress_interception.validate("egress interception")?;
+        self.request_attribution.validate("request attribution")?;
+        self.privilege_floor.validate("privilege floor")
+    }
+}
+
+/// Per-boundary confirmation produced before agent launch.
+///
+/// Common validation binds the confirmation to the admitted workload and
+/// checks backend-neutral properties. `backend_audit` remains opaque to this
+/// crate; the registered backend owns its schema and validates it before
+/// constructing [`ConfirmedBoundary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryConfirmation {
     pub generation: String,
     pub identity: ResolvedWorkloadIdentity,
-    pub capabilities: CapabilityEvidence,
-    pub no_new_privileges: bool,
-    pub sandbox_dumpable: bool,
-    pub child_dumpable: bool,
-    pub core_limit_zero: bool,
-    pub native_architecture: String,
-    pub kernel_release: String,
-    pub seccomp: SeccompEvidence,
-    pub landlock_abi: u32,
-    pub landlock_allow_deny: bool,
-    pub udp_dns_round_trip: bool,
-    pub tcp_dns_round_trip: bool,
-    pub tcp_allow_round_trip: bool,
-    pub tcp_deny_round_trip: bool,
+    pub properties: BoundaryProperties,
     pub authenticated_supervisor: bool,
     pub session_id: SandboxSessionId,
-    pub driver_fence: DriverFenceEvidence,
+    pub outer_fence: OuterFenceGuarantees,
     /// The driver-owned containment primitive terminates the workload when its
     /// Sandbox Runtime exits.
     pub runtime_exit_terminates_workload: bool,
     pub resource_claims: BTreeMap<String, String>,
+    pub backend_audit: serde_json::Value,
 }
 
-impl SandboxConfirmEvidence {
-    /// Validate the security-critical evidence required before launch.
+impl BoundaryConfirmation {
+    /// Validate common security properties and immutable launch binding.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
-        self.driver_fence.validate()?;
+        self.outer_fence.validate(&self.generation)?;
+        self.properties.validate()?;
         let complete = &self.identity == expected
-            && self.capabilities.is_empty()
-            && self.no_new_privileges
-            && !self.sandbox_dumpable
-            && self.child_dumpable
-            && self.core_limit_zero
-            && self.seccomp.new_listener
-            && self.seccomp.notification_round_trip
-            && self.seccomp.id_validation
-            && self.seccomp.addfd_send
-            && self.seccomp.retained_socket_operation
-            && self.seccomp.proc_fd_identity
-            && self.seccomp.task_memory_read
-            && self.seccomp.task_memory_write
-            && self.seccomp.cancellation
-            && self.landlock_abi >= 3
-            && self.landlock_allow_deny
-            && self.udp_dns_round_trip
-            && self.tcp_dns_round_trip
-            && self.tcp_allow_round_trip
-            && self.tcp_deny_round_trip
             && self.authenticated_supervisor
             && self.runtime_exit_terminates_workload
             && !self.generation.is_empty();
@@ -576,41 +583,45 @@ impl SandboxConfirmEvidence {
             Ok(())
         } else {
             Err(BackendError::Confirm(
-                "sandbox confirmation evidence is incomplete or mismatched".to_string(),
+                "boundary confirmation is incomplete or mismatched".to_string(),
             ))
         }
     }
 }
 
-/// Ready boundary paired with the evidence measured by `confirm`.
+/// Ready boundary paired with the confirmation established by `confirm`.
 pub struct ConfirmedBoundary {
     boundary: Box<dyn ReadyBoundary>,
-    evidence: SandboxConfirmEvidence,
+    confirmation: BoundaryConfirmation,
 }
 
 impl ConfirmedBoundary {
-    /// Construct confirmation after checking measured evidence against the
-    /// immutable identity admitted at attach time.
+    /// Construct confirmation after checking backend-neutral properties and
+    /// immutable identity binding.
     ///
-    /// Backend implementations are trusted to collect this evidence and bind
-    /// it to their resource. This constructor enforces the common requirements
-    /// without requiring those implementations to live in the interface crate.
+    /// Backend implementations are trusted to validate their audit evidence and
+    /// bind this confirmation to their resource. This constructor enforces the
+    /// common requirements without requiring those implementations to live in
+    /// the interface crate.
     ///
     /// # Errors
     ///
-    /// Returns an error if evidence is incomplete or the identity does not match.
+    /// Returns an error if confirmation is incomplete or the identity does not match.
     pub fn try_new(
         boundary: Box<dyn ReadyBoundary>,
-        evidence: SandboxConfirmEvidence,
+        confirmation: BoundaryConfirmation,
         expected: &ResolvedWorkloadIdentity,
     ) -> Result<Self, BackendError> {
-        evidence.validate(expected)?;
-        Ok(Self { boundary, evidence })
+        confirmation.validate(expected)?;
+        Ok(Self {
+            boundary,
+            confirmation,
+        })
     }
 
-    /// Return the measured evidence carried by this confirmed state.
-    pub fn evidence(&self) -> &SandboxConfirmEvidence {
-        &self.evidence
+    /// Return the record carried by this confirmed state.
+    pub fn confirmation(&self) -> &BoundaryConfirmation {
+        &self.confirmation
     }
 
     /// Consume confirmation and advance to the sole launch-capable state.
@@ -831,7 +842,7 @@ pub trait BoundaryLoopbackConnector: Send + Sync {
 /// unavailable identity field cannot authorize the connection. How a backend
 /// resolves identity is private to that backend; the shape and the fail-closed
 /// semantics do not change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryIdentity {
     /// Absolute path of the executable resolved for the accepted connection.
     pub binary_path: PathBuf,
@@ -865,6 +876,12 @@ impl From<Sha256Digest> for String {
 }
 
 impl Sha256Digest {
+    fn compute(bytes: &[u8]) -> Self {
+        use sha2::{Digest as _, Sha256};
+
+        Self(Sha256::digest(bytes).into())
+    }
+
     /// Return the raw digest bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {

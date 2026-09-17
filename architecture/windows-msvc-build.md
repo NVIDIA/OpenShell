@@ -11,8 +11,9 @@ driver. It does not make Windows a Docker, Kubernetes, Podman, or VM runtime hos
 - Preserve gateway configuration parsing for all existing compute driver names.
 - Build and test the in-process MXC driver on supported Windows hosts.
 - Use the ordinary in-process compute-driver composition path; MXC receives the
-  canonical sandbox policy through `DriverSandboxSpec` and advertises that it
-  reports runtime readiness.
+  canonical sandbox policy through `DriverSandboxSpec`, then starts the standard
+  host supervisor and in-ProcessContainer sandbox boundary. Supervisor session
+  readiness remains authoritative.
 - Return clear unsupported errors when a Windows gateway is configured to use Docker, Kubernetes, Podman, or VM.
 - Keep dedicated `windows:*` validation tasks while allowing the repository-wide
   `pre-commit` task to delegate compiler-bearing Rust checks to the native
@@ -49,9 +50,9 @@ domain sockets. Their libraries remain in the gateway dependency graph, so the
 gateway's credential-driver configuration and in-process behavior still compile
 on Windows.
 
-The standalone sandbox and supervisor runtimes are Unix-only and are excluded
-as top-level Windows workspace targets. The MXC driver links only the
-cross-platform supervisor network library needed by its host egress proxy.
+The sandbox, supervisor, and supervisor-process crates compile on Windows and
+form the RFC 0012 MXC runtime pair. The release lane builds both runtime
+binaries with the gateway and CLI.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
@@ -59,7 +60,7 @@ cross-platform supervisor network library needed by its host egress proxy.
 | Kubernetes | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
 | Podman | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
 | VM | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
-| MXC | Driver links into the native gateway and runs in Windows validation. | `process_container` is default-deny; grant-only `isolation_session` requires explicit configuration. |
+| MXC | Driver, supervisor, and sandbox compile in the native Windows lane. | `process_container` supplies the default-deny outer fence and authenticated RFC 0012 runtime pair; `isolation_session` is rejected. |
 
 This keeps Windows behavior explicit without carrying runtime dependencies or
 creating misleading Windows driver artifacts.
@@ -88,8 +89,8 @@ Windows validation is exposed through `tasks/windows.toml`:
 | `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI build graph. |
 | `windows:lint:x64` | Run Clippy over the Windows-supported workspace for x64 MSVC. |
 | `windows:lint:arm64` | Run Clippy over the Windows-supported workspace for ARM64 MSVC. |
-| `windows:build:x64` | Build release x64 `openshell-gateway.exe` and `openshell.exe`. |
-| `windows:build:arm64` | Build release ARM64 `openshell-gateway.exe` and `openshell.exe`. |
+| `windows:build:x64` | Build release x64 `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-sandbox.exe`. |
+| `windows:build:arm64` | Build the same four release binaries for ARM64. |
 | `windows:test:x64` | Run native x64 workspace tests with the nextest CI profile and server test support, while excluding unsupported Windows packages as top-level test targets. |
 | `windows:test:arm64` | Run the same suite natively on ARM64. |
 | `windows:test:unsupported:x64` | Run focused gateway-composition tests for unsupported driver contracts. |
@@ -199,7 +200,7 @@ native rather than emulated coverage.
 A successful Windows build report should include:
 
 - x64 and ARM64 `cargo check` status.
-- x64 and ARM64 release build status for `openshell-gateway.exe` and `openshell.exe`.
+- x64 and ARM64 release build status for `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-sandbox.exe`.
 - x64 test summary.
 - Native ARM64 test summary when validation runs on an ARM64 host.
 - Focused unsupported-driver contract test status.

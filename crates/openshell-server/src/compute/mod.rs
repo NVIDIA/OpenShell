@@ -36,9 +36,11 @@ use openshell_core::proto::compute::v1::{
     watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint,
+    SshSession,
 };
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 use prost::Message;
@@ -65,6 +67,62 @@ pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+pub type SandboxProviderCredentialsSink = Arc<StdMutex<HashMap<String, ProviderCredentialState>>>;
+
+/// Driver-specific values that must be delivered atomically with sandbox
+/// creation without expanding the public compute-driver protobuf contract.
+#[derive(Clone, Default)]
+pub struct SandboxCreateRuntimeInputs {
+    pub effective_policy: Option<ProtoSandboxPolicy>,
+    pub provider_credentials: Option<ProviderCredentialState>,
+    pub launch_authentication: Option<Vec<u8>>,
+}
+
+impl SandboxCreateRuntimeInputs {
+    #[must_use]
+    pub(crate) fn new(
+        effective_policy: ProtoSandboxPolicy,
+        provider_credentials: Option<ProviderCredentialState>,
+    ) -> Self {
+        Self {
+            effective_policy: Some(effective_policy),
+            provider_credentials,
+            launch_authentication: None,
+        }
+    }
+}
+
+struct StagedProviderCredentials {
+    sink: SandboxProviderCredentialsSink,
+    sandbox_id: String,
+}
+
+impl StagedProviderCredentials {
+    fn stage(
+        sink: SandboxProviderCredentialsSink,
+        sandbox_id: &str,
+        credentials: ProviderCredentialState,
+    ) -> Self {
+        let mut pending = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.insert(sandbox_id.to_string(), credentials);
+        drop(pending);
+        Self {
+            sink,
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+}
+
+impl Drop for StagedProviderCredentials {
+    fn drop(&mut self) {
+        self.sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.sandbox_id);
+    }
+}
 
 use traced_driver::TracedDriver;
 
@@ -270,6 +328,16 @@ struct SandboxDeleteTarget {
     sandbox_name: String,
 }
 
+/// Optional caller-owned preconditions for an identity-safe sandbox delete.
+///
+/// These values are validated again while holding the sandbox lifecycle and
+/// gateway-global locks, immediately before the durable `Deleting` mutation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SandboxDeletePreconditions {
+    pub expected_sandbox_id: Option<String>,
+    pub expected_resource_version: Option<u64>,
+}
+
 /// Identity and driver result for a completed delete request.
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeleteSandboxResult {
@@ -307,6 +375,7 @@ enum BeginDelete {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComputeDriverInfoSnapshot {
     /// Gateway-selected driver name used for routing and `driver_config` keys.
     pub name: String,
@@ -326,6 +395,9 @@ pub struct ComputeDriverInfoSnapshot {
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
     pub rootfs_tar_max_bytes: u64,
+    /// Whether this configured driver instance completely enforces the portable
+    /// UI policy contract.
+    pub supports_ui_policy: bool,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -616,6 +688,7 @@ pub struct ComputeRuntime {
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
+    provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -652,6 +725,7 @@ impl ComputeRuntime {
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
+        provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
@@ -681,6 +755,7 @@ impl ComputeRuntime {
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
+            supports_ui_policy: capabilities.supports_ui_policy,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -748,6 +823,7 @@ impl ComputeRuntime {
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
             default_image,
+            provider_credentials_sink,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -799,6 +875,7 @@ impl ComputeRuntime {
             endpoint.name,
             driver,
             endpoint.driver_process,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -811,6 +888,12 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    /// Whether this in-process driver accepts create-time provider state.
+    #[must_use]
+    pub(crate) fn accepts_create_time_provider_credentials(&self) -> bool {
+        self.provider_credentials_sink.is_some()
     }
 
     #[must_use]
@@ -918,8 +1001,26 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_sandbox_create_with_runtime_inputs(
+            sandbox,
+            &SandboxCreateRuntimeInputs::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_sandbox_create_with_runtime_inputs(
+        &self,
+        sandbox: &Sandbox,
+        runtime_inputs: &SandboxCreateRuntimeInputs,
+    ) -> Result<(), Status> {
+        self.validate_policy_capabilities(sandbox, runtime_inputs.effective_policy.as_ref())?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(effective_policy) = runtime_inputs.effective_policy.as_ref()
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy.clone());
+        }
         // Peek, never consume: create runs the same path immediately after and
         // must still find the token.
         if let Some(token) = take_staging_token(&mut driver_sandbox) {
@@ -942,17 +1043,35 @@ impl ComputeRuntime {
             .map(|_| ())
     }
 
+    fn validate_policy_capabilities(
+        &self,
+        sandbox: &Sandbox,
+        effective_policy: Option<&ProtoSandboxPolicy>,
+    ) -> Result<(), Status> {
+        let has_explicit_ui = effective_policy
+            .or_else(|| sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()))
+            .and_then(|policy| policy.ui.as_ref())
+            .is_some();
+        if has_explicit_ui && !self.driver_info.supports_ui_policy {
+            return Err(Status::invalid_argument(format!(
+                "compute driver '{}' does not support the complete UI policy contract; remove the explicit ui section or select a supporting driver/backend",
+                self.driver_info.name
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn create_sandbox(
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
-        self.create_sandbox_authenticated(
+        self.create_sandbox_with_runtime_inputs(
             sandbox,
             sandbox_token,
-            None,
             await_main_process_attachment,
+            SandboxCreateRuntimeInputs::default(),
         )
         .await
     }
@@ -964,6 +1083,34 @@ impl ComputeRuntime {
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
+        self.create_sandbox_with_runtime_inputs(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            SandboxCreateRuntimeInputs {
+                launch_authentication,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn create_sandbox_with_runtime_inputs(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        await_main_process_attachment: bool,
+        runtime_inputs: SandboxCreateRuntimeInputs,
+    ) -> Result<Sandbox, Status> {
+        // Defense in depth for internal callers that bypass the public create
+        // handler's ValidateSandboxCreate step. This check has no side effects.
+        self.validate_policy_capabilities(&sandbox, runtime_inputs.effective_policy.as_ref())?;
+        if runtime_inputs.provider_credentials.is_some() && self.provider_credentials_sink.is_none()
+        {
+            return Err(Status::internal(
+                "provider credentials supplied to a compute driver without a create-time sink",
+            ));
+        }
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -978,6 +1125,11 @@ impl ComputeRuntime {
 
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(effective_policy) = runtime_inputs.effective_policy
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy);
+        }
         if let Some(staged) = staged.as_ref() {
             set_rootfs_tar_path(&mut driver_sandbox, staged.path());
         }
@@ -1026,8 +1178,20 @@ impl ComputeRuntime {
         }
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
-            spec.launch_authentication = launch_authentication.unwrap_or_default();
+            spec.launch_authentication = runtime_inputs.launch_authentication.unwrap_or_default();
         }
+        let _staged_provider_credentials = match (
+            self.provider_credentials_sink.clone(),
+            runtime_inputs.provider_credentials,
+        ) {
+            (Some(sink), Some(credentials)) => Some(StagedProviderCredentials::stage(
+                sink,
+                &sandbox_id,
+                credentials,
+            )),
+            (None, Some(_)) => unreachable!("provider credential sink checked before persistence"),
+            (_, None) => None,
+        };
         match self
             .driver
             .call(
@@ -1578,8 +1742,12 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_allow_missing(workspace, name, false)
-            .await
+        self.delete_sandbox_with_preconditions(
+            workspace,
+            name,
+            SandboxDeletePreconditions::default(),
+        )
+        .await
     }
 
     pub(crate) async fn delete_sandbox_allow_missing(
@@ -1587,6 +1755,48 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
         allow_missing: bool,
+    ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_with_options(
+            workspace,
+            name,
+            allow_missing,
+            SandboxDeletePreconditions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_sandbox_with_preconditions(
+        &self,
+        workspace: &str,
+        name: &str,
+        preconditions: SandboxDeletePreconditions,
+    ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_with_options(workspace, name, false, preconditions)
+            .await
+    }
+
+    pub(crate) async fn delete_sandbox_allow_missing_with_preconditions(
+        &self,
+        workspace: &str,
+        name: &str,
+        allow_missing: bool,
+        preconditions: SandboxDeletePreconditions,
+    ) -> Result<DeleteSandboxResult, Status> {
+        if preconditions == SandboxDeletePreconditions::default() {
+            return self
+                .delete_sandbox_allow_missing(workspace, name, allow_missing)
+                .await;
+        }
+        self.delete_sandbox_with_options(workspace, name, allow_missing, preconditions)
+            .await
+    }
+
+    async fn delete_sandbox_with_options(
+        &self,
+        workspace: &str,
+        name: &str,
+        allow_missing: bool,
+        preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
         // Resolve and acquire both request-side locks before spawning the
         // owned worker. Cancellation while any of these awaits is pending is
@@ -1605,6 +1815,15 @@ impl ComputeRuntime {
             }
             return Err(Status::not_found("sandbox not found"));
         };
+        if preconditions
+            .expected_sandbox_id
+            .as_deref()
+            .is_some_and(|expected| expected != candidate.object_id())
+        {
+            return Err(Status::aborted(
+                "sandbox identity does not match expected_sandbox_id",
+            ));
+        }
         let target = SandboxDeleteTarget {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
@@ -1622,7 +1841,7 @@ impl ComputeRuntime {
         tokio::spawn(
             async move {
                 runtime
-                    .delete_sandbox_inner(target, delete_guard, global_guard)
+                    .delete_sandbox_inner(target, preconditions, delete_guard, global_guard)
                     .await
             }
             .instrument(request_span),
@@ -1638,6 +1857,7 @@ impl ComputeRuntime {
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
+        preconditions: SandboxDeletePreconditions,
         delete_guard: SandboxLifecycleGuard,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<DeleteSandboxResult, Status> {
@@ -1659,6 +1879,23 @@ impl ComputeRuntime {
         if current.object_name() != target.sandbox_name {
             return Err(Status::aborted(
                 "sandbox name changed while the delete request was waiting; retry explicitly",
+            ));
+        }
+        if preconditions
+            .expected_sandbox_id
+            .as_deref()
+            .is_some_and(|expected| expected != current.object_id())
+        {
+            return Err(Status::aborted(
+                "sandbox identity changed before delete mutation",
+            ));
+        }
+        if preconditions
+            .expected_resource_version
+            .is_some_and(|expected| expected != sandbox_resource_version(&current))
+        {
+            return Err(Status::aborted(
+                "sandbox resource version changed before delete mutation",
             ));
         }
 
@@ -5062,6 +5299,7 @@ impl ComputeDriver for NoopTestDriver {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             },
         ))
     }
@@ -5209,10 +5447,12 @@ pub fn new_test_runtime_with_driver(
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_ui_policy: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
+        provider_credentials_sink: None,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -5235,6 +5475,7 @@ mod tests {
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
         ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
+    use openshell_core::proto::{SandboxPolicy as PublicSandboxPolicy, UiPolicy};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as TestMutex};
@@ -5514,6 +5755,11 @@ mod tests {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
+        validate_create_calls: AtomicUsize,
+        create_calls: AtomicUsize,
+        provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
+        provider_env_at_create: TestMutex<Option<HashMap<String, String>>>,
+        created_sandboxes: TestMutex<Vec<DriverSandbox>>,
     }
 
     #[tonic::async_trait]
@@ -5546,6 +5792,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             }))
         }
 
@@ -5562,6 +5809,7 @@ mod tests {
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+            self.validate_create_calls.fetch_add(1, Ordering::Relaxed);
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
         }
 
@@ -5611,8 +5859,28 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            self.create_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(sandbox) = request.into_inner().sandbox {
+                if let Some(sink) = &self.provider_credentials_sink {
+                    let credentials = sink
+                        .lock()
+                        .expect("provider credential staging lock poisoned")
+                        .get(&sandbox.id)
+                        .cloned()
+                        .expect("provider credentials must be staged before driver create");
+                    *self
+                        .provider_env_at_create
+                        .lock()
+                        .expect("provider env observation lock poisoned") =
+                        Some(credentials.child_env_with_gcp_resolved());
+                }
+                self.created_sandboxes
+                    .lock()
+                    .expect("created sandbox observation lock poisoned")
+                    .push(sandbox);
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -5899,6 +6167,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             }))
         }
 
@@ -6116,10 +6385,12 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
+            provider_credentials_sink: None,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -6131,6 +6402,200 @@ mod tests {
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         }
+    }
+
+    fn sandbox_with_explicit_ui(id: &str) -> Sandbox {
+        let mut sandbox = sandbox_record(id, "ui-policy", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(PublicSandboxPolicy {
+                ui: Some(UiPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_rejects_before_unsupported_driver_validation() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+
+        let error = runtime
+            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-validate"))
+            .await
+            .expect_err("an unsupported driver must reject explicit UI policy");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("complete UI policy contract"));
+        assert_eq!(
+            driver.validate_create_calls.load(Ordering::Relaxed),
+            0,
+            "gateway capability validation must run before the driver RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_rejects_before_unsupported_driver_create() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+
+        let error = runtime
+            .create_sandbox(sandbox_with_explicit_ui("sb-ui-create"), None, false)
+            .await
+            .expect_err("an internal caller must not bypass UI capability validation");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            driver.create_calls.load(Ordering::Relaxed),
+            0,
+            "unsupported UI policy must fail before provisioning"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_ui_policy_rejects_before_unsupported_driver_validation() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-effective-ui",
+            "effective-ui-policy",
+            SandboxPhase::Provisioning,
+        );
+        let runtime_inputs = SandboxCreateRuntimeInputs::new(
+            PublicSandboxPolicy {
+                ui: Some(UiPolicy::default()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let error = runtime
+            .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
+            .await
+            .expect_err("an unsupported driver must reject the effective UI policy");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_reaches_driver_when_capability_is_complete() {
+        let driver = Arc::new(TestDriver::default());
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.driver_info.supports_ui_policy = true;
+
+        runtime
+            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-supported"))
+            .await
+            .expect("a driver advertising complete UI support accepts validation");
+
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn absent_ui_policy_preserves_unsupported_driver_behavior() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-no-ui", "no-ui-policy", SandboxPhase::Provisioning);
+
+        runtime
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("an absent UI section must preserve existing behavior");
+
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn create_runtime_inputs_reach_driver_without_persisting_effective_policy_or_secrets() {
+        let sink: SandboxProviderCredentialsSink = Arc::new(TestMutex::new(HashMap::new()));
+        let driver = Arc::new(TestDriver {
+            provider_credentials_sink: Some(sink.clone()),
+            ..Default::default()
+        });
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.provider_credentials_sink = Some(sink.clone());
+
+        let mut sandbox = sandbox_record(
+            "sb-provider-inputs",
+            "provider-inputs",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(PublicSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let provider_credentials = ProviderCredentialState::from_environment(
+            17,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "raw-test-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let runtime_inputs = SandboxCreateRuntimeInputs::new(
+            PublicSandboxPolicy {
+                version: 2,
+                ..Default::default()
+            },
+            Some(provider_credentials),
+        );
+
+        runtime
+            .create_sandbox_with_runtime_inputs(sandbox, None, false, runtime_inputs)
+            .await
+            .expect("create should succeed");
+
+        let observed_env = driver
+            .provider_env_at_create
+            .lock()
+            .expect("provider env observation lock poisoned")
+            .clone()
+            .expect("driver should observe staged provider credentials");
+        let observed_token = &observed_env["GITHUB_TOKEN"];
+        assert_ne!(observed_token, "raw-test-token");
+        assert!(observed_token.starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC));
+        assert!(
+            sink.lock()
+                .expect("provider credential staging lock poisoned")
+                .is_empty(),
+            "create-time credentials must be removed after the driver call"
+        );
+
+        let observed_policy_version = {
+            let created = driver
+                .created_sandboxes
+                .lock()
+                .expect("created sandbox observation lock poisoned");
+            created[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version)
+        };
+        assert_eq!(
+            observed_policy_version,
+            Some(2),
+            "the driver must receive the effective policy"
+        );
+
+        let persisted = runtime
+            .store
+            .get_message::<Sandbox>("sb-provider-inputs")
+            .await
+            .expect("persisted sandbox lookup should succeed")
+            .expect("sandbox should be persisted");
+        assert_eq!(
+            persisted
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version),
+            Some(1),
+            "the public sandbox must retain its base policy"
+        );
     }
 
     async fn test_runtime_with_gateway_managed_lifecycle(
@@ -8943,6 +9408,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_guarded_delete_rejects_a_different_sandbox_before_mutation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-current", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-stale".to_string()),
+                    expected_resource_version: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.delete_calls(), 0);
+        let current = runtime
+            .store
+            .get_message::<Sandbox>("sb-current")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(current.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_guarded_delete_revalidates_resource_version_under_lifecycle_lock() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_resource_version = sandbox_resource_version(&current);
+
+        let delete_gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
+        let delete_guard = delete_gate.lock().await;
+        let delete_runtime = runtime.clone();
+        let delete = tokio::spawn(async move {
+            delete_runtime
+                .delete_sandbox_with_preconditions(
+                    "default",
+                    "sandbox-a",
+                    SandboxDeletePreconditions {
+                        expected_sandbox_id: Some("sb-1".to_string()),
+                        expected_resource_version: Some(expected_resource_version),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guarded delete did not start waiting on the sandbox gate");
+
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                expected_resource_version,
+                |sandbox| sandbox.set_current_policy_version(9),
+            )
+            .await
+            .unwrap();
+        drop(delete_guard);
+
+        let error = delete.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.delete_calls(), 0);
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.current_policy_version(), 9);
+        assert_eq!(
+            SandboxPhase::try_from(current.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_guarded_delete_accepts_the_exact_current_identity() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some(current.object_id().to_string()),
+                    expected_resource_version: Some(sandbox_resource_version(&current)),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.acknowledged());
+        assert_eq!(result.sandbox_id, "sb-1");
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn request_cancellation_does_not_cancel_the_delete_worker() {
         let driver = ControlledDriver::new();
         driver.block_delete();
@@ -10524,6 +11116,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -10695,6 +11288,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -11519,6 +12113,7 @@ mod tests {
         ComputeRuntime::from_driver(
             "test-driver".to_string(),
             Arc::new(TestDriver::default()),
+            None,
             None,
             store,
             SandboxIndex::new(),

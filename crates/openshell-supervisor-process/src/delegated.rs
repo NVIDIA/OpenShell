@@ -11,8 +11,10 @@ use miette::Result;
 use openshell_isolation_interface::contract::{
     BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
 };
+#[cfg(unix)]
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
+#[cfg(unix)]
 fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
     openshell_ocsf::ctx::ctx()
 }
@@ -77,6 +79,7 @@ impl Drop for BoundaryAccess {
 /// Start the supervisor access plane using sandbox-supplied exec and
 /// loopback-forwarding capabilities.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub async fn start_boundary_access(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
@@ -100,105 +103,114 @@ pub async fn start_boundary_access(
             main_session: None,
         });
     };
+    #[cfg(not(unix))]
+    return Err(miette::miette!(
+        "SSH access sockets are unsupported by the Windows supervisor"
+    ));
 
-    let attachment = agent
-        .attach()
-        .await
-        .map_err(|error| miette::miette!(error.to_string()))?;
-    let main_session = crate::main_session::MainSession::from_boundary(attachment, agent);
+    #[cfg(unix)]
+    {
+        let attachment = agent
+            .attach()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let main_session = crate::main_session::MainSession::from_boundary(attachment, agent);
 
-    let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
-    let listen_path = ssh_socket_path.clone();
-    let ssh_port_forward = port_forward.clone();
-    let ssh_main_session = main_session.clone();
-    let ssh_task = tokio::spawn(async move {
-        if let Err(error) = crate::ssh::run_ssh_server(
-            listen_path,
-            ssh_ready_tx,
-            ca_file_paths,
-            shared_ssh_socket,
-            ssh_port_forward,
-            boundary_exec,
-            Some(ssh_main_session),
-        )
-        .await
-        {
-            ocsf_emit!(
-                AppLifecycleBuilder::new(ocsf_ctx())
-                    .activity(ActivityId::Fail)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message(format!("SSH server failed: {error}"))
-                    .build()
-            );
-        }
-    });
+        let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
+        let listen_path = ssh_socket_path.clone();
+        let ssh_port_forward = port_forward.clone();
+        let ssh_main_session = main_session.clone();
+        let ssh_task = tokio::spawn(async move {
+            if let Err(error) = crate::ssh::run_ssh_server(
+                listen_path,
+                ssh_ready_tx,
+                ca_file_paths,
+                shared_ssh_socket,
+                ssh_port_forward,
+                boundary_exec,
+                Some(ssh_main_session),
+            )
+            .await
+            {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH server failed: {error}"))
+                        .build()
+                );
+            }
+        });
 
-    match tokio::time::timeout(Duration::from_secs(10), ssh_ready_rx).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => {
-            ssh_task.abort();
-            return Err(error.context("SSH server failed during startup"));
-        }
-        Ok(Err(_)) => {
-            ssh_task.abort();
-            return Err(miette::miette!(
-                "SSH server task ended before signaling readiness"
-            ));
-        }
-        Err(_) => {
-            ssh_task.abort();
-            return Err(miette::miette!(
-                "SSH server did not start within 10 seconds"
-            ));
-        }
-    }
-
-    let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
-        (Some(endpoint), Some(id)) => {
-            let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
-                endpoint.to_string(),
-                id.to_string(),
-                ssh_socket_path,
-                port_forward,
-                None,
-                terminating.clone(),
-                crate::supervisor_session::SessionRuntimeContext {
-                    instance_id: instance_id.clone(),
-                    session_id_updates: supervisor_session_updates,
-                },
-            );
-            let accepted_result =
-                tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))
-                    .await
-                    .map(|result| result.map(|_| ()));
-            match accepted_result {
-                Ok(Ok(())) => (Some(task), Some(accepted)),
-                Ok(Err(_)) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "supervisor session ended before gateway acceptance"
-                    ));
-                }
-                Err(_) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "gateway did not accept supervisor session within 10 seconds"
-                    ));
-                }
+        match tokio::time::timeout(Duration::from_secs(10), ssh_ready_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                ssh_task.abort();
+                return Err(error.context("SSH server failed during startup"));
+            }
+            Ok(Err(_)) => {
+                ssh_task.abort();
+                return Err(miette::miette!(
+                    "SSH server task ended before signaling readiness"
+                ));
+            }
+            Err(_) => {
+                ssh_task.abort();
+                return Err(miette::miette!(
+                    "SSH server did not start within 10 seconds"
+                ));
             }
         }
-        _ => (None, None),
-    };
 
-    Ok(BoundaryAccess {
-        instance_id,
-        terminating,
-        ssh_task: Some(ssh_task),
-        session_task,
-        session_readiness,
-        main_session: Some(main_session),
-    })
+        let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
+            (Some(endpoint), Some(id)) => {
+                let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
+                    endpoint.to_string(),
+                    id.to_string(),
+                    ssh_socket_path,
+                    port_forward,
+                    None,
+                    terminating.clone(),
+                    crate::supervisor_session::SessionRuntimeContext {
+                        instance_id: instance_id.clone(),
+                        session_id_updates: supervisor_session_updates,
+                    },
+                );
+                let accepted_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    accepted.wait_for(|ready| *ready),
+                )
+                .await
+                .map(|result| result.map(|_| ()));
+                match accepted_result {
+                    Ok(Ok(())) => (Some(task), Some(accepted)),
+                    Ok(Err(_)) => {
+                        task.abort();
+                        return Err(miette::miette!(
+                            "supervisor session ended before gateway acceptance"
+                        ));
+                    }
+                    Err(_) => {
+                        task.abort();
+                        return Err(miette::miette!(
+                            "gateway did not accept supervisor session within 10 seconds"
+                        ));
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+
+        Ok(BoundaryAccess {
+            instance_id,
+            terminating,
+            ssh_task: Some(ssh_task),
+            session_task,
+            session_readiness,
+            main_session: Some(main_session),
+        })
+    }
 }
 
 /// Report the canonical process exit until the gateway acknowledges it.

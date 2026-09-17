@@ -203,6 +203,7 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    direct_proxy: Option<openshell_isolation_interface::contract::DirectProxyConfiguration>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -469,10 +470,15 @@ pub async fn run_networking(
         // originating inside the namespace can reach the proxy. Otherwise the
         // proxy falls back to the policy-declared http_addr (loopback in
         // tests, etc.).
-        let bind_addr = proxy_bind_ip.map(|ip| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ip, port)
-        });
+        let bind_addr = direct_proxy
+            .as_ref()
+            .map(|proxy| proxy.bind_addr)
+            .or_else(|| {
+                proxy_bind_ip.map(|ip| {
+                    let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                    SocketAddr::new(ip, port)
+                })
+            });
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
@@ -493,7 +499,12 @@ pub async fn run_networking(
             mediated_policy_dns
                 .as_ref()
                 .map(|runtime| runtime.store.clone()),
-            None,
+            direct_proxy
+                .as_ref()
+                .map(|proxy| proxy.binary_identity.clone()),
+            direct_proxy
+                .as_ref()
+                .map(|proxy| Arc::<str>::from(proxy.authorization.clone())),
         )
         .await?;
         Some(proxy_handle)

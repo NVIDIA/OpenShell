@@ -217,6 +217,7 @@ mod tests {
         with_vars(
             [
                 ("XDG_CONFIG_HOME", Some(tmp.as_str())),
+                ("OPENSHELL_SYSTEM_GATEWAY_DIR", Some(tmp.as_str())),
                 ("OPENSHELL_GATEWAY", None::<&str>),
             ],
             f,

@@ -61,6 +61,7 @@ tokio-rustls = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+url = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -76,6 +77,9 @@ landlock = "0.4"
 seccompiler = "0.5"
 socket2 = { workspace = true }
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

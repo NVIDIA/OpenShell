@@ -25,7 +25,7 @@ pub struct LossItem {
 /// MXC capabilities that have no `OpenShell` *policy* equivalent. Surfaced in the
 /// loss report so reviewers understand the mapping is not symmetric.
 pub const OPEN_SHELL_SUPERSET_GAPS: &[&str] = &[
-    "MXC UI policy has no OpenShell policy equivalent: ui.disable, ui.clipboard, and ui.injection.",
+    "MXC processContainer UI refinements have no portable OpenShell policy equivalent: isolation, desktopSystemControl, systemSettings, and ime.",
     "MXC lifecycle fields have no OpenShell policy equivalent: destroyOnExit, preservePolicy, phase, and sandboxId.",
     "MXC backend selection and backend-specific blocks are outside OpenShell policy YAML.",
     "MXC process command, cwd, env, and timeout are runtime config fields, not OpenShell policy fields.",

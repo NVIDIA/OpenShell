@@ -21,8 +21,10 @@
 //! `start_agent` -> Running. Nothing untrusted runs inside the boundary until it
 //! is confirmed ready. This is enforced *by construction*: each transition
 //! consumes the prior state by value. Trusted backends construct confirmation
-//! through [`contract::ConfirmedBoundary::try_new`], which checks common evidence
-//! before the supervisor can obtain a [`contract::ReadyBoundary`].
+//! through [`contract::ConfirmedBoundary::try_new`], which checks common
+//! enforcement properties and immutable launch binding before the supervisor
+//! can obtain a [`contract::ReadyBoundary`]. Mechanism-specific evidence stays
+//! owned by the backend that can interpret it.
 //!
 //! [`AgentSpec`] is shared between the workload definition the supervisor
 //! submits and the [`contract::SandboxContext`] that `attach` binds to a

@@ -20,11 +20,42 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct KubernetesOuterFenceEvidence<'a> {
+    network_policy_uid: &'a str,
+    network_policy_resource_version: &'a str,
+    ingress_isolated: bool,
+    egress_isolated: bool,
+    egress_rule_count: u32,
+}
+
+impl KubernetesOuterFenceEvidence<'_> {
+    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
+        if self.network_policy_uid.is_empty()
+            || self.network_policy_resource_version.is_empty()
+            || !self.ingress_isolated
+            || !self.egress_isolated
+            || self.egress_rule_count != 0
+        {
+            return Err(BackendError::Descriptor(
+                "Kubernetes outer fence evidence is incomplete".to_string(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode Kubernetes outer fence evidence: {error}"))
+        })?;
+        OuterFenceGuarantees::confirmed(generation, &encoded)
+    }
+}
 
 /// Isolation backend implemented by the `OpenShell` sandbox runtime.
 pub const BACKEND_NAME: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -181,8 +212,7 @@ pub struct KubernetesSandboxRuntimeBoundaryProvisioning {
 impl KubernetesSandboxRuntimeBoundarySpec {
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
-    #[must_use]
-    pub fn provision(self) -> KubernetesSandboxRuntimeBoundaryProvisioning {
+    pub fn provision(self) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {
         let resource_claims = BTreeMap::from([
             ("kubernetes.namespace_uid".to_string(), self.namespace_uid),
             (
@@ -206,15 +236,16 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
-        let driver_fence = DriverFenceEvidence::Kubernetes {
-            network_policy_uid: resource_claims["kubernetes.egress_policy_uid"].clone(),
-            network_policy_resource_version:
-                resource_claims["kubernetes.egress_policy_resource_version"].clone(),
+        let outer_fence = KubernetesOuterFenceEvidence {
+            network_policy_uid: &resource_claims["kubernetes.egress_policy_uid"],
+            network_policy_resource_version: &resource_claims
+                ["kubernetes.egress_policy_resource_version"],
             ingress_isolated: true,
             egress_isolated: true,
             egress_rule_count: 0,
-        };
-        KubernetesSandboxRuntimeBoundaryProvisioning {
+        }
+        .project(&self.generation)?;
+        Ok(KubernetesSandboxRuntimeBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
                 generation: self.generation.clone(),
@@ -233,7 +264,8 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                     self.workload_pod_uid_path,
                 )]),
                 workload_identity: self.workload_identity.clone(),
-                driver_fence: driver_fence.clone(),
+                outer_fence: outer_fence.clone(),
+                direct_proxy_url: None,
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -247,10 +279,11 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 },
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
+                direct_proxy: None,
                 resource_claims,
-                driver_fence,
+                outer_fence,
             },
-        }
+        })
     }
 }
 
@@ -303,7 +336,7 @@ mod tests {
 
     #[test]
     fn provisioning_binds_identical_kubernetes_resource_claims() {
-        let provisioned = spec().provision();
+        let provisioned = spec().provision().unwrap();
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
@@ -318,21 +351,21 @@ mod tests {
             "1945"
         );
         assert_eq!(
-            provisioned.boundary_config.driver_fence,
-            provisioned.runtime_descriptor.driver_fence
+            provisioned.boundary_config.outer_fence,
+            provisioned.runtime_descriptor.outer_fence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .driver_fence
-                .validate()
+                .outer_fence
+                .validate("generation-1")
                 .is_ok()
         );
     }
 
     #[test]
     fn provisioning_uses_one_shared_tcp_protocol_across_pods() {
-        let provisioned = spec().provision();
+        let provisioned = spec().provision().unwrap();
 
         assert_eq!(
             provisioned.boundary_config.listener,

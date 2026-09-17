@@ -222,6 +222,7 @@ impl ProxyHandle {
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
+        required_proxy_authorization: Option<Arc<str>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -238,6 +239,11 @@ impl ProxyHandle {
         }
 
         let source_backed = network_mediation_source.is_some();
+        if source_backed && required_proxy_authorization.is_some() {
+            return Err(miette::miette!(
+                "proxy authorization cannot be required for a network mediation source"
+            ));
+        }
         let listener = if source_backed {
             None
         } else {
@@ -450,6 +456,7 @@ impl ProxyHandle {
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
+                        let required_authorization = required_proxy_authorization.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_mediated_connection(
@@ -473,6 +480,7 @@ impl ProxyHandle {
                                 dtx,
                                 atx,
                                 endpoint_observations,
+                                required_authorization,
                             )
                             .await
                             {
@@ -1274,6 +1282,8 @@ enum AcceptAction {
     },
 }
 
+// The resource-pressure counter is used only by the Unix errno classifier.
+#[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
@@ -1281,7 +1291,6 @@ fn classify_accept_error(
 ) -> AcceptAction {
     #[cfg(not(unix))]
     let _ = (err, &mut *consecutive_resource_errors);
-
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -2024,6 +2033,40 @@ where
     .await
 }
 
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn has_valid_proxy_authorization(request: &str, expected: &str) -> bool {
+    let mut provided = None;
+    for line in request.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            // Reject duplicates even when both values are correct. Accepting
+            // ambiguous credentials can produce parser differentials between
+            // this proxy and downstream HTTP implementations.
+            if provided.is_some() {
+                return false;
+            }
+            provided = Some(value.trim());
+        }
+    }
+
+    provided.is_some_and(|value| constant_time_bytes_eq(value.as_bytes(), expected.as_bytes()))
+}
+
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
@@ -2076,6 +2119,7 @@ async fn handle_tcp_connection(
         denial_tx,
         activity_tx,
         endpoint_observation_tx,
+        None,
     ))
     .await
 }
@@ -2147,6 +2191,7 @@ async fn handle_mediated_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
+    required_proxy_authorization: Option<Arc<str>>,
 ) -> Result<()> {
     // Bind observations to the policy/provider inventory active when this
     // connection was accepted, even if configuration changes while it runs.
@@ -2207,6 +2252,20 @@ async fn handle_mediated_connection(
         std::str::from_utf8(&buf[..header_end]).expect("validated HTTP request headers are UTF-8");
     if crate::l7::rest::parse_body_length(request).is_err() {
         respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
+    }
+    if let Some(expected) = required_proxy_authorization.as_deref()
+        && !has_valid_proxy_authorization(request, expected)
+    {
+        warn!("Rejected host proxy request with missing or invalid per-sandbox credentials");
+        respond(
+            &mut client,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"OpenShell\"\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await?;
         return Ok(());
     }
     let mut lines = request.split("\r\n");
@@ -6851,6 +6910,7 @@ network_policies: {}
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
             Some(Arc::new(FailedMediationSource)),
+            None,
             None,
             None,
         )

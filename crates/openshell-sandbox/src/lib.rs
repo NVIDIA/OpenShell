@@ -5,9 +5,12 @@
 
 #[cfg(target_os = "linux")]
 mod accept_interrupt;
+#[cfg(target_os = "linux")]
 pub mod boundary_exec;
+#[cfg(target_os = "linux")]
 pub mod boundary_io;
 mod boundary_server;
+#[cfg(target_os = "linux")]
 pub mod child_env;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
@@ -15,6 +18,7 @@ pub(crate) mod delegated;
 pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod main_session;
+#[cfg(target_os = "linux")]
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
@@ -22,7 +26,9 @@ mod network_broker;
 pub mod perf;
 #[cfg(unix)]
 pub mod process;
+#[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
 pub mod sandbox;
 
 /// Results of actively qualifying the admitted workload runtime before the
@@ -34,7 +40,7 @@ pub mod sandbox;
     reason = "qualification preserves independently exercised security results"
 )]
 pub struct RuntimeQualification {
-    pub seccomp: openshell_isolation_interface::contract::SeccompEvidence,
+    pub seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence,
     pub landlock_abi: u32,
     pub landlock_allow_deny: bool,
     pub udp_dns_round_trip: bool,

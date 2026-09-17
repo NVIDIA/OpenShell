@@ -99,10 +99,11 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             })?;
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
+        let direct_proxy = runtime_descriptor.direct_proxy.clone();
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
-        let driver_fence = runtime_descriptor.driver_fence.clone();
+        let outer_fence = runtime_descriptor.outer_fence.clone();
         let client = Arc::new(BoundaryClient::new(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
@@ -129,13 +130,14 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             sandbox_id: sandbox.sandbox_id,
             mediation: Arc::new(RemoteNetworkMediation { client }),
             host_gateway_ip,
+            direct_proxy,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
             identity: sandbox.identity,
             generation,
             session_id,
             resource_claims,
-            driver_fence,
+            outer_fence,
         }))
     }
 }
@@ -167,7 +169,9 @@ fn validate_runtime_descriptor(
         ));
     }
     validate_resource_claims(&runtime_descriptor.resource_claims)?;
-    runtime_descriptor.driver_fence.validate()?;
+    runtime_descriptor
+        .outer_fence
+        .validate(&runtime_descriptor.generation)?;
     match &runtime_descriptor.transport {
         SandboxTransport::Unix { socket_path } => {
             validate_socket_path(socket_path)?;
@@ -196,6 +200,18 @@ fn validate_runtime_descriptor(
         }
     }
     validate_client_tls(&runtime_descriptor.tls)?;
+    if let Some(proxy) = &runtime_descriptor.direct_proxy
+        && (!proxy.bind_addr.ip().is_loopback()
+            || proxy.bind_addr.port() == 0
+            || proxy.authorization.trim().is_empty()
+            || proxy.authorization.contains(['\r', '\n'])
+            || !proxy.binary_identity.binary_path.is_absolute())
+    {
+        return Err(BackendError::Descriptor(
+            "direct proxy requires a loopback listener, a single-line authorization value, and an absolute binary identity"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -272,13 +288,14 @@ struct RemoteBound {
     sandbox_id: String,
     mediation: Arc<RemoteNetworkMediation>,
     host_gateway_ip: Option<std::net::IpAddr>,
+    direct_proxy: Option<openshell_isolation_interface::contract::DirectProxyConfiguration>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     generation: String,
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
-    driver_fence: openshell_isolation_interface::contract::DriverFenceEvidence,
+    outer_fence: openshell_isolation_interface::contract::OuterFenceGuarantees,
 }
 
 #[async_trait]
@@ -291,19 +308,35 @@ impl BoundBoundary for RemoteBound {
         self.host_gateway_ip
     }
 
+    fn direct_proxy_configuration(
+        &self,
+    ) -> Option<openshell_isolation_interface::contract::DirectProxyConfiguration> {
+        self.direct_proxy.clone()
+    }
+
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
-        let Response::Confirmed { evidence } = response else {
-            return Err(unexpected_response("confirmed_with_evidence", &response));
+        let Response::Confirmed { confirmation } = response else {
+            return Err(unexpected_response("confirmed", &response));
         };
-        if evidence.generation != self.generation
-            || evidence.session_id != self.session_id
-            || evidence.resource_claims != self.resource_claims
-            || evidence.driver_fence != self.driver_fence
+        if confirmation.generation != self.generation
+            || confirmation.session_id != self.session_id
+            || confirmation.resource_claims != self.resource_claims
+            || confirmation.outer_fence != self.outer_fence
         {
             return Err(BackendError::Confirm(
-                "sandbox confirmation generation, session, resource claims, or driver fence do not match runtime descriptor"
+                "sandbox confirmation generation, session, resource claims, or outer fence do not match runtime descriptor"
                     .to_string(),
+            ));
+        }
+        let audit: crate::boundary_protocol::OpenShellBoundaryAuditEvidence =
+            serde_json::from_value(confirmation.backend_audit.clone()).map_err(|error| {
+                BackendError::Confirm(format!("decode OpenShell sandbox audit evidence: {error}"))
+            })?;
+        audit.validate()?;
+        if confirmation.properties != audit.properties() {
+            return Err(BackendError::Confirm(
+                "sandbox confirmation properties do not match OpenShell audit evidence".to_string(),
             ));
         }
         self.client.start_credential_monitor();
@@ -316,7 +349,7 @@ impl BoundBoundary for RemoteBound {
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
             }),
-            *evidence,
+            *confirmation,
             &self.identity,
         )
     }
@@ -1845,11 +1878,12 @@ mod tests {
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
 
-    fn test_driver_fence() -> openshell_isolation_interface::contract::DriverFenceEvidence {
-        openshell_isolation_interface::contract::DriverFenceEvidence::Vm {
-            generation: "test-generation".to_string(),
-            network_device_count: 0,
-        }
+    fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
+        openshell_isolation_interface::contract::OuterFenceGuarantees::confirmed(
+            "test-generation",
+            b"test-vm-fence",
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1939,7 +1973,7 @@ mod tests {
                                 },
                             },
                             Request::Confirm => Response::Confirmed {
-                                evidence: Box::new(test_confirmation_evidence()),
+                                confirmation: Box::new(test_confirmation()),
                             },
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
@@ -2352,8 +2386,9 @@ mod tests {
             },
             tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
         }
     }
 
@@ -2437,12 +2472,9 @@ mod tests {
         }
     }
 
-    fn test_confirmation_evidence()
-    -> openshell_isolation_interface::contract::SandboxConfirmEvidence {
-        openshell_isolation_interface::contract::SandboxConfirmEvidence {
-            generation: "test-generation".to_string(),
-            identity: sandbox().identity,
-            capabilities: openshell_isolation_interface::contract::CapabilityEvidence {
+    fn test_confirmation() -> openshell_isolation_interface::contract::BoundaryConfirmation {
+        let audit = crate::boundary_protocol::OpenShellSandboxAuditEvidence {
+            capabilities: crate::boundary_protocol::CapabilityEvidence {
                 inheritable: 0,
                 permitted: 0,
                 effective: 0,
@@ -2455,7 +2487,7 @@ mod tests {
             core_limit_zero: true,
             native_architecture: std::env::consts::ARCH.to_string(),
             kernel_release: "test".to_string(),
-            seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+            seccomp: crate::boundary_protocol::SeccompEvidence {
                 new_listener: true,
                 notification_round_trip: true,
                 id_validation: true,
@@ -2472,11 +2504,17 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+        };
+        openshell_isolation_interface::contract::BoundaryConfirmation {
+            generation: "test-generation".to_string(),
+            identity: sandbox().identity,
+            properties: audit.properties(),
             authenticated_supervisor: true,
             session_id: test_session_id(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
             runtime_exit_terminates_workload: true,
             resource_claims: std::collections::BTreeMap::new(),
+            backend_audit: serde_json::to_value(audit).expect("serialize audit evidence"),
         }
     }
 
@@ -2493,8 +2531,9 @@ mod tests {
             },
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -2513,8 +2552,9 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -2535,8 +2575,9 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -2557,8 +2598,9 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
+            outer_fence: test_outer_fence(),
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -2594,7 +2636,7 @@ mod tests {
                 .await
                 .expect("TLS request"),
             Response::Confirmed {
-                evidence: Box::new(test_confirmation_evidence()),
+                confirmation: Box::new(test_confirmation()),
             }
         );
         server.abort();
@@ -2750,8 +2792,9 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -2837,8 +2880,9 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
             },
             test_bearer(&"a".repeat(32)),
         );

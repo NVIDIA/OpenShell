@@ -1716,6 +1716,20 @@ async fn auto_approve_chunk(
     Ok(())
 }
 
+/// Preserve UI as the sandbox's startup contract when applying a global policy.
+///
+/// UI controls are enforced by the compute runtime before the workload starts,
+/// so a later global override cannot safely add, remove, or change them. Global
+/// policy writes reject their own UI section; this overlay also prevents a
+/// global dynamic policy from hiding the UI state that the runtime enforced.
+fn preserve_sandbox_startup_ui(policy: &mut ProtoSandboxPolicy, sandbox: &Sandbox) {
+    policy.ui = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.as_ref())
+        .and_then(|policy| policy.ui);
+}
+
 // TODO: share effective-policy lookup with `load_sandbox_policy` /
 // `GetSandboxConfig`. They re-implement very similar global-settings and
 // profile-composition logic; consolidating them is out of scope for the
@@ -1732,20 +1746,40 @@ async fn current_effective_policy_for_sandbox(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    current_effective_policy_for_sandbox_with_records(
+        state,
+        catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await
+}
+
+async fn current_effective_policy_for_sandbox_with_records(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<ProtoSandboxPolicy, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
-        // A global policy is the complete effective policy. Dormant sandbox
-        // history and specs may predate the current schema, but they must not
-        // prevent the valid global policy from being served.
-        return apply_effective_policy_context(
-            state,
+    if let Some(mut global_policy) = decode_policy_from_global_settings(&global_settings)? {
+        // A global policy replaces dynamic policy, but startup-only UI remains
+        // anchored to the sandbox spec so reads cannot misrepresent enforcement.
+        preserve_sandbox_startup_ui(&mut global_policy, sandbox);
+        return apply_effective_policy_context_from_records(
             catalog,
-            workspace,
-            &provider_names,
+            provider_records,
             global_policy,
             PolicySource::Global,
-        )
-        .await;
+        );
     }
 
     let policy = if let Some(record) = state
@@ -1764,15 +1798,12 @@ async fn current_effective_policy_for_sandbox(
         }
     };
 
-    apply_effective_policy_context(
-        state,
+    apply_effective_policy_context_from_records(
         catalog,
-        workspace,
-        &provider_names,
+        provider_records,
         policy,
         PolicySource::Sandbox,
     )
-    .await
 }
 
 async fn effective_policy_for_source(
@@ -1807,17 +1838,26 @@ async fn apply_effective_policy_context(
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
-    mut policy: ProtoSandboxPolicy,
+    policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    clear_provider_credentialed_markers(&mut policy);
-    let mut provider_context = provider_policy_context_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    apply_effective_policy_context_from_records(catalog, &provider_records, policy, policy_source)
+}
+
+fn apply_effective_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    mut policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    clear_provider_credentialed_markers(&mut policy);
+    let mut provider_context = provider_policy_context_from_records(catalog, provider_records);
     if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
@@ -2523,9 +2563,10 @@ pub(super) async fn handle_get_sandbox_config(
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-    let (mut policy, version, mut policy_hash, policy_source) = if let Some(global_policy) =
+    let (mut policy, version, mut policy_hash, policy_source) = if let Some(mut global_policy) =
         global_policy
     {
+        preserve_sandbox_startup_ui(&mut global_policy, &sandbox);
         let version = latest
             .as_ref()
             .map(|record| u32::try_from(record.version).unwrap_or(0))
@@ -2991,16 +3032,23 @@ async fn provider_policy_context_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
+    let records =
+        super::provider::load_provider_environment_records(store, workspace, provider_names)
+            .await?;
+    Ok(provider_policy_context_from_records(catalog, &records))
+}
+
+fn provider_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> ProviderPolicyContext {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
     let mut endpointless_provider_names = HashSet::new();
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
 
         let provider_type = provider.r#type.trim();
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
@@ -3016,7 +3064,7 @@ async fn provider_policy_context_with_catalog(
             continue;
         };
 
-        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
+        if !super::provider::provider_profile_endpoints_are_active(&profile, provider) {
             endpointless_provider_names.insert(name.clone());
             continue;
         }
@@ -3045,11 +3093,11 @@ async fn provider_policy_context_with_catalog(
         });
     }
 
-    Ok(ProviderPolicyContext {
+    ProviderPolicyContext {
         layers,
         credentialed_scopes,
         endpointless_provider_names,
-    })
+    }
 }
 
 fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
@@ -3230,21 +3278,169 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+/// Resolve the effective policy and provider credential snapshot required by
+/// an in-process compute driver at sandbox creation time.
+///
+/// The policy, revision, endpoint bindings, and environment are all derived
+/// from one immutable provider-record snapshot. Raw static credentials remain
+/// in the returned resolver state; only revision-scoped placeholders are
+/// exposed through its child environment.
+pub(super) async fn resolve_sandbox_create_runtime_inputs(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<crate::compute::SandboxCreateRuntimeInputs, Status> {
+    if !state.compute.accepts_create_time_provider_credentials() {
+        return Ok(crate::compute::SandboxCreateRuntimeInputs::default());
+    }
+
+    let sandbox_id = sandbox.object_id();
+    let workspace = sandbox.object_workspace();
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let effective_policy = current_effective_policy_for_sandbox_with_records(
+        state,
+        &provider_profile_catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await?;
+    let policy_credential_bindings =
+        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+    validate_policy_credential_binding_context(
+        &provider_profile_catalog,
+        &provider_records,
+        &effective_policy,
+        &policy_credential_bindings,
+    )?;
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
+        &provider_profile_catalog,
+        &provider_records,
+        &policy_credential_bindings,
+    )?;
+    let mut provider_environment =
+        super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+            state.store.as_ref(),
+            &provider_profile_catalog,
+            &provider_records,
+            &policy_credential_bindings,
+            &state.credentials,
+            Some(sandbox_id),
+        )
+        .await?;
+
+    // MXC uses the binding-capable host proxy. Withhold any static value that
+    // has no endpoint binding instead of exposing it directly to the process.
+    let unbound_static_keys = provider_environment
+        .static_credential_keys
+        .iter()
+        .filter(|key| {
+            !provider_environment
+                .static_credential_bindings
+                .contains_key(*key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in unbound_static_keys {
+        warn!(
+            sandbox_id,
+            key = %key,
+            "withholding unbound static provider credential from MXC sandbox"
+        );
+        provider_environment.environment.remove(&key);
+        provider_environment
+            .credential_expiration_times
+            .remove(&key);
+        provider_environment.static_credential_keys.remove(&key);
+    }
+    validate_create_time_provider_credential_lifetimes(sandbox_id, &provider_environment)?;
+
+    let provider_credentials = if provider_records.is_empty() {
+        None
+    } else {
+        let non_secret_environment_keys = provider_environment
+            .environment
+            .keys()
+            .filter(|key| !provider_environment.static_credential_keys.contains(*key))
+            .cloned()
+            .collect();
+        Some(
+            openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                provider_env_revision,
+                provider_environment.environment,
+                provider_environment.credential_expiration_times,
+                provider_environment.dynamic_credentials,
+                provider_environment.static_credential_bindings,
+                non_secret_environment_keys,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid provider credential binding for sandbox '{sandbox_id}': {error}"
+                ))
+            })?,
+        )
+    };
+
+    Ok(crate::compute::SandboxCreateRuntimeInputs::new(
+        effective_policy,
+        provider_credentials,
+    ))
+}
+
+fn validate_create_time_provider_credential_lifetimes(
+    sandbox_id: &str,
+    provider_environment: &super::provider::ProviderEnvironment,
+) -> Result<(), Status> {
+    let mut expiring_static_keys = provider_environment
+        .static_credential_keys
+        .iter()
+        .filter(|key| {
+            provider_environment
+                .credential_expiration_times
+                .get(*key)
+                .is_some_and(|expires_at_ms| *expires_at_ms > 0)
+        })
+        .chain(provider_environment.expired_static_keys.iter())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    expiring_static_keys.sort();
+
+    if expiring_static_keys.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "compute driver cannot refresh expiring or already-expired provider credentials for sandbox '{sandbox_id}'; recreate the sandbox with non-expiring, current credentials (affected keys: {})",
+            expiring_static_keys.join(", ")
+        )))
+    }
+}
+
 pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
     let workspace = sandbox.object_workspace().to_string();
 
     let spec = sandbox
@@ -3263,12 +3459,12 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_for_sandbox(
+    let effective_policy = current_effective_policy_for_sandbox_with_records(
         state.as_ref(),
         &provider_profile_catalog,
-        &workspace,
         &sandbox,
         &sandbox_id,
+        &provider_records,
     )
     .await?;
     let policy_credential_bindings =
@@ -3479,6 +3675,11 @@ async fn handle_update_config_inner(
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
+            if new_policy.ui.is_some() {
+                return Err(Status::invalid_argument(
+                    "UI policy cannot be set globally because it is applied at sandbox startup; configure ui in each sandbox policy",
+                ));
+            }
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
@@ -3884,7 +4085,10 @@ async fn handle_update_config_inner(
     }
 
     let should_backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        let comparable_baseline = baseline_policy.clone();
+        let comparable_baseline = validate_and_canonicalize_stored_policy(
+            baseline_policy.clone(),
+            STORED_POLICY_SOURCE_SPEC,
+        )?;
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         false
     } else {
@@ -6586,17 +6790,17 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
 ) -> Result<SandboxPolicyMergeValidationData, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
-    let ProviderPolicyContext {
-        layers,
-        credentialed_scopes,
-        endpointless_provider_names,
-    } = provider_policy_context_with_catalog(
+    let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_from_records(catalog, &records);
     let provider_layers = if composition_enabled {
         layers
     } else {
@@ -6607,12 +6811,6 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
         provider_layer_count = provider_layers.len(),
         "Composed provider policy and credential context for merge validation"
     );
-    let records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        workspace,
-        provider_names,
-    )
-    .await?;
     Ok(SandboxPolicyMergeValidationData {
         provider_layers,
         catalog: catalog.clone(),
@@ -7223,6 +7421,7 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
+    use crate::grpc::provider::ProviderEnvironment;
     use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::persistence::test_store;
     use std::collections::HashMap;
@@ -8141,6 +8340,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_policy_preserves_each_sandbox_startup_ui_contract() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        assert!(global_policy.ui.is_none());
+
+        let sandbox_id = "global-preserves-startup-ui";
+        let startup_ui = UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::Read as i32,
+            allow_input_injection: false,
+        };
+        let mut sandbox_policy = openshell_policy::restrictive_default_policy();
+        sandbox_policy.ui = Some(startup_ui);
+        let sandbox = test_sandbox(sandbox_id, sandbox_id, sandbox_policy, Vec::new());
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("global policy read must preserve startup UI")
+        .into_inner();
+        assert_eq!(
+            response
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.ui.as_ref()),
+            Some(&startup_ui)
+        );
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective policy lookup must preserve startup UI");
+        assert_eq!(effective.ui.as_ref(), Some(&startup_ui));
+    }
+
+    #[tokio::test]
     async fn canonical_mcp_version_order_produces_identical_policy_bytes_and_hashes() {
         let state = test_server_state().await;
         let forward = mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
@@ -8235,6 +8494,93 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_policy_ingress_rejects_startup_only_ui_before_persistence() {
+        use openshell_core::proto::UiPolicy;
+
+        let state = test_server_state().await;
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.ui = Some(UiPolicy::default());
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("global UI must be rejected before persistence");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("sandbox startup"));
+        assert!(
+            state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+                .expect("global policy lookup")
+                .is_none()
+        );
+        let settings = load_global_settings(state.store.as_ref())
+            .await
+            .expect("global settings lookup");
+        assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    #[tokio::test]
+    async fn sandbox_policy_update_accepts_semantically_unchanged_ui_default() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let state = test_server_state().await;
+        let sandbox_id = "ui-default-roundtrip";
+        let mut canonical = openshell_policy::restrictive_default_policy();
+        canonical.ui = Some(UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::None as i32,
+            ..Default::default()
+        });
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                canonical.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+
+        let mut protobuf_default = canonical;
+        protobuf_default.ui.as_mut().expect("UI policy").clipboard =
+            UiClipboardAccess::Unspecified as i32;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_id.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(protobuf_default),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("unspecified and none are the same static UI policy");
+
+        let stored = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("policy revision");
+        let persisted = ProtoSandboxPolicy::decode(stored.policy_payload.as_slice())
+            .expect("decode persisted policy");
+        assert_eq!(
+            persisted.ui.expect("persisted UI").clipboard,
+            UiClipboardAccess::None as i32
+        );
     }
 
     #[tokio::test]
@@ -11665,6 +12011,63 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[test]
+    fn create_time_provider_credentials_reject_expiring_static_values() {
+        let provider_environment = ProviderEnvironment {
+            credential_expiration_times: HashMap::from([
+                ("B_TOKEN".to_string(), 20_000),
+                ("A_TOKEN".to_string(), 10_000),
+                ("NON_SECRET".to_string(), 30_000),
+            ]),
+            static_credential_keys: HashSet::from(["A_TOKEN".to_string(), "B_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        let error = validate_create_time_provider_credential_lifetimes(
+            "sandbox-expiring",
+            &provider_environment,
+        )
+        .expect_err("expiring static credentials must fail closed");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("A_TOKEN, B_TOKEN"));
+        assert!(!error.message().contains("NON_SECRET"));
+    }
+
+    #[test]
+    fn create_time_provider_credentials_allow_non_expiring_static_values() {
+        let provider_environment = ProviderEnvironment {
+            credential_expiration_times: HashMap::from([("STATIC_TOKEN".to_string(), 0)]),
+            static_credential_keys: HashSet::from(["STATIC_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        validate_create_time_provider_credential_lifetimes("sandbox-static", &provider_environment)
+            .expect("non-expiring static credentials are supported");
+    }
+
+    #[test]
+    fn create_time_provider_credentials_reject_already_expired_static_values() {
+        // The shared resolver withholds already-expired static credentials
+        // entirely -- they never appear in `static_credential_keys` or
+        // `credential_expires_at_ms` -- so this check must consult
+        // `expired_static_keys` independently instead of silently allowing
+        // sandbox creation without the configured credential.
+        let provider_environment = ProviderEnvironment {
+            expired_static_keys: HashSet::from(["GITHUB_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        let error = validate_create_time_provider_credential_lifetimes(
+            "sandbox-expired",
+            &provider_environment,
+        )
+        .expect_err("already-expired static credentials must fail closed");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("GITHUB_TOKEN"));
     }
 
     #[tokio::test]
@@ -18896,6 +19299,35 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_distinguishes_ui_absence_presence_and_values() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let absent = ProtoSandboxPolicy::default();
+        let explicit_deny = ProtoSandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let clipboard_read = ProtoSandboxPolicy {
+            ui: Some(UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            deterministic_policy_hash(&absent),
+            deterministic_policy_hash(&explicit_deny),
+            "an explicitly present deny-only UI block remains hash-significant"
+        );
+        assert_ne!(
+            deterministic_policy_hash(&explicit_deny),
+            deterministic_policy_hash(&clipboard_read),
+            "UI capability changes must produce a new policy hash"
+        );
+    }
+
+    #[test]
     fn policy_hash_is_stable_across_middleware_config_field_insertion_order() {
         use prost_types::{Struct, Value, value::Kind};
         use std::collections::BTreeMap;
@@ -21294,6 +21726,22 @@ mod tests {
             err.code(),
             Code::NotFound,
             "handle_get_sandbox_config must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_get_sandbox_provider_environment ---
+        let err = handle_get_sandbox_provider_environment(
+            &state,
+            non_member_request(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sandbox-other".into(),
+                supports_static_credential_bindings: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_provider_environment must hide cross-workspace sandboxes"
         );
 
         // --- handle_get_sandbox_logs ---

@@ -332,7 +332,7 @@ status = "not_run"
 [[capabilities]]
 id = "mxc-windows-driver-configuration"
 topics = ["mxc"]
-origin_main_access_paths = ["[openshell.drivers.mxc].{wxc_exec_path,backend,pc_least_privilege,pc_capabilities,default_configuration_id,debug}"]
+origin_main_access_paths = ["[openshell.drivers.mxc].{wxc_exec_path,supervisor_binary_path,sandbox_binary_path,state_dir,grpc_endpoint,backend,pc_least_privilege,pc_capabilities,pc_allow_local_network,pc_minimal_env,debug,etw_audit}"]
 schema_v2_access_paths = ["same [openshell.drivers.mxc] fields"]
 behavioral_oracle = "The Windows gateway selects MXC and passes the configured wxc-exec path, backend, AppContainer capabilities, isolation configuration, and debug flag to MXC."
 required_environment = "Windows host with MXC/wxc-exec; mock fixture for deterministic smoke variant"

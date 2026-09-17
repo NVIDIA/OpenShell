@@ -841,11 +841,10 @@ impl russh::server::Handler for SshHandler {
             .is_some_and(|state| state.main_attached)
         {
             let signal = match signal {
-                Sig::HUP => Some(nix::sys::signal::Signal::SIGHUP),
-                Sig::INT => Some(nix::sys::signal::Signal::SIGINT),
-                Sig::KILL => Some(nix::sys::signal::Signal::SIGKILL),
-                Sig::QUIT => Some(nix::sys::signal::Signal::SIGQUIT),
-                Sig::TERM => Some(nix::sys::signal::Signal::SIGTERM),
+                Sig::HUP => Some(openshell_isolation_interface::contract::BoundarySignal::Hup),
+                Sig::INT => Some(openshell_isolation_interface::contract::BoundarySignal::Int),
+                Sig::KILL => Some(openshell_isolation_interface::contract::BoundarySignal::Kill),
+                Sig::TERM => Some(openshell_isolation_interface::contract::BoundarySignal::Term),
                 _ => None,
             };
             if let (Some(signal), Some(main_session)) = (signal, self.main_session.as_ref())

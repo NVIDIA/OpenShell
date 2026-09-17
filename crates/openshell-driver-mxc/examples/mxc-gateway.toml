@@ -12,18 +12,18 @@
 # smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
-# process_container is the default because AppContainer enforces default-deny
-# filesystem access. isolation_session is an explicit grant-only compatibility
-# mode and does not deny access to paths omitted from the sandbox policy.
+# The RFC 0012 MXC runtime requires ProcessContainer.
 backend = "process_container"
+
+# The packaged runtime binaries default to siblings of openshell-gateway.exe.
+# Override these paths when running from a different development layout.
+# supervisor_binary_path = "C:\\path\\to\\openshell-supervisor.exe"
+# sandbox_binary_path = "C:\\path\\to\\openshell-sandbox.exe"
 
 # process_container only: request a Less-Privileged AppContainer.
 # pc_least_privilege = false
 # process_container only: AppContainer capabilities to grant.
 # pc_capabilities = []
-
-# isolation_session only. Never use "small" (known OS bug).
-default_configuration_id = "composable"
 
 # Enable --debug on wxc-exec invocations.
 debug = false

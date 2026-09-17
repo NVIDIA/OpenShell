@@ -1272,7 +1272,7 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Create the sandbox from a named sandbox template.
-        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
@@ -1396,6 +1396,13 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// Set a sandbox environment variable from the CLI process environment.
+        ///
+        /// Format: `KEY[=ENVVAR]`. When `ENVVAR` is omitted, `KEY` is used.
+        /// The value does not appear in the CLI process arguments. Repeatable.
+        #[arg(long = "env-from", value_name = "KEY[=ENVVAR]")]
+        env_from: Vec<String>,
+
         /// Suppress warnings when --env values look like credentials.
         #[arg(long = "no-credential-warnings")]
         no_credential_warnings: bool,
@@ -1477,8 +1484,16 @@ enum SandboxCommands {
         names: Vec<String>,
 
         /// Delete all sandboxes.
-        #[arg(long, conflicts_with = "names")]
+        #[arg(long, conflicts_with_all = ["names", "expected_id", "expected_resource_version"])]
         all: bool,
+
+        /// Delete only if the current sandbox has this exact immutable ID.
+        #[arg(long = "expected-id", value_name = "ID")]
+        expected_id: Option<String>,
+
+        /// Delete only if the current sandbox has this resource version.
+        #[arg(long = "expected-resource-version", value_name = "VERSION")]
+        expected_resource_version: Option<u64>,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3067,6 +3082,7 @@ async fn run_async() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    env_from,
                     no_credential_warnings,
                     approval_mode,
                     output,
@@ -3104,7 +3120,14 @@ async fn run_async() -> Result<()> {
                     }
 
                     // Parse --env flags into a HashMap<String, String>.
-                    let env_map = run::parse_env_pairs(&envs)?;
+                    let mut env_map = run::parse_env_pairs(&envs)?;
+                    for (key, value) in run::parse_env_from_pairs(&env_from)? {
+                        if env_map.insert(key.clone(), value).is_some() {
+                            return Err(miette::miette!(
+                                "duplicate sandbox environment key '{key}' supplied through --env and --env-from"
+                            ));
+                        }
+                    }
                     run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
@@ -3261,11 +3284,18 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete { names, all } => {
+                        SandboxCommands::Delete {
+                            names,
+                            all,
+                            expected_id,
+                            expected_resource_version,
+                        } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
                                 all,
+                                expected_id.as_deref(),
+                                expected_resource_version,
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,
@@ -4803,6 +4833,48 @@ mod tests {
                 command: Some(SandboxCommands::Start { name: None }),
             })
         ));
+    }
+
+    #[test]
+    fn sandbox_delete_accepts_identity_preconditions() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "delete",
+            "demo",
+            "--expected-id",
+            "sb-123",
+            "--expected-resource-version",
+            "17",
+        ])
+        .expect("identity-guarded sandbox delete should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    ref names,
+                    all: false,
+                    expected_id: Some(ref expected_id),
+                    expected_resource_version: Some(17),
+                })
+            }) if names == &["demo"] && expected_id == "sb-123"
+        ));
+    }
+
+    #[test]
+    fn sandbox_delete_all_rejects_identity_preconditions() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "delete",
+                "--all",
+                "--expected-id",
+                "sb-123",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

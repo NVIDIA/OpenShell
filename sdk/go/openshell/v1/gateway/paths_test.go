@@ -39,6 +39,22 @@ func TestSystemGatewayDir(t *testing.T) {
 	assert.Equal(t, filepath.FromSlash("/etc/openshell/gateways"), dir)
 }
 
+func TestSystemGatewayDirOverride(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv(systemGatewayDirEnv, tmp)
+
+	assert.Equal(t, filepath.Join(tmp, "gateways"), systemGatewayDir())
+}
+
+func TestSystemGatewayDirIgnoresInvalidOverrides(t *testing.T) {
+	for _, override := range []string{"", "relative/path"} {
+		t.Run(override, func(t *testing.T) {
+			t.Setenv(systemGatewayDirEnv, override)
+			assert.Equal(t, filepath.FromSlash("/etc/openshell/gateways"), systemGatewayDir())
+		})
+	}
+}
+
 func TestResolveGatewayDir_UserDir(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)

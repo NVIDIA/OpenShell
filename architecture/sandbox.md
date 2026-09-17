@@ -62,19 +62,33 @@ replacement from granting authority.
 ## Startup Flow
 
 1. The driver resolves the immutable workload identity, installs the outer
-   network fence, and starts `openshell-sandbox` with one-use bootstrap state.
+   network fence, validates its native evidence, and starts `openshell-sandbox`
+   with one-use bootstrap state. Docker inspects container networking,
+   Kubernetes verifies its NetworkPolicy, and VM drivers inspect the guest
+   device model; those native schemas remain in their driver crates.
 2. The sandbox consumes and unlinks bootstrap material, proves the admitted
    runtime posture, and listens on the protected driver channel. It does not
    run untrusted code yet.
 3. `openshell-supervisor` loads policy and runtime settings from the gateway,
    attaches to the sandbox, and verifies the driver's generation and evidence.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   then reports measured confirmation. The supervisor must accept that evidence
-before it sends the launch permit.
+   validates its mechanism-specific audit evidence, and reports backend-neutral
+   enforcement properties. The supervisor must accept those properties and
+   their immutable session and resource binding before it sends the launch
+   permit. Other isolation backends may establish the same properties with
+   different mechanisms and retain their detailed evidence in backend-owned
+   audit data.
 5. The sandbox starts the canonical process through its single workload
    launcher. The supervisor starts SSH and registers its gateway session.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
    authenticated channel for the lifetime of the sandbox generation.
+
+The shared isolation contract receives only the driver's normalized outer-fence
+guarantees: egress is default-deny, there is no unmanaged egress path, the
+evidence is bound to the sandbox generation, revocation has been verified, and
+controller loss fails closed. A digest commits those guarantees to the native
+driver evidence without teaching the shared contract about container networks,
+Kubernetes objects, VM devices, or accelerator resources.
 
 When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
@@ -89,6 +103,16 @@ While an exec handle is retained, independent waits return its stable exit or
 signal status, whether or not an output attachment is open or the main process
 has exited. Waiting never holds the exec registry lock, so other operations can
 still signal or attach to the process.
+
+## Deletion Authority
+
+The public delete API resolves a sandbox name to its immutable metadata ID and
+holds that ID's lifecycle lock through the pre-mutation check. Callers that
+already observed a sandbox may also supply its expected ID and resource
+version. OpenShell revalidates those preconditions under the lifecycle and
+gateway-global locks, then returns `ABORTED` without changing durable state or
+calling the compute driver if either value drifted. An unguarded delete retains
+the interactive CLI's existing name-based behavior.
 
 ## Isolation Layers
 

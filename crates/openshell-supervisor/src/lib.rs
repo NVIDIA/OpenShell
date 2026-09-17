@@ -89,11 +89,13 @@ where
     }
 }
 
+#[cfg(unix)]
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
     path: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl ControlReadiness {
     fn start(
         path: std::path::PathBuf,
@@ -221,10 +223,26 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(unix))]
+struct ControlReadiness;
+
+#[cfg(not(unix))]
+impl ControlReadiness {
+    fn start(
+        _path: std::path::PathBuf,
+        _session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Self> {
+        Err(miette::miette!(
+            "supervisor readiness sockets require a Unix host"
+        ))
     }
 }
 
@@ -507,6 +525,7 @@ pub async fn run_network_proxy(
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
+        None,
         None,
         None,
     )
@@ -869,7 +888,10 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let remote_network_source = remote_boundary.0.network_mediation_source();
+    let direct_proxy = remote_boundary.0.direct_proxy_configuration();
+    let remote_network_source = direct_proxy
+        .is_none()
+        .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -907,7 +929,8 @@ pub async fn run_sandbox(
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
-            Some(remote_network_source),
+            remote_network_source,
+            direct_proxy,
         )
         .await?,
     );
@@ -4360,6 +4383,7 @@ mod tests {
         assert!(prepare_network_proxy_tls_dir(Some(writable)).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
@@ -4373,6 +4397,7 @@ mod tests {
         assert!(check_control_readiness(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
@@ -4401,6 +4426,7 @@ mod tests {
         .expect("replacement session restores readiness socket");
     }
 
+    #[cfg(unix)]
     #[test]
     fn control_readiness_rejects_relative_path() {
         let error = prepare_control_readiness_path(std::path::Path::new("health.sock"))

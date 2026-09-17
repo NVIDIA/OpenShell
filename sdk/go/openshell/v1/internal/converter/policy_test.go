@@ -200,6 +200,11 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 			RunAsUser:  "sandbox-user",
 			RunAsGroup: "sandbox-group",
 		},
+		UI: &v1.UIPolicy{
+			AllowGraphicalUI:    true,
+			Clipboard:           v1.UIClipboardAccessRead,
+			AllowInputInjection: true,
+		},
 		NetworkPolicies: map[string]v1.NetworkPolicyRule{
 			"web-api": {
 				Name: "web-api",
@@ -238,6 +243,10 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 	require.NotNil(t, roundTrip.Process)
 	assert.Equal(t, original.Process.RunAsUser, roundTrip.Process.RunAsUser)
 	assert.Equal(t, original.Process.RunAsGroup, roundTrip.Process.RunAsGroup)
+
+	// UI
+	require.NotNil(t, roundTrip.UI)
+	assert.Equal(t, original.UI, roundTrip.UI)
 
 	// NetworkPolicies
 	require.Len(t, roundTrip.NetworkPolicies, 2)
@@ -313,6 +322,39 @@ func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 		assert.Nil(t, roundTrip.Landlock)
 		assert.Nil(t, roundTrip.Process)
 		assert.Nil(t, roundTrip.NetworkPolicies)
+	})
+
+	t.Run("only UI", func(t *testing.T) {
+		for _, clipboard := range []v1.UIClipboardAccess{
+			v1.UIClipboardAccessUnspecified,
+			v1.UIClipboardAccessNone,
+			v1.UIClipboardAccessRead,
+			v1.UIClipboardAccessWrite,
+			v1.UIClipboardAccessAll,
+		} {
+			original := &v1.SandboxPolicy{
+				UI: &v1.UIPolicy{
+					AllowGraphicalUI:    true,
+					Clipboard:           clipboard,
+					AllowInputInjection: true,
+				},
+			}
+			roundTrip := SandboxPolicyFromProto(SandboxPolicyToProto(original))
+			require.NotNil(t, roundTrip)
+			assert.Equal(t, original.UI, roundTrip.UI)
+		}
+	})
+
+	t.Run("explicit empty UI remains present", func(t *testing.T) {
+		original := &v1.SandboxPolicy{UI: &v1.UIPolicy{}}
+		protoPolicy := SandboxPolicyToProto(original)
+		require.NotNil(t, protoPolicy)
+		require.NotNil(t, protoPolicy.Ui)
+
+		roundTrip := SandboxPolicyFromProto(protoPolicy)
+		require.NotNil(t, roundTrip)
+		require.NotNil(t, roundTrip.UI)
+		assert.Equal(t, &v1.UIPolicy{}, roundTrip.UI)
 	})
 
 	t.Run("only landlock", func(t *testing.T) {

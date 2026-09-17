@@ -645,7 +645,7 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
-### MXC
+### MXC audit configuration
 
 The MXC driver runs Windows workloads through `wxc-exec`. Enable ETW auditing to
 map Windows Sandboxing provider events into the gateway's OCSF stream.
@@ -660,13 +660,14 @@ log_level       = "info"
 compute_driver = "mxc"
 
 [openshell.drivers.mxc]
-wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
-backend                 = "process_container"
-default_configuration_id = "composable"
-pc_least_privilege      = false
-pc_capabilities         = []
-debug                   = false
-etw_audit               = true
+wxc_exec_path          = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+supervisor_binary_path = "C:\\OpenShell\\openshell-supervisor.exe"
+sandbox_binary_path    = "C:\\OpenShell\\openshell-sandbox.exe"
+backend                = "process_container"
+pc_least_privilege     = false
+pc_capabilities        = []
+debug                  = false
+etw_audit              = true
 ```
 
 `etw_audit` defaults to `false`. When enabled, the gateway account must be an
@@ -887,6 +888,50 @@ Use `ssh_socket_path` for Podman configurations. The legacy
 OpenShell sends no override and Podman applies its runtime-selected profile.
 The setting applies to the workload container; the supervisor retains Podman's
 runtime-selected profile.
+
+### MXC
+
+The MXC driver is Windows-only and opt-in. It links into the gateway and invokes Microsoft MXC through `wxc-exec.exe`. The driver starts `openshell-supervisor --role=isolation-backend` on the host and `openshell-sandbox` inside each ProcessContainer. The standard authenticated Sandbox Protocol and supervisor session provide lifecycle, exec, forwarding, provider refresh, and network policy.
+
+```toml
+[openshell]
+version = 2
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_driver = "mxc"
+# Required when gateway TLS is enabled. The gateway injects this bundle into
+# the host supervisor.
+guest_tls_ca   = "C:\\OpenShell\\certs\\ca.pem"
+guest_tls_cert = "C:\\OpenShell\\certs\\client.pem"
+guest_tls_key  = "C:\\OpenShell\\certs\\client-key.pem"
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+supervisor_binary_path = "C:\\OpenShell\\openshell-supervisor.exe"
+sandbox_binary_path = "C:\\OpenShell\\openshell-sandbox.exe"
+# Defaults to %LOCALAPPDATA%\OpenShell\mxc.
+state_dir = "C:\\Users\\operator\\AppData\\Local\\OpenShell\\mxc"
+# Empty derives the gateway loopback URL and its TLS mode.
+grpc_endpoint = ""
+# The RFC 0012 MXC path requires process_container.
+backend = "process_container"
+pc_least_privilege = false
+pc_capabilities    = []
+pc_allow_local_network = true
+pc_minimal_env = false
+debug = false
+etw_audit = false
+```
+
+The packaged supervisor and sandbox binaries default to siblings of `openshell-gateway.exe`; explicit paths are useful for development layouts. The driver protects host supervisor tokens and descriptors with an owner-only Windows DACL.
+
+Supply the workload command and working directory through `sandbox create --driver-config-json`, for example `{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","echo hello"],"cwd":"C:\\work"}}`. Both are required. Supply workload environment through `sandbox create --env` or `--env-from`; it is not part of gateway configuration.
+
+The driver assigns distinct Sandbox Protocol and proxy listeners plus fresh credentials to every generation. The host proxy rejects missing, invalid, duplicate, or cross-sandbox proxy credentials before forwarding. MXC denies direct Internet egress and permits only the `127.0.0.1/32` route required by the authenticated transport and proxy. That loopback exception does not isolate unrelated host services. The current explicit-proxy path attributes descendant traffic to the admitted main workload binary rather than resolving each Windows socket owner. Treat the gateway host as trusted and avoid policies that rely on different network rights for child executables.
+
+Attached provider credentials use the ordinary live supervisor refresh path. Static values stay in the host supervisor's endpoint-bound resolver and are injected only for matching requests. Dynamic token grants remain request-time operations in the host proxy.
 
 ### MicroVM
 

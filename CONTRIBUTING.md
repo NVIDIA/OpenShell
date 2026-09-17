@@ -105,7 +105,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
-| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
+| Platform        | `build-openshell-mxc-windows` | Maintain and validate the x64 and ARM64 Windows MSVC and MXC runtime lane                        |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |

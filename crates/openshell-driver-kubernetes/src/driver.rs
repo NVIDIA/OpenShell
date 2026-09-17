@@ -763,6 +763,7 @@ impl KubernetesComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_ui_policy: false,
         })
     }
 
@@ -2370,7 +2371,8 @@ impl KubernetesComputeDriver {
             workload_identity,
             child_env,
         }
-        .provision();
+        .provision()
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let descriptor = provisioned
             .runtime_descriptor
             .backend_descriptor()
@@ -2608,7 +2610,8 @@ impl KubernetesComputeDriver {
             workload_identity,
             child_env,
         }
-        .provision();
+        .provision()
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let descriptor = provisioned
             .runtime_descriptor
             .backend_descriptor()

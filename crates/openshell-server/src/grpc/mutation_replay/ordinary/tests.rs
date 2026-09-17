@@ -48,6 +48,8 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
         workspace_scope: Some(scope()),
         allow_missing: true,
         request_id: id(),
+        expected_sandbox_id: String::new(),
+        expected_resource_version: 0,
     };
     let mut tasks = Vec::new();
     for index in 0..16 {
@@ -281,6 +283,8 @@ async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
         workspace_scope: Some(scope()),
         allow_missing: true,
         request_id: id(),
+        expected_sandbox_id: String::new(),
+        expected_resource_version: 0,
     };
     assert_eq!(
         reason(
@@ -328,6 +332,8 @@ async fn original_payload_is_identity_and_current_transformation_is_a_replay_gua
         workspace_scope: Some(scope()),
         allow_missing: true,
         request_id: id(),
+        expected_sandbox_id: String::new(),
+        expected_resource_version: 0,
     };
     let mut effective = original.clone();
     effective.name = "transformed".into();

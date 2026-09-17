@@ -15,6 +15,8 @@ name = "openshell_driver_mxc"
 
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 # OCSF builders + emit target used by the Windows ETW audit consumer. OS-agnostic
 # crate (no windows deps), so safe to depend on from all targets; only the
 # windows-gated `etw_consumer` module actually uses it.
@@ -26,16 +28,17 @@ tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+rand = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
-# ETW/TDH real-time consumer and host CONNECT proxy integration.
+# ETW/TDH real-time consumer.
 [target.'cfg(target_os = "windows")'.dependencies]
-openshell-supervisor-network = { path = "../openshell-supervisor-network" }
 windows = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"

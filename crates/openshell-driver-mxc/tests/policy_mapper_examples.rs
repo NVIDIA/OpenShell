@@ -210,12 +210,15 @@ fn all_example_policies_split_with_expected_invariants() {
             assert!(str_list(&cfg["filesystem"]["readonlyPaths"]).is_empty());
         }
 
-        assert_eq!(cfg["network"]["defaultPolicy"], "block");
-        assert!(str_list(&cfg["network"]["allowedHosts"]).is_empty());
-        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
-        assert_eq!(cfg["network"]["proxy"]["localhost"], 18080);
-        assert!(cfg["network"]["proxy"].get("host").is_none());
-        assert!(cfg["network"]["proxy"].get("port").is_none());
+        assert_eq!(cfg["version"], "0.8.0-alpha");
+        assert_eq!(cfg["network"]["egress"]["default"], "deny");
+        assert_eq!(
+            cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+            "127.0.0.1/32"
+        );
+        assert_eq!(cfg["network"]["ingress"]["hostLoopback"], "allow");
+        assert!(cfg.get("runtimeConfig").is_none());
+        assert!(cfg["network"].get("proxy").is_none());
         let errors: Vec<_> = result
             .loss
             .iter()
@@ -295,29 +298,24 @@ fn split_policy_routes_network_to_proxy() {
     let result = split_policy(&policy, &opts).expect("split_policy returns Some when addr is set");
     let cfg = &result.mxc_config;
 
-    // Proxy redirect is emitted. 127.0.0.2 is not the loopback 127.0.0.1 so
-    // the mapper records an error loss and omits the proxy block entirely.
-    // (MXC 0.6.0-alpha can only encode {"localhost": N}; non-127.0.0.1 is
-    // not representable.)
+    // 127.0.0.2 is not the supported 127.0.0.1 host-proxy address, so the
+    // mapper records an error loss and keeps the MXC config fail-closed.
     assert!(
-        cfg["network"].get("proxy").is_none() || cfg["network"]["proxy"].is_null(),
-        "non-127.0.0.1 redirect must NOT produce a proxy block: {:?}",
-        cfg["network"].get("proxy")
+        cfg.get("runtimeConfig").is_none() || cfg["runtimeConfig"].is_null(),
+        "non-127.0.0.1 redirect must NOT produce runtimeConfig: {:?}",
+        cfg.get("runtimeConfig")
     );
     let has_proxy_loss = result
         .loss
         .iter()
-        .any(|i| i.path == "network.proxy" && i.severity == "error");
+        .any(|i| i.path == "proxy_redirect" && i.severity == "error");
     assert!(
         has_proxy_loss,
         "non-127.0.0.1 redirect must produce an error loss item"
     );
 
-    // Direct egress is blocked; unsupported host-list fields are omitted and
-    // the proxy enforces the full list.
-    assert_eq!(cfg["network"]["defaultPolicy"], "block");
-    assert!(cfg["network"].get("allowedHosts").is_none());
-    assert!(cfg["network"].get("blockedHosts").is_none());
+    // Direct egress is denied; the host proxy enforces the list.
+    assert_eq!(cfg["network"]["egress"]["default"], "deny");
 
     // Filesystem grants are preserved unchanged.
     assert_eq!(
@@ -401,7 +399,7 @@ fn split_policy_rejects_proxy_redirect_on_isolation_session() {
         "expected one containment error: {errors:?}"
     );
     assert_eq!(errors[0].path, "containment");
-    assert!(errors[0].message.contains("MXC M1"));
+    assert!(errors[0].message.contains("processcontainer"));
     assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 
@@ -425,9 +423,7 @@ fn network_only_policy_has_empty_filesystem() {
 // ── New tests: proxy JSON shape and non-127.0.0.1 guard ──────────────────────
 
 #[test]
-fn split_with_loopback_addr_emits_localhost_port_shape() {
-    // MXC 0.6.0-alpha accepts ONLY {"proxy": {"localhost": N}}.
-    // Verified against the real wxc-exec 0.6.0-alpha binary via --dry-run.
+fn split_with_loopback_addr_emits_loopback_only_08_shape() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
@@ -440,18 +436,15 @@ fn split_with_loopback_addr_emits_localhost_port_shape() {
     let result = split_policy(&policy, &opts).expect("split returns Some");
     let cfg = &result.mxc_config;
 
+    assert_eq!(cfg["version"], "0.8.0-alpha");
+    assert_eq!(cfg["network"]["egress"]["default"], "deny");
     assert_eq!(
-        cfg["network"]["proxy"]["localhost"], 18080,
-        "proxy must use {{\"localhost\": N}} shape"
+        cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],
+        "127.0.0.1/32"
     );
-    assert!(
-        cfg["network"]["proxy"].get("host").is_none(),
-        "proxy must not contain 'host' key"
-    );
-    assert!(
-        cfg["network"]["proxy"].get("port").is_none(),
-        "proxy must not contain 'port' key"
-    );
+    assert_eq!(cfg["network"]["ingress"]["hostLoopback"], "allow");
+    assert!(cfg.get("runtimeConfig").is_none());
+    assert!(cfg["network"].get("proxy").is_none());
     // No error losses — 127.0.0.1 is representable.
     assert!(
         result.loss.iter().all(|i| i.severity != "error"),
@@ -465,9 +458,7 @@ fn split_with_loopback_addr_emits_localhost_port_shape() {
 }
 
 #[test]
-fn split_with_non_loopback_addr_emits_error_loss_and_no_proxy_block() {
-    // Non-127.0.0.1 redirect addresses are not representable in MXC 0.6.0-alpha.
-    // The mapper must record an error loss and omit the proxy block.
+fn split_with_non_loopback_addr_emits_error_loss_and_no_runtime_proxy() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
@@ -480,28 +471,29 @@ fn split_with_non_loopback_addr_emits_error_loss_and_no_proxy_block() {
     let result = split_policy(&policy, &opts).expect("split returns Some");
     let cfg = &result.mxc_config;
 
-    // Proxy block must be absent.
+    // A runtime proxy block is never emitted; proxy-aware clients receive
+    // environment variables from the driver after this mapping step.
     assert!(
-        cfg["network"].get("proxy").is_none() || cfg["network"]["proxy"].is_null(),
-        "non-127.0.0.1 redirect must not produce a proxy block: {:?}",
-        cfg["network"].get("proxy")
+        cfg.get("runtimeConfig").is_none() || cfg["runtimeConfig"].is_null(),
+        "non-127.0.0.1 redirect must not produce runtimeConfig: {:?}",
+        cfg.get("runtimeConfig")
     );
 
-    // An error loss for "network.proxy" must be present.
+    // An error loss for the unusable redirect must be present.
     let proxy_loss = result
         .loss
         .iter()
-        .find(|i| i.path == "network.proxy" && i.severity == "error");
+        .find(|i| i.path == "proxy_redirect" && i.severity == "error");
     assert!(
         proxy_loss.is_some(),
-        "non-127.0.0.1 redirect must produce an error loss item on network.proxy: {:?}",
+        "non-127.0.0.1 redirect must produce a proxy_redirect error loss item: {:?}",
         result.loss
     );
     let loss = proxy_loss.unwrap();
     assert_eq!(loss.openshell_feature, "per-sandbox egress attribution");
     assert!(
-        loss.message.contains("localhost"),
-        "loss message should mention 'localhost': {}",
+        loss.message.contains("127.0.0.1"),
+        "loss message should mention '127.0.0.1': {}",
         loss.message
     );
 }

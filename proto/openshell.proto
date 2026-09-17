@@ -875,6 +875,10 @@ message ComputeDriverCapabilities {
 
   // Static portable resource request forms reported by the driver.
   ResourceCapabilities resource_capabilities = 3;
+
+  // Whether the configured driver instance completely enforces the portable
+  // SandboxPolicy.ui contract.
+  bool supports_ui_policy = 4;
 }
 
 // Static portable resource request forms reported by a compute driver.
@@ -1347,9 +1351,19 @@ message DeleteSandboxRequest {
   // Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
   // asynchronous cleanup and does not suppress authorization or parent errors.
   bool allow_missing = 4;
+  // Optional immutable sandbox identity precondition. When non-empty, the
+  // gateway rejects the request with ABORTED unless the currently resolved
+  // sandbox has this exact metadata ID. The check is repeated under the
+  // lifecycle lock immediately before any delete mutation.
+  string expected_sandbox_id = 5;
+  // Optional optimistic-concurrency precondition. Requires
+  // expected_sandbox_id. When non-zero, the gateway rejects the request with
+  // ABORTED unless the sandbox's current resource version matches this value
+  // immediately before any delete mutation.
+  uint64 expected_resource_version = 6;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
-  string request_id = 5;
+  string request_id = 7;
 }
 
 // Stop sandbox request.
