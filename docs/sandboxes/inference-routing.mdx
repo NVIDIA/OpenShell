@@ -232,8 +232,8 @@ openshell inference set \
   --timeout 300
 ```
 
-Clients called `https://inference.local`, supplied a placeholder key and model,
-and relied on OpenShell to rewrite the request.
+Clients called a managed virtual endpoint, supplied a placeholder key and
+model, and relied on OpenShell to rewrite the request.
 
 ### After
 
@@ -266,9 +266,9 @@ Update each workload to:
 5. Use the provider's native request format.
 
 Launch a new process after attachment and verify a native request before
-upgrading production workloads. Code that still calls `inference.local` fails
-DNS resolution because OpenShell no longer resolves or trusts that virtual
-host.
+upgrading production workloads. Code that still calls the retired managed
+virtual endpoint fails DNS resolution because OpenShell no longer resolves or
+trusts that host.
 
 ### Migration Checklist
 

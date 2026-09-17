@@ -1,6 +1,6 @@
 ---
 name: debug-inference
-description: Debug inference clients that use an attached provider and its native endpoint, including hosted APIs and host-local Ollama, vLLM, SGLang, TRT-LLM, LM Studio, or NIM. Use for provider attachment, endpoint policy, credential substitution, topology, and migration from the removed inference.local endpoint. Trigger keywords - debug inference, inference.local, local inference, ollama, lm studio, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, credential_endpoint_mismatch, host.openshell.internal.
+description: Debug inference clients that use an attached provider and its native endpoint, including hosted APIs and host-local Ollama, vLLM, SGLang, TRT-LLM, LM Studio, or NIM. Use for provider attachment, endpoint policy, credential substitution, topology, and migration from the removed managed inference endpoint. Trigger keywords - debug inference, managed inference endpoint, local inference, ollama, lm studio, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, credential_endpoint_mismatch, host.openshell.internal.
 ---
 
 # Debug Inference
@@ -83,7 +83,7 @@ openshell sandbox provider detach <sandbox> <provider>
 
 The application must use the real upstream contract:
 
-- Native provider base URL, not `https://inference.local`.
+- Native provider base URL, not the retired managed virtual endpoint.
 - Real model ID, not a placeholder that OpenShell used to rewrite.
 - Native OpenAI, Anthropic, Vertex, or other provider request shape.
 - Application-owned timeout and retry settings.
@@ -98,7 +98,7 @@ inference request using the provider's documented API shape.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `credential_placeholder_in_request_body` | A body reference is invalid/revoked, or classification metadata is unavailable | Check the controlled denial reason; remove the reference from conversation history or restore provider access. Do not enable body credential rewriting or bypass flags to send tool output. Unknown literals and valid issued placeholders pass unchanged, including the model provider’s own placeholder. Header resolution does not enable body rewriting. |
-| `Could not resolve host: inference.local` | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
+| A retired managed endpoint fails DNS resolution | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
 | Direct request is denied | Missing attachment, endpoint policy, HTTP rule, or binary authorization | Inspect the attached provider profile and sandbox effective policy |
 | `credential_endpoint_mismatch` | Credential profile does not authorize the request recipient | Correct the host/port/path or import a narrowly scoped profile for the intended endpoint |
 | `request_authority_mismatch` | HTTP authority differs from the CONNECT destination | Use the same host and effective port in both authorities |

@@ -4633,8 +4633,8 @@ filesystem_policy:
 
     #[test]
     fn discover_policy_restrictive_default_blocks_network() {
-        // In cluster mode we keep proxy mode enabled so `inference.local`
-        // can always be routed through proxy/OPA controls.
+        // In cluster mode we keep proxy mode enabled so all egress passes
+        // through proxy/OPA controls.
         let proto = openshell_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));

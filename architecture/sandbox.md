@@ -330,17 +330,11 @@ security logs. See
 [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
 configuration and protocol details.
 
-`https://inference.local` is special. It bypasses OPA network policy and is
-handled by the inference interception path:
-
-1. The proxy terminates the local TLS connection with the sandbox CA.
-2. It detects known OpenAI, Anthropic, and compatible inference request shapes.
-3. It strips caller-supplied credentials and disallowed headers.
-4. It forwards through `openshell-router` using the route bundle fetched from
-   the gateway.
-
-External inference endpoints that do not use `inference.local` are treated like
-ordinary network traffic and must be allowed by policy.
+Inference providers use the same egress path as other external services. An
+attached provider profile contributes endpoint and binary policy. The proxy
+then resolves the provider's credential placeholder only when both policy and
+the profile's endpoint binding authorize the native request. Model selection,
+request shape, headers, streaming, and timeouts remain client concerns.
 
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,

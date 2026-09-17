@@ -839,4 +839,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from `inference.local` |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |
