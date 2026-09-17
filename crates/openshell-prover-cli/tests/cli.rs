@@ -104,6 +104,58 @@ fn exceeding_policy_returns_counterexample_and_one() {
 }
 
 #[test]
+fn boundary_v2_counterexamples_have_stable_json_shapes() {
+    for (candidate, boundary, expected) in [
+        (
+            "candidate-process-root.yaml",
+            "boundary-execution.yaml",
+            serde_json::json!({
+                "domain": "process",
+                "field": "run_as_user",
+                "boundary": "sandbox",
+                "candidate": "root"
+            }),
+        ),
+        (
+            "candidate-landlock-best-effort.yaml",
+            "boundary-execution.yaml",
+            serde_json::json!({
+                "domain": "landlock",
+                "boundary": "hard_requirement",
+                "candidate": "best_effort"
+            }),
+        ),
+        (
+            "candidate-ipv6.yaml",
+            "boundary-empty.yaml",
+            serde_json::json!({
+                "domain": "network",
+                "binary": null,
+                "ancestor_binary": null,
+                "binary_identity_required": false,
+                "host": "api.example.com",
+                "destination_ip": "2001:db8::",
+                "trusted_gateway": false,
+                "port": 443,
+                "protocol": "l4",
+                "method": null,
+                "path": null
+            }),
+        ),
+    ] {
+        let output = check_json(candidate, boundary);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "candidate={candidate}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("single JSON object");
+        assert_eq!(value["counterexample"], expected, "candidate={candidate}");
+    }
+}
+
+#[test]
 fn unsupported_policy_returns_reason_and_three() {
     let output = check_json("unsupported.yaml", "boundary.yaml");
     assert_eq!(
