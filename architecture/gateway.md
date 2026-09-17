@@ -37,6 +37,10 @@ immediately without a grace period. Finalization is persisted separately from
 the exit result; the gateway deletes an ephemeral sandbox only after the
 finalized supervisor session disconnects.
 
+Local Docker development builds the supervisor image separately from the
+`openshell-sandbox` workload runtime. Cross-platform runtime extraction uses
+the sandbox image, which exports `/openshell-sandbox`.
+
 ## Configuration Boundary
 
 The gateway accepts exactly schema version 2. Missing, legacy, and future
