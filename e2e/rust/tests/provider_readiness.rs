@@ -186,14 +186,14 @@ impl FixtureImage {
         &self.tag
     }
 
-    async fn build(&self, dockerfile: &Path, context: &Path) -> Result<(), String> {
+    async fn build(&self, dockerfile: &Path, context: &Path, label: &str) -> Result<(), String> {
         let mut command = Command::from(self.engine.command());
         command
             .args(["build", "--file"])
             .arg(dockerfile)
             .args(["--tag", &self.tag])
             .arg(context);
-        checked_command_with_timeout(&mut command, "build fixture image", IMAGE_BUILD_TIMEOUT)
+        checked_command_with_timeout(&mut command, label, IMAGE_BUILD_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -1369,16 +1369,25 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
             "FROM {base}\nUSER root\nCOPY client.py /opt/provider-readiness-client.py\nUSER sandbox\n"
         )).map_err(|_| "could not write fixture Dockerfile")?;
         let supervisor_dockerfile = context.join("Dockerfile.supervisor");
-        // Outbound TLS belongs to the separate supervisor. Its combined public
-        // trust bundle is delivered to the workload through the sandbox protocol.
-        // Preserve the base image's user setting: Docker's archive upload applies
-        // an explicit image user to the supervisor's private bootstrap files.
+        // Outbound TLS belongs to the separate supervisor. Replace the system
+        // bundle in this test-only image with the fixture CA without invoking a
+        // shell: the production supervisor image is deliberately distroless.
+        // The supervisor retains its compiled Mozilla roots and delivers this
+        // fixture CA together with the generated sandbox CA to the workload.
         std::fs::write(&supervisor_dockerfile, format!(
-            "FROM {}\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN cat /tmp/readiness-fixture-ca.crt >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/readiness-fixture-ca.crt\n",
+            "FROM {}\nCOPY fixture-ca.crt /etc/ssl/certs/ca-certificates.crt\n",
             gateway_config.supervisor_image
         )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
-        image.build(&dockerfile, &context).await?;
-        supervisor_image.build(&supervisor_dockerfile, &context).await?;
+        image
+            .build(&dockerfile, &context, "build workload fixture image")
+            .await?;
+        supervisor_image
+            .build(
+                &supervisor_dockerfile,
+                &context,
+                "build supervisor fixture image",
+            )
+            .await?;
         gateway_config.apply(supervisor_image.tag()).await?;
         let profile = directory.path().join("profile.json");
         let policy = directory.path().join("policy.json");
