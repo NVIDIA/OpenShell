@@ -586,6 +586,14 @@ sandbox workload directly. The relay supports:
   `BASH_ENV` when the child environment sets it.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
+- Persistent HTTP and WebSocket service routing through gateway-managed
+  `ServiceEndpoint` records. `CreateSandboxRequest.service_exposures` registers
+  named or unnamed endpoints as part of sandbox creation, and the gateway
+  returns their routed URLs keyed by service name. The empty key identifies the
+  unnamed endpoint. Routing starts only while the sandbox is ready. `sandbox
+  create --expose PORT` uses the unnamed create-time endpoint and keeps the
+  sandbox. The standalone service API can add, update, or remove endpoints
+  later.
 
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal

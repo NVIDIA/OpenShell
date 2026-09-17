@@ -41,6 +41,7 @@ export type {
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateProvenance,
   SandboxWorkloadTemplateSpec,
+  ServiceExposure,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
