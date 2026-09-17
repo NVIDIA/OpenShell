@@ -3875,9 +3875,24 @@ impl ComputeRuntime {
 
         let sandbox = decode_sandbox_record(&current_record)?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-        if phase == SandboxPhase::Completed || is_failed_main_process_result(&sandbox) {
+        if phase == SandboxPhase::Completed
+            || phase == SandboxPhase::Error
+            || is_failed_main_process_result(&sandbox)
+        {
             // A terminal canonical process may legitimately have removed its
             // transient compute object. Keep the durable command result.
+            //
+            // Error is already the settled, informational terminal state this
+            // sweep would otherwise produce for Stopping/Stopped/Starting
+            // below -- deleting it outright instead of leaving it in place
+            // silently races a concurrent GetSandbox/ListSandboxes/DeleteSandbox
+            // caller: a driver whose registry never rehydrates after a
+            // restart (in-process-only state, e.g. MXC) reports every
+            // previously-known sandbox as "missing" on the very first sweep
+            // after startup, even ones already correctly marked Error by
+            // earlier crash detection, so this is reached far more than the
+            // "orphaned compute resource" case this pruning otherwise exists
+            // for.
             return Ok(());
         }
         if matches!(
@@ -9370,6 +9385,36 @@ mod tests {
             driver.delete_requests(),
             vec![("sb-1".to_string(), "sandbox-a".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn prune_missing_sandbox_keeps_error_phase_records() {
+        // Regression test: a driver whose registry never rehydrates after a
+        // restart (in-process-only state, e.g. MXC) reports every
+        // previously-known sandbox as missing on the first sweep after
+        // startup -- including ones already correctly, terminally marked
+        // Error by earlier crash detection. The sweep must not delete those;
+        // it must treat Error the same as the existing Completed exemption
+        // and leave the durable record in place.
+        let driver = ControlledDriver::new();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .reconcile_store_with_backend(Duration::ZERO)
+            .await
+            .unwrap();
+
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .expect("Error-phase sandbox record must survive the prune sweep");
+        assert_eq!(retained.phase(), SandboxPhase::Error as i32);
+        assert_eq!(driver.delete_calls(), 0);
     }
 
     #[tokio::test]
