@@ -194,10 +194,10 @@ fn check(
     let result = openshell_prover::containment::check_within_boundary_cancellable(
         &boundary,
         &candidate,
-        CheckOptions { timeout },
+        CheckOptions::new(timeout),
         cancelled,
     );
-    let envelope = result_envelope(&result, inputs);
+    let envelope = result_envelope(&result, inputs)?;
     render(output, &envelope)?;
     Ok(envelope.exit_code)
 }
@@ -302,19 +302,19 @@ fn render_input_error(
 
 fn render_cancelled(output: OutputFormat, inputs: InputsJson) -> Result<u8, String> {
     let result = CheckResult::cancelled();
-    let envelope = result_envelope(&result, inputs);
+    let envelope = result_envelope(&result, inputs)?;
     render(output, &envelope)?;
     Ok(envelope.exit_code)
 }
 
-fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Envelope<'_> {
+fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<'_>, String> {
     let (scope, result_name, exit_code, counterexample, reason_code, reason) = match result {
         CheckResult::Within(evidence) => (evidence.scope(), "within_boundary", 0, None, None, None),
         CheckResult::Exceeds(evidence) => (
             evidence.scope(),
             "exceeds_boundary",
             1,
-            Some(counterexample_json(evidence.counterexample())),
+            Some(counterexample_json(evidence.counterexample())?),
             None,
             None,
         ),
@@ -343,7 +343,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Envelope<'_> {
             )
         }
     };
-    Envelope {
+    Ok(Envelope {
         schema_version: 1,
         prover_version: env!("CARGO_PKG_VERSION"),
         check: "boundary",
@@ -354,7 +354,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Envelope<'_> {
         counterexample,
         reason_code,
         reason,
-    }
+    })
 }
 
 fn scope_json(scope: &CheckScope) -> ScopeJson<'_> {
@@ -365,9 +365,9 @@ fn scope_json(scope: &CheckScope) -> ScopeJson<'_> {
     }
 }
 
-fn counterexample_json(counterexample: &Counterexample) -> CounterexampleJson<'_> {
-    match counterexample {
-        Counterexample::Filesystem { access, path } => CounterexampleJson::Filesystem {
+fn counterexample_json(counterexample: &Counterexample) -> Result<CounterexampleJson<'_>, String> {
+    let converted = match counterexample {
+        Counterexample::Filesystem { access, path, .. } => CounterexampleJson::Filesystem {
             access: access.as_str(),
             path,
         },
@@ -380,6 +380,7 @@ fn counterexample_json(counterexample: &Counterexample) -> CounterexampleJson<'_
             protocol,
             method,
             path,
+            ..
         } => CounterexampleJson::Network {
             binary: binary.as_deref(),
             ancestor_binary: ancestor_binary.as_deref(),
@@ -390,7 +391,9 @@ fn counterexample_json(counterexample: &Counterexample) -> CounterexampleJson<'_
             method: method.as_deref(),
             path: path.as_deref(),
         },
-    }
+        _ => return Err("unsupported counterexample kind returned by containment API".to_owned()),
+    };
+    Ok(converted)
 }
 
 fn render(output: OutputFormat, envelope: &Envelope<'_>) -> Result<(), String> {

@@ -19,9 +19,7 @@ fn check(boundary: &str, candidate: &str) -> CheckResult {
     check_within_boundary(
         &boundary,
         &candidate,
-        CheckOptions {
-            timeout: Duration::from_secs(5),
-        },
+        CheckOptions::new(Duration::from_secs(5)),
     )
 }
 

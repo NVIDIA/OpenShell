@@ -6,6 +6,11 @@
 //! This module is independent of the legacy proposal-risk model. It parses the
 //! canonical authored schema and fails closed when authority falls outside its
 //! supported containment model.
+//!
+//! Callers construct [`CheckOptions`] with [`CheckOptions::new`] and should
+//! match extensible enums with a wildcard arm. [`CheckResult`] deliberately
+//! remains exhaustive: its four outcomes are the stable, closed result-state
+//! contract, and authorization should accept only [`CheckResult::Within`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -115,13 +120,32 @@ fn normalize_path(path: &str) -> Result<String, ParsePolicyError> {
 }
 
 /// Per-invocation solver limits. These never modify Z3 global parameters.
+///
+/// Construct options with [`CheckOptions::new`]. The struct is extensible so
+/// future settings can receive defaults without breaking callers.
+///
+/// ```compile_fail
+/// use openshell_prover::containment::CheckOptions;
+/// use std::time::Duration;
+///
+/// let _options = CheckOptions { timeout: Duration::from_secs(1) };
+/// ```
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CheckOptions {
     pub timeout: Duration,
 }
 
+impl CheckOptions {
+    #[must_use]
+    pub const fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
 /// Stable reason identifiers for automation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReasonCode {
     UnsupportedPolicyShape,
     UnresolvedWorkdir,
@@ -153,6 +177,7 @@ impl ReasonCode {
 
 /// Authority domains modeled by this engine version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CheckDomain {
     Filesystem,
     NetworkL4,
@@ -172,6 +197,7 @@ impl CheckDomain {
 
 /// Scope attached to every completed or recoverably incomplete check.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CheckScope {
     pub model_version: &'static str,
     pub policy_version: u32,
@@ -209,6 +235,7 @@ impl FilesystemAccess {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Protocol {
     L4,
     Rest,
@@ -226,11 +253,14 @@ impl Protocol {
 
 /// Concrete action showing why containment failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Counterexample {
+    #[non_exhaustive]
     Filesystem {
         access: FilesystemAccess,
         path: String,
     },
+    #[non_exhaustive]
     Network {
         binary: Option<String>,
         ancestor_binary: Option<String>,
@@ -244,6 +274,7 @@ pub enum Counterexample {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WithinEvidence;
 
 impl WithinEvidence {
@@ -1988,9 +2019,7 @@ mod tests {
     }
 
     fn options() -> CheckOptions {
-        CheckOptions {
-            timeout: Duration::from_secs(10),
-        }
+        CheckOptions::new(Duration::from_secs(10))
     }
 
     #[test]
@@ -2355,9 +2384,7 @@ mod tests {
         let broader_method = parse(
             "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
-        let options = CheckOptions {
-            timeout: Duration::from_secs(30),
-        };
+        let options = CheckOptions::new(Duration::from_secs(30));
         let result = check_within_boundary(&boundary, &narrower, options);
         assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
         let result = check_within_boundary(&boundary, &broader_method, options);
