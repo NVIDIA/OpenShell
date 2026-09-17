@@ -18,6 +18,7 @@ pub mod certgen;
 pub mod cli;
 mod compute;
 pub mod config_file;
+mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;

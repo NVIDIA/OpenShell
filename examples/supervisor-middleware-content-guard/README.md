@@ -8,18 +8,18 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies and complete client-to-upstream WebSocket text messages for configured literal strings, then either replaces every match or denies the request or message. Findings report only aggregate counts and never include configured terms or inspected content.
+This configured-literal guard applies the same case-sensitive terms to UTF-8 HTTP request bodies, complete HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request and response bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
-Install `cargo`, `curl`, `jq`, and `openssl` on the host before running the smoke script.
+Install `cargo`, `curl`, `jq`, `openssl`, `mise`, and `uv` with Python 3 on the host before running the smoke script. Start Docker or Podman. The supervisor image build uses the repository's Linux cross-compilation toolchain, including `cargo-zigbuild` and Zig on macOS. Install the repository's mise tools before running it.
 
 ## Run the smoke example
 
-Run the end-to-end smoke suite to build and start a local gateway, start the content-guard service, create a sandbox, and send the same request body to two destinations:
+Run the end-to-end smoke suite to build a local gateway and sandbox supervisor, start the content-guard service, create a sandbox, and send the same request body to two destinations:
 
 ```shell
 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
@@ -39,6 +39,16 @@ The script creates the sandbox and prints the guarded and unguarded request comm
 CONTENT_GUARD_SMOKE_HOST=192.168.1.10 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
 ```
 
+The script defaults to Docker. Set `CONTENT_GUARD_SMOKE_DRIVER=podman` to build and run with Podman instead.
+
+On Linux and macOS, the script runs `mise run docker:build:supervisor` with the selected container engine to build a Linux supervisor from the current checkout. It configures that driver's `supervisor_image` with a unique local tag, so the response checks exercise the local runtime changes. macOS host binaries are never used inside the sandbox. The local image remains available after the smoke run.
+
+Cargo's configured target directory applies to the host binaries and the Linux supervisor build. For example:
+
+```shell
+CARGO_TARGET_DIR=/tmp/content-guard-target ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
+```
+
 ## Run manually
 
 Start the service before starting the gateway. Bind to all host interfaces so a local containerized gateway and sandbox supervisor can reach it:
@@ -54,6 +64,7 @@ Add the service registration to your local gateway TOML:
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
+allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 ```
@@ -84,6 +95,34 @@ curl -sS https://httpbin.org/anything \
 
 The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
+## HTTP response behavior
+
+The smoke launcher starts the local fixture. To start it manually:
+
+```shell
+uv run --no-project python examples/supervisor-middleware-content-guard/upstream.py
+```
+
+The policy permits `GET /clean` and `GET /sensitive` on
+`http://host.openshell.internal:18081`. The first returns ordinary public text.
+The second contains both configured terms. Redact mode returns
+`contains [FILTERED] and [FILTERED]`. Deny mode returns typed `BlockDelivery`
+with reason code `content_match`, which produces the canonical 403 response
+before delivery. The smoke suite recreates the sandbox in deny mode and checks
+both clean and matching responses through the external gRPC service.
+
+Every selected response requires `WHOLE_BODY_BYTES`. If that mode is unavailable,
+the service returns a middleware failure and the policy's `on_error` decides
+whether delivery fails open or closed. This includes encoded, partial,
+no-transform, bodyless, and known oversized responses. Unknown-length bodies can
+also exceed the runtime limit during collection. Invalid UTF-8 fails the same way.
+The example policy uses `fail_closed`.
+
+Clean bodies pass unchanged. Matching spans are merged and replaced in the
+complete body, so transport chunk boundaries do not affect matching. Trailers
+are accepted without mutation. The guard does not decode compressed bodies,
+normalize Unicode, scan response headers, retain stream units, or spool bodies.
+
 ## WebSocket behavior
 
 For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and OpenShell closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
@@ -107,4 +146,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, advertises a 256 KiB limit for each operation, and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

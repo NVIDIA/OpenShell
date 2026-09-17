@@ -16,14 +16,15 @@ let
     builtins.attrValues toolchains
   );
 
-  mkTestArchive = {
-    name,
-    workspacePath,
-    manifestPath,
-    package,
-    target,
-    output,
-  }:
+  mkTestArchive =
+    {
+      name,
+      workspacePath,
+      manifestPath,
+      package,
+      target,
+      output,
+    }:
     pkgs.writeShellApplication {
       name = "build-${name}-test-archive";
       runtimeInputs = [
@@ -90,6 +91,7 @@ rec {
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
     runtimeInputs = [
+      pkgs.coreutils
       pkgs.git
       rustToolchain
     ];
@@ -105,6 +107,22 @@ rec {
       cargo build --target ${gnuToolchain.target} \
         -p openshell-gateway \
         -p openshell-supervisor
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell \
+        artifacts/binaries/${muslToolchain.target}/openshell
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-sandbox \
+        artifacts/binaries/${muslToolchain.target}/openshell-sandbox
+
+      install -D -m 0755 \
+        target/${gnuToolchain.target}/debug/openshell-gateway \
+        artifacts/binaries/${gnuToolchain.target}/openshell-gateway
+
+      install -D -m 0755 \
+        target/${gnuToolchain.target}/debug/openshell-supervisor \
+        artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
     '';
   };
 
@@ -119,15 +137,15 @@ rec {
       cd "$root"
 
       install -D -m 0755 \
-        target/${gnuToolchain.target}/debug/openshell-gateway \
+        artifacts/binaries/${gnuToolchain.target}/openshell-gateway \
         deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-gateway
 
       install -D -m 0755 \
-        target/${gnuToolchain.target}/debug/openshell-supervisor \
+        artifacts/binaries/${gnuToolchain.target}/openshell-supervisor \
         deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-supervisor
 
       install -D -m 0755 \
-        target/${muslToolchain.target}/debug/openshell-sandbox \
+        artifacts/binaries/${muslToolchain.target}/openshell-sandbox \
         deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-sandbox
 
       docker build \

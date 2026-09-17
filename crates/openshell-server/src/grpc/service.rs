@@ -434,6 +434,7 @@ mod tests {
         let exposed = handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 8080,
@@ -486,6 +487,7 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
@@ -544,6 +546,7 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 8080,
@@ -561,6 +564,7 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 9090,
@@ -612,6 +616,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 7070,
@@ -630,6 +635,7 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 8080,
@@ -647,6 +653,7 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 9090,
@@ -704,6 +711,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -735,6 +743,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 8080,
@@ -750,6 +759,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 9090,
@@ -839,6 +849,7 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
@@ -891,6 +902,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "api".to_string(),
                 target_port: 3000,

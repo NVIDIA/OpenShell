@@ -116,13 +116,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "574bf5fcff731bd6e3fd84ed3f124161035bd236ef0fb7e32b4d8a8c55ceba5e";
+        "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "d323fdd0c989049950ed3bf9cc2cbae9f05e1ae83b13fa2a65a2f5db1ebab95f";
+        "418130a28d1a5398d3d7f73f11b7f025d027c70f215be320dfe8e58371769f83";
     const DURABLE_SCHEMA_SHA256: &str =
-        "65066c0b0eef57a4c708f20fcbbb8e8f47376da9f4bf73dfc3bca0b3df174ba8";
+        "557ca283c55fd46b213d5573b950ba8604cc3f4b31bad3e433eb9c5f9975138d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "39e8aaf0d1fbc86906c49a9e7f60641a3ce203d3130799c8065e09acf9d53ddf";
+        "f541c25bb3e1e5806865bc61470c66d10c16cca7399bf5909c77dc384d469171";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -138,9 +138,10 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
-    const STORAGE_MESSAGE_NAMES: [&str; 8] = [
+    const STORAGE_MESSAGE_NAMES: [&str; 9] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
+        "StoredConfigUpdateOperation",
         "StoredDraftChunk",
         "StoredPolicyRevision",
         "StoredProviderCredentialRefreshState",
@@ -148,12 +149,21 @@ mod tests {
         "StoredProviderProfile",
         "StoredRefreshMaterialDeletion",
     ];
-    const DURABLE_ROOTS: [&str; 12] = [
+    const PROVIDER_READINESS_RPC_SIGNATURES: [&str; 2] = [
+        "openshell.v1.OpenShell/GetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
+        "openshell.v1.OpenShell/ReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    // Synthetic SandboxSpec bytes with log level, provider, and command fields,
+    // emitted before the gateway-owned attachment epoch field was introduced.
+    const PRE_READINESS_SANDBOX_SPEC: &str =
+        "0a04696e666f421273796e7468657469632d70726f766964657262046563686f";
+    const DURABLE_ROOTS: &[&str] = &[
         ".openshell.datamodel.v1.Provider",
         ".openshell.datamodel.v1.Workspace",
         ".openshell.sandbox.v1.SandboxPolicy",
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
+        ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.v1.Sandbox",
@@ -495,19 +505,34 @@ mod tests {
             }
         }
         methods.sort();
-        assert_eq!(compiled_method_count, 101, "classify every compiled RPC");
-        assert_eq!(methods.len(), 75, "inventory every public gateway RPC");
+        for signature in PROVIDER_READINESS_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "provider readiness RPC is missing or changed: {signature}"
+            );
+        }
+        assert_eq!(
+            compiled_method_count,
+            101 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            "classify every compiled RPC"
+        );
+        assert_eq!(
+            methods.len(),
+            75 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            "inventory every public gateway RPC"
+        );
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            75
+            75 + PROVIDER_READINESS_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
         let public_closure = schema_closure(&index, public_roots);
-        let durable_closure = schema_closure(&index, DURABLE_ROOTS.into_iter().map(str::to_string));
+        let durable_closure =
+            schema_closure(&index, DURABLE_ROOTS.iter().copied().map(str::to_string));
         let overlap_messages = public_closure
             .messages
             .intersection(&durable_closure.messages)
@@ -533,28 +558,39 @@ mod tests {
         let durable_inventory_hash = schema_fingerprint(&index, &durable_closure);
         let overlap_hash = format!("{:x}", Sha256::digest(overlap_inventory.as_bytes()));
 
+        // Report the complete measured inventory on failure so one schema
+        // change exposes every affected boundary in the same focused run.
         assert_eq!(
-            (public_closure.messages.len(), public_closure.enums.len()),
-            (283, 14)
+            (
+                (public_closure.messages.len(), public_closure.enums.len()),
+                (durable_closure.messages.len(), durable_closure.enums.len()),
+                (overlap_messages.len(), overlap_enums.len()),
+                public_inventory_hash.as_str(),
+                durable_inventory_hash.as_str(),
+                overlap_hash.as_str(),
+            ),
+            (
+                (294, 20),
+                (90, 15),
+                (78, 15),
+                PUBLIC_RPC_SCHEMA_SHA256,
+                DURABLE_SCHEMA_SHA256,
+                PUBLIC_DURABLE_OVERLAP_SHA256
+            ),
+            "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
         );
-        assert_eq!(
-            (durable_closure.messages.len(), durable_closure.enums.len()),
-            (83, 9)
-        );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (73, 9));
+    }
 
-        assert_eq!(
-            public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
-            "the public RPC schema closure changed; review API compatibility and update the inventory and architecture/gateway.md"
-        );
-        assert_eq!(
-            durable_inventory_hash, DURABLE_SCHEMA_SHA256,
-            "a durable protobuf root or transitive dependency changed; record migration handling and a prior-version fixture before updating this fingerprint"
-        );
-        assert_eq!(
-            overlap_hash, PUBLIC_DURABLE_OVERLAP_SHA256,
-            "the public/durable protobuf overlap changed; review both API and storage compatibility before updating this inventory"
-        );
+    #[test]
+    fn pre_readiness_sandbox_spec_decodes_with_initial_attachment_epoch() {
+        let spec = openshell_core::proto::SandboxSpec::decode(
+            legacy_bytes(PRE_READINESS_SANDBOX_SPEC).as_slice(),
+        )
+        .expect("prior sandbox spec must decode");
+        assert_eq!(spec.log_level, "info");
+        assert_eq!(spec.providers, ["synthetic-provider"]);
+        assert_eq!(spec.command, ["echo"]);
+        assert!(spec.provider_attachment_epoch.is_empty());
     }
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {

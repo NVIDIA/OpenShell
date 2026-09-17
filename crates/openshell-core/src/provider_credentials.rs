@@ -17,9 +17,25 @@ const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentialSnapshot {
+    /// Identifies this local installation, including repairs at the same revision.
+    pub installation_id: String,
     pub revision: u64,
     pub child_env: HashMap<String, String>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+}
+
+/// One atomic workload-facing snapshot and its local installation identity.
+///
+/// Only the prepared environment crosses an isolation boundary; resolver
+/// material remains in the supervisor. The identity distinguishes an empty
+/// fail-closed snapshot from a later repair with the same provider revision.
+pub struct ChildEnvironmentSnapshot {
+    /// Opaque identity of the installed supervisor snapshot.
+    pub installation_id: String,
+    /// Opaque provider content fingerprint, never an ordered counter.
+    pub revision: u64,
+    /// Prepared environment used by future workload processes.
+    pub environment: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -89,6 +105,7 @@ impl ProviderCredentialState {
                 revision,
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -136,6 +153,7 @@ impl ProviderCredentialState {
                 &stable_handles,
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -178,6 +196,7 @@ impl ProviderCredentialState {
     /// or holding the gateway-side resolver material.
     pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -221,6 +240,7 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -386,6 +406,7 @@ impl ProviderCredentialState {
         inner.suppressed_keys.insert(key.to_string());
         let mut env = (*inner.current).clone();
         env.child_env.remove(key);
+        env.installation_id = uuid::Uuid::new_v4().to_string();
         inner.current = Arc::new(env);
     }
 
@@ -429,6 +450,20 @@ impl ProviderCredentialState {
             .read()
             .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
         Ok(Self::resolve_child_env_snapshot(&inner))
+    }
+
+    /// Capture installation identity and prepared environment under one lock.
+    pub fn child_environment_snapshot(&self) -> std::io::Result<ChildEnvironmentSnapshot> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        let (revision, environment) = Self::resolve_child_env_snapshot(&inner);
+        Ok(ChildEnvironmentSnapshot {
+            installation_id: inner.current.installation_id.clone(),
+            revision,
+            environment,
+        })
     }
 
     fn resolve_child_env_snapshot(
@@ -491,8 +526,9 @@ impl ProviderCredentialState {
     /// Compare and install a workload-facing environment snapshot.
     ///
     /// Provider environment revisions are opaque content identities, not
-    /// ordered counters. The expected revision makes retries idempotent while
-    /// rejecting updates based on a stale view of the boundary state.
+    /// ordered counters. The expected revision rejects a different current
+    /// fingerprint. Callers must also fence publication order when a failed
+    /// refresh and its repair can share that fingerprint.
     pub fn compare_and_install_child_env_snapshot(
         &self,
         expected_revision: u64,
@@ -503,14 +539,19 @@ impl ProviderCredentialState {
             .inner
             .write()
             .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
-        if revision == inner.current.revision || expected_revision != inner.current.revision {
+        if expected_revision != inner.current.revision {
             return Ok(inner.current.revision);
         }
+
+        // A failed refresh can clear the map without changing its provider
+        // fingerprint. A matching expectation must therefore install even an
+        // equal revision. Boundary publication ordering fences delayed retries.
 
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -587,6 +628,7 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -652,6 +694,7 @@ impl ProviderCredentialState {
             child_env.remove(key);
         }
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -711,6 +754,7 @@ impl ProviderCredentialState {
         let dynamic_credentials =
             dynamic_credentials.unwrap_or_else(|| inner.current.dynamic_credentials.clone());
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env: HashMap::new(),
             dynamic_credentials,
@@ -2425,6 +2469,26 @@ mod tests {
         let (revision, env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
         assert_eq!(revision, 2);
         assert!(env.is_empty(), "an empty snapshot must revoke the old env");
+    }
+
+    #[test]
+    fn child_environment_repair_replaces_an_empty_map_at_the_same_revision() {
+        let state = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
+        let failed = state.child_environment_snapshot().unwrap();
+        state
+            .compare_and_install_child_env_snapshot(
+                6,
+                6,
+                HashMap::from([("TOKEN".to_string(), "reference".to_string())]),
+            )
+            .unwrap();
+        let repaired = state.child_environment_snapshot().unwrap();
+        assert_ne!(failed.installation_id, repaired.installation_id);
+        assert_eq!(repaired.revision, 6);
+        assert_eq!(
+            repaired.environment.get("TOKEN").map(String::as_str),
+            Some("reference")
+        );
     }
 
     #[test]

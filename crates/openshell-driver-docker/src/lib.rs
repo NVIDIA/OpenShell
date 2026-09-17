@@ -4723,6 +4723,10 @@ async fn stage_docker_supervisor_bundle(
             ),
             ContainerCreateBody {
                 image: Some(config.supervisor_image_id.clone()),
+                // Docker's copyUIDGID upload uses Config.User when it is set,
+                // overriding the archive's numeric ownership. Match the reader
+                // explicitly instead of inheriting the staging image's user.
+                user: Some(format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")),
                 entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
                 labels: Some(docker_auxiliary_container_labels(
                     sandbox,
