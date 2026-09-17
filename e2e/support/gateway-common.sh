@@ -182,12 +182,17 @@ e2e_register_oidc_admin_session() {
   local client_id="${10:-openshell-cli}"
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
+  # The OpenShell scopes are optional client scopes on openshell-cli, so
+  # Keycloak mints them only when they are asked for. Without an explicit
+  # scope the token carries the realm defaults alone and every authorized RPC
+  # fails with "scope '<name>' required".
   local token
   token=$(curl -sf -X POST "${issuer}/protocol/openid-connect/token" \
     -d "grant_type=password" \
     -d "client_id=${client_id}" \
     -d "username=${username}" \
     -d "password=${password}" \
+    --data-urlencode "scope=openid openshell:all" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
 
   if [ -z "${token}" ]; then
@@ -216,7 +221,8 @@ e2e_register_oidc_admin_session() {
   "gateway_port": ${port},
   "auth_mode": "oidc",
   "oidc_issuer": "${issuer}",
-  "oidc_client_id": "${client_id}"
+  "oidc_client_id": "${client_id}",
+  "oidc_scopes": "openid openshell:all"
 }
 EOF
   cat >"${gateway_config_dir}/oidc_token.json" <<EOF
