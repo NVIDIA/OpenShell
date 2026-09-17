@@ -2732,6 +2732,14 @@ async fn fetch_sandboxes(
 }
 
 fn sandbox_notes(sandbox: &openshell_core::proto::Sandbox, forwards: String) -> String {
+    sandbox_notes_for_view(sandbox, forwards, false)
+}
+
+fn sandbox_notes_for_view(
+    sandbox: &openshell_core::proto::Sandbox,
+    forwards: String,
+    detail: bool,
+) -> String {
     if let Some(record) = sandbox
         .status
         .as_ref()
@@ -2760,17 +2768,18 @@ fn sandbox_notes(sandbox: &openshell_core::proto::Sandbox, forwards: String) -> 
     let Some(rejection) = rejection else {
         return forwards;
     };
-    // Keep the table row on one line even when a diagnostic contains newlines.
-    let message = rejection
-        .message
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut notes = "Config invalid".to_string();
-    if !message.is_empty() {
-        notes.push_str(": ");
-        notes.push_str(&message);
-    }
+    let mut notes = if detail {
+        format!(
+            "Invalid config: {}",
+            rejection
+                .message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else {
+        "inspect for config".to_string()
+    };
     if !forwards.is_empty() {
         notes.push_str("; ");
         notes.push_str(&forwards);
@@ -2835,6 +2844,14 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
             let name = s.object_name();
             let forwards = openshell_core::forward::build_sandbox_notes(name, &forwards);
             sandbox_notes(s, forwards)
+        })
+        .collect();
+
+    app.sandbox_detail_notes = sandboxes
+        .iter()
+        .map(|s| {
+            let forwards = openshell_core::forward::build_sandbox_notes(s.object_name(), &forwards);
+            sandbox_notes_for_view(s, forwards, true)
         })
         .collect();
 
@@ -3330,18 +3347,19 @@ mod sandbox_notes_tests {
         };
         assert_eq!(
             sandbox_notes(&sandbox, "fwd:8080".into()),
-            "Config invalid: credentialed endpoint requires L7 inspection; fwd:8080"
+            "inspect for config; fwd:8080"
         );
-        // Older gateways can expose only Ready; retain the diagnostic there too.
-        sandbox.status.as_mut().unwrap().conditions.remove(0);
         assert_eq!(
-            sandbox_notes(&sandbox, String::new()),
-            "Config invalid: credentialed endpoint requires L7 inspection"
+            super::sandbox_notes_for_view(&sandbox, "fwd:8080".into(), true),
+            "Invalid config: credentialed endpoint requires L7 inspection; fwd:8080"
         );
+        // Older gateways can expose only Ready; retain the note there too.
+        sandbox.status.as_mut().unwrap().conditions.remove(0);
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "inspect for config");
         sandbox.status.as_mut().unwrap().conditions[0]
             .message
             .clear();
-        assert_eq!(sandbox_notes(&sandbox, String::new()), "Config invalid");
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "inspect for config");
         sandbox.status.as_mut().unwrap().conditions[0].status = "True".into();
         assert_eq!(sandbox_notes(&sandbox, "fwd:8080".into()), "fwd:8080");
         sandbox.status = None;

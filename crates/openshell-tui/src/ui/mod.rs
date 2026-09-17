@@ -74,8 +74,8 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(sandbox_detail::required_height(app)), // metadata
-            Constraint::Min(0),                                       // policy or logs
+            Constraint::Length(sandbox_detail::required_height(app, area.width)), // metadata
+            Constraint::Min(0),                                                   // policy or logs
         ])
         .split(area);
 
@@ -736,6 +736,55 @@ mod tests {
             .collect::<String>();
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("ALPHA"));
+    }
+
+    #[tokio::test]
+    async fn configuration_notes_fit_dashboard_and_wrap_in_detail() {
+        let mut app = test_app();
+        app.sandbox_names = vec!["quarantined".into()];
+        app.sandbox_count = 1;
+        app.sandbox_notes = vec!["inspect for config".into()];
+        let diagnostic = "Invalid config: credentialed endpoint api.example.com:443 requires L7 inspection before the sandbox workload can start safely";
+        app.sandbox_detail_notes = vec![diagnostic.into()];
+        for width in [80, 100, 120] {
+            for all_workspaces in [false, true] {
+                app.all_workspaces = all_workspaces;
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        sandboxes::draw(frame, &app, frame.size(), true);
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                assert!(
+                    text.contains("inspect for config"),
+                    "dashboard at {width}: {text}"
+                );
+                assert!(!text.contains("credentialed endpoint"));
+            }
+            app.screen = Screen::Sandbox;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            let words = text
+                .replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(words.contains(diagnostic), "detail at {width}: {words}");
+        }
     }
 
     #[tokio::test]

@@ -574,7 +574,7 @@ fn display_width(text: &str) -> usize {
 ///
 /// A word wider than `width` is hard-broken rather than allowed to overflow.
 /// Always returns at least one row so callers can index the first row safely.
-fn wrap_value(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_value(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
