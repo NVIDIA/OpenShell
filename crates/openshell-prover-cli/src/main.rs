@@ -73,8 +73,6 @@ struct Envelope<'a> {
 
 #[derive(Debug, Serialize)]
 struct ScopeJson<'a> {
-    model_version: &'a str,
-    policy_version: u32,
     domains: Vec<&'a str>,
 }
 
@@ -370,8 +368,6 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<
 
 fn scope_json(scope: &CheckScope) -> ScopeJson<'_> {
     ScopeJson {
-        model_version: scope.model_version,
-        policy_version: scope.policy_version,
         domains: scope.domains.iter().map(|domain| domain.as_str()).collect(),
     }
 }
@@ -446,14 +442,8 @@ fn render_text(mut writer: impl Write, envelope: &Envelope<'_>) -> Result<(), St
     writeln!(writer, "result: {}", envelope.result)
         .map_err(|error| format!("failed to write output: {error}"))?;
     if let Some(scope) = &envelope.scope {
-        writeln!(
-            writer,
-            "scope: model={} policy={} domains={}",
-            escape_terminal(scope.model_version),
-            scope.policy_version,
-            scope.domains.join(",")
-        )
-        .map_err(|error| format!("failed to write output: {error}"))?;
+        writeln!(writer, "scope: domains={}", scope.domains.join(","))
+            .map_err(|error| format!("failed to write output: {error}"))?;
     }
     if let Some(counterexample) = &envelope.counterexample {
         match counterexample {

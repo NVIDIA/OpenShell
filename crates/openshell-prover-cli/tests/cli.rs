@@ -80,12 +80,35 @@ fn contained_policy_returns_stable_json_and_zero() {
     assert_eq!(
         value["scope"],
         serde_json::json!({
-            "model_version": "boundary-v2",
-            "policy_version": 1,
             "domains": ["filesystem", "network_l4", "network_rest", "process", "landlock"]
         })
     );
     assert!(value["counterexample"].is_null());
+}
+
+#[test]
+fn contained_policy_returns_stable_text_scope_and_zero() {
+    let output = run(&[
+        "check",
+        fixture("candidate-contained.yaml")
+            .to_str()
+            .expect("UTF-8 fixture path"),
+        "--boundary",
+        fixture("boundary.yaml")
+            .to_str()
+            .expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 text output"),
+        "result: within_boundary\nscope: domains=filesystem,network_l4,network_rest,process,landlock\n"
+    );
 }
 
 #[test]
@@ -104,7 +127,7 @@ fn exceeding_policy_returns_counterexample_and_one() {
 }
 
 #[test]
-fn boundary_v2_counterexamples_have_stable_json_shapes() {
+fn counterexamples_have_stable_json_shapes() {
     for (candidate, boundary, expected) in [
         (
             "candidate-process-root.yaml",

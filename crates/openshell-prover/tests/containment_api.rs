@@ -65,7 +65,6 @@ fn external_callers_use_extensible_construction_and_matching_patterns() {
     let CheckResult::Exceeds(evidence) = &result else {
         panic!("expected filesystem violation, got {result:?}");
     };
-    assert_eq!(evidence.scope().model_version, "boundary-v2");
     assert!(
         evidence
             .scope()
@@ -106,5 +105,11 @@ fn external_callers_read_reason_evidence_and_authorize_only_within() {
         ReasonCode::SolverTimeout => {}
         _ => panic!("unexpected reason code"),
     }
-    assert_eq!(evidence.scope().policy_version, 1);
+    assert!(
+        evidence
+            .scope()
+            .domains
+            .iter()
+            .any(|domain| domain_name(*domain) == "landlock")
+    );
 }

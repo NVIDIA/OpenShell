@@ -179,7 +179,7 @@ impl ReasonCode {
     }
 }
 
-/// Authority domains modeled by this engine version.
+/// Authority domains modeled by this check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CheckDomain {
@@ -207,8 +207,6 @@ impl CheckDomain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CheckScope {
-    pub model_version: &'static str,
-    pub policy_version: u32,
     pub domains: &'static [CheckDomain],
 }
 
@@ -220,11 +218,7 @@ static DOMAINS: &[CheckDomain] = &[
     CheckDomain::Landlock,
 ];
 fn check_scope() -> &'static CheckScope {
-    static SCOPE: CheckScope = CheckScope {
-        model_version: "boundary-v2",
-        policy_version: 1,
-        domains: DOMAINS,
-    };
+    static SCOPE: CheckScope = CheckScope { domains: DOMAINS };
     &SCOPE
 }
 

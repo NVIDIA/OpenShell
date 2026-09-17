@@ -100,12 +100,12 @@ openshell-prover check candidate.yaml \
   --output json
 ```
 
-The JSON object includes the result, exit code, input paths, prover version,
-model version, checked policy version, and modeled domains. The documented
-semantics and environmental conditions for that scope are tied to its model
-version. An exceeding result also includes a typed counterexample. Automation
-should use `result` and `reason_code` instead of parsing the human-readable
-explanation.
+The JSON object includes the result, exit code, input paths, schema version,
+prover version, and modeled domains. `schema_version` versions the JSON contract,
+`prover_version` identifies the implementation that produced the result, and
+`scope.domains` is the machine-readable coverage declaration. An exceeding
+result also includes a typed counterexample. Automation should use `result` and
+`reason_code` instead of parsing the human-readable explanation.
 
 | Field | When populated |
 |---|---|
@@ -147,7 +147,7 @@ openshell-prover check candidate.yaml \
 
 | Exit | Result | Meaning |
 |---|---|---|
-| `0` | `within_boundary` | Containment was established for the reported model scope. |
+| `0` | `within_boundary` | Containment was established for the reported scope. |
 | `1` | `exceeds_boundary` | The candidate exceeds the boundary; inspect the counterexample. |
 | `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
 | `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
@@ -158,12 +158,12 @@ inconclusive results as failures in CI.
 
 ## Interpretation and Limits
 
-The `boundary-v2` containment model covers filesystem paths, process
-identity settings, Landlock compatibility requirements, L4 destination authority,
-and enforced REST method and path authority, including explicit REST denies.
-The result object reports the domains used for each check. Policies that use
-recognized authority outside that model return `unsupported` rather than
-silently ignoring it.
+The containment check covers filesystem paths, process identity settings,
+Landlock compatibility requirements, L4 destination authority, and enforced
+REST method and path authority, including explicit REST denies. The result
+object reports the domains used for each check. Policies that use recognized
+authority outside that scope return `unsupported` rather than silently ignoring
+it.
 
 Both inputs use the same bounded YAML/JSON parser and authored policy schema as
 OpenShell. Unknown fields, duplicate keys, malformed field types, and unsupported
@@ -212,9 +212,9 @@ literal suffixes differ. CIDR unions within a supported endpoint are checked by
 the solver. Unsupported IP-literal wildcard selectors and ranges rejected by
 the runtime also cannot produce a successful proof.
 
-Consumers must explicitly accept model `boundary-v2` and its additional
-`process` and `landlock` domains. Do not treat a v1 result as covering these
-fields.
+Consumers must inspect `scope.domains` and require every domain relevant to
+their authorization decision. A successful result applies only to those
+reported domains and the documented assumptions.
 
 ### Remaining limits
 

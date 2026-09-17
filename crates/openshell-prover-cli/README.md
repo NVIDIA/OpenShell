@@ -33,8 +33,8 @@ cargo test -p openshell-prover-cli
 
 See the [policy prover reference](../../docs/reference/policy-prover.mdx) for installed usage and interpretation guidance.
 
-The `boundary-v2` model adds process identity, Landlock compatibility,
-and destination IP restrictions to the containment check. Consumers that validate
-the JSON contract must accept the new model and its `process` and `landlock`
-domains explicitly. A passing check compares configuration under the documented
-assumptions; it does not attest that a running sandbox installed its restrictions.
+JSON output uses a numeric `schema_version` for the result contract and a
+`prover_version` for the implementation that produced it. Consumers must inspect
+`scope.domains` for the machine-readable coverage declaration. A passing check
+compares configuration under the documented assumptions; it does not attest that
+a running sandbox installed its restrictions.

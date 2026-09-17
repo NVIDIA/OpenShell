@@ -63,7 +63,10 @@ unknown values as a fail-closed result. Existing identifier strings are stable.
 `Unsupported`, and `Inconclusive`. `FilesystemAccess` is likewise closed to
 `Read` and `Write`. Adding a result state or filesystem access mode is a
 breaking API change. Rust source compatibility is separate from the CLI JSON
-schema and containment model versions; this contract changes neither.
+schema contract. The CLI's numeric `schema_version` versions that JSON contract,
+while `prover_version` identifies the implementation that produced a result.
+The result's `scope.domains` list is the machine-readable declaration of modeled
+authority.
 
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
