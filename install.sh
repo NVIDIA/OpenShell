@@ -22,6 +22,7 @@ HOMEBREW_FORMULA_NAME="openshell"
 HOMEBREW_CLI_ASSET="openshell-aarch64-apple-darwin.tar.gz"
 HOMEBREW_GATEWAY_ASSET="openshell-gateway-aarch64-apple-darwin.tar.gz"
 HOMEBREW_DRIVER_VM_ASSET="openshell-driver-vm-aarch64-apple-darwin.tar.gz"
+HOMEBREW_PROVER_ASSET="openshell-prover-aarch64-apple-darwin.tar.gz"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
@@ -400,8 +401,8 @@ resolve_latest_prerelease_tag() {
     /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
       tag = $0
       sub(/^v/, "", tag)
-      split(tag, version_parts, "-pre\\.")
-      split(version_parts[1], core, "\\.")
+      split(tag, version_parts, "-pre[.]")
+      split(version_parts[1], core, "[.]")
       sequence = version_parts[2] + 0
 
       if (!found || core[1] + 0 > major ||
@@ -839,7 +840,7 @@ patch_prerelease_homebrew_formula_urls() {
   _formula_file="$1"
   [ -n "$RELEASE_ASSET_DIR" ] || return 0
 
-  for _asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET"; do
+  for _asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
     if [ ! -f "${RELEASE_ASSET_DIR}/${_asset}" ]; then
       error "prerelease artifact is missing the required macOS asset: ${_asset}"
     fi
@@ -852,6 +853,7 @@ patch_prerelease_homebrew_formula_urls() {
     -e "s#${_release_asset_url}/${HOMEBREW_CLI_ASSET}#${_local_asset_url}/${HOMEBREW_CLI_ASSET}#g" \
     -e "s#${_release_asset_url}/${HOMEBREW_GATEWAY_ASSET}#${_local_asset_url}/${HOMEBREW_GATEWAY_ASSET}#g" \
     -e "s#${_release_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#${_local_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_PROVER_ASSET}#${_local_asset_url}/${HOMEBREW_PROVER_ASSET}#g" \
     "$_formula_file" >"$_patched_file"
   mv "$_patched_file" "$_formula_file"
 }

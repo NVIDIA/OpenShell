@@ -545,9 +545,11 @@ jobs:
             release/openshell-aarch64-apple-darwin.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
             release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 

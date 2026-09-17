@@ -228,7 +228,7 @@ if [ "$(cat "$downloaded_checksum")" != "checksums" ]; then
   exit 1
 fi
 
-for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET"; do
+for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
   : >"${RELEASE_ASSET_DIR}/${asset}"
 done
 prerelease_formula="${tmpdir}/openshell.rb"
@@ -236,9 +236,10 @@ printf '%s\n' \
   "  url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_CLI_ASSET}\"" \
   "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_GATEWAY_ASSET}\"" \
   "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_DRIVER_VM_ASSET}\"" \
+  "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_PROVER_ASSET}\"" \
   >"$prerelease_formula"
 patch_prerelease_homebrew_formula_urls "$prerelease_formula"
-for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET"; do
+for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
   if ! grep -Fq "file://${RELEASE_ASSET_DIR}/${asset}" "$prerelease_formula"; then
     echo "FAIL: prerelease formula did not use local asset ${asset}" >&2
     exit 1
