@@ -83,6 +83,10 @@ jobs:
           openshell --version
           systemctl --user is-active openshell-gateway
           openshell status
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
   ubuntu-snap:
     name: Ubuntu Snap
@@ -204,6 +208,10 @@ jobs:
           openshell --version
           sudo snap services openshell
           openshell status
+          sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
 
   ubuntu-snap-provision-docker:
     name: Ubuntu Snap without Docker preinstalled
