@@ -162,7 +162,7 @@ func (s *mockProfileServer) DeleteProviderProfile(_ context.Context, req *pb.Del
 		return nil, status.Errorf(codes.NotFound, "profile %q not found", req.GetId())
 	}
 	delete(s.profiles, req.GetId())
-	return &pb.DeleteProviderProfileResponse{Deleted: true}, nil
+	return &pb.DeleteProviderProfileResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 // --- Test setup ---
@@ -537,7 +537,7 @@ func TestProfileDelete(t *testing.T) {
 	deleted, err := client.Delete(context.Background(), "default", "p1")
 
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	// Verify subsequent Get returns NotFound
 	profile, err := client.Get(context.Background(), "default", "p1")
@@ -553,7 +553,7 @@ func TestProfileDelete_NotFound(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "nonexistent")
 
-	assert.False(t, deleted)
+	assert.Nil(t, deleted)
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
 }
@@ -566,6 +566,6 @@ func TestProfileDelete_Error(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "p1")
 
-	assert.False(t, deleted)
+	assert.Nil(t, deleted)
 	require.Error(t, err)
 }

@@ -21,6 +21,25 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+### Authored policy boundary
+
+`openshell-policy-schema` is the sole owner of the authored YAML and JSON
+representation. It preserves authored distinctions such as an absent
+`filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
+and applies parser budgets while noyalib constructs the document. It also owns
+pure language semantics such as access presets, MCP revision vocabulary,
+effective ports and rule names, protocol classification, and lexical policy
+path normalization.
+
+Consumers project that syntax into purpose-specific models. `openshell-policy`
+owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
+validation that depends on runtime components. The existing prover retains its
+risk model but uses the same fail-closed parser as the runtime. The parser
+requires `version: 1` and rejects managed annotations and every unknown field
+before any consumer-specific projection runs. There is no permissive parsing
+profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
+parameter names are open user-data maps rather than schema extensions.
+
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
 does not weaken the whole ruleset. When GPU devices are present, GPU baseline
@@ -70,9 +89,7 @@ proxy.
 | `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
-Validation rejects the disallowed patterns at policy load time with a message
-that names the offending host. Exact hosts and IP addresses do not use this
-path.
+Validation rejects the disallowed patterns at policy load time. OPA load errors omit the supplied hostname. Exact hosts and IP addresses do not use this wildcard-validation path.
 
 ## TLS and L7 Inspection
 
@@ -181,6 +198,14 @@ replace the local policy. Workload-image files and environment variables cannot
 configure the separately isolated supervisor. When a supervisor override is
 combined with injected provider credentials, the supervisor emits a
 high-severity detection finding at startup naming the inactive controls.
+
+## Policy Load Diagnostics
+
+`OpaEngine` bounds the error messages returned when loading or reloading policy from files, strings, or protobuf. Each message contains at most eight error items and 512 UTF-8 bytes, including its heading, separators, and any `additional violations omitted` marker. The loader reports complete, fixed categories and discards authored names, values, paths, source snippets, and nested error chains.
+
+Typed validation categories distinguish process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration. Opaque L7 errors identify the protocol-configuration or policy-validation stage; endpoint conflicts report ambiguous selectors. YAML errors retain a fixed parser category and numeric line and column when available. File I/O, Rego loading, and internal policy-data errors use fixed messages.
+
+A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor separately applies `policy_validation_failure_mode` and may publish a quarantine generation as described below. The diagnostic bounds cover returned OPA load errors; accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
 
 ## Live Updates
 

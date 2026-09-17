@@ -230,11 +230,11 @@
 //	fmt.Printf("Host key: %s\n", session.HostKeyFingerprint)
 //	// Use session.Token to authenticate the SSH connection.
 //
-//	revoked, err := client.SSH().RevokeSession(ctx, "default", session.Token)
+//	deletion, err := client.SSH().RevokeSession(ctx, "default", session.Token)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	fmt.Printf("Session revoked: %v\n", revoked)
+//	fmt.Printf("Revocation outcome: %v\n", deletion.Outcome)
 //
 // # TCP Port Forwarding
 //

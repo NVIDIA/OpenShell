@@ -70,11 +70,11 @@ func (c *fakeProfileClient) Lint(_ context.Context, _ string, _ []types.ProfileI
 }
 
 // Delete returns Unimplemented.
-func (c *fakeProfileClient) Delete(_ context.Context, _, _ string) (bool, error) {
+func (c *fakeProfileClient) Delete(_ context.Context, _, _ string, _ ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return false, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return false, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
 }
 
 // Compile-time check that fakeProfileClient implements v1.ProfileInterface.

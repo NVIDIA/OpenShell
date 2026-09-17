@@ -250,6 +250,8 @@ The pre-1.0 SDK intentionally includes source-incompatible API corrections:
   types preserve that scope.
 - Several public struct field orders changed. Use keyed struct literals.
 - Initialisms use Go spelling, including `JSONRPCMaxBodyBytes`.
+- Provider profile durations use the exact `RefreshBefore`, `MaxLifetime`, and
+  `CacheTTL` fields. The legacy whole-second fields were removed.
 
 These changes are intentional while the module remains below v1. Update callers
 as one migration rather than relying on the v0.0.101 API shape.

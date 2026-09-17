@@ -37,7 +37,8 @@ use tempfile::NamedTempFile;
 // ---------------------------------------------------------------------------
 
 /// Build a policy YAML that allows any binary to reach the given hosts on
-/// port 443.
+/// port 443. Keep its filesystem paths aligned with the empty-network policy
+/// so live network updates do not remove startup filesystem access.
 ///
 /// NOTE: The indentation in the format string is load-bearing YAML structure.
 fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
@@ -64,6 +65,7 @@ fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc

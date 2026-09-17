@@ -920,6 +920,8 @@ Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavio
 
 Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
 
+Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
+
 After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
 
 If a mirror is missing or stale and you have maintainer authority, post:
@@ -964,6 +966,7 @@ Required gates include at least:
 - `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
 - `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+- Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
 
