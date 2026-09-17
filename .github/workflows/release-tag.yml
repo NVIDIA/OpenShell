@@ -154,6 +154,10 @@ jobs:
         [
           {
             "scenario":"fedora-podman-rootful",
+            "testsuite":"conformance"
+          },
+          {
+            "scenario":"fedora-podman-rootful",
             "testsuite":"provider-refresh"
           }
         ]
@@ -169,6 +173,13 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
+  conformance:
+    needs: [build-binaries, build-images]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/tmachine-test.yml
   tag-ghcr-release:
     name: Tag GHCR Images
     needs: [compute-versions, build-images, release]

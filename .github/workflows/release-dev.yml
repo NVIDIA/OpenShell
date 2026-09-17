@@ -106,10 +106,8 @@ jobs:
     permissions:
       actions: read
       contents: read
-    uses: ./.github/workflows/conformance.yml
-    with:
-      scenarios: '["ubuntu-docker-rootful", "fedora-podman-rootful", "fedora-podman-rootless"]'
-      testsuites: '["conformance"]'
+      packages: read
+    uses: ./.github/workflows/tmachine-test.yml
 
   docker-e2e:
     needs: [build-binaries, build-images]
@@ -136,6 +134,10 @@ jobs:
         [
           {
             "scenario":"fedora-podman-rootful",
+            "testsuite":"conformance"
+          },
+          {
+            "scenario":"fedora-podman-rootful",
             "testsuite":"provider-refresh"
           }
         ]
@@ -150,14 +152,6 @@ jobs:
     with:
       checkout-ref: ${{ github.sha }}
       conformance-artifact-prefix: openshell-conformance
-
-  conformance:
-    needs: [build-binaries, build-sandbox-image, build-supervisor-image]
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/tmachine-test.yml
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev

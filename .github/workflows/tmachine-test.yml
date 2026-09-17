@@ -17,9 +17,9 @@ on:
         type: string
         default: >-
           [
-            {"scenario":"ubuntu-docker-rootful","testsuite":"smoke"},
-            {"scenario":"fedora-podman-rootful","testsuite":"smoke"},
-            {"scenario":"fedora-podman-rootless","testsuite":"smoke"}
+            {"scenario":"ubuntu-docker-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootless","testsuite":"conformance"}
           ]
   workflow_dispatch:
     inputs:
@@ -34,9 +34,9 @@ on:
         type: string
         default: >-
           [
-            {"scenario":"ubuntu-docker-rootful","testsuite":"smoke"},
-            {"scenario":"fedora-podman-rootful","testsuite":"smoke"},
-            {"scenario":"fedora-podman-rootless","testsuite":"smoke"}
+            {"scenario":"ubuntu-docker-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootless","testsuite":"conformance"}
           ]
 
 permissions:

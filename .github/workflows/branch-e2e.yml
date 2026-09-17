@@ -225,6 +225,10 @@ jobs:
         [
           {
             "scenario":"fedora-podman-rootful",
+            "testsuite":"conformance"
+          },
+          {
+            "scenario":"fedora-podman-rootful",
             "testsuite":"provider-refresh"
           }
         ]
