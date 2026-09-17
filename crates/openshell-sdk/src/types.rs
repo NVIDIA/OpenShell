@@ -161,6 +161,17 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
+}
+
+/// A loopback HTTP service to expose during sandbox creation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceExposure {
+    /// Service name. Empty selects the sandbox's unnamed endpoint.
+    pub service: String,
+    /// Loopback TCP port inside the sandbox.
+    pub target_port: u16,
 }
 
 /// Caller intent for creating a sandbox from a named workload template.
@@ -178,6 +189,8 @@ pub struct SandboxTemplateCreateSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
@@ -227,6 +240,9 @@ pub struct SandboxRef {
     pub resource_version: u64,
     pub exit_code: Option<i32>,
     pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+    /// Service URLs returned by sandbox creation, keyed by service name. The
+    /// empty key identifies the unnamed service. Non-create reads leave this empty.
+    pub service_urls: HashMap<String, String>,
 }
 
 /// Reusable workload template revision used to create a sandbox.
@@ -258,6 +274,7 @@ impl SandboxRef {
             resource_version: meta.resource_version,
             exit_code,
             created_from_workload_template,
+            service_urls: HashMap::new(),
         }
     }
 }

@@ -78,7 +78,11 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 		Status: &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
 	}
 	s.sandboxes[req.GetName()] = sb
-	return &pb.SandboxResponse{Sandbox: sb}, nil
+	serviceURLs := make(map[string]string, len(req.GetServiceExposures()))
+	for _, exposure := range req.GetServiceExposures() {
+		serviceURLs[exposure.GetService()] = "https://" + exposure.GetService() + ".example.test/"
+	}
+	return &pb.SandboxResponse{Sandbox: sb, ServiceUrls: serviceURLs}, nil
 }
 
 func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequest) (*pb.SandboxResponse, error) {
@@ -287,7 +291,17 @@ func TestSandboxCreate(t *testing.T) {
 	}
 	labels := map[string]string{"env": "dev"}
 
-	result, err := client.Create(context.Background(), "default", "my-sandbox", spec, labels)
+	result, err := client.Create(
+		context.Background(),
+		"default",
+		"my-sandbox",
+		spec,
+		labels,
+		CreateOptions{ServiceExposures: []ServiceExposure{
+			{TargetPort: 4500},
+			{Service: "metrics", TargetPort: 9090},
+		}},
+	)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -295,6 +309,13 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, "sb-my-sandbox", result.ID)
 	assert.Equal(t, map[string]string{"env": "dev"}, result.Labels)
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
+	assert.Equal(t, map[string]string{
+		"":        "https://.example.test/",
+		"metrics": "https://metrics.example.test/",
+	}, result.ServiceURLs)
+	require.Len(t, mock.createRequest.GetServiceExposures(), 2)
+	assert.Equal(t, uint32(4500), mock.createRequest.GetServiceExposures()[0].GetTargetPort())
+	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
 }
 
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {

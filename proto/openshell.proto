@@ -1194,6 +1194,10 @@ message CreateSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
+  // HTTP services to expose when the sandbox is created. Endpoints are
+  // registered after the sandbox has been persisted and route only while the
+  // sandbox is ready.
+  repeated SandboxServiceExposure service_exposures = 9;
 }
 
 message CreateSandboxTemplateRequest {
@@ -1378,6 +1382,9 @@ message StartSandboxRequest {
 // Sandbox response.
 message SandboxResponse {
   Sandbox sandbox = 1;
+  // Service URLs created by CreateSandbox, keyed by service name. The empty
+  // key identifies the unnamed service. Other sandbox RPCs return an empty map.
+  map<string, string> service_urls = 2;
 }
 
 // List sandboxes response.
@@ -3597,4 +3604,12 @@ message SandboxProvisioning {
   // Attachment edits have their own durable clock; status writes do not change it.
   string attachment_change_id = 10;
   google.protobuf.Timestamp attachment_change_time = 11;
+}
+
+// Create-time request to expose one loopback HTTP service in a sandbox.
+message SandboxServiceExposure {
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 1;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 2;
 }

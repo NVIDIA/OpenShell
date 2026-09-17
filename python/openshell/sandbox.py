@@ -80,6 +80,18 @@ def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
     return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
 
 
+def _service_exposure_messages(
+    exposures: Sequence[ServiceExposure] | None,
+) -> list[openshell_pb2.SandboxServiceExposure]:
+    return [
+        openshell_pb2.SandboxServiceExposure(
+            service=exposure.service,
+            target_port=exposure.target_port,
+        )
+        for exposure in exposures or ()
+    ]
+
+
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
     pass
 
@@ -410,6 +422,14 @@ class SandboxStatusRef:
     exit_code: int | None = None
 
 
+@dataclass(frozen=True)
+class ServiceExposure:
+    """A loopback HTTP service to expose during sandbox creation."""
+
+    target_port: int
+    service: str = ""
+
+
 class _ImmutableLabels(dict[str, str]):
     """A read-only, copy- and pickle-safe label mapping."""
 
@@ -451,9 +471,14 @@ class SandboxRef:
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
     labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
     created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
+    # Populated by create operations. The empty key identifies the unnamed service.
+    service_urls: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
+        object.__setattr__(self, "service_urls", _ImmutableLabels(self.service_urls))
 
     @property
     def phase(self) -> int:
@@ -764,6 +789,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -772,10 +798,11 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -788,6 +815,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -799,10 +827,11 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -814,9 +843,17 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
-            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+            self,
+            self.create(
+                workspace=workspace,
+                spec=spec,
+                name=name,
+                labels=labels,
+                service_exposures=service_exposures,
+            ),
         )
 
     def create_session_from_template(
@@ -827,6 +864,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -836,6 +874,7 @@ class SandboxClient:
                 spec=spec,
                 name=name,
                 labels=labels,
+                service_exposures=service_exposures,
             ),
         )
 
@@ -1677,7 +1716,10 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
-def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
+def _sandbox_ref(
+    sandbox: openshell_pb2.Sandbox,
+    service_urls: Mapping[str, str] | None = None,
+) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
     provenance = (
         SandboxWorkloadTemplateProvenanceRef(
@@ -1700,6 +1742,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
+        service_urls=service_urls or {},
     )
 
 
