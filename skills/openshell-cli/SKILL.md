@@ -454,7 +454,12 @@ repair the complete policy or provider set through the gateway. The workload
 has not started on its first activation, so static fields can also be replaced
 during this initial repair. A previously activated sandbox retains static-field
 restrictions while restart admission is pending or rejected.
-After validation succeeds, the supervisor completes startup. Follow the
+Before the gateway's 300-second repair window expires, successful validation
+completes startup in place. Effective stored configuration changes and their
+first failed load reset that window; repeated failures do not. After
+`ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
+configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
+wait timeout is separate from this gateway deadline. Follow the
 published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
 and confirm current replacement/detach syntax with installed CLI help.
 

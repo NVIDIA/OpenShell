@@ -502,6 +502,18 @@ async fn handle_create_sandbox_inner(
         .as_mut()
         .expect("status initialized")
         .configuration_activated = Some(false);
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .provisioning = Some(crate::compute::provisioning_deadline::new_record(now_ms));
+    crate::compute::provisioning_deadline::refresh_configuration(
+        &state.store,
+        &mut sandbox,
+        now_ms,
+    )
+    .await
+    .map_err(Status::internal)?;
     crate::compute::apply_configuration_readiness(&mut sandbox);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
@@ -1242,6 +1254,10 @@ pub(super) async fn handle_attach_sandbox_provider(
                     spec.providers.push(provider_name.clone());
                     spec.provider_attachment_epoch.clone_from(&mutation_id);
                     attached_clone.store(true, Ordering::Relaxed);
+                    crate::compute::provisioning_deadline::attachments_changed(
+                        sandbox,
+                        current_time_ms(),
+                    );
                 }
             },
         )
@@ -1361,6 +1377,10 @@ pub(super) async fn handle_detach_sandbox_provider(
                     detached_clone.store(true, Ordering::Relaxed);
                     // Only dedupe after making a change
                     dedupe_provider_names(&mut spec.providers);
+                    crate::compute::provisioning_deadline::attachments_changed(
+                        sandbox,
+                        current_time_ms(),
+                    );
                 }
             },
         )

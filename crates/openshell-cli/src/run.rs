@@ -1173,7 +1173,16 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let create_result = if last_error_reason.is_empty() {
+            let provisioning_timed_out = last_sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.provisioning.as_ref())
+                .is_some_and(|record| record.timeout_time.is_some());
+            let create_result = if provisioning_timed_out {
+                Err(miette::miette!(
+                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+                ))
+            } else if last_error_reason.is_empty() {
                 Err(miette::miette!(
                     "sandbox entered error phase while provisioning"
                 ))
@@ -1186,7 +1195,12 @@ pub async fn sandbox_create(
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
-                persist,
+                persist
+                    || last_sandbox
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.provisioning.as_ref())
+                        .is_some_and(|record| record.timeout_time.is_some()),
                 create_result,
                 workspace,
                 &effective_tls,
@@ -2566,6 +2580,18 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                 "provider_env_revision": admission.provider_env_revision,
             })
         });
+    let provisioning = sandbox.status.as_ref().and_then(|status| status.provisioning.as_ref())
+        .map(|record| serde_json::json!({
+            "attempt_id": record.attempt_id,
+            "configuration_change_id": record.configuration_change_id,
+            "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
+            "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "deadline": record.deadline.as_ref().map(ToString::to_string),
+            "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
+            "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
+            "cleanup_error": record.cleanup_error,
+            "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+        }));
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2580,6 +2606,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
         "configuration_admission": admission,
+        "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
     })
 }
@@ -7423,6 +7450,30 @@ mod tests {
         let json = super::sandbox_template_to_json(&template);
 
         assert_eq!(json["resources"]["gpu"], 2);
+    }
+
+    #[test]
+    fn provisioning_json_exposes_deadline_and_cleanup_separately() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                attempt_id: "attempt".into(),
+                timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+                cleanup_error: "Compute reclamation is pending; the gateway will retry".into(),
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["attempt_id"], "attempt");
+        assert!(json["provisioning"]["deadline"].is_null());
+        assert!(json["provisioning"]["cleanup_completed_time"].is_null());
+        assert_eq!(json["provisioning"]["timeout_time"], "1970-01-01T00:05:00Z");
+        assert!(
+            json["provisioning"]["cleanup_error"]
+                .as_str()
+                .unwrap()
+                .contains("pending")
+        );
     }
 
     #[test]

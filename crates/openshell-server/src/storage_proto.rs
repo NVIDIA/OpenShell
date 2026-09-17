@@ -605,6 +605,7 @@ mod tests {
         assert_eq!(status.current_policy_version, 7);
         assert!(status.configuration_admission.is_none());
         assert_eq!(status.configuration_activated, None);
+        assert!(status.provisioning.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &sandbox
         ));

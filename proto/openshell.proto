@@ -1120,6 +1120,8 @@ message SandboxStatus {
   SandboxConfigurationAdmission configuration_admission = 11;
   // Durable first-acceptance marker. Absent on legacy records; never reset by restart.
   optional bool configuration_activated = 12;
+  // Gateway-owned repair window. Retained after timeout for inspection and retry.
+  SandboxProvisioning provisioning = 13;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -3680,4 +3682,24 @@ message EndpointStatus {
   // time: still-valid evidence can be reaccepted after a reset. Identical
   // same-sequence retries do not advance it. Absent until a result is reported.
   google.protobuf.Timestamp last_reported_time = 106;
+}
+
+// Durable provisioning attempt, independent of supervisor registration and polling.
+message SandboxProvisioning {
+  string attempt_id = 1;
+  string configuration_change_id = 2;
+  google.protobuf.Timestamp configuration_change_time = 3;
+  google.protobuf.Timestamp first_rejection_time = 4;
+  // Present only while the repair window is armed.
+  google.protobuf.Timestamp deadline = 5;
+  google.protobuf.Timestamp timeout_time = 6;
+  // Set only after both supervisor and workload compute have been reclaimed.
+  google.protobuf.Timestamp cleanup_completed_time = 7;
+  // A safe gateway-authored diagnostic; never a raw driver error.
+  string cleanup_error = 8;
+  // Durable backoff for interrupted or failed reclamation.
+  google.protobuf.Timestamp cleanup_retry_time = 9;
+  // Attachment edits have their own durable clock; status writes do not change it.
+  string attachment_change_id = 10;
+  google.protobuf.Timestamp attachment_change_time = 11;
 }

@@ -173,10 +173,20 @@ const MAX_LABEL_SELECTOR_PAIRS: usize = 64;
 struct StoredSettings {
     revision: u64,
     settings: BTreeMap<String, StoredSettingValue>,
+    /// Per-key commit clocks, including deletion tombstones. Persisted in the
+    /// same CAS payload as values so polling and restart cannot refresh them.
+    #[serde(default)]
+    change_clocks: BTreeMap<String, SettingChangeClock>,
     /// Database `resource_version` for CAS. Not persisted in the JSON payload;
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
     resource_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettingChangeClock {
+    id: String,
+    committed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

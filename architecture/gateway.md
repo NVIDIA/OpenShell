@@ -443,9 +443,19 @@ acceptance stores `true` permanently, including across restart. Legacy rows
 have neither field and conservatively retain static-policy restrictions. No
 database rewrite is required. A pre-admission byte fixture verifies that legacy
 phase and policy-version fields survive without fabricated admission or activation.
+`SandboxStatus.provisioning` uses field 13 for gateway-owned attempt timing and
+compute reclamation progress. Its timestamps survive supervisor reconnects and
+ordinary driver status updates. Older records decode with no provisioning
+record; timing must be adopted once and persisted, never reconstructed from the
+object's frequently changing update timestamp. The additive message requires
+no rewrite of existing payloads and leaves the frozen storage-v1 schema intact.
+Stored settings JSON also carries per-key change IDs and commit timestamps,
+including deletion tombstones. Legacy values acquire stable source identities
+on read; a subsequent write preserves them. These clocks distinguish effective
+edits from no-op writes without treating status updates as configuration edits.
 With timestamp types, deletion outcomes, and optional mutation request IDs, the
-admission contract brings the public closure to 286 messages and 15 enums, the
-durable closure to 84 messages and 10 enums, and their overlap to 74 messages
+admission contract brings the public closure to 287 messages and 15 enums, the
+durable closure to 85 messages and 10 enums, and their overlap to 75 messages
 and 10 enums. Mutation request IDs extend public request fields without adding
 messages to these closures or changing the durable protobuf schema.
 

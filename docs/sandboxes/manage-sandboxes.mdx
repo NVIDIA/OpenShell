@@ -770,6 +770,31 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
+The gateway enforces a 300-second provisioning repair window, independently of
+the CLI wait timeout. An effective policy, settings, provider, profile, or
+attachment change resets the window from its stored change time. The first
+failed configuration load for that change grants another full window. Repeated
+failures and reconnects do not extend it; reaching `Ready` clears it.
+
+When the window expires, the sandbox enters `Error` with reason
+`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
+retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
+remain pending if the backend is unavailable; the gateway retries it. Inspect
+`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
+TUI NOTES distinguishes pending cleanup from reclaimed compute.
+
+Repair the configuration, wait for cleanup to complete, then explicitly restart:
+
+```shell
+openshell sandbox get my-sandbox --output json
+openshell sandbox start my-sandbox
+```
+
+Editing configuration after expiry does not restart compute. A retry gets a new
+300-second window, while static-policy restrictions from any previous activation
+remain in force. Timed-out records are retained even for ephemeral creates; use
+`sandbox delete` when you no longer need the diagnostic or stored state.
+
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |

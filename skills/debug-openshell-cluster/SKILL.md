@@ -190,6 +190,12 @@ the image/effective policy or provider configuration. The supervisor remains
 alive while the workload stays unstarted. Inspect `openshell sandbox get` and
 repair the desired configuration with a complete policy replacement or provider
 change; do not treat a healthy container as proof that the workload is ready.
+If the 300-second provisioning repair window expires, the gateway records
+`ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
+`provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
+complete. Repairing configuration after expiry does not restart compute: wait
+for cleanup, then explicitly use `sandbox start`. Repeated rejected reports do
+not refresh the deadline, and the CLI wait timeout does not control it.
 See [policy validation and repair](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md).
 The isolated supervisor requests image-policy discovery through the authenticated
 sandbox boundary before admission. The workload boundary can remain alive without

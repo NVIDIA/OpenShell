@@ -630,6 +630,29 @@ the same supervisor to reconcile and launch; it does not recreate the sandbox.
 Startup retries continue reporting readiness, but unchanged configuration rejections
 produce only one log event. A changed configuration or diagnostic emits a new
 rejection event; successful repair emits a recovery event.
+The gateway gives each initial provisioning attempt and explicit restart a
+300-second repair window. Persisted configuration-source clocks reset the window
+from the latest effective stored change, including settings deletion and provider
+attachment changes. The first accepted rejection for that generation grants one
+full window; repeated reports and reconnects do not extend it. Ready disarms the
+timer. Failed desired updates to a running sandbox do not arm it.
+
+A leader-owned scan runs independently of driver inventory. Expiry records
+`Error`/`ProvisioningTimedOut` before reclaiming compute; cleanup progress and
+backoff survive restart. Late runtime reports cannot replace that result. The
+record and restartable storage survive cleanup, including for ephemeral creates.
+Explicit start is blocked while cleanup is pending, then creates a fresh attempt
+using the latest configuration. Configuration edits alone never restart an
+expired sandbox. Legacy provisioning records receive one persisted rollout
+window. Cross-object configuration serialization uses the gateway's existing
+single-writer guard; enabling concurrent configuration writers still requires
+the database-backed invariant work tracked by #1255.
+
+Docker startup health remains unready during policy quarantine. A failed probe
+does not terminate a live provisioning supervisor; the gateway deadline owns
+that decision. Cleanup cancels pending driver startup before stopping compute
+so a late startup failure cannot remove retained workload storage.
+
 Static policy fields can be replaced before the first accepted activation.
 A durable first-activation marker closes this repair window permanently, including
 across stop/start and later rejected configurations. Legacy records without the
@@ -646,7 +669,7 @@ so it cannot replace the configuration captured for that launch. Restart resets
 admission and requires a fresh accepted configuration. Permanent gateway errors
 and exhausted transient retries terminate startup; each RPC attempt has a
 10-second deadline, including acceptance reports; only acknowledged configuration
-rejections wait indefinitely for repair. Image discovery uses the authenticated
+rejections wait for repair within the gateway's provisioning deadline. Image discovery uses the authenticated
 sandbox boundary control request deadline.
 
 Policy and provider refreshes are prepared before publication. Publication

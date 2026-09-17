@@ -285,6 +285,12 @@ openshell sandbox provider detach <name> <provider>
 ```
 
 These are alternative repairs; choose the one that matches the intended access.
+Startup has a [300-second provisioning repair window](/sandboxes/manage-sandboxes#sandbox-lifecycle).
+Effective configuration changes and their first failed load reset the window;
+repeated failures do not. If it expires, the gateway records `ProvisioningTimedOut`
+and reclaims compute. Repair the configuration, wait for cleanup, then run
+`openshell sandbox start <name>` to retry. Before expiry, repair resumes the same
+provisioning attempt.
 The supervisor starts the workload after the repaired configuration passes
 validation. You can replace static policy fields while the first startup is
 blocked. After the first accepted activation, the usual static-field restrictions

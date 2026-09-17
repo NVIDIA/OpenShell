@@ -11,6 +11,8 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 mod endpoint_status;
+mod provisioning_clock;
+pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::handle_report_endpoint_status;
 pub use endpoint_status::{
@@ -3574,6 +3576,7 @@ async fn handle_update_config_inner(
             ));
         }
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3609,7 +3612,6 @@ async fn handle_update_config_inner(
             // Global policy determines the report's effective configuration.
             // Serialize its writes after validation so a report cannot commit
             // evidence derived from the policy this update has replaced.
-            let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -3709,11 +3711,6 @@ async fn handle_update_config_inner(
 
         // Deleting global policy changes the report's effective configuration.
         // Keep settings -> sandbox lock order for all global policy mutations.
-        let _sandbox_sync_guard = if key == POLICY_SETTING_KEY && req.delete_setting {
-            Some(state.compute.sandbox_sync_guard().await)
-        } else {
-            None
-        };
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -3780,6 +3777,7 @@ async fn handle_update_config_inner(
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -3874,6 +3872,7 @@ async fn handle_update_config_inner(
         ));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4046,12 +4045,6 @@ async fn handle_update_config_inner(
         )
         .await?;
     }
-
-    let _sandbox_sync_guard = if backfill_policy.is_some() {
-        Some(state.compute.sandbox_sync_guard().await)
-    } else {
-        None
-    };
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
@@ -4423,8 +4416,21 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let sandbox =
+    let _guard = state.compute.sandbox_sync_guard().await;
+    let mut sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    crate::compute::provisioning_deadline::refresh_configuration(
+        &state.store,
+        &mut sandbox,
+        current_time_ms(),
+    )
+    .await
+    .map_err(Status::internal)?;
+    if crate::compute::provisioning_deadline::timed_out(&sandbox) {
+        return Err(Status::failed_precondition(
+            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+        ));
+    }
     let current = sandbox
         .status
         .as_ref()
@@ -4494,10 +4500,35 @@ pub(super) async fn handle_report_sandbox_configuration(
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version);
-    let _guard = state.compute.sandbox_sync_guard().await;
+    let now_ms = current_time_ms();
+    let mut provisioning = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.clone());
+    if let Some(record) = provisioning.as_mut() {
+        if !crate::compute::provisioning_deadline::allows_admission(record, now_ms) {
+            state
+                .compute
+                .claim_provisioning_timeout(&sandbox, now_ms)
+                .await
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "provisioning repair window expired",
+            ));
+        }
+        if reported == ConfigurationAdmissionState::Rejected {
+            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
+                .map_err(Status::internal)?;
+        }
+    }
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .provisioning
+                .clone_from(&provisioning);
             sandbox
                 .status
                 .get_or_insert_with(Default::default)
@@ -7365,6 +7396,15 @@ async fn load_settings_record(
         let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
             .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
         settings.resource_version = record.resource_version;
+        for key in settings.settings.keys() {
+            settings
+                .change_clocks
+                .entry(key.clone())
+                .or_insert_with(|| super::SettingChangeClock {
+                    id: format!("{}:{}:{key}", record.id, record.resource_version),
+                    committed_at_ms: record.updated_at_ms,
+                });
+        }
         Ok(settings)
     } else {
         Ok(StoredSettings::default())
@@ -7380,7 +7420,22 @@ async fn save_settings_record(
 ) -> Result<(), Status> {
     use crate::persistence::WriteCondition;
 
-    let payload = serde_json::to_vec(settings)
+    let previous = load_settings_record(store, object_type, workspace, name).await?;
+    let mut persisted = settings.clone();
+    persisted.change_clocks = previous.change_clocks.clone();
+    let now_ms = current_time_ms();
+    for key in previous.settings.keys().chain(settings.settings.keys()) {
+        if previous.settings.get(key) != settings.settings.get(key) {
+            persisted.change_clocks.insert(
+                key.clone(),
+                super::SettingChangeClock {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    committed_at_ms: now_ms,
+                },
+            );
+        }
+    }
+    let payload = serde_json::to_vec(&persisted)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
 
     let (id, condition) = if settings.resource_version == 0 {
@@ -7764,6 +7819,47 @@ mod tests {
                 trust_domain: Some("openshell".to_string()),
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn provisioning_timeout_rejects_supervisor_registration() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase, SandboxProvisioning,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-timeout-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "timeout-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(SandboxProvisioning {
+            timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("repair window expired"));
     }
 
     #[tokio::test]

@@ -2732,6 +2732,24 @@ async fn fetch_sandboxes(
 }
 
 fn sandbox_notes(sandbox: &openshell_core::proto::Sandbox, forwards: String) -> String {
+    if let Some(record) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        && record.timeout_time.is_some()
+    {
+        let cleanup = if record.cleanup_completed_time.is_some() {
+            "compute reclaimed"
+        } else {
+            "compute cleanup pending"
+        };
+        let mut notes = format!("Provisioning timed out; {cleanup}");
+        if !forwards.is_empty() {
+            notes.push_str("; ");
+            notes.push_str(&forwards);
+        }
+        return notes;
+    }
     let rejection = sandbox.status.as_ref().and_then(|status| {
         status.conditions.iter().find(|condition| {
             matches!(condition.r#type.as_str(), "ConfigurationReady" | "Ready")
@@ -3257,6 +3275,36 @@ mod provider_profile_pagination_tests {
 mod sandbox_notes_tests {
     use super::sandbox_notes;
     use openshell_core::proto::{Sandbox, SandboxCondition, SandboxStatus};
+
+    #[test]
+    fn provisioning_timeout_notes_distinguish_pending_and_completed_cleanup() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(openshell_core::proto::SandboxProvisioning {
+                    timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, "fwd:8080".into()),
+            "Provisioning timed out; compute cleanup pending; fwd:8080"
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .cleanup_completed_time = openshell_core::time::timestamp_from_millis(301_000).ok();
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Provisioning timed out; compute reclaimed"
+        );
+    }
 
     #[test]
     fn configuration_rejection_precedes_forwards_and_clears_after_repair() {

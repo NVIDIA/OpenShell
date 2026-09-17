@@ -813,6 +813,12 @@ pub(crate) async fn run_server(
         )));
     }
 
+    // Deadlines must run while restored supervisors wait for policy repair.
+    let (startup_tx, startup_rx) = watch::channel(false);
+    state
+        .compute
+        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+
     // Restored supervisors need the callback listeners while the compute
     // driver reconciles persisted sandboxes. Serve them before starting that
     // reconciliation so policy fetch and supervisor-session registration
@@ -841,7 +847,7 @@ pub(crate) async fn run_server(
         warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
-    state.compute.spawn_watchers(shutdown_rx.clone());
+    startup_tx.send_replace(true);
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
