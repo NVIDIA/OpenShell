@@ -4761,6 +4761,7 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
+ "opentelemetry-proto",
  "prost",
  "prost-types",
  "rustix 1.1.4",
