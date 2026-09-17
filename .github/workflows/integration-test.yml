@@ -17,14 +17,14 @@ on:
         type: string
         default: conformance
       test-matrix:
-        description: JSON array of scenario and testsuite combinations
+        description: JSON array of environment, installer, and testsuite combinations
         required: true
         type: string
         default: >-
           [
-            {"scenario":"ubuntu-docker-rootful","testsuite":"conformance"},
-            {"scenario":"fedora-podman-rootful","testsuite":"conformance"},
-            {"scenario":"fedora-podman-rootless","testsuite":"conformance"}
+            {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
           ]
 
 permissions:

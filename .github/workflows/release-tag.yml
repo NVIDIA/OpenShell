@@ -162,8 +162,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"scenario":"fedora-podman-rootful","testsuite":"provider-refresh"},
-          {"scenario":"fedora-podman-rootless","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
         ]
 
   docker-e2e:

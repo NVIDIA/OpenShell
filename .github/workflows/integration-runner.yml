@@ -19,14 +19,14 @@ on:
         required: false
         type: string
       test-matrix:
-        description: JSON array of scenario and testsuite combinations
+        description: JSON array of environment, installer, and testsuite combinations
         required: false
         type: string
         default: >-
           [
-            {"scenario":"ubuntu-docker-rootful","testsuite":"conformance"},
-            {"scenario":"fedora-podman-rootful","testsuite":"conformance"},
-            {"scenario":"fedora-podman-rootless","testsuite":"conformance"}
+            {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
           ]
 
 permissions:
@@ -40,7 +40,7 @@ concurrency:
 
 jobs:
   integration:
-    name: Integration test (${{ inputs.category }}, ${{ matrix.scenario }}, ${{ matrix.testsuite }})
+    name: Integration test (${{ inputs.category }}, ${{ matrix.environment }}, ${{ matrix.installer }}, ${{ matrix.testsuite }})
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +80,7 @@ jobs:
 
       - name: Run test suite
         env:
-          SCENARIO: ${{ matrix.scenario }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          INSTALLER: ${{ matrix.installer }}
           TESTSUITE: ${{ matrix.testsuite }}
-        run: nix run .#tmachine -- test "${SCENARIO}" "${TESTSUITE}"
+        run: nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"

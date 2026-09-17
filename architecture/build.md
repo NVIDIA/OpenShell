@@ -263,12 +263,18 @@ dependencies after installation. The Keycloak provider-refresh suite starts a
 guest-local Keycloak realm and verifies a successful OAuth refresh followed by
 revocation and the gateway's reauthorization-required recovery state.
 
-The `tests/tmachine` setup and installation caches include a digest of the
+Tmachine environments define the guest machine and runtime setup, while named
+installers define how OpenShell is installed. This keeps the runtime mode
+independent from binary or package installation and lets multiple installers
+reuse the same prepared setup disk. The test command is
+`tmachine test <environment> <installer> <testsuite>`.
+
+The `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task
 includes, templates, inventory, and requirements. The digest uses sorted
 relative paths, file contents, and executable permissions; source symlinks
 are unsupported. Both keys also retain the ordered playbook paths and contents,
-their base disk contents, and whether Galaxy is enabled; installation keys
+their base disk contents, and whether Galaxy is enabled; install keys
 include named binary inputs. The top-level `.roles` directory is excluded:
 Galaxy release pins in `requirements.yaml` are treated as immutable, including
 any transitive dependency pins. Cache misses with Galaxy enabled reinstall
@@ -279,7 +285,7 @@ with musl, and the gateway and supervisor with GNU. Image assembly stages
 the gateway, sandbox, and supervisor as separate binaries for their respective
 Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
 CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
-Docker and Fedora Podman scenarios import both local runtime images and
+Docker and Fedora Podman environments import both local runtime images and
 configure the gateway to use them.
 
 ## Python Wheel Packaging

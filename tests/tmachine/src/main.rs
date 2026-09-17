@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{Config, Machine, Scenario};
+use config::{Config, Environment, Installer, Machine};
 
 mod ansible;
 mod config;
@@ -23,9 +23,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Setup { scenario: String },
-    Install { scenario: String },
-    Test { scenario: String, testsuite: String },
+    Setup {
+        environment: String,
+    },
+    Install {
+        environment: String,
+        installer: String,
+    },
+    Test {
+        environment: String,
+        installer: String,
+        testsuite: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -34,49 +43,64 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     match cli.command {
-        Command::Setup { scenario } => {
-            let (machine, scenario) = find_scenario(&config, &scenario)?;
-            qemu::setup(&machine, &scenario).await?;
+        Command::Setup { environment } => {
+            let (machine, environment) = find_environment(&config, &environment)?;
+            qemu::setup(&machine, &environment).await?;
         }
-        Command::Install { scenario } => {
-            let (machine, scenario) = find_scenario(&config, &scenario)?;
-            qemu::install(&machine, &scenario).await?;
+        Command::Install {
+            environment,
+            installer,
+        } => {
+            let (machine, environment) = find_environment(&config, &environment)?;
+            let installer = find_installer(&config, &installer)?;
+            qemu::install(&machine, &environment, &installer).await?;
         }
         Command::Test {
-            scenario,
+            environment,
+            installer,
             testsuite,
         } => {
-            let (machine, scenario) = find_scenario(&config, &scenario)?;
+            let (machine, environment) = find_environment(&config, &environment)?;
+            let installer = find_installer(&config, &installer)?;
             let testsuite = config
                 .testsuites
                 .iter()
                 .find(|candidate| candidate.name == testsuite)
                 .with_context(|| format!("testsuite {testsuite:?} is not defined"))?;
-            qemu::test(&machine, &scenario, testsuite).await?;
+            qemu::test(&machine, &environment, &installer, testsuite).await?;
         }
     }
 
     Ok(())
 }
 
-fn find_scenario(config: &Config, name: &str) -> Result<(Machine, Scenario)> {
-    let scenario = config
-        .scenarios
+fn find_installer(config: &Config, name: &str) -> Result<Installer> {
+    config
+        .installers
         .iter()
-        .find(|scenario| scenario.name == name)
-        .with_context(|| format!("scenario {name:?} is not defined"))?
+        .find(|installer| installer.name == name)
+        .with_context(|| format!("installer {name:?} is not defined"))
+        .cloned()
+}
+
+fn find_environment(config: &Config, name: &str) -> Result<(Machine, Environment)> {
+    let environment = config
+        .environments
+        .iter()
+        .find(|environment| environment.name == name)
+        .with_context(|| format!("environment {name:?} is not defined"))?
         .clone();
     let machine = config
         .machines
         .iter()
-        .find(|machine| machine.name == scenario.machine)
+        .find(|machine| machine.name == environment.machine)
         .with_context(|| {
             format!(
-                "machine {:?} referenced by scenario {:?} is not defined",
-                scenario.machine, scenario.name
+                "machine {:?} referenced by environment {:?} is not defined",
+                environment.machine, environment.name
             )
         })?
         .clone();
 
-    Ok((machine, scenario))
+    Ok((machine, environment))
 }

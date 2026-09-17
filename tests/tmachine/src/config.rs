@@ -10,7 +10,8 @@ use serde::Deserialize;
 #[derive(Clone, Deserialize)]
 pub struct Config {
     pub machines: Vec<Machine>,
-    pub scenarios: Vec<Scenario>,
+    pub environments: Vec<Environment>,
+    pub installers: Vec<Installer>,
     pub testsuites: Vec<Testsuite>,
 }
 
@@ -21,11 +22,10 @@ pub struct Machine {
 }
 
 #[derive(Clone, Deserialize)]
-pub struct Scenario {
+pub struct Environment {
     pub name: String,
     pub machine: String,
     pub setup: Setup,
-    pub install: Install,
 }
 
 #[derive(Clone, Deserialize)]
@@ -35,7 +35,8 @@ pub struct Setup {
 }
 
 #[derive(Clone, Deserialize)]
-pub struct Install {
+pub struct Installer {
+    pub name: String,
     pub use_galaxy: bool,
     pub playbooks: Vec<PathBuf>,
     pub inputs: BTreeMap<String, PathBuf>,
