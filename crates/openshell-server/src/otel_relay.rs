@@ -35,6 +35,17 @@ impl OtelRelayExporter {
         })
     }
 
+    /// An exporter over a lazy channel that performs no I/O until the first
+    /// RPC, for tests that only need "a relay exporter is configured".
+    #[cfg(test)]
+    pub(crate) fn lazy_for_test() -> Self {
+        Self {
+            client: TraceServiceClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+        }
+    }
+
     /// Export raw protobuf-encoded `ExportTraceServiceRequest` bytes.
     pub async fn export_raw(&self, trace_data: Vec<u8>) -> Result<(), ExportError> {
         let request = ExportTraceServiceRequest::decode(trace_data.as_slice())
@@ -110,10 +121,7 @@ mod tests {
     async fn export_raw_rejects_undecodable_trace_bytes() {
         // A lazy channel performs no I/O, so the decode failure surfaces
         // before any RPC is attempted and no collector is needed.
-        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        let exporter = OtelRelayExporter {
-            client: TraceServiceClient::new(channel),
-        };
+        let exporter = OtelRelayExporter::lazy_for_test();
         let err = exporter
             .export_raw(vec![0xff, 0xff, 0xff])
             .await

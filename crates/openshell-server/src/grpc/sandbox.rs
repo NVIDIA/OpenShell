@@ -447,6 +447,11 @@ async fn handle_create_sandbox_inner(
         *policy = validate_and_canonicalize_policy(policy.clone())?;
     }
 
+    // Point the workload's OTel SDK at the supervisor relay when this gateway
+    // can accept relayed telemetry. The values persist in the stored spec, so
+    // restarts inherit them and `sandbox get` shows where traces go.
+    inject_otel_relay_environment(&mut spec.environment, state.otel_relay_exporter.is_some());
+
     // Process identity and MCP default materialization can increase the
     // protobuf size. Recheck the exact canonical spec before any middleware or
     // compute boundary can observe or persist it. The initial check remains
@@ -616,6 +621,31 @@ fn validate_create_sandbox_request_pre_io(
         validate_sandbox_governance_spec(&request.name, &SandboxSpec::default())?;
     }
     Ok(())
+}
+
+/// Set `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_PROTOCOL` to the
+/// supervisor relay when `otel_relay_enabled`, unless the caller already chose
+/// an endpoint. A caller-supplied endpoint is left untouched together with its
+/// protocol, since both describe their collector rather than ours. Returns
+/// whether anything was injected.
+fn inject_otel_relay_environment(
+    environment: &mut HashMap<String, String>,
+    otel_relay_enabled: bool,
+) -> bool {
+    use openshell_core::sandbox_env::{
+        OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, OTLP_RELAY_ENDPOINT,
+    };
+    if !otel_relay_enabled || environment.contains_key(OTEL_EXPORTER_OTLP_ENDPOINT) {
+        return false;
+    }
+    environment.insert(
+        OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
+        OTLP_RELAY_ENDPOINT.to_string(),
+    );
+    environment
+        .entry(OTEL_EXPORTER_OTLP_PROTOCOL.to_string())
+        .or_insert_with(|| "http/protobuf".to_string());
+    true
 }
 
 fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), Status> {
@@ -3322,6 +3352,122 @@ mod tests {
     };
     use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+    // ---- OTLP relay environment ----
+
+    async fn test_server_state_with_otel_relay() -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("test server state should be uniquely owned")
+            .otel_relay_exporter = Some(Arc::new(
+            crate::otel_relay::OtelRelayExporter::lazy_for_test(),
+        ));
+        state
+    }
+
+    fn otel_create_request(
+        name: &str,
+        environment: HashMap<String, String>,
+    ) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            name: name.to_string(),
+            spec: Some(SandboxSpec {
+                environment,
+                ..Default::default()
+            }),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            await_main_process_attachment: false,
+            workload_template_name: String::new(),
+            request_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_sets_endpoint_and_protocol_when_enabled() {
+        let mut env = HashMap::from([("HOME".to_string(), "/home/user".to_string())]);
+        assert!(inject_otel_relay_environment(&mut env, true));
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+        );
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            Some("http/protobuf")
+        );
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_is_a_noop_without_a_relay() {
+        let mut env = HashMap::new();
+        assert!(!inject_otel_relay_environment(&mut env, false));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn inject_otel_relay_environment_keeps_a_caller_supplied_endpoint() {
+        let mut env = HashMap::from([(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            "https://collector.example:4317".to_string(),
+        )]);
+        assert!(!inject_otel_relay_environment(&mut env, true));
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some("https://collector.example:4317")
+        );
+        assert!(
+            !env.contains_key("OTEL_EXPORTER_OTLP_PROTOCOL"),
+            "the caller's collector keeps the caller's protocol choice"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_injects_relay_endpoint_when_gateway_has_an_exporter() {
+        let state = test_server_state_with_otel_relay().await;
+        let created = handle_create_sandbox(
+            &state,
+            authed_request(otel_create_request("otel-relay", HashMap::new())),
+        )
+        .await
+        .expect("create should succeed")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        let env = created.spec.expect("resolved sandbox spec").environment;
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some(openshell_core::sandbox_env::OTLP_RELAY_ENDPOINT)
+        );
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            Some("http/protobuf")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_leaves_environment_alone_without_an_exporter() {
+        let state = test_server_state().await;
+        let created = handle_create_sandbox(
+            &state,
+            authed_request(otel_create_request(
+                "no-relay",
+                HashMap::from([("HOME".to_string(), "/home/user".to_string())]),
+            )),
+        )
+        .await
+        .expect("create should succeed")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        let env = created.spec.expect("resolved sandbox spec").environment;
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/user"));
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"));
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_PROTOCOL"));
+    }
 
     // ---- shell_escape ----
 
