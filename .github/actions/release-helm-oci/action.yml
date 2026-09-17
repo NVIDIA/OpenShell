@@ -18,7 +18,7 @@ inputs:
       (e.g. 0.6.0 for tag releases, dev for dev).
     required: true
   release-kind:
-    description: "dev, prerelease, or public — only public versions reject duplicates."
+    description: "dev or public — controls the duplicate-version guard."
     required: true
   pin-sha:
     description: >
@@ -53,7 +53,6 @@ runs:
         set -euo pipefail
         GATEWAY_CHART_DIR="${RUNNER_TEMP}/gateway-chart-build"
         WORKSPACE_CHART_DIR="${RUNNER_TEMP}/workspace-chart-build"
-        rm -rf "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}" /tmp/helm-charts /tmp/sha-pin
         cp -a deploy/helm/openshell/. "${GATEWAY_CHART_DIR}"
         cp -a deploy/helm/openshell-workspace/. "${WORKSPACE_CHART_DIR}"
         for chart_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do

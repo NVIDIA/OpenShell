@@ -26,9 +26,9 @@ does not contribute to product usage metrics.
 
 After Release Dev, the workflow sets `OPENSHELL_VERSION=dev` and pins the
 matching `0.0.0-dev` chart and `:dev` images. After a prerelease publication,
-the caller supplies the exact `vX.Y.Z-pre.N` Actions artifact version and the
-floating `<version>-pre` Helm chart, so every job exercises the newly published
-candidate without requiring a GitHub Release entry.
+the caller supplies the exact `vX.Y.Z-pre.N` Actions artifact version, which
+also selects the matching `<version>-pre.N` Helm chart. Every job exercises the
+newly published candidate without requiring a GitHub Release entry.
 
 The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
@@ -53,7 +53,7 @@ on:
 ```
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
-- **Reusable.** A successful prerelease publication in Release Tag calls the canary with its exact artifact version, floating Helm version, and release run ID. This smoke-tests Debian, RPM, Homebrew, Snap, and Helm after publication.
+- **Reusable.** A prerelease publication in Release Tag calls the canary with its exact version. This smoke-tests Debian, RPM, Homebrew, Snap, and Helm before the workflow is considered successful.
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. To include `ubuntu-snap`, supply `release-dev-run-id` for a successful Release Dev run whose Snap artifact should be tested; without it, that job is skipped because no artifact is available.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
@@ -100,7 +100,7 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
-To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). Reusable callers can select a published chart with the `chart-version` input and its matching CLI release with `install-version`.
+To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). Reusable callers select a published prerelease and its matching chart with the `install-version` input.
 
 ## Local kind reproduction
 

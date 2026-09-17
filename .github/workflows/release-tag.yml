@@ -49,10 +49,6 @@ jobs:
       # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
       source_sha: ${{ steps.v.outputs.source_sha }}
       is_prerelease: ${{ steps.v.outputs.is_prerelease }}
-      release_tag: ${{ steps.v.outputs.release_tag }}
-      prerelease_channel: ${{ steps.v.outputs.prerelease_channel }}
-      prerelease_train: ${{ steps.v.outputs.prerelease_train }}
-      prerelease_chart: ${{ steps.v.outputs.prerelease_chart }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,25 +68,14 @@ jobs:
           set -euo pipefail
           if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
             is_prerelease=true
-            semver="${RELEASE_TAG#v}"
-            prerelease_train="${semver%-pre.*}"
-            prerelease_channel="pre-${prerelease_train}"
-            prerelease_chart="${prerelease_train}-pre"
           elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             is_prerelease=false
-            prerelease_channel=""
-            prerelease_train=""
-            prerelease_chart=""
           else
             echo "Unsupported release tag: ${RELEASE_TAG}" >&2
             exit 1
           fi
           {
             echo "is_prerelease=${is_prerelease}"
-            echo "release_tag=${RELEASE_TAG}"
-            echo "prerelease_channel=${prerelease_channel}"
-            echo "prerelease_train=${prerelease_train}"
-            echo "prerelease_chart=${prerelease_chart}"
             echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
             echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
             echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
@@ -199,22 +184,19 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          if [[ "${IS_PRERELEASE}" == "true" ]]; then
-            CHANNEL_TAG="${{ needs.compute-versions.outputs.prerelease_channel }}"
-          else
-            CHANNEL_TAG="latest"
-          fi
           for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
               "${REGISTRY}/${component}:${SOURCE_TAG}"
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${CHANNEL_TAG}..."
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:${CHANNEL_TAG}" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:latest" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
           done
 
   build-python-wheel:
@@ -647,14 +629,6 @@ jobs:
           app-version: ${{ needs.compute-versions.outputs.semver }}
           release-kind: public
 
-      - name: Publish rolling prerelease chart
-        if: needs.compute-versions.outputs.is_prerelease == 'true'
-        uses: ./.github/actions/release-helm-oci
-        with:
-          chart-version: ${{ needs.compute-versions.outputs.prerelease_chart }}
-          app-version: ${{ needs.compute-versions.outputs.prerelease_channel }}
-          release-kind: prerelease
-
   smoke-published-prerelease:
     name: Smoke Published Prerelease
     needs: [compute-versions, release, release-helm]
@@ -664,9 +638,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/release-canary.yml
     with:
-      install-version: ${{ needs.compute-versions.outputs.release_tag }}
-      chart-version: ${{ needs.compute-versions.outputs.prerelease_chart }}
-      release-run-id: ${{ github.run_id }}
+      install-version: v${{ needs.compute-versions.outputs.semver }}
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

@@ -314,11 +314,6 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 For Kubernetes, select the corresponding Helm chart version. Helm chart versions omit the leading `v` from release tags:
 
 ```shell
-# Latest qualified candidate in the 0.1.0 train
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.1.0-pre
-
 # Pin an exact candidate
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -330,7 +325,7 @@ helm upgrade --install openshell \
   --version 0.0.0-dev
 ```
 
-Prerelease charts publish both a floating `<version>-pre` version and immutable `<version>-pre.N` versions. Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
+Prerelease charts use exact `<version>-pre.N` versions. Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
 
 ## Contributing
 
