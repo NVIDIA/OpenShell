@@ -130,15 +130,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(providers_str, t.text),
     ]);
 
-    // Row 6: Forwarded Ports
-    let forwards_str = app
+    // Row 6: Configuration diagnostics and forwarded ports
+    let notes_str = app
         .sandbox_notes
         .get(idx)
         .filter(|s| !s.is_empty())
         .map_or("none", String::as_str);
     let row6 = Line::from(vec![
-        Span::styled("  Forwards: ", t.muted),
-        Span::styled(forwards_str, t.text),
+        Span::styled("  Notes: ", t.muted),
+        Span::styled(notes_str, t.text),
     ]);
 
     let mut lines = vec![row1, row2, row3, row4, row5, row6];

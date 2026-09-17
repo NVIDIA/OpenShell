@@ -2731,6 +2731,35 @@ async fn fetch_sandboxes(
     }
 }
 
+fn sandbox_notes(sandbox: &openshell_core::proto::Sandbox, forwards: String) -> String {
+    let rejection = sandbox.status.as_ref().and_then(|status| {
+        status.conditions.iter().find(|condition| {
+            matches!(condition.r#type.as_str(), "ConfigurationReady" | "Ready")
+                && condition.status == "False"
+                && condition.reason == "ConfigurationInvalid"
+        })
+    });
+    let Some(rejection) = rejection else {
+        return forwards;
+    };
+    // Keep the table row on one line even when a diagnostic contains newlines.
+    let message = rejection
+        .message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut notes = "Config invalid".to_string();
+    if !message.is_empty() {
+        notes.push_str(": ");
+        notes.push_str(&message);
+    }
+    if !forwards.is_empty() {
+        notes.push_str("; ");
+        notes.push_str(&forwards);
+    }
+    notes
+}
+
 fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sandbox>) {
     app.sandbox_count = sandboxes.len();
     app.sandbox_ids = sandboxes
@@ -2780,13 +2809,14 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(openshell_core::proto::Sandbox::current_policy_version)
         .collect();
 
-    // Build NOTES column from active port forwards.
+    // Show configuration blockers before active port forwards in NOTES.
     let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
     app.sandbox_notes = sandboxes
         .iter()
         .map(|s| {
             let name = s.object_name();
-            openshell_core::forward::build_sandbox_notes(name, &forwards)
+            let forwards = openshell_core::forward::build_sandbox_notes(name, &forwards);
+            sandbox_notes(s, forwards)
         })
         .collect();
 
@@ -3220,5 +3250,53 @@ mod provider_profile_pagination_tests {
         );
         assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
         assert_eq!(profiles.last().unwrap().id, "page-two-profile");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_notes_tests {
+    use super::sandbox_notes;
+    use openshell_core::proto::{Sandbox, SandboxCondition, SandboxStatus};
+
+    #[test]
+    fn configuration_rejection_precedes_forwards_and_clears_after_repair() {
+        let condition = SandboxCondition {
+            r#type: "ConfigurationReady".into(),
+            status: "False".into(),
+            reason: "ConfigurationInvalid".into(),
+            message: "credentialed endpoint requires\nL7 inspection".into(),
+            ..Default::default()
+        };
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![
+                    condition.clone(),
+                    SandboxCondition {
+                        r#type: "Ready".into(),
+                        ..condition
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, "fwd:8080".into()),
+            "Config invalid: credentialed endpoint requires L7 inspection; fwd:8080"
+        );
+        // Older gateways can expose only Ready; retain the diagnostic there too.
+        sandbox.status.as_mut().unwrap().conditions.remove(0);
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Config invalid: credentialed endpoint requires L7 inspection"
+        );
+        sandbox.status.as_mut().unwrap().conditions[0]
+            .message
+            .clear();
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "Config invalid");
+        sandbox.status.as_mut().unwrap().conditions[0].status = "True".into();
+        assert_eq!(sandbox_notes(&sandbox, "fwd:8080".into()), "fwd:8080");
+        sandbox.status = None;
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "");
     }
 }

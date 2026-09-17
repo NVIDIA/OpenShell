@@ -170,7 +170,7 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection.
+**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection. The NOTES column puts active `ConfigurationInvalid` readiness diagnostics before port forwards and clears them on refresh after repair. The sandbox detail pane uses the same Notes field.
 
 **Providers**: Fetched via `ListProviders` in the background collection-refresh task. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`. Follow each list RPC's `next_page_token` until empty.
 

@@ -624,7 +624,8 @@ default.
 The gateway tracks configuration admission independently of compute health.
 A blocked startup remains `Provisioning` with a `ConfigurationInvalid` readiness
 condition, even when the container backend reports readiness. Gateway management
-operations remain available. Replacing the policy or repairing providers allows
+operations remain available. The TUI exposes configuration rejection conditions
+in sandbox NOTES alongside active port forwards. Replacing the policy or repairing providers allows
 the same supervisor to reconcile and launch; it does not recreate the sandbox.
 Startup retries continue reporting readiness, but unchanged configuration rejections
 produce only one log event. A changed configuration or diagnostic emits a new

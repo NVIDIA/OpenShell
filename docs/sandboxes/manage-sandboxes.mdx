@@ -609,6 +609,8 @@ Use the terminal to spot blocked connections marked `action=deny` and provider-r
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
+The sandbox table’s NOTES column shows `Config invalid` and the rejection reason when policy or provider configuration blocks provisioning. Open the sandbox detail view to see the Notes field. The diagnostic clears after the configuration is repaired; active port forwards remain listed.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
