@@ -415,8 +415,9 @@ fn check_within_boundary_inner(
     if let Some(reason) = unresolved_workdir_reason(boundary, candidate) {
         return unsupported(ReasonCode::UnresolvedWorkdir, reason);
     }
-    if let Some(result) = execution::check(boundary, candidate) {
-        return result;
+    let execution_result = execution::check(boundary, candidate);
+    if let Some(result @ CheckResult::Exceeds(_)) = execution_result.as_ref() {
+        return result.clone();
     }
     if boundary == candidate {
         return CheckResult::Within(WithinEvidence);
@@ -456,7 +457,9 @@ fn check_within_boundary_inner(
                 .to_owned(),
         );
     }
-    filesystem_result.unwrap_or(CheckResult::Within(WithinEvidence))
+    execution_result
+        .or(filesystem_result)
+        .unwrap_or(CheckResult::Within(WithinEvidence))
 }
 
 fn preflight_and_validate_policies<F>(
@@ -1756,16 +1759,16 @@ struct AttributeSummary<T> {
     mixed: bool,
 }
 
-impl<T: Clone + Eq> AttributeSummary<T> {
-    fn conflicts(&self, value: &T) -> bool {
-        self.mixed || self.first.as_ref().is_some_and(|first| first != value)
+impl<T: Copy + Eq> AttributeSummary<T> {
+    fn conflicts(&self, value: T) -> bool {
+        self.mixed || self.first.is_some_and(|first| first != value)
     }
 
-    fn insert(&mut self, value: &T) {
-        if let Some(first) = &self.first {
+    fn insert(&mut self, value: T) {
+        if let Some(first) = self.first {
             self.mixed |= first != value;
         } else {
-            self.first = Some(value.clone());
+            self.first = Some(value);
         }
     }
 }
@@ -1795,8 +1798,8 @@ impl<T> Default for AuthorityAttributeIndex<T> {
     }
 }
 
-impl<T: Clone + Eq> AuthorityAttributeIndex<T> {
-    fn overlaps_with_different(&self, host: &str, ports: &[u16], value: &T) -> bool {
+impl<T: Copy + Eq> AuthorityAttributeIndex<T> {
+    fn overlaps_with_different(&self, host: &str, ports: &[u16], value: T) -> bool {
         ports.iter().any(|port| {
             if host.contains('*') {
                 self.all
@@ -1815,7 +1818,7 @@ impl<T: Clone + Eq> AuthorityAttributeIndex<T> {
         })
     }
 
-    fn insert(&mut self, host: &str, ports: &[u16], value: &T) {
+    fn insert(&mut self, host: &str, ports: &[u16], value: T) {
         for port in ports {
             self.all.entry(*port).or_default().insert(value);
             if host.contains('*') {
@@ -1838,6 +1841,7 @@ fn validate_no_cross_protocol_overlap(
 ) -> Result<(), PolicyValidationError> {
     let mut protocols = AuthorityAttributeIndex::default();
     let mut allowed_ips = AuthorityAttributeIndex::default();
+    let mut allowed_ip_values: BTreeMap<&[String], usize> = BTreeMap::new();
     let mut implicit_modes = AuthorityAttributeIndex::default();
     let mut different_allowed_ips_overlap = false;
     let mut different_implicit_ip_modes_overlap = false;
@@ -1853,17 +1857,22 @@ fn validate_no_cross_protocol_overlap(
         let host = endpoint.host.to_ascii_lowercase();
         let ports = endpoint.effective_ports();
         let protocol = endpoint.protocol_kind();
+        let endpoint_allowed_ips = endpoint.allowed_ips.as_slice();
+        let next_allowed_ip_id = allowed_ip_values.len();
+        let allowed_ip_id = *allowed_ip_values
+            .entry(endpoint_allowed_ips)
+            .or_insert(next_allowed_ip_id);
         different_allowed_ips_overlap |=
-            allowed_ips.overlaps_with_different(&host, &ports, &endpoint.allowed_ips);
-        different_protocols_overlap |= protocols.overlaps_with_different(&host, &ports, &protocol);
+            allowed_ips.overlaps_with_different(&host, &ports, allowed_ip_id);
+        different_protocols_overlap |= protocols.overlaps_with_different(&host, &ports, protocol);
         if endpoint.allowed_ips.is_empty() {
             let wildcard = endpoint.host.contains('*');
             different_implicit_ip_modes_overlap |=
-                implicit_modes.overlaps_with_different(&host, &ports, &wildcard);
-            implicit_modes.insert(&host, &ports, &wildcard);
+                implicit_modes.overlaps_with_different(&host, &ports, wildcard);
+            implicit_modes.insert(&host, &ports, wildcard);
         }
-        allowed_ips.insert(&host, &ports, &endpoint.allowed_ips);
-        protocols.insert(&host, &ports, &protocol);
+        allowed_ips.insert(&host, &ports, allowed_ip_id);
+        protocols.insert(&host, &ports, protocol);
     }
     if different_allowed_ips_overlap {
         return Err(UnsupportedFeature::policy_shape(
@@ -3076,6 +3085,32 @@ network_policies:
             let indexed = validate_no_cross_protocol_overlap(&policy, None).is_err();
             assert_eq!(indexed, pairwise(&policy), "{source}");
         }
+    }
+
+    #[test]
+    fn overlap_index_interns_exact_limit_allowed_ips_across_ports() {
+        let empty = parse("version: 1\n");
+        let mut policy = parse(
+            "version: 1
+network_policies:
+  api:
+    endpoints: [{ host: api.example.com, port: 443 }]
+",
+        );
+        let endpoint = &mut policy.network_policies.get_mut("api").unwrap().endpoints[0];
+        endpoint.port = 0;
+        endpoint.ports = (1..=32_768).collect();
+        endpoint.allowed_ips = vec!["10.0.0.0/8".to_owned(); MAX_IP_RANGES / 2];
+        let second = endpoint.clone();
+        policy
+            .network_policies
+            .get_mut("api")
+            .unwrap()
+            .endpoints
+            .push(second);
+
+        assert_eq!(resource_limit_reason(&empty, &policy), None);
+        assert!(validate_supported_policy(&policy, None).is_ok());
     }
 
     #[test]

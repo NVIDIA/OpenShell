@@ -48,6 +48,7 @@ pub(super) fn check(
         .process
         .as_ref()
         .map_or("", |process| process.run_as_group.as_str());
+    let mut unresolved_change = None;
     for (field, boundary, candidate) in [
         ("run_as_user", boundary_user, candidate_user),
         ("run_as_group", boundary_group, candidate_group),
@@ -68,12 +69,14 @@ pub(super) fn check(
                 },
             )));
         }
-        return Some(unsupported(
-            ReasonCode::UnsupportedPolicyShape,
-            format!(
-                "process {field} changes from '{boundary}' to '{candidate}'; identity resolution and ordering require execution-environment evidence"
-            ),
-        ));
+        unresolved_change.get_or_insert_with(|| {
+            unsupported(
+                ReasonCode::UnsupportedPolicyShape,
+                format!(
+                    "process {field} changes from '{boundary}' to '{candidate}'; identity resolution and ordering require execution-environment evidence"
+                ),
+            )
+        });
     }
     if boundary
         .landlock
@@ -91,7 +94,7 @@ pub(super) fn check(
             },
         )));
     }
-    None
+    unresolved_change
 }
 
 #[cfg(test)]
@@ -144,6 +147,36 @@ mod tests {
             assert!(matches!(result(soft, soft), CheckResult::Within(_)));
         }
         assert!(matches!(result(hard, hard), CheckResult::Within(_)));
+    }
+
+    #[test]
+    fn unresolved_identity_changes_do_not_mask_definitive_execution_violations() {
+        let boundary = "process: {run_as_user: sandbox, run_as_group: sandbox}\nlandlock: {compatibility: hard_requirement}";
+        let root_group = "process: {run_as_user: '1001', run_as_group: root}\nlandlock: {compatibility: hard_requirement}";
+        assert!(matches!(
+            result(boundary, root_group),
+            CheckResult::Exceeds(ref evidence)
+                if matches!(evidence.counterexample(), Counterexample::Process { field: "run_as_group", .. })
+        ));
+
+        let weaker_landlock = "process: {run_as_user: '1001', run_as_group: sandbox}\nlandlock: {compatibility: best_effort}";
+        assert!(matches!(
+            result(boundary, weaker_landlock),
+            CheckResult::Exceeds(ref evidence)
+                if matches!(evidence.counterexample(), Counterexample::Landlock { .. })
+        ));
+    }
+
+    #[test]
+    fn unresolved_identity_change_does_not_mask_filesystem_expansion() {
+        let boundary =
+            "process: {run_as_user: sandbox, run_as_group: sandbox}\nfilesystem_policy: {}";
+        let candidate = "process: {run_as_user: '1001', run_as_group: sandbox}\nfilesystem_policy: {read_write: [/tmp]}";
+        assert!(matches!(
+            result(boundary, candidate),
+            CheckResult::Exceeds(ref evidence)
+                if matches!(evidence.counterexample(), Counterexample::Filesystem { .. })
+        ));
     }
 
     #[test]
