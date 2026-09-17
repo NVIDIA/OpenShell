@@ -49,7 +49,6 @@ function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefin
 // Generated protobuf message shapes that callers need to populate or round-trip
 // directly. Re-export these rather than re-curating parallel surfaces.
 export type {
-  SandboxResources,
   SandboxServiceLevel,
   SandboxStartup,
   SandboxWorkloadConfig,
@@ -126,6 +125,38 @@ function deletionResult(response: { outcome: number; sandboxId?: string }): Dele
   };
 }
 
+/** Portable compute resource requirements for a sandbox workload. */
+export interface ResourceRequirements {
+  /** Presence requests GPU resources. An empty object uses the driver's default assignment. */
+  gpu?: GPUResourceRequirements;
+  /** CPU requirements for the sandbox workload. */
+  cpu?: CPUResourceRequirements;
+  /** Memory requirements for the sandbox workload. */
+  memory?: MemoryResourceRequirements;
+}
+
+/** GPU resource requirements for a sandbox. */
+export interface GPUResourceRequirements {
+  /** Number of GPUs requested. Omit to use the driver's default assignment. */
+  count?: number;
+}
+
+/** CPU resource requirements for a sandbox. */
+export interface CPUResourceRequirements {
+  /** Optional CPU limit, as a Kubernetes-style quantity such as `500m`, `1`, or `2.5`. */
+  limit?: string;
+  /** Optional CPU request, independent of the limit. */
+  request?: string;
+}
+
+/** Memory resource requirements for a sandbox. */
+export interface MemoryResourceRequirements {
+  /** Optional memory limit, as a byte quantity such as `512Mi`, `4Gi`, or `8G`. */
+  limit?: string;
+  /** Optional memory request, independent of the limit. */
+  request?: string;
+}
+
 export interface SandboxSpec {
   name?: string;
   /** Workspace name. Omit for `default`; empty strings are invalid. */
@@ -134,7 +165,8 @@ export interface SandboxSpec {
   labels?: Record<string, string>;
   environment?: Record<string, string>;
   providers?: string[];
-  gpu?: boolean;
+  /** Portable GPU, CPU, and memory requirements for the sandbox workload. */
+  resourceRequirements?: ResourceRequirements;
   /** Exact canonical command. Empty selects the gateway scratch shell. */
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
@@ -149,8 +181,8 @@ export interface SandboxSpec {
    * Advanced escape hatch: the full generated proto spec. Curated fields build
    * the base spec, then `rawSpec` shallow-overrides at the top spec level, so
    * any field it sets wins. Use it to reach proto spec fields the curated shape
-   * does not surface (template runtime class, resource limits, log level, and
-   * future additions) without an SDK change.
+   * does not surface (template runtime class, log level, and future additions)
+   * without an SDK change.
    */
   rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
@@ -857,7 +889,7 @@ export class SandboxClient {
         environment: spec.environment ?? {},
         providers: spec.providers ?? [],
         template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+        resourceRequirements: spec.resourceRequirements,
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,

@@ -26,6 +26,15 @@ func CopyBoolPtr(p *bool) *bool {
 	return &v
 }
 
+// StringPtr returns a pointer to value unless it is empty. Empty resource
+// quantities are invalid, so use nil to preserve optional-field presence.
+func StringPtr(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
 // CopyInt32Ptr returns a copy of an *int32 pointer.
 func CopyInt32Ptr(p *int32) *int32 {
 	if p == nil {

@@ -28,9 +28,9 @@ pub use openshell_core::proto::{
     ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
     ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt,
     ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
-    ProviderReadinessStatus, Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources,
-    SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate,
-    SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    ProviderReadinessStatus, ResourceRequirements, Sandbox, SandboxPhase as ProtoSandboxPhase,
+    SandboxResources, SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup,
+    SandboxTemplate, SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
     SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
     ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
 };

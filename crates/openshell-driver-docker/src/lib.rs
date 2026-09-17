@@ -48,8 +48,8 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
-    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    MemoryResourceCapabilities, ResourceCapabilities, ResourceRequirements, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -1022,9 +1022,11 @@ impl DockerComputeDriver {
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
+                    request_supported: false,
                 }),
                 memory: Some(MemoryResourceCapabilities {
                     limit_supported: true,
+                    request_supported: false,
                 }),
                 gpu: Some(GpuResourceCapabilities {
                     default_selection_supported: self.config.gpu.cdi_supported,
@@ -1059,7 +1061,7 @@ impl DockerComputeDriver {
             .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
 
         Self::validate_sandbox_template_base(template)?;
-        let _ = docker_resource_limits(template)?;
+        let _ = docker_resource_limits(spec.resource_requirements.as_ref())?;
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
@@ -5513,7 +5515,7 @@ fn build_container_create_body_for_image(
         .template
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
-    let resource_limits = docker_resource_limits(template)?;
+    let resource_limits = docker_resource_limits(spec.resource_requirements.as_ref())?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
     driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
@@ -5925,26 +5927,45 @@ fn docker_bridge_gateway_ip(
 }
 
 fn docker_resource_limits(
-    template: &DriverSandboxTemplate,
+    resources: Option<&ResourceRequirements>,
 ) -> Result<DockerResourceLimits, Status> {
-    let Some(resources) = template.resources.as_ref() else {
+    let Some(resources) = resources else {
         return Ok(DockerResourceLimits::default());
     };
-
-    if !resources.cpu_request.trim().is_empty() {
+    if resources
+        .cpu
+        .as_ref()
+        .is_some_and(|cpu| cpu.request.is_some())
+    {
         return Err(Status::failed_precondition(
-            "docker compute driver does not support resources.requests.cpu",
+            "docker does not support cpu.request",
         ));
     }
-    if !resources.memory_request.trim().is_empty() {
+    if resources
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.request.is_some())
+    {
         return Err(Status::failed_precondition(
-            "docker compute driver does not support resources.requests.memory",
+            "docker does not support memory.request",
         ));
     }
 
     Ok(DockerResourceLimits {
-        nano_cpus: parse_cpu_limit(&resources.cpu_limit)?,
-        memory_bytes: parse_memory_limit(&resources.memory_limit)?,
+        nano_cpus: parse_cpu_limit(
+            resources
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.limit.as_deref())
+                .unwrap_or(""),
+        )?,
+        memory_bytes: parse_memory_limit(
+            resources
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.limit.as_deref())
+                .unwrap_or(""),
+        )?,
     })
 }
 
@@ -6045,12 +6066,12 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
     if let Some(millicores) = value.strip_suffix('m') {
         let millicores = millicores.parse::<i64>().map_err(|_| {
             Status::failed_precondition(format!(
-                "invalid docker cpu_limit '{value}'; expected an integer or millicore quantity",
+                "invalid docker cpu.limit '{value}'; expected an integer or millicore quantity",
             ))
         })?;
         if millicores <= 0 {
             return Err(Status::failed_precondition(
-                "docker cpu_limit must be greater than zero",
+                "docker cpu.limit must be greater than zero",
             ));
         }
         return Ok(Some(millicores.saturating_mul(1_000_000)));
@@ -6058,12 +6079,12 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
 
     let cores = value.parse::<f64>().map_err(|_| {
         Status::failed_precondition(format!(
-            "invalid docker cpu_limit '{value}'; expected an integer or millicore quantity",
+            "invalid docker cpu.limit '{value}'; expected an integer or millicore quantity",
         ))
     })?;
     if !cores.is_finite() || cores <= 0.0 {
         return Err(Status::failed_precondition(
-            "docker cpu_limit must be greater than zero",
+            "docker cpu.limit must be greater than zero",
         ));
     }
 
@@ -6083,12 +6104,12 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     let (number, suffix) = value.split_at(number_end);
     let amount = number.parse::<f64>().map_err(|_| {
         Status::failed_precondition(format!(
-            "invalid docker memory_limit '{value}'; expected a Kubernetes-style quantity",
+            "invalid docker memory.limit '{value}'; expected a Kubernetes-style quantity",
         ))
     })?;
     if !amount.is_finite() || amount <= 0.0 {
         return Err(Status::failed_precondition(
-            "docker memory_limit must be greater than zero",
+            "docker memory.limit must be greater than zero",
         ));
     }
 
@@ -6108,7 +6129,7 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
         "E" => 1000_f64.powi(6),
         _ => {
             return Err(Status::failed_precondition(format!(
-                "invalid docker memory_limit suffix '{suffix}'",
+                "invalid docker memory.limit suffix '{suffix}'",
             )));
         }
     };
