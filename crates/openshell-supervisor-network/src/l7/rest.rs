@@ -3606,7 +3606,7 @@ mod tests {
                         SupervisorMiddlewarePhase::PreReturn
                     } as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }

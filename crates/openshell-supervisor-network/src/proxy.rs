@@ -6777,7 +6777,7 @@ process:
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }

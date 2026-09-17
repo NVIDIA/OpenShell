@@ -1371,11 +1371,10 @@ mod tests {
                     } else {
                         4096
                     },
-                    timeout: if matches!(self.script, Script::HangBody) {
-                        "10ms".into()
-                    } else {
-                        String::new()
-                    },
+                    request_timeout: matches!(self.script, Script::HangBody).then(|| {
+                        openshell_core::time::duration_from_std(Duration::from_millis(10))
+                            .expect("test timeout is in protobuf range")
+                    }),
                 }],
                 expected_audience: String::new(),
             }
@@ -1715,7 +1714,7 @@ mod tests {
                     as i32,
                 phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
         }
@@ -1921,7 +1920,10 @@ mod tests {
     impl InProcessMiddleware for ReadPreflightBeforeOpening {
         async fn describe(&self) -> MiddlewareManifest {
             let mut manifest = response_manifest("test/response");
-            manifest.bindings[0].timeout = "10ms".into();
+            manifest.bindings[0].request_timeout = Some(
+                openshell_core::time::duration_from_std(Duration::from_millis(10))
+                    .expect("test timeout is in protobuf range"),
+            );
             manifest
         }
 

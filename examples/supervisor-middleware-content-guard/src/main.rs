@@ -252,7 +252,7 @@ impl SupervisorMiddleware for ContentGuard {
                     operation: SupervisorMiddlewareOperation::HttpResponse as i32,
                     phase: SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
-                    timeout: String::new(),
+                    request_timeout: None,
                 },
             ],
             expected_audience: String::new(),
