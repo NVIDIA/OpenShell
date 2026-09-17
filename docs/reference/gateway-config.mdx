@@ -296,6 +296,12 @@ Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce s
 
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
 
+### Agent Telemetry Relay
+
+Configuring this table also enables the sandbox telemetry relay. `CreateSandbox` sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in each new sandbox's environment unless the caller already supplied an endpoint. The values persist in the sandbox spec and survive restarts. OTel SDKs inside the sandbox export to that address over HTTP/protobuf or HTTP/JSON.
+
+The address is never routed. The sandbox stages the connection for the supervisor, which serves the OTLP receiver itself, adds `openshell.sandbox.id`, `openshell.workspace.id`, `openshell.sandbox.policy`, `openshell.sandbox.user`, `openshell.sandbox.image`, `openshell.sandbox.driver`, and `openshell.telemetry.source=agent`, and forwards the spans to the gateway. The gateway exports them to the same `endpoint` through a dedicated exporter, so agent spans arrive with the supervisor's resource attributes rather than the gateway's. Agent traces need no sandbox egress and no network policy entry. Telemetry never blocks sandbox control traffic: the relay buffers up to 4096 items per sandbox and drops the newest on overflow.
+
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
 driver service names remain fixed.
