@@ -2760,7 +2760,7 @@ impl KubernetesComputeDriver {
                 pod_is_gone,
             );
             if stop_is_complete {
-                self.delete_sandbox_runtime_generation_secrets(sandbox_id, &namespace)
+                self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
                     .await?;
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
@@ -2852,7 +2852,7 @@ impl KubernetesComputeDriver {
                     .unwrap_or(&self.config.namespace);
                 if sandbox_runtime_control_availability(&self.client, namespace, sandbox_id).await
                     == SandboxRuntimeControlAvailability::Available
-                    && sandbox_runtime_runtime_is_ready(&object)
+                    && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
                     self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
@@ -3511,7 +3511,7 @@ impl KubernetesComputeDriver {
             if sandbox_runtime_bootstrap_in_progress(&object) {
                 if sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await
                     == SandboxRuntimeControlAvailability::Available
-                    && sandbox_runtime_runtime_is_ready(&object)
+                    && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
                     self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
@@ -3836,6 +3836,9 @@ impl KubernetesComputeDriver {
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
     ) {
+        if !sandbox_runtime_bootstrap_is_ready_to_complete(object) {
+            return;
+        }
         let (Some(name), Some(resource_version)) = (
             object.metadata.name.as_deref(),
             object.metadata.resource_version.as_deref(),
@@ -4137,8 +4140,7 @@ fn spawn_sandbox_runtime_bootstrap_completion(
         let runtime_ready = |object: Option<&DynamicObject>| {
             object.is_some_and(|object| {
                 object.metadata.uid == expected_sandbox_uid
-                    && sandbox_runtime_bootstrap_in_progress(object)
-                    && sandbox_runtime_runtime_is_ready(object)
+                    && sandbox_runtime_bootstrap_is_ready_to_complete(object)
             })
         };
         let object = match tokio::time::timeout_at(
@@ -4218,6 +4220,16 @@ fn sandbox_runtime_bootstrap_operation(object: &DynamicObject) -> Option<&str> {
         .as_ref()
         .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION))
         .map(String::as_str)
+}
+
+fn sandbox_runtime_bootstrap_is_ready_to_complete(object: &DynamicObject) -> bool {
+    sandbox_runtime_bootstrap_in_progress(object)
+        && sandbox_runtime_bootstrap_phase(object) == Some(SandboxRuntimeBootstrapPhase::Released)
+        && matches!(
+            sandbox_runtime_bootstrap_operation(object),
+            Some("create" | "restart")
+        )
+        && sandbox_runtime_runtime_is_ready(object)
 }
 
 fn sandbox_runtime_bootstrap_phase(object: &DynamicObject) -> Option<SandboxRuntimeBootstrapPhase> {
@@ -6914,6 +6926,7 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Full;
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -6924,6 +6937,39 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[derive(Debug)]
+    struct StopApiState {
+        supervisor_exists: bool,
+        secrets: BTreeSet<String>,
+        completion_saw_clean_runtime: bool,
+    }
+
+    fn kube_test_response(
+        status: http::StatusCode,
+        body: serde_json::Value,
+    ) -> http::Response<Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(bytes::Bytes::from(body.to_string())))
+            .expect("valid Kubernetes test response")
+    }
+
+    fn kube_test_not_found(kind: &str, name: &str) -> http::Response<Full<bytes::Bytes>> {
+        kube_test_response(
+            http::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": format!("{kind} {name} not found"),
+                "reason": "NotFound",
+                "details": {"kind": kind, "name": name},
+                "code": 404
+            }),
+        )
+    }
 
     #[test]
     fn boundary_authority_uses_stable_service_dns_name() {
@@ -7544,6 +7590,199 @@ mod tests {
         assert!(alpha_start["metadata"].get("annotations").is_none());
         assert_eq!(alpha_start["spec"]["replicas"], 1);
         assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_resumed_from_rolling_back_removes_the_complete_runtime() {
+        let state = Arc::new(std::sync::Mutex::new(StopApiState {
+            supervisor_exists: true,
+            secrets: BTreeSet::from([
+                "sandbox-generation-secret".to_string(),
+                "supervisor-generation-secret".to_string(),
+            ]),
+            completion_saw_clean_runtime: false,
+        }));
+        let service_state = state.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let state = service_state.clone();
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let query = request.uri().query().unwrap_or_default().to_string();
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("read Kubernetes test request body");
+                let sandbox = serde_json::json!({
+                    "apiVersion": "agents.x-k8s.io/v1beta1",
+                    "kind": "Sandbox",
+                    "metadata": {
+                        "name": "sandbox-cr",
+                        "namespace": "openshell",
+                        "uid": "sandbox-uid",
+                        "resourceVersion": "42",
+                        "generation": 7,
+                        "labels": {
+                            LABEL_SANDBOX_ID: "sandbox-1",
+                            LABEL_GATEWAY_ID: "openshell"
+                        },
+                        "annotations": {
+                            SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
+                                SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+                        }
+                    },
+                    "spec": {
+                        "operatingMode": "Suspended",
+                        "podTemplate": {"spec": {"terminationGracePeriodSeconds": 0}}
+                    },
+                    "status": {
+                        "conditions": [{"type": "Suspended", "status": "True"}]
+                    }
+                });
+                let response = match (method.as_str(), path.as_str()) {
+                    ("GET", "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes") => {
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "agents.x-k8s.io/v1beta1",
+                                "kind": "SandboxList",
+                                "metadata": {"resourceVersion": "42"},
+                                "items": [sandbox]
+                            }),
+                        )
+                    }
+                    (
+                        "GET",
+                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                    ) => kube_test_response(http::StatusCode::OK, sandbox),
+                    (
+                        "PATCH",
+                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                    ) => {
+                        let completion_patch: serde_json::Value =
+                            serde_json::from_slice(&body).expect("valid sandbox completion patch");
+                        let mut state = state.lock().unwrap();
+                        assert!(!state.supervisor_exists);
+                        assert!(state.secrets.is_empty());
+                        assert_eq!(
+                            completion_patch["metadata"]["annotations"]
+                                [ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+                            serde_json::Value::Null
+                        );
+                        state.completion_saw_clean_runtime = true;
+                        kube_test_response(http::StatusCode::OK, sandbox)
+                    }
+                    ("GET", "/api/v1/namespaces/openshell/pods/workload-pod") => {
+                        kube_test_not_found("pods", "workload-pod")
+                    }
+                    ("GET", "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1") => {
+                        if state.lock().unwrap().supervisor_exists {
+                            kube_test_response(
+                                http::StatusCode::OK,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {
+                                        "name": "os-supervisor-sandbox-1",
+                                        "namespace": "openshell",
+                                        "uid": "supervisor-uid",
+                                        "resourceVersion": "7"
+                                    },
+                                    "spec": {"containers": []}
+                                }),
+                            )
+                        } else {
+                            kube_test_not_found("pods", "os-supervisor-sandbox-1")
+                        }
+                    }
+                    ("DELETE", "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1") => {
+                        state.lock().unwrap().supervisor_exists = false;
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Success",
+                                "code": 200
+                            }),
+                        )
+                    }
+                    ("GET", "/api/v1/namespaces/openshell/secrets") => {
+                        let component = if query.contains("component%3Dsandbox") {
+                            "sandbox-generation-secret"
+                        } else {
+                            "supervisor-generation-secret"
+                        };
+                        let items = if state.lock().unwrap().secrets.contains(component) {
+                            vec![serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Secret",
+                                "metadata": {
+                                    "name": component,
+                                    "namespace": "openshell",
+                                    "uid": format!("{component}-uid"),
+                                    "resourceVersion": "8"
+                                }
+                            })]
+                        } else {
+                            Vec::new()
+                        };
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "SecretList",
+                                "metadata": {"resourceVersion": "8"},
+                                "items": items
+                            }),
+                        )
+                    }
+                    ("DELETE", path)
+                        if path.starts_with("/api/v1/namespaces/openshell/secrets/") =>
+                    {
+                        let name = path.rsplit('/').next().unwrap();
+                        state.lock().unwrap().secrets.remove(name);
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Success",
+                                "code": 200
+                            }),
+                        )
+                    }
+                    _ => panic!("unexpected Kubernetes test request: {method} {path}?{query}"),
+                };
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .expect("set test Sandbox API version");
+
+        driver
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("resume stop from RollingBack");
+
+        let state = state.lock().unwrap();
+        assert!(!state.supervisor_exists);
+        assert!(state.secrets.is_empty());
+        assert!(state.completion_saw_clean_runtime);
     }
 
     #[test]
@@ -10188,6 +10427,72 @@ mod tests {
             {"type": "Ready", "status": "True", "observedGeneration": 7}
         ]);
         assert!(!sandbox_runtime_runtime_is_ready(&sandbox));
+    }
+
+    #[test]
+    fn sandbox_runtime_bootstrap_completion_requires_released_create_or_restart() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.metadata.generation = Some(7);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "observedGeneration": 7
+                }]
+            }
+        });
+        let annotations = sandbox.metadata.annotations.get_or_insert_default();
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+            "true".to_string(),
+        );
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+            SandboxRuntimeBootstrapPhase::Released.as_str().to_string(),
+        );
+        annotations.insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+            "create".to_string(),
+        );
+        assert!(sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+            "restart".to_string(),
+        );
+        assert!(sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+            SandboxRuntimeBootstrapPhase::StoppingSupervisor
+                .as_str()
+                .to_string(),
+        );
+        assert!(!sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+            SandboxRuntimeBootstrapPhase::RollingBack
+                .as_str()
+                .to_string(),
+        );
+        assert!(!sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+            SandboxRuntimeBootstrapPhase::Released.as_str().to_string(),
+        );
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+            "stop".to_string(),
+        );
+        assert!(!sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
     }
 
     #[test]
