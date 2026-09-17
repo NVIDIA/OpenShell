@@ -631,17 +631,6 @@ jobs:
           app-version: ${{ needs.compute-versions.outputs.semver }}
           release-kind: public
 
-  smoke-published-prerelease:
-    name: Smoke Published Prerelease
-    needs: [compute-versions, release, release-helm]
-    if: needs.compute-versions.outputs.is_prerelease == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/release-canary.yml
-    with:
-      install-version: v${{ needs.compute-versions.outputs.semver }}
-
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
