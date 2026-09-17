@@ -24,8 +24,8 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    Service, ServiceAccount, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
+    Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -42,6 +42,7 @@ use kube::runtime::WatchStreamExt;
 use kube::runtime::wait::await_condition;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::NetworkSupervisorTrustBundle;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
@@ -69,6 +70,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use rand::RngCore as _;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -104,6 +106,172 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: &str =
     "openshell.ai/sandbox-runtime-network-policy-version";
+
+/// Full gateway-normalized destination-trust digest recorded on each immutable
+/// `ConfigMap` generation. The digest is intentionally not truncated here even
+/// though the object name uses stable, DNS-safe hash prefixes.
+const ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION: &str =
+    "openshell.ai/network-additional-ca-generation";
+const NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-network-additional-ca-";
+const NETWORK_ADDITIONAL_CA_DATA_KEY: &str = "ca.crt";
+
+/// A validated immutable `ConfigMap` generation selected for a supervisor Pod.
+/// This contains only an object name and non-secret digest; PEM bytes remain in
+/// the API object and are never copied into a workload template or Secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkAdditionalCaConfigMap {
+    name: String,
+    digest: String,
+}
+
+fn network_additional_ca_config_map_name(gateway_id: &str, digest: &str) -> String {
+    // Kubernetes labels have a 63-byte limit. Keep recognizable stable
+    // prefixes while hashing both variable inputs. The complete digest is
+    // retained in an annotation and checked before every supervisor creation.
+    let gateway_hash = format!("{:x}", Sha256::digest(gateway_id.as_bytes()));
+    let digest_hash = format!("{:x}", Sha256::digest(digest.as_bytes()));
+    format!(
+        "{NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX}{}-{}",
+        &gateway_hash[..12],
+        &digest_hash[..18],
+    )
+}
+
+fn network_additional_ca_config_map(
+    namespace: &str,
+    gateway_id: &str,
+    bundle: &NetworkSupervisorTrustBundle,
+) -> Result<ConfigMap, KubernetesDriverError> {
+    let pem = std::str::from_utf8(bundle.normalized_pem()).map_err(|_| {
+        KubernetesDriverError::Precondition(
+            "gateway-normalized network additional CA bundle is not UTF-8".to_string(),
+        )
+    })?;
+    let name = network_additional_ca_config_map_name(gateway_id, bundle.digest());
+    Ok(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                (LABEL_GATEWAY_ID.to_string(), gateway_id.to_string()),
+            ])),
+            annotations: Some(BTreeMap::from([(
+                ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION.to_string(),
+                bundle.digest().to_string(),
+            )])),
+            // Generations are intentionally retained across Pod and Sandbox
+            // replacement. A sandbox owner reference would allow garbage
+            // collection to remove material still needed by a stopped PVC.
+            owner_references: None,
+            ..Default::default()
+        },
+        immutable: Some(true),
+        data: Some(BTreeMap::from([(
+            NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+            pem.to_string(),
+        )])),
+        binary_data: None,
+    })
+}
+
+fn validate_network_additional_ca_config_map(
+    existing: &ConfigMap,
+    expected: &ConfigMap,
+) -> Result<(), KubernetesDriverError> {
+    let name = expected.metadata.name.as_deref().unwrap_or_default();
+    let expected_labels = expected.metadata.labels.as_ref();
+    if existing.metadata.labels.as_ref() != expected_labels
+        // The immutable generation must outlive individual sandbox objects.
+        // Reject even an explicitly empty ownerReferences field so only the
+        // API representation produced by our ownerless template is accepted.
+        || existing.metadata.owner_references.is_some()
+    {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} is not owned by this gateway"
+        )));
+    }
+    let expected_digest = expected
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION));
+    let actual_digest = existing
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION));
+    if actual_digest != expected_digest {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} has an unexpected trust generation"
+        )));
+    }
+    if existing.immutable != Some(true) {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} is not immutable"
+        )));
+    }
+    if existing.data != expected.data || existing.binary_data.is_some() {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "network additional CA ConfigMap {name} did not retain the exact gateway-normalized trust bundle"
+        )));
+    }
+    Ok(())
+}
+
+async fn create_or_validate_network_additional_ca_config_map(
+    config_maps: &Api<ConfigMap>,
+    expected: &ConfigMap,
+) -> Result<(), KubernetesDriverError> {
+    let name = expected.metadata.name.as_deref().ok_or_else(|| {
+        KubernetesDriverError::Message("network additional CA ConfigMap has no name".to_string())
+    })?;
+    match tokio::time::timeout(KUBE_API_TIMEOUT, config_maps.get_opt(name)).await {
+        Ok(Ok(Some(existing))) => {
+            return validate_network_additional_ca_config_map(&existing, expected);
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
+        Err(_) => {
+            return Err(KubernetesDriverError::Message(
+                "timed out reading network additional CA ConfigMap".to_string(),
+            ));
+        }
+    }
+
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        config_maps.create(&PostParams::default(), expected),
+    )
+    .await
+    {
+        // Validate the server response as well: an admission controller must
+        // not be able to silently alter the immutable material we mount.
+        Ok(Ok(created)) => validate_network_additional_ca_config_map(&created, expected),
+        // A concurrent gateway instance may win creation. Re-read exactly the
+        // named object and subject the winner to the same byte-for-byte checks;
+        // no LIST, WATCH, PATCH, UPDATE, or DELETE is ever used for this API.
+        Ok(Err(KubeError::Api(error))) if error.code == 409 => {
+            let existing = tokio::time::timeout(KUBE_API_TIMEOUT, config_maps.get(name))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out validating concurrent network additional CA ConfigMap creation"
+                            .to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+            validate_network_additional_ca_config_map(&existing, expected)
+        }
+        Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
+        Err(_) => Err(KubernetesDriverError::Message(
+            "timed out creating network additional CA ConfigMap".to_string(),
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeBootstrapPhase {
@@ -638,6 +806,10 @@ pub struct KubernetesComputeDriver {
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
+    /// Gateway-normalized destination trust available only to this in-process
+    /// driver. The external driver protocol deliberately has no transport for
+    /// the PEM bytes or a gateway-local artifact path.
+    network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
 
@@ -665,6 +837,7 @@ impl KubernetesComputeDriver {
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
+            network_trust_bundle: None,
             operator_allowlist: None,
         }
     }
@@ -672,6 +845,7 @@ impl KubernetesComputeDriver {
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        network_trust_bundle: Option<NetworkSupervisorTrustBundle>,
     ) -> Result<Self, KubernetesDriverError> {
         config
             .validate_workspace_mode()
@@ -735,6 +909,7 @@ impl KubernetesComputeDriver {
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
+            network_trust_bundle,
             operator_allowlist,
         };
 
@@ -1905,6 +2080,29 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Create or validate the gateway-owned destination-trust generation for
+    /// one target namespace. The source PEM never crosses the external driver
+    /// boundary: only this in-process driver receives the normalized bundle.
+    async fn ensure_network_additional_ca_config_map(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<NetworkAdditionalCaConfigMap>, KubernetesDriverError> {
+        let Some(bundle) = self.network_trust_bundle.as_ref() else {
+            return Ok(None);
+        };
+        let expected =
+            network_additional_ca_config_map(namespace, &self.config.gateway_id, bundle)?;
+        let name = expected.metadata.name.clone().ok_or_else(|| {
+            KubernetesDriverError::Message(
+                "network additional CA ConfigMap has no name".to_string(),
+            )
+        })?;
+        let digest = bundle.digest().to_string();
+        let config_maps = Api::<ConfigMap>::namespaced(self.client.clone(), namespace);
+        create_or_validate_network_additional_ca_config_map(&config_maps, &expected).await?;
+        Ok(Some(NetworkAdditionalCaConfigMap { name, digest }))
+    }
+
     async fn wait_for_bootstrap_workload_pod(
         &self,
         pods: &Api<Pod>,
@@ -2214,6 +2412,12 @@ impl KubernetesComputeDriver {
                 ))
             })?;
 
+        // Validate or create the immutable trust generation before creating
+        // the dedicated supervisor Pod. A same-name delete/recreate with
+        // altered bytes therefore fails closed while no control process runs.
+        let network_additional_ca = self
+            .ensure_network_additional_ca_config_map(namespace)
+            .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let supervisor = pods
             .create(
@@ -2248,6 +2452,9 @@ impl KubernetesComputeDriver {
                             .provider_spiffe_workload_api_socket_path
                             .as_str(),
                     ),
+                    network_additional_ca
+                        .as_ref()
+                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     dependent_owner.clone(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
@@ -2451,6 +2658,11 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::from_kube)?;
 
+        // Re-read the exact generation before releasing the supervisor's
+        // scheduling gate. This closes the bootstrap window against a
+        // delete/recreate of the same content-addressed ConfigMap name.
+        self.ensure_network_additional_ca_config_map(namespace)
+            .await?;
         pods.patch(
             &names.supervisor_pod,
             &PatchParams::default(),
@@ -2694,6 +2906,10 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::from_kube)?;
 
+        // A restarted generation must revalidate immediately before resuming
+        // the gated supervisor as well as before creating it.
+        self.ensure_network_additional_ca_config_map(namespace)
+            .await?;
         pods.patch(
             &names.supervisor_pod,
             &PatchParams::default(),
@@ -2962,6 +3178,13 @@ impl KubernetesComputeDriver {
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
+        // Validate the current gateway generation before touching a stopped
+        // sandbox's stale companion. This detects equal-generation
+        // delete/recreate tampering before a supervisor can be created or
+        // released, while running supervisors remain untouched.
+        let network_additional_ca = self
+            .ensure_network_additional_ca_config_map(&namespace)
+            .await?;
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
             .await?;
         let main_process_spec =
@@ -3007,6 +3230,9 @@ impl KubernetesComputeDriver {
                             .provider_spiffe_workload_api_socket_path
                             .as_str(),
                     ),
+                    network_additional_ca
+                        .as_ref()
+                        .map(|generation| (generation.name.as_str(), generation.digest.as_str())),
                     sandbox_runtime_sandbox_owner_reference(
                         cr_name,
                         cr_uid,
@@ -7056,6 +7282,9 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox_runtime::{
+        NETWORK_ADDITIONAL_CA_BUNDLE_PATH, NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+    };
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -7091,6 +7320,134 @@ mod tests {
                 "code": 404
             }),
         )
+    }
+
+    fn network_trust_bundle(gateway_id: &str, digest: &str) -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            digest,
+            PathBuf::from(format!("/gateway-state/{gateway_id}.crt")),
+        )
+    }
+
+    #[test]
+    fn destination_trust_config_map_is_immutable_content_addressed_and_retained() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bundle = network_trust_bundle("gateway-a", digest);
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+        let name = expected.metadata.name.as_deref().expect("ConfigMap name");
+        assert_eq!(name.len(), 63);
+        assert!(name.starts_with(NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX));
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        assert_eq!(expected.immutable, Some(true));
+        assert_eq!(expected.metadata.owner_references, None);
+        assert_eq!(
+            expected.metadata.labels.as_ref(),
+            Some(&BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string()
+                ),
+                (LABEL_GATEWAY_ID.to_string(), "gateway-a".to_string()),
+            ]))
+        );
+        assert_eq!(
+            expected.metadata.annotations.as_ref().and_then(
+                |annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION)
+            ),
+            Some(&digest.to_string())
+        );
+        assert_eq!(
+            expected.data.as_ref(),
+            Some(&BTreeMap::from([(
+                NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+                String::from_utf8(bundle.normalized_pem().to_vec()).unwrap(),
+            )]))
+        );
+        assert_eq!(expected.binary_data, None);
+        assert_ne!(
+            name,
+            network_additional_ca_config_map_name("gateway-b", digest),
+            "gateway identity participates in content addressing"
+        );
+        assert_ne!(
+            name,
+            network_additional_ca_config_map_name("gateway-a", "sha256:other-generation"),
+            "trust generation participates in content addressing"
+        );
+        assert!(validate_network_additional_ca_config_map(&expected, &expected).is_ok());
+    }
+
+    #[test]
+    fn destination_trust_config_map_rejects_same_name_recreation_tampering() {
+        let bundle = network_trust_bundle(
+            "gateway-a",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let expected = network_additional_ca_config_map("workspace-a", "gateway-a", &bundle)
+            .expect("normalized PEM must be valid UTF-8");
+
+        let mut replaced = expected.clone();
+        replaced.data = Some(BTreeMap::from([(
+            NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+            "not-a-certificate\n".to_string(),
+        )]));
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&replaced, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("did not retain the exact gateway-normalized trust bundle")
+        ));
+
+        let mut binary_data = expected.clone();
+        binary_data.binary_data = Some(BTreeMap::new());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&binary_data, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("did not retain the exact gateway-normalized trust bundle")
+        ));
+
+        let mut wrong_gateway = expected.clone();
+        wrong_gateway
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_GATEWAY_ID.to_string(), "other-gateway".to_string());
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&wrong_gateway, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
+        ));
+
+        let mut sandbox_owned = expected.clone();
+        sandbox_owned.metadata.owner_references =
+            Some(vec![sandbox_runtime_sandbox_owner_reference(
+                "sandbox",
+                "sandbox-uid",
+                "agents.x-k8s.io/v1beta1",
+                false,
+            )]);
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&sandbox_owned, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("is not owned by this gateway")
+        ));
+
+        let mut stale_digest = expected.clone();
+        stale_digest.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION.to_string(),
+            "sha256:stale".to_string(),
+        );
+        assert!(matches!(
+            validate_network_additional_ca_config_map(&stale_digest, &expected),
+            Err(KubernetesDriverError::Precondition(message))
+                if message.contains("unexpected trust generation")
+        ));
     }
 
     #[test]
@@ -7894,6 +8251,7 @@ mod tests {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
+            network_trust_bundle: None,
         };
         driver
             .sandbox_api_version
@@ -7984,6 +8342,7 @@ mod tests {
             sandbox_api_version: Arc::new(OnceCell::new()),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
+            network_trust_bundle: None,
         };
 
         driver
@@ -8954,6 +9313,33 @@ mod tests {
         );
 
         let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            !volumes
+                .iter()
+                .any(|volume| volume["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME),
+            "destination trust is exclusive to the separate supervisor Pod"
+        );
+        for container in pod_template["spec"]["containers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                pod_template["spec"]["initContainers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            )
+        {
+            assert!(
+                !container["volumeMounts"].as_array().is_some_and(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME
+                            || mount["mountPath"] == NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+                    })
+                }),
+                "destination trust leaked into a workload or init container: {container:#?}"
+            );
+        }
         let pod_identity = volumes
             .iter()
             .find(|volume| volume["name"] == SANDBOX_POD_IDENTITY_VOLUME_NAME)

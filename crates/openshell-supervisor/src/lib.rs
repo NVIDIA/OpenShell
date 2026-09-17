@@ -441,7 +441,13 @@ pub async fn run_network_proxy(
     policy_data: String,
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
+    network_additional_ca_digest: Option<String>,
 ) -> Result<i32> {
+    openshell_supervisor_network::l7::tls::validate_network_additional_ca_args(
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
+    )?;
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
             "network-proxy listener must use a loopback address: {listen}"
@@ -512,6 +518,8 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
     )
     .await?;
 
@@ -574,7 +582,14 @@ pub async fn run_sandbox(
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
+    network_additional_ca_digest: Option<String>,
 ) -> Result<i32> {
+    openshell_supervisor_network::l7::tls::validate_network_additional_ca_args(
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
+    )?;
+
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -894,6 +909,8 @@ pub async fn run_sandbox(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            network_additional_ca_bundle.as_deref(),
+            network_additional_ca_digest.as_deref(),
         )
         .await?,
     );

@@ -82,6 +82,7 @@ impl LifecycleEventFences {
 
     /// Clear an unconsumed intentional-removal fence when rollback proves the
     /// original container remains the authoritative sandbox.
+    #[cfg(test)]
     pub fn clear_intentional_removal(&self, container_id: &str) {
         self.intentional_removals
             .lock()
@@ -95,14 +96,6 @@ impl LifecycleEventFences {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(container_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn intentional_removal_is_pending(&self, container_id: &str) -> bool {
-        self.intentional_removals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(container_id)
     }
 
     fn matches_previous_exit(

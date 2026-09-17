@@ -112,6 +112,10 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
+        /// Fresh supervisor-facing credentials. These remain opaque in test
+        /// diagnostics just as they do in production tracing.
+        launch_authentication: Vec<u8>,
+        generation_id: String,
         /// The optional durable provisioning snapshot supplied by newer
         /// gateways. Keeping it in the fake makes compatibility and
         /// reconciliation tests able to verify the start contract.
@@ -400,6 +404,8 @@ impl ComputeDriver for FakeComputeDriver {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
                 sandbox_name: request.name,
+                launch_authentication: request.launch_authentication,
+                generation_id: request.generation_id,
                 sandbox: request.sandbox,
             });
         });

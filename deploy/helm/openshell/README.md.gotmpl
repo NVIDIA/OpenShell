@@ -102,8 +102,8 @@ The chart mounts the source into the gateway and renders
 `[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
 and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
 separate managed ConfigMap in each target sandbox namespace and mounts it only
-at the network-supervisor boundary. The sandbox receives the expected generation
-as a protected startup argument and rejects mounted PEM whose canonical digest
+in the dedicated supervisor Pod. That supervisor receives the expected generation
+as protected startup arguments and rejects mounted PEM whose canonical digest
 differs before network setup. The configured roots augment default destination
 trust. They do not configure the corporate proxy, OIDC, or gateway callback mTLS
 trust.
