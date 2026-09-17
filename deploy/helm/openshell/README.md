@@ -17,6 +17,114 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+## Cluster-scoped vs namespaced objects
+
+Most objects in this chart are namespaced and land in the release namespace.
+Only two are cluster-scoped:
+
+| Object | Default name |
+| --- | --- |
+| `ClusterRole` | `<fullname>-node-reader-<release namespace>` |
+| `ClusterRoleBinding` | `<fullname>-node-reader-<release namespace>` |
+
+By default the release creates both, so an install by a cluster-admin is
+unchanged. On clusters where cluster-scoped RBAC is owned by a different team,
+split the install in two.
+
+A cluster-admin applies the cluster-scoped objects once per gateway
+ServiceAccount, rendered from the same values the release uses:
+
+```shell
+helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
+```
+
+A namespace-admin then installs and upgrades the release with cluster-scoped
+objects omitted, using [`ci/values-namespace-admin.yaml`](ci/values-namespace-admin.yaml)
+or the equivalent `--set`:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.clusterScoped.create=false
+```
+
+The gateway ServiceAccount name and namespace do not change, so the
+pre-created `ClusterRoleBinding` keeps matching the release. This works with
+`serviceAccount.create=false` too: the `ClusterRoleBinding` subject follows
+`serviceAccount.name`, so render the admin step with the same values.
+
+### Which flag the installer needs
+
+In the default `shared` workspace mode the release also creates a namespaced
+sandbox `Role` granting Agent Sandbox (`agents.x-k8s.io`) permissions.
+Kubernetes forbids granting permissions you do not hold, and the built-in
+`admin` ClusterRole does not cover that CRD, so an installer holding only
+`admin` cannot create it. `rbac.clusterScoped.create=false` alone is then not
+enough and the install fails with `attempting to grant RBAC permissions not
+currently held`.
+
+| Workspace mode | Installer holds | Use |
+| --- | --- | --- |
+| `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
+| `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+
+`managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
+is needed there.
+
+With `rbac.create=false` the cluster-admin applies the namespaced RBAC too,
+adding it to the same render:
+
+```shell
+helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --namespace openshell -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml \
+  --show-only templates/role.yaml \
+  --show-only templates/rolebinding.yaml \
+  --show-only templates/peer-role.yaml | kubectl apply -f -
+```
+
+To grant the installer the sandbox permissions instead, bind it to a Role
+carrying the same rules as the chart's `openshell-sandbox` Role.
+
+The certgen hook and credential driver RBAC keep their own flags
+(`pkiInitJob.enabled` and
+`server.credentialDrivers.kubernetesSecrets.rbac.create`).
+
+### Migrating an existing release
+
+Helm deletes objects that leave a release manifest, so setting
+`rbac.clusterScoped.create=false` on a release that already owns the
+`ClusterRole` and `ClusterRoleBinding` deletes them. The gateway then loses
+TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
+cluster-admin, so nothing is deleted:
+
+```shell
+kubectl annotate clusterrole "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+```
+
+The objects then survive the upgrade that sets the flag, and the cluster-admin
+owns them from that point on. Fresh installs need no such step.
+
+`rbac.clusterScoped.create` is independent of
+`server.drivers.kubernetes.workspaceMode`. Managed and operator modes change
+what the `ClusterRole` contains, but they never force the namespaced release to
+apply it. Re-run the cluster-admin step after changing values that affect the
+`ClusterRole` rules.
+
 ## Prerequisites
 
 > **Required:** Your cluster CNI MUST enforce Kubernetes `NetworkPolicy` for
@@ -260,6 +368,10 @@ discovery endpoint or its TLS CA.
 | probes.startup.failureThreshold | int | `30` | Startup probe failure threshold before the container is killed. |
 | probes.startup.periodSeconds | int | `2` | Startup probe period, in seconds. |
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
+| rbac.clusterScoped.clusterRoleBindingName | string | `""` | Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+| rbac.clusterScoped.clusterRoleName | string | `""` | Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+| rbac.clusterScoped.create | bool | `true` | Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable for a namespace-admin install where a cluster-admin applies them separately; the gateway ServiceAccount name and namespace are unchanged, so a pre-created ClusterRoleBinding still matches. |
+| rbac.create | bool | `true` | Create the RBAC objects that grant the gateway ServiceAccount access. Disable to supply the namespaced sandbox and peer Role/RoleBinding and the cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook and credential driver RBAC keep their own flags. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
 | sandbox.image.digest | string | `""` | Sandbox image digest. When set, this takes precedence over tag. |
