@@ -646,6 +646,23 @@ a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
 capabilities, gateway egress, or credentials to the workload Pod as a
 workaround.
 
+If a Sandbox remains in the `rolling-back` bootstrap phase, verify that the
+gateway ServiceAccount can create, list, and delete Secrets in the sandbox
+namespace. Recovery lists generation Secrets by sandbox and component labels
+even when none remain, then deletes stale entries with UID preconditions before
+clearing the rollback annotations:
+
+```bash
+for verb in create list delete; do
+  kubectl auth can-i "$verb" secrets \
+    --namespace <sandbox-namespace> \
+    --as system:serviceaccount:openshell:openshell
+done
+```
+
+Any `no` result can strand recovery before workload Pod creation. Upgrade the
+OpenShell chart rather than treating missing workload Pods as Pod failures.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
