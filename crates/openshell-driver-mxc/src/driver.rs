@@ -71,7 +71,12 @@ impl MxcBackend {
 #[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)] // Independent, existing gateway TOML options.
 pub struct MxcComputeConfig {
-    /// Path to `wxc-exec.exe`. Required for live runs.
+    /// Path to `wxc-exec.exe`. Required for live runs, and must be an
+    /// absolute path: `wxc-exec` is the binary that builds every sandbox, so
+    /// a relative path (including the unset default) would let PATH-lookup
+    /// or working-directory-relative resolution execute a decoy binary with
+    /// the gateway's identity instead of the approved `wxc-exec`. Enforced
+    /// at gateway startup by the compute-driver config preflight.
     pub wxc_exec_path: String,
     /// Backend to target. Default: `process_container`.
     pub backend: MxcBackend,
@@ -148,7 +153,12 @@ pub struct MxcComputeConfig {
 impl Default for MxcComputeConfig {
     fn default() -> Self {
         Self {
-            wxc_exec_path: "wxc-exec.exe".into(),
+            // No usable default: `wxc_exec_path` must be explicitly set to an
+            // absolute path (see `validate_configuration` and the field doc
+            // comment above). Shipping a bare relative filename here would
+            // silently reintroduce the exact PATH/CWD-hijack risk the
+            // validation exists to reject.
+            wxc_exec_path: String::new(),
             backend: MxcBackend::default(),
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
@@ -164,6 +174,32 @@ impl Default for MxcComputeConfig {
             debug: false,
             etw_audit: false,
         }
+    }
+}
+
+impl MxcComputeConfig {
+    /// Validate startup configuration without touching `wxc-exec` or the
+    /// filesystem beyond `Path::is_absolute`.
+    ///
+    /// `wxc_exec_path` must be set to an absolute path: it is the binary
+    /// that builds every sandbox, so a relative path (including an unset,
+    /// empty value) would let PATH-lookup or working-directory-relative
+    /// resolution execute a decoy binary with the gateway's identity instead
+    /// of the approved `wxc-exec`, turning the containment mechanism itself
+    /// into an arbitrary-code-execution primitive.
+    pub fn validate_configuration(&self) -> openshell_core::Result<()> {
+        if self.wxc_exec_path.trim().is_empty() {
+            return Err(openshell_core::Error::config(
+                "[openshell.drivers.mxc] wxc_exec_path must be set to an absolute path to wxc-exec.exe",
+            ));
+        }
+        if !Path::new(&self.wxc_exec_path).is_absolute() {
+            return Err(openshell_core::Error::config(format!(
+                "[openshell.drivers.mxc] wxc_exec_path must be an absolute path, got '{}'",
+                self.wxc_exec_path
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2558,6 +2594,50 @@ mod lifecycle_tests {
                 .expect_err("workload fields must not be accepted in gateway config");
             assert!(error.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn validate_configuration_rejects_unset_wxc_exec_path() {
+        // Regression test: the shipped default used to be the bare relative
+        // filename "wxc-exec.exe", which is exactly the PATH/CWD-hijack
+        // primitive this validation exists to reject. The default must stay
+        // rejected, not silently become a usable-but-insecure fallback.
+        let config = MxcComputeConfig::default();
+        assert!(config.wxc_exec_path.is_empty());
+        let error = config.validate_configuration().unwrap_err();
+        assert!(error.to_string().contains("wxc_exec_path"));
+    }
+
+    #[test]
+    fn validate_configuration_rejects_relative_wxc_exec_path() {
+        let config = MxcComputeConfig {
+            wxc_exec_path: "wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        let error = config.validate_configuration().unwrap_err();
+        assert!(error.to_string().contains("wxc_exec_path"));
+
+        let config = MxcComputeConfig {
+            wxc_exec_path: r"..\wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        assert!(config.validate_configuration().is_err());
+    }
+
+    #[test]
+    fn validate_configuration_accepts_absolute_wxc_exec_path() {
+        let config = MxcComputeConfig {
+            wxc_exec_path: r"C:\mxc-kit\bin\wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        config.validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn governed_egress_defaults_off_and_allocates_unique_loopback_ports() {
+        let config = MxcComputeConfig::default();
+        assert!(!config.egress_proxy);
+        assert!(config.egress_proxy_addr.is_empty());
     }
 
     #[test]

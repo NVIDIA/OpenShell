@@ -149,8 +149,8 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let _: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        Ok(())
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        config.validate_configuration()
     }
 
     async fn build(
