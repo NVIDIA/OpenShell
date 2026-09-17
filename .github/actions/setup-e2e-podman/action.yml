@@ -8,7 +8,7 @@ inputs:
   mise-version:
     description: mise release to install
     required: false
-    default: v2026.4.25
+    default: v2026.9.9
   podman-major:
     description: Expected Podman major version
     required: true

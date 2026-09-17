@@ -4901,15 +4901,16 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
     !transient_reasons.contains(&reason.as_str())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NoopTestDriver {
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<String, (Code, String)>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl NoopTestDriver {
+    #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
@@ -4917,6 +4918,7 @@ impl NoopTestDriver {
         }
     }
 
+    #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
@@ -4924,6 +4926,7 @@ impl NoopTestDriver {
         }
     }
 
+    #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
@@ -4932,7 +4935,7 @@ impl NoopTestDriver {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for NoopTestDriver {
     fn default() -> Self {
         Self {
@@ -4942,7 +4945,7 @@ impl Default for NoopTestDriver {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
     async fn authenticate_sandbox(
@@ -5101,18 +5104,18 @@ impl ComputeDriver for NoopTestDriver {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     new_test_runtime_for_driver(store, "test").await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
-    new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await
+    new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default()))
 }
 
-#[cfg(test)]
-pub async fn new_test_runtime_with_driver(
+#[cfg(any(test, feature = "test-support"))]
+pub fn new_test_runtime_with_driver(
     store: Arc<Store>,
     driver_name: &str,
     driver: Arc<NoopTestDriver>,
