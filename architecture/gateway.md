@@ -1026,13 +1026,12 @@ system entry instead of pretending to delete package-manager owned state.
   the host can bind that bridge IP.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
-  `host-gateway` resolver. Linux Podman keeps the resolver unless
-  `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
-  gateway listener. Rootless Podman explicitly reporting pasta requests the
-  private IPv4 source selected by the host default route rather than an
-  arbitrary private interface. Slirp4netns, other helpers, and missing helper
-  metadata fail closed for local callbacks until a rootless-network namespace
-  relay is available.
+  `host-gateway` resolver. Linux Podman resolves sandbox host aliases to
+  loopback directly by default, for both rootful and rootless operation: the
+  callback-capable supervisor always shares the host network namespace with
+  the gateway (RFC 0012), so loopback is reachable independent of host
+  topology and rootless network helper. An explicit `host_gateway_ip`
+  overrides either platform default with a concrete address.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

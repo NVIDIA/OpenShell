@@ -53,10 +53,15 @@ pub struct PodmanComputeConfig {
     pub network_name: String,
     /// Host gateway IP used for sandbox host aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver. macOS defaults to
-    /// gvproxy's host-loopback IP because stale Podman machines may fail to
-    /// resolve `host-gateway` while still serving `host.containers.internal`
-    /// through gvproxy.
+    /// Empty on Linux resolves the alias to loopback directly: since RFC
+    /// 0012, the callback-capable supervisor always shares the host network
+    /// namespace with the gateway, so loopback is always reachable and
+    /// independent of host topology (see #3412 for the multi-homed-host
+    /// failure this replaced). Empty on macOS uses gvproxy's host-loopback
+    /// IP because stale Podman machines may fail to resolve `host-gateway`
+    /// while still serving `host.containers.internal` through gvproxy. Set
+    /// explicitly to override either default, e.g. for a containerized or
+    /// remote gateway.
     pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,

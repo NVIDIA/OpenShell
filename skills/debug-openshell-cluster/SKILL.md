@@ -281,17 +281,21 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
-- Gateway exits before becoming healthy with a callback-listener discovery
-  error: inspect `podman info --debug`, the configured Podman network, and the
-  host's IPv4 default route. Rootless pasta uses the private source address
-  selected by that route; rootful Podman uses the bridge gateway address.
-- Current gateways reuse the primary listener when it covers Podman's callback
-  address. If the primary does not cover that address, inspect the gateway
-  startup logs for the additional callback-only listener and its provenance.
-- Rootless slirp4netns, another named helper, or missing helper metadata
-  requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
-  cannot bypass slirp4netns host-loopback isolation. Do not work around
-  discovery failures by broadening the primary gateway listener to `0.0.0.0`.
+- The supervisor exits with a policy-fetch failure and the sandbox container
+  follows into `Error` with a misleading `ContainerExited: code 0` (the
+  workload's own exit state, not the supervisor's): check the
+  `openshell-supervisor-<id>` container's own logs first, not the sandbox
+  container's. On a multi-homed host (multiple interfaces, VPN/mesh
+  adapters), this usually means the default local callback resolved to an
+  unreachable interface — see below.
+- On Linux, the automatic (no explicit `host_gateway_ip`) callback route
+  resolves to loopback directly, for both rootful and rootless Podman: since
+  RFC 0012, the supervisor always shares the host network namespace with the
+  gateway, so loopback is reachable independent of host topology or rootless
+  network helper. Do not work around a mismatch by broadening the primary
+  gateway listener to `0.0.0.0`; set `host_gateway_ip` explicitly only when
+  the gateway itself is not on the same host (containerized or remote
+  gateway).
 
 When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
@@ -760,7 +764,7 @@ credential failures.
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
-| Gateway exits while resolving compute-driver listener requirements | The callback hostname is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
+| Gateway exits while resolving compute-driver listener requirements | The callback hostname is unsupported, or the selected address is not private/authorized | Gateway startup error, driver logs |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |

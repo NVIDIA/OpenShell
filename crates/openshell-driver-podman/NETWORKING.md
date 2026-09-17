@@ -31,10 +31,13 @@ the upstream corporate proxy apply only to the supervisor. The gateway's SSH
 tunnel uses the supervisor relay over its private Unix socket, so the driver
 does not publish a supervisor port.
 
-Rootful Podman uses the configured bridge and its gateway address. Rootless
-local callbacks require the existing pasta path; slirp4netns or unknown helpers
-require an explicitly remote `grpc_endpoint`. On macOS, Podman Machine provides
-the runtime and host-loopback forwarding.
+On Linux, the supervisor's host network namespace is the same as the
+gateway's, for both rootful and rootless Podman, so the automatic callback
+route resolves the sandbox host aliases to loopback directly rather than
+Podman's `host-gateway` resolver, which can select a different, unreachable
+interface on multi-homed hosts. Set `host_gateway_ip` explicitly to override
+with a different address (for example, a containerized or remote gateway).
+On macOS, Podman Machine provides the runtime and host-loopback forwarding.
 
 These runtime-managed network helpers are outside the workload trust boundary.
 Sharing the workload's user namespace preserves volume UID/GID mapping; it

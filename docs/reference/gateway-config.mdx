@@ -766,8 +766,12 @@ grpc_endpoint           = "https://host.containers.internal:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
 network_name            = "openshell"
-# Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
-# Set "" to force Podman's host-gateway resolver.
+# Omit for the platform default. On Linux the supervisor always shares the
+# gateway's host network namespace, so the default resolves to loopback
+# regardless of host topology. On macOS Podman machine, the default is
+# gvproxy's host-loopback IP (192.168.127.254). Set explicitly only to
+# override with a different reachable address (e.g. a containerized or
+# remote gateway).
 # host_gateway_ip       = "192.168.127.254"
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
