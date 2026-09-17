@@ -67,17 +67,20 @@ jobs:
 
       - name: Ensure Docker
         run: |
+          set -euo pipefail
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y docker.io
           fi
           sudo systemctl start docker || sudo service docker start
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          printf 'OPENSHELL_COMPUTE_DRIVER=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
           docker info
 
       - name: Install and check status
         run: |
+          set -euo pipefail
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           dpkg -l openshell | grep '^ii'
           openshell --version
@@ -107,6 +110,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo snap install docker
+          for _ in $(seq 1 90); do
+            if docker info >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker info
 
       - name: Download snap from release-dev artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -198,8 +208,11 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
+          sudo systemctl set-environment \
+            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           snap list openshell
+          snap info openshell | grep -E '^tracking: +latest/edge$'
           if snap list docker >/dev/null 2>&1; then
             echo "install.sh unexpectedly installed the docker snap" >&2
             exit 1
@@ -244,9 +257,12 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
+          sudo systemctl set-environment \
+            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           snap list docker
           snap list openshell
+          snap info openshell | grep -E '^tracking: +latest/edge$'
           docker info
           snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
@@ -428,6 +444,8 @@ jobs:
       - name: Install OpenShell CLI
         run: |
           set -euo pipefail
+          sudo systemctl set-environment \
+            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           mkdir -p "${HOME}/.config/openshell"
           printf 'OPENSHELL_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/openshell/gateway.env"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
