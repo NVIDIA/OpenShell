@@ -652,7 +652,7 @@ pub async fn run_sandbox(
         captured_provider_credentials,
     ) = load_policy_with_gateway(
         sandbox_id.clone(),
-        sandbox,
+        sandbox.clone(),
         openshell_endpoint.clone(),
         policy_rules,
         policy_data,
@@ -1000,12 +1000,14 @@ pub async fn run_sandbox(
     }
 
     // Spawn background policy poll task (gRPC mode only).
-    if let (Some(id), Some(endpoint), Some(engine)) = (
+    if let (Some(id), Some(sandbox), Some(endpoint), Some(engine)) = (
         sandbox_id.as_deref(),
+        sandbox.as_deref(),
         openshell_endpoint.as_deref(),
         opa_engine.as_ref(),
     ) {
         let poll_id = id.to_string();
+        let poll_sandbox = sandbox.to_string();
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
@@ -1023,6 +1025,7 @@ pub async fn run_sandbox(
         let poll_ctx = PolicyPollLoopContext {
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
+            sandbox: poll_sandbox,
             opa_engine: poll_engine,
             loaded_policy_origin,
             entrypoint_pid: poll_pid,
@@ -2094,14 +2097,16 @@ where
 
 #[tonic::async_trait]
 trait StartupGateway: Send + Sync {
-    async fn snapshot(&self, id: &str) -> Result<openshell_core::grpc_client::SettingsPollResult>;
+    async fn snapshot(
+        &self,
+        sandbox: &str,
+    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
     async fn provider(
         &self,
         id: &str,
     ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult>;
     async fn sync(
         &self,
-        id: &str,
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
@@ -2122,8 +2127,11 @@ struct RemoteStartupGateway {
 
 #[tonic::async_trait]
 impl StartupGateway for RemoteStartupGateway {
-    async fn snapshot(&self, id: &str) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        openshell_core::grpc_client::fetch_settings_snapshot(&self.endpoint, id).await
+    async fn snapshot(
+        &self,
+        sandbox: &str,
+    ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        openshell_core::grpc_client::fetch_settings_snapshot(&self.endpoint, sandbox).await
     }
     async fn provider(
         &self,
@@ -2133,14 +2141,12 @@ impl StartupGateway for RemoteStartupGateway {
     }
     async fn sync(
         &self,
-        id: &str,
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
     ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
         openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
             &self.endpoint,
-            id,
             sandbox,
             policy,
             workspace,
@@ -2311,9 +2317,11 @@ async fn load_policy_with_gateway(
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
-    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    if let (Some(id), Some(sandbox), Some(endpoint)) = (&sandbox_id, &sandbox, &openshell_endpoint)
+    {
         info!(
             sandbox_id = %id,
+            sandbox = %sandbox,
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
@@ -2321,7 +2329,7 @@ async fn load_policy_with_gateway(
         // Capture the previous instance once. Registration retries must never
         // rebase this fence and displace a newer supervisor instance.
         let registration_snapshot =
-            grpc_retry("Startup configuration fetch", || gateway.snapshot(id)).await?;
+            grpc_retry("Startup configuration fetch", || gateway.snapshot(sandbox)).await?;
         grpc_retry("Supervisor registration", || {
             gateway.report(
                 id,
@@ -2343,7 +2351,7 @@ async fn load_policy_with_gateway(
             }
             reconciliation_attempts += 1;
             let mut snapshot =
-                grpc_retry("Startup configuration fetch", || gateway.snapshot(id)).await?;
+                grpc_retry("Startup configuration fetch", || gateway.snapshot(sandbox)).await?;
 
             if snapshot.policy.is_none() && !snapshot.configuration_error.is_empty() {
                 reject_startup_configuration(
@@ -2386,18 +2394,11 @@ async fn load_policy_with_gateway(
                 // baseline paths from the start.
                 enrich_proto_baseline_paths(&mut discovered);
                 strip_proto_provider_policy_entries(&mut discovered);
-                let sandbox = sandbox.as_deref().ok_or_else(|| {
-                    miette::miette!(
-                        "Cannot sync discovered policy: sandbox not available.\n\
-                     Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
-                    )
-                })?;
-
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
                 let ws = snapshot.workspace.clone();
                 snapshot = grpc_retry("Image policy synchronization", || {
-                    gateway.sync(id, sandbox, &discovered, &ws)
+                    gateway.sync(sandbox, &discovered, &ws)
                 })
                 .await?;
                 if let Some(policy) = snapshot.policy.clone() {
@@ -2428,20 +2429,14 @@ async fn load_policy_with_gateway(
             let enriched = enrich_proto_baseline_paths(&mut proto_policy);
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
             if let Some(sync_policy) = sync_policy {
-                if let Some(sandbox_name) = sandbox.as_deref() {
-                    let canonical = grpc_retry("Enriched policy synchronization", || {
-                        gateway.sync(id, sandbox_name, &sync_policy, &snapshot.workspace)
-                    })
-                    .await?;
-                    proto_policy = canonical.policy.clone().ok_or_else(|| {
-                        miette::miette!("Gateway returned no effective policy after enrichment")
-                    })?;
-                    snapshot = canonical;
-                } else {
-                    return Err(miette::miette!(
-                        "Cannot sync enriched policy: sandbox name is unavailable"
-                    ));
-                }
+                let canonical = grpc_retry("Enriched policy synchronization", || {
+                    gateway.sync(sandbox, &sync_policy, &snapshot.workspace)
+                })
+                .await?;
+                proto_policy = canonical.policy.clone().ok_or_else(|| {
+                    miette::miette!("Gateway returned no effective policy after enrichment")
+                })?;
+                snapshot = canonical;
             }
 
             let loaded_policy_revision = Some({
@@ -2623,7 +2618,7 @@ async fn load_policy_with_gateway(
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
          - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
-         - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)"
+         - --sandbox-id, --sandbox, and --openshell-endpoint (or OPENSHELL_SANDBOX_ID, OPENSHELL_SANDBOX, and OPENSHELL_ENDPOINT env vars)"
     ))
 }
 
@@ -3279,7 +3274,7 @@ fn initial_provider_credentials(
 trait PolicyGatewayClient: Clone + Send + Sync + 'static {
     async fn poll_settings(
         &self,
-        sandbox_id: &str,
+        sandbox: &str,
     ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
 
     async fn report_policy_status(
@@ -3325,9 +3320,9 @@ trait PolicyGatewayClient: Clone + Send + Sync + 'static {
 impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient {
     async fn poll_settings(
         &self,
-        sandbox_id: &str,
+        sandbox: &str,
     ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        self.poll_settings(sandbox_id).await
+        self.poll_settings(sandbox).await
     }
 
     async fn report_policy_status(
@@ -3508,6 +3503,8 @@ async fn report_initial_policy_failure(
 struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
+    /// Canonical sandbox reference used by name-scoped configuration APIs.
+    sandbox: String,
     opa_engine: Arc<OpaEngine>,
     /// Source of the policy currently loaded into OPA. This distinguishes an
     /// explicit local-file override from an unbound gateway revision so the
@@ -4019,7 +4016,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
-    match client.poll_settings(&ctx.sandbox_id).await {
+    match client.poll_settings(&ctx.sandbox).await {
         Ok(result) => {
             let _ = ctx.workspace_tx.send(client.workspace());
             match (
@@ -4106,7 +4103,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             result
         } else {
             tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
-            match client.poll_settings(&ctx.sandbox_id).await {
+            match client.poll_settings(&ctx.sandbox).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
                     result
@@ -5273,7 +5270,6 @@ network_policies:
         }
         async fn sync(
             &self,
-            _id: &str,
             _sandbox: &str,
             _policy: &openshell_core::proto::SandboxPolicy,
             _workspace: &str,
@@ -5666,14 +5662,16 @@ network_policies:
         >,
         reports: UnboundedSender<(u32, bool, String)>,
         environment_identity: Arc<std::sync::Mutex<EnvironmentIdentity>>,
+        polled_sandboxes: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
     #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedPolicyGateway {
         async fn poll_settings(
             &self,
-            _sandbox_id: &str,
+            sandbox: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.polled_sandboxes.lock().await.push(sandbox.to_string());
             let result = self
                 .polls
                 .lock()
@@ -5728,9 +5726,9 @@ network_policies:
     impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
         async fn poll_settings(
             &self,
-            sandbox_id: &str,
+            sandbox: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            self.inner.poll_settings(sandbox_id).await
+            self.inner.poll_settings(sandbox).await
         }
 
         async fn fetch_provider_environment(
@@ -5785,6 +5783,7 @@ network_policies:
                 environment_identity: Arc::new(std::sync::Mutex::new(
                     EnvironmentIdentity::default(),
                 )),
+                polled_sandboxes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             },
             poll_tx,
             report_rx,
@@ -5880,9 +5879,9 @@ network_policies:
     impl PolicyGatewayClient for ScriptedProviderGateway {
         async fn poll_settings(
             &self,
-            sandbox_id: &str,
+            sandbox: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            self.policy.poll_settings(sandbox_id).await
+            self.policy.poll_settings(sandbox).await
         }
 
         async fn report_policy_status(
@@ -6025,9 +6024,9 @@ network_policies:
     impl PolicyGatewayClient for GenerationChangingPolicyGateway {
         async fn poll_settings(
             &self,
-            sandbox_id: &str,
+            sandbox: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            let result = self.inner.poll_settings(sandbox_id).await?;
+            let result = self.inner.poll_settings(sandbox).await?;
             if self.first_poll.swap(false, Ordering::SeqCst) {
                 self.engine
                     .enter_fail_closed("generation replaced while first poll was pending")?;
@@ -6391,6 +6390,7 @@ network_policies:
         PolicyPollLoopContext {
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
+            sandbox: "sandbox-test-name".to_string(),
             opa_engine,
             loaded_policy_origin,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
@@ -6459,10 +6459,16 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, polls, mut reports) = scripted_policy_gateway();
+        let observed_client = client.clone();
         polls.send(v1).unwrap();
 
         let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
         expect_policy_report(&mut reports, 1).await;
+        assert_eq!(
+            observed_client.polled_sandboxes.lock().await.as_slice(),
+            &["sandbox-test-name"],
+            "settings polling must use the canonical sandbox reference, not its ID"
+        );
 
         polls.send(v2.clone()).unwrap();
         expect_policy_report(&mut reports, 2).await;

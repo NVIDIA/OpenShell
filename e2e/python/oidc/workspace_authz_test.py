@@ -1070,12 +1070,9 @@ class TestWorkspaceAuthorization:
                     ),
                     metadata=user_md,
                 )
-            _assert_workspace_admin_denial(
-                exc_info.value,
-                WS,
-                user_sub,
-                "ApproveDraftChunk",
-            )
+            # Name-scoped sandbox operations hide whether an unknown sandbox
+            # exists before evaluating workspace-admin authorization.
+            _assert_hidden_sandbox(exc_info.value, "ApproveDraftChunk")
         finally:
             _remove_member(admin_stub, admin_md, WS, user_sub)
 
