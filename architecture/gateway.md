@@ -682,17 +682,15 @@ modes:
 and `page_token` fields, and responses carry `next_page_token`. The gateway
 clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
-authorization grant, and use immutable keyset cursors for object-backed lists.
-Collections whose canonical order belongs to a parent resource use an opaque
-position cursor within that order, not a database offset. Each page repeats
-normal authentication and authorization. Pagination is weakly consistent under
+authorization grant, and use immutable keyset cursors. Each page repeats normal
+authentication and authorization. Pagination is weakly consistent under
 concurrent writes and deletes; it does not provide a historical snapshot.
 
 Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
 `ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
 by `(created_at_ms, name, workspace, id)`. `ListProviderProfiles` sorts
 ascending by `(id, scope)`, and `ListSandboxPolicies` sorts by descending policy
-version. Provider attachments preserve their sandbox's attachment order.
+version. Provider attachments sort ascending by provider name.
 
 The token wire format is a private shared protobuf used only by the gateway.
 Public request and response messages repeat the standard AIP fields directly

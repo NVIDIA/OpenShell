@@ -18,7 +18,7 @@ message PageToken {
     ObjectCursor object = 4;
     PolicyCursor policy = 5;
     ProfileCursor profile = 6;
-    OffsetCursor offset = 7;
+    ProviderCursor provider = 7;
   }
 }
 
@@ -40,7 +40,7 @@ message ProfileCursor {
   string key = 1;
 }
 
-// Cursor for a bounded collection whose order is defined by its parent.
-message OffsetCursor {
-  uint32 offset = 1;
+// Cursor for providers attached to one sandbox, ordered by provider name.
+message ProviderCursor {
+  string name = 1;
 }

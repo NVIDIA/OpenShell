@@ -1133,17 +1133,35 @@ pub(super) async fn handle_list_sandbox_providers(
         "ListSandboxProviders",
         &[&workspace, &req.sandbox],
     )?;
-    let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
-    let start = usize::try_from(pagination.offset_cursor()?.unwrap_or_default())
-        .unwrap_or(usize::MAX)
-        .min(providers.len());
+    let mut providers = providers_for_sandbox(state, &sandbox, &workspace)
+        .await?
+        .into_iter()
+        .map(|provider| {
+            let name = provider
+                .metadata
+                .as_ref()
+                .filter(|metadata| !metadata.name.is_empty())
+                .map(|metadata| metadata.name.clone())
+                .ok_or_else(|| Status::internal("provider metadata name is missing"))?;
+            Ok((name, provider))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    providers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let start = pagination.provider_cursor()?.map_or(0, |cursor| {
+        providers.partition_point(|(name, _)| name.as_str() <= cursor)
+    });
     let end = start
-        .saturating_add(usize::try_from(pagination.page_size()).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(pagination.page_size()).expect("u32 fits in usize"))
         .min(providers.len());
     let next_page_token = pagination
-        .next_offset_token((end < providers.len()).then(|| u32::try_from(end).unwrap_or(u32::MAX)));
+        .next_provider_token((end < providers.len()).then(|| providers[end - 1].0.as_str()));
     Ok(Response::new(ListSandboxProvidersResponse {
-        providers: providers[start..end].to_vec(),
+        providers: providers
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, provider)| provider)
+            .collect(),
         next_page_token,
     }))
 }
@@ -4270,6 +4288,20 @@ mod tests {
             Some(&"REDACTED".to_string())
         );
         assert!(!first_page.next_page_token.is_empty());
+
+        let mut sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "work")
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        sandbox
+            .spec
+            .as_mut()
+            .expect("sandbox has a spec")
+            .providers
+            .retain(|name| name != "work-github");
+        state.store.put_message(&sandbox).await.unwrap();
 
         let err = handle_list_sandbox_providers(
             &state,
