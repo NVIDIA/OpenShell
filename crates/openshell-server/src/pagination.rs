@@ -5,7 +5,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use openshell_core::proto::pagination::v1::{
-    ObjectCursor as ProtoObjectCursor, OffsetCursor, PageToken, PolicyCursor, ProfileCursor,
+    ObjectCursor as ProtoObjectCursor, PageToken, PolicyCursor, ProfileCursor, ProviderCursor,
     page_token::Cursor,
 };
 use prost::Message;
@@ -111,10 +111,10 @@ impl Pagination {
         }
     }
 
-    pub fn offset_cursor(&self) -> Result<Option<u32>, Status> {
+    pub fn provider_cursor(&self) -> Result<Option<&str>, Status> {
         match &self.cursor {
             None => Ok(None),
-            Some(Cursor::Offset(cursor)) => Ok(Some(cursor.offset)),
+            Some(Cursor::Provider(cursor)) => Ok(Some(&cursor.name)),
             Some(_) => Err(Status::invalid_argument(
                 "page_token has the wrong cursor type",
             )),
@@ -146,9 +146,11 @@ impl Pagination {
         })
     }
 
-    pub fn next_offset_token(&self, offset: Option<u32>) -> String {
-        offset.map_or_else(String::new, |offset| {
-            self.encode(Cursor::Offset(OffsetCursor { offset }))
+    pub fn next_provider_token(&self, name: Option<&str>) -> String {
+        name.map_or_else(String::new, |name| {
+            self.encode(Cursor::Provider(ProviderCursor {
+                name: name.to_string(),
+            }))
         })
     }
 
@@ -235,16 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn offset_token_round_trips() {
+    fn provider_token_round_trips() {
         let first =
             Pagination::new(1, "", "ListSandboxProviders", &["default", "sandbox"]).unwrap();
-        let token = first.next_offset_token(Some(1));
+        let token = first.next_provider_token(Some("provider-a"));
         assert_eq!(
             Pagination::new(1, &token, "ListSandboxProviders", &["default", "sandbox"])
                 .unwrap()
-                .offset_cursor()
+                .provider_cursor()
                 .unwrap(),
-            Some(1)
+            Some("provider-a")
         );
     }
 
