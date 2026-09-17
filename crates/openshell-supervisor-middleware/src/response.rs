@@ -1247,7 +1247,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: tonic::Request<()>,
+            _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(response_manifest(
                 "test/remote-response",
@@ -1377,6 +1377,12 @@ mod tests {
                     }),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-response-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -1717,6 +1723,12 @@ mod tests {
                 request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                name,
+                "test",
+                [],
+            )),
         }
     }
 
