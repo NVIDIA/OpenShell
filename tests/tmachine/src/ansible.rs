@@ -28,11 +28,18 @@ pub async fn install_roles() {
 pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
     let mut command = Command::new("ansible-playbook");
     for (name, path) in inputs {
-        let path = std::fs::canonicalize(path)
-            .with_context(|| format!("failed to resolve input {name:?} from {}", path.display()))?;
+        let value = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve input {name:?} from {}", path.display())
+                });
+            }
+        };
         command
             .arg("--extra-vars")
-            .arg(format!("{name}={}", path.display()));
+            .arg(format!("{name}={}", value.display()));
     }
 
     let status = command.arg(playbook).status().await.unwrap();
