@@ -201,6 +201,11 @@ macro_rules! request_id_middleware {
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
 
+/// Concurrent HTTP/2 streams allowed per connection. Sits above the
+/// per-replica pending relay budget so pooled peer connections are bounded by
+/// the relay caps rather than by the transport.
+const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 1024;
+
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
 pub struct MultiplexService {
@@ -309,10 +314,15 @@ impl MultiplexService {
         // it the gateway never PINGs them, so idle/half-dead connections linger and orphan
         // in-flight relay execs. The timer is required — hyper panics on the keepalive
         // interval without one.
+        //
+        // Peer relays from one replica now share a single pooled connection, so every
+        // forwarded session for every sandbox counts against this one limit. hyper's
+        // default of 200 would cap the whole replica pair below MAX_PENDING_RELAYS.
         builder
             .http2()
             .timer(TokioTimer::new())
             .adaptive_window(true)
+            .max_concurrent_streams(MAX_HTTP2_CONCURRENT_STREAMS)
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10));
 
@@ -747,6 +757,11 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 fields.insert("trust_domain".to_string(), trust_domain.clone());
             }
         }
+        Principal::Peer(peer) => {
+            fields.insert("kind".to_string(), "peer".to_string());
+            fields.insert("replica_id".to_string(), peer.replica_id.clone());
+            fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -917,12 +932,15 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
+/// 1. `PeerServiceAccountAuthenticator` (path-scoped to `PeerRelay`)
+///    — validates gateway replica projected `ServiceAccount` tokens with
+///    `TokenReview` for internal peer relay calls. No-op on every other path.
+/// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
-/// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
+/// 3. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 3. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -937,6 +955,9 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
+    if let Some(peer) = state.peer_authenticator.clone() {
+        authenticators.push(peer);
+    }
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
     }
@@ -1109,6 +1130,13 @@ where
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
+                        )));
+                    }
+                }
+                Principal::Peer(_) => {
+                    if !crate::auth::method_authz::is_peer_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "gateway peer principals may not call this method",
                         )));
                     }
                 }

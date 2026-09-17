@@ -15,6 +15,7 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
@@ -631,6 +632,13 @@ pub struct ComputeRuntime {
     rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
 }
 
+pub struct SandboxSyncGuard {
+    // Drop the database guard before the local mutex so another local waiter
+    // cannot race ahead while this replica still owns the cluster-wide lock.
+    _distributed: crate::persistence::DistributedMutationGuard,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl fmt::Debug for ComputeRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ComputeRuntime").finish_non_exhaustive()
@@ -762,13 +770,19 @@ impl ComputeRuntime {
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
-    /// within this gateway process.
+    /// across gateway replicas.
     ///
-    /// This is a temporary single-gateway guard for cross-object invariants.
-    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
-    /// tracked by #1255 before enabling multiple gateway writers.
-    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.sync_lock.clone().lock_owned().await
+    /// The local mutex preserves lock ordering within one process. `PostgreSQL`
+    /// deployments also hold a session-level advisory lock for the duration.
+    pub(crate) async fn sandbox_sync_guard(
+        &self,
+    ) -> crate::persistence::PersistenceResult<SandboxSyncGuard> {
+        let local = self.sync_lock.clone().lock_owned().await;
+        let distributed = self.store.acquire_distributed_mutation_guard().await?;
+        Ok(SandboxSyncGuard {
+            _distributed: distributed,
+            _local: local,
+        })
     }
 
     /// Acquires the process-wide lock for code that already holds the
@@ -1481,7 +1495,13 @@ impl ComputeRuntime {
     ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
-        let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        let session_connected = self
+            .supervisor_session_ready(&sandbox_id)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(sandbox_id, %error, "Failed to resolve supervisor owner during lifecycle reconciliation");
+                self.supervisor_sessions.has_session(&sandbox_id)
+            });
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
@@ -1961,7 +1981,13 @@ impl ComputeRuntime {
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
-                let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                let session_connected = self
+                    .supervisor_session_ready(sandbox_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(sandbox_id, %error, "Failed to resolve supervisor owner during delete recovery");
+                        self.supervisor_sessions.has_session(sandbox_id)
+                    });
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
                     deleting_resource_version,
@@ -3136,7 +3162,7 @@ impl ComputeRuntime {
         expected_resource_version: u64,
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let session_connected = self.supervisor_session_ready(&incoming.id).await?;
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
@@ -3187,8 +3213,77 @@ impl ComputeRuntime {
         sandbox_id: &str,
         terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false, None, terminal_delivery_finalized)
+        let _guard = self.sync_lock.lock().await;
+
+        // A replacement session may already belong to another gateway. Do not
+        // let cleanup from this replica overwrite the replacement's Ready state.
+        if self.supervisor_session_ready(sandbox_id).await? {
+            return Ok(());
+        }
+
+        let existing = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
             .await
+            .map_err(|error| error.to_string())?;
+        self.set_supervisor_session_state_from_snapshot(
+            sandbox_id,
+            false,
+            None,
+            terminal_delivery_finalized,
+            existing,
+        )
+        .await?;
+
+        // Ownership can move while the CAS above is in flight. Restore Ready
+        // from the new owner's supervisor instance before releasing the local
+        // synchronization boundary.
+        if let Some(instance_id) = self
+            .supervisor_session_owner_instance_id(sandbox_id)
+            .await?
+        {
+            let existing = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.set_supervisor_session_state_from_snapshot(
+                sandbox_id,
+                true,
+                Some(&instance_id),
+                false,
+                existing,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
+        if self.supervisor_sessions.has_session(sandbox_id) {
+            return Ok(true);
+        }
+        Ok(self
+            .supervisor_session_owner_instance_id(sandbox_id)
+            .await?
+            .is_some())
+    }
+
+    async fn supervisor_session_owner_instance_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<String>, String> {
+        let owner_index = SupervisorOwnerIndex::new(self.store.clone(), OWNER_TTL);
+        let Some(owner) = owner_index
+            .read(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
+        let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
+        Ok((age_ms < ttl_ms).then_some(owner.supervisor_instance_id))
     }
 
     async fn set_supervisor_session_state(
@@ -10184,6 +10279,42 @@ mod tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
         assert_eq!(ready.message, "Supervisor session disconnected");
+    }
+
+    #[tokio::test]
+    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-1",
+                "replacement-session",
+                "supervisor-instance",
+                2,
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1", false)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 
     // --- Composition rule tests ---

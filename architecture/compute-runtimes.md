@@ -97,15 +97,14 @@ shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
 composition rule treats a connected session as the stronger signal and keeps `Ready`
 in that case, preventing a lagging snapshot from undoing the session-driven promotion.
 
-**Known HA limitation:** Supervisor sessions are process-local while the public
-sandbox phase is shared. A replica that reconciles a driver snapshot without owning
-the active supervisor session can demote the shared phase to `Provisioning`. The
-session-owning replica may not receive another connection event to restore `Ready`,
-so a usable sandbox can remain unavailable through the public phase gate. Reliable
-HA readiness requires persisted or leased supervisor presence plus routing to the
-session-owning replica. That work is deferred to GitHub issue #1868. Until then,
-deployments that require reliable readiness composition must run a single gateway
-replica.
+**HA session composition:** Live relay handles remain process-local, while the
+session-owning gateway publishes a short-lived owner record in shared PostgreSQL.
+Driver reconciliation treats a fresh local or remote owner as connected, so a
+non-owner replica cannot demote the shared sandbox phase merely because it lacks the
+in-memory stream. Session-bound requests are forwarded to the owning gateway; a
+supervisor reconnect publishes a higher connection epoch before stale-session cleanup
+can demote readiness. Multi-replica deployments therefore require shared PostgreSQL
+and the gateway peer Service configured by the Helm chart.
 
 **Extension point:** Driver-reported readiness is a capability, not an
 operator-configurable hook. A driver may enable it only when it owns workload

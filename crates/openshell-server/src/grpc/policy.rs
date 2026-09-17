@@ -2478,6 +2478,9 @@ async fn resolve_sandbox_by_name_for_principal(
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals may not resolve sandbox configuration",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
         )),
@@ -3493,7 +3496,10 @@ async fn handle_update_config_inner(
             // Global policy determines the report's effective configuration.
             // Serialize its writes after validation so a report cannot commit
             // evidence derived from the policy this update has replaced.
-            let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+            let _sandbox_sync_guard =
+                state.compute.sandbox_sync_guard().await.map_err(|error| {
+                    super::persistence_error_to_status(error, "acquire policy mutation lock")
+                })?;
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -3594,7 +3600,9 @@ async fn handle_update_config_inner(
         // Deleting global policy changes the report's effective configuration.
         // Keep settings -> sandbox lock order for all global policy mutations.
         let _sandbox_sync_guard = if key == POLICY_SETTING_KEY && req.delete_setting {
-            Some(state.compute.sandbox_sync_guard().await)
+            Some(state.compute.sandbox_sync_guard().await.map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?)
         } else {
             None
         };
@@ -3926,7 +3934,9 @@ async fn handle_update_config_inner(
     }
 
     let _sandbox_sync_guard = if backfill_policy.is_some() {
-        Some(state.compute.sandbox_sync_guard().await)
+        Some(state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?)
     } else {
         None
     };
@@ -4299,7 +4309,9 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)

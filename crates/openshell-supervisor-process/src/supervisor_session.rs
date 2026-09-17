@@ -342,7 +342,7 @@ async fn run_session_loop(config: SessionConfig) {
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config).await;
+        let result = run_single_session(&config, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
@@ -375,6 +375,7 @@ async fn run_session_loop(config: SessionConfig) {
 
 async fn run_single_session(
     config: &SessionConfig,
+    connection_epoch: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -394,6 +395,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
+            connection_epoch,
         })),
     })
     .await

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openshell.fullname" . }}-peer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+rules:
+  # Gateway peer identity: TokenReview authenticates the projected token, then
+  # the receiver resolves the returned pod name and UID to the live gateway pod
+  # in the release namespace.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openshell.fullname" . }}-peer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openshell.fullname" . }}-peer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

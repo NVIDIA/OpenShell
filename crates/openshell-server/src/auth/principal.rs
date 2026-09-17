@@ -28,6 +28,8 @@ pub enum Principal {
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
+    /// Gateway replica authenticated for internal peer RPCs.
+    Peer(PeerPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -55,6 +57,15 @@ pub struct SandboxPrincipal {
     /// Optional namespace component parsed from sandbox identity credentials.
     /// Gateway-minted sandbox JWTs currently use an identity-shaped subject.
     pub trust_domain: Option<String>,
+}
+
+/// Gateway peer caller.
+#[derive(Debug, Clone)]
+pub struct PeerPrincipal {
+    /// Peer replica id supplied by the authenticated caller.
+    pub replica_id: String,
+    /// UID of the authenticated Kubernetes pod.
+    pub pod_uid: String,
 }
 
 /// How a [`SandboxPrincipal`] was authenticated.

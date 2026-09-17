@@ -79,7 +79,9 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
     // Session validation, configuration derivation, and persistence share the
     // sandbox mutation boundary. A newly registered supervisor can therefore
     // invalidate its predecessor before any stale report reaches the CAS.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
@@ -328,7 +330,9 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     sandbox_id: &str,
     supervisor_session_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if !state
         .supervisor_sessions
         .is_current_session(sandbox_id, supervisor_session_id)
@@ -373,7 +377,9 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if state
         .supervisor_sessions
         .current_session_id(sandbox_id)
