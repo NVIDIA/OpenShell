@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Protobuf lint and breaking-change checks, driven by the repo-level buf.yaml.
+
+["proto:lint"]
+description = "Lint proto/ against the configured buf ruleset"
+run = "buf lint"
+hide = true
+
+["proto:breaking"]
+description = "Check proto/ for wire-breaking changes against upstream main"
+run = "buf breaking --against 'https://github.com/NVIDIA/OpenShell.git#branch=main'"
+hide = true
