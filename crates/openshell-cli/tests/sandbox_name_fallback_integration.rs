@@ -133,12 +133,12 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "test-id".to_string(),
                     name,
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
                     annotations: std::collections::HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 ..Default::default()
             }),
@@ -179,7 +179,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -408,7 +411,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Ok(Response::new(DeleteProviderResponse { deleted: true }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     type WatchSandboxStream =
@@ -489,8 +494,8 @@ impl OpenShell for TestOpenShell {
                 version: 7,
                 policy_hash: "sha256:test-policy".to_string(),
                 status: PolicyStatus::Loaded.into(),
-                created_at_ms: 1_700_000_000_000,
-                loaded_at_ms: 1_700_000_000_500,
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                loaded_time: openshell_core::time::timestamp_from_millis(1_700_000_000_500).ok(),
                 policy: Some(policy),
                 ..Default::default()
             }),

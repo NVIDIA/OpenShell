@@ -161,7 +161,10 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteSandboxResponse>, Status> {
         Ok(Response::new(
-            openshell_core::proto::DeleteSandboxResponse { deleted: true },
+            openshell_core::proto::DeleteSandboxResponse {
+                sandbox_id: String::new(),
+                outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+            },
         ))
     }
 

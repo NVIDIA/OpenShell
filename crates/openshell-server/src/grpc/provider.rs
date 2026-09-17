@@ -16,7 +16,10 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
-use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
+use crate::storage_proto::{
+    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+    StoredProviderProfile,
+};
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
@@ -64,7 +67,7 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
     pub environment: HashMap<String, String>,
-    pub credential_expires_at_ms: HashMap<String, i64>,
+    pub credential_expiration_times: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
@@ -138,12 +141,12 @@ async fn create_provider_record_validating(
         provider.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: generate_name(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         });
     }
 
@@ -313,7 +316,7 @@ pub(super) async fn update_provider_record_with_catalog(
     workspace: &str,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    update_provider_record_validating(store, workspace, catalog, provider, None).await
+    update_provider_record_validating(store, workspace, catalog, provider, &[], None).await
 }
 
 async fn reject_refresh_owned_credential_updates(
@@ -361,6 +364,7 @@ async fn update_provider_record_validating(
     workspace: &str,
     catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
+    clear_credential_expiration_keys: &[String],
     credentials: Option<&crate::credentials::CredentialRuntime>,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
@@ -426,9 +430,17 @@ async fn update_provider_record_validating(
         .collect::<HashMap<_, _>>();
     candidate.credentials = merge_map(candidate.credentials, provider.credentials);
     candidate.config = merge_map(candidate.config, provider.config);
-    candidate.credential_expires_at_ms = merge_i64_map(
-        candidate.credential_expires_at_ms,
-        provider.credential_expires_at_ms,
+    for key in clear_credential_expiration_keys {
+        if provider.credential_expiration_times.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "credential expiration for '{key}' cannot be both set and cleared"
+            )));
+        }
+        candidate.credential_expiration_times.remove(key);
+    }
+    candidate.credential_expiration_times = merge_timestamp_map(
+        candidate.credential_expiration_times,
+        provider.credential_expiration_times,
     );
 
     // Validate BEFORE writing to prevent persisting invalid state.
@@ -596,9 +608,12 @@ pub(super) async fn delete_provider_record_with_credentials(
         .await?;
 
     store
-        .delete_by_name(Provider::object_type(), workspace, name)
+        .delete(Provider::object_type(), provider.object_id())
         .await
-        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))?;
+    // This call observed the original target. A concurrent removal is also
+    // completion, and must not remove a replacement with the same name.
+    Ok(true)
 }
 
 /// Iterate over every `Sandbox` in the store and collect items produced by
@@ -735,19 +750,15 @@ fn merge_map(
     existing
 }
 
-fn merge_i64_map(
-    mut existing: HashMap<String, i64>,
-    incoming: HashMap<String, i64>,
-) -> HashMap<String, i64> {
+fn merge_timestamp_map(
+    mut existing: HashMap<String, prost_types::Timestamp>,
+    incoming: HashMap<String, prost_types::Timestamp>,
+) -> HashMap<String, prost_types::Timestamp> {
     if incoming.is_empty() {
         return existing;
     }
     for (key, value) in incoming {
-        if value <= 0 {
-            existing.remove(&key);
-        } else {
-            existing.insert(key, value);
-        }
+        existing.insert(key, value);
     }
     existing
 }
@@ -1224,20 +1235,21 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                     continue;
                 }
                 let expires_at_ms = provider
-                    .credential_expires_at_ms
+                    .credential_expiration_times
                     .get(key)
-                    .copied()
-                    .unwrap_or_default();
-                if expires_at_ms > 0 && expires_at_ms <= now_ms {
-                    warn!(
-                        provider_name = %name,
-                        key = %key,
-                        expires_at_ms,
-                        "skipping expired provider credential"
-                    );
-                    continue;
-                }
-                if expires_at_ms > 0 {
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if let Some(expires_at_ms) = expires_at_ms {
+                    if expires_at_ms <= now_ms {
+                        warn!(
+                            provider_name = %name,
+                            key = %key,
+                            expires_at_ms,
+                            "skipping expired provider credential"
+                        );
+                        continue;
+                    }
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
                 provider_env.insert(key.clone(), value.clone());
@@ -1302,12 +1314,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                     );
                     continue;
                 }
-                if let Some(expires_at_ms) = resolved_refs
-                    .expires_at_ms
-                    .get(&key)
-                    .copied()
-                    .filter(|expires_at_ms| *expires_at_ms > 0)
-                {
+                if let Some(expires_at_ms) = resolved_refs.expires_at_ms.get(&key).copied() {
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
                 provider_env.insert(key.clone(), value);
@@ -1350,7 +1357,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
 
     Ok(ProviderEnvironment {
         environment: env,
-        credential_expires_at_ms: expires,
+        credential_expiration_times: expires,
         dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
         static_credential_bindings,
         static_credential_keys,
@@ -1365,7 +1372,7 @@ fn refresh_authorization_epochs_by_key(
         if state
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
         {
             continue;
         }
@@ -1795,7 +1802,7 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes_w
         .credentials
         .entry(credential_key.to_string())
         .or_insert_with(|| "pending".to_string());
-    candidate.credential_expires_at_ms.remove(credential_key);
+    candidate.credential_expiration_times.remove(credential_key);
     validate_provider_update_against_attached_sandboxes_with_catalog(
         store, catalog, workspace, &candidate,
     )
@@ -2257,9 +2264,10 @@ fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<St
 
 fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) -> bool {
     provider
-        .credential_expires_at_ms
+        .credential_expiration_times
         .get(key)
-        .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
+        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+        .is_none_or(|expiration_ms| expiration_ms > now_ms)
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
@@ -2957,9 +2965,11 @@ pub(super) async fn handle_delete_provider_profile(
         .get_message_by_name::<StoredProviderProfile>(&workspace, &id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
-    if existing.is_none() {
-        return Err(Status::not_found("provider profile not found"));
-    }
+    let Some(existing) = existing else {
+        return Ok(Response::new(DeleteProviderProfileResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "provider profile")?,
+        }));
+    };
 
     let blocking_providers = providers_using_profile(state.store.as_ref(), &workspace, &id).await?;
     if !blocking_providers.is_empty() {
@@ -2969,13 +2979,15 @@ pub(super) async fn handle_delete_provider_profile(
         )));
     }
 
-    let deleted = state
+    state
         .store
-        .delete_by_name(StoredProviderProfile::object_type(), &workspace, &id)
+        .delete(StoredProviderProfile::object_type(), existing.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
-    Ok(Response::new(DeleteProviderProfileResponse { deleted }))
+    Ok(Response::new(DeleteProviderProfileResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 pub(super) fn get_provider_type_profile_for_scope(
@@ -3671,12 +3683,12 @@ fn stored_provider_profile_for_workspace(
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile.id.clone(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         profile: Some(profile),
     }
@@ -3734,8 +3746,8 @@ pub(super) async fn handle_update_provider(
     };
     let provider_type = provider.r#type.clone();
     provider
-        .credential_expires_at_ms
-        .extend(req.credential_expires_at_ms);
+        .credential_expiration_times
+        .extend(req.credential_expiration_times);
     if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
         state.compute.ensure_workspace(&workspace).await?;
     }
@@ -3748,6 +3760,7 @@ pub(super) async fn handle_update_provider(
         &workspace,
         &catalog,
         provider,
+        &req.clear_credential_expiration_keys,
         Some(&state.credentials),
     )
     .await;
@@ -3897,7 +3910,10 @@ pub(super) async fn handle_exchange_provider_subject_token(
     if let Some(cached) = INTERMEDIATE_TOKEN_CACHE.get(&intermediate_cache_key) {
         return Ok(Response::new(ExchangeProviderSubjectTokenResponse {
             access_token: cached.access_token,
-            expires_in: cached.expires_in,
+            expires_after: openshell_core::time::duration_from_std(std::time::Duration::from_secs(
+                u64::try_from(cached.expires_in).unwrap_or_default(),
+            ))
+            .ok(),
             token_type: cached.token_type,
         }));
     }
@@ -3932,8 +3948,14 @@ pub(super) async fn handle_exchange_provider_subject_token(
     })?;
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
-        token_grant.cache_ttl_seconds,
-        provider_credential_expires_at_ms(&provider, &subject_token.credential),
+        token_grant
+            .cache_ttl
+            .as_ref()
+            .map(openshell_core::time::duration_to_std)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?,
+        provider_credential_expiration_ms(&provider, &subject_token.credential)?
+            .unwrap_or_default(),
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -3942,7 +3964,10 @@ pub(super) async fn handle_exchange_provider_subject_token(
 
     Ok(Response::new(ExchangeProviderSubjectTokenResponse {
         access_token: token_response.access_token,
-        expires_in: token_response.expires_in,
+        expires_after: openshell_core::time::duration_from_std(std::time::Duration::from_secs(
+            u64::try_from(token_response.expires_in).unwrap_or_default(),
+        ))
+        .ok(),
         token_type: token_response.token_type,
     }))
 }
@@ -3983,8 +4008,8 @@ fn ensure_subject_token_credential_not_expired(
     provider: &Provider,
     credential_key: &str,
 ) -> Result<(), Status> {
-    let expires_at_ms = provider_credential_expires_at_ms(provider, credential_key);
-    if expires_at_ms > 0 && expires_at_ms <= crate::persistence::current_time_ms() {
+    let expires_at_ms = provider_credential_expiration_ms(provider, credential_key)?;
+    if expires_at_ms.is_some_and(|value| value <= crate::persistence::current_time_ms()) {
         return Err(Status::failed_precondition(
             "subject token credential has expired",
         ));
@@ -3992,12 +4017,16 @@ fn ensure_subject_token_credential_not_expired(
     Ok(())
 }
 
-fn provider_credential_expires_at_ms(provider: &Provider, credential_key: &str) -> i64 {
+fn provider_credential_expiration_ms(
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<Option<i64>, Status> {
     provider
-        .credential_expires_at_ms
+        .credential_expiration_times
         .get(credential_key)
-        .copied()
-        .unwrap_or_default()
+        .map(openshell_core::time::timestamp_to_millis)
+        .transpose()
+        .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 struct IntermediateTokenCacheKeyInput<'a> {
@@ -4044,25 +4073,31 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
 
 fn intermediate_token_cache_expires_at_ms(
     token: &oauth::OAuthTokenResponse,
-    cache_ttl_seconds: i64,
+    cache_ttl: Option<std::time::Duration>,
     subject_token_expires_at_ms: i64,
     supervisor_svid_exp_seconds: i64,
 ) -> i64 {
     let now_ms = crate::persistence::current_time_ms();
-    let mut ttl_seconds = if token.expires_in > 0 {
+    let default_ttl_seconds = if token.expires_in > 0 {
         token
             .expires_in
             .min(MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS)
     } else {
         DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS
     };
-    if cache_ttl_seconds > 0 {
-        ttl_seconds = ttl_seconds.min(cache_ttl_seconds);
+    let default_ttl =
+        std::time::Duration::from_secs(u64::try_from(default_ttl_seconds).unwrap_or(u64::MAX));
+    let ttl = cache_ttl.map_or(default_ttl, |override_ttl| override_ttl.min(default_ttl));
+    if ttl.is_zero() {
+        return now_ms;
     }
-    ttl_seconds = ttl_seconds
-        .saturating_sub(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS)
-        .max(1);
-    let mut expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+    let ttl = ttl
+        .saturating_sub(std::time::Duration::from_secs(
+            u64::try_from(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS).unwrap_or(u64::MAX),
+        ))
+        .max(std::time::Duration::from_millis(1));
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+    let mut expires_at_ms = now_ms.saturating_add(ttl_ms);
     expires_at_ms = cap_cache_expiry_ms(expires_at_ms, jwt_exp_ms(&token.access_token));
     expires_at_ms = cap_cache_expiry_ms(expires_at_ms, Some(subject_token_expires_at_ms));
     expires_at_ms = cap_cache_expiry_ms(
@@ -4415,14 +4450,12 @@ pub(super) async fn handle_configure_provider_refresh(
             "aws_session_token requires aws_access_key_id and aws_secret_access_key",
         ));
     }
-    if request
-        .expires_at_ms
-        .is_some_and(|expires_at_ms| expires_at_ms < 0)
-    {
-        return Err(Status::invalid_argument(
-            "expires_at_ms must be greater than or equal to 0",
-        ));
-    }
+    let requested_expiration_ms = request
+        .expiration_time
+        .as_ref()
+        .map(openshell_core::time::timestamp_to_millis)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
     // Serialize the reserve-then-persist sequence against other configurations
     // and sandbox mutations. The collision validation below and the refresh-state
@@ -4514,31 +4547,37 @@ pub(super) async fn handle_configure_provider_refresh(
         material_scopes
     };
     let refresh_before_seconds =
-        crate::provider_refresh::parse_material_i64(&request.material, "refresh_before_seconds")?
-            .or_else(|| {
-                refresh_defaults
-                    .as_ref()
-                    .map(|refresh| refresh.refresh_before_seconds)
-            })
-            .unwrap_or_default();
+        crate::provider_refresh::parse_material_i64(&request.material, "refresh_before_seconds")?;
     let max_lifetime_seconds =
-        crate::provider_refresh::parse_material_i64(&request.material, "max_lifetime_seconds")?
-            .or_else(|| {
-                refresh_defaults
-                    .as_ref()
-                    .map(|refresh| refresh.max_lifetime_seconds)
-            })
-            .unwrap_or_default();
-    if refresh_before_seconds < 0 {
+        crate::provider_refresh::parse_material_i64(&request.material, "max_lifetime_seconds")?;
+    if refresh_before_seconds.is_some_and(|value| value < 0) {
         return Err(Status::invalid_argument(
             "refresh_before_seconds material must be greater than or equal to 0",
         ));
     }
-    if max_lifetime_seconds < 0 {
+    if max_lifetime_seconds.is_some_and(|value| value < 0) {
         return Err(Status::invalid_argument(
             "max_lifetime_seconds material must be greater than or equal to 0",
         ));
     }
+    let refresh_before = match refresh_before_seconds {
+        Some(0) => None,
+        Some(seconds) => Some(prost_types::Duration { seconds, nanos: 0 }),
+        None => refresh_defaults.as_ref().and_then(|refresh| {
+            refresh
+                .refresh_before_wkt
+                .to_proto(refresh.refresh_before_seconds)
+        }),
+    };
+    let max_lifetime = match max_lifetime_seconds {
+        Some(0) => None,
+        Some(seconds) => Some(prost_types::Duration { seconds, nanos: 0 }),
+        None => refresh_defaults.as_ref().and_then(|refresh| {
+            refresh
+                .max_lifetime_wkt
+                .to_proto(refresh.max_lifetime_seconds)
+        }),
+    };
     let existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
@@ -4550,7 +4589,7 @@ pub(super) async fn handle_configure_provider_refresh(
         state
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
     }) {
         return Err(Status::failed_precondition(
             "provider refresh is being deleted; retry deletion before configuring it again",
@@ -4562,7 +4601,11 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
-    let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
+    let has_expiration = requested_expiration_ms.is_some()
+        || existing_refresh_state
+            .as_ref()
+            .is_some_and(crate::provider_refresh::refresh_has_expiration);
+    let expires_at_ms = requested_expiration_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
             .map(|state| state.expires_at_ms)
@@ -4588,8 +4631,8 @@ pub(super) async fn handle_configure_provider_refresh(
             expires_at_ms,
             token_url,
             scopes,
-            refresh_before_seconds,
-            max_lifetime_seconds,
+            refresh_before,
+            max_lifetime,
             additional_output_keys,
         },
     )?;
@@ -4607,6 +4650,7 @@ pub(super) async fn handle_configure_provider_refresh(
             );
         }
     }
+    crate::provider_refresh::set_refresh_expiration_presence(&mut state_record, has_expiration);
     let material_staging_id = format!(
         "{}-refresh-config-{}",
         provider.object_id(),
@@ -4658,22 +4702,26 @@ pub(super) async fn handle_configure_provider_refresh(
         return Err(err);
     }
 
-    if let Some(expires_at_ms) = request.expires_at_ms {
+    if let Some(expires_at_ms) = requested_expiration_ms {
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: provider_name.to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: String::new(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::from([(credential_key.to_string(), expires_at_ms)]),
+            credential_expiration_times: HashMap::from([(
+                credential_key.to_string(),
+                openshell_core::time::timestamp_from_millis(expires_at_ms)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            )]),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -4744,16 +4792,14 @@ fn clear_refresh_owned_expiries(
     refresh_expires_at_ms: i64,
     owned_keys: &[String],
 ) {
-    if refresh_expires_at_ms <= 0 {
-        return;
-    }
     for key in owned_keys {
         if provider
-            .credential_expires_at_ms
+            .credential_expiration_times
             .get(key)
-            .is_some_and(|expires_at_ms| *expires_at_ms == refresh_expires_at_ms)
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .is_some_and(|expires_at_ms| expires_at_ms == refresh_expires_at_ms)
         {
-            provider.credential_expires_at_ms.remove(key);
+            provider.credential_expiration_times.remove(key);
         }
     }
 }
@@ -4796,12 +4842,19 @@ pub(super) async fn handle_delete_provider_refresh(
         credential_key,
     )
     .await?;
-    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state_with_credentials(
+    let Some(refresh_state) = existing_refresh_state else {
+        return Ok(Response::new(DeleteProviderRefreshResponse {
+            outcome: super::deletion_outcome(
+                false,
+                request.allow_missing,
+                "provider refresh configuration",
+            )?,
+        }));
+    };
+    crate::provider_refresh::delete_observed_refresh_state_with_credentials(
         state.store.as_ref(),
         &state.credentials,
-        &workspace,
-        provider.object_id(),
-        credential_key,
+        refresh_state.clone(),
     )
     .await?;
 
@@ -4811,9 +4864,7 @@ pub(super) async fn handle_delete_provider_refresh(
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if let Some(refresh_state) = existing_refresh_state
-        && refresh_state.expires_at_ms > 0
-    {
+    if crate::provider_refresh::refresh_has_expiration(&refresh_state) {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
         let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
             .chain(refresh_state.additional_output_keys.into_values())
@@ -4832,7 +4883,7 @@ pub(super) async fn handle_delete_provider_refresh(
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
-        deleted: deleted_refresh_state,
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
     }))
 }
 
@@ -4864,13 +4915,15 @@ pub(super) async fn handle_delete_provider(
     .await;
     match result {
         Ok(deleted) => {
-            let outcome = TelemetryOutcome::from_success(deleted);
+            let outcome = TelemetryOutcome::from_success(deleted || req.allow_missing);
             emit_provider_profile_lifecycle(
                 provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
                 LifecycleOperation::Delete,
                 outcome,
             );
-            Ok(Response::new(DeleteProviderResponse { deleted }))
+            Ok(Response::new(DeleteProviderResponse {
+                outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
+            }))
         }
         Err(err) => {
             emit_provider_profile_lifecycle(
@@ -4958,6 +5011,10 @@ mod tests {
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
 
+    fn ts(milliseconds: i64) -> prost_types::Timestamp {
+        openshell_core::time::timestamp_from_millis(milliseconds).unwrap()
+    }
+
     #[test]
     fn env_key_validation_accepts_valid_keys() {
         assert!(is_valid_env_key("PATH"));
@@ -4973,6 +5030,20 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn subject_token_epoch_expiration_is_expired() {
+        let provider = Provider {
+            credential_expiration_times: HashMap::from([("SUBJECT_TOKEN".to_string(), ts(0))]),
+            ..Default::default()
+        };
+
+        let error = ensure_subject_token_credential_not_expired(&provider, "SUBJECT_TOKEN")
+            .expect_err("the Unix epoch is a present, expired timestamp");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
+            .expect("an absent expiration remains non-expiring");
     }
 
     #[test]
@@ -5078,7 +5149,7 @@ mod tests {
                 subject_token: None,
                 scopes: vec!["openid".to_string()],
                 requested_token_type: String::new(),
-                cache_ttl_seconds: 300,
+                cache_ttl: Some(prost_types::Duration { seconds: 300, nanos: 0 }),
                 audience_overrides: service_audiences
                     .iter()
                     .map(
@@ -5172,17 +5243,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -5257,12 +5328,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-import-ambiguity-id".to_string(),
                     name: "sandbox-import-ambiguity".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -5399,7 +5470,7 @@ mod tests {
         let after_meta = after.metadata.unwrap();
         assert_eq!(after_meta.id, before_meta.id);
         assert_eq!(after_meta.name, before_meta.name);
-        assert_eq!(after_meta.created_at_ms, before_meta.created_at_ms);
+        assert_eq!(after_meta.created_time, before_meta.created_time);
         assert_eq!(after_meta.labels, before_meta.labels);
         assert!(after_meta.resource_version > before_meta.resource_version);
         assert_eq!(
@@ -5584,12 +5655,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-update-ambiguity-id".to_string(),
                     name: "sandbox-update-ambiguity".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -5651,12 +5722,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: [
@@ -5671,7 +5742,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -5686,7 +5757,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 ..Default::default()
@@ -5694,7 +5765,7 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: std::iter::once((
                 credential_key.to_string(),
@@ -5718,7 +5789,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 ..Default::default()
@@ -5726,7 +5797,7 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), value.to_string())).collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -5774,8 +5845,14 @@ mod tests {
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
                 token_url: "https://auth.example.com/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(prost_types::Duration {
+                    seconds: 300,
+                    nanos: 0,
+                }),
+                max_lifetime: Some(prost_types::Duration {
+                    seconds: 3600,
+                    nanos: 0,
+                }),
                 additional_outputs: Vec::new(),
                 material: vec![
                     ProviderCredentialRefreshMaterial {
@@ -5856,7 +5933,10 @@ mod tests {
                 subject_token: None,
                 scopes: vec!["read".to_string()],
                 requested_token_type: String::new(),
-                cache_ttl_seconds: 300,
+                cache_ttl: Some(prost_types::Duration {
+                    seconds: 300,
+                    nanos: 0,
+                }),
                 audience_overrides: Vec::new(),
             }),
         }
@@ -6076,6 +6156,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_provider_profile_preserves_exact_duration_values() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("duration-api");
+        let mut credential = refreshable_credential("access_token", "ACCESS_TOKEN");
+        let refresh = credential.refresh.as_mut().unwrap();
+        refresh.refresh_before = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        });
+        refresh.max_lifetime = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 500_000_000,
+        });
+        profile.credentials.push(credential);
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "duration-api.proto".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.imported, "diagnostics: {:?}", response.diagnostics);
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "duration-api".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        let refresh = fetched.credentials[0].refresh.as_ref().unwrap();
+        assert_eq!(
+            refresh.refresh_before,
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            })
+        );
+        assert_eq!(
+            refresh.max_lifetime,
+            Some(prost_types::Duration {
+                seconds: 1,
+                nanos: 500_000_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_malformed_duration_values() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("invalid-duration-api");
+        let mut credential = refreshable_credential("access_token", "ACCESS_TOKEN");
+        credential.refresh.as_mut().unwrap().refresh_before = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: -1,
+        });
+        profile.credentials.push(credential);
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "invalid-duration-api.proto".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.refresh.refresh_before"
+                && diagnostic.message.contains("valid non-negative duration")
+        }));
+    }
+
+    #[tokio::test]
     async fn profile_update_rejects_fanout_endpoint_ambiguity_without_persisting() {
         let state = test_server_state().await;
 
@@ -6114,12 +6286,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "fanout-sandbox-id".to_string(),
                     name: "fanout-sandbox".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["fanout-provider".to_string()],
@@ -6324,6 +6496,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: " Alex-API ".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6331,7 +6504,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert_eq!(state.credentials.stored_credential_count(), Some(0));
     }
 
@@ -6602,6 +6778,7 @@ mod tests {
         let builtin_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "github".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6623,12 +6800,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-id".to_string(),
                     name: "sandbox-custom".to_string(),
-                    created_at_ms: 0,
+                    created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: Vec::new(),
@@ -6642,6 +6819,7 @@ mod tests {
         let in_use_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -6693,6 +6871,7 @@ mod tests {
         let err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "global-custom".to_string(),
                 workspace: String::new(),
             }),
@@ -6715,12 +6894,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "msgraph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -6729,7 +6908,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -6753,7 +6932,7 @@ mod tests {
                 // profile; direct callers cannot opt a client secret out of
                 // credential storage by omitting this advisory list.
                 secret_material_keys: Vec::new(),
-                expires_at_ms: Some(expires_at_ms),
+                expiration_time: openshell_core::time::timestamp_from_millis(expires_at_ms).ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6780,7 +6959,13 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(status.credentials.len(), 1);
-        assert_eq!(status.credentials[0].expires_at_ms, expires_at_ms);
+        assert_eq!(
+            status.credentials[0]
+                .expiration_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok()),
+            Some(expires_at_ms)
+        );
 
         let provider = state
             .store
@@ -6790,9 +6975,9 @@ mod tests {
             .expect("provider");
         assert_eq!(
             provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&expires_at_ms)
+            Some(&ts(expires_at_ms))
         );
 
         let first_refresh = crate::provider_refresh::get_refresh_state(
@@ -6839,7 +7024,7 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: Some(expires_at_ms),
+                expiration_time: openshell_core::time::timestamp_from_millis(0).ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -6861,10 +7046,14 @@ mod tests {
             first_refresh.authorization_epoch, second_refresh.authorization_epoch,
             "every explicit configuration starts a new authorization epoch"
         );
+        assert!(crate::provider_refresh::refresh_has_expiration(
+            &second_refresh
+        ));
+        assert_eq!(second_refresh.expires_at_ms, 0);
 
-        let deleted = handle_delete_provider_refresh(
+        let epoch_status = handle_get_provider_refresh_status(
             &state,
-            authed_request(DeleteProviderRefreshRequest {
+            authed_request(GetProviderRefreshStatusRequest {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -6875,7 +7064,44 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            epoch_status.credentials[0]
+                .expiration_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok()),
+            Some(0)
+        );
+        let provider_with_epoch = state
+            .store
+            .get_message_by_name::<Provider>("default", "msgraph")
+            .await
+            .unwrap()
+            .expect("provider");
+        assert_eq!(
+            provider_with_epoch
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(0))
+        );
+
+        let deleted = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
         assert_eq!(state.credentials.stored_credential_count(), Some(0));
 
         let status_after_delete = handle_get_provider_refresh_status(
@@ -6901,7 +7127,7 @@ mod tests {
             .expect("provider");
         assert!(
             !provider_after_delete
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
     }
@@ -6936,7 +7162,7 @@ mod tests {
                 ("client_secret".to_string(), client_secret.to_string()),
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
-            expires_at_ms: None,
+            expiration_time: None,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
@@ -7058,7 +7284,7 @@ mod tests {
                 ("client_secret".to_string(), client_secret.to_string()),
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
-            expires_at_ms: None,
+            expiration_time: None,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
@@ -7148,12 +7374,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-authoritative-profiles-id".to_string(),
                     name: "sandbox-authoritative-profiles".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -7185,7 +7411,7 @@ mod tests {
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
                 material: HashMap::new(),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: Some(expires_at_ms),
+                expiration_time: openshell_core::time::timestamp_from_millis(expires_at_ms).ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7201,8 +7427,8 @@ mod tests {
             .unwrap()
             .expect("provider-a");
         assert_eq!(
-            provider.credential_expires_at_ms.get("REFRESH_TOKEN"),
-            Some(&expires_at_ms)
+            provider.credential_expiration_times.get("REFRESH_TOKEN"),
+            Some(&ts(expires_at_ms))
         );
     }
 
@@ -7214,17 +7440,20 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "provider-a".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: String::new(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::from([("REFRESH_TOKEN".to_string(), expires_at_ms)]),
+            credential_expiration_times: HashMap::from([(
+                "REFRESH_TOKEN".to_string(),
+                ts(expires_at_ms),
+            )]),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -7248,8 +7477,8 @@ mod tests {
                 expires_at_ms,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -7261,6 +7490,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7279,7 +7509,7 @@ mod tests {
             .expect("provider-a");
         assert!(
             !provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("REFRESH_TOKEN")
         );
     }
@@ -7294,12 +7524,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-sa".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -7308,7 +7538,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7333,7 +7563,7 @@ mod tests {
                     ),
                 ]),
                 secret_material_keys: vec!["private_key".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7366,12 +7596,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "msgraph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -7380,7 +7610,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7401,7 +7631,8 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: Some(refresh_expires_at_ms),
+                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms)
+                    .ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7418,19 +7649,19 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "msgraph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::from([(
+                credential_expiration_times: HashMap::from([(
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                    manual_expires_at_ms,
+                    ts(manual_expires_at_ms),
                 )]),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
@@ -7442,6 +7673,7 @@ mod tests {
         let deleted = handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7452,7 +7684,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let provider_after_delete = state
             .store
@@ -7462,9 +7697,9 @@ mod tests {
             .expect("provider");
         assert_eq!(
             provider_after_delete
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&manual_expires_at_ms)
+            Some(&ts(manual_expires_at_ms))
         );
     }
 
@@ -7478,17 +7713,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-delete".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7508,7 +7743,8 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: Some(refresh_expires_at_ms),
+                expiration_time: openshell_core::time::timestamp_from_millis(refresh_expires_at_ms)
+                    .ok(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7528,19 +7764,25 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-delete".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::from([
-                    ("AWS_SECRET_ACCESS_KEY".to_string(), refresh_expires_at_ms),
-                    ("AWS_SESSION_TOKEN".to_string(), independent_expires_at_ms),
+                credential_expiration_times: HashMap::from([
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        ts(refresh_expires_at_ms),
+                    ),
+                    (
+                        "AWS_SESSION_TOKEN".to_string(),
+                        ts(independent_expires_at_ms),
+                    ),
                 ]),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
@@ -7552,6 +7794,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -7571,18 +7814,20 @@ mod tests {
         // Refresh-owned expiries for the primary and secret are cleared.
         assert!(
             !provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("AWS_ACCESS_KEY_ID")
         );
         assert!(
             !provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("AWS_SECRET_ACCESS_KEY")
         );
         // The independently updated session-token expiry is preserved.
         assert_eq!(
-            provider.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
-            Some(&independent_expires_at_ms)
+            provider
+                .credential_expiration_times
+                .get("AWS_SESSION_TOKEN"),
+            Some(&ts(independent_expires_at_ms))
         );
     }
 
@@ -7600,20 +7845,23 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "p".to_string(),
                 name: "p".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::from([
-                ("AWS_ACCESS_KEY_ID".to_string(), refresh_expires_at_ms),
-                ("AWS_SECRET_ACCESS_KEY".to_string(), refresh_expires_at_ms),
-                ("AWS_SESSION_TOKEN".to_string(), concurrently_changed),
+            credential_expiration_times: HashMap::from([
+                ("AWS_ACCESS_KEY_ID".to_string(), ts(refresh_expires_at_ms)),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ts(refresh_expires_at_ms),
+                ),
+                ("AWS_SESSION_TOKEN".to_string(), ts(concurrently_changed)),
             ]),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
@@ -7628,17 +7876,30 @@ mod tests {
 
         assert!(
             !provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("AWS_ACCESS_KEY_ID")
         );
         assert!(
             !provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("AWS_SECRET_ACCESS_KEY")
         );
         assert_eq!(
-            provider.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
-            Some(&concurrently_changed)
+            provider
+                .credential_expiration_times
+                .get("AWS_SESSION_TOKEN"),
+            Some(&ts(concurrently_changed))
+        );
+
+        provider
+            .credential_expiration_times
+            .insert("AWS_ACCESS_KEY_ID".to_string(), ts(0));
+        clear_refresh_owned_expiries(&mut provider, 0, &owned_keys);
+        assert!(
+            !provider
+                .credential_expiration_times
+                .contains_key("AWS_ACCESS_KEY_ID"),
+            "an epoch expiry owned by the refresh must be cleared"
         );
     }
 
@@ -7653,12 +7914,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "existing-graph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -7667,7 +7928,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7681,18 +7942,18 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "refreshing-graph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7705,12 +7966,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-collision".to_string(),
                     name: "collision".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -7733,7 +7994,7 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7763,17 +8024,17 @@ mod tests {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: name.to_string(),
-                        created_at_ms: 0,
+                        created_time: None,
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: "default".to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     }),
                     r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
                     config: HashMap::new(),
-                    credential_expires_at_ms: HashMap::new(),
+                    credential_expiration_times: HashMap::new(),
                     profile_workspace: "default".to_string(),
                     credential_handles: HashMap::new(),
                 },
@@ -7787,12 +8048,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-refresh-collision".to_string(),
                     name: "refresh-collision".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["first-graph".to_string(), "second-graph".to_string()],
@@ -7815,7 +8076,7 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7836,7 +8097,7 @@ mod tests {
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7863,12 +8124,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "msgraph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -7877,7 +8138,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7901,7 +8162,7 @@ mod tests {
                     ),
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7920,7 +8181,7 @@ mod tests {
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
                 material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
                 secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7942,12 +8203,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "msgraph".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -7956,7 +8217,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -7976,7 +8237,7 @@ mod tests {
                     strategy: strategy as i32,
                     material: HashMap::new(),
                     secret_material_keys: Vec::new(),
-                    expires_at_ms: None,
+                    expiration_time: None,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -8017,6 +8278,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
             }),
@@ -8024,7 +8286,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let missing = handle_get_provider_profile(
             &state,
@@ -8053,6 +8318,7 @@ mod tests {
             handle_delete_provider_profile(
                 &task_state,
                 authed_request(DeleteProviderProfileRequest {
+                    allow_missing: false,
                     id: "guarded-delete".to_string(),
                     workspace: "default".to_string(),
                 }),
@@ -8073,7 +8339,10 @@ mod tests {
             .expect("join delete task")
             .expect("delete should succeed")
             .into_inner();
-        assert!(response.deleted);
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -8165,12 +8434,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "gitlab-local".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -8180,7 +8449,7 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -8341,6 +8610,7 @@ mod tests {
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
+            &[],
             Some(&credentials),
         )
         .await
@@ -8381,6 +8651,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_provider_record_clears_credential_expiration_by_key() {
+        let store = test_store().await;
+        let mut provider = provider_with_values("legacy-provider", "legacy-custom");
+        provider.credential_expiration_times.insert(
+            "API_TOKEN".to_string(),
+            openshell_core::time::timestamp_from_millis(1_700_000_000_000).unwrap(),
+        );
+        create_provider_record(&store, "default", provider)
+            .await
+            .unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+
+        let updated = update_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "legacy-provider".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &["API_TOKEN".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !updated
+                .credential_expiration_times
+                .contains_key("API_TOKEN")
+        );
+    }
+
+    #[tokio::test]
     async fn update_provider_record_with_runtime_preserves_legacy_inline_credentials_on_noop() {
         let store = test_store().await;
         let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
@@ -8406,7 +8716,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "legacy-provider".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     ..Default::default()
@@ -8418,10 +8728,11 @@ mod tests {
                     "https://updated.example.com".to_string(),
                 ))
                 .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             },
+            &[],
             Some(&credentials),
         )
         .await
@@ -8471,7 +8782,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "legacy-provider".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     ..Default::default()
@@ -8483,10 +8794,11 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             },
+            &[],
             Some(&credentials),
         )
         .await
@@ -8892,7 +9204,8 @@ mod tests {
                     "openai",
                     "OPENAI_API_KEY",
                 )),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -8913,7 +9226,10 @@ mod tests {
             &store,
             "default",
             Provider {
-                credential_expires_at_ms: HashMap::from([("API_TOKEN".to_string(), 123_456)]),
+                credential_expiration_times: HashMap::from([(
+                    "API_TOKEN".to_string(),
+                    ts(123_456),
+                )]),
                 ..provider_with_values("gitlab-local", "gitlab")
             },
         )
@@ -8934,8 +9250,14 @@ mod tests {
                 expires_at_ms: 123_456,
                 token_url: "https://refresh.example.com/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(prost_types::Duration {
+                    seconds: 300,
+                    nanos: 0,
+                }),
+                max_lifetime: Some(prost_types::Duration {
+                    seconds: 3600,
+                    nanos: 0,
+                }),
             },
         )
         .unwrap();
@@ -8971,12 +9293,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-id".to_string(),
                     name: "attached-sandbox".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["gitlab-local".to_string()],
@@ -9021,12 +9343,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "test-provider".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "legacy-custom".to_string(),
                 credentials: std::iter::once((
@@ -9035,7 +9357,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9056,12 +9378,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "test-provider".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "legacy-custom".to_string(),
                 credentials: std::iter::once((
@@ -9070,7 +9392,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9096,17 +9418,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "bad-provider".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9122,17 +9444,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "gitlab-no-creds".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9166,8 +9488,14 @@ mod tests {
                                     as i32,
                                 token_url: "https://login.example/token".to_string(),
                                 scopes: vec!["https://example.test/.default".to_string()],
-                                refresh_before_seconds: 300,
-                                max_lifetime_seconds: 3600,
+                                refresh_before: Some(prost_types::Duration {
+                                    seconds: 300,
+                                    nanos: 0,
+                                }),
+                                max_lifetime: Some(prost_types::Duration {
+                                    seconds: 3600,
+                                    nanos: 0,
+                                }),
                                 additional_outputs: Vec::new(),
                                 material: vec![
                                     ProviderCredentialRefreshMaterial {
@@ -9207,17 +9535,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "delegated-refresh-no-token-yet".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "delegated-refresh-api".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9250,17 +9578,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "mixed-required-no-token-yet".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "mixed-required-api".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9293,17 +9621,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "optional-static-no-token-yet".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "optional-static-api".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9319,17 +9647,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-no-token-yet".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9353,17 +9681,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "missing".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9389,17 +9717,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "noop-test".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9444,17 +9772,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "delete-key-test".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9503,17 +9831,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "type-preserve-test".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9540,17 +9868,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "type-change-test".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9579,17 +9907,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "validate-merge-test".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9612,17 +9940,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "legacy-oversized-type".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: oversized_type.clone(),
             credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -9635,18 +9963,18 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "legacy-oversized-type".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("API_TOKEN".to_string(), "new".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -9673,12 +10001,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "claude-local".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "claude".to_string(),
             credentials: [
@@ -9692,7 +10020,7 @@ mod tests {
                 "https://api.anthropic.com".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -9856,7 +10184,7 @@ mod tests {
                 ("client_secret".to_string(), "client-secret".to_string()),
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
-            expires_at_ms: None,
+            expiration_time: None,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
@@ -9900,7 +10228,7 @@ mod tests {
             openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
                 revision_1,
                 first.environment.clone(),
-                first.credential_expires_at_ms.clone(),
+                first.credential_expiration_times.clone(),
                 first.dynamic_credentials.clone(),
                 first.static_credential_bindings.clone(),
                 Vec::new(),
@@ -9923,7 +10251,8 @@ mod tests {
                         )]),
                         ..Default::default()
                     }),
-                    credential_expires_at_ms: HashMap::new(),
+                    credential_expiration_times: HashMap::new(),
+                    clear_credential_expiration_keys: Vec::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -9962,7 +10291,7 @@ mod tests {
             .install_bound_environment(
                 revision_1,
                 unchanged_environment.environment,
-                unchanged_environment.credential_expires_at_ms,
+                unchanged_environment.credential_expiration_times,
                 unchanged_environment.dynamic_credentials,
                 unchanged_environment.static_credential_bindings,
                 Vec::new(),
@@ -10018,7 +10347,7 @@ mod tests {
             .install_bound_environment(
                 revision_2,
                 second.environment.clone(),
-                second.credential_expires_at_ms.clone(),
+                second.credential_expiration_times.clone(),
                 second.dynamic_credentials.clone(),
                 second.static_credential_bindings.clone(),
                 Vec::new(),
@@ -10035,7 +10364,7 @@ mod tests {
             openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
                 revision_2,
                 second.environment.clone(),
-                second.credential_expires_at_ms.clone(),
+                second.credential_expiration_times.clone(),
                 second.dynamic_credentials.clone(),
                 second.static_credential_bindings.clone(),
                 Vec::new(),
@@ -10082,7 +10411,7 @@ mod tests {
             .install_bound_environment(
                 revision_3,
                 third.environment,
-                third.credential_expires_at_ms,
+                third.credential_expiration_times,
                 third.dynamic_credentials,
                 third.static_credential_bindings,
                 Vec::new(),
@@ -10110,8 +10439,8 @@ mod tests {
             "GCP_ADC_ACCESS_TOKEN".to_string(),
             "google-token".to_string(),
         )]);
-        google_cloud.credential_expires_at_ms =
-            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), expires_at_ms)]);
+        google_cloud.credential_expiration_times =
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), ts(expires_at_ms))]);
         create_provider_record(&store, "default", google_cloud)
             .await
             .unwrap();
@@ -10138,7 +10467,7 @@ mod tests {
         );
         assert!(
             !result
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("GCP_ADC_ACCESS_TOKEN"),
             "withheld static credentials must not retain expiry metadata"
         );
@@ -10580,24 +10909,26 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "expiring-provider".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "test".to_string(),
             credentials: [
                 ("FRESH_TOKEN".to_string(), "fresh".to_string()),
                 ("STALE_TOKEN".to_string(), "stale".to_string()),
+                ("EPOCH_TOKEN".to_string(), "epoch".to_string()),
             ]
             .into_iter()
             .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: [
-                ("FRESH_TOKEN".to_string(), now_ms + 60_000),
-                ("STALE_TOKEN".to_string(), now_ms - 60_000),
+            credential_expiration_times: [
+                ("FRESH_TOKEN".to_string(), ts(now_ms + 60_000)),
+                ("STALE_TOKEN".to_string(), ts(now_ms - 60_000)),
+                ("EPOCH_TOKEN".to_string(), ts(0)),
             ]
             .into_iter()
             .collect(),
@@ -10614,8 +10945,9 @@ mod tests {
                 .unwrap();
         assert_eq!(result.get("FRESH_TOKEN"), Some(&"fresh".to_string()));
         assert!(!result.contains_key("STALE_TOKEN"));
+        assert!(!result.contains_key("EPOCH_TOKEN"));
         assert_eq!(
-            result.credential_expires_at_ms.get("FRESH_TOKEN"),
+            result.credential_expiration_times.get("FRESH_TOKEN"),
             Some(&(now_ms + 60_000))
         );
     }
@@ -10637,12 +10969,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "test-provider".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -10653,7 +10985,7 @@ mod tests {
             .into_iter()
             .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -10680,12 +11012,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "claude-local".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -10694,7 +11026,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10708,18 +11040,18 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "gitlab-local".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10748,18 +11080,18 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-a".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10773,12 +11105,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-b".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -10787,7 +11119,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10824,7 +11156,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-a".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     ..Default::default()
@@ -10833,7 +11165,7 @@ mod tests {
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             },
@@ -10874,12 +11206,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "google-config".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-cloud".to_string(),
                 credentials: std::iter::once((
@@ -10889,7 +11221,7 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("project_id".to_string(), "config-project".to_string()))
                     .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10903,12 +11235,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "static-credential".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -10917,7 +11249,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -10963,12 +11295,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-local".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -10985,7 +11317,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11043,12 +11375,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-bootstrap".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -11064,7 +11396,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11094,12 +11426,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-no-config".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -11108,7 +11440,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11149,12 +11481,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "vertex-collision".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -11173,7 +11505,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11204,18 +11536,18 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "openai-local".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11248,12 +11580,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-a".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -11262,7 +11594,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11276,12 +11608,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-b".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-drive".to_string(),
                 credentials: std::iter::once((
@@ -11290,7 +11622,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11301,12 +11633,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-collision".to_string(),
                 name: "collision".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -11323,12 +11655,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "provider-b".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -11337,7 +11669,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11360,12 +11692,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "google-config".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "google-cloud".to_string(),
                 credentials: std::iter::once((
@@ -11375,7 +11707,7 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("project_id".to_string(), "config-project".to_string()))
                     .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11389,12 +11721,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "credential-provider".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -11403,7 +11735,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11415,12 +11747,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-plugin-config-collision".to_string(),
                     name: "plugin-config-collision".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -11441,12 +11773,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "credential-provider".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -11455,7 +11787,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11482,12 +11814,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "my-claude".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -11496,7 +11828,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -11508,12 +11840,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -11548,12 +11880,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
@@ -11599,17 +11931,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "test-validate-provider".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: String::new(), // Empty type is ignored in update
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -11765,7 +12097,8 @@ mod tests {
             &state,
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11814,7 +12147,8 @@ mod tests {
             &state,
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11869,7 +12203,8 @@ mod tests {
             &state,
             authed_request(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -11939,7 +12274,8 @@ mod tests {
             &state,
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12016,7 +12352,8 @@ mod tests {
             &state,
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12092,7 +12429,8 @@ mod tests {
                     &state_clone,
                     authed_request(UpdateProviderRequest {
                         provider: Some(updated),
-                        credential_expires_at_ms: HashMap::new(),
+                        credential_expiration_times: HashMap::new(),
+                        clear_credential_expiration_keys: Vec::new(),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
                         )),
@@ -12155,12 +12493,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "my-aws-v2".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: std::iter::once((
@@ -12169,7 +12507,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12188,7 +12526,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12217,17 +12555,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-endpoint-override".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12252,7 +12590,7 @@ mod tests {
                     ),
                 ]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12294,17 +12632,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-partial-source".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12328,7 +12666,7 @@ mod tests {
                     ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
                 ]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12351,17 +12689,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-lone-session".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12386,7 +12724,7 @@ mod tests {
                     ),
                 ]),
                 secret_material_keys: vec!["aws_session_token".to_string()],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12409,17 +12747,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-outputs".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12438,7 +12776,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12518,7 +12856,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12544,7 +12882,8 @@ mod tests {
                             credentials: HashMap::from([(key.to_string(), value.to_string())]),
                             ..Default::default()
                         }),
-                        credential_expires_at_ms: HashMap::new(),
+                        credential_expiration_times: HashMap::new(),
+                        clear_credential_expiration_keys: Vec::new(),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
                         )),
@@ -12579,12 +12918,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "generic-no-profile".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "generic".to_string(),
                 credentials: std::iter::once((
@@ -12593,7 +12932,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12612,7 +12951,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12635,17 +12974,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-wrong-key".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12666,7 +13005,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12689,17 +13028,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "aws-env".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "aws".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -12733,8 +13072,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
             },
         )
         .unwrap();
@@ -12762,17 +13101,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "existing-aws-provider".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -12788,12 +13127,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "new-aws-provider".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws".to_string(),
             credentials: std::iter::once((
@@ -12802,7 +13141,7 @@ mod tests {
             ))
             .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -12816,12 +13155,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-aws-configure-collision".to_string(),
                     name: "aws-configure-collision".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -12846,7 +13185,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12870,17 +13209,17 @@ mod tests {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: name.to_string(),
-                        created_at_ms: 0,
+                        created_time: None,
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: "default".to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     }),
                     r#type: "aws".to_string(),
                     credentials: HashMap::new(),
                     config: HashMap::new(),
-                    credential_expires_at_ms: HashMap::new(),
+                    credential_expiration_times: HashMap::new(),
                     profile_workspace: "default".to_string(),
                     credential_handles: HashMap::new(),
                 },
@@ -12897,12 +13236,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-concurrent-configure".to_string(),
                     name: "concurrent-configure".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["aws-a".to_string(), "aws-b".to_string()],
@@ -12923,7 +13262,7 @@ mod tests {
                     "arn:aws:iam::123456789012:role/Test".to_string(),
                 )]),
                 secret_material_keys: Vec::new(),
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -12957,17 +13296,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "my-google-cloud".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "google-cloud".to_string(),
             credentials: HashMap::new(),
             config,
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -13064,17 +13403,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "github".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "github".to_string(),
             credentials: HashMap::new(),
             config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -13112,7 +13451,7 @@ mod tests {
             r#type: "pypi".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -13125,12 +13464,12 @@ mod tests {
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: "shared-name".to_string(),
-                        created_at_ms: 0,
+                        created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: "default".to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     });
                     p
                 }),
@@ -13157,12 +13496,12 @@ mod tests {
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: "shared-name".to_string(),
-                        created_at_ms: 0,
+                        created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: "default".to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     });
                     p
                 }),
@@ -13249,6 +13588,7 @@ mod tests {
         let deleted = handle_delete_provider(
             &state,
             authed_request(DeleteProviderRequest {
+                allow_missing: false,
                 name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -13258,7 +13598,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let listed = handle_list_providers(
             &state,
@@ -13299,12 +13642,12 @@ mod tests {
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: "provider-d".to_string(),
-                        created_at_ms: 0,
+                        created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: "default".to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     });
                     p
                 }),
@@ -13415,6 +13758,7 @@ mod tests {
         let delete_error = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 id: "nonexistent".to_string(),
                 workspace: String::new(),
             }),
@@ -13436,17 +13780,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "cross-ws".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "claude".to_string(),
             credentials: HashMap::from([("ANTHROPIC_API_KEY".to_string(), "sk-123".to_string())]),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "other-workspace".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -13464,17 +13808,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "global-profile".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "claude".to_string(),
             credentials: HashMap::from([("ANTHROPIC_API_KEY".to_string(), "sk-123".to_string())]),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -13491,17 +13835,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "same-ws-profile".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "claude".to_string(),
             credentials: HashMap::from([("ANTHROPIC_API_KEY".to_string(), "sk-123".to_string())]),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -13518,17 +13862,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "immutable-pw".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "claude".to_string(),
             credentials: HashMap::from([("ANTHROPIC_API_KEY".to_string(), "sk-123".to_string())]),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -13540,17 +13884,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: "immutable-pw".to_string(),
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: String::new(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "other".to_string(),
             credential_handles: HashMap::new(),
         };
@@ -13623,17 +13967,17 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "uses-ws".to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: "ws-custom".to_string(),
                 credentials: HashMap::from([("TOKEN".to_string(), "val".to_string())]),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -13735,7 +14079,11 @@ mod tests {
             async move {
                 handle_delete_provider_profile(
                     &state,
-                    authed_request(DeleteProviderProfileRequest { id, workspace }),
+                    authed_request(DeleteProviderProfileRequest {
+                        allow_missing: false,
+                        id,
+                        workspace,
+                    }),
                 )
                 .await
                 .unwrap()
@@ -13743,8 +14091,14 @@ mod tests {
             }
         };
 
-        assert!(delete("e2e-platform", "").await.deleted);
-        assert!(delete("e2e-workspace", "default").await.deleted);
+        assert_eq!(
+            delete("e2e-platform", "").await.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
+        assert_eq!(
+            delete("e2e-workspace", "default").await.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
     }
 
     #[tokio::test]
@@ -14244,6 +14598,7 @@ mod tests {
         let err = handle_delete_provider_refresh(
             &state,
             non_member_request(DeleteProviderRefreshRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -14259,6 +14614,7 @@ mod tests {
         let err = handle_delete_provider(
             &state,
             non_member_request(DeleteProviderRequest {
+                allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
@@ -14351,6 +14707,7 @@ mod tests {
         let err = handle_delete_provider_profile(
             &state,
             non_member_request(DeleteProviderProfileRequest {
+                allow_missing: false,
                 workspace: "no-such-ws".into(),
                 ..Default::default()
             }),

@@ -89,9 +89,7 @@ proxy.
 | `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
-Validation rejects the disallowed patterns at policy load time with a message
-that names the offending host. Exact hosts and IP addresses do not use this
-path.
+Validation rejects the disallowed patterns at policy load time. OPA load errors omit the supplied hostname. Exact hosts and IP addresses do not use this wildcard-validation path.
 
 ## TLS and L7 Inspection
 
@@ -200,6 +198,14 @@ replace the local policy. Workload-image files and environment variables cannot
 configure the separately isolated supervisor. When a supervisor override is
 combined with injected provider credentials, the supervisor emits a
 high-severity detection finding at startup naming the inactive controls.
+
+## Policy Load Diagnostics
+
+`OpaEngine` bounds the error messages returned when loading or reloading policy from files, strings, or protobuf. Each message contains at most eight error items and 512 UTF-8 bytes, including its heading, separators, and any `additional violations omitted` marker. The loader reports complete, fixed categories and discards authored names, values, paths, source snippets, and nested error chains.
+
+Typed validation categories distinguish process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration. Opaque L7 errors identify the protocol-configuration or policy-validation stage; endpoint conflicts report ambiguous selectors. YAML errors retain a fixed parser category and numeric line and column when available. File I/O, Rego loading, and internal policy-data errors use fixed messages.
+
+A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor separately applies `policy_validation_failure_mode` and may publish a quarantine generation as described below. The diagnostic bounds cover returned OPA load errors; accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
 
 ## Live Updates
 

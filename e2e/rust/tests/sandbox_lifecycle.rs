@@ -302,9 +302,15 @@ async fn sandbox_can_be_deleted_while_stopped() {
     );
 
     let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    // Deletion may return before the owned cleanup worker finishes. Both
+    // outcomes must still reach absence, which is checked below.
     assert!(
-        delete_output.contains("Deleted sandbox"),
-        "expected delete confirmation in:\n{delete_output}",
+        delete_output.contains(&format!("Deleted sandbox {}", sandbox.name))
+            || delete_output.contains(&format!(
+                "Sandbox {} deletion accepted; cleanup is pending",
+                sandbox.name
+            )),
+        "expected completed or accepted deletion in:\n{delete_output}",
     );
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {

@@ -112,7 +112,11 @@ async fn run_refresh() -> Result<i32> {
     match resp {
         Ok(r) => {
             let inner = r.into_inner();
-            print_token_summary(&inner.token, Some(inner.expires_at_ms));
+            let expires_at_ms = inner
+                .expiration_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok());
+            print_token_summary(&inner.token, expires_at_ms);
             Ok(0)
         }
         Err(status) => {

@@ -77,7 +77,7 @@ type SandboxInterface interface {
 	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
-	Delete(ctx context.Context, workspace, name string) error
+	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
 	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
 	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
 	ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error)

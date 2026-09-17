@@ -98,7 +98,7 @@ func TestFileUpload(t *testing.T) {
 		GatewayHost: "gateway.example.com",
 		GatewayPort: 2222,
 	}
-	mock.revokeResp = &pb.RevokeSshSessionResponse{Revoked: true}
+	mock.revokeResp = &pb.RevokeSshSessionResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}
 	client, cleanup := setupFileTest(t, mock)
 	defer cleanup()
 
@@ -154,7 +154,7 @@ func TestFileDownload(t *testing.T) {
 		GatewayHost: "gateway.example.com",
 		GatewayPort: 2222,
 	}
-	mock.revokeResp = &pb.RevokeSshSessionResponse{Revoked: true}
+	mock.revokeResp = &pb.RevokeSshSessionResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}
 	client, cleanup := setupFileTest(t, mock)
 	defer cleanup()
 
@@ -250,7 +250,7 @@ func TestFileUpload_ResolvesNameToID(t *testing.T) {
 		GatewayHost: "gw.example.com",
 		GatewayPort: 2222,
 	}
-	mock.revokeResp = &pb.RevokeSshSessionResponse{Revoked: true}
+	mock.revokeResp = &pb.RevokeSshSessionResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}
 	client, cleanup := setupFileTest(t, mock)
 	defer cleanup()
 

@@ -78,14 +78,14 @@ func TestSandboxTemplate_CreateGetListDelete(t *testing.T) {
 
 	deleted, err := tc.Delete(ctx, "default", "gpu-kata")
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, types.DeletionCompleted, deleted.Outcome)
 	_, err = tc.Get(ctx, "default", "gpu-kata")
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
 
-	deleted, err = tc.Delete(ctx, "default", "gpu-kata")
+	deleted, err = tc.Delete(ctx, "default", "gpu-kata", types.DeleteOptions{AllowMissing: true})
 	require.NoError(t, err)
-	assert.False(t, deleted)
+	assert.Equal(t, types.DeletionAlreadyAbsent, deleted.Outcome)
 }
 
 func TestSandboxTemplate_CreateAlreadyExists(t *testing.T) {

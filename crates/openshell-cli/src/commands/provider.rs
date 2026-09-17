@@ -34,6 +34,12 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status};
 
+fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
+    timestamp
+        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+        .unwrap_or_default()
+}
+
 fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> {
     if failures.is_empty() {
         Ok(())
@@ -475,17 +481,17 @@ async fn auto_create_provider(
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: exact_name.to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
@@ -523,17 +529,17 @@ async fn auto_create_provider(
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: name.clone(),
-                        created_at_ms: 0,
+                        created_time: None,
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: workspace.to_string(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
-                    credential_expires_at_ms: HashMap::new(),
+                    credential_expiration_times: HashMap::new(),
                     profile_workspace: workspace.to_string(),
                     credential_handles: HashMap::new(),
                 }),
@@ -670,6 +676,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
 ) -> Result<()> {
     match client
         .delete_provider(DeleteProviderRequest {
+            allow_missing: true,
             name: provider_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
@@ -1104,17 +1111,24 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: oidc_credential_expires_at_ms,
+                credential_expiration_times: oidc_credential_expires_at_ms
+                    .into_iter()
+                    .map(|(key, value)| {
+                        openshell_core::time::timestamp_from_millis(value)
+                            .map(|timestamp| (key, timestamp))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()
+                    .into_diagnostic()?,
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
@@ -1147,7 +1161,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     "client_secret".to_string(),
                     "refresh_token".to_string(),
                 ],
-                expires_at_ms: None,
+                expiration_time: None,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
@@ -1291,19 +1305,26 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
                 serde_json::json!(meta.resource_version),
             );
         }
-        if meta.created_at_ms != 0 {
+        if meta.created_time.is_some() {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    meta.created_time.as_ref()
+                ))),
             );
         }
     }
 
     // Credential expiration times (only if present)
-    if !provider.credential_expires_at_ms.is_empty() {
+    if !provider.credential_expiration_times.is_empty() {
+        let expirations: HashMap<_, _> = provider
+            .credential_expiration_times
+            .iter()
+            .map(|(key, value)| (key, proto_timestamp_ms(Some(value))))
+            .collect();
         obj.insert(
             "credential_expires_at_ms".to_string(),
-            serde_json::json!(provider.credential_expires_at_ms),
+            serde_json::json!(expirations),
         );
     }
 
@@ -1693,6 +1714,7 @@ pub async fn provider_profile_delete(
     for id in ids {
         let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
+                allow_missing: true,
                 id: id.clone(),
                 workspace: workspace.to_string(),
             })
@@ -1708,7 +1730,7 @@ pub async fn provider_profile_delete(
                 continue;
             }
         };
-        if response.deleted {
+        if crate::run::deletion_completed(response.outcome)? {
             println!("{} Deleted provider profile {id}", "✓".green().bold());
         } else {
             println!("{} Provider profile {id} not found", "!".yellow());
@@ -1809,7 +1831,11 @@ pub async fn provider_refresh_config(
             strategy: strategy as i32,
             material,
             secret_material_keys,
-            expires_at_ms: input.credential_expires_at_ms,
+            expiration_time: input
+                .credential_expires_at_ms
+                .map(openshell_core::time::timestamp_from_millis)
+                .transpose()
+                .into_diagnostic()?,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
@@ -1874,6 +1900,7 @@ pub async fn provider_refresh_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_provider_refresh(DeleteProviderRefreshRequest {
+            allow_missing: true,
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1882,7 +1909,7 @@ pub async fn provider_refresh_delete(
         .into_diagnostic()?
         .into_inner();
 
-    if response.deleted {
+    if crate::run::deletion_completed(response.outcome)? {
         println!(
             "{} Deleted refresh config for {} {}",
             "✓".green().bold(),
@@ -1925,20 +1952,15 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
         provider_refresh_strategy_name(strategy),
         status.status,
         provider_refresh_recovery_action_name(recovery_action),
-        format_optional_epoch_ms(status.expires_at_ms),
-        format_refresh_next_at_ms(status.next_refresh_at_ms),
-        format_optional_epoch_ms(status.last_refresh_at_ms),
+        format_optional_epoch_ms(proto_timestamp_ms(status.expiration_time.as_ref())),
+        status.next_refresh_time.as_ref().map_or_else(
+            || "manual".to_string(),
+            |value| format_optional_epoch_ms(proto_timestamp_ms(Some(value))),
+        ),
+        format_optional_epoch_ms(proto_timestamp_ms(status.last_refresh_time.as_ref())),
         status.failure_code,
         truncate_status_field(&status.last_error, 72),
     )
-}
-
-fn format_refresh_next_at_ms(next_refresh_at_ms: i64) -> String {
-    if next_refresh_at_ms == i64::MAX {
-        "-".to_string()
-    } else {
-        format_optional_epoch_ms(next_refresh_at_ms)
-    }
 }
 
 fn provider_refresh_recovery_action_name(
@@ -2287,6 +2309,11 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let mut config_map = parse_key_value_pairs(config, "--config")?;
     let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
     credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
+    let clear_credential_expiration_keys = credential_expires_at_ms
+        .iter()
+        .filter_map(|(key, expires_at_ms)| (*expires_at_ms == 0).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    credential_expires_at_ms.retain(|_, expires_at_ms| *expires_at_ms != 0);
 
     if from_existing {
         let stored = existing.as_ref().expect("checked above");
@@ -2314,12 +2341,12 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
-                    created_at_ms: 0,
+                    created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: existing
                     .as_ref()
@@ -2327,15 +2354,23 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                     .unwrap_or_default(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: existing
                     .as_ref()
                     .map(|provider| provider.profile_workspace.clone())
                     .unwrap_or_default(),
                 credential_handles: HashMap::new(),
             }),
-            credential_expires_at_ms,
+            credential_expiration_times: credential_expires_at_ms
+                .into_iter()
+                .map(|(key, value)| {
+                    openshell_core::time::timestamp_from_millis(value)
+                        .map(|timestamp| (key, timestamp))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()
+                .into_diagnostic()?,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            clear_credential_expiration_keys,
         })
         .await
         .into_diagnostic()?;
@@ -2364,6 +2399,7 @@ pub async fn provider_delete(
     for name in names {
         let response = match client
             .delete_provider(DeleteProviderRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
@@ -2379,7 +2415,7 @@ pub async fn provider_delete(
                 continue;
             }
         };
-        if response.into_inner().deleted {
+        if crate::run::deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted provider {name}", "✓".green().bold());
         } else {
             println!("{} Provider {name} not found", "!".yellow());
@@ -2419,7 +2455,10 @@ mod tests {
                 ("Z_URL".to_string(), "https://secret.example".to_string()),
                 ("A_MODE".to_string(), "sensitive-config".to_string()),
             ]),
-            credential_expires_at_ms: HashMap::from([("Z_TOKEN".to_string(), 123)]),
+            credential_expiration_times: HashMap::from([(
+                "Z_TOKEN".to_string(),
+                openshell_core::time::timestamp_from_millis(123).unwrap(),
+            )]),
             profile_workspace: "internal".to_string(),
             credential_handles: HashMap::from([
                 (
@@ -2482,7 +2521,7 @@ mod tests {
                     "https://api.custom.example".to_string(),
                 ))
                 .collect(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             }],
@@ -2514,15 +2553,15 @@ mod tests {
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
             status: "error".to_string(),
-            expires_at_ms: 1_767_225_600_000,
-            next_refresh_at_ms: i64::MAX,
-            last_refresh_at_ms: 1_767_225_000_000,
+            expiration_time: openshell_core::time::timestamp_from_millis(1_767_225_600_000).ok(),
+            next_refresh_time: None,
+            last_refresh_time: openshell_core::time::timestamp_from_millis(1_767_225_000_000).ok(),
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
             recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
             failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
             provider_error_subtype: "invalid_rapt".to_string(),
-            last_error_at_ms: 1_767_225_000_000,
+            last_error_time: openshell_core::time::timestamp_from_millis(1_767_225_000_000).ok(),
         });
 
         assert!(row.contains("my-graph"));
@@ -2806,7 +2845,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2830,7 +2869,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials,
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2869,7 +2908,7 @@ mod tests {
             r#type: "custom".to_string(),
             credentials: HashMap::new(),
             config,
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2901,7 +2940,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(), // Empty config
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2923,11 +2962,11 @@ mod tests {
             id: "prov-123".to_string(),
             name: "test-provider".to_string(),
             resource_version: 42,
-            created_at_ms: 1_234_567_890_000,
+            created_time: openshell_core::time::timestamp_from_millis(1_234_567_890_000).ok(),
             labels,
             annotations: HashMap::new(),
             workspace: String::new(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         };
 
         let provider = Provider {
@@ -2935,7 +2974,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2962,7 +3001,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2993,7 +3032,15 @@ mod tests {
             r#type: "oauth".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms,
+            credential_expiration_times: credential_expires_at_ms
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        openshell_core::time::timestamp_from_millis(value).unwrap(),
+                    )
+                })
+                .collect(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -3011,7 +3058,7 @@ mod tests {
         let metadata = ObjectMeta {
             id: "prov-123".to_string(),
             name: "test-provider".to_string(),
-            created_at_ms: 1_609_459_200_000, // 2021-01-01 00:00:00
+            created_time: openshell_core::time::timestamp_from_millis(1_609_459_200_000).ok(), // 2021-01-01 00:00:00
             ..Default::default()
         };
 
@@ -3020,7 +3067,7 @@ mod tests {
             r#type: "anthropic".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };

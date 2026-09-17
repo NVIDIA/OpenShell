@@ -42,5 +42,5 @@ type SandboxTemplateInterface interface {
 	Get(ctx context.Context, workspace, name string) (*SandboxWorkloadTemplate, error)
 	List(workspace string, opts ...ListOptions) (*Pager[*SandboxWorkloadTemplate], error)
 	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error)
-	Delete(ctx context.Context, workspace, name string) (bool, error)
+	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
 }
