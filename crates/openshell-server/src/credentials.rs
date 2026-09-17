@@ -1701,10 +1701,10 @@ where
 
         match tokio::time::timeout(remaining, connect()).await {
             Ok(Ok(connected)) => return Ok(connected),
-            Ok(Err(CredentialDriverReadinessError::Retryable(err))) => {
-                last_error = Some(err.to_string());
+            Ok(Err(error)) if error.is_retryable() => {
+                last_error = Some(error.into_error().to_string());
             }
-            Ok(Err(CredentialDriverReadinessError::Terminal(err))) => return Err(err),
+            Ok(Err(error)) => return Err(error.into_error()),
             Err(_) => {
                 return Err(Error::execution(format!(
                     "timed out waiting for credential driver '{driver_name}' to respond to GetCapabilities"
@@ -1728,14 +1728,44 @@ where
 #[derive(Debug)]
 enum CredentialDriverReadinessError {
     Retryable(Error),
+    RpcStatus { driver_name: String, status: Status },
     Terminal(Error),
 }
 
 #[cfg(unix)]
 impl CredentialDriverReadinessError {
+    fn rpc_status(driver_name: &str, status: Status) -> Self {
+        Self::RpcStatus {
+            driver_name: driver_name.to_string(),
+            status,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Retryable(_) => true,
+            Self::RpcStatus { status, .. } => matches!(
+                status.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::ResourceExhausted
+                    | tonic::Code::Aborted
+                    | tonic::Code::Internal
+                    | tonic::Code::Unknown
+            ),
+            Self::Terminal(_) => false,
+        }
+    }
+
     fn into_error(self) -> Error {
         match self {
             Self::Retryable(error) | Self::Terminal(error) => error,
+            Self::RpcStatus {
+                driver_name,
+                status,
+            } => Error::config(format!(
+                "credential driver '{driver_name}' GetCapabilities failed: {status}"
+            )),
         }
     }
 }
@@ -1760,8 +1790,7 @@ async fn connect_ready_credential_driver(
         timeout,
         client.get_capabilities(request),
     )
-    .await
-    .map_err(CredentialDriverReadinessError::Retryable)?;
+    .await?;
     let negotiated_extension = negotiate(
         ExtensionFamily::Credentials,
         driver_name,
@@ -1779,19 +1808,15 @@ async fn await_credential_driver_capabilities(
     response: impl Future<
         Output = Result<tonic::Response<GetCredentialDriverCapabilitiesResponse>, Status>,
     >,
-) -> CoreResult<GetCredentialDriverCapabilitiesResponse> {
+) -> Result<GetCredentialDriverCapabilitiesResponse, CredentialDriverReadinessError> {
     tokio::time::timeout(timeout, response)
         .await
         .map_err(|_| {
-            Error::config(format!(
+            CredentialDriverReadinessError::Retryable(Error::config(format!(
                 "credential driver '{driver_name}' GetCapabilities timed out"
-            ))
+            )))
         })?
-        .map_err(|status| {
-            Error::config(format!(
-                "credential driver '{driver_name}' GetCapabilities failed: {status}"
-            ))
-        })
+        .map_err(|status| CredentialDriverReadinessError::rpc_status(driver_name, status))
         .map(tonic::Response::into_inner)
 }
 
@@ -2559,14 +2584,15 @@ socket_path = {socket_path_toml}
             response,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_error();
 
         assert!(err.to_string().contains("GetCapabilities timed out"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn launched_driver_protocol_incompatibility_is_terminal() {
+    async fn launched_driver_failed_precondition_is_terminal() {
         let mut child = Command::new("sleep")
             .arg("30")
             .kill_on_drop(true)
@@ -2579,12 +2605,16 @@ socket_path = {socket_path_toml}
             Path::new("/unused-test-socket"),
             &mut child,
             Duration::from_secs(30),
-            || {
-                std::future::ready(Err(CredentialDriverReadinessError::Terminal(
-                    Error::config(
+            || async {
+                await_credential_driver_capabilities(
+                    "enterprise-secrets",
+                    Duration::from_secs(30),
+                    std::future::ready(Err(Status::failed_precondition(
                         "credentials extension 'enterprise-secrets' uses unsupported protocol 2.0; gateway supports 1.0",
-                    ),
-                )))
+                    ))),
+                )
+                .await?;
+                unreachable!("failed-precondition response cannot produce capabilities")
             },
         )
         .await
@@ -2592,6 +2622,45 @@ socket_path = {socket_path_toml}
 
         assert!(err.to_string().contains("unsupported protocol 2.0"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_driver_rpc_status_retries_only_transient_failures() {
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::Internal,
+            Code::Unknown,
+        ] {
+            assert!(
+                CredentialDriverReadinessError::rpc_status(
+                    "enterprise-secrets",
+                    Status::new(code, "not ready"),
+                )
+                .is_retryable(),
+                "{code:?} should be retried"
+            );
+        }
+
+        for code in [
+            Code::InvalidArgument,
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::Unimplemented,
+        ] {
+            assert!(
+                !CredentialDriverReadinessError::rpc_status(
+                    "enterprise-secrets",
+                    Status::new(code, "incompatible"),
+                )
+                .is_retryable(),
+                "{code:?} should fail immediately"
+            );
+        }
     }
 
     #[test]
