@@ -550,8 +550,13 @@ pub async fn run_network_proxy(
     policy_data: String,
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    additional_ca_bundle: Option<String>,
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
+    network_additional_ca_digest: Option<String>,
 ) -> Result<i32> {
+    openshell_supervisor_network::l7::tls::validate_network_additional_ca_args(
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
+    )?;
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
             "network-proxy listener must use a loopback address: {listen}"
@@ -624,6 +629,8 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
         None,
     )
     .await?;
@@ -690,6 +697,8 @@ pub async fn run_sandbox(
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    network_additional_ca_bundle: Option<std::path::PathBuf>,
+    network_additional_ca_digest: Option<String>,
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
@@ -716,6 +725,8 @@ pub async fn run_sandbox(
             auth_bundle,
             admitted_isolation_backend,
             main_exit_marker,
+            network_additional_ca_bundle,
+            network_additional_ca_digest,
         },
     ))
     .await
@@ -744,6 +755,8 @@ pub struct SandboxRunConfig {
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     pub admitted_isolation_backend: Option<String>,
     pub main_exit_marker: Option<std::path::PathBuf>,
+    pub network_additional_ca_bundle: Option<std::path::PathBuf>,
+    pub network_additional_ca_digest: Option<String>,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
@@ -775,7 +788,13 @@ pub async fn run_sandbox_with_backend(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        network_additional_ca_bundle,
+        network_additional_ca_digest,
     } = config;
+    openshell_supervisor_network::l7::tls::validate_network_additional_ca_args(
+        network_additional_ca_bundle.as_deref(),
+        network_additional_ca_digest.as_deref(),
+    )?;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
     if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
@@ -783,6 +802,7 @@ pub async fn run_sandbox_with_backend(
             "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
         ));
     }
+
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -1124,6 +1144,8 @@ pub async fn run_sandbox_with_backend(
             #[cfg(target_os = "linux")]
             None,
             remote_network_source,
+            network_additional_ca_bundle.as_deref(),
+            network_additional_ca_digest.as_deref(),
             proxy_listener,
         )
         .await?,

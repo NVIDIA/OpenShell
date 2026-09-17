@@ -462,6 +462,12 @@ message StartSandboxRequest {
   // under a different selection. Operator endpoints may change without
   // changing that identity; the driver still validates the retained resource.
   IsolationBackendRegistration isolation_backend = 6;
+  // Durable provisioning snapshot recovered by the gateway from its persisted
+  // Sandbox record. Local drivers use this only to reconcile a stopped
+  // workload/supervisor pair without trusting mutable runtime inspection
+  // output. Older gateways omit the field, preserving the original start
+  // contract on the wire.
+  optional DriverSandbox sandbox = 7;
 }
 
 message StartSandboxResponse {
