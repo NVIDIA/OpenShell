@@ -871,12 +871,12 @@ wait_for_local_gateway_status() {
   error "openshell status did not report connected within ${_timeout}s"
 }
 
-remove_local_gateway_registration() {
+remove_local_gateway_registration_from() {
+  _config_dir="$1"
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
-  _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The install-dev gateway is a user service. Replace the CLI registration
-  # directly instead of asking `gateway destroy` to tear down Docker resources.
+  # Replace the CLI registration directly instead of asking `gateway destroy`
+  # to tear down package-managed resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
     config_dir=$1
@@ -893,6 +893,15 @@ remove_local_gateway_registration() {
       rm -f "$active"
     fi
   ' sh "$_config_dir"
+}
+
+remove_local_gateway_registration() {
+  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+}
+
+remove_local_gateway_registration_snap() {
+  remove_local_gateway_registration_from \
+    "${TARGET_HOME}/snap/openshell/common/.config/openshell"
 }
 
 register_local_gateway() {
@@ -1084,18 +1093,18 @@ wait_for_docker_daemon() {
 register_local_gateway_snap() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
 
-  if _add_output="$($_register_bin gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell 2>&1)"; then
+  if _add_output="$(as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
     return 0
+  else
+    _add_status=$?
   fi
-
-  _add_status=$?
 
   case "$_add_output" in
     *"already exists"*)
       info "local gateway already exists; removing and re-adding it..."
-      remove_local_gateway_registration
-      "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell
+      remove_local_gateway_registration_snap
+      as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell
       ;;
     *)
       printf '%s\n' "$_add_output" >&2

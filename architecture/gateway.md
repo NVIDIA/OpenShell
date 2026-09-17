@@ -921,6 +921,9 @@ infrastructure:
 
 Store-installed OpenShell Snaps auto-connect `openshell:docker` to the system
 `:docker` slot. This interface does not depend on how Docker was packaged.
+Snap CLI registration is per-user under `$SNAP_USER_COMMON`; the installer runs
+registration and replacement as the invoking target user even when privilege
+escalation is needed for Snap package operations.
 
 ## Configuration
 

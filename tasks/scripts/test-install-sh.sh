@@ -408,4 +408,63 @@ if ! grep -Fq "Docker daemon did not become reachable within 2s" "$err"; then
   exit 1
 fi
 
+assert_snap_registration_uses_target_user() {
+  local calls_file="${tmpdir}/target-user-calls"
+  : > "$calls_file"
+  (
+    as_target_user() { printf 'target:%s\n' "$*" >> "$calls_file"; }
+    print_gateway_add_output() { :; }
+    register_local_gateway_snap
+  )
+  local calls
+  calls="$(<"$calls_file")"
+  if [ "$calls" != "target:openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
+    echo "FAIL: Snap registration did not run as target user" >&2
+    printf '%s\n' "$calls" >&2
+    exit 1
+  fi
+}
+
+assert_snap_registration_uses_target_user
+
+assert_snap_registration_cleanup() {
+  local target_home="${tmpdir}/target-home"
+  local snap_config="${target_home}/snap/openshell/common/.config/openshell"
+  local native_config="${target_home}/.config/openshell"
+  mkdir -p "$snap_config/gateways/openshell" "$native_config/gateways/openshell"
+  printf 'snap\n' > "$snap_config/gateways/openshell/metadata.json"
+  printf 'openshell\n' > "$snap_config/active_gateway"
+  printf 'native\n' > "$native_config/gateways/openshell/metadata.json"
+
+  export TARGET_HOME="$target_home"
+  export TARGET_USER=test-user
+  as_target_user() { "$@"; }
+  remove_local_gateway_registration_snap
+
+  if [ -e "$snap_config/gateways/openshell/metadata.json" ] || [ -e "$snap_config/active_gateway" ]; then
+    echo "FAIL: Snap registration cleanup did not remove Snap metadata" >&2
+    exit 1
+  fi
+  if [ ! -e "$native_config/gateways/openshell/metadata.json" ]; then
+    echo "FAIL: Snap registration cleanup modified native-package metadata" >&2
+    exit 1
+  fi
+}
+
+assert_snap_registration_cleanup
+
+if (
+  as_target_user() { return 17; }
+  register_local_gateway_snap
+) >"$out" 2>"$err"; then
+  echo "FAIL: unexpected Snap registration error should propagate" >&2
+  exit 1
+else
+  status=$?
+  if [ "$status" -ne 17 ]; then
+    echo "FAIL: Snap registration returned ${status}, expected 17" >&2
+    exit 1
+  fi
+fi
+
 echo "install.sh focused tests passed"
