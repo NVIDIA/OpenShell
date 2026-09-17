@@ -1002,6 +1002,12 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/vm",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 
@@ -4237,9 +4243,17 @@ impl ComputeDriver for VmDriver {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        Ok(Response::new(self.capabilities()))
+        let capabilities = self.capabilities();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            DRIVER_NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn get_gateway_listener_requirements(
@@ -7141,7 +7155,11 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }))
             .await
             .unwrap();
         client.shutdown().await;
@@ -7173,7 +7191,11 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }))
             .await
             .unwrap();
         assert!(

@@ -20,6 +20,7 @@ pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
+pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
 pub mod forward;

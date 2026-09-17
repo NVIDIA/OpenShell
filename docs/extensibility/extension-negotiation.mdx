@@ -1,0 +1,69 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Extension Protocol Negotiation"
+sidebar-title: "Protocol Negotiation"
+description: "Implement version and capability negotiation for OpenShell extensions."
+keywords: "OpenShell Extensions, Protocol Version, Capabilities, Version Skew, Migration"
+---
+
+OpenShell negotiates a common metadata envelope before it uses a compute driver, credential driver, gateway interceptor, or supervisor middleware service. Family-specific fields remain in each protocol; the common envelope determines whether the peers can safely interpret them.
+
+## Exchange Peer Metadata
+
+Both peers send `openshell.extension.v1.PeerMetadata` during the family's startup RPC. The gateway sends its metadata in `GetCapabilities` or `Describe`; the extension returns its metadata in the capability response or manifest.
+
+Set these fields:
+
+- `protocol_version` identifies the extension-family contract. OpenShell starts each family at `1.0`.
+- `implementation_name` identifies the implementation, such as `example/acme-compute`.
+- `implementation_version` identifies the extension build. Do not put the Docker, Kubernetes, Vault, or another backend's version here.
+- `supported_capabilities` lists optional behavior the peer understands.
+- `required_capabilities` lists behavior the opposite peer must support.
+
+Capability identifiers must start with `openshell.`, contain at least three lowercase dot-separated segments, and use only lowercase ASCII letters, digits, and hyphens within each segment. Each family requires its base contract capability:
+
+| Family | Base capability |
+| --- | --- |
+| Compute driver | `openshell.compute.contract` |
+| Credential driver | `openshell.credentials.contract` |
+| Gateway interceptor | `openshell.gateway-interceptor.contract` |
+| Supervisor middleware | `openshell.supervisor-middleware.contract` |
+
+Do not repeat a capability. OpenShell rejects empty, malformed, duplicate, or oversized metadata instead of normalizing ambiguous input.
+
+## Version-Skew Policy
+
+OpenShell applies this compatibility matrix at startup:
+
+| Peer relationship | Result |
+| --- | --- |
+| Same major and same minor | Accepted when both requirement sets are satisfied. |
+| Same major and different minor | Accepted when both requirement sets are satisfied. Unknown optional capabilities are retained for discovery and otherwise ignored. |
+| Different major | Rejected with both protocol versions in the error. |
+| Missing peer metadata or protocol version | Rejected with upgrade guidance. |
+| Either peer lacks a capability required by the other | Rejected with the missing capability names. |
+
+Minor releases must keep existing fields and behavior compatible. Add a capability when a peer must detect an optional behavior. Increment the protocol major when requirements cannot express a safe additive transition.
+
+## Preserve Family-Specific Capabilities
+
+Keep typed family data beside the common envelope. Compute resource capabilities, credential-driver feature flags, interceptor bindings, and middleware operation/phase bindings remain authoritative for their domains. Do not flatten typed values into capability strings.
+
+Built-in and external extensions follow the same validator. A built-in cannot bypass protocol version or requirement checks merely because it runs in the gateway process.
+
+## Migrate an Extension
+
+1. Regenerate bindings from the current OpenShell protobuf files. Supervisor middleware authors must update `Describe` from `google.protobuf.Empty` to `MiddlewareDescribeRequest`.
+2. Read and validate the gateway metadata supplied in the startup request.
+3. Return protocol `1.0`, a stable implementation name, the extension build version, the family base capability, and any additional supported or required capabilities.
+4. Schedule a coordinated gateway and extension upgrade. There is no supported mixed legacy/current pairing: current extensions reject legacy gateways that omit metadata, and current gateways reject legacy extensions that omit metadata. Stop traffic, upgrade both peers, and restart them together.
+5. Run mixed-minor tests with required capabilities present and absent after both peers implement negotiation. Verify that a major mismatch and missing metadata fail before runtime traffic.
+
+The legacy compute and credential `driver_version` fields and middleware `service_version` field remain populated during migration. New integrations must use `PeerMetadata.implementation_version`; the legacy fields are diagnostic compatibility fields and may be removed in a future protocol major.
+
+## Inspect Negotiated Extensions
+
+Admins can run `openshell gateway info` or call protected `GetGatewayInfo`. The response contains a sorted snapshot captured at startup: family, configured name, implementation identity/version, protocol version, supported capabilities, and extension requirements.
+
+The snapshot excludes endpoints, audiences, bearer tokens, certificates, backend configuration, and free-form extension diagnostics.

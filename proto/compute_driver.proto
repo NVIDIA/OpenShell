@@ -7,6 +7,7 @@ package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "extension.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -71,7 +72,10 @@ service ComputeDriver {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
-message GetCapabilitiesRequest {}
+message GetCapabilitiesRequest {
+  // Gateway protocol metadata. Drivers must reject unmet requirements.
+  openshell.extension.v1.PeerMetadata gateway = 1;
+}
 
 message GetCapabilitiesResponse {
   reserved 4, 5;
@@ -79,7 +83,7 @@ message GetCapabilitiesResponse {
 
   // Human-readable driver name.
   string driver_name = 1;
-  // Driver implementation version string.
+  // Deprecated diagnostic compatibility field. Use extension.implementation_version.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
@@ -101,6 +105,8 @@ message GetCapabilitiesResponse {
   // Maximum rootfs tar file size in bytes accepted by the driver. Zero means
   // the driver does not support rootfs tar sources.
   uint64 rootfs_tar_max_bytes = 11;
+  // Compute extension protocol metadata. Required for protocol negotiation.
+  openshell.extension.v1.PeerMetadata extension = 12;
 }
 
 message AuthenticateSandboxRequest {

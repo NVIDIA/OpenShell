@@ -10,6 +10,7 @@ use std::time::Instant;
 use json_patch::{PatchOperation, patch};
 use metrics::{counter, histogram};
 use openshell_core::config::GatewayInterceptorConfig;
+use openshell_core::extension_protocol::NegotiatedExtension;
 use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorEvaluation, InterceptorResult, JsonPatch, ModifyOperationEvaluation,
     PostCommitEvaluation, ValidateEvaluation, interceptor_evaluation,
@@ -102,6 +103,11 @@ impl GatewayInterceptorRuntime {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.plan.is_empty()
+    }
+
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        self.plan.negotiated_extensions()
     }
 
     #[must_use]

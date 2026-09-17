@@ -20,7 +20,7 @@ use openshell_bootstrap::{
     save_active_gateway, store_gateway_metadata,
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
-use openshell_core::proto::{GetGatewayInfoRequest, HealthRequest, ServiceStatus};
+use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -33,6 +33,7 @@ struct GatewayInfoView {
     status: String,
     version: String,
     compute_drivers: Vec<ComputeDriverInfoView>,
+    extensions: Vec<ExtensionInfoView>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,17 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionInfoView {
+    kind: String,
+    configured_name: String,
+    implementation_name: String,
+    implementation_version: String,
+    protocol_version: String,
+    supported_capabilities: Vec<String>,
+    required_capabilities: Vec<String>,
 }
 
 /// Show gateway status.
@@ -376,6 +388,19 @@ pub async fn gateway_info(
         })?
         .into_inner();
 
+    let extensions = info
+        .extensions
+        .into_iter()
+        .map(|extension| ExtensionInfoView {
+            kind: extension_kind_name(extension.kind).to_string(),
+            configured_name: extension.configured_name,
+            implementation_name: extension.implementation_name,
+            implementation_version: extension.implementation_version,
+            protocol_version: format!("{}.{}", extension.protocol_major, extension.protocol_minor),
+            supported_capabilities: extension.supported_capabilities,
+            required_capabilities: extension.required_capabilities,
+        })
+        .collect();
     let view = GatewayInfoView {
         gateway: gateway_name.to_string(),
         server: server.to_string(),
@@ -396,6 +421,7 @@ pub async fn gateway_info(
                 }
             })
             .collect(),
+        extensions,
     };
 
     print_gateway_info(&view, output)
@@ -422,8 +448,50 @@ fn print_gateway_info(view: &GatewayInfoView, output: &str) -> Result<()> {
     println!("  {} {}", "Status:".dimmed(), view.status);
     println!("  {} {}", "Version:".dimmed(), view.version);
     print_compute_driver_info(&view.compute_drivers);
+    print_extension_info(&view.extensions);
 
     Ok(())
+}
+
+fn extension_kind_name(kind: i32) -> &'static str {
+    match ExtensionKind::try_from(kind).unwrap_or(ExtensionKind::Unspecified) {
+        ExtensionKind::ComputeDriver => "compute-driver",
+        ExtensionKind::CredentialDriver => "credential-driver",
+        ExtensionKind::GatewayInterceptor => "gateway-interceptor",
+        ExtensionKind::SupervisorMiddleware => "supervisor-middleware",
+        ExtensionKind::Unspecified => "unspecified",
+    }
+}
+
+fn print_extension_info(extensions: &[ExtensionInfoView]) {
+    if extensions.is_empty() {
+        return;
+    }
+    println!("  {}", "Extensions:".dimmed());
+    for extension in extensions {
+        println!("    {} ({})", extension.configured_name, extension.kind);
+        println!(
+            "      {} {} {} (protocol {})",
+            "Implementation:".dimmed(),
+            extension.implementation_name,
+            extension.implementation_version,
+            extension.protocol_version
+        );
+        if !extension.supported_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Capabilities:".dimmed(),
+                extension.supported_capabilities.join(", ")
+            );
+        }
+        if !extension.required_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Requires gateway:".dimmed(),
+                extension.required_capabilities.join(", ")
+            );
+        }
+    }
 }
 
 fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
@@ -467,6 +535,15 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 },
             }))
             .collect::<Vec<_>>(),
+        "extensions": view.extensions.iter().map(|extension| serde_json::json!({
+            "kind": &extension.kind,
+            "configured_name": &extension.configured_name,
+            "implementation_name": &extension.implementation_name,
+            "implementation_version": &extension.implementation_version,
+            "protocol_version": &extension.protocol_version,
+            "supported_capabilities": &extension.supported_capabilities,
+            "required_capabilities": &extension.required_capabilities,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1507,9 +1584,9 @@ pub fn gateway_remove(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
-        GatewayInfoView, TlsOptions, format_gateway_select_header, format_gateway_select_items,
-        gateway_add, gateway_auth_label, gateway_authentication_state,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, ExtensionInfoView,
+        GatewayAuthenticationState, GatewayInfoView, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_authentication_state,
         gateway_env_override_warning, gateway_info_to_json, gateway_remote_label,
         gateway_select_with, gateway_to_json, gateway_type_label, http_health_check,
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
@@ -1824,6 +1901,15 @@ mod tests {
                     driver_version: "0.0.75".to_string(),
                 },
             }],
+            extensions: vec![ExtensionInfoView {
+                kind: "compute-driver".to_string(),
+                configured_name: "podman".to_string(),
+                implementation_name: "openshell/podman".to_string(),
+                implementation_version: "0.0.75".to_string(),
+                protocol_version: "1.0".to_string(),
+                supported_capabilities: vec!["openshell.compute.contract".to_string()],
+                required_capabilities: vec!["openshell.compute.contract".to_string()],
+            }],
         };
 
         let json = gateway_info_to_json(&view);
@@ -1836,6 +1922,7 @@ mod tests {
             json["compute_drivers"][0]["capabilities"]["driver_name"],
             "podman"
         );
+        assert_eq!(json["extensions"][0]["protocol_version"], "1.0");
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
@@ -1851,6 +1938,7 @@ mod tests {
             status: "healthy".to_string(),
             version: "0.0.74".to_string(),
             compute_drivers: Vec::new(),
+            extensions: Vec::new(),
         };
 
         let json = gateway_info_to_json(&view);

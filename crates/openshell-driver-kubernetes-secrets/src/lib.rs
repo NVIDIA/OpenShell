@@ -461,15 +461,29 @@ impl Clone for KubernetesSecretsCredentialDriver {
 impl CredentialDriver for CredentialDriverService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCredentialDriverCapabilitiesRequest>,
+        request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
-        Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
+        let capabilities = GetCredentialDriverCapabilitiesResponse {
             driver_name: KubernetesSecretsCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: KubernetesSecretsCredentialDriver::NAME.to_string(),
             supports_list: false,
             supports_expires_at: false,
-        }))
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Credentials,
+                "openshell/kubernetes-secrets",
+                VERSION,
+                [],
+            )),
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Credentials,
+            KubernetesSecretsCredentialDriver::NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn store_credential(

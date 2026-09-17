@@ -3609,6 +3609,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-response-relay",
+                    "test",
+                    [],
+                )),
             }
         }
 
