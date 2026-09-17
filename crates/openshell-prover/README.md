@@ -29,6 +29,42 @@ runtime match language and can therefore match non-ASCII runtime values. A
 solver string that cannot be decoded and validated exactly produces
 `invalid_witness` rather than counterexample evidence.
 
+## Containment API compatibility
+
+The containment module is a reusable Rust API, but this contract does not make
+the entire `openshell-prover` crate a stable published SDK. Construct options
+through `CheckOptions::new`, and accept a policy only when the result is
+`CheckResult::Within`:
+
+```rust
+use std::time::Duration;
+use openshell_prover::containment::{
+    CheckOptions, CheckResult, check_within_boundary, parse_policy_str,
+};
+
+let boundary = parse_policy_str("version: 1\n")?;
+let candidate = parse_policy_str("version: 1\n")?;
+let result = check_within_boundary(
+    &boundary,
+    &candidate,
+    CheckOptions::new(Duration::from_secs(10)),
+);
+let authorized = matches!(result, CheckResult::Within(_));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`ReasonCode`, `CheckDomain`, `Protocol`, and `Counterexample` are open to new
+variants. `CheckOptions`, `CheckScope`, `WithinEvidence`, and existing
+counterexample variants are open to new fields. Match these types with `..`
+and wildcard arms, use their accessors and `as_str()` identifiers, and treat
+unknown values as a fail-closed result. Existing identifier strings are stable.
+
+`CheckResult` is intentionally closed to the four states `Within`, `Exceeds`,
+`Unsupported`, and `Inconclusive`. `FilesystemAccess` is likewise closed to
+`Read` and `Write`. Adding a result state or filesystem access mode is a
+breaking API change. Rust source compatibility is separate from the CLI JSON
+schema and containment model versions; this contract changes neither.
+
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
 chunk pass through (when the reviewer opts in via the

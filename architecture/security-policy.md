@@ -389,6 +389,13 @@ aggregate limits across both inputs. Oversized checks therefore return
 validation indexes host and port authority rather than comparing every endpoint
 pair, and it checks cancellation while scanning admitted policies.
 
+The Rust containment API has an explicit extensibility contract: options and
+modeled-domain evidence permit additive growth, while the four `CheckResult`
+states remain exhaustive and authorization accepts only `Within`. This Rust
+source-compatibility boundary is separate from the CLI JSON schema and the
+reported containment model version. See the `openshell-prover` crate README for
+the supported construction and matching patterns.
+
 This containment operation is separate from the proposal-risk queries below.
 See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
 for installation, command behavior, model limitations, evidence, and exit codes.
