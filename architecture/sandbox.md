@@ -39,6 +39,9 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+
+A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
