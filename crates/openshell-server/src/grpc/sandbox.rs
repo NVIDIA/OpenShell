@@ -128,7 +128,7 @@ impl Drop for WatchSandboxStream {
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
 /// cannot distinguish the two cases (CWE-203).
 pub(super) async fn fetch_and_authorize_sandbox(
-    state: &Arc<ServerState>,
+    state: &ServerState,
     principal: &crate::auth::principal::Principal,
     sandbox_id: &str,
 ) -> Result<Sandbox, Status> {
@@ -1874,19 +1874,12 @@ pub(super) async fn handle_exec_sandbox(
     use openshell_core::ObjectId;
 
     let principal = super::extract_principal(&request)?;
+    let completion = request
+        .extensions()
+        .get::<super::mutation_replay::Completion>()
+        .cloned();
     let req = request.into_inner();
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-    if req.command.is_empty() {
-        return Err(Status::invalid_argument("command is required"));
-    }
-    if req.environment.keys().any(|key| !is_valid_env_key(key)) {
-        return Err(Status::invalid_argument(
-            "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
-        ));
-    }
-    validate_exec_request_fields(&req)?;
+    validate_exec_start(&req)?;
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
@@ -1940,6 +1933,7 @@ pub(super) async fn handle_exec_sandbox(
             no_login_shell,
             cols,
             rows,
+            completion,
         )
         .await
         {
@@ -2290,6 +2284,29 @@ async fn bridge_forward_tcp_stream(
 // Interactive exec handler (bidirectional stdin streaming)
 // ---------------------------------------------------------------------------
 
+pub(super) fn validate_exec_start(req: &ExecSandboxRequest) -> Result<(), Status> {
+    use openshell_core::rpc_error;
+    if req.sandbox_id.is_empty() {
+        return Err(rpc_error::invalid_argument(
+            "sandbox_id",
+            "sandbox_id is required",
+        ));
+    }
+    if req.command.is_empty() {
+        return Err(rpc_error::invalid_argument(
+            "command",
+            "command is required",
+        ));
+    }
+    if req.environment.keys().any(|key| !is_valid_env_key(key)) {
+        return Err(rpc_error::invalid_argument(
+            "environment",
+            "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
+        ));
+    }
+    validate_exec_request_fields(req)
+}
+
 fn validate_interactive_exec_start(
     msg: Option<ExecSandboxInput>,
 ) -> Result<ExecSandboxRequest, Status> {
@@ -2304,18 +2321,7 @@ fn validate_interactive_exec_start(
         ));
     };
 
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-    if req.command.is_empty() {
-        return Err(Status::invalid_argument("command is required"));
-    }
-    if req.environment.keys().any(|key| !is_valid_env_key(key)) {
-        return Err(Status::invalid_argument(
-            "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
-        ));
-    }
-    validate_exec_request_fields(&req)?;
+    validate_exec_start(&req)?;
 
     Ok(req)
 }
@@ -2324,10 +2330,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<ExecSandboxInput>>,
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
-    use openshell_core::ObjectId;
-
-    let principal = super::extract_principal(&request)?;
-    let mut input_stream = request.into_inner();
+    let (metadata, extensions, mut input_stream) = request.into_parts();
 
     let first_msg = input_stream
         .message()
@@ -2335,6 +2338,46 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::internal(format!("failed to read first message: {e}")))?;
 
     let req = validate_interactive_exec_start(first_msg)?;
+
+    let mut request = Request::from_parts(
+        metadata,
+        extensions,
+        ExecSandboxInput {
+            payload: Some(openshell_core::proto::exec_sandbox_input::Payload::Start(
+                req,
+            )),
+        },
+    );
+    request
+        .extensions_mut()
+        .insert(super::mutation_replay::streaming::InteractiveInput(
+            Arc::new(tokio::sync::Mutex::new(Some(input_stream))),
+        ));
+    super::mutation_replay::run(state, request).await
+}
+
+pub(super) async fn handle_exec_sandbox_interactive_start(
+    state: &Arc<ServerState>,
+    request: Request<ExecSandboxInput>,
+) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let completion = request
+        .extensions()
+        .get::<super::mutation_replay::Completion>()
+        .cloned();
+    let input = request
+        .extensions()
+        .get::<super::mutation_replay::streaming::InteractiveInput>()
+        .ok_or_else(|| Status::internal("interactive input handoff missing"))?
+        .clone();
+    let input_stream = input
+        .0
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| Status::internal("interactive input already claimed"))?;
+    let req = super::mutation_replay::streaming::start(request.get_ref())?;
+    validate_exec_start(req)?;
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
@@ -2348,7 +2391,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
+    let command_str = build_remote_exec_command(req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
@@ -2388,6 +2431,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             execution_timeout,
             cols,
             rows,
+            completion,
         )
         .await
         {
@@ -2695,6 +2739,7 @@ async fn stream_exec_over_relay(
     no_login_shell: bool,
     cols: u32,
     rows: u32,
+    completion: Option<super::mutation_replay::Completion>,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -2724,26 +2769,22 @@ async fn stream_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if let Some(execution_timeout) = execution_timeout {
-        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
-            result
-        } else {
-            let _ = tx
-                .send(Ok(ExecSandboxEvent {
-                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                        ExecSandboxExit { exit_code: 124 },
-                    )),
-                }))
-                .await;
-            let _ = proxy_task.await;
-            return Ok(());
-        }
-    } else {
-        exec.await
-    };
+    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    if matches!(exec_result, Ok(None)) {
+        let _ = tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                    ExecSandboxExit { exit_code: 124 },
+                )),
+            }))
+            .await;
+        let _ = proxy_task.await;
+        return Ok(());
+    }
 
     let exit_code = match exec_result {
-        Ok(code) => code,
+        Ok(Some(code)) => code,
+        Ok(None) => unreachable!("timeout returned above"),
         Err(status) => {
             let _ = proxy_task.await;
             return Err(status);
@@ -2776,6 +2817,7 @@ async fn stream_interactive_exec_over_relay(
     execution_timeout: Option<std::time::Duration>,
     cols: u32,
     rows: u32,
+    completion: Option<super::mutation_replay::Completion>,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -2805,26 +2847,22 @@ async fn stream_interactive_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if let Some(execution_timeout) = execution_timeout {
-        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
-            result
-        } else {
-            let _ = tx
-                .send(Ok(ExecSandboxEvent {
-                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                        ExecSandboxExit { exit_code: 124 },
-                    )),
-                }))
-                .await;
-            let _ = proxy_task.await;
-            return Ok(());
-        }
-    } else {
-        exec.await
-    };
+    let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    if matches!(exec_result, Ok(None)) {
+        let _ = tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                    ExecSandboxExit { exit_code: 124 },
+                )),
+            }))
+            .await;
+        let _ = proxy_task.await;
+        return Ok(());
+    }
 
     let exit_code = match exec_result {
-        Ok(code) => code,
+        Ok(Some(code)) => code,
+        Ok(None) => unreachable!("timeout returned above"),
         Err(status) => {
             let _ = proxy_task.await;
             return Err(status);
@@ -2842,6 +2880,29 @@ async fn stream_interactive_exec_over_relay(
         .await;
 
     Ok(())
+}
+
+/// `Ok(Some(code))` requires a real SSH `ExitStatus`, including nonzero codes.
+/// Synthetic gateway timeouts, lost status, and dropped futures leave the claim
+/// unresolved. Finalization precedes terminal delivery to the client.
+pub(super) async fn wait_for_exec_terminal(
+    exec: impl Future<Output = Result<i32, Status>>,
+    execution_timeout: Option<std::time::Duration>,
+    completion: Option<super::mutation_replay::Completion>,
+) -> Result<Option<i32>, Status> {
+    let result = if let Some(execution_timeout) = execution_timeout {
+        match tokio::time::timeout(execution_timeout, exec).await {
+            Ok(result) => result,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        exec.await
+    };
+    let exit_code = result?;
+    if let Some(completion) = completion {
+        completion.stream_terminal().await?;
+    }
+    Ok(Some(exit_code))
 }
 
 #[allow(clippy::too_many_arguments)]

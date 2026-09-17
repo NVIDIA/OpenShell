@@ -5014,7 +5014,12 @@ type ExecSandboxRequest struct {
 	// (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
 	// sourced by them) are applied. When true, the command runs without those
 	// files (`bash -c`), for automation that needs predictable startup behavior.
-	NoLoginShell  bool `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	NoLoginShell bool `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	// Optional nonzero UUID for durable launch admission. Also applies to the
+	// initial ExecSandboxInteractive start message. Duplicates never relaunch,
+	// reattach, or replay output/stdin. Unconfirmed executions remain fenced;
+	// confirmed terminal executions retain the fence for 24 hours.
+	RequestId     string `protobuf:"bytes,11,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5117,6 +5122,13 @@ func (x *ExecSandboxRequest) GetNoLoginShell() bool {
 		return x.NoLoginShell
 	}
 	return false
+}
+
+func (x *ExecSandboxRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
 }
 
 // One stdout chunk from a sandbox exec.
@@ -15506,7 +15518,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12#\n" +
 	"\rallow_missing\x18\x02 \x01(\bR\fallowMissing\"b\n" +
 	"\x18RevokeSshSessionResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xd1\x03\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xf0\x03\n" +
 	"\x12ExecSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
@@ -15519,7 +15531,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04cols\x18\b \x01(\rR\x04cols\x12\x12\n" +
 	"\x04rows\x18\t \x01(\rR\x04rows\x12$\n" +
 	"\x0eno_login_shell\x18\n" +
-	" \x01(\bR\fnoLoginShell\x1a>\n" +
+	" \x01(\bR\fnoLoginShell\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\v \x01(\tR\trequestId\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06R\x0ftimeout_seconds\"'\n" +
