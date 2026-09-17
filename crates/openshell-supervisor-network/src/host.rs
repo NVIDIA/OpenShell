@@ -231,6 +231,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         config.activity_tx,
         ready_rx,
         &upstream_proxy_args,
+        None,
     )
     .await?;
 

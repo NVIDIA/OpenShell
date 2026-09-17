@@ -832,15 +832,24 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let output_dir = tempfile::tempdir().expect("HTTPS output directory");
     let output_path = output_dir.path().join("example.html");
     let certificate_path = output_dir.path().join("peer-certificate.txt");
+    let diagnostic_path = output_dir.path().join("https-diagnostic.txt");
     let output_dir_string = output_dir.path().to_string_lossy().into_owned();
     let output_path_string = output_path.to_string_lossy().into_owned();
     let certificate_path_string = certificate_path.to_string_lossy().into_owned();
+    let diagnostic_path_string = diagnostic_path.to_string_lossy().into_owned();
     let cmd_string = cmd.to_string_lossy().into_owned();
+    // Schannel's revocation lookup targets are intentionally outside this
+    // test's example.com-only policy. Disable that network lookup while still
+    // requiring curl to validate the proxy-issued certificate against the
+    // injected CA bundle.
     let script = format!(
-        "type \"%CURL_CA_BUNDLE%\" 1>NUL && \
-         \"{}\" --fail --silent --show-error --cacert \"%CURL_CA_BUNDLE%\" \
+        "echo CURL_CA_BUNDLE=%CURL_CA_BUNDLE% 1>\"{diagnostic_path_string}\" && \
+         type \"%CURL_CA_BUNDLE%\" 1>NUL 2>>\"{diagnostic_path_string}\" && \
+         \"{}\" --fail --silent --show-error --ssl-no-revoke \
+         --cacert \"%CURL_CA_BUNDLE%\" \
          https://example.com/ --output \"{output_path_string}\" \
-         --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\"",
+         --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\" \
+         2>>\"{diagnostic_path_string}\"",
         curl.display()
     );
     let command = vec![
@@ -932,10 +941,12 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     }
 
     let condition = terminal_condition.expect("HTTPS sandbox should reach a terminal condition");
+    let diagnostic = std::fs::read_to_string(diagnostic_path)
+        .unwrap_or_else(|error| format!("failed to read HTTPS diagnostic: {error}"));
     assert_eq!(
         condition.reason, "AgentCompleted",
-        "HTTPS workload failed: {}",
-        condition.message
+        "HTTPS workload failed: {}; diagnostic: {diagnostic}",
+        condition.message,
     );
     assert!(output_path.exists(), "curl should write the HTTPS response");
     assert!(

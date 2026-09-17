@@ -660,6 +660,31 @@ fn append_tls_readonly_grant(
     }
 }
 fn encode_windows_command_line(args: &[String]) -> String {
+    if args
+        .first()
+        .and_then(|executable| executable.rsplit(['\\', '/']).next())
+        .is_some_and(|executable| {
+            executable.eq_ignore_ascii_case("cmd") || executable.eq_ignore_ascii_case("cmd.exe")
+        })
+        && let Some(command_index) = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+    {
+        let mut encoded = args[..=command_index]
+            .iter()
+            .map(|arg| quote_windows_argument(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if command_index + 1 < args.len() {
+            encoded.push(' ');
+            // cmd.exe parses the command tail with its own grammar. Escaping
+            // embedded quotes as C argv would leave literal backslashes in
+            // paths and redirections (for example `\"C:\\work file\"`).
+            encoded.push_str(&args[command_index + 1..].join(" "));
+        }
+        return encoded;
+    }
+
     args.iter()
         .map(|arg| quote_windows_argument(arg))
         .collect::<Vec<_>>()
@@ -2918,6 +2943,15 @@ mod lifecycle_tests {
         assert_eq!(
             quote_windows_argument("trailing slash\\ "),
             r#""trailing slash\ ""#
+        );
+        assert_eq!(
+            encode_windows_command_line(&[
+                r"C:\Windows\System32\CMD.EXE".into(),
+                "/d".into(),
+                "/c".into(),
+                r#"echo hello > "C:\work dir\output.txt""#.into(),
+            ]),
+            r#"C:\Windows\System32\CMD.EXE /d /c echo hello > "C:\work dir\output.txt""#
         );
     }
     #[tokio::test]
