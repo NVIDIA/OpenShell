@@ -39,6 +39,9 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+
+A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
@@ -381,6 +384,8 @@ enhancement and out of scope.) Workload proxy variables are removed from the
 protected launch environment; transparent socket mediation does not depend on
 them.
 
+The canonical main process receives the declared workload environment before
+supervisor-only values are stripped and provider placeholders are injected.
 Template environment is treated like user-provided sandbox environment. It can
 shape the workload child, but it cannot override driver-controlled identity,
 gateway callback, TLS, relay socket, proxy, provider, or supervisor coordination

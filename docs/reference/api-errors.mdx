@@ -31,6 +31,9 @@ Recognized gateway reasons include the following.
 | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
 | `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
 | `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+| `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
+| `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
+| `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original scope, resource, interceptor transformation, or fingerprint key is no longer replayable. Reconcile effects; the gateway does not execute the request again. Missing private-key material can also reject admission before work starts. |
 
 ## Status and retry guidance
 
@@ -84,6 +87,108 @@ status fields; use `..` when destructuring variants that do not need those field
 Go and TypeScript add typed detail fields to their existing error types.
 
 No SDK automatically retries a mutation as a result of decoding these details.
+
+## Durable request admission
+
+Thirty user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
+
+| Resource | RPCs |
+|---|---|
+| Workspace | `CreateWorkspace`, `DeleteWorkspace` |
+| Workspace member | `AddWorkspaceMember`, `RemoveWorkspaceMember` |
+| Sandbox template | `CreateSandboxTemplate`, `DeleteSandboxTemplate` |
+| Sandbox | `CreateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
+| Service | `ExposeService`, `DeleteService` |
+| Provider | `CreateProvider`, `UpdateProvider`, `DeleteProvider`, `ConfigureProviderRefresh`, `DeleteProviderRefresh`, `RotateProviderCredential` |
+| Provider profile | `ImportProviderProfiles`, `UpdateProviderProfiles`, `DeleteProviderProfile` |
+| Policy and config | `UpdateConfig`, `ApproveDraftChunk`, `RejectDraftChunk`, `EditDraftChunk`, `UndoDraftChunk`, `ApproveAllDraftChunks`, `ClearDraftChunks` |
+
+Use a nonzero, hyphenated UUID of exactly 36 characters. Uppercase and lowercase
+forms identify the same request. An empty ID preserves the existing behavior
+without deduplication. This ID is separate from transport correlation metadata.
+The gateway scopes it to the authenticated identity provider, OIDC issuer,
+subject, RPC method, and requested workspace. Use the same identity, scope, ID,
+and payload when checking an admitted attempt. Map ordering does not affect the
+payload fingerprint; changed values or protobuf message presence do.
+
+For `CreateWorkspace` and `DeleteWorkspace`, the requested workspace is the
+request's `name`. The same caller can reuse an ID for the same method on different
+workspace names. Within one workspace name, a changed payload still returns
+`REQUEST_ID_PAYLOAD_MISMATCH`. Workspace deletion replay does not require the
+deleted workspace to exist and does not delete a same-name replacement.
+
+Pre-release gateways that used unscoped workspace admission require reconciliation
+before upgrading. Their workspace create/delete receipts do not replay under the
+corrected name-scoped namespace. Do not retry those IDs after upgrading without
+reconciling the original operations' effects.
+
+The gateway durably admits one owner before executing the mutation. Concurrent
+duplicates either replay its confirmed success or return
+`REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
+admitted work. An error, interrupted process, or failed success-record write
+leaves the admission unresolved. No gateway replica takes over that admission,
+even after restart or after 24 hours. Status codes alone do not prove that the
+attempt had no effects.
+
+Successful results have a 24-hour replay window, measured from durable completion.
+A successful replay includes `openshell-replayed: true` response metadata and
+does not extend the window. After it expires, the same ID can admit a new
+execution. Do not retry an old operation after that window without reconciling
+its effects. Unresolved admissions never expire.
+
+Every replay checks current authorization, including membership and permission
+to assign workspace administrators. A replacement workspace makes workspace-scoped
+replay unavailable. Target readiness, conditional-write versions, and draft review
+tokens are first-execution preconditions, not conditions to execute again.
+
+| Result family | Replay behavior |
+|---|---|
+| Workspace, membership, template, provider, and profile resources | Load the original UUID at its recorded version. Missing or changed resources make replay unavailable. Provider credentials remain redacted. |
+| Sandbox resources | Load the original UUID with its current state, including newer status or configuration. Attach/detach flags describe the original operation. A missing original sandbox makes replay unavailable. |
+| Provider readiness receipts | Return the original attach, detach, or update receipts and mutation ID, including the original update target set. Later attachment changes do not replace these receipts. Missing operation evidence makes replay unavailable without executing the mutation again. |
+| Service endpoint | Require the original endpoint version and sandbox identity. Return the recorded URL. |
+| Refresh status | Return current status for the original provider, refresh record, and authorization epoch. Reconfiguration or removal makes replay unavailable. Rotation is not repeated. |
+| Policy and config | Return the original versions, counts, and nonsecret annotations while the original sandbox exists. Global config has no sandbox guard. |
+| Deletion | Return the original outcome without requiring the deleted target or parent to exist and without deleting a replacement. `ACCEPTED` remains an acknowledgment of the original cleanup, not proof of completion. |
+
+Profile imports and updates also preserve their original public diagnostics and
+success flags. Profile declarations, diagnostic source labels, and annotations
+must not contain secrets.
+
+For sandbox, service, provider, profile, and policy/config methods, fingerprints
+use HMAC with domain-separated material derived from the configured gateway JWT
+private key, or the primary TLS private key when JWT signing is not configured.
+These methods require readable, stable private-key material when you supply an
+ID. Replicas sharing a database must share that material. Changing it makes
+existing protected receipts unavailable until their successful replay window
+expires; unresolved admissions remain protected indefinitely. Workspace,
+membership, and template methods retain their original fingerprint format.
+
+Gateway interceptors run their current modification and validation phases on
+every attempt, including replay. They cannot add, remove, or change `request_id`.
+The gateway fingerprints the original client payload and separately guards the
+effective transformed payload and workspace. A changed transformation makes
+replay unavailable. A current denial remains authoritative. Successful replay
+does not invoke post-commit observers again. Post-commit observation remains
+best-effort; this is not a durable delivery queue.
+
+Replay rows contain fingerprints, resource references, and explicitly selected
+public diagnostic or scalar outcomes, not credential-bearing response snapshots.
+Completed receipts are limited to 64 KiB. A failure to capture a bounded receipt
+after execution leaves the admission unresolved. Each caller can
+hold at most 1,000 durable admissions. At capacity, the gateway removes expired
+successes; if no space remains, it rejects new admissions with
+`RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
+require operator investigation; there is no automatic reset or takeover API.
+The gateway also limits detached admission workers to 64 per process and these
+request messages to 4 MiB.
+
+Supply IDs through generated/raw RPC clients. Curated SDK request-ID helpers and
+automatic retry policies are not part of this contract yet. Exec, SSH sessions,
+rootfs staging, and supervisor-authenticated mutations do not gain deduplication
+from this feature. Sandbox principals cannot opt into `UpdateConfig` admission.
+Check gateway compatibility
+before relying on IDs; older protobuf servers can silently ignore unknown fields.
 
 ## Deletion outcomes
 

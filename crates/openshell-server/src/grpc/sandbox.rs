@@ -3337,6 +3337,7 @@ mod tests {
     #[test]
     fn sandbox_create_telemetry_uses_resolved_template_gpu_request() {
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
                 policy: Some(openshell_core::proto::SandboxPolicy::default()),
@@ -3376,6 +3377,7 @@ mod tests {
     #[test]
     fn sandbox_create_telemetry_falls_back_to_request_for_unresolved_template() {
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
                 ..SandboxSpec::default()
@@ -3813,6 +3815,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
+                    request_id: String::new(),
                     allow_missing: false,
                     name: "reused-name".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -3876,6 +3879,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3917,6 +3921,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -3955,6 +3960,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -4006,6 +4012,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -4031,6 +4038,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -4078,6 +4086,7 @@ mod tests {
         let error = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "work-gcp".to_string(),
                 expected_resource_version: 0,
@@ -4146,6 +4155,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
@@ -4317,6 +4327,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "collision".to_string(),
                 spec: Some(SandboxSpec {
                     providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -4345,6 +4356,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "user-catalog".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -4379,6 +4391,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "reserved-policy-key".to_string(),
                 spec: Some(SandboxSpec {
                     policy: Some(policy),
@@ -4746,6 +4759,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "annotated".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -4804,6 +4818,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "partial-id".to_string(),
                 spec: Some(SandboxSpec {
                     policy: Some(policy),
@@ -4869,6 +4884,7 @@ mod tests {
         let response = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "kube-partial-id".to_string(),
                 spec: Some(SandboxSpec {
                     policy: Some(policy),
@@ -4904,6 +4920,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "bad-label".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
@@ -4935,6 +4952,7 @@ mod tests {
             handle_create_sandbox(
                 &task_state,
                 authed_request(CreateSandboxRequest {
+                    request_id: String::new(),
                     name: "guarded-create".to_string(),
                     spec: Some(SandboxSpec {
                         providers: vec!["work-github".to_string()],
@@ -4976,6 +4994,7 @@ mod tests {
         let created = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5032,6 +5051,7 @@ mod tests {
         let deleted = handle_delete_sandbox_template(
             &state,
             authed_request(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "gpu-kata".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -5074,6 +5094,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(gpu),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5092,6 +5113,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(cpu),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5128,6 +5150,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template(" gpu-kata ")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5166,6 +5189,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -5179,6 +5203,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
@@ -5216,6 +5241,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5355,6 +5381,7 @@ mod tests {
         let err = handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("overflow")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5386,6 +5413,7 @@ mod tests {
                 handle_create_sandbox_template(
                     &state,
                     authed_request(CreateSandboxTemplateRequest {
+                        request_id: String::new(),
                         template: Some(test_workload_template(&format!("overflow-{index}"))),
                         workspace_scope: Some(openshell_core::proto::workspace_selector(
                             "default".to_string(),
@@ -5492,6 +5520,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("epoch-template")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
@@ -5546,6 +5575,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5570,6 +5600,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec {
                     providers: vec!["work-github".to_string()],
@@ -5650,6 +5681,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5662,6 +5694,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -5701,6 +5734,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5713,6 +5747,7 @@ mod tests {
         let created = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -5752,6 +5787,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "from-corrupt".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -5776,6 +5812,7 @@ mod tests {
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
+                request_id: String::new(),
                 template: Some(test_workload_template("gpu-kata")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -5788,6 +5825,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec {
                     environment: HashMap::from([("INLINE".to_string(), "blocked".to_string())]),
@@ -5816,6 +5854,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
@@ -5841,6 +5880,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "bad-template-create".to_string(),
                 spec: Some(SandboxSpec {
                     providers: (0..=MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
@@ -5869,6 +5909,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "bad-direct-create".to_string(),
                 spec: Some(SandboxSpec {
                     providers: (0..=MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
@@ -5912,6 +5953,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
@@ -5959,6 +6001,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
@@ -6014,6 +6057,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
@@ -6061,6 +6105,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
@@ -6088,6 +6133,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
@@ -6300,6 +6346,7 @@ mod tests {
         let response = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
@@ -6352,6 +6399,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
@@ -6415,6 +6463,7 @@ mod tests {
         let response = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
@@ -6467,6 +6516,7 @@ mod tests {
         let err = handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
@@ -6548,6 +6598,7 @@ mod tests {
                 handle_attach_sandbox_provider(
                     &state_clone,
                     authed_request(AttachSandboxProviderRequest {
+                        request_id: String::new(),
                         sandbox_name: "work".to_string(),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
@@ -6612,6 +6663,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -6928,6 +6980,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 name: "any".into(),
@@ -6945,6 +6998,7 @@ mod tests {
             handle_stop_sandbox(
                 &state,
                 non_member_request(StopSandboxRequest {
+                    request_id: String::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                     name: "any".into(),
                 }),
@@ -6953,6 +7007,7 @@ mod tests {
             handle_start_sandbox(
                 &state,
                 non_member_request(StartSandboxRequest {
+                    request_id: String::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                     name: "any".into(),
                 }),

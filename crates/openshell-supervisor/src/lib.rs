@@ -5902,6 +5902,245 @@ network_policies:
         handle.abort();
     }
 
+    fn proto_provenance_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        let mut policy = proto_tcp_policy_fixture();
+        policy.landlock = proto_policy_fixture().landlock;
+        let endpoint = &mut policy.network_policies.get_mut("redis").unwrap().endpoints[0];
+        endpoint.host = "allowed.example.com".into();
+        endpoint.port = 443;
+        endpoint.ports = vec![443];
+        endpoint.protocol.clear();
+        // Typed validation must retain gateway provenance so OPA can apply
+        // credential guards and distinguish advisor-proposed endpoints.
+        endpoint.provider_credentialed = true;
+        endpoint.advisor_proposed = true;
+        policy
+    }
+
+    fn assert_gateway_policy_authorization(
+        engine: &OpaEngine,
+        allowed_host: &str,
+        generation: u64,
+    ) {
+        use openshell_supervisor_network::opa::{NetworkAction, NetworkInput};
+
+        assert_eq!(engine.current_generation(), generation);
+        for host in ["allowed.example.com", "repaired.example.com"] {
+            let input = NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: "/usr/bin/redis-cli".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let authorization = engine.authorize_egress(&input).expect("authorize endpoint");
+            assert_eq!(authorization.generation, generation);
+            assert_eq!(
+                matches!(authorization.action, NetworkAction::Allow { .. }),
+                host == allowed_host,
+                "unexpected authorization for {host}"
+            );
+            if host == allowed_host {
+                assert!(!authorization.exact_declared_endpoint_host);
+                let guards = engine
+                    .query_endpoint_credential_guards(&input)
+                    .expect("query credential provenance");
+                assert_eq!(guards.len(), 1);
+                assert!(
+                    openshell_supervisor_network::l7::parse_endpoint_credential_guard(&guards[0])
+                        .provider_credentialed
+                );
+            }
+        }
+    }
+
+    async fn assert_gateway_reload_rejects_and_repairs(registry_changed: bool) {
+        let policy = proto_provenance_policy_fixture();
+        let engine = OpaEngine::from_proto(&policy).expect("build initial gateway policy");
+        install_builtin_middleware_registry(&engine)
+            .await
+            .expect("install initial registry");
+        let generation = engine.current_generation();
+        assert_gateway_policy_authorization(&engine, "allowed.example.com", generation);
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_for_connector = connections.clone();
+        let connector: MiddlewareConnector = Arc::new(move |services, authentication| {
+            connections_for_connector.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { connect_middleware_registry(&services, &authentication).await })
+        });
+        let authentication = MiddlewareAuthentication::default();
+        let middleware = || MiddlewareReloadContext {
+            desired_services: &[],
+            authentication: &authentication,
+            registry_changed,
+            connector: &connector,
+        };
+        let mut candidate = policy;
+        candidate.landlock.as_mut().unwrap().compatibility = "unsupported".into();
+        candidate
+            .network_policies
+            .get_mut("redis")
+            .unwrap()
+            .endpoints[0]
+            .host = "repaired.example.com".into();
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&candidate),
+            0,
+            middleware(),
+            TransparentTcpReloadState::default(),
+        )
+        .await
+        .expect_err("invalid protobuf scalar must reject the complete candidate");
+        assert!(matches!(
+            failure,
+            GatewayRuntimeReloadError::PolicyValidation(_)
+        ));
+        let disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            failure,
+            PolicyValidationFailureMode::RetainLastValid,
+            true,
+            2,
+        )
+        .expect("retain accepted runtime");
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::PolicyRejected { disposition, .. }
+                if disposition.previous_policy_active && disposition.active_generation == generation
+        ));
+        assert!(engine.fail_closed_reason().is_none());
+        assert_gateway_policy_authorization(&engine, "allowed.example.com", generation);
+
+        // Repair only the rejected scalar: the endpoint change must now install
+        // with both runtime provenance flags and one new generation.
+        candidate.landlock.as_mut().unwrap().compatibility = "best_effort".into();
+        reload_gateway_policy_runtime(
+            &engine,
+            Some(&candidate),
+            0,
+            middleware(),
+            TransparentTcpReloadState::default(),
+        )
+        .await
+        .expect("install repaired gateway policy");
+        assert_gateway_policy_authorization(&engine, "repaired.example.com", generation + 1);
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            if registry_changed { 2 } else { 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_only_reload_rejects_candidate_retains_policy_and_accepts_repair() {
+        assert_gateway_reload_rejects_and_repairs(false).await;
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_and_registry_reload_rejects_candidate_retains_policy_and_accepts_repair()
+     {
+        assert_gateway_reload_rejects_and_repairs(true).await;
+    }
+
+    #[tokio::test]
+    async fn local_file_startup_normalizes_matchers_and_rejects_malformed_policy() {
+        use openshell_supervisor_network::opa::NetworkInput;
+
+        let files = tempfile::tempdir().expect("policy directory");
+        let rules_path = files.path().join("policy.rego");
+        let data_path = files.path().join("policy.yaml");
+        std::fs::write(
+            &rules_path,
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+        )
+        .expect("write policy rules");
+        std::fs::write(
+            &data_path,
+            r#"
+network_policies:
+  startup:
+    endpoints:
+      - host: startup.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**", query: { scope: "public-*" } }
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+        )
+        .expect("write raw policy");
+        let credentials = openshell_extension_core::ExtensionCredentialStore::new();
+        let startup = || {
+            load_policy(
+                None,
+                None,
+                None,
+                Some(rules_path.to_string_lossy().into_owned()),
+                Some(data_path.to_string_lossy().into_owned()),
+                &credentials,
+                LocalPolicyIdentity::Required,
+            )
+        };
+        let (_, engine, proto, registry, origin, proposals, extension_authentication_enabled) =
+            startup().await.expect("load valid local policy");
+        assert!(proto.is_none());
+        assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
+        assert!(matches!(registry, MiddlewareRegistryStatus::Synchronized));
+        assert!(!proposals && !extension_authentication_enabled);
+        let engine = engine.expect("local startup installs OPA");
+        assert!(engine.binary_identity_required());
+        // Installing the built-in registry creates the first active generation.
+        assert_eq!(engine.current_generation(), 1);
+
+        let mut input = NetworkInput {
+            host: "startup.example.com".into(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(
+            engine
+                .evaluate_network(&input)
+                .expect("allowed binary")
+                .allowed
+        );
+        let endpoint = engine
+            .query_endpoint_config(&input)
+            .expect("query startup endpoint")
+            .expect("startup endpoint must exist");
+        let endpoint: serde_json::Value =
+            serde_json::from_str(&endpoint.to_json_str().expect("serialize endpoint"))
+                .expect("endpoint JSON");
+        assert_eq!(
+            endpoint["rules"][0]["allow"]["query"]["scope"],
+            serde_json::json!({ "glob": "public-*" }),
+        );
+        input.binary_path = "/usr/bin/unlisted".into();
+        assert!(
+            !engine
+                .evaluate_network(&input)
+                .expect("unlisted binary")
+                .allowed
+        );
+
+        // A malformed new startup must fail before returning an active evaluator.
+        std::fs::write(&data_path, "network_policies: []\n").expect("write malformed policy");
+        let Err(error) = startup().await else {
+            panic!("malformed startup must reject");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("network_policies must be an object")
+        );
+    }
+
     #[tokio::test]
     async fn failed_external_startup_registry_build_preserves_installed_builtins() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");

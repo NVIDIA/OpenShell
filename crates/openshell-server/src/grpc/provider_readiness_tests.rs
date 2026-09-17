@@ -810,6 +810,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
     let initial = super::super::provider::handle_create_provider(
         &state,
         authed_request(CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(provider("synthetic-first")),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         }),
@@ -829,6 +830,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
         super::super::provider::handle_update_provider(
             &update_state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(replacement),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -843,6 +845,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
         .unwrap();
     let attach_wait_probe = Arc::new(tokio::sync::Notify::new());
     let mut attach_request = authed_request(AttachSandboxProviderRequest {
+        request_id: String::new(),
         sandbox_name: "attach-race".to_string(),
         provider_name: "work-github".to_string(),
         expected_resource_version: 0,
