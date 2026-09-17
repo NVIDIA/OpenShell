@@ -99,6 +99,16 @@ jobs:
     with:
       checkout-ref: ${{ github.sha }}
 
+  conformance:
+    needs: [build-binaries, build-images]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/conformance.yml
+    with:
+      scenarios: '["ubuntu-docker-rootful", "fedora-podman-rootful", "fedora-podman-rootless"]'
+      testsuites: '["smoke"]'
+
   docker-e2e:
     needs: [build-binaries, build-images]
     permissions:
@@ -232,7 +242,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, package-binaries, build-python-wheel, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap]
+    needs: [compute-versions, package-binaries, build-python-wheel, conformance, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:

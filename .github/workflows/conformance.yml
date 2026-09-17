@@ -4,150 +4,106 @@
 name: Conformance
 
 on:
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      scenarios:
+        description: JSON array of tmachine scenarios to run
+        required: true
+        type: string
+      testsuites:
+        description: JSON array of tmachine test suites to run
+        required: true
+        type: string
 
-permissions: {}
+permissions:
+  actions: read
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-conformance-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - id: gate
-        uses: ./.github/actions/pr-gate
-
-  version:
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      cargo: ${{ steps.version.outputs.cargo }}
-      rpm_version: ${{ steps.version.outputs.rpm_version }}
-      rpm_release: ${{ steps.version.outputs.rpm_release }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Compute versions
-        id: version
-        run: |
-          cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
-          rpm_version="$(python3 tasks/scripts/release.py get-version --rpm-version)"
-          rpm_release="$(python3 tasks/scripts/release.py get-version --rpm-release)"
-          {
-            echo "cargo=$cargo"
-            echo "rpm_version=$rpm_version"
-            echo "rpm_release=$rpm_release"
-          } >> "$GITHUB_OUTPUT"
-
-  build-cli:
-    needs: version
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: ./.github/actions/setup-nix
-        with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: ./.github/actions/build-rust-binary
-        with:
-          package: openshell-cli
-          binary: openshell
-          triple: x86_64-unknown-linux-musl
-          cargo-version: ${{ needs.version.outputs.cargo }}
-
-  build-conformance:
-    needs: version
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: ./.github/actions/setup-nix
-        with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: ./.github/actions/build-rust-binary
-        with:
-          package: openshell-conformance-cli
-          binary: openshell-conformance
-          triple: x86_64-unknown-linux-musl
-          cargo-version: ${{ needs.version.outputs.cargo }}
-
-  build-gateway:
-    needs: version
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: ./.github/actions/setup-nix
-        with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: ./.github/actions/build-rust-binary
-        with:
-          package: openshell-gateway
-          binary: openshell-gateway
-          triple: x86_64-unknown-linux-gnu
-          cargo-version: ${{ needs.version.outputs.cargo }}
-          supervisor-image-tag: dev
-
-  build-rpm:
-    needs: [version, build-cli, build-gateway]
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-rpm.yml
-    with:
-      checkout-ref: ${{ github.sha }}
-      arch: x86_64
-      runner: linux-amd64-cpu8
-      cli-target: x86_64-unknown-linux-musl
-      gateway-target: x86_64-unknown-linux-gnu
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      rpm-version: ${{ needs.version.outputs.rpm_version }}
-      rpm-release: ${{ needs.version.outputs.rpm_release }}
-
-  fedora:
-    name: Fedora with Rootless Podman
-    needs: [build-conformance, build-rpm]
+  prepare:
+    name: Prepare conformance inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      actions: read
-      contents: read
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-x86_64-unknown-linux-musl
+          path: artifacts/binaries/x86_64-unknown-linux-musl
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-x86_64-unknown-linux-gnu
+          path: artifacts/binaries/x86_64-unknown-linux-gnu
+
+      - name: Download sandbox image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-sandbox
+          path: image-input/sandbox
+
+      - name: Download supervisor image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-supervisor
+          path: image-input/supervisor
+
+      - name: Convert runtime images
+        shell: nix develop .#testing -c bash -euo pipefail {0}
+        run: |
+          mkdir -p artifacts/images
+
+          skopeo copy \
+            --override-os linux \
+            --override-arch amd64 \
+            oci-archive:image-input/sandbox/images/sandbox.tar \
+            docker-archive:artifacts/images/openshell-sandbox-tmachine.tar:openshell/sandbox:tmachine
+
+          skopeo copy \
+            --override-os linux \
+            --override-arch amd64 \
+            oci-archive:image-input/supervisor/images/supervisor.tar \
+            docker-archive:artifacts/images/openshell-supervisor-tmachine.tar:openshell/supervisor:tmachine
+
+      - name: Build conformance test archive
+        run: nix run .#build-artifacts-test-archives
+
+      - name: Upload conformance inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-conformance-inputs
+          path: artifacts
+          compression-level: 0
+          retention-days: 5
+          if-no-files-found: error
+
+  conformance:
+    name: Conformance (${{ matrix.scenario }}, ${{ matrix.testsuite }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(inputs.scenarios) }}
+        testsuite: ${{ fromJSON(inputs.testsuites) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Enable KVM access
         run: |
@@ -162,40 +118,20 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
 
-      - name: Download RPM artifacts
+      - name: Cache tmachine disks
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/tmachine
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Download conformance inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rpm-linux-x86_64
-          path: rpm-input
+          name: openshell-conformance-inputs
+          path: artifacts
 
-      - name: Download conformance CLI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-conformance-x86_64-unknown-linux-musl
-          path: conformance-input
-
-      - name: Run RPM smoke conformance
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x conformance-input/openshell-conformance
-          shopt -s nullglob
-          candidate_cli_package=(rpm-input/openshell-[0-9]*.rpm)
-          candidate_gateway_package=(rpm-input/openshell-gateway-[0-9]*.rpm)
-          if [[ ${#candidate_cli_package[@]} -ne 1 || ${#candidate_gateway_package[@]} -ne 1 ]]; then
-            echo "expected one candidate CLI and gateway RPM" >&2
-            printf 'RPM artifacts:\n' >&2
-            printf '  %s\n' rpm-input/* >&2
-            exit 1
-          fi
-
-          OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
-            --distro fedora \
-            --with podman-rootless \
-            --with selinux \
-            --install "${candidate_cli_package[0]}" \
-            --install "${candidate_gateway_package[0]}" \
-            --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
-            --provision openshell-rpm \
-            --provision gateway-podman \
-            -- /tmp/openshell-conformance run smoke
+      - name: Run conformance
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          TESTSUITE: ${{ matrix.testsuite }}
+        run: nix run .#tmachine -- test "${SCENARIO}" "${TESTSUITE}"

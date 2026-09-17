@@ -49,8 +49,8 @@ let
             "ansible/playbooks/gateway.yaml"
           ];
           inputs = {
-            openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
-            openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
+            openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+            openshell_gateway_binary = "../artifacts/binaries/${gnuTarget}/openshell-gateway";
             openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
             openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
           };
@@ -73,8 +73,8 @@ let
             "ansible/playbooks/gateway.yaml"
           ];
           inputs = {
-            openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
-            openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
+            openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+            openshell_gateway_binary = "../artifacts/binaries/${gnuTarget}/openshell-gateway";
             openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
             openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
           };
@@ -97,8 +97,8 @@ let
             "ansible/playbooks/gateway.yaml"
           ];
           inputs = {
-            openshell_cli_binary = "../target/${muslTarget}/debug/openshell";
-            openshell_gateway_binary = "../target/${gnuTarget}/debug/openshell-gateway";
+            openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+            openshell_gateway_binary = "../artifacts/binaries/${gnuTarget}/openshell-gateway";
             openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
             openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
           };
