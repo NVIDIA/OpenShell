@@ -330,16 +330,20 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    install_listener_with_flags(syscalls, true).map_err(|error| {
-        if error.raw_os_error() == Some(libc::EINVAL) {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "seccomp WAIT_KILLABLE_RECV is required (Linux 5.19 or newer)",
-            )
-        } else {
-            error
+    // WAIT_KILLABLE_RECV (Linux 5.19+) makes the supervisor's notification
+    // receive interruptible by a fatal signal. Kernels older than 5.19 (for
+    // example RHEL 9.x / 5.14 nodes) reject the flag with EINVAL. Rather than
+    // refusing to start there, fall back to a plain listener: the notification
+    // receive is then uninterruptible, but the sandbox is otherwise fully
+    // functional. The resulting listener records `wait_killable_recv = false`
+    // so callers can observe the degraded cancellation semantics.
+    match install_listener_with_flags(syscalls, true) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            install_listener_with_flags(syscalls, false)
         }
-    })
+        Err(error) => Err(error),
+    }
 }
 
 /// Install the capability-free workload networking listener on the calling
