@@ -80,8 +80,8 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
 local Snap lifecycle experiments. It does not install Docker, because the Snap
-gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
-interface rather than the host-package Docker configuration.
+gateway reproduction installs the Docker Snap itself and connects OpenShell to
+the system `:docker` slot.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the

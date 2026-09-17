@@ -127,7 +127,7 @@ jobs:
       - name: Connect interfaces
         run: |
           set -euo pipefail
-          sudo snap connect openshell:docker docker:docker-daemon
+          sudo snap connect openshell:docker :docker
           sudo snap connect openshell:log-observe
           sudo snap connect openshell:system-observe
 
