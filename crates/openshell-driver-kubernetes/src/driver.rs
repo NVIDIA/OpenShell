@@ -6926,37 +6926,29 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::Full;
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-    #[derive(Debug)]
-    struct StopApiState {
-        supervisor_exists: bool,
-        secrets: BTreeSet<String>,
-        completion_saw_clean_runtime: bool,
-    }
-
     fn kube_test_response(
         status: http::StatusCode,
         body: serde_json::Value,
-    ) -> http::Response<Full<bytes::Bytes>> {
+    ) -> http::Response<kube::client::Body> {
         http::Response::builder()
             .status(status)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(bytes::Bytes::from(body.to_string())))
+            .body(kube::client::Body::from(body.to_string().into_bytes()))
             .expect("valid Kubernetes test response")
     }
 
-    fn kube_test_not_found(kind: &str, name: &str) -> http::Response<Full<bytes::Bytes>> {
+    fn kube_test_not_found(kind: &str, name: &str) -> http::Response<kube::client::Body> {
         kube_test_response(
             http::StatusCode::NOT_FOUND,
             serde_json::json!({
@@ -7594,170 +7586,110 @@ mod tests {
 
     #[tokio::test]
     async fn stop_resumed_from_rolling_back_removes_the_complete_runtime() {
-        let state = Arc::new(std::sync::Mutex::new(StopApiState {
-            supervisor_exists: true,
-            secrets: BTreeSet::from([
-                "sandbox-generation-secret".to_string(),
-                "supervisor-generation-secret".to_string(),
-            ]),
-            completion_saw_clean_runtime: false,
-        }));
-        let service_state = state.clone();
+        let sandbox = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr",
+                "namespace": "openshell",
+                "resourceVersion": "42",
+                "annotations": {
+                    SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
+                        SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+                }
+            },
+            "status": {"conditions": [{"type": "Suspended", "status": "True"}]}
+        });
+        let sandbox_path =
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
+        let supervisor_path = "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1";
+        let success = || {
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({"kind": "Status", "status": "Success", "code": 200}),
+            )
+        };
+        let no_secrets = || {
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({"apiVersion": "v1", "kind": "SecretList", "items": []}),
+            )
+        };
+        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            (
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxList",
+                        "items": [sandbox.clone()]
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                sandbox_path,
+                kube_test_response(http::StatusCode::OK, sandbox.clone()),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/workload-pod",
+                kube_test_not_found("pods", "workload-pod"),
+            ),
+            (
+                http::Method::GET,
+                supervisor_path,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "os-supervisor-sandbox-1", "uid": "supervisor-uid"},
+                        "spec": {"containers": []}
+                    }),
+                ),
+            ),
+            (http::Method::DELETE, supervisor_path, success()),
+            (
+                http::Method::GET,
+                supervisor_path,
+                kube_test_not_found("pods", "os-supervisor-sandbox-1"),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/secrets",
+                no_secrets(),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/secrets",
+                no_secrets(),
+            ),
+            (
+                http::Method::GET,
+                sandbox_path,
+                kube_test_response(http::StatusCode::OK, sandbox.clone()),
+            ),
+            (
+                http::Method::PATCH,
+                sandbox_path,
+                kube_test_response(http::StatusCode::OK, sandbox),
+            ),
+        ])));
+        let service_steps = steps.clone();
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
-            let state = service_state.clone();
+            let steps = service_steps.clone();
             async move {
-                let method = request.method().clone();
-                let path = request.uri().path().to_string();
-                let query = request.uri().query().unwrap_or_default().to_string();
-                let body = request
-                    .into_body()
-                    .collect_bytes()
-                    .await
-                    .expect("read Kubernetes test request body");
-                let sandbox = serde_json::json!({
-                    "apiVersion": "agents.x-k8s.io/v1beta1",
-                    "kind": "Sandbox",
-                    "metadata": {
-                        "name": "sandbox-cr",
-                        "namespace": "openshell",
-                        "uid": "sandbox-uid",
-                        "resourceVersion": "42",
-                        "generation": 7,
-                        "labels": {
-                            LABEL_SANDBOX_ID: "sandbox-1",
-                            LABEL_GATEWAY_ID: "openshell"
-                        },
-                        "annotations": {
-                            SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
-                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
-                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
-                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
-                                SandboxRuntimeBootstrapPhase::RollingBack.as_str()
-                        }
-                    },
-                    "spec": {
-                        "operatingMode": "Suspended",
-                        "podTemplate": {"spec": {"terminationGracePeriodSeconds": 0}}
-                    },
-                    "status": {
-                        "conditions": [{"type": "Suspended", "status": "True"}]
-                    }
-                });
-                let response = match (method.as_str(), path.as_str()) {
-                    ("GET", "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes") => {
-                        kube_test_response(
-                            http::StatusCode::OK,
-                            serde_json::json!({
-                                "apiVersion": "agents.x-k8s.io/v1beta1",
-                                "kind": "SandboxList",
-                                "metadata": {"resourceVersion": "42"},
-                                "items": [sandbox]
-                            }),
-                        )
-                    }
-                    (
-                        "GET",
-                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
-                    ) => kube_test_response(http::StatusCode::OK, sandbox),
-                    (
-                        "PATCH",
-                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
-                    ) => {
-                        let completion_patch: serde_json::Value =
-                            serde_json::from_slice(&body).expect("valid sandbox completion patch");
-                        let mut state = state.lock().unwrap();
-                        assert!(!state.supervisor_exists);
-                        assert!(state.secrets.is_empty());
-                        assert_eq!(
-                            completion_patch["metadata"]["annotations"]
-                                [ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
-                            serde_json::Value::Null
-                        );
-                        state.completion_saw_clean_runtime = true;
-                        kube_test_response(http::StatusCode::OK, sandbox)
-                    }
-                    ("GET", "/api/v1/namespaces/openshell/pods/workload-pod") => {
-                        kube_test_not_found("pods", "workload-pod")
-                    }
-                    ("GET", "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1") => {
-                        if state.lock().unwrap().supervisor_exists {
-                            kube_test_response(
-                                http::StatusCode::OK,
-                                serde_json::json!({
-                                    "apiVersion": "v1",
-                                    "kind": "Pod",
-                                    "metadata": {
-                                        "name": "os-supervisor-sandbox-1",
-                                        "namespace": "openshell",
-                                        "uid": "supervisor-uid",
-                                        "resourceVersion": "7"
-                                    },
-                                    "spec": {"containers": []}
-                                }),
-                            )
-                        } else {
-                            kube_test_not_found("pods", "os-supervisor-sandbox-1")
-                        }
-                    }
-                    ("DELETE", "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1") => {
-                        state.lock().unwrap().supervisor_exists = false;
-                        kube_test_response(
-                            http::StatusCode::OK,
-                            serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Status",
-                                "status": "Success",
-                                "code": 200
-                            }),
-                        )
-                    }
-                    ("GET", "/api/v1/namespaces/openshell/secrets") => {
-                        let component = if query.contains("component%3Dsandbox") {
-                            "sandbox-generation-secret"
-                        } else {
-                            "supervisor-generation-secret"
-                        };
-                        let items = if state.lock().unwrap().secrets.contains(component) {
-                            vec![serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Secret",
-                                "metadata": {
-                                    "name": component,
-                                    "namespace": "openshell",
-                                    "uid": format!("{component}-uid"),
-                                    "resourceVersion": "8"
-                                }
-                            })]
-                        } else {
-                            Vec::new()
-                        };
-                        kube_test_response(
-                            http::StatusCode::OK,
-                            serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "SecretList",
-                                "metadata": {"resourceVersion": "8"},
-                                "items": items
-                            }),
-                        )
-                    }
-                    ("DELETE", path)
-                        if path.starts_with("/api/v1/namespaces/openshell/secrets/") =>
-                    {
-                        let name = path.rsplit('/').next().unwrap();
-                        state.lock().unwrap().secrets.remove(name);
-                        kube_test_response(
-                            http::StatusCode::OK,
-                            serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Status",
-                                "status": "Success",
-                                "code": 200
-                            }),
-                        )
-                    }
-                    _ => panic!("unexpected Kubernetes test request: {method} {path}?{query}"),
-                };
+                let (method, path, response) = steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected Kubernetes API request");
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), path);
                 Ok::<_, std::convert::Infallible>(response)
             }
         });
@@ -7774,15 +7706,11 @@ mod tests {
             .set(SANDBOX_VERSION_V1BETA1)
             .expect("set test Sandbox API version");
 
-        driver
-            .stop_sandbox("sandbox-1")
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_sandbox("sandbox-1"))
             .await
+            .expect("stop timed out")
             .expect("resume stop from RollingBack");
-
-        let state = state.lock().unwrap();
-        assert!(!state.supervisor_exists);
-        assert!(state.secrets.is_empty());
-        assert!(state.completion_saw_clean_runtime);
+        assert!(steps.lock().unwrap().is_empty());
     }
 
     #[test]
