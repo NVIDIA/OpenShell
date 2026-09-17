@@ -38,12 +38,14 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
+use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite,
     AsyncWriteExt,
@@ -71,6 +73,41 @@ struct TransparentOpen {
 enum ProxyAcceptError {
     Listener(std::io::Error),
     Source(openshell_isolation_interface::contract::BackendError),
+}
+
+/// A future that serves one reserved-destination stream to completion.
+pub type ReservedStreamFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Serves workload connections to a reserved, unroutable destination inside
+/// the supervisor instead of dialing upstream.
+///
+/// The proxy consults the handler before the sandbox commits the workload
+/// socket. `None` refuses the open, which the workload observes as `EAGAIN`;
+/// `Some` accepts it, after which the proxy answers `RelayReady` and drives
+/// the returned future on its own task. Nothing may be read from `stream`
+/// until that future is polled.
+pub trait ReservedStreamHandler: Send + Sync {
+    fn serve(&self, stream: BoundaryDuplexStream) -> Option<ReservedStreamFuture>;
+}
+
+/// A reserved destination the proxy serves locally.
+#[derive(Clone)]
+pub struct ReservedDestination {
+    pub addr: SocketAddr,
+    pub handler: Arc<dyn ReservedStreamHandler>,
+}
+
+/// The OTLP relay address, known to the proxy even when no handler is
+/// installed so a workload connect to it never falls through to policy
+/// evaluation and upstream dialing.
+static OTLP_RELAY_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
+    openshell_core::sandbox_env::OTLP_RELAY_ADDR
+        .parse()
+        .expect("OTLP_RELAY_ADDR is a valid socket address")
+});
+
+fn is_reserved_relay_destination(destination: SocketAddr) -> bool {
+    destination == *OTLP_RELAY_ADDR
 }
 
 use self::destination::{
@@ -222,6 +259,7 @@ impl ProxyHandle {
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
+        reserved_destination: Option<ReservedDestination>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -383,6 +421,7 @@ impl ProxyHandle {
                                     let opa = opa_engine.clone();
                                     let backend_gateway = *backend_host_gateway;
                                     let trusted_gateway = *trusted_host_gateway;
+                                    let reserved = reserved_destination.clone();
                                     tokio::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
@@ -390,6 +429,7 @@ impl ProxyHandle {
                                             &opa,
                                             backend_gateway,
                                             trusted_gateway,
+                                            reserved.as_ref(),
                                         )
                                         .await
                                         {
@@ -558,6 +598,7 @@ async fn preauthorize_transparent_open(
     opa_engine: &OpaEngine,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
+    reserved: Option<&ReservedDestination>,
 ) -> Option<AcceptedProxyConnection> {
     let PendingTcpOpen {
         stream,
@@ -572,6 +613,40 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
+    // A reserved destination is served inside the supervisor. It is decided
+    // before host mapping, policy, and SSRF validation because the address is
+    // an unroutable label, not a place anything could dial.
+    if let Some(reserved) = reserved.filter(|reserved| reserved.addr == destination) {
+        if let Some(served) = reserved.handler.serve(stream) {
+            debug!(%destination, "Serving staged connection on reserved destination");
+            // If the sandbox side is already gone, dropping `served` closes
+            // the stream and releases the handler's slot.
+            if completion.send(TcpOpenDecision::RelayReady).is_ok() {
+                tokio::spawn(served);
+            }
+        } else {
+            warn!(
+                %destination,
+                "Refused staged reserved-destination connection: handler at capacity"
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::ResourceExhausted));
+        }
+        return None;
+    }
+    if is_reserved_relay_destination(destination) {
+        warn!(
+            %destination,
+            "Denied staged reserved-destination connection: no handler installed"
+        );
+        emit_staged_transparent_denial(
+            destination,
+            &binary_identity,
+            "reserved destination has no handler",
+            "transparent_tcp_reserved_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied));
+        return None;
+    }
     let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
         Ok(host) => host,
         Err(error) => {
@@ -6582,7 +6657,7 @@ process:
 
         let (allowed, allowed_result) = pending("203.0.113.7:443");
         assert!(
-            preauthorize_transparent_open(allowed, None, &engine, None, None)
+            preauthorize_transparent_open(allowed, None, &engine, None, None, None)
                 .await
                 .is_some()
         );
@@ -6590,7 +6665,7 @@ process:
 
         let (unsafe_destination, unsafe_result) = pending("169.254.169.254:80");
         assert!(
-            preauthorize_transparent_open(unsafe_destination, None, &engine, None, None)
+            preauthorize_transparent_open(unsafe_destination, None, &engine, None, None, None)
                 .await
                 .is_none()
         );
@@ -6601,13 +6676,223 @@ process:
 
         let (denied, denied_result) = pending("203.0.113.8:443");
         assert!(
-            preauthorize_transparent_open(denied, None, &engine, None, None)
+            preauthorize_transparent_open(denied, None, &engine, None, None, None)
                 .await
                 .is_none()
         );
         assert_eq!(
             denied_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+    }
+
+    // ---- reserved destinations ----
+
+    /// Policy that allows one public endpoint and nothing else. It never
+    /// mentions the relay address, so a served relay stream proves the
+    /// reserved path bypassed policy.
+    fn reserved_test_engine() -> OpaEngine {
+        OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: 203.0.113.7
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .unwrap()
+    }
+
+    /// A staged open from `/usr/bin/curl` to `destination`, plus the
+    /// decision receiver and the workload-side peer of the staged stream.
+    fn staged_open(
+        engine: &OpaEngine,
+        destination: &str,
+    ) -> (
+        PendingTcpOpen,
+        tokio::sync::oneshot::Receiver<TcpOpenDecision>,
+        tokio::io::DuplexStream,
+    ) {
+        let (stream, peer) = tokio::io::duplex(256);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let open = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(ContractBinaryIdentity {
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_digest: Some("00".repeat(32).parse().unwrap()),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            }),
+            destination: destination.parse().unwrap(),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+        (open, completion, peer)
+    }
+
+    /// Handler double: counts calls, optionally refuses, and hands every
+    /// accepted stream back to the test.
+    struct RecordingReservedHandler {
+        accept: bool,
+        served: mpsc::UnboundedSender<BoundaryDuplexStream>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ReservedStreamHandler for RecordingReservedHandler {
+        fn serve(&self, stream: BoundaryDuplexStream) -> Option<ReservedStreamFuture> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.accept {
+                return None;
+            }
+            let served = self.served.clone();
+            Some(Box::pin(async move {
+                let _ = served.send(stream);
+            }))
+        }
+    }
+
+    fn reserved_relay(
+        accept: bool,
+    ) -> (
+        ReservedDestination,
+        mpsc::UnboundedReceiver<BoundaryDuplexStream>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (served, served_rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = RecordingReservedHandler {
+            accept,
+            served,
+            calls: Arc::clone(&calls),
+        };
+        let reserved = ReservedDestination {
+            addr: *OTLP_RELAY_ADDR,
+            handler: Arc::new(handler),
+        };
+        (reserved, served_rx, calls)
+    }
+
+    #[tokio::test]
+    async fn reserved_destination_is_served_without_policy_evaluation() {
+        let engine = reserved_test_engine();
+        let (reserved, mut served_rx, calls) = reserved_relay(true);
+        let (open, decision, mut peer) =
+            staged_open(&engine, openshell_core::sandbox_env::OTLP_RELAY_ADDR);
+
+        assert!(
+            preauthorize_transparent_open(open, None, &engine, None, None, Some(&reserved))
+                .await
+                .is_none(),
+            "a reserved open never becomes a proxy connection"
+        );
+        assert_eq!(decision.await.unwrap(), TcpOpenDecision::RelayReady);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The handler holds the workload's stream: bytes written by the
+        // workload side arrive at the handler.
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(1), served_rx.recv())
+            .await
+            .expect("handler future ran")
+            .expect("handler received the stream");
+        peer.write_all(b"POST /v1/traces").await.unwrap();
+        let mut head = [0u8; 15];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"POST /v1/traces");
+    }
+
+    #[tokio::test]
+    async fn reserved_destination_is_refused_when_handler_is_at_capacity() {
+        let engine = reserved_test_engine();
+        let (reserved, _served_rx, calls) = reserved_relay(false);
+        let (open, decision, _peer) =
+            staged_open(&engine, openshell_core::sandbox_env::OTLP_RELAY_ADDR);
+
+        assert!(
+            preauthorize_transparent_open(open, None, &engine, None, None, Some(&reserved))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            decision.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::ResourceExhausted),
+            "refusal happens before the sandbox commits the socket"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_relay_destination_is_denied_without_a_handler() {
+        let engine = reserved_test_engine();
+        let (open, decision, _peer) =
+            staged_open(&engine, openshell_core::sandbox_env::OTLP_RELAY_ADDR);
+
+        assert!(
+            preauthorize_transparent_open(open, None, &engine, None, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            decision.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied),
+            "the relay address must never reach policy evaluation or dialing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_handler_ignores_other_destinations() {
+        let engine = reserved_test_engine();
+        let (reserved, _served_rx, calls) = reserved_relay(true);
+
+        let (denied, denied_result) = {
+            let (open, decision, _peer) = staged_open(&engine, "203.0.113.8:443");
+            (open, decision)
+        };
+        assert!(
+            preauthorize_transparent_open(denied, None, &engine, None, None, Some(&reserved))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            denied_result.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+
+        let (allowed, allowed_result) = {
+            let (open, decision, _peer) = staged_open(&engine, "203.0.113.7:443");
+            (open, decision)
+        };
+        assert!(
+            preauthorize_transparent_open(allowed, None, &engine, None, None, Some(&reserved))
+                .await
+                .is_some(),
+            "policy-allowed destinations still flow to the proxy"
+        );
+        assert_eq!(allowed_result.await.unwrap(), TcpOpenDecision::RelayReady);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the handler is consulted only for its own address"
         );
     }
 
@@ -6992,6 +7277,7 @@ network_policies: {}
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
             Some(Arc::new(FailedMediationSource)),
+            None,
             None,
             None,
         )
