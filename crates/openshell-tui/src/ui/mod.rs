@@ -743,7 +743,7 @@ mod tests {
         let mut app = test_app();
         app.sandbox_names = vec!["quarantined".into()];
         app.sandbox_count = 1;
-        app.sandbox_notes = vec!["inspect for config".into()];
+        app.sandbox_notes = vec!["Invalid config".into()];
         let diagnostic = "Invalid config: credentialed endpoint api.example.com:443 requires L7 inspection before the sandbox workload can start safely";
         app.sandbox_detail_notes = vec![diagnostic.into()];
         for width in [80, 100, 120] {
@@ -763,7 +763,7 @@ mod tests {
                     .map(ratatui::buffer::Cell::symbol)
                     .collect();
                 assert!(
-                    text.contains("inspect for config"),
+                    text.contains("Invalid config"),
                     "dashboard at {width}: {text}"
                 );
                 assert!(!text.contains("credentialed endpoint"));

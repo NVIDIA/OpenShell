@@ -2778,7 +2778,7 @@ fn sandbox_notes_for_view(
                 .join(" ")
         )
     } else {
-        "inspect for config".to_string()
+        "Invalid config".to_string()
     };
     if !forwards.is_empty() {
         notes.push_str("; ");
@@ -3347,7 +3347,7 @@ mod sandbox_notes_tests {
         };
         assert_eq!(
             sandbox_notes(&sandbox, "fwd:8080".into()),
-            "inspect for config; fwd:8080"
+            "Invalid config; fwd:8080"
         );
         assert_eq!(
             super::sandbox_notes_for_view(&sandbox, "fwd:8080".into(), true),
@@ -3355,11 +3355,11 @@ mod sandbox_notes_tests {
         );
         // Older gateways can expose only Ready; retain the note there too.
         sandbox.status.as_mut().unwrap().conditions.remove(0);
-        assert_eq!(sandbox_notes(&sandbox, String::new()), "inspect for config");
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "Invalid config");
         sandbox.status.as_mut().unwrap().conditions[0]
             .message
             .clear();
-        assert_eq!(sandbox_notes(&sandbox, String::new()), "inspect for config");
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "Invalid config");
         sandbox.status.as_mut().unwrap().conditions[0].status = "True".into();
         assert_eq!(sandbox_notes(&sandbox, "fwd:8080".into()), "fwd:8080");
         sandbox.status = None;
