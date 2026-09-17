@@ -443,9 +443,11 @@ acceptance stores `true` permanently, including across restart. Legacy rows
 have neither field and conservatively retain static-policy restrictions. No
 database rewrite is required. A pre-admission byte fixture verifies that legacy
 phase and policy-version fields survive without fabricated admission or activation.
-With timestamp types and deletion outcomes, the admission contract brings the public closure
-to 286 messages and 15 enums, the durable closure to 84 messages and 10 enums,
-and their overlap to 74 messages and 10 enums.
+With timestamp types, deletion outcomes, and optional mutation request IDs, the
+admission contract brings the public closure to 286 messages and 15 enums, the
+durable closure to 84 messages and 10 enums, and their overlap to 74 messages
+and 10 enums. Mutation request IDs extend public request fields without adding
+messages to these closures or changing the durable protobuf schema.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
