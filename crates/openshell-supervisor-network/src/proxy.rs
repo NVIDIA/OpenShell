@@ -31,8 +31,8 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse,
-    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, DispositionId, Endpoint, EventContext, HttpActivityBuilder, HttpRequest,
+    HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -175,6 +175,9 @@ pub(crate) enum ProxyIdentityMode {
         binary_path: PathBuf,
         binary_sha256: String,
         required_proxy_authorization: Option<Arc<str>>,
+        /// Per-sandbox context for host-side proxies. The process-wide OCSF
+        /// context cannot identify one sandbox when a gateway hosts many.
+        event_context: Option<Arc<EventContext>>,
     },
 }
 
@@ -206,7 +209,31 @@ impl ProxyIdentityMode {
             binary_path,
             binary_sha256,
             required_proxy_authorization,
+            event_context: None,
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn with_event_context(mut self, context: EventContext) -> Self {
+        match &mut self {
+            #[cfg(target_os = "linux")]
+            Self::Procfs { .. } => {}
+            Self::Static { event_context, .. } => {
+                *event_context = Some(Arc::new(context));
+            }
+        }
+        self
+    }
+
+    fn event_context(&self) -> &EventContext {
+        match self {
+            #[cfg(any(not(target_os = "linux"), test))]
+            Self::Static {
+                event_context: Some(context),
+                ..
+            } => context,
+            _ => openshell_ocsf::ctx::ctx(),
+        }
     }
 
     fn required_proxy_authorization(&self) -> Option<&str> {
@@ -269,8 +296,9 @@ impl ProxyHandle {
 
         let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
         let local_addr = listener.local_addr().into_diagnostic()?;
+        let event_context = Arc::new(identity_mode.event_context().clone());
         {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = NetworkActivityBuilder::new(&event_context)
                 .activity(ActivityId::Listen)
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -307,22 +335,21 @@ impl ProxyHandle {
         // access.
         let upstream_proxy: Arc<Option<UpstreamProxyConfig>> = Arc::new(
             UpstreamProxyConfig::from_args(upstream_proxy_args).map_err(|err| {
-                let event =
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(SeverityId::High)
-                        .status(StatusId::Failure)
-                        .state(openshell_ocsf::StateId::Disabled, "invalid")
-                        .message(format!(
-                            "Upstream corporate proxy configuration invalid; \
+                let event = openshell_ocsf::ConfigStateChangeBuilder::new(&event_context)
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "invalid")
+                    .message(format!(
+                        "Upstream corporate proxy configuration invalid; \
                              refusing to start: {err}"
-                        ))
-                        .build();
+                    ))
+                    .build();
                 ocsf_emit!(event);
                 miette::miette!("invalid upstream corporate proxy configuration: {err}")
             })?,
         );
         if let Some(cfg) = upstream_proxy.as_ref() {
-            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(&event_context)
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "enabled")
@@ -392,6 +419,7 @@ impl ProxyHandle {
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
+                        let event_context = event_context.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_tcp_connection(
@@ -412,7 +440,7 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                let event = NetworkActivityBuilder::new(&event_context)
                                     .activity(ActivityId::Fail)
                                     .severity(SeverityId::Low)
                                     .status(StatusId::Failure)
@@ -429,7 +457,7 @@ impl ProxyHandle {
                             &mut consecutive_unknown_errors,
                         ) {
                             AcceptAction::Terminal => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                let event = NetworkActivityBuilder::new(&event_context)
                                     .activity(ActivityId::Fail)
                                     .severity(SeverityId::High)
                                     .status(StatusId::Failure)
@@ -441,7 +469,7 @@ impl ProxyHandle {
                                 break;
                             }
                             AcceptAction::Retry { backoff, severity } => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                let event = NetworkActivityBuilder::new(&event_context)
                                     .activity(ActivityId::Fail)
                                     .severity(severity)
                                     .status(StatusId::Failure)
@@ -1366,6 +1394,7 @@ fn emit_denial_simple(
 
 #[allow(clippy::too_many_arguments)]
 fn build_connect_allow_ocsf_event(
+    event_context: &EventContext,
     peer_addr: SocketAddr,
     host: &str,
     port: u16,
@@ -1381,7 +1410,7 @@ fn build_connect_allow_ocsf_event(
     } else {
         "CONNECT"
     };
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    NetworkActivityBuilder::new(event_context)
         .activity(ActivityId::Open)
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
@@ -1397,6 +1426,7 @@ fn build_connect_allow_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 fn build_forward_allow_ocsf_event(
+    event_context: &EventContext,
     peer_addr: SocketAddr,
     method: &str,
     host: &str,
@@ -1408,7 +1438,7 @@ fn build_forward_allow_ocsf_event(
     cmdline: &str,
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::for_http_method(method))
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
@@ -1426,8 +1456,11 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
-fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+fn build_forward_parse_error_ocsf_event(
+    event_context: &EventContext,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::Other)
         .http_response(HttpResponse {
             code: StatusCode::BAD_REQUEST.as_u16(),
@@ -1443,12 +1476,13 @@ fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent
 /// contain credentials; the method and generated response provide the HTTP
 /// context required by OCSF 1.8.
 fn build_forward_unsupported_scheme_ocsf_event(
+    event_context: &EventContext,
     method: &str,
     scheme: &str,
     host: &str,
     port: u16,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::for_http_method(method))
         .http_request(HttpRequest {
             http_method: method.parse().expect("HTTP method parsing is infallible"),
@@ -1470,6 +1504,7 @@ fn build_forward_unsupported_scheme_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 fn build_forward_l7_parse_rejection_ocsf_event(
+    event_context: &EventContext,
     peer_addr: SocketAddr,
     method: &str,
     host: &str,
@@ -1482,7 +1517,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
     policy: &str,
     detail: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::for_http_method(method))
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1505,6 +1540,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 fn build_forward_policy_deny_ocsf_event(
+    event_context: &EventContext,
     peer_addr: SocketAddr,
     method: &str,
     host: &str,
@@ -1516,7 +1552,7 @@ fn build_forward_policy_deny_ocsf_event(
     cmdline: &str,
     reason: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::Other)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1556,6 +1592,7 @@ fn endpoint_result_for_destination_failure(kind: DestinationDenialKind) -> Endpo
 
 #[allow(clippy::too_many_arguments)]
 fn build_connect_destination_deny_ocsf_event(
+    event_context: &EventContext,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     host: &str,
@@ -1572,7 +1609,7 @@ fn build_connect_destination_deny_ocsf_event(
         format!("CONNECT blocked: {detail} for {host}:{port}")
     };
 
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    NetworkActivityBuilder::new(event_context)
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1589,6 +1626,7 @@ fn build_connect_destination_deny_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 fn build_forward_destination_deny_ocsf_event(
+    event_context: &EventContext,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     method: &str,
@@ -1608,7 +1646,7 @@ fn build_forward_destination_deny_ocsf_event(
         detail
     };
 
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::for_http_method(method))
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1629,6 +1667,7 @@ fn build_forward_destination_deny_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination(
+    event_context: &EventContext,
     client: &mut TcpStream,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
@@ -1644,7 +1683,15 @@ async fn deny_connect_destination(
 ) -> Result<()> {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_connect_destination_deny_ocsf_event(
-        denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
+        event_context,
+        denial,
+        peer_addr,
+        host,
+        port,
+        binary,
+        pid,
+        ancestors,
+        cmdline,
     ));
 
     emit_denial(
@@ -1675,6 +1722,7 @@ async fn deny_connect_destination(
 
 #[allow(clippy::too_many_arguments)]
 async fn deny_forward_destination(
+    event_context: &EventContext,
     client: &mut TcpStream,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
@@ -1693,7 +1741,18 @@ async fn deny_forward_destination(
 ) -> Result<()> {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_forward_destination_deny_ocsf_event(
-        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+        event_context,
+        denial,
+        peer_addr,
+        method,
+        host,
+        port,
+        path,
+        binary,
+        pid,
+        ancestors,
+        cmdline,
+        policy,
     ));
 
     emit_denial_simple(
@@ -1782,6 +1841,7 @@ async fn handle_tcp_connection(
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    let event_context = identity_mode.event_context().clone();
     // Capture authority before request parsing or policy selection can yield.
     // A later inventory installation cannot acquire this connection's result.
     let endpoint_observation_context = endpoint_observation_tx
@@ -1935,7 +1995,7 @@ async fn handle_tcp_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        let event = NetworkActivityBuilder::new(&event_context)
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -2021,6 +2081,7 @@ async fn handle_tcp_connection(
                 observer.observe(endpoint_result_for_destination_failure(denial.kind));
             }
             deny_connect_destination(
+                &event_context,
                 &mut client,
                 &denial,
                 workload_addr,
@@ -2062,6 +2123,7 @@ async fn handle_tcp_connection(
                 observer.observe(endpoint_result_for_destination_failure(denial.kind));
             }
             deny_connect_destination(
+                &event_context,
                 &mut client,
                 &denial,
                 workload_addr,
@@ -2093,7 +2155,7 @@ async fn handle_tcp_connection(
         if let Some(observer) = connect_endpoint_observer.as_ref() {
             observer.observe(EndpointResult::TlsFailed);
         }
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        let event = NetworkActivityBuilder::new(&event_context)
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -2131,7 +2193,7 @@ async fn handle_tcp_connection(
         if let Some(observer) = connect_endpoint_observer.as_ref() {
             observer.observe(EndpointResult::PolicyDenied);
         }
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        let event = NetworkActivityBuilder::new(&event_context)
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -2231,6 +2293,7 @@ async fn handle_tcp_connection(
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
     ocsf_emit!(build_connect_allow_ocsf_event(
+        &event_context,
         workload_addr,
         &host_lc,
         port,
@@ -2339,7 +2402,7 @@ async fn handle_tcp_connection(
                     if let Some(observer) = connect_endpoint_observer.as_ref() {
                         observer.observe(EndpointResult::TlsFailed);
                     }
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    let event = NetworkActivityBuilder::new(&event_context)
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -2368,7 +2431,7 @@ async fn handle_tcp_connection(
                         "TLS connection closed"
                     );
                 } else {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    let event = NetworkActivityBuilder::new(&event_context)
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -2391,7 +2454,7 @@ async fn handle_tcp_connection(
             // placeholder verbatim).
             const DETAIL: &str = "TLS termination unavailable after tunnel establishment; \
                  closing connection - credential rewrite would be bypassed";
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = NetworkActivityBuilder::new(&event_context)
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -2443,7 +2506,7 @@ async fn handle_tcp_connection(
                 } else {
                     format!("HTTP relay error: {e}")
                 };
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                let event = NetworkActivityBuilder::new(&event_context)
                     .activity(ActivityId::Fail)
                     .severity(SeverityId::Low)
                     .status(StatusId::Failure)
@@ -2462,7 +2525,7 @@ async fn handle_tcp_connection(
             if requirement == InspectionRequirement::RequiredMiddleware {
                 crate::l7::middleware::emit_middleware_uninspectable(&ctx, protocol_detail, true);
             }
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = NetworkActivityBuilder::new(&event_context)
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -4491,6 +4554,7 @@ async fn handle_forward_proxy(
     activity_tx: Option<&ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    let event_context = identity_mode.event_context().clone();
     // Capture authority before asynchronous authorization or credential selection.
     // Policy and provider snapshots must belong to this same installation.
     let endpoint_observation_context = endpoint_observation_tx
@@ -4501,7 +4565,10 @@ async fn handle_forward_proxy(
     // canonicalized below before credential binding, policy-path evaluation,
     // upstream bytes, or telemetry consume it.
     let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
-        ocsf_emit!(build_forward_parse_error_ocsf_event(&telemetry_path));
+        ocsf_emit!(build_forward_parse_error_ocsf_event(
+            &event_context,
+            &telemetry_path
+        ));
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
@@ -4543,7 +4610,13 @@ async fn handle_forward_proxy(
     }
 
     if scheme != "http" {
-        let event = build_forward_unsupported_scheme_ocsf_event(method, &scheme, &host_lc, port);
+        let event = build_forward_unsupported_scheme_ocsf_event(
+            &event_context,
+            method,
+            &scheme,
+            &host_lc,
+            port,
+        );
         ocsf_emit!(event);
         if scheme == "https" {
             respond(
@@ -4624,6 +4697,7 @@ async fn handle_forward_proxy(
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
             ocsf_emit!(build_forward_policy_deny_ocsf_event(
+                &event_context,
                 workload_addr,
                 method,
                 &host_lc,
@@ -4735,7 +4809,7 @@ async fn handle_forward_proxy(
     let prepared_target = match prepare_forward_target(&path, canonicalize_options) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = NetworkActivityBuilder::new(&event_context)
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Medium)
                 .status(StatusId::Failure)
@@ -4906,6 +4980,7 @@ async fn handle_forward_proxy(
                 observer.observe(EndpointResult::PolicyDenied);
             }
             ocsf_emit!(build_forward_l7_parse_rejection_ocsf_event(
+                &event_context,
                 workload_addr,
                 method,
                 &host_lc,
@@ -4935,7 +5010,7 @@ async fn handle_forward_proxy(
             if let Some(observer) = endpoint_observer.as_ref() {
                 observer.observe(EndpointResult::PolicyDenied);
             }
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = HttpActivityBuilder::new(&event_context)
                 .activity(ActivityId::Other)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -5015,7 +5090,7 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    let event = NetworkActivityBuilder::new(&event_context)
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
@@ -5069,7 +5144,7 @@ async fn handle_forward_proxy(
                 {
                     Ok(body) => body,
                     Err(e) => {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        let event = NetworkActivityBuilder::new(&event_context)
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Medium)
                             .status(StatusId::Failure)
@@ -5132,7 +5207,7 @@ async fn handle_forward_proxy(
             || {
                 crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
                     .unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        let event = NetworkActivityBuilder::new(&event_context)
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -5197,7 +5272,7 @@ async fn handle_forward_proxy(
                     )
                 },
             );
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = HttpActivityBuilder::new(&event_context)
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
@@ -5271,6 +5346,7 @@ async fn handle_forward_proxy(
                 observer.observe(EndpointResult::PolicyDenied);
             }
             deny_forward_destination(
+                &event_context,
                 client,
                 &denial,
                 workload_addr,
@@ -5311,6 +5387,7 @@ async fn handle_forward_proxy(
                 observer.observe(endpoint_result_for_destination_failure(denial.kind));
             }
             deny_forward_destination(
+                &event_context,
                 client,
                 &denial,
                 workload_addr,
@@ -5702,7 +5779,7 @@ async fn handle_forward_proxy(
             if let Some(observer) = endpoint_observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            let event = HttpActivityBuilder::new(&event_context)
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -5860,6 +5937,7 @@ async fn handle_forward_proxy(
     // rewriting, generation checks, and the HTTP relay. Only now record the
     // final allowed outcome.
     ocsf_emit!(build_forward_allow_ocsf_event(
+        &event_context,
         workload_addr,
         method,
         &host_lc,
@@ -6153,6 +6231,18 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    fn proxy_event_context(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+        EventContext {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_name: sandbox_name.to_string(),
+            container_image: String::new(),
+            hostname: "windows-gateway".to_string(),
+            product_version: "test".to_string(),
+            proxy_ip: Ipv4Addr::LOCALHOST.into(),
+            proxy_port: 3128,
+        }
+    }
 
     #[test]
     fn endpoint_result_distinguishes_resolution_from_policy() {
@@ -7169,6 +7259,7 @@ network_policies:
     fn forward_policy_denial_ocsf_includes_validation_rationale() {
         let reason = "policy validation failed; fail-closed quarantine is active; candidate version 7 rejected: conflicting tls metadata";
         let event = build_forward_policy_deny_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
             "127.0.0.1:45123".parse().unwrap(),
             "GET",
             "api.example.com",
@@ -7188,8 +7279,44 @@ network_policies:
     }
 
     #[test]
+    fn forward_policy_denial_ocsf_keeps_per_proxy_sandbox_attribution() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let peer = "127.0.0.1:45123".parse().unwrap();
+        let build_event = |context: &EventContext| {
+            build_forward_policy_deny_ocsf_event(
+                context,
+                peer,
+                "GET",
+                "api.example.com",
+                80,
+                "/v1/models",
+                r"C:\agent.exe",
+                "-",
+                "-",
+                r"C:\agent.exe",
+                "endpoint is not allowed by any policy",
+            )
+            .to_json()
+            .unwrap()
+        };
+
+        let sandbox_a = build_event(&proxy_event_context("sandbox-a-id", "sandbox-a"));
+        let sandbox_b = build_event(&proxy_event_context("sandbox-b-id", "sandbox-b"));
+
+        assert_eq!(sandbox_a["container"]["uid"], "sandbox-a-id");
+        assert_eq!(sandbox_a["container"]["name"], "sandbox-a");
+        assert_eq!(sandbox_b["container"]["uid"], "sandbox-b-id");
+        assert_eq!(sandbox_b["container"]["name"], "sandbox-b");
+        let schema = load_class_schema("http_activity");
+        validate_required_fields(&sandbox_a, &schema);
+        validate_required_fields(&sandbox_b, &schema);
+    }
+
+    #[test]
     fn forward_l7_parse_rejection_ocsf_includes_denial_context() {
         let event = build_forward_l7_parse_rejection_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
             "127.0.0.1:45123".parse().unwrap(),
             "GET",
             "api.example.com",
@@ -7364,6 +7491,7 @@ network_policies:
         assert_eq!(path, "/v1/[CREDENTIAL]");
 
         let allowed = build_forward_allow_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
             peer,
             "GET",
             "api.example.com",
@@ -7378,6 +7506,7 @@ network_policies:
         .to_json()
         .unwrap();
         let denied = build_forward_policy_deny_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
             peer,
             "GET",
             "api.example.com",
@@ -7404,6 +7533,7 @@ network_policies:
         assert_eq!(host, "api.example.com");
         assert_eq!(path, "/?token=real-secret");
         let no_path_query = build_forward_allow_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
             peer,
             "GET",
             &host,
@@ -7423,9 +7553,12 @@ network_policies:
         assert!(!serialized.contains("real-secret"), "{serialized}");
         assert!(!serialized.contains("?token="), "{serialized}");
 
-        let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
-            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
-        ))
+        let malformed = build_forward_parse_error_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
+            &forward_telemetry_path(
+                "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+            ),
+        )
         .to_json()
         .unwrap();
         assert_eq!(
@@ -10387,8 +10520,13 @@ network_policies:
     fn unsupported_forward_scheme_event_omits_request_url() {
         use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
 
-        let event =
-            build_forward_unsupported_scheme_ocsf_event("GET", "https", "api.example.com", 443);
+        let event = build_forward_unsupported_scheme_ocsf_event(
+            openshell_ocsf::ctx::ctx(),
+            "GET",
+            "https",
+            "api.example.com",
+            443,
+        );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["http_request"]["http_method"], "GET");

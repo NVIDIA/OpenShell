@@ -92,6 +92,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
 
         let (mut app, mut proxy) = tcp_pair().await;
         deny_connect_destination(
+            openshell_ocsf::ctx::ctx(),
             &mut proxy,
             &denial,
             peer,
@@ -119,6 +120,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
 
         let (mut app, mut proxy) = tcp_pair().await;
         deny_forward_destination(
+            openshell_ocsf::ctx::ctx(),
             &mut proxy,
             &denial,
             peer,
@@ -165,6 +167,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     // global tracing pipeline. Its callsite-interest cache is process-global,
     // so parallel tests can otherwise make captured-event assertions flaky.
     let connect = serde_json::to_value(build_connect_destination_deny_ocsf_event(
+        openshell_ocsf::ctx::ctx(),
         &denial,
         peer,
         "target.example",
@@ -194,6 +197,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     assert_eq!(connect["status_detail"], denial_reason);
 
     let forward = serde_json::to_value(build_forward_destination_deny_ocsf_event(
+        openshell_ocsf::ctx::ctx(),
         &denial,
         peer,
         "POST",
@@ -229,6 +233,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
 fn representative_adapter_allows_preserve_ocsf_fields() {
     let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
     let connect = serde_json::to_value(build_connect_allow_ocsf_event(
+        openshell_ocsf::ctx::ctx(),
         peer,
         "target.example",
         8443,
@@ -254,6 +259,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(connect["message"], "CONNECT_L7 allowed target.example:8443");
 
     let forward = serde_json::to_value(build_forward_allow_ocsf_event(
+        openshell_ocsf::ctx::ctx(),
         peer,
         "GET",
         "target.example",
