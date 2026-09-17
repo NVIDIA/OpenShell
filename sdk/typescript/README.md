@@ -295,6 +295,7 @@ mise run sdk:ts:lint        # Biome: lint + format check (read-only)
 mise run sdk:ts:typecheck   # tsc --noEmit
 mise run sdk:ts:test        # Vitest unit tests with an 80% line-coverage gate
 mise run sdk:ts:build       # emit dist/
+mise run e2e:sdk:ts:exec    # public interactive helper against an isolated Docker gateway
 ```
 
 Formatting and linting are handled by [Biome](https://biomejs.dev) (`biome.json`): 2-space indent, single quotes, semicolons, 120-column width. Generated `src/gen/` is excluded. `sdk:ts:lint` runs in CI as part of `sdk:ts:ci`.

@@ -797,6 +797,8 @@ input. The gateway sends SSH EOF while keeping the output channel open until
 command completion. Input errors terminate the operation rather than masquerading
 as normal EOF. The input and output pumps are owned by the exec operation, so
 timeout or response abandonment cannot leave a detached stdin task behind.
+The pumps share polling fairly, and request processing yields cooperatively even
+for ignored resize messages, so sustained input cannot monopolize the operation.
 
 Go and TypeScript interactive-exec helpers distinguish process exit from stream
 completion. They consume the final gRPC status before reporting success and retain

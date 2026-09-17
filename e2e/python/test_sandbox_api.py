@@ -215,7 +215,7 @@ def test_interactive_exec_drains_output_after_request_eof(
                         "printf '%s' \"$input\"; printf 'drained-stderr' >&2; exit 7",
                     ],
                     tty=False,
-                    timeout_seconds=20,
+                    execution_timeout=duration_pb2.Duration(seconds=20),
                 )
             )
             yield openshell_pb2.ExecSandboxInput(stdin=b"drained-stdout")
