@@ -155,6 +155,15 @@ managed `metadata` or `review` annotations return `error` with
 `reason_code: invalid_input` and exit `2`. Schema-valid controls outside the
 containment model return `unsupported` and exit `3`.
 
+The prover applies aggregate limits across the candidate and boundary before
+semantic shape validation: 1,024 network rules, 4,096 endpoints, 4,096 binary
+selectors, 65,536 authored port entries, 16,384 REST rules, 4 KiB per modeled
+pattern, and 1 MiB of modeled pattern text. Exceeding any limit returns
+`inconclusive` with `reason_code: resource_limit`. A cancellation already
+requested at preflight takes precedence over that result; otherwise a resource
+limit takes precedence over unsupported policy-shape diagnostics. This ordering
+keeps validation work bounded for checked-in CI inputs.
+
 Network binary selectors, endpoint host and path selectors, and REST allow and
 deny method and path selectors must use ASCII literals in both the candidate and
 boundary. A non-ASCII literal in one of these fields returns `unsupported` with

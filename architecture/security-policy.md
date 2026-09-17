@@ -383,6 +383,12 @@ results when a sound decision depends on authority or runtime context outside
 the model. The result records the model version and covered domains so callers
 can bind a successful check to those semantics.
 
+Before semantic validation, the checker observes cancellation and applies
+aggregate limits across both inputs. Oversized checks therefore return
+`resource_limit` without building validation indexes. Cross-protocol ambiguity
+validation indexes host and port authority rather than comparing every endpoint
+pair, and it checks cancellation while scanning admitted policies.
+
 This containment operation is separate from the proposal-risk queries below.
 See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
 for installation, command behavior, model limitations, evidence, and exit codes.
