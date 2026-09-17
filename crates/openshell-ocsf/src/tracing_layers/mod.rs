@@ -9,6 +9,7 @@
 
 pub(crate) mod event_bridge;
 mod jsonl_layer;
+mod relay_layer;
 mod shorthand_layer;
 
 pub use event_bridge::{
@@ -16,4 +17,5 @@ pub use event_bridge::{
     set_current_event,
 };
 pub use jsonl_layer::OcsfJsonlLayer;
+pub use relay_layer::{OcsfRelayLayer, OcsfRelaySink};
 pub use shorthand_layer::OcsfShorthandLayer;
