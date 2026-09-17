@@ -111,7 +111,7 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
-    needs: [build-binaries, build-vm-driver]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     permissions:
       actions: read
       contents: read
